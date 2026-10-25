@@ -122,8 +122,9 @@ pub(crate) fn request(
     }
     let checkout = crate::GitRepo::discover(cwd)?;
     let root = checkout.root().canonicalize()?;
-    if root != PathBuf::from(&session.worktree_path).canonicalize()? {
-        return Err(invalid("run from the named session's own worktree"));
+    if root != PathBuf::from(&session.worktree_path).canonicalize()? || cwd.canonicalize()? != root
+    {
+        return Err(invalid("run from the named session's own worktree root"));
     }
     reject_aliases(&root, path)?;
     let repository = broker.worktree_root_plan()?.repository_key;

@@ -200,6 +200,22 @@ fn idle_owner_cannot_be_taken_over_and_wrong_worktree_never_dispatches() {
         !sentinel.exists(),
         "wrong-worktree generator was dispatched"
     );
+    let nested = Path::new(&first.worktree_path).join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let nested_refusal = cli(root, &nested, &home, first.id, &command)
+        .output()
+        .unwrap();
+    assert!(!nested_refusal.status.success());
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&nested_refusal.stdout),
+        String::from_utf8_lossy(&nested_refusal.stderr)
+    );
+    assert!(diagnostic.contains("worktree root"), "{diagnostic}");
+    assert!(
+        !sentinel.exists(),
+        "nested-worktree generator was dispatched"
+    );
     std::fs::write(&done, b"done").unwrap();
     assert!(held.child.wait().unwrap().success());
     let completed = cli(

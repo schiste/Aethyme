@@ -2,7 +2,7 @@
 
 Last Updated: 2026-10-25
 
-Run a generator from its broker session worktree:
+Run a generator from its broker session worktree root:
 
 ```sh
 aethyme broker advanced resources artifact-run config/generated.json --session 123 -- generator --output config/generated.json
@@ -16,7 +16,7 @@ its owner becomes idle. It can wait with `--wait`; the default is immediate
 contention refusal. Normal named ownership claims keep their existing semantics.
 
 The request is bound to an open recorded session and requires running inside
-that session's own checkout. Closed sessions, another checkout, ambiguous paths,
+that session's own checkout root. Closed sessions, another checkout, ambiguous paths,
 Git-administrative paths, existing symlinks, directories and Unix hard-linked
 files are refused before resource acquisition. Keys fold NFC Unicode, lowercase,
 and trailing dots/spaces conservatively, including on case-sensitive filesystems.
