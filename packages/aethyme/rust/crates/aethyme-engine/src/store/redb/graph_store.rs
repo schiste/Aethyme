@@ -48,7 +48,8 @@ use crate::model::unresolved::UnresolvedNode;
 /// Bumped when the on-disk format changes incompatibly. We re-create the file
 /// rather than try to migrate.
 // v11 requires section endpoints; old derived stores must be rematerialized.
-const SCHEMA_VERSION: u32 = 11;
+// Schema 12 additionally binds actual persisted File endpoints after relocation.
+const SCHEMA_VERSION: u32 = 12;
 
 /// Public compatibility identity used by the immutable materialization cache.
 pub const GRAPH_STORE_SCHEMA_VERSION: u32 = SCHEMA_VERSION;

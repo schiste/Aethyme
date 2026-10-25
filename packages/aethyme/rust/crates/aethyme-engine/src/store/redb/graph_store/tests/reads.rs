@@ -1082,7 +1082,7 @@ fn schema_mismatch_is_reported() {
 }
 
 #[test]
-fn schema_v10_store_is_rejected_without_materialized_document_sections() {
+fn schema_v11_store_is_rejected_without_relocated_file_endpoint_binding() {
     let root = tmp_root(function_name!());
     let _ = GraphStore::open(&root).expect("open current schema");
     {
@@ -1091,7 +1091,7 @@ fn schema_v10_store_is_rejected_without_materialized_document_sections() {
         let txn = db.begin_write().expect("write txn");
         {
             let mut meta = txn.open_table(META).expect("META");
-            meta.insert(META_KEY_SCHEMA_VERSION, &10u32.to_le_bytes()[..])
+            meta.insert(META_KEY_SCHEMA_VERSION, &11u32.to_le_bytes()[..])
                 .expect("set prior schema");
         }
         txn.commit().expect("commit old version");
@@ -1100,8 +1100,8 @@ fn schema_v10_store_is_rejected_without_materialized_document_sections() {
     assert!(matches!(
         GraphStore::open(&root),
         Err(GraphStoreError::SchemaMismatch {
-            found: 10,
-            expected: 11
+            found: 11,
+            expected: 12
         })
     ));
     let _ = std::fs::remove_dir_all(&root);
