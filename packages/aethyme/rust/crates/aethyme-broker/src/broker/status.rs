@@ -432,7 +432,11 @@ impl Broker {
         );
         let phase_started = std::time::Instant::now();
         advice.extend(stalled_submit_advice(
-            &crate::submit_progress::in_flight_submits(&self.main_root, now_ms),
+            &crate::submit_progress::in_flight_for_sessions(
+                &self.main_root,
+                now_ms,
+                agents.iter().map(|agent| agent.session.id),
+            ),
         ));
         phase_timings_ms.insert("submits".into(), phase_started.elapsed().as_millis() as u64);
         let phase_started = std::time::Instant::now();
@@ -1438,7 +1442,15 @@ impl Broker {
         } else if refresh {
             budget_cut.push("shared_edit_classification");
         }
-        let in_flight_submits = crate::submit_progress::in_flight_submits(&self.main_root, now_ms);
+        let in_flight_submits = if refresh {
+            crate::submit_progress::in_flight_submits(&self.main_root, now_ms)
+        } else {
+            crate::submit_progress::in_flight_for_sessions(
+                &self.main_root,
+                now_ms,
+                agents.iter().map(|agent| agent.session.id),
+            )
+        };
         advice.extend(stalled_submit_advice(&in_flight_submits));
         let foreign_started = std::time::Instant::now();
         // The main checkout is where agents gather before starting their own
