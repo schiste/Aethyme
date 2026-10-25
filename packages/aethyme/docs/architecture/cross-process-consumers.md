@@ -46,7 +46,11 @@ repository/user identity, executable and embedded helper hashes, paths and
 unit content. The explicit macOS `service install` command requires the exact
 recomputed digest via `--confirm` and emits `aethyme.pr-watch-service-install/v1`
 with created paths, no activation and an unobserved scheduler state. It never
-loads a unit or replaces differing files. No activation consumer exists yet. See
+loads a unit or replaces differing files. Explicit macOS `service activate` and
+`deactivate` require the installed digest; `status` is read-only. Their
+`aethyme.pr-watch-service-control/v1` result reports scheduler observations and
+optional generation-bound last-pass metadata. Unacknowledged actions exit
+nonzero and report unknown scheduler state; loaded is not a delivery proof. See
 `docs/guides/pr-watch-service.md` for fields, digest construction and limits.
 
 ## Direct-child helper observations (#713)

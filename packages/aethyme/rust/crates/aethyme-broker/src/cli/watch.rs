@@ -1071,10 +1071,18 @@ pub(super) fn run_pr(parsed: Parsed) -> Result<(), UsageError> {
 
 // Validate the entire request before opening even a read-only broker snapshot.
 fn run_service(parsed: &Parsed) -> Result<(), UsageError> {
+    if parsed.positional.len() == 3
+        && matches!(
+            parsed.positional[2].as_str(),
+            "activate" | "deactivate" | "status"
+        )
+    {
+        return run_service_control(parsed);
+    }
     if parsed.positional.len() != 3 || !matches!(parsed.positional[2].as_str(), "plan" | "install")
     {
         return Err(UsageError::Message(
-            "watch pr service requires plan or install --broker-bin <absolute-router>".into(),
+            "watch pr service requires plan or install --broker-bin <absolute-router>, or activate, deactivate, status".into(),
         ));
     }
     let binary = parsed
@@ -1174,7 +1182,7 @@ fn run_service(parsed: &Parsed) -> Result<(), UsageError> {
             out!("Helpers: {}", plan.directory.display());
             out!("Interval: {} seconds", plan.interval_seconds);
             out!(
-                "Plan only: use explicit install with this digest to create files. Activation is not available yet."
+                "Plan only: use explicit install with this digest to create files. Use explicit activate with the installed digest to load the service."
             );
         }
         Ok(())
@@ -1186,4 +1194,59 @@ fn run_service(parsed: &Parsed) -> Result<(), UsageError> {
             "macOS service planning requires a Unix host".into(),
         ))
     }
+}
+
+fn run_service_control(parsed: &Parsed) -> Result<(), UsageError> {
+    let action = parsed.positional[2].as_str();
+    if action != "status"
+        && parsed.confirm.as_deref().is_none_or(|value| {
+            value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        })
+    {
+        return Err(UsageError::Message(
+            "service control requires --confirm <installed-plan-digest>".into(),
+        ));
+    }
+    if action != "status" && parsed.read_only_snapshot {
+        return Err(read_only_refusal(
+            parsed,
+            "service control",
+            "broker advanced watch pr service status --json",
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| UsageError::Message("service control requires absolute HOME".into()))?;
+        let mut broker = open_broker(true)?;
+        let uuid = broker
+            .store()
+            .binding_scope
+            .as_ref()
+            .and_then(|scope| scope.repository_uuid.clone())
+            .ok_or_else(|| {
+                UsageError::Message("service control requires existing repository identity".into())
+            })?;
+        let report = crate::pr_watch_service_install::lifecycle::control(
+            &home,
+            &uuid,
+            action,
+            parsed.confirm.as_deref(),
+        )?;
+        out!("{}", serde_json::to_string_pretty(&report)?);
+        if report["operation_result"] != "acknowledged" {
+            return Err(UsageError::Message(
+                "service control not acknowledged; inspect status before another mutation".into(),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    Err(UsageError::Message(
+        "service control is available on macOS only".into(),
+    ))
 }

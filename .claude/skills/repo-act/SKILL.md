@@ -15,6 +15,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - Load repo-onboarding first if the repository or area is unfamiliar.
 - Run Aethyme Explore on the user task before broad manual search.
 - Verify answer candidates before concluding when trust_policy is not answer-safe.
+- Before reporting an emitted setting or guard as missing, inspect its complete
+  producer or template, including lines beyond the initial excerpt. A missing
+  value in a selected span does not establish that the output omits it.
 - Identify the nearest fast test or validation command before editing.
 - For implementation and version audits, search production source and maintained
   guides before archived qualification payloads or raw logs. Frozen transcripts
