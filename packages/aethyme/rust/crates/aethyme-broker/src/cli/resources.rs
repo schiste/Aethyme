@@ -113,6 +113,41 @@ pub(super) struct ResourceAcquireFailure<'a> {
     conflicts: &'a [crate::HostResourceConflict],
 }
 
+// Keep this off successful acquisition and retry paths. It is observational
+// advice after a final refusal, never a reason to alter admission or ownership.
+fn contention_advice(
+    code: &str,
+    capture: impl FnOnce() -> Option<crate::resource_pressure::Report>,
+) -> Option<serde_json::Value> {
+    if code != "resource_contention" {
+        return None;
+    }
+    let report = capture();
+    Some(serde_json::json!({
+        "type": "resource_contention_advice",
+        "schema": "aethyme.resource-contention-advice/v1",
+        "reason": "resource_contention_memory_pressure_unproven",
+        "observation": if report.is_some() { "available" } else { "unavailable" },
+        "report": report,
+        "next_action": "aethyme broker advanced resources pressure --json",
+        "cleanup_authorized": false,
+    }))
+}
+
+fn emit_contention_advice(code: &str) {
+    if let Some(advice) = contention_advice(code, || {
+        // A global host-resource command can run outside a broker repository.
+        // Missing state, capture errors and malformed state are not admission
+        // errors; preserve the original refusal and emit unknown diagnostics.
+        match open_broker(true) {
+            Ok(broker) => broker.resource_pressure_report().ok(),
+            Err(_) => None,
+        }
+    }) {
+        eprintln!("{advice}");
+    }
+}
+
 pub(super) fn render_host_lease(lease: &crate::HostResourceLease) {
     out!(
         "{} generation {} — {} until {}",
@@ -949,6 +984,7 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                     Err(crate::HostResourceError::Conflict {
                         code, conflicts, ..
                     }) if parsed.json => {
+                        emit_contention_advice(&code);
                         out!(
                             "{}",
                             serde_json::to_string_pretty(&ResourceAcquireFailure {
@@ -961,7 +997,12 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                         );
                         return Err(UsageError::SilentExit(75));
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        if let crate::HostResourceError::Conflict { code, .. } = &error {
+                            emit_contention_advice(code);
+                        }
+                        return Err(error.into());
+                    }
                 };
                 if let Some(path) = parsed.grant_out.as_deref() {
                     write_private_grant(path, &grant)?;
@@ -1105,6 +1146,7 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                         code, conflicts, ..
                     },
                 )) if json => {
+                    emit_contention_advice(&code);
                     eprintln!(
                         "{}",
                         serde_json::to_string(&ResourceAcquireFailure {
@@ -1117,7 +1159,15 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                     );
                     return Err(UsageError::SilentExit(75));
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    if let crate::HostResourceRunError::Resource(
+                        crate::HostResourceError::Conflict { code, .. },
+                    ) = &error
+                    {
+                        emit_contention_advice(code);
+                    }
+                    return Err(error.into());
+                }
             };
             if json {
                 eprintln!("{}", serde_json::to_string(&report)?);
@@ -1269,6 +1319,40 @@ mod tests {
         let resolution = crate::cli::surface::resolve(&args);
         assert!(resolution.refusal.is_none(), "{:?}", resolution.refusal);
         assert_eq!(resolution.args, ["resources", "pressure", "--json"]);
+    }
+
+    #[test]
+    fn only_waitable_contention_captures_owner_advice() {
+        for code in [
+            "capacity_policy_mismatch",
+            "orphaned_holder",
+            "invalid_request",
+        ] {
+            assert!(super::contention_advice(code, || panic!("must not sample")).is_none());
+        }
+        let advice = super::contention_advice("resource_contention", || {
+            Some(crate::resource_pressure::Report::over_budget(201))
+        })
+        .unwrap();
+        assert_eq!(advice["schema"], "aethyme.resource-contention-advice/v1");
+        assert_eq!(advice["observation"], "available");
+        assert_eq!(
+            advice["report"]["memory_observation"],
+            "session_inventory_over_budget"
+        );
+        assert_eq!(
+            advice["reason"],
+            "resource_contention_memory_pressure_unproven"
+        );
+        assert_eq!(advice["cleanup_authorized"], false);
+    }
+
+    #[test]
+    fn unavailable_contention_advice_preserves_unknown_memory() {
+        let advice = super::contention_advice("resource_contention", || None).unwrap();
+        assert_eq!(advice["observation"], "unavailable");
+        assert!(advice["report"].is_null());
+        assert_eq!(advice["cleanup_authorized"], false);
     }
 
     const PROVEN: ConsoleHolderIdentity = ConsoleHolderIdentity::Proven;

@@ -17,6 +17,27 @@ pub(crate) struct Owner {
     pub holder: Option<AgentProcess>,
 }
 
+// Observational inactivity only. A fresh command or Git metadata protects an
+// owner even if its recorded state was idle. A recently active owner whose PID
+// disappeared stays protected until idle age; no per-owner liveness probe runs.
+pub(crate) fn activity(
+    status: crate::SessionStatus,
+    recorded_ms: i64,
+    metadata_ms: Option<i64>,
+    now_ms: i64,
+) -> (bool, i64) {
+    let latest = metadata_ms.unwrap_or(0).max(recorded_ms);
+    let idle_ms = now_ms.saturating_sub(latest).max(0);
+    let inactive = match status {
+        crate::SessionStatus::Active | crate::SessionStatus::Idle | crate::SessionStatus::Stale => {
+            idle_ms > crate::broker::IDLE_AFTER_MS
+        }
+        crate::SessionStatus::Exited => true,
+        _ => false,
+    };
+    (inactive, idle_ms)
+}
+
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct Report {
     schema: &'static str,
@@ -244,6 +265,23 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn activity_uses_recent_metadata_and_never_infers_process_death() {
+        use crate::SessionStatus::{Active, Exited, Idle, Stale};
+        let now = 2_000_000;
+        let old = now - crate::broker::IDLE_AFTER_MS - 1;
+        assert_eq!(activity(Active, old, None, now), (true, now - old));
+        assert_eq!(activity(Active, now, None, now), (false, 0));
+        assert_eq!(activity(Idle, old, Some(now), now), (false, 0));
+        assert_eq!(activity(Stale, now, None, now), (false, 0));
+        assert_eq!(activity(Exited, now, None, now), (true, 0));
+        assert_eq!(activity(Active, now + 1, None, now), (false, 0));
+        assert_eq!(
+            activity(Active, now - crate::broker::IDLE_AFTER_MS, None, now),
+            (false, crate::broker::IDLE_AFTER_MS)
+        );
+    }
+
     fn snapshot() -> MemorySnapshot {
         MemorySnapshot::parse("10 0 100 Mon Oct 5 12:00:00 2026 codex\n11 10 20 Mon Oct 5 12:00:01 2026 child\n12 10 30 Mon Oct 5 12:00:02 2026 codex\n13 12 40 Mon Oct 5 12:00:03 2026 child\n").unwrap()
     }

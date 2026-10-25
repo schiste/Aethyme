@@ -16,6 +16,8 @@ use aethyme_broker::{
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
+mod common;
+
 fn run(cwd: &Path, state: &Path, args: &[&str]) -> Output {
     Command::new(CLI)
         .args(args)
@@ -178,6 +180,196 @@ impl Drop for ProcessGroupSurvivor {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn pressure_report_does_not_probe_each_session_pid() {
+    let fixture = common::FixtureRepository::new();
+    let repo = fixture.path();
+    std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "gc.auto", "0"],
+        vec!["config", "maintenance.auto", "false"],
+        vec!["config", "core.hooksPath", "/dev/null"],
+        vec!["config", "user.name", "fixture"],
+        vec!["config", "user.email", "fixture@example.invalid"],
+        vec!["add", ".gitignore"],
+        vec!["commit", "-qm", "chore: fixture"],
+    ] {
+        let output = Command::new("git")
+            .args(&args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // The override names a container, while the broker binds a new repository
+    // root beneath it. Fresh binding requires that container to exist.
+    std::fs::create_dir_all(fixture.worktree_root()).unwrap();
+    let started = common::broker_cli_for_fixture(
+        CLI,
+        &["start", "--task", "pressure fixture", "--json"],
+        repo,
+    )
+    .current_dir(repo)
+    .env("AETHYME_WORKTREE_ROOT", fixture.worktree_root())
+    .output()
+    .unwrap();
+    assert!(
+        started.status.success(),
+        "start failed ({:?}): stdout={}\nstderr={}",
+        started.status.code(),
+        String::from_utf8_lossy(&started.stdout),
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    let id = value.get("session").unwrap_or(&value)["id"]
+        .as_i64()
+        .unwrap();
+    let database = rusqlite::Connection::open(repo.join(".aethyme/broker.db")).unwrap();
+    database
+        .execute("UPDATE sessions SET pid = 2147483646 WHERE id = ?1", [id])
+        .unwrap();
+    drop(database);
+
+    // Linux leaves a missing /proc entry to the per-PID ps fallback. The old
+    // agent_views path therefore calls this stub for the deliberately absent PID.
+    let bin = fixture.owner_path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let ps = bin.join("ps");
+    std::fs::write(
+        &ps,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$PRESSURE_PS_LOG"
+if [ "$1" = -A ]; then
+  printf '10 0 1 Mon Oct 5 12:00:00 2026 fixture\n'
+  exit 0
+fi
+exit 1
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&ps, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let log = fixture.owner_path().join("ps.log");
+    let output =
+        common::broker_cli_for_fixture(CLI, &["advanced", "resources", "pressure", "--json"], repo)
+            .current_dir(repo)
+            .env("AETHYME_WORKTREE_ROOT", fixture.worktree_root())
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("PRESSURE_PS_LOG", &log)
+            .output()
+            .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema"], "aethyme.resource-pressure/v1");
+    let calls = std::fs::read_to_string(log).unwrap();
+    assert!(
+        !calls.lines().any(|line| line.contains("-p 2147483646")),
+        "per-owner liveness probe: {calls}"
+    );
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("-A -ww -o pid=,ppid=,rss="))
+            .count(),
+        1,
+        "{calls}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn final_capacity_refusal_reports_advice_without_dispatch_or_stdout_pollution() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let mut coordinator = HostResourceCoordinator::open(&state.join("host-resources.db")).unwrap();
+    let request = |id: &str| HostResourceRequest {
+        schema_version: 1,
+        request_id: id.into(),
+        repository: "synthetic/pressure".into(),
+        worktree_fingerprint: id.into(),
+        run_id: id.into(),
+        ttl_seconds: 60,
+        holder_pid: Some(std::process::id()),
+        resources: vec![HostResourceRequirement {
+            key: "workers".into(),
+            resource: HostResourceKind::Capacity {
+                pool: "pressure-advice-fixture".into(),
+                units: 1,
+                limit: 1,
+            },
+        }],
+    };
+    let held = coordinator.acquire(&request("holder")).unwrap();
+    let contender = temp.path().join("contender.json");
+    std::fs::write(
+        &contender,
+        serde_json::to_vec(&request("contender")).unwrap(),
+    )
+    .unwrap();
+    let marker = temp.path().join("must-not-dispatch");
+    let command = format!("printf dispatched > '{}'", marker.display());
+    for action in ["acquire", "run"] {
+        for json in [false, true] {
+            let mut args = vec!["advanced", "resources", action, contender.to_str().unwrap()];
+            if json {
+                args.push("--json");
+            }
+            if action == "run" {
+                args.extend(["--", "/bin/sh", "-c", &command]);
+            }
+            let blocked = run(temp.path(), &state, &args);
+            assert!(!blocked.status.success());
+            let stderr = String::from_utf8(blocked.stderr).unwrap();
+            let advice: Vec<serde_json::Value> = stderr
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|value| value["type"] == "resource_contention_advice")
+                .collect();
+            assert_eq!(advice.len(), 1, "{action} json={json}: {stderr}");
+            assert_eq!(advice[0]["schema"], "aethyme.resource-contention-advice/v1");
+            assert_eq!(advice[0]["observation"], "unavailable");
+            assert!(advice[0]["report"].is_null());
+            assert_eq!(advice[0]["cleanup_authorized"], false);
+            assert!(!marker.exists(), "refused command must not run");
+            assert!(!stderr.contains(&held.ownership_token));
+            if json {
+                assert_eq!(blocked.status.code(), Some(75));
+                let failure = if action == "acquire" {
+                    serde_json::from_slice::<serde_json::Value>(&blocked.stdout).unwrap()
+                } else {
+                    assert!(blocked.stdout.is_empty());
+                    stderr
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                        .find(|value| value["code"] == "resource_contention")
+                        .unwrap()
+                };
+                assert_eq!(failure["code"], "resource_contention");
+                assert_eq!(failure["retryable"], true);
+            } else {
+                assert!(blocked.stdout.is_empty());
+            }
+        }
+    }
+    assert_eq!(coordinator.list(false).unwrap().len(), 1);
+    assert_eq!(
+        coordinator.list(false).unwrap()[0].state,
+        HostLeaseState::Active
+    );
+}
+
 #[test]
 fn acquire_wait_is_structured_and_grant_out_is_private() {
     let temp = tempfile::tempdir().unwrap();
@@ -225,6 +417,7 @@ fn acquire_wait_is_structured_and_grant_out_is_private() {
         String::from_utf8_lossy(&acquired.stderr)
     );
     assert!(!String::from_utf8_lossy(&acquired.stdout).contains("ownership_token"));
+    assert!(!String::from_utf8_lossy(&acquired.stderr).contains("resource_contention_advice"));
     let stored: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&grant_path).unwrap()).unwrap();
     assert!(stored["ownership_token"].as_str().unwrap().len() >= 64);
@@ -252,6 +445,7 @@ fn acquire_wait_is_structured_and_grant_out_is_private() {
     assert_eq!(failure["code"], "capacity_policy_mismatch");
     assert_eq!(failure["retryable"], false);
     assert_eq!(failure["conflicts"][0]["code"], "capacity_policy_mismatch");
+    assert!(!String::from_utf8_lossy(&blocked.stderr).contains("resource_contention_advice"));
 }
 
 #[test]

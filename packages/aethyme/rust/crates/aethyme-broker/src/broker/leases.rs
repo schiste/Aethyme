@@ -397,7 +397,8 @@ impl Broker {
             .unwrap_or(0)
     }
 
-    /// Explicit read-only diagnostics; never called by routine status or admission.
+    /// Read-only diagnostics for explicit requests and final admission refusal.
+    /// Never called by routine status, successful acquisition or wait retries.
     pub(crate) fn resource_pressure_report(
         &self,
     ) -> Result<crate::resource_pressure::Report, BrokerOpError> {
@@ -408,15 +409,18 @@ impl Broker {
         }
         let now = now_ms();
         let mut owners = Vec::new();
-        for view in self.agent_views(sessions, now)? {
+        for session in sessions {
+            let (inactive, idle_ms) = crate::resource_pressure::activity(
+                session.status,
+                session.last_activity_at,
+                worktree_activity_ms(&self.main_root, &session),
+                now,
+            );
             owners.push(crate::resource_pressure::Owner {
-                session_id: view.session.id,
-                inactive: matches!(
-                    view.derived_status,
-                    SessionStatus::Idle | SessionStatus::Stale | SessionStatus::Exited
-                ),
-                idle_ms: now.saturating_sub(view.activity_at).max(0),
-                holder: crate::session_holder::recorded_holder(&self.store, view.session.id)?,
+                session_id: session.id,
+                inactive,
+                idle_ms,
+                holder: crate::session_holder::recorded_holder(&self.store, session.id)?,
             });
         }
         Ok(crate::resource_pressure::Report::capture(owners))
