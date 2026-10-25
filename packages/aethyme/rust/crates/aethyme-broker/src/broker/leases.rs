@@ -397,7 +397,8 @@ impl Broker {
             .unwrap_or(0)
     }
 
-    /// Explicit read-only diagnostics; never called by routine status or admission.
+    /// Read-only diagnostics for explicit requests and final admission refusal.
+    /// Never called by routine status, successful acquisition or wait retries.
     pub(crate) fn resource_pressure_report(
         &self,
     ) -> Result<crate::resource_pressure::Report, BrokerOpError> {

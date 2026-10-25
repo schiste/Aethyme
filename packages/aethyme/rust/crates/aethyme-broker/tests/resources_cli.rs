@@ -178,6 +178,88 @@ impl Drop for ProcessGroupSurvivor {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn final_capacity_refusal_reports_advice_without_dispatch_or_stdout_pollution() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    let mut coordinator = HostResourceCoordinator::open(&state.join("host-resources.db")).unwrap();
+    let request = |id: &str| HostResourceRequest {
+        schema_version: 1,
+        request_id: id.into(),
+        repository: "synthetic/pressure".into(),
+        worktree_fingerprint: id.into(),
+        run_id: id.into(),
+        ttl_seconds: 60,
+        holder_pid: Some(std::process::id()),
+        resources: vec![HostResourceRequirement {
+            key: "workers".into(),
+            resource: HostResourceKind::Capacity {
+                pool: "pressure-advice-fixture".into(),
+                units: 1,
+                limit: 1,
+            },
+        }],
+    };
+    let held = coordinator.acquire(&request("holder")).unwrap();
+    let contender = temp.path().join("contender.json");
+    std::fs::write(
+        &contender,
+        serde_json::to_vec(&request("contender")).unwrap(),
+    )
+    .unwrap();
+    let marker = temp.path().join("must-not-dispatch");
+    let command = format!("printf dispatched > '{}'", marker.display());
+    for action in ["acquire", "run"] {
+        for json in [false, true] {
+            let mut args = vec!["advanced", "resources", action, contender.to_str().unwrap()];
+            if json {
+                args.push("--json");
+            }
+            if action == "run" {
+                args.extend(["--", "/bin/sh", "-c", &command]);
+            }
+            let blocked = run(temp.path(), &state, &args);
+            assert!(!blocked.status.success());
+            let stderr = String::from_utf8(blocked.stderr).unwrap();
+            let advice: Vec<serde_json::Value> = stderr
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|value| value["type"] == "resource_contention_advice")
+                .collect();
+            assert_eq!(advice.len(), 1, "{action} json={json}: {stderr}");
+            assert_eq!(advice[0]["schema"], "aethyme.resource-contention-advice/v1");
+            assert_eq!(advice[0]["observation"], "unavailable");
+            assert!(advice[0]["report"].is_null());
+            assert_eq!(advice[0]["cleanup_authorized"], false);
+            assert!(!marker.exists(), "refused command must not run");
+            assert!(!stderr.contains(&held.ownership_token));
+            if json {
+                assert_eq!(blocked.status.code(), Some(75));
+                let failure = if action == "acquire" {
+                    serde_json::from_slice::<serde_json::Value>(&blocked.stdout).unwrap()
+                } else {
+                    assert!(blocked.stdout.is_empty());
+                    stderr
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                        .find(|value| value["code"] == "resource_contention")
+                        .unwrap()
+                };
+                assert_eq!(failure["code"], "resource_contention");
+                assert_eq!(failure["retryable"], true);
+            } else {
+                assert!(blocked.stdout.is_empty());
+            }
+        }
+    }
+    assert_eq!(coordinator.list(false).unwrap().len(), 1);
+    assert_eq!(
+        coordinator.list(false).unwrap()[0].state,
+        HostLeaseState::Active
+    );
+}
+
 #[test]
 fn acquire_wait_is_structured_and_grant_out_is_private() {
     let temp = tempfile::tempdir().unwrap();
@@ -225,6 +307,7 @@ fn acquire_wait_is_structured_and_grant_out_is_private() {
         String::from_utf8_lossy(&acquired.stderr)
     );
     assert!(!String::from_utf8_lossy(&acquired.stdout).contains("ownership_token"));
+    assert!(!String::from_utf8_lossy(&acquired.stderr).contains("resource_contention_advice"));
     let stored: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&grant_path).unwrap()).unwrap();
     assert!(stored["ownership_token"].as_str().unwrap().len() >= 64);
@@ -252,6 +335,7 @@ fn acquire_wait_is_structured_and_grant_out_is_private() {
     assert_eq!(failure["code"], "capacity_policy_mismatch");
     assert_eq!(failure["retryable"], false);
     assert_eq!(failure["conflicts"][0]["code"], "capacity_policy_mismatch");
+    assert!(!String::from_utf8_lossy(&blocked.stderr).contains("resource_contention_advice"));
 }
 
 #[test]

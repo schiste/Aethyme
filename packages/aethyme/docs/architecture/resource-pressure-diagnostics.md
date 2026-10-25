@@ -3,8 +3,9 @@
 Last Updated: 2026-10-25
 
 `aethyme broker advanced resources pressure --json` explicitly diagnoses
-inactive recorded session owners. Routine status and resource admission do not
-run this report. It never signals a process, terminates an agent, releases a
+inactive recorded session owners. Routine status, successful resource admission
+and acquisition retries do not run this report. A final resource-contention
+refusal runs it once as best-effort advice. It never signals a process, terminates an agent, releases a
 lease, deletes a worktree, or changes a session's status.
 
 ## Wire contract
@@ -44,6 +45,29 @@ sample. These are observations made at different instants, not an atomic host
 snapshot. Missing holder records cannot establish sharing, and foreign agents
 or repositories are outside this repository's owner inventory. Output cannot
 authorize cleanup or establish that an idle agent can safely be terminated.
-Owned-service registration, verified service/container teardown, automatic
-contention diagnostics and actual memory-pressure admission remain separate
-work under #765.
+Owned-service registration, verified service/container teardown and actual
+memory-pressure admission remain separate work under #765.
+
+## Final admission refusal
+
+`resources acquire`, `run` and `artifact-run` emit one JSON line on stderr
+when final acquisition fails with `resource_contention`, in human and JSON
+modes. The event uses `type = resource_contention_advice` and schema
+`aethyme.resource-contention-advice/v1`. Stdout, the existing failure payload,
+exit status and retryability are unchanged. Other refusal codes do not sample.
+There is no extra sampling during the acquisition wait loop or on success.
+
+Every event contains `reason = resource_contention_memory_pressure_unproven`,
+`cleanup_authorized = false`, the explicit diagnostic `next_action`,
+`observation` and `report`. A readable repository produces `available` with the
+existing ranked pressure report; a command outside a broker repository or a
+failed diagnostic produces `unavailable` and a null report. Diagnostic errors
+never replace the acquisition error. An available report can still contain
+unknown memory or an over-budget inventory; consult its own observation fields.
+
+This does not establish that memory caused resource contention, and no process,
+container, lease or session is stopped. Diagnostics execute after acquisition
+has refused; their time is additional to the acquisition wait budget. The
+existing process-sampling limits apply, but the complete repository read is not
+a hard wall-clock bound. Long-wait proactive pressure notification remains
+separate from this final-refusal advice.
