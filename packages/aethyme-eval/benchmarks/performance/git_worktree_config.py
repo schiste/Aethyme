@@ -16,8 +16,8 @@ from git_worktree_options import Experiment as GitExperiment
 
 class Experiment(GitExperiment):
     def run(self, *args, **kwargs):
-        if len(self.commands) >= 600:
-            raise RuntimeError("synthetic experiment exhausted its 600-command budget")
+        if len(self.commands) >= 750:
+            raise RuntimeError("synthetic experiment exhausted its 750-command budget")
         return super().run(*args, **kwargs)
 
 
@@ -45,7 +45,34 @@ def snapshot(ex, repos, git=None):
             for p in repos]
 
 
-def case(ex, name, bare, explicit_worktree, other):
+def require_extension_refusal(ex, repos, git, extension):
+    for repo in repos:
+        row = ex.run(repo, "rev-parse", "--verify", "HEAD", git=git, required=False)
+        diagnostic = row["stderr"].lower()
+        if row["returncode"] == 0 or extension.lower() not in diagnostic or "extension" not in diagnostic:
+            raise RuntimeError("client did not refuse the unknown repository extension: " + extension)
+
+
+def verify_format_fence(ex, repos, shared):
+    if value(ex, repos[0], "core.repositoryformatversion") != "1":
+        raise RuntimeError("experimental migration lacks the format-one refusal fence")
+    enabled = shared.read_bytes()
+    probe = shared.with_name("config.experiment-refusal-probe")
+    restore = shared.with_name("config.experiment-refusal-restore")
+    probe.write_bytes(enabled)
+    extension = "aethymeUnknownRefusalProbe"
+    ex.run(repos[0], "config", "--file", str(probe), "extensions." + extension, "true")
+    try:
+        os.replace(probe, shared)
+        require_extension_refusal(ex, repos, None, extension)
+    finally:
+        restore.write_bytes(enabled)
+        os.replace(restore, shared)
+    if shared.read_bytes() != enabled:
+        raise RuntimeError("unknown-extension probe did not restore exact enabled bytes")
+
+
+def case(ex, name, bare, explicit_worktree, other, legacy=None):
     primary = ex.init(name, ("--bare",) if bare else ())
     # A non-bare seed is needed to create a commit for the bare primary.
     seed = ex.init(name + "-seed") if bare else primary
@@ -76,6 +103,8 @@ def case(ex, name, bare, explicit_worktree, other):
     if value(ex, primary, "aethymeFixture.beforeEnable") is not None:
         raise RuntimeError("refused config write changed shared settings")
     before = snapshot(ex, repos)
+    if legacy and snapshot(ex, repos, legacy) != before:
+        raise RuntimeError("legacy client disagreed before experimental migration")
     common = Path(ex.run(primary, "rev-parse", "--git-common-dir")["stdout"].strip())
     if not common.is_absolute():
         common = primary / common
@@ -91,6 +120,9 @@ def case(ex, name, bare, explicit_worktree, other):
                      required=False)
         if row["returncode"] not in (0, 5):
             raise RuntimeError("could not remove staged shared key")
+    # Unknown extensions are a mandatory refusal only in repository format 1.
+    # Set both keys in the staged file so no intermediate shared state leaks.
+    ex.run(primary, "config", "--file", str(staged_shared), "core.repositoryformatversion", "1")
     ex.run(primary, "config", "--file", str(staged_shared), "extensions.worktreeConfig", "true")
     stages = []
     for i, repo in enumerate(repos):
@@ -110,6 +142,11 @@ def case(ex, name, bare, explicit_worktree, other):
         stages.append("staged_" + str(i) + "_old_semantics_preserved")
     os.replace(staged_shared, shared)
     after = snapshot(ex, repos)
+    verify_format_fence(ex, repos, shared)
+    if snapshot(ex, repos) != after:
+        raise RuntimeError("refusal control changed enabled repository semantics")
+    if legacy:
+        require_extension_refusal(ex, repos, legacy, "worktreeConfig")
     # Effective core.bare differs for linked worktrees (now explicit false), but
     # repository identity and heads must be unchanged, including a bare primary.
     for old, new in zip(before, after):
@@ -146,6 +183,8 @@ def case(ex, name, bare, explicit_worktree, other):
     os.replace(rollback, shared)
     if snapshot(ex, repos) != before:
         raise RuntimeError("rollback did not restore original semantics")
+    if legacy and snapshot(ex, repos, legacy) != before:
+        raise RuntimeError("legacy client did not recover after exact-byte rollback")
     for p in repos:
         config_path(ex, p).unlink()
     if shared.read_bytes() != original:
@@ -154,7 +193,9 @@ def case(ex, name, bare, explicit_worktree, other):
                 interruption_checkpoints=stages + ["after_atomic_enable"],
                 before=before, after=after, session_isolation=True,
                 new_worktree_full=True, alternate_client=alternate,
-                rollback_original_bytes=True)
+                rollback_original_bytes=True, format_one_refusal_fence=True,
+                unknown_extension_refusal_checked=True,
+                legacy_client="before_refuse_after_rollback_passed" if legacy else "not_run")
 
 
 def main():
@@ -163,6 +204,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--git", default="/opt/homebrew/bin/git")
     parser.add_argument("--other-git")
+    parser.add_argument("--legacy-git", help="actual client that predates worktreeConfig; never simulated")
     args = parser.parse_args()
     parent = args.fixture_parent.resolve(strict=True)
     if not parent.is_dir():
@@ -178,12 +220,14 @@ def main():
                       git=ex.run(root, "--version")["stdout"].strip(),
                       other_git=ex.run(root, "--version", git=args.other_git)["stdout"].strip()
                       if args.other_git else None,
-                      cases=[case(ex, "nonbare", False, False, args.other_git),
-                             case(ex, "explicit-worktree", False, True, args.other_git),
-                             case(ex, "bare", True, False, args.other_git)],
+                      legacy_git=ex.run(root, "--version", git=args.legacy_git)["stdout"].strip()
+                      if args.legacy_git else None,
+                      cases=[case(ex, "nonbare", False, False, args.other_git, args.legacy_git),
+                             case(ex, "explicit-worktree", False, True, args.other_git, args.legacy_git),
+                             case(ex, "bare", True, False, args.other_git, args.legacy_git)],
                       limitations=["quiescent synthetic experiment, not live migration",
                                    "interruption checkpoints, not power-loss durability",
-                                   "no old-client, IDE, CI or GitHub qualification",
+                                   "actual legacy client tested only when legacy_git is present; no IDE, CI or GitHub qualification",
                                    "no production config change or performance claim"])
         (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     except BaseException:
