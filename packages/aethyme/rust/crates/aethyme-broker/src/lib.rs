@@ -168,6 +168,8 @@ mod pr_projection;
 mod pr_watch;
 #[cfg(unix)]
 mod pr_watch_service;
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod pr_watch_service_install;
 mod preparation;
 mod promotion_record;
 mod quality_report;

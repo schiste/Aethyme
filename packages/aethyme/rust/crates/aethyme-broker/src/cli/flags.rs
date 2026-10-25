@@ -451,6 +451,10 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("watch pr stop", &["--id"]),
     ("watch pr tick", &["--limit"]),
     ("watch pr service plan", &["--broker-bin", "--seconds"]),
+    (
+        "watch pr service install",
+        &["--broker-bin", "--seconds", "--confirm"],
+    ),
     ("watch pr batches", &["--id", "--all"]),
     ("watch pr ack", &["--id", "--outcome", "--reason"]),
     (

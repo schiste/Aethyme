@@ -1663,3 +1663,29 @@ fn invalid_service_plan_requests_refuse_before_broker_discovery() {
         assert!(message.contains(expected), "{message}");
     }
 }
+
+#[test]
+fn service_install_requires_confirmation_before_broker_discovery() {
+    for confirmation in [None, Some("short")] {
+        let mut args = vec![
+            "pr",
+            "service",
+            "install",
+            "--broker-bin",
+            "/missing/router",
+        ];
+        if let Some(value) = confirmation {
+            args.extend(["--confirm", value]);
+        }
+        let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let parsed = super::parse(&args).unwrap();
+        super::validate_flags("watch", &parsed).unwrap();
+        let Err(UsageError::Message(message)) = super::watch::run_pull_request_watch(parsed) else {
+            panic!("missing or invalid confirmation must refuse before broker discovery");
+        };
+        assert!(message.contains("requires --confirm"), "{message}");
+    }
+    let args = ["pr", "service", "plan", "--confirm", "unexpected"].map(str::to_owned);
+    let parsed = super::parse(&args).unwrap();
+    assert!(super::validate_flags("watch", &parsed).is_err());
+}
