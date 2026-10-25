@@ -102,3 +102,23 @@ reverse links, missing subjects, node/result/depth limits and coverage semantics
 These qualify a consumer of produced links; they do not claim every prose
 reference or language is semantically resolved. CI sizing and session-bootstrap
 qualification remain separate work under #213.
+
+## Symbol-aware import query
+
+The Imports impact lane seeds every indexed subject at each exact changed file
+path, including functions and classes targeted by named Rust and Python imports.
+When a typed importing File is reached, all subjects at that exact path are
+seeded at the same import depth; containment does not consume an import hop.
+This permits transitive named imports without treating Calls as Imports.
+Expanded paths suppress cycles and duplicate importer results. Function subjects
+also feed the existing explicit Tests traversal.
+
+Changed-path lookups, indexed nodes, raw adjacency rows, depth and result counts
+remain bounded. Missing subjects and absent, mistyped or unsafe importer endpoints
+mark the observation incomplete. An exhausted allowance retains conservative
+fallback; stale revision results expose no paths. The real CLI regression indexes,
+links and materializes a synthetic Rust named-import chain before querying both
+hops and checking stale withholding. Provider controls cover class/function
+subjects, cycles, sibling isolation, explicit test links and incomplete budgets.
+This is advisory evidence, not CI-selection authority or complete import semantics
+for every language. Session-bootstrap qualification remains open under #213.
