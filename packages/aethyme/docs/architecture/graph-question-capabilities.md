@@ -85,8 +85,9 @@ profile and the same `documents` array; other relationship arrays stay empty.
 
 Seeds include every indexed node kind at each exact changed path, so file,
 function and class references are considered without a prefix scan. Document
-paths are deduplicated. The query reads bounded raw adjacency rows, nodes and
-results. Missing subjects, malformed document endpoints or exhausted limits
+paths are deduplicated. The query bounds exact changed-path lookups as well as raw adjacency rows,
+nodes and results. Missing paths consume the lookup allowance; reaching it leaves
+the result incomplete without probing later paths. Missing subjects, malformed document endpoints or exhausted limits
 make the result incomplete; stale or unavailable results expose no paths.
 Documentation mode requires an explicit `documents` coverage entry, including
 zero, but does not require test relationships. Revision-bound partial paths

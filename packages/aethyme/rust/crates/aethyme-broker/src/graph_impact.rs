@@ -1249,7 +1249,13 @@ fn document_frontier(
     let mut chains = Vec::new();
     let mut remaining_raw_rows = query.max_nodes;
     let mut truncated = false;
-    for path in changed {
+    for (path_index, path) in changed.into_iter().enumerate() {
+        // Missing subjects consume no nodes, but must not permit an unlimited
+        // number of store lookups before reaching an indexed path.
+        if path_index >= query.max_nodes || visited.len() >= query.max_nodes {
+            truncated = true;
+            break;
+        }
         let seeds = store.node_ids_for_path(path, query.max_nodes.saturating_sub(visited.len()))?;
         truncated |= seeds.truncated || seeds.ids.is_empty();
         for seed in seeds.ids {
@@ -2176,6 +2182,35 @@ mod tests {
         assert_eq!(report.status, GraphImpactContractStatus::Partial);
         assert!(report.impact.documents.is_empty());
         assert!(report.limits.truncated);
+    }
+
+    #[test]
+    fn documents_missing_paths_consume_the_seed_lookup_budget() {
+        let root = document_fixture();
+        let query = |paths: &[String]| {
+            GraphStoreImpactProvider.lookup(&GraphImpactQuery {
+                repo_root: root.path(),
+                changed_files: paths,
+                mode: GraphImpactMode::Documents,
+                max_nodes: 8,
+                max_results: 64,
+                max_depth: 2,
+            })
+        };
+        let positive = query(&["src/core.rs".into()]);
+        assert!(!positive.impacted_paths.is_empty(), "{positive:?}");
+        let mut paths = (0..8)
+            .map(|index| format!("absent/{index}.rs"))
+            .collect::<Vec<_>>();
+        paths.push("src/core.rs".into());
+        let bounded = query(&paths);
+        assert_eq!(bounded.status, GraphImpactStatus::Ready);
+        assert!(bounded.truncated, "{bounded:?}");
+        assert!(
+            bounded.impacted_paths.is_empty(),
+            "late indexed subjects must not be queried: {bounded:?}"
+        );
+        assert_eq!(bounded.visited_nodes, 0);
     }
 
     #[test]
