@@ -1090,7 +1090,7 @@ pub(super) fn run_verify_loop(parsed: Parsed) -> Result<(), UsageError> {
 }
 
 fn run_gate_incidents(parsed: &Parsed) -> Result<(), UsageError> {
-    const USAGE: &str = "gates incidents: list; confirm <failed-run-id> <test-id>... --session <id> [--pr <n>]; resolve <incident-id> <passing-run-id>";
+    const USAGE: &str = "gates incidents: list; confirm <failed-run-id> <test-id>... --session <id> [--pr <n>]; resolve <incident-id> <passing-run-id>; handoff <incident-id> <expected-owner> --session <new-owner> --reason <text>";
     let action = parsed
         .positional
         .get(1)
@@ -1120,6 +1120,20 @@ fn run_gate_incidents(parsed: &Parsed) -> Result<(), UsageError> {
             positive_id(2)?;
             positive_id(3)?;
         }
+        "handoff" if parsed.positional.len() == 4 => {
+            positive_id(2)?;
+            let previous = positive_id(3)?;
+            if parsed.session.is_none_or(|id| id <= 0 || id == previous)
+                || parsed.reason.as_deref().is_none_or(|r| {
+                    r.trim().is_empty() || r.len() > 1000 || r.chars().any(char::is_control)
+                })
+            {
+                return Err(UsageError::Message(
+                    "handoff requires a different --session <new-owner> and a bounded --reason"
+                        .into(),
+                ));
+            }
+        }
         _ => return Err(UsageError::Message(USAGE.into())),
     }
     if parsed.read_only_snapshot && action != "list" {
@@ -1137,6 +1151,12 @@ fn run_gate_incidents(parsed: &Parsed) -> Result<(), UsageError> {
             parsed.pr_number,
         )?],
         "resolve" => vec![broker.resolve_base_failure_incident(positive_id(2)?, positive_id(3)?)?],
+        "handoff" => vec![broker.handoff_base_failure_incident(
+            positive_id(2)?,
+            positive_id(3)?,
+            parsed.session.expect("validated next owner"),
+            parsed.reason.as_deref().expect("validated reason"),
+        )?],
         _ => unreachable!("validated action"),
     };
     if parsed.json {

@@ -219,6 +219,18 @@ fn malformed_incident_commands_are_refused_before_broker_state_is_opened() {
         vec!["gates", "incidents", "resolve", "1", "-2"],
         vec!["gates", "incidents", "list", "unexpected"],
         vec!["gates", "incidents", "list", "--session", "1"],
+        vec!["gates", "incidents", "handoff", "1", "1", "--session", "2"],
+        vec![
+            "gates",
+            "incidents",
+            "handoff",
+            "1",
+            "1",
+            "--session",
+            "1",
+            "--reason",
+            "same owner",
+        ],
     ] {
         let output = cli(&root, &args);
         assert!(!output.status.success());

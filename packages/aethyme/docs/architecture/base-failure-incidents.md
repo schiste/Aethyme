@@ -34,8 +34,8 @@ An immediate SQLite transaction checks the live owner and gate row and chooses
 the incident identity `(base commit, gate name, definition hash, profile hash)`.
 The first confirmation owns it. Duplicate confirmation returns that exact
 incident, preserving its owner, test identifiers and PR annotation. A quiet or
-closed owner is never silently replaced. Explicit ownership handoff is future
-work; a closed session does not erase an unresolved incident.
+closed owner is never silently replaced. Explicit ownership handoff is available through the operator boundary below;
+a closed session does not erase an unresolved incident.
 
 ## Resolution and retention
 
@@ -79,8 +79,18 @@ Start/adopt entrypoints and session/all/named gate execution print the same
 bounded notices on stderr without probing owner liveness. Valid pre-push content
 gates use the all-gates path; deletion-only pushes run no content gates. Notices
 preserve existing argument, policy-trust, selection and gate-result refusals.
-Ownership handoff and automatic resolution after a proven base run still need
-integration. Issue #760 remains open. The existing path-overlap warnings and generated-file claims do
+`handoff <incident-id> <expected-owner> --session <new-owner> --reason <text>`
+transfers ownership only if the incident is unresolved, the expected owner
+still matches, the new owner is open, and the bounded reason is valid. It records
+the previous/new owners and reason in the existing event journal atomically;
+a failed audit write rolls back the handoff. Repeating a stale expected owner
+refuses and requires inspection, rather than silently retrying. This is an
+explicit local operator action; quiet/absent status never triggers it. Other
+proof fields and the original confirmation remain unchanged. Event history is
+subject to its normal retention policy.
+
+Automatic resolution after a proven base run still needs integration. Issue
+#760 remains open. The existing path-overlap warnings and generated-file claims do
 not provide those incident notices.
 
 Deterministic tests cover duplicate ownership, unqualified/mismatched proof

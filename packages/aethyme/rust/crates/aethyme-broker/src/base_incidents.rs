@@ -196,3 +196,19 @@ impl Broker {
         }
     }
 }
+
+impl Broker {
+    /// Explicit operator handoff. Compare the expected owner atomically and
+    /// record the reason; never infer a transfer from idle or absent liveness.
+    pub fn handoff_base_failure_incident(
+        &mut self,
+        incident_id: i64,
+        expected_owner: i64,
+        next_owner: i64,
+        reason: &str,
+    ) -> Result<BaseFailureIncident, BrokerOpError> {
+        self.store()
+            .handoff_base_incident(incident_id, expected_owner, next_owner, reason)
+            .map_err(Into::into)
+    }
+}

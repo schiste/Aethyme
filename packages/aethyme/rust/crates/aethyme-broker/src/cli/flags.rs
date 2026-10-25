@@ -417,6 +417,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("gates incidents list", &[]),
     ("gates incidents confirm", &["--session", "--pr"]),
     ("gates incidents resolve", &[]),
+    ("gates incidents handoff", &["--session", "--reason"]),
     ("gates manifest", &["--head"]),
     ("gates scope", &["--base", "--head"]),
     ("gates affected", &["--session", "--timings"]),
