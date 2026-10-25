@@ -26,8 +26,8 @@ third-party configuration include is covered. No production key is moved.
 
 Run `packages/aethyme-eval/benchmarks/performance/git_worktree_config.py` with an
 existing `--fixture-parent`, a new `--output` directory and optionally
-`--other-git`. It creates a new synthetic Playground only. Commands have a
-20-second deadline and a 600-command budget; complete receipts and exact harness
+`--other-git` and `--legacy-git`. It creates a new synthetic Playground only. Commands have a
+20-second deadline and a 750-command budget; complete receipts and exact harness
 digest are retained. Failure preserves its explicitly recorded fixture path;
 success removes only that fixture. No package installation or native build runs.
 
@@ -40,11 +40,29 @@ installed client must refuse that spelling without changing shared config. Stagi
 
 The experimental transition prepares every per-worktree file before atomically
 replacing the shared config with a staged version that enables the extension and
-removes the migrated shared keys. After each prepared file, all original effective
+removes the migrated shared keys. The same staged file sets
+`core.repositoryformatversion=1`: Git's mandatory refusal of an unknown
+extension depends on format 1. The original format-0 experiment did not establish
+this old-client safety fence. No production repository format is changed. After each prepared file, all original effective
 settings, heads and bare identities must remain unchanged. After enable, checkout
 identity and clean status must hold. A synthetic session-only setting must stay
 out of siblings and newly created checkouts. The alternate client reads the same
 configuration and refreshes linked indexes without changing status.
+
+Each topology temporarily adds an intentionally unknown extension and requires
+all three existing checkouts to refuse a valid HEAD lookup with the extension
+in the diagnostic. A `finally` block restores exact enabled config bytes, then
+heads, identities and effective settings must still agree. An optional actual
+`--legacy-git` must first read the original layout, refuse `worktreeConfig`
+after enable, and read the original layout again after rollback. A modern Git
+passed as the legacy client must fail this control; changing its version text
+is not qualification.
+
+The additive report fields are `legacy_git` (the invoked client's version text,
+or null when omitted), and per-case `format_one_refusal_fence` and
+`unknown_extension_refusal_checked` booleans. `legacy_client` is `not_run` when
+omitted, or `before_refuse_after_rollback_passed` after all three phases pass.
+Version text is provenance, not proof that an executable is a genuine old client.
 
 Rollback atomically restores the original shared bytes before removing staged
 per-worktree files. This deliberately discards the synthetic session setting; it
@@ -72,3 +90,18 @@ chains, active sparse checkout and live interrupted migration remain unqualified
 Do not infer compatibility from a version string or simulate an old-client pass.
 The extension is a configuration control plane, with no performance gain claimed.
 Keep #906 open until its remaining compatibility and adoption criteria are met.
+
+## Refusal-fence follow-up
+
+The repository-format requirement follows the [Git repository format contract](https://git-scm.com/docs/gitrepository-layout#_git_repository_format_versions)
+and is explicit in [Git 2.19's format verifier](https://github.com/git/git/blob/v2.19.0/setup.c#L470-L489).
+The new format-one and unknown-extension controls passed all three synthetic
+Playground topologies with Git 2.55.0 and Apple Git 2.54.0: 513 commands and
+successful fixture removal. Removing the format setter fails the explicit
+format-one assertion; bypassing the refusal guard makes the modern-as-legacy
+negative control fail as intended. Both positive and restored controls pass,
+and every owned control Playground was removed. These are two in-memory
+mutations, not native Aethyme test runs. Remote CI is pending; the 450-command
+observation above belongs to the earlier experiment. An actual
+unsupported client and the supported minimum are still unqualified unless their
+separate run receipts are present. The production recommendation remains defer.
