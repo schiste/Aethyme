@@ -1689,3 +1689,30 @@ fn service_install_requires_confirmation_before_broker_discovery() {
     let parsed = super::parse(&args).unwrap();
     assert!(super::validate_flags("watch", &parsed).is_err());
 }
+
+#[test]
+fn service_lifecycle_confirmation_and_flag_scope_precede_broker_discovery() {
+    for action in ["activate", "deactivate"] {
+        for confirmation in [None, Some("short")] {
+            let mut args = vec!["pr", "service", action];
+            if let Some(value) = confirmation {
+                args.extend(["--confirm", value]);
+            }
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let parsed = super::parse(&args).unwrap();
+            super::validate_flags("watch", &parsed).unwrap();
+            let Err(UsageError::Message(message)) = super::watch::run_pull_request_watch(parsed)
+            else {
+                panic!("confirmation must precede broker discovery");
+            };
+            assert!(message.contains("requires --confirm"), "{message}");
+        }
+    }
+    for args in [
+        ["pr", "service", "status", "--confirm", "unexpected"],
+        ["pr", "service", "activate", "--broker-bin", "/missing"],
+    ] {
+        let parsed = super::parse(&args.map(str::to_owned)).unwrap();
+        assert!(super::validate_flags("watch", &parsed).is_err());
+    }
+}

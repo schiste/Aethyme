@@ -19,7 +19,7 @@ hosts for inspecting a proposed macOS unit. It is not a Linux service installer.
 The versioned JSON schema is `aethyme.pr-watch-service-plan/v1`. `digest` is
 SHA-256 over the serialized plan with its digest field empty, in struct field
 order. It binds the repository, user, canonical paths, executable identities,
-helper identities, interval and complete unit text. A future installer must
+helper identities, interval and complete unit text. The installer must
 recompute the plan rather than trusting paths in an imported JSON document.
 
 The proposed helper destination is under the user's Library/Application Support/
@@ -68,6 +68,44 @@ The JSON result is `aethyme.pr-watch-service-install/v1`: `plan_digest`,
 `created_files`, `activation_performed: false`, and `scheduler_state:
 "not_observed"`. Files being present does not imply a service is loaded or
 unloaded. Installation never invokes launchctl, a provider or the monitor.
-Activation, status, deactivation and removal are not implemented yet; do not
-manually enable this proposed service before generation and runtime identity
-checks have been qualified. Existing manual monitoring remains separate.
+## Explicit scheduler control (macOS)
+
+```sh
+aethyme broker advanced watch pr service activate --confirm <installed-plan-digest> --json
+aethyme broker advanced watch pr service status --json
+aethyme broker advanced watch pr service deactivate --confirm <installed-plan-digest> --json
+```
+
+These commands read the installed private manifest under this repository UUID
+and current user's HOME. Mutation requires its exact digest. The manifest's
+original compact producer bytes, user, UUID, helper directory, unit path and
+installed unit bytes must match. Re-encoded or differing manifests are refused.
+Controls never accept arbitrary launchd labels or imported paths.
+
+Activation recomputes the current complete plan and verifies the frozen helper
+bytes before one `launchctl bootstrap gui/<uid> <unit>` invocation. It does not
+kickstart a pass: RunAtLoad remains false. Status uses the exact derived service
+target with `launchctl print`; deactivation uses `bootout` for only that target.
+Stopping a retired installation does not require its old executable to exist.
+Mutation shares the persistent installer lock; contention refuses immediately.
+Each launchctl invocation is capped at ten seconds and 64 KiB per output stream.
+Raw launchctl output, which can contain environment values, is not published.
+
+The `aethyme.pr-watch-service-control/v1` result carries action, installed plan
+digest, optional generation, operation_result, scheduler_state and last_pass.
+Only a successful print/bootstrap is reported loaded and a successful bootout
+unloaded. A nonzero exit or uncertain deadline/output limit is unknown, never
+proof that a service is absent. An unacknowledged control returns nonzero after
+printing its structured report; inspect status instead of blindly retrying.
+
+The last_pass state is unavailable, unbound, bound_recent, or
+bound_stale_or_clock_unknown. Recent requires matching nonempty generation,
+verified executable identity and a nonfuture timestamp within interval + 120
+seconds. A recent record can still describe a failed tick. An attempted delivery
+never proves notification; delivery_proven remains false. Status does not poll
+providers or probe user sockets, and never creates service files.
+
+Removal/update remains manual and separately reviewed: stop the exact installed
+service before changing retained files or removing immutable runtime versions.
+The final synthetic red-check-to-session-task scheduler qualification and runtime
+rollout for #887 are still pending. Existing manual monitoring remains separate.

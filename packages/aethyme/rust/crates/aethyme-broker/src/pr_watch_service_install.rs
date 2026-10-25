@@ -5,6 +5,8 @@ use std::io::{self, Read, Seek, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
+pub(crate) mod lifecycle;
+
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 const SCRATCH: &str = ".install.pending";
 
@@ -150,6 +152,34 @@ fn publish_with_hook(
     Ok(true)
 }
 
+fn claim_installer(root: &Path, uid: u32) -> io::Result<crate::file_lock::ExclusiveFileLock> {
+    let lock_path = root.join(".install.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&lock_path)?;
+    let identity = file.metadata()?;
+    private_file(&identity, uid, 1)?;
+    if identity.len() != 0 {
+        return Err(invalid("service installer lock must be empty"));
+    }
+    let claim = crate::file_lock::ExclusiveFileLock::try_acquire(file)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "another service installer is active",
+        )
+    })?;
+    let named = fs::symlink_metadata(&lock_path)?;
+    if named.dev() != identity.dev() || named.ino() != identity.ino() {
+        return Err(invalid("service installer lock identity changed"));
+    }
+    Ok(claim)
+}
+
 pub(crate) fn install(plan: &Plan, confirmation: &str) -> io::Result<Vec<PathBuf>> {
     if confirmation != plan.digest {
         return Err(invalid(
@@ -180,30 +210,7 @@ pub(crate) fn install(plan: &Plan, confirmation: &str) -> io::Result<Vec<PathBuf
         .strip_prefix(&plan.home)
         .map_err(|_| invalid("service helpers are outside the reviewed home"))?;
     let root = ensure_directories(&plan.home, relative, plan.uid, true)?;
-    let lock_path = root.join(".install.lock");
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(&lock_path)?;
-    let identity = file.metadata()?;
-    private_file(&identity, plan.uid, 1)?;
-    if identity.len() != 0 {
-        return Err(invalid("service installer lock must be empty"));
-    }
-    let _claim = crate::file_lock::ExclusiveFileLock::try_acquire(file)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "another service installer is active",
-        )
-    })?;
-    let named = fs::symlink_metadata(&lock_path)?;
-    if named.dev() != identity.dev() || named.ino() != identity.ino() {
-        return Err(invalid("service installer lock identity changed"));
-    }
+    let _claim = claim_installer(&root, plan.uid)?;
     let unit_parent = plan
         .unit_path
         .parent()
@@ -239,7 +246,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    fn fixture() -> (tempfile::TempDir, Plan) {
+    pub(super) fn fixture() -> (tempfile::TempDir, Plan) {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("private home");
         let repo = root.path().join("repo '& < >");
