@@ -32,6 +32,8 @@ pub(crate) struct Plan {
     pub directory: PathBuf,
     pub unit_path: PathBuf,
     pub scripts: Vec<Script>,
+    #[serde(default)]
+    pub generation: String,
     pub unit: String,
     pub digest: String,
 }
@@ -176,9 +178,14 @@ impl Plan {
             directory,
             unit_path,
             scripts,
+            generation: String::new(),
             unit: String::new(),
             digest: String::new(),
         };
+        // Bind the unit template too, with generation and digest empty. Render
+        // the final unit only after deriving this non-recursive identity.
+        plan.unit = plan.unit_text()?;
+        plan.generation = digest(&serde_json::to_vec(&plan).map_err(io::Error::other)?);
         plan.unit = plan.unit_text()?;
         // Empty digest is part of the versioned canonical input. Never accept
         // a deserialized plan as installation authority: recompute from inputs.
@@ -190,16 +197,21 @@ impl Plan {
         let python = xml(text(&self.python)?)?;
         let monitor = xml(text(&self.directory.join("aethyme-pr-monitor.py"))?)?;
         let repository = xml(text(&self.repository)?)?;
+        let home = xml(text(&self.home)?)?;
         let broker = xml(text(&self.broker)?)?;
         Ok(format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>{label}</string>
-<key>ProgramArguments</key><array><string>{python}</string><string>{monitor}</string></array>
+<key>ProgramArguments</key><array><string>{python}</string><string>-I</string><string>-B</string><string>{monitor}</string></array>
 <key>EnvironmentVariables</key><dict>
+<key>HOME</key><string>{home}</string>
 <key>AETHYME_PR_MONITOR_REPO</key><string>{repository}</string>
 <key>AETHYME_BROKER_BIN</key><string>{broker}</string>
+<key>AETHYME_PR_MONITOR_BROKER_SHA256</key><string>{broker_sha256}</string>
+<key>AETHYME_PR_MONITOR_GENERATION</key><string>{generation}</string>
+<key>AETHYME_PR_MONITOR_RECORD_HEALTH</key><string>1</string>
 <key>AETHYME_PR_MONITOR_WORKER</key><string>{label}</string>
 <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
 </dict>
@@ -210,6 +222,8 @@ impl Plan {
 </dict></plist>
 "#,
             label = self.label,
+            generation = self.generation,
+            broker_sha256 = self.broker_sha256,
             interval = self.interval_seconds
         ))
     }
@@ -240,6 +254,19 @@ mod tests {
         let second = Plan::new(&repo, UUID, &home, &broker, &broker, 300, 501).unwrap();
         assert_eq!(first.digest, second.digest);
         assert_eq!(first.digest.len(), 64);
+        assert_eq!(first.generation.len(), 64);
+        assert!(first.unit.contains("<key>HOME</key>"));
+        assert_eq!(first.generation, second.generation);
+        assert_ne!(first.generation, first.digest);
+        assert!(first.unit.contains(&format!(
+            "<key>AETHYME_PR_MONITOR_GENERATION</key><string>{}</string>",
+            first.generation
+        )));
+        assert!(
+            first
+                .unit
+                .contains("<string>-I</string><string>-B</string>")
+        );
         assert!(first.unit.contains("&apos;&amp; &lt; &gt;"));
         assert!(first.unit.contains("<key>RunAtLoad</key><false/>"));
         assert!(first.unit.contains("<string>/dev/null</string>"));
@@ -257,6 +284,8 @@ mod tests {
         let c = Plan::new(&repo, UUID, &home, &broker, &broker, 300, 501).unwrap();
         assert_ne!(a.digest, b.digest);
         assert_ne!(a.digest, c.digest);
+        assert_ne!(a.generation, b.generation);
+        assert_ne!(a.generation, c.generation);
     }
 
     #[test]
@@ -280,7 +309,10 @@ mod tests {
             assert_eq!(script.name, name);
             assert_eq!(script.sha256, digest(content.as_bytes()));
         }
-        assert_eq!(plan.broker_sha256, digest(b"synthetic executable identity"));
+        assert_eq!(
+            plan.broker_sha256,
+            "6d9d8bab02b1b20c6a5989e08f64787a3ddc44c20c1eb5417297e7464c865bd6"
+        );
         assert_eq!(plan.python_sha256, plan.broker_sha256);
         assert!(!plan.unit.contains("<key>KeepAlive</key>"));
     }
