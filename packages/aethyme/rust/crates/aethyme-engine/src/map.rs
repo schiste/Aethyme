@@ -538,6 +538,24 @@ impl RepositoryMap {
             docs.push(doc);
         }
 
+        // Fragment repository names survive relocation, whereas overlay model
+        // ids use the current checkout name. Join actual non-code owner ids
+        // through their exact indexed path before mapping section endpoints.
+        let doc_files_by_path = docs
+            .iter()
+            .map(|doc| (doc.path.as_str(), doc.id.clone()))
+            .collect::<HashMap<_, _>>();
+        for fragment in &fragments {
+            for node in fragment.nodes() {
+                if let Node::NonCodeFile(file) = node
+                    && file.path() == fragment.file_path()
+                    && let Some(id) = doc_files_by_path.get(file.path())
+                {
+                    model_id_by_schema.insert(file.id().as_str().to_string(), id.clone());
+                }
+            }
+        }
+
         // Persist structured documentation sections as distinct Doc nodes.
         // Documents edges originate at section ids; keeping only the file
         // overlay leaves their endpoints unreadable after materialization.
@@ -1809,10 +1827,18 @@ mod tests {
     fn persisted_document_sections_remain_queryable_after_materialization() {
         use crate::store::redb::graph_store::GraphStore;
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
+        let original = temp.path().join("original-name");
+        let relocated = temp.path().join("materialization-checkout");
+        fs::create_dir(&original).unwrap();
+        let root = original.as_path();
         fs::write(root.join("app.py"), "def answer():\n    return 42\n").unwrap();
         fs::write(root.join("README.md"),
             "# API\n\nUse `answer()`; [code](app.py#answer).\n\n# API\n\nAlso use `answer()`.\n\n# Narrative\n\nThe word answer alone is not a reference.\n").unwrap();
+        // The real refresh/materialize path uses a differently named disposable
+        // checkout. Existing fragments must keep working without source reindex.
+        RepositoryMap::build_from_fragments(root).unwrap();
+        fs::rename(&original, &relocated).unwrap();
+        let root = relocated.as_path();
         let (map, _) = RepositoryMap::build_from_fragments(root).unwrap();
         let sections = map
             .docs
