@@ -33,6 +33,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- For graph consumer changes, include a real producer-to-materialization-to-query
+  fixture alongside hand-built store tests. Verify relationship endpoints resolve
+  to the expected typed nodes, and move persisted fragments to a differently
+  named checkout before materialization. Overlay identities can depend on the
+  current checkout name while fragment identities retain the indexing name.
+  Invalidate derived caches when correcting their persisted semantic projection.
 - For commands protected by repository-relative artifact claims, verify that
   the named session owns the checkout and the generator runs at its root. Test
   nested-directory and wrong-worktree refusals before dispatch; a normalized
