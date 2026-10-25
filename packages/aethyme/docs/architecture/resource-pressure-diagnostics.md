@@ -5,13 +5,16 @@ Last Updated: 2026-10-25
 `aethyme broker advanced resources pressure --json` explicitly diagnoses
 inactive recorded session owners. Routine status, successful resource admission
 and acquisition retries do not run this report. A final resource-contention
-refusal runs it once as best-effort advice. It never signals a process, terminates an agent, releases a
-lease, deletes a worktree, or changes a session's status.
+refusal runs it once as best-effort advice. It never signals a process,
+terminates an agent, releases a lease, deletes a worktree, or changes a
+session's status.
 
 ## Wire contract
 
 The report schema is `aethyme.resource-pressure/v1`. All fields are present.
-`session_count` is the observed live-session inventory, not historical rows.
+`session_count` counts the store's non-cleaned session inventory, including
+closed sessions retained for inspection. It is not a count of running agents;
+cleaned historical rows are excluded.
 `groups` contains at most 20 inactive-owner groups, ranked by known process-tree
 RSS descending and then oldest inactivity. `omitted_groups` counts groups
 outside the display. Each group includes at most eight
@@ -36,7 +39,7 @@ A process-table invocation has a two-second deadline and four-MiB cap on each
 stream. Nonzero status, timeout, truncation, invalid UTF-8, malformed or duplicate
 rows, overflow, more than 16,384 rows, incomplete ancestry, cycles, or ancestry
 deeper than 128 produce unavailable memory rather than partial totals. At more
-than 200 live sessions the report returns empty groups with
+than 200 non-cleaned sessions the report returns empty groups with
 `memory_observation = session_inventory_over_budget`; it skips process sampling.
 The inventory count is still read from the repository database.
 
@@ -47,8 +50,8 @@ recorded command or Git metadata timestamp and the ordinary idle-age threshold;
 recorded exited owners are inactive. Fresh activity protects an owner even
 when its stored status says idle or stale. A recently active owner whose process
 disappeared stays protected until the inactivity threshold. These are
-observational recommendations, never a session-state transition. These are observations made at different instants, not an atomic host
-snapshot. Missing holder records cannot establish sharing, and foreign agents
+observational recommendations, never a session-state transition. The observations
+come from different instants, not an atomic host snapshot. Missing holder records cannot establish sharing, and foreign agents
 or repositories are outside this repository's owner inventory. Output cannot
 authorize cleanup or establish that an idle agent can safely be terminated.
 Owned-service registration, verified service/container teardown and actual
