@@ -77,6 +77,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   wall time, workload and binary identity, and raw samples. Do not equate an
   internal phase or coordinated-operation interval with end-to-end or network
   time. Use the existing non-gating performance workflow before adding builds.
+- When investigating Git worktreeConfig migration, stage config.worktree files
+  with explicit config --file paths before enabling the extension. Before enable,
+  config --worktree can write shared local config in a single checkout; installed
+  clients refuse it when multiple worktrees exist. Verify both cases.
+  Verify primary and existing linked checkouts at each interruption checkpoint,
+  including explicit core.worktree and a bare primary; keep new session settings
+  isolated and distinguish quiescent byte rollback from safe live migration.
 - For Git ref-backend benchmarks, compare both loose and packed files-backend
   refs with reftable at matching counts. Record actual ref layout and shared
   object history; the backend name alone does not define a fair baseline.
