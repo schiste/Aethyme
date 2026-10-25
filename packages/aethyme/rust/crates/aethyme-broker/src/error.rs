@@ -52,6 +52,9 @@ pub enum BrokerError {
     #[error("repository worktree binding confirmation does not match the reviewed plan digest")]
     RepositoryWorktreeBindingConfirmationMismatch,
 
+    #[error("base failure incident refused: {0}")]
+    InvalidBaseFailureIncident(String),
+
     #[error("no session with id {0}")]
     SessionNotFound(i64),
 

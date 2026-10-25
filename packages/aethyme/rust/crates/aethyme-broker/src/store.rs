@@ -2829,6 +2829,7 @@ mod review_ledger_tests {
     }
 }
 
+mod base_incidents;
 mod coordination;
 #[path = "store/fresh_database.rs"]
 pub(crate) mod fresh_database;
