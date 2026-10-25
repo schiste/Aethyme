@@ -42,7 +42,10 @@ fn clear_git_environment(command: &mut Command) {
 fn run_fixture_git(repo: &Path, global_config: &Path, args: &[&OsStr]) {
     let mut command = Command::new("git");
     clear_git_environment(&mut command);
+    // Setup must not leave Git's own background writer racing the exact
+    // before/after sentinel snapshot. Keep every snapshot path protected.
     command
+        .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
         .args(args)
         .current_dir(repo)
         .env("HOME", global_config.parent().unwrap())
