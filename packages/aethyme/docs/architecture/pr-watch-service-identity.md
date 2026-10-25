@@ -18,6 +18,14 @@ It explicitly sets the reviewed HOME so runtime configuration and adapter lookup
 use the planned user namespace. It sets the health opt-in, generation and expected canonical broker
 executable SHA-256. Planning still writes nothing and never activates a service.
 
+The native planner also reads each executable through one no-follow,
+nonblocking descriptor, checking executable regular-file type before hashing.
+It retains the 256 MiB cap and compares descriptor and named-path identity,
+length, mode and change/modification times before accepting the hash. Replacement
+or mutation refuses planning; this is conservative race detection rather than
+an atomic guarantee for a later exec. The byte cap cannot interrupt an individual
+filesystem operation that stalls.
+
 The monitor requires `AETHYME_PR_MONITOR_GENERATION` and
 `AETHYME_PR_MONITOR_BROKER_SHA256` together, as 64 lowercase hexadecimal digits.
 Empty or absent values preserve the existing manual monitor defaults. A partial
