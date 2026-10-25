@@ -87,3 +87,33 @@ esac
     );
     assert!(log.contains("delivery listing failed"), "{log}");
 }
+
+/// Offline Python controls exercise transport limits without a live Chau7/broker.
+#[test]
+fn the_delivery_adapter_protocol_and_budget_controls_pass() {
+    let script = aethyme_testkit::paths::repo_root()
+        .join("packages/aethyme/scripts/adapters/test_chau7_delivery_adapter.py");
+    let output = Command::new("python3")
+        .arg(script)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("Ran 12 tests"),
+        "expected all offline controls: {stderr}"
+    );
+    for name in [
+        "test_trickled_bytes_do_not_restart_request_deadline",
+        "test_notification_flood_has_a_finite_message_budget",
+        "test_broker_output_overflow_is_not_treated_as_a_valid_prefix",
+        "test_broker_timeout_stops_and_reaps_only_its_owned_child",
+        "test_main_shares_one_pass_budget_and_closes_the_client",
+    ] {
+        assert!(
+            stderr.contains(name),
+            "missing selected control {name}: {stderr}"
+        );
+    }
+}
