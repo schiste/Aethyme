@@ -26,7 +26,7 @@ pub fn repo_overview_seed(map: &RepositoryMap) -> Vec<String> {
             seed.push(function.file_path.to_string());
         }
     }
-    for config in &map.configs {
+    for config in map.configs.iter().filter(|config| config.value.is_none()) {
         if !seed.contains(&config.path) {
             seed.push(config.path.clone());
         }
@@ -145,6 +145,7 @@ pub fn build_repo_overview(map: &RepositoryMap, navigation_order: &[String]) -> 
     let mut key_configs = map
         .configs
         .iter()
+        .filter(|config| config.value.is_none())
         .filter(|config| {
             if code_areas.is_empty() {
                 return config_is_overview_eligible(
@@ -358,6 +359,7 @@ fn area_score(map: &RepositoryMap, area_id: &str, area_name: &str) -> i32 {
     let config_score = map
         .configs
         .iter()
+        .filter(|config| config.value.is_none())
         .filter(|config| config.area_id.as_deref() == Some(area_id))
         .map(|config| config_weight(config.config_type.as_str()))
         .sum::<i32>();
@@ -444,6 +446,7 @@ fn subarea_score(map: &RepositoryMap, area_id: &str, area_name: &str) -> i32 {
     let config_score = map
         .configs
         .iter()
+        .filter(|config| config.value.is_none())
         .filter(|config| config.path.starts_with(&format!("{area_name}/")))
         .map(|config| config_weight(config.config_type.as_str()))
         .sum::<i32>();

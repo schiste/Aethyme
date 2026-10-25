@@ -1997,6 +1997,13 @@ mod tests {
             2,
             "bare fallback text is not a symbol reference"
         );
+        let mut files_only = map.clone();
+        files_only.configs.retain(|config| config.value.is_none());
+        assert_eq!(
+            crate::graph::signals::evaluate_graph_signals(&map).config_hygiene,
+            crate::graph::signals::evaluate_graph_signals(&files_only).config_hygiene,
+            "addressable keys do not become duplicate configuration files"
+        );
         let (again, _) = RepositoryMap::build_from_fragments(&relocated).unwrap();
         assert_eq!(map.configs, again.configs);
         crate::index_store::materialize_graph_store(&relocated, &map, "fixture").unwrap();

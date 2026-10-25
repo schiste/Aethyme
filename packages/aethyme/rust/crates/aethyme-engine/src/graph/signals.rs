@@ -389,6 +389,7 @@ fn config_hygiene(map: &RepositoryMap) -> SignalAssessment {
     let operational_configs = map
         .configs
         .iter()
+        .filter(|config| config.value.is_none())
         .filter(|config| is_operational_config(config.path.as_str(), config.config_type.as_str()))
         .collect::<Vec<_>>();
     let linked_configs = operational_configs
@@ -419,7 +420,12 @@ fn config_hygiene(map: &RepositoryMap) -> SignalAssessment {
             .map(|families| families.len())
             .sum::<usize>(),
     );
-    let noisy_configs = map.configs.len().saturating_sub(operational_configs.len());
+    let noisy_configs = map
+        .configs
+        .iter()
+        .filter(|config| config.value.is_none())
+        .count()
+        .saturating_sub(operational_configs.len());
 
     let linked_bonus = ratio_scaled(linked_configs, operational_configs.len(), 35);
     let duplicate_penalty = (duplicate_families.min(5) as i32) * 8;
@@ -444,6 +450,7 @@ fn config_hygiene_redb(ctx: &RedbSignalContext) -> SignalAssessment {
     let operational_configs = ctx
         .configs
         .iter()
+        .filter(|config| config.value.is_none())
         .filter(|config| is_operational_config(config.path.as_str(), config.config_type.as_str()))
         .collect::<Vec<_>>();
     let linked_configs = operational_configs
