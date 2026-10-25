@@ -119,6 +119,7 @@ impl Broker {
     pub(crate) fn claim_worktree_lifecycle(
         &self,
     ) -> Result<crate::file_lock::ExclusiveFileLock, BrokerOpError> {
+        self.store.require_live_schema_compatible()?;
         let main_root = self
             .main_root
             .canonicalize()
@@ -153,13 +154,17 @@ impl Broker {
         if let Some(observer) = &self.worktree_lifecycle_test_observer {
             observer(&main_root);
         }
-        crate::file_lock::acquire_repository_lifecycle_lock(&main_root).map_err(|source| {
-            BrokerError::Io {
-                path: main_root.join(".aethyme/run"),
-                source,
-            }
-            .into()
-        })
+        let claim =
+            crate::file_lock::acquire_repository_lifecycle_lock(&main_root).map_err(|source| {
+                BrokerError::Io {
+                    path: main_root.join(".aethyme/run"),
+                    source,
+                }
+            })?;
+        // The floor may have advanced while this controller waited. Keep the
+        // claim only if the currently committed markers still permit us.
+        self.store.require_live_schema_compatible()?;
+        Ok(claim)
     }
 
     /// Whether a directory is the remains of a worktree of *this* repository
@@ -2657,6 +2662,131 @@ mod registered_removal_failure_tests {
             worktree.join(gitdir)
         };
         std::fs::remove_dir_all(gitdir).unwrap();
+    }
+
+    fn advance_schema_floor(database: &Path) {
+        let mut conn = rusqlite::Connection::open(database).unwrap();
+        let tx = conn.transaction().unwrap();
+        let newer = crate::SCHEMA_VERSION + 1;
+        for key in ["schema_version", "min_compatible_schema"] {
+            assert_eq!(
+                tx.execute(
+                    "UPDATE meta SET value=?2 WHERE key=?1",
+                    rusqlite::params![key, newer.to_string()]
+                )
+                .unwrap(),
+                1
+            );
+        }
+        tx.commit().unwrap();
+    }
+
+    fn assert_new_schema_refusal(error: &crate::BrokerOpError) {
+        assert!(
+            matches!(error, crate::BrokerOpError::Store(crate::BrokerError::SchemaTooNew { found, supported })
+            if *found == crate::SCHEMA_VERSION + 1 && *supported == crate::SCHEMA_VERSION),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_claim_refuses_a_floor_raised_after_controller_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = initialized_repository(tmp.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let database = broker.store().db_path().to_path_buf();
+        let reached_claim = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = std::sync::Arc::clone(&reached_claim);
+        broker.worktree_lifecycle_test_observer = Some(std::sync::Arc::new(move |_| {
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        advance_schema_floor(&database);
+        let error = broker.claim_worktree_lifecycle().unwrap_err();
+        assert_new_schema_refusal(&error);
+        assert!(!reached_claim.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!storage.worktree_root().exists());
+    }
+
+    #[test]
+    fn start_rechecks_the_floor_after_waiting_for_the_lifecycle_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = initialized_repository(tmp.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let database = broker.store().db_path().to_path_buf();
+        let claim = crate::file_lock::acquire_repository_lifecycle_lock(&root).unwrap();
+        let held = std::sync::Arc::new(std::sync::Mutex::new(Some(claim)));
+        let held_at_boundary = std::sync::Arc::clone(&held);
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reached_at_boundary = std::sync::Arc::clone(&reached);
+        broker.worktree_lifecycle_test_observer = Some(std::sync::Arc::new(move |_| {
+            reached_at_boundary.store(true, std::sync::atomic::Ordering::SeqCst);
+            advance_schema_floor(&database);
+            drop(held_at_boundary.lock().unwrap().take());
+        }));
+        let before = git_head(&root);
+        let error = broker
+            .start_worktree("must not allocate", None)
+            .unwrap_err();
+        assert_new_schema_refusal(&error);
+        assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !storage.worktree_root().exists(),
+            "refusal must precede root preparation"
+        );
+        assert!(broker.store().live_sessions().unwrap().is_empty());
+        assert_eq!(git_head(&root), before);
+        // The failed post-acquisition check must release the claim.
+        drop(crate::file_lock::acquire_repository_lifecycle_lock(&root).unwrap());
+    }
+
+    #[test]
+    fn stale_controller_force_cleanup_preserves_registered_and_orphan_checkouts() {
+        for orphan in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = initialized_repository(tmp.path());
+            let storage = crate::test_storage::TestStorage::new();
+            let mut broker = storage.open(&root).unwrap();
+            let session = broker
+                .start_worktree("preserve while incompatible", None)
+                .unwrap();
+            broker.close(session.id).unwrap();
+            let path = Path::new(&session.worktree_path);
+            let evidence = path.join("service-data.txt");
+            std::fs::write(&evidence, b"must survive").unwrap();
+            if orphan {
+                remove_worktree_admin_directory(path);
+            }
+            let database = broker.store().db_path().to_path_buf();
+            let before = broker.store().session(session.id).unwrap();
+            advance_schema_floor(&database);
+            let error = broker.cleanup(session.id, true).unwrap_err();
+            assert_new_schema_refusal(&error);
+            assert_eq!(std::fs::read(&evidence).unwrap(), b"must survive");
+            assert_eq!(
+                broker.store().session(session.id).unwrap().cleanup_state,
+                before.cleanup_state
+            );
+            let branch = format!("refs/heads/{}", session.branch);
+            assert!(broker.repo.resolve_ref(&branch).is_some());
+        }
+    }
+
+    fn git_head(root: &Path) -> Vec<u8> {
+        let mut command = Command::new("git");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(key);
+            }
+        }
+        let output = command
+            .current_dir(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        output.stdout
     }
 
     #[test]
