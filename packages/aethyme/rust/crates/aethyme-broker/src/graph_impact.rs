@@ -113,6 +113,7 @@ pub struct GraphImpactSet {
     pub transitive: Vec<String>,
     pub callers: Vec<String>,
     pub importers: Vec<String>,
+    pub documents: Vec<String>,
     pub tests: Vec<String>,
     pub configs: Vec<String>,
     pub manifests: Vec<String>,
@@ -167,6 +168,7 @@ pub struct GraphImpactReport {
 pub enum GraphImpactMode {
     Calls,
     Imports,
+    Documents,
 }
 
 impl GraphImpactMode {
@@ -174,6 +176,7 @@ impl GraphImpactMode {
         match value {
             "calls" => Some(Self::Calls),
             "imports" => Some(Self::Imports),
+            "documents" => Some(Self::Documents),
             _ => None,
         }
     }
@@ -182,6 +185,7 @@ impl GraphImpactMode {
         match self {
             Self::Calls => "calls",
             Self::Imports => "imports",
+            Self::Documents => "documents",
         }
     }
 
@@ -189,6 +193,7 @@ impl GraphImpactMode {
         match self {
             Self::Calls => "Calls",
             Self::Imports => "Imports",
+            Self::Documents => "Documents",
         }
     }
 }
@@ -278,8 +283,8 @@ pub fn diff_digest(changed_files: &[String]) -> String {
 
 /// Evaluate a bounded graph provider against an exact repository revision and
 /// diff. The graph is advisory: only an exact, covered, untruncated result is
-/// `complete`; every other outcome carries no impact paths so consumers cannot
-/// mistake uncertainty for permission to reduce mandatory checks.
+/// `complete`. Revision-bound partial results carry advisory paths, but cannot
+/// authorize reducing mandatory checks. Stale/unavailable results withhold paths.
 pub fn revision_bound_impact_report(
     repo_root: &Path,
     requested_revision: &str,
@@ -559,6 +564,7 @@ fn impact_set(
     match mode {
         GraphImpactMode::Calls => impact.callers = impacted_paths,
         GraphImpactMode::Imports => impact.importers = impacted_paths,
+        GraphImpactMode::Documents => impact.documents = impacted_paths,
     }
     for path in all {
         if is_test_path(&path) {
@@ -584,8 +590,14 @@ fn impact_set(
 fn missing_edge_kinds(coverage: &GraphCoverage, mode: GraphImpactMode) -> Vec<String> {
     // A missing key is not evidence of a complete zero count; coverage must
     // explicitly report each required relationship kind, including zero.
-    [mode.as_str(), "tests"]
-        .into_iter()
+    let required: &[&str] = if mode == GraphImpactMode::Documents {
+        &["documents"]
+    } else {
+        &[mode.as_str(), "tests"]
+    };
+    required
+        .iter()
+        .copied()
         .filter(|wanted| {
             !coverage
                 .edge_counts_by_kind
@@ -971,6 +983,7 @@ impl GraphImpactProvider for GraphStoreImpactProvider {
         let lookup = match query.mode {
             GraphImpactMode::Calls => caller_frontier(&store, query),
             GraphImpactMode::Imports => import_frontier(&store, query),
+            GraphImpactMode::Documents => document_frontier(&store, query),
         };
         match lookup {
             Ok(lookup) => lookup,
@@ -1221,6 +1234,80 @@ fn import_frontier(
             .with_mode(GraphImpactMode::Imports);
     lookup.test_paths = test_paths.into_iter().collect();
     Ok(lookup)
+}
+
+/// Documents are direct incoming links from persisted documentation nodes to
+/// any indexed subject in a changed file. This is deliberately not an Imports
+/// closure or a claim that unlinked prose is unaffected.
+fn document_frontier(
+    store: &ReadOnlyGraphStore,
+    query: &GraphImpactQuery<'_>,
+) -> Result<GraphImpactLookup, GraphStoreError> {
+    let changed = query.changed_files.iter().collect::<BTreeSet<_>>();
+    let mut visited = BTreeSet::new();
+    let mut documents = BTreeSet::new();
+    let mut chains = Vec::new();
+    let mut remaining_raw_rows = query.max_nodes;
+    let mut truncated = false;
+    for path in changed {
+        let seeds = store.node_ids_for_path(path, query.max_nodes.saturating_sub(visited.len()))?;
+        truncated |= seeds.truncated || seeds.ids.is_empty();
+        for seed in seeds.ids {
+            if !visited.contains(&seed) && visited.len() >= query.max_nodes {
+                truncated = true;
+                break;
+            }
+            visited.insert(seed.clone());
+            let edges = bounded_neighbors(
+                store,
+                &seed,
+                NeighborDirection::Incoming,
+                EdgeKind::Documents,
+                &mut remaining_raw_rows,
+                &mut truncated,
+            )?;
+            for edge in edges {
+                let id = edge.other.as_str();
+                let Some(display) = store.node_display(id)? else {
+                    truncated = true;
+                    continue;
+                };
+                if display.kind != StoredNodeKind::Doc {
+                    truncated = true;
+                    continue;
+                }
+                let Some(doc_path) = display.path.filter(|path| is_safe_repo_relative(path)) else {
+                    truncated = true;
+                    continue;
+                };
+                if documents.contains(&doc_path) {
+                    continue;
+                }
+                if query.max_depth == 0
+                    || chains.len() >= query.max_results
+                    || (!visited.contains(id) && visited.len() >= query.max_nodes)
+                {
+                    truncated = true;
+                    continue;
+                }
+                visited.insert(id.to_string());
+                documents.insert(doc_path.clone());
+                chains.push(GraphImpactChain {
+                    changed_file: path.clone(),
+                    caller_file: doc_path,
+                    depth: 1,
+                });
+            }
+        }
+    }
+    let explanation = format!(
+        "read direct incoming Documents links for exact changed-file subjects; returned {} document(s); missing subjects, invalid endpoints or exhausted node/row/result limits require fallback; unlinked prose is outside this profile",
+        chains.len()
+    );
+    Ok(
+        GraphImpactLookup::ready_with_chains(chains, visited.len(), truncated, explanation)
+            .with_mode(GraphImpactMode::Documents),
+    )
 }
 
 fn callable_callers(
@@ -1883,6 +1970,305 @@ mod tests {
             imports
                 .explanation
                 .contains("incoming Imports and Tests edges")
+        );
+    }
+
+    fn document_fixture() -> tempfile::TempDir {
+        use aethyme_engine::model::{
+            class::ClassNode,
+            doc::DocNode,
+            edge::Edge,
+            file::{FileNode, FileRole},
+            function::FunctionNode,
+            intern::InternedStr,
+        };
+        use aethyme_engine::store::redb::graph_store::{
+            insert_class, insert_doc, insert_edge, insert_file, insert_function,
+        };
+        use aethyme_graph_storage::write_coverage_artifacts;
+        let root = covered_root_without_tests_coverage("revision-a", "calls");
+        let mut coverage = read_coverage(root.path()).unwrap();
+        coverage.edge_counts_by_kind.clear();
+        coverage.edge_counts_by_kind.insert("documents".into(), 5);
+        write_coverage_artifacts(root.path(), &coverage, &[]).unwrap();
+        let store = GraphStore::open(root.path()).unwrap();
+        let source = FileNode::new(
+            "Repo",
+            "src/core.rs",
+            Some("rust".into()),
+            FileRole::Source,
+            10,
+            100,
+            false,
+            None,
+        );
+        let sibling = FileNode::new(
+            "Repo",
+            "src/core.rs.other",
+            Some("rust".into()),
+            FileRole::Source,
+            10,
+            100,
+            false,
+            None,
+        );
+        let function = FunctionNode::new(
+            "Repo",
+            InternedStr::from(source.id.clone()),
+            InternedStr::from(source.path.clone()),
+            None,
+            None,
+            "rust".into(),
+            "answer".into(),
+            1,
+            "fn answer()".into(),
+        );
+        let class = ClassNode::new(
+            "Repo",
+            InternedStr::from(source.id.clone()),
+            InternedStr::from(source.path.clone()),
+            None,
+            "rust".into(),
+            "Thing".into(),
+            2,
+            "struct Thing".into(),
+        );
+        let mut index = store.begin_index().unwrap();
+        insert_file(&mut index, &source).unwrap();
+        insert_file(&mut index, &sibling).unwrap();
+        insert_function(&mut index, &function).unwrap();
+        insert_class(&mut index, &class).unwrap();
+        for (path, target) in [
+            ("docs/file.md", source.id.as_str()),
+            ("docs/function.md", function.id.as_str()),
+            ("docs/class.md", class.id.as_str()),
+            ("docs/sibling.md", sibling.id.as_str()),
+        ] {
+            let doc = DocNode::new("Repo", "fixture", path, "Guide", "markdown", None);
+            insert_doc(&mut index, &doc).unwrap();
+            insert_edge(
+                &mut index,
+                &Edge::new(&doc.id, target, EdgeKind::Documents, 1000, "fixture"),
+            )
+            .unwrap();
+            // A duplicate document path linked to two subjects remains one result.
+            if path == "docs/function.md" {
+                insert_edge(
+                    &mut index,
+                    &Edge::new(
+                        &doc.id,
+                        source.id.as_str(),
+                        EdgeKind::Documents,
+                        1000,
+                        "fixture",
+                    ),
+                )
+                .unwrap();
+            }
+        }
+        // A reverse-direction link is not evidence that this doc describes source.
+        let reverse = DocNode::new(
+            "Repo",
+            "fixture",
+            "docs/reverse.md",
+            "Reverse",
+            "markdown",
+            None,
+        );
+        insert_doc(&mut index, &reverse).unwrap();
+        insert_edge(
+            &mut index,
+            &Edge::new(
+                source.id.as_str(),
+                &reverse.id,
+                EdgeKind::Documents,
+                1000,
+                "fixture",
+            ),
+        )
+        .unwrap();
+        index.commit().unwrap();
+        drop(store);
+        root
+    }
+
+    #[test]
+    fn documents_consumer_covers_file_function_and_class_subjects() {
+        let root = document_fixture();
+        let paths = vec!["src/core.rs".into()];
+        let report = revision_bound_impact_report(
+            root.path(),
+            "revision-a",
+            "revision-a",
+            &paths,
+            GraphImpactMode::Documents,
+            128,
+            &GraphStoreImpactProvider,
+        )
+        .unwrap();
+        assert_eq!(
+            report.status,
+            GraphImpactContractStatus::Complete,
+            "{report:?}"
+        );
+        assert_eq!(
+            report.impact.documents,
+            vec!["docs/class.md", "docs/file.md", "docs/function.md"]
+        );
+        assert!(report.impact.callers.is_empty());
+        assert!(report.impact.importers.is_empty());
+        assert!(report.coverage.missing_edge_kinds.is_empty());
+        assert!(report.impact.tests.is_empty());
+        let again = revision_bound_impact_report(
+            root.path(),
+            "revision-a",
+            "revision-a",
+            &paths,
+            GraphImpactMode::Documents,
+            128,
+            &GraphStoreImpactProvider,
+        )
+        .unwrap();
+        assert_eq!(report, again);
+        let envelope = crate::impact_analysis_envelope(&GraphImpactReport {
+            repository: GraphImpactRepository {
+                root: "fixture".into(),
+                revision: "a".repeat(40),
+            },
+            ..report
+        })
+        .unwrap();
+        let result = serde_json::to_value(envelope.result).unwrap();
+        assert_eq!(
+            result["documents"],
+            serde_json::json!(["docs/class.md", "docs/file.md", "docs/function.md"])
+        );
+    }
+
+    #[test]
+    fn documents_limits_and_missing_subjects_are_not_complete_empty_results() {
+        let root = document_fixture();
+        let paths = vec!["src/core.rs".into()];
+        for (nodes, results, depth) in [(1, 64, 2), (128, 1, 2), (128, 64, 0)] {
+            let lookup = GraphStoreImpactProvider.lookup(&GraphImpactQuery {
+                repo_root: root.path(),
+                changed_files: &paths,
+                mode: GraphImpactMode::Documents,
+                max_nodes: nodes,
+                max_results: results,
+                max_depth: depth,
+            });
+            assert!(lookup.truncated, "{lookup:?}");
+            assert!(lookup.visited_nodes <= nodes, "{lookup:?}");
+            assert!(lookup.impacted_paths.len() <= results);
+        }
+        let report = revision_bound_impact_report(
+            root.path(),
+            "revision-a",
+            "revision-a",
+            &["deleted.rs".into()],
+            GraphImpactMode::Documents,
+            128,
+            &GraphStoreImpactProvider,
+        )
+        .unwrap();
+        assert_eq!(report.status, GraphImpactContractStatus::Partial);
+        assert!(report.impact.documents.is_empty());
+        assert!(report.limits.truncated);
+    }
+
+    #[test]
+    fn documents_invalid_endpoints_preserve_partial_status() {
+        use aethyme_engine::model::{
+            edge::Edge,
+            file::{FileNode, FileRole},
+        };
+        use aethyme_engine::store::redb::graph_store::{insert_edge, insert_file};
+        let root = document_fixture();
+        let store = GraphStore::open(root.path()).unwrap();
+        let file = FileNode::new(
+            "Repo",
+            "src/core.rs",
+            Some("rust".into()),
+            FileRole::Source,
+            10,
+            100,
+            false,
+            None,
+        );
+        let foreign = FileNode::new(
+            "Repo",
+            "foreign.md",
+            None,
+            FileRole::Source,
+            10,
+            100,
+            false,
+            None,
+        );
+        let mut index = store.begin_index().unwrap();
+        insert_file(&mut index, &foreign).unwrap();
+        insert_edge(
+            &mut index,
+            &Edge::new(
+                &foreign.id,
+                &file.id,
+                EdgeKind::Documents,
+                1000,
+                "invalid-endpoint",
+            ),
+        )
+        .unwrap();
+        index.commit().unwrap();
+        drop(store);
+        let report = revision_bound_impact_report(
+            root.path(),
+            "revision-a",
+            "revision-a",
+            &["src/core.rs".into()],
+            GraphImpactMode::Documents,
+            128,
+            &GraphStoreImpactProvider,
+        )
+        .unwrap();
+        assert_eq!(report.status, GraphImpactContractStatus::Partial);
+        assert_eq!(
+            report.impact.documents,
+            vec!["docs/class.md", "docs/file.md", "docs/function.md"]
+        );
+        assert!(report.limits.truncated);
+    }
+
+    #[test]
+    fn documents_stale_revision_withholds_observed_paths() {
+        let root = document_fixture();
+        let report = revision_bound_impact_report(
+            root.path(),
+            "revision-b",
+            "revision-b",
+            &["src/core.rs".into()],
+            GraphImpactMode::Documents,
+            128,
+            &GraphStoreImpactProvider,
+        )
+        .unwrap();
+        assert_eq!(report.status, GraphImpactContractStatus::Stale);
+        assert!(report.impact.documents.is_empty());
+    }
+
+    #[test]
+    fn documents_require_document_coverage_without_requiring_test_coverage() {
+        let root = covered_root_without_tests_coverage("revision-a", "calls");
+        let mut coverage = read_coverage(root.path()).unwrap();
+        assert_eq!(
+            missing_edge_kinds(&coverage, GraphImpactMode::Documents),
+            vec!["documents"]
+        );
+        coverage.edge_counts_by_kind.insert("documents".into(), 0);
+        assert!(missing_edge_kinds(&coverage, GraphImpactMode::Documents).is_empty());
+        assert_eq!(
+            GraphImpactMode::parse("documents"),
+            Some(GraphImpactMode::Documents)
         );
     }
 

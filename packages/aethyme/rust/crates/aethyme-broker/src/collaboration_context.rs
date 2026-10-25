@@ -375,9 +375,10 @@ fn legacy_graph_impact_status(envelope: &AnalysisEnvelope, profile: &str) -> Pro
         let Value::Object(result) = result else {
             return ProducerStatus::Incompatible;
         };
-        let (active_edge, inactive_edge) = match mode {
-            GraphImpactMode::Calls => ("callers", "importers"),
-            GraphImpactMode::Imports => ("importers", "callers"),
+        let (active_edge, inactive_edges) = match mode {
+            GraphImpactMode::Calls => ("callers", ["importers", "documents"]),
+            GraphImpactMode::Imports => ("importers", ["callers", "documents"]),
+            GraphImpactMode::Documents => ("documents", ["callers", "importers"]),
         };
         if !matches!(
             result.get(active_edge),
@@ -385,12 +386,14 @@ fn legacy_graph_impact_status(envelope: &AnalysisEnvelope, profile: &str) -> Pro
         ) {
             return ProducerStatus::Incompatible;
         }
-        if let Some(value) = result.get(inactive_edge) {
-            let Value::Array(paths) = value else {
-                return ProducerStatus::Incompatible;
-            };
-            if !paths.is_empty() {
-                return ProducerStatus::Incompatible;
+        for inactive_edge in inactive_edges {
+            if let Some(value) = result.get(inactive_edge) {
+                let Value::Array(paths) = value else {
+                    return ProducerStatus::Incompatible;
+                };
+                if !paths.is_empty() {
+                    return ProducerStatus::Incompatible;
+                }
             }
         }
     }
@@ -3679,6 +3682,39 @@ mod tests {
                 .any(|reason| reason.kind == ReasonKind::ImpactEdge)
         }));
         assert!(gaps(&context).contains(&"analysis_subject_unbound"));
+    }
+
+    #[test]
+    fn documentation_impact_profiles_validate_active_and_inactive_relationships() {
+        let fixture = Fixture::new();
+        let mut analysis = graph_impact_adapter_envelope(&fixture, "docs/guide.md");
+        analysis.profile = ProfileRef::Legacy(format!(
+            "aethyme-engine/{}/graph-impact-documents",
+            env!("CARGO_PKG_VERSION")
+        ));
+        let Some(Value::Object(result)) = analysis.result.as_mut() else {
+            panic!("fixture result");
+        };
+        let paths = result
+            .insert("callers".into(), Value::Array(Vec::new()))
+            .unwrap();
+        result.insert("documents".into(), paths);
+        let profile = format!(
+            "aethyme-engine/{}/graph-impact-documents",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(
+            legacy_graph_impact_status(&analysis, &profile),
+            ProducerStatus::Supported
+        );
+        let Some(Value::Object(result)) = analysis.result.as_mut() else {
+            panic!("fixture result");
+        };
+        result.insert("importers".into(), Value::Array(vec![text("foreign.rs")]));
+        assert_eq!(
+            legacy_graph_impact_status(&analysis, &profile),
+            ProducerStatus::Incompatible
+        );
     }
 
     #[test]

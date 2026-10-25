@@ -852,3 +852,48 @@ fn sample_unresolved(file: &FileNode, name: &str) -> UnresolvedNode {
 
 mod reads;
 mod typed_writes;
+
+#[test]
+fn exact_path_node_ids_include_all_kinds_and_report_omitted_seeds() {
+    let root = tempfile::tempdir().unwrap();
+    let store = GraphStore::open(root.path()).unwrap();
+    let file = FileNode::new(
+        "Repo",
+        "src/core.rs",
+        Some("rust".into()),
+        FileRole::Source,
+        10,
+        100,
+        false,
+        None,
+    );
+    let sibling = FileNode::new(
+        "Repo",
+        "src/core.rs.other",
+        Some("rust".into()),
+        FileRole::Source,
+        10,
+        100,
+        false,
+        None,
+    );
+    let doc = DocNode::new("Repo", &file.id, &file.path, "Guide", "markdown", None);
+    let mut index = store.begin_index().unwrap();
+    insert_file(&mut index, &file).unwrap();
+    insert_file(&mut index, &sibling).unwrap();
+    insert_doc(&mut index, &doc).unwrap();
+    index.commit().unwrap();
+    let zero = store.node_ids_for_path(&file.path, 0).unwrap();
+    assert!(zero.ids.is_empty());
+    assert!(zero.truncated);
+    let one = store.node_ids_for_path(&file.path, 1).unwrap();
+    assert_eq!(one.ids.len(), 1);
+    assert!(one.truncated);
+    let all = store.node_ids_for_path(&file.path, 2).unwrap();
+    assert_eq!(all.ids, vec![doc.id, file.id.clone()]);
+    assert!(!all.truncated);
+    assert!(store.node_ids_for_path("absent", 0).unwrap().ids.is_empty());
+    drop(store);
+    let reader = GraphStore::open_read_only(root.path()).unwrap();
+    assert_eq!(reader.node_ids_for_path(&file.path, 2).unwrap(), all);
+}

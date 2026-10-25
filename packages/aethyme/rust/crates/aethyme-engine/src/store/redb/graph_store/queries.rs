@@ -190,6 +190,16 @@ impl GraphStore {
         functions_under_path_from(&self.db, prefix)
     }
 
+    /// Return at most `limit` node ids for one exact file path, across all
+    /// indexed node kinds. Truncation never silently discards further seeds.
+    pub fn node_ids_for_path(
+        &self,
+        path: &str,
+        limit: usize,
+    ) -> Result<BoundedNodeIds, GraphStoreError> {
+        node_ids_for_path_from(&self.db, path, limit)
+    }
+
     /// Return at most `limit` callable ids for one exact file path.
     pub fn function_ids_for_path(
         &self,
@@ -455,6 +465,16 @@ impl ReadOnlyGraphStore {
     /// Return all functions whose file path starts with `prefix`.
     pub fn functions_under_path(&self, prefix: &str) -> Result<Vec<FunctionNode>, GraphStoreError> {
         functions_under_path_from(&self.db, prefix)
+    }
+
+    /// Return at most `limit` node ids for one exact file path, across all
+    /// indexed node kinds. Truncation never silently discards further seeds.
+    pub fn node_ids_for_path(
+        &self,
+        path: &str,
+        limit: usize,
+    ) -> Result<BoundedNodeIds, GraphStoreError> {
+        node_ids_for_path_from(&self.db, path, limit)
     }
 
     /// Return at most `limit` callable ids for one exact file path.

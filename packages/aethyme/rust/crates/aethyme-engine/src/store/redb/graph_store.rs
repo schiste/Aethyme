@@ -169,14 +169,17 @@ pub struct BoundedAdjacency {
     pub truncated: bool,
 }
 
-/// Strictly bounded callable ids contained by one exact repository-relative
+/// Strictly bounded node ids contained by one exact repository-relative
 /// file path. The multimap value order is deterministic, so callers can use
 /// this directly as seed order without scanning a broader path prefix.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BoundedFunctionIds {
+pub struct BoundedNodeIds {
     pub ids: Vec<String>,
     pub truncated: bool,
 }
+
+/// Compatibility name for the callable-only exact-path query.
+pub type BoundedFunctionIds = BoundedNodeIds;
 
 #[derive(Debug)]
 pub enum GraphStoreError {
