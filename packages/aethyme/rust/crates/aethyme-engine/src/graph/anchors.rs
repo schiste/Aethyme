@@ -787,7 +787,7 @@ fn config_anchors(
         })
         .map(|area| area.id.clone())
         .collect::<Vec<_>>();
-    for config in &map.configs {
+    for config in map.configs.iter().filter(|config| config.value.is_none()) {
         let path_lower = config.path.to_ascii_lowercase();
         let area_name = config
             .area_id
@@ -1643,7 +1643,7 @@ fn explain_repo_area_anchors_redb(overview: &OverviewV2, limit: usize) -> Vec<An
 
 fn explain_repo_config_anchors(map: &RepositoryMap, limit: usize) -> Vec<Anchor> {
     let mut anchors = Vec::new();
-    for config in &map.configs {
+    for config in map.configs.iter().filter(|config| config.value.is_none()) {
         let score = match config.config_type.as_str() {
             "manifest" | "project" => 6,
             "runtime" => 5,

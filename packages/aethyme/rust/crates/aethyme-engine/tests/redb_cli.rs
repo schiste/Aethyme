@@ -3404,7 +3404,10 @@ fn configuration_references_survive_relocation_in_cli_and_store() {
     ]);
     assert_success(&output);
     let (map, _) = RepositoryMap::build_from_fragments(&relocated).unwrap();
-    let expected = aethyme_engine::json::graph_relation(&configs_view(&map, "answer"));
+    let expected: serde_json::Value = serde_json::from_str(&aethyme_engine::json::graph_relation(
+        &configs_view(&map, "answer"),
+    ))
+    .unwrap();
     let actual = graph_cli_json(&relocated, "graph-configs", "answer");
     assert_eq!(actual, expected);
     let items = actual["items"].as_array().unwrap();
