@@ -97,12 +97,68 @@ pub fn in_flight_submits(main_root: &Path, now_ms: i64) -> Vec<InFlightSubmit> {
     in_flight_with(main_root, now_ms, crate::broker::pid_alive)
 }
 
+/// Routine status reads only the records of its live-session inventory.
+/// Historical files remain available to the full observer and queue-position
+/// code; this projection never deletes records or authorizes process cleanup.
+pub(crate) fn in_flight_for_sessions(
+    main_root: &Path,
+    now_ms: i64,
+    sessions: impl IntoIterator<Item = i64>,
+) -> Vec<InFlightSubmit> {
+    let sessions = sessions
+        .into_iter()
+        .filter(|id| *id > 0)
+        .collect::<std::collections::BTreeSet<_>>();
+    let records = scoped_records(&sessions, |id| {
+        use std::io::Read as _;
+        let path = submits_dir(main_root).join(format!("session-{id}.json"));
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(path).ok()?;
+        let metadata = file.metadata().ok()?;
+        const LIMIT: u64 = 64 * 1024;
+        if !metadata.is_file() || metadata.len() > LIMIT {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        file.take(LIMIT + 1).read_to_end(&mut bytes).ok()?;
+        if bytes.len() as u64 > LIMIT {
+            return None;
+        }
+        serde_json::from_slice(&bytes).ok()
+    });
+    in_flight_records(records, now_ms, crate::broker::pid_alive)
+}
+
+fn scoped_records(
+    sessions: &std::collections::BTreeSet<i64>,
+    mut read: impl FnMut(i64) -> Option<SubmitProgressRecord>,
+) -> Vec<SubmitProgressRecord> {
+    sessions
+        .iter()
+        .filter_map(|id| read(*id).filter(|record| record.session_id == *id))
+        .collect()
+}
+
 fn in_flight_with(
     main_root: &Path,
     now_ms: i64,
     alive: impl Fn(i64) -> bool,
 ) -> Vec<InFlightSubmit> {
-    let mut records = read_records(main_root)
+    in_flight_records(read_records(main_root), now_ms, alive)
+}
+
+fn in_flight_records(
+    records: Vec<SubmitProgressRecord>,
+    now_ms: i64,
+    alive: impl Fn(i64) -> bool,
+) -> Vec<InFlightSubmit> {
+    let mut records = records
         .into_iter()
         .map(|record| {
             let live = alive(record.pid);
@@ -455,6 +511,138 @@ mod tests {
                 "position 2 of 2 waiting, slots held by session 812 (verifying for 3m10s"
             ),
             "{line}"
+        );
+    }
+
+    #[test]
+    fn routine_scope_reads_only_requested_ids_and_refuses_payload_rebinding() {
+        let ids = std::collections::BTreeSet::from([2, 3]);
+        let mut observed = Vec::new();
+        let records = scoped_records(&ids, |id| {
+            observed.push(id);
+            Some(record(if id == 3 { 99 } else { id }, PHASE_VERIFYING, 1))
+        });
+        assert_eq!(observed, [2, 3]);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].session_id, 2);
+    }
+
+    #[test]
+    fn routine_scope_does_not_enumerate_history_and_bounds_record_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        for id in 1..=100 {
+            write(root.path(), &record(id, PHASE_VERIFYING, 1));
+        }
+        let selected = in_flight_for_sessions(root.path(), 2, [2, 2, 0, -1]);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].session_id, 2);
+        std::fs::write(
+            submits_dir(root.path()).join("session-2.json"),
+            vec![b' '; 65_537],
+        )
+        .unwrap();
+        assert!(in_flight_for_sessions(root.path(), 2, [2]).is_empty());
+        assert!(submits_dir(root.path()).join("session-100.json").exists());
+        #[cfg(unix)]
+        {
+            let alias = submits_dir(root.path()).join("session-101.json");
+            std::os::unix::fs::symlink("session-1.json", &alias).unwrap();
+            assert!(in_flight_for_sessions(root.path(), 2, [101]).is_empty());
+        }
+    }
+
+    #[test]
+    fn routine_status_omits_closed_submit_history_but_explicit_refresh_retains_it() {
+        let owner = tempfile::tempdir().unwrap();
+        let root = owner.path().join("repo");
+        let home = owner.path().join("home");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let empty_config = home.join("empty.gitconfig");
+        std::fs::write(&empty_config, "").unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec![
+                "config",
+                "core.excludesFile",
+                empty_config.to_str().unwrap(),
+            ],
+            vec!["commit", "--allow-empty", "-qm", "fixture"],
+        ] {
+            let mut command = std::process::Command::new("git");
+            for (key, _) in
+                std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("GIT_"))
+            {
+                command.env_remove(key);
+            }
+            let output = command
+                .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
+                .args(args)
+                .current_dir(&root)
+                .env("HOME", &home)
+                .env("GIT_CONFIG_GLOBAL", &empty_config)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+                .env("GIT_COMMITTER_NAME", "fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let session = broker.start_worktree("old completed task", None).unwrap();
+        broker
+            .store()
+            .set_session_status(session.id, crate::SessionStatus::Closed, None)
+            .unwrap();
+        let mut progress = record(session.id, PHASE_VERIFYING, 1);
+        progress.pid = 2_000_000_000;
+        assert!(
+            !crate::broker::pid_alive(progress.pid),
+            "synthetic unused PID unexpectedly exists"
+        );
+        write(&root, &progress);
+        let path = submits_dir(&root).join(format!("session-{}.json", session.id));
+        let before = std::fs::read(&path).unwrap();
+        let now = epoch_ms();
+        let brief = broker.status_brief_snapshot(now).unwrap();
+        assert!(
+            !brief
+                .advice
+                .iter()
+                .any(|advice| advice.id == "submit.possibly-stalled")
+        );
+        let routine = broker.status_current_snapshot(now).unwrap();
+        assert!(routine.in_flight_submits.is_empty());
+        assert!(
+            !routine
+                .advice
+                .iter()
+                .any(|advice| advice.id == "submit.possibly-stalled")
+        );
+        let audit = broker.status_snapshot(now).unwrap();
+        assert!(
+            audit
+                .in_flight_submits
+                .iter()
+                .any(|submit| submit.session_id == session.id)
+        );
+        assert!(
+            audit
+                .advice
+                .iter()
+                .any(|advice| advice.id == "submit.possibly-stalled")
+        );
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            before,
+            "observation must preserve historical evidence"
         );
     }
 
