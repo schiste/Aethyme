@@ -2138,7 +2138,8 @@ mod tests {
             ..report
         })
         .unwrap();
-        let result = serde_json::to_value(envelope.result).unwrap();
+        let result: serde_json::Value =
+            serde_json::from_slice(&envelope.result.unwrap().to_canonical_bytes()).unwrap();
         assert_eq!(
             result["documents"],
             serde_json::json!(["docs/class.md", "docs/file.md", "docs/function.md"])
