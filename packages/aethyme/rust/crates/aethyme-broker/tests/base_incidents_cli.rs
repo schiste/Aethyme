@@ -439,6 +439,18 @@ fn executed_gate_resolves_only_after_passing_tree_is_the_fetched_default() {
 
     let next = git(&root, &["rev-parse", "HEAD"]);
     git(&root, &["update-ref", "refs/remotes/origin/main", &next]);
+    let cached = broker.run_all_gates(root.path()).unwrap();
+    assert_eq!(cached.len(), 1);
+    assert_eq!(cached[0].status, GateStatus::Pass);
+    assert!(
+        cached[0].cached,
+        "the preceding feature pass must be reused"
+    );
+    assert_eq!(
+        broker.base_failure_incidents().unwrap(),
+        vec![incident.clone()],
+        "cached results cannot trigger fresh base settlement"
+    );
     let proven = broker
         .run_all_gates_with_policy(root.path(), aethyme_broker::CachePolicy::Bypass)
         .unwrap();

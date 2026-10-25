@@ -90,14 +90,14 @@ explicit local operator action; quiet/absent status never triggers it. Other
 proof fields and the original confirmation remain unchanged. Event history is
 subject to its normal retention policy.
 
-Session/all/named gate execution also reconciles newly executed passing results
+The shared gate runner also reconciles newly executed passing results
 against unresolved incidents after the gate runner records them. A matching
 current fetched-default tree, gate definition and execution profile are required;
 the transaction rechecks the stored proof and chronology. Cache hits cannot
 trigger this automatic settlement. Registry errors emit diagnostics and preserve
-the gate outcomes. Submit/ship paths that call the lower-level runner directly
-are outside this hook; explicit resolution remains available. Issue #760 remains
-open until end-to-end qualification and remaining execution paths are assessed. The existing path-overlap warnings and generated-file claims do
+the gate outcomes. Session, checkout, submit, ship and native gate paths share this hook; explicit
+resolution remains available. Issue #760 remains
+open until end-to-end qualification is complete. The existing path-overlap warnings and generated-file claims do
 not provide those incident notices.
 
 Deterministic tests cover duplicate ownership, unqualified/mismatched proof

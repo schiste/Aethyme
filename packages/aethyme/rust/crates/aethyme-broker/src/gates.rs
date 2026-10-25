@@ -3262,6 +3262,7 @@ where
             break;
         }
     }
+    crate::base_incidents::settle_after_gate_runs(store, checkout, &outcomes);
     Ok(outcomes)
 }
 

@@ -103,21 +103,7 @@ impl Broker {
     }
 
     fn base_failure_current_base(&self) -> Result<(String, String), BrokerOpError> {
-        // Require an actual default remote HEAD, never current-branch upstream
-        // fallback. This observation is offline and only as fresh as last fetch.
-        let reference = self
-            .repo_handle()
-            .symbolic_ref("refs/remotes/origin/HEAD")
-            .filter(|value| {
-                value.starts_with("refs/remotes/origin/") && value != "refs/remotes/origin/HEAD"
-            })
-            .ok_or_else(|| invalid("origin/HEAD must identify the fetched default branch"))?;
-        let commit = self
-            .repo_handle()
-            .resolve_ref(&reference)
-            .ok_or_else(|| invalid("fetched default branch does not resolve"))?;
-        let tree = self.repo_handle().commit_tree_id(&commit)?;
-        Ok((commit, tree))
+        current_base(self.repo_handle())
     }
 }
 
@@ -213,72 +199,84 @@ impl Broker {
     }
 }
 
-impl Broker {
-    /// Observe newly executed passing results only. Failure to update advisory
-    /// metadata must neither rewrite a gate result nor authorize cache reuse.
-    pub(crate) fn settle_base_failure_incidents(
-        &mut self,
-        outcomes: &[crate::gates::GateRunOutcome],
-    ) {
-        if !outcomes
-            .iter()
-            .any(|o| !o.cached && o.status == crate::GateStatus::Pass && o.run_id.is_some())
-        {
+fn current_base(repo: &crate::GitRepo) -> Result<(String, String), BrokerOpError> {
+    // Require an actual default remote HEAD, never current-branch upstream
+    // fallback. This observation is offline and only as fresh as last fetch.
+    let reference = repo
+        .symbolic_ref("refs/remotes/origin/HEAD")
+        .filter(|value| {
+            value.starts_with("refs/remotes/origin/") && value != "refs/remotes/origin/HEAD"
+        })
+        .ok_or_else(|| invalid("origin/HEAD must identify the fetched default branch"))?;
+    let commit = repo
+        .resolve_ref(&reference)
+        .ok_or_else(|| invalid("fetched default branch does not resolve"))?;
+    let tree = repo.commit_tree_id(&commit)?;
+    Ok((commit, tree))
+}
+
+/// Observe newly executed passing results only. Failure to update advisory
+/// metadata must neither rewrite a gate result nor authorize cache reuse.
+pub(crate) fn settle_after_gate_runs(
+    store: &mut crate::BrokerStore,
+    checkout: &crate::GitRepo,
+    outcomes: &[crate::gates::GateRunOutcome],
+) {
+    if !outcomes
+        .iter()
+        .any(|o| !o.cached && o.status == crate::GateStatus::Pass && o.run_id.is_some())
+    {
+        return;
+    }
+    let records = match store.base_incidents() {
+        Ok(records) => records
+            .into_iter()
+            .filter(|r| r.resolved_at.is_none())
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            eprintln!("[base-failure] Cannot reconcile incident registry: {error}");
             return;
         }
-        let records = match self.base_failure_incidents() {
-            Ok(records) => records
-                .into_iter()
-                .filter(|r| r.resolved_at.is_none())
-                .collect::<Vec<_>>(),
-            Err(error) => {
-                eprintln!("[base-failure] Cannot reconcile incident registry: {error}");
-                return;
-            }
-        };
-        if records.is_empty() {
+    };
+    if records.is_empty() {
+        return;
+    }
+    let (base, tree) = match current_base(checkout) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!("[base-failure] Cannot establish fetched base for resolution: {error}");
             return;
         }
-        let (base, tree) = match self.base_failure_current_base() {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                eprintln!("[base-failure] Cannot establish fetched base for resolution: {error}");
-                return;
-            }
-        };
-        for record in records {
-            let matching = outcomes.iter().find(|outcome| {
-                !outcome.cached
-                    && outcome.status == crate::GateStatus::Pass
-                    && outcome.exit_code == Some(0)
-                    && outcome.tree_hash == tree
-                    && outcome.gate == record.gate_name
-                    && outcome.definition_hash == record.definition_hash
-                    && outcome
-                        .cache_provenance
-                        .as_ref()
-                        .and_then(|p| p.execution_profile_digest.as_deref())
-                        == Some(record.execution_profile_hash.as_str())
-                    && outcome
-                        .run_id
-                        .is_some_and(|id| id > record.confirmed_run_id)
-            });
-            if let Some(run) = matching.and_then(|outcome| outcome.run_id) {
-                // The transaction rechecks the stored proof, chronology and
-                // unresolved state. The outcome alone is never authority.
-                match self
-                    .store()
-                    .resolve_base_incident(record.id, run, &base, &tree)
-                {
-                    Ok(_) => eprintln!(
-                        "[base-failure] Incident {} resolved by passing base run {run}",
-                        record.id
-                    ),
-                    Err(error) => eprintln!(
-                        "[base-failure] Incident {} remains unconfirmed after passing run {run}: {error}",
-                        record.id
-                    ),
-                }
+    };
+    for record in records {
+        let matching = outcomes.iter().find(|outcome| {
+            !outcome.cached
+                && outcome.status == crate::GateStatus::Pass
+                && outcome.exit_code == Some(0)
+                && outcome.tree_hash == tree
+                && outcome.gate == record.gate_name
+                && outcome.definition_hash == record.definition_hash
+                && outcome
+                    .cache_provenance
+                    .as_ref()
+                    .and_then(|p| p.execution_profile_digest.as_deref())
+                    == Some(record.execution_profile_hash.as_str())
+                && outcome
+                    .run_id
+                    .is_some_and(|id| id > record.confirmed_run_id)
+        });
+        if let Some(run) = matching.and_then(|outcome| outcome.run_id) {
+            // The transaction rechecks the stored proof, chronology and
+            // unresolved state. The outcome alone is never authority.
+            match store.resolve_base_incident(record.id, run, &base, &tree) {
+                Ok(_) => eprintln!(
+                    "[base-failure] Incident {} resolved by passing base run {run}",
+                    record.id
+                ),
+                Err(error) => eprintln!(
+                    "[base-failure] Incident {} remains unconfirmed after passing run {run}: {error}",
+                    record.id
+                ),
             }
         }
     }
