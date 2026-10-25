@@ -2610,7 +2610,7 @@ mod tests {
 
         migrate(&conn).unwrap();
 
-        assert_eq!(current_version(&conn).unwrap(), 55);
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 52);
         assert!(table_exists(&conn, "guarded_exec_receipts").unwrap());
         assert!(schema_is_compatible_with(&conn, 55, 52).unwrap());
