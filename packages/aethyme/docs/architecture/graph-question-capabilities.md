@@ -42,12 +42,22 @@ of excluded or unindexed files. `majority_has_observed_question` is true only
 when every selected language has at least one question with observed
 prerequisites. An empty inventory is false.
 
-The existing `healthy` and lifecycle exit behavior still describe graph
-transport/integrity. Authority-disabled repositories remain a cheap healthy
-no-op, with an empty capability report and no content claim. This instrument is
-one part of #213; question-specific query qualification, producer guardrails
-and integration of content readiness into lifecycle health remain open. It is
-not evidence that the entire graph redesign is complete.
+Status reports `transport_healthy` for compatible, current committed fragment
+integrity. With graph authority enabled, `healthy` additionally requires
+`majority_has_observed_question`. Missing, empty, partial or legacy measurements
+cannot produce a healthy content claim merely because their bytes validate.
+The blocker `majority_question_prerequisites_not_observed` makes the gap explicit;
+`action_required` is true. The existing human status exit becomes nonzero, while
+JSON status keeps its observational zero exit and callers must inspect the fields.
+Compatibility, uncommitted artifacts and materialization retain their earlier
+next-action priority. Once those are current, the next action points to coverage
+and question evidence rather than prescribing an ineffective refresh loop.
+
+Authority-disabled repositories remain a cheap healthy no-op, with an empty
+capability report and no content claim. Observed prerequisites remain a necessary
+health condition, not proof that any impact query is complete: this change grants
+no CI selection authority. Complete question-specific query qualification and
+content semantics remain open under #213; the entire graph redesign is not done.
 
 The `aethyme-graph-indexer` integration test `edge_production` exhaustively
 classifies every schema `EdgeKind`. Seventeen kinds require positive witnesses

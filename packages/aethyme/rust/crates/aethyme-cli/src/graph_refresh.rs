@@ -236,6 +236,8 @@ struct GraphStatusReport {
     fragments: FragmentState,
     derived_store: DerivedStoreState,
     compatibility: GraphRefreshCompatibility,
+    /// Fragment transport/integrity only; it does not establish useful content.
+    transport_healthy: bool,
     healthy: bool,
     action_required: bool,
     safe_to_refresh: bool,
@@ -522,6 +524,7 @@ impl GraphStatusInspector {
                     action: DerivedStoreAction::None,
                 },
                 compatibility,
+                transport_healthy: true,
                 healthy: true,
                 action_required: false,
                 safe_to_refresh: false,
@@ -573,8 +576,16 @@ impl GraphStatusInspector {
         blockers.sort();
         blockers.dedup();
         let derived_store = derived_store_state(root, &source.head_sha);
-        let healthy = compatibility == GraphRefreshCompatibility::Compatible
+        let transport_healthy = compatibility == GraphRefreshCompatibility::Compatible
             && fragment_status == GraphIntegrityStatus::Passed;
+        let question_capabilities = coverage.question_capabilities();
+        // Current bytes are necessary, but cannot make an empty or incomplete
+        // majority-language content measurement healthy. Observed prerequisites
+        // still grant no authority to narrow CI or skip a bounded query.
+        let healthy = transport_healthy && question_capabilities.majority_has_observed_question;
+        if !question_capabilities.majority_has_observed_question {
+            blockers.push("majority_question_prerequisites_not_observed".into());
+        }
         let action_required = !healthy || derived_store.action != DerivedStoreAction::None;
         let next_action = if compatibility != GraphRefreshCompatibility::Compatible {
             "resolve the compatibility blocker before using graph artifacts".into()
@@ -586,6 +597,9 @@ impl GraphStatusInspector {
                 .into()
         } else if derived_store.action != DerivedStoreAction::None {
             "run `aethyme graph materialize --repo .` to build the verified local query store"
+                .into()
+        } else if !question_capabilities.majority_has_observed_question {
+            "inspect coverage gaps and per-language question_capabilities; current graph bytes do not establish the majority-language question prerequisites. Use conservative fallback for incomplete queries; refreshing unchanged inputs alone does not resolve missing producers or coverage"
                 .into()
         } else {
             "graph fragments and derived store are current; no action is required".into()
@@ -614,6 +628,7 @@ impl GraphStatusInspector {
             },
             derived_store,
             compatibility,
+            transport_healthy,
             healthy,
             action_required,
             // Status is observational; only a digest-bound refresh plan checks
@@ -626,7 +641,7 @@ impl GraphStatusInspector {
             next_action,
             work,
             performance,
-            question_capabilities: coverage.question_capabilities(),
+            question_capabilities,
             coverage,
         })
     }
@@ -2319,6 +2334,7 @@ fn render_status(status: &GraphStatusReport, json: bool) -> Result<(), String> {
         println!(
             "  capability counts do not authorize CI selection; inspect bounded query completeness"
         );
+        println!("  transport healthy: {}", status.transport_healthy);
         println!("  healthy: {}", status.healthy);
         println!("  action required: {}", status.action_required);
         render_performance_text(&status.performance);
