@@ -221,6 +221,22 @@ fn committed_coverage_and_units_are_bound_to_the_source_tree() {
     )))
     .unwrap();
     assert_eq!(status["coverage"]["available"], true);
+    assert_eq!(status["fragments"]["status"], "passed");
+    assert_eq!(status["transport_healthy"], true);
+    assert_eq!(status["healthy"], false);
+    assert_eq!(status["action_required"], true);
+    assert!(
+        status["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| { reason == "majority_question_prerequisites_not_observed" })
+    );
+    // A valid committed artifact is not sufficient to pass a scripted human
+    // status check when its actual indexed content lacks prerequisites.
+    let human_status = run(&repo, &["graph", "status", "--repo", "."]);
+    assert!(!human_status.status.success());
+    assert!(String::from_utf8_lossy(&human_status.stdout).contains("transport healthy: true"));
     assert_eq!(status["question_capabilities"]["schema_version"], 1);
     assert_eq!(
         status["question_capabilities"]["grants_ci_selection_authority"],
@@ -238,6 +254,35 @@ fn committed_coverage_and_units_are_bound_to_the_source_tree() {
     assert_eq!(status["coverage"]["indexed_revision"], indexed_revision);
     assert!(status["coverage"]["source_tree_sha256"].is_string());
     assert_eq!(status["coverage"]["safe_to_use"], false);
+    success(run(
+        &repo,
+        &["graph", "materialize", "--repo", ".", "--json"],
+    ));
+    let materialized: Value = serde_json::from_str(&success(run(
+        &repo,
+        &["graph", "status", "--repo", ".", "--json"],
+    )))
+    .unwrap();
+    assert_eq!(materialized["derived_store"]["action"], "none");
+    assert_eq!(materialized["transport_healthy"], true);
+    assert_eq!(materialized["healthy"], false);
+    assert!(
+        !materialized["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("refresh plan")
+    );
+    assert!(
+        materialized["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("question_capabilities")
+    );
+    assert!(
+        !run(&repo, &["graph", "status", "--repo", "."])
+            .status
+            .success()
+    );
     assert!(
         status["coverage"]["gaps"]
             .as_array()
@@ -479,6 +524,7 @@ fn disabled_status_is_a_cheap_healthy_no_op() {
         status["question_capabilities"]["grants_ci_selection_authority"],
         false
     );
+    assert_eq!(status["transport_healthy"], true);
     assert_eq!(status["healthy"], true);
     assert_eq!(status["action_required"], false);
     assert_eq!(status["refresh_plan_required"], false);
