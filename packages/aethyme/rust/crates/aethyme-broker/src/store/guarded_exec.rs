@@ -518,6 +518,20 @@ mod tests {
         assert_eq!(row.command_outcome, "unknown");
         assert_eq!(row.ownership_audit, "not_run");
         assert_eq!(row.process_group_cleanup, "unknown");
+        let encoded = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            encoded["helper_observation"]["direct_child_outcome"],
+            "failed"
+        );
+        assert_eq!(encoded["helper_observation"]["exit_code"], 7);
+        assert_eq!(
+            encoded["helper_observation"]["process_group_cleanup"],
+            "unknown"
+        );
+        assert_eq!(
+            encoded["helper_observation"]["ownership_audit"],
+            "not_run_by_helper"
+        );
         let observed = row.helper_observation.unwrap();
         assert_eq!(observed.direct_child_outcome, "failed");
         assert_eq!(observed.exit_code, Some(7));

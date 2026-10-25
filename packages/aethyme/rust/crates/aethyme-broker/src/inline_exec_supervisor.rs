@@ -2244,6 +2244,32 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_observation_write_does_not_replace_the_command_result() {
+        let (_owner, store, receipt, target) =
+            crate::store::guarded_exec::helper_observation_fixture();
+        store.connection().execute_batch("BEGIN IMMEDIATE").unwrap();
+        let result = start_helper()
+            .with_observation(Some(target))
+            .run(
+                Path::new("/"),
+                &["/bin/sh".into(), "-c".into(), "exit 7".into()],
+                &[],
+                || Ok(()),
+            )
+            .unwrap();
+        store.connection().execute_batch("ROLLBACK").unwrap();
+        assert_eq!(result.exit_code, Some(7));
+        assert!(
+            store
+                .guarded_exec_receipt(1, &receipt)
+                .unwrap()
+                .unwrap()
+                .helper_observation
+                .is_none()
+        );
+    }
+
+    #[test]
     fn direct_child_exit_is_persisted_before_parent_completion() {
         let (_owner, store, receipt, target) =
             crate::store::guarded_exec::helper_observation_fixture();
@@ -2349,6 +2375,10 @@ mod tests {
         );
         assert_eq!(
             dispatch(&["--aethyme-inline-exec-supervisor-v2".into()]),
+            Some(125)
+        );
+        assert_eq!(
+            dispatch(&["--aethyme-inline-exec-supervisor-v3".into()]),
             Some(125)
         );
         assert_eq!(dispatch(&[FLAG.into(), "extra".into()]), Some(125));
