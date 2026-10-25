@@ -226,8 +226,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   formatting problem.
   Prepare the exact body file. When local validation is allowed, run the pinned
   CLI's `broker advanced check-contract --base <exact-base> --pr-body <file>`
-  from that PR's worktree, verify HEAD matches the reviewed source, and retain
-  the result before publication. The body path and base do not select a worktree. During a local-check pause, use the
+  from that PR's worktree. Resolve `<exact-base>` with `git merge-base` between
+  the verified target-branch SHA and the reviewed PR HEAD, matching the contract
+  workflow. A two-dot comparison with the latest target tree can misclassify
+  target-only changes as removals when the PR is behind. Record both SHAs and
+  recompute after syncing. Verify HEAD matches the reviewed source and retain
+  the result before publication. The body path and base do not select a worktree.
+  During a local-check pause, use the
   PR's remote contract check instead of running it locally. Review each refusal;
   use a `Contract justification:` of at least 24 characters
   only for a verified false-positive, while preserving the actual retirement
