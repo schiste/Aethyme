@@ -332,6 +332,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   recovery intent, assert that the intent exists, and only then simulate the
   interruption. An option that skips cleanup or a hand-seeded event does not
   test the producer-to-consumer path.
+- For bounded persistent writers, bound scratch-file count across repeated
+  interruptions as well as each file's bytes. Exercise the real publication
+  boundary, preserve the previous record, and verify safe resume and writer
+  contention. Prefer serialized fixed scratch ownership over accumulating names;
+  never recover by deleting unrelated files matching a prefix.
 - For storage ownership and reclamation changes, test replacement of a root and
   its origin at the same pathname, both before admission and before recording.
   A canonical path locates an object; it does not prove the object or filesystem
