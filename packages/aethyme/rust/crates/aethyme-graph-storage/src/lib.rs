@@ -62,6 +62,7 @@ pub mod manifest;
 pub mod overlay;
 pub mod performance;
 pub mod policy;
+pub mod question_capabilities;
 pub mod store;
 pub mod write_guard;
 pub use write_guard::{ensure_isolated_graph_write, mark_broker_managed_graph};

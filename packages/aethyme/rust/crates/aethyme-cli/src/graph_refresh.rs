@@ -246,6 +246,7 @@ struct GraphStatusReport {
     work: GraphLifecycleWork,
     performance: GraphLifecycleObservability,
     coverage: GraphCoverage,
+    question_capabilities: aethyme_graph_storage::question_capabilities::GraphQuestionCapabilities,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -531,6 +532,7 @@ impl GraphStatusInspector {
                     .into(),
                 work,
                 performance,
+                question_capabilities: GraphCoverage::unavailable(&running_version).question_capabilities(),
                 coverage: GraphCoverage::unavailable(running_version),
             });
         }
@@ -624,6 +626,7 @@ impl GraphStatusInspector {
             next_action,
             work,
             performance,
+            question_capabilities: coverage.question_capabilities(),
             coverage,
         })
     }
@@ -2309,6 +2312,13 @@ fn render_status(status: &GraphStatusReport, json: bool) -> Result<(), String> {
         for gap in &status.coverage.gaps {
             println!("  coverage gap: {gap}");
         }
+        println!(
+            "  majority languages have observed question prerequisites: {}",
+            status.question_capabilities.majority_has_observed_question
+        );
+        println!(
+            "  capability counts do not authorize CI selection; inspect bounded query completeness"
+        );
         println!("  healthy: {}", status.healthy);
         println!("  action required: {}", status.action_required);
         render_performance_text(&status.performance);

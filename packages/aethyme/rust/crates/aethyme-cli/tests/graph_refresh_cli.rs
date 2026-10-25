@@ -221,6 +221,19 @@ fn committed_coverage_and_units_are_bound_to_the_source_tree() {
     )))
     .unwrap();
     assert_eq!(status["coverage"]["available"], true);
+    assert_eq!(status["question_capabilities"]["schema_version"], 1);
+    assert_eq!(
+        status["question_capabilities"]["grants_ci_selection_authority"],
+        false
+    );
+    assert_eq!(
+        status["question_capabilities"]["by_language"]["python"]["session_navigation"]["state"],
+        "partial"
+    );
+    assert_eq!(
+        status["question_capabilities"]["majority_has_observed_question"],
+        false
+    );
     assert_eq!(status["coverage"]["source_revision"], indexed_revision);
     assert_eq!(status["coverage"]["indexed_revision"], indexed_revision);
     assert!(status["coverage"]["source_tree_sha256"].is_string());
@@ -454,6 +467,18 @@ fn disabled_status_is_a_cheap_healthy_no_op() {
     )))
     .unwrap();
     assert_eq!(status["compatibility"], "authority_disabled");
+    assert_eq!(
+        status["question_capabilities"]["by_language"],
+        serde_json::json!({})
+    );
+    assert_eq!(
+        status["question_capabilities"]["majority_has_observed_question"],
+        false
+    );
+    assert_eq!(
+        status["question_capabilities"]["grants_ci_selection_authority"],
+        false
+    );
     assert_eq!(status["healthy"], true);
     assert_eq!(status["action_required"], false);
     assert_eq!(status["refresh_plan_required"], false);
