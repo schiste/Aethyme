@@ -815,6 +815,19 @@ fn render_exec_receipt(receipt: &crate::store::guarded_exec::GuardedExecReceipt)
         receipt.process_revalidation,
         receipt.updated_at_ms
     );
+    if let Some(observed) = &receipt.helper_observation {
+        out!(
+            "  helper observed direct child: outcome={}, exit_code={}, at_ms={}; group cleanup={}, ownership audit={}",
+            observed.direct_child_outcome,
+            observed.exit_code.map_or_else(
+                || "unavailable (for example, a signal)".into(),
+                |code| code.to_string()
+            ),
+            observed.observed_at_ms,
+            observed.process_group_cleanup,
+            observed.ownership_audit,
+        );
+    }
 }
 
 fn exec_timeout_from_seconds(

@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-10-24
+Last Updated: 2026-10-25
 
 When code outside the `packages/aethyme/` Rust source tree invokes an
 Aethyme command, it crosses a process boundary. Static
@@ -35,6 +35,36 @@ consumer. This file exists so that doesn't happen again.
 3. **Suspect something is stale?** Run
    `scripts/eval/verify-playground.sh` against any deployed
    playground; it asserts a subset of the contracts below.
+
+## Direct-child helper observations (#713)
+
+`aethyme broker advanced exec-status --session <id> [--receipt <id>] --json`
+adds nullable `helper_observation` to each receipt. When present it contains
+`direct_child_outcome` (`succeeded`, `failed` or `cancelled`), nullable
+`exit_code`, `observed_at_ms`, `process_group_cleanup: "unknown"` and
+`ownership_audit: "not_run_by_helper"`. Human output prints the same distinction.
+The parent receipt's existing phase, audit and cleanup fields remain authoritative
+for their existing purposes; a helper observation never completes those checks.
+Signal termination has no numeric exit code. A cancellation observation means
+the helper observed its directly supervised child exit on a cancellation path,
+not that it verified every descendant or detected an escaped process.
+
+Schema 57 adds a diagnostic table, retaining the existing compatibility floor.
+Older writers can continue their existing receipt transitions. The private helper
+wire moves to v4; caller and helper must use the matched runtime. The helper opens
+a fresh existing database connection, checks its file identity and exact receipt
+binding, and does not create or migrate a database. Lock waiting is limited to
+250 ms; storage operations are not an OS-level wall-time guarantee. A failed
+write leaves the observation absent. Abrupt helper death, database contention or
+failed cancellation/reaping can still leave an unknown outcome. The helper never
+persists argv, environment, output or process IDs in this table.
+
+At most 100 helper observations are retained per session, independently of
+unresolved parent receipts. Parent receipt deletion cascades to its observation.
+An absent or aged-out observation is unknown, not proof of success or cleanup.
+These diagnostics introduce no process-signaling, lease-release or worktree-removal
+authority. Gate/preparation and legacy interactive execution do not gain this
+observation unless they use the receipt-bearing supervised path.
 
 ## Inventory
 
@@ -282,9 +312,9 @@ An unavailable or incompatible helper refuses before the command request is
 sent; the broker never retries through direct spawn after helper failure.
 
 The inline-exec wire protocol uses the reserved
-`--aethyme-inline-exec-supervisor-v3` entrypoint and `AIX3` frame marker. The
-v3 helper emits a `Started` frame only after the child process has spawned;
-older v1/v2 helpers reject the v3 entrypoint before receiving a command. Keep
+`--aethyme-inline-exec-supervisor-v4` entrypoint and `AIX4` frame marker. The
+v4 helper emits a `Started` frame only after the child process has spawned;
+older v1/v2/v3 helpers reject the v4 entrypoint before receiving a command. Keep
 the entrypoint suffix and frame marker in sync when changing this private wire
 protocol. The spawn-failure frame carries a stable tag for known
 `std::io::ErrorKind` values plus an optional raw OS error code, preserving

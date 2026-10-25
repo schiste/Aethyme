@@ -1917,7 +1917,7 @@ impl Broker {
             session_id,
             command,
             record_receipt,
-            move |session, dispatch| {
+            move |session, observation, dispatch| {
                 let mut execution_environment = vec![
                     (
                         "AETHYME_BROKER_SESSION_ID".to_owned(),
@@ -1960,7 +1960,7 @@ impl Broker {
                                 ));
                             }
                         };
-                        let result = match supervisor.run_with_timeout_and_dispatch(
+                        let result = match supervisor.with_observation(observation).run_with_timeout_and_dispatch(
                             Path::new(&session.worktree_path),
                             command,
                             &execution_environment,
@@ -2149,26 +2149,31 @@ impl Broker {
             ),
         ];
         execution_environment.extend_from_slice(environment);
-        self.guarded_exec_with_runner(session_id, command, false, move |session, _dispatch| {
-            let result = supervisor
-                .run(
-                    Path::new(&session.worktree_path),
-                    command,
-                    &execution_environment,
-                    heartbeat,
-                )
-                .map_err(|error| {
-                    map_preparation_exec_supervisor_error(session_id, command, error)
-                })?;
-            Ok(GuardedCommandResult {
-                exit_code: result.exit_code,
-                succeeded: result.succeeded,
-                timed_out: result.termination
-                    == crate::inline_exec_supervisor::CommandTermination::TimedOut,
-                command_started: result.command_started,
-                process_group_cleanup: "verified",
-            })
-        })
+        self.guarded_exec_with_runner(
+            session_id,
+            command,
+            false,
+            move |session, _observation, _dispatch| {
+                let result = supervisor
+                    .run(
+                        Path::new(&session.worktree_path),
+                        command,
+                        &execution_environment,
+                        heartbeat,
+                    )
+                    .map_err(|error| {
+                        map_preparation_exec_supervisor_error(session_id, command, error)
+                    })?;
+                Ok(GuardedCommandResult {
+                    exit_code: result.exit_code,
+                    succeeded: result.succeeded,
+                    timed_out: result.termination
+                        == crate::inline_exec_supervisor::CommandTermination::TimedOut,
+                    command_started: result.command_started,
+                    process_group_cleanup: "verified",
+                })
+            },
+        )
         .map(|(report, _)| report)
     }
 
@@ -2182,6 +2187,7 @@ impl Broker {
     where
         F: FnOnce(
             &crate::types::Session,
+            Option<crate::store::guarded_exec::HelperObservationTarget>,
             &mut dyn FnMut(GuardedExecDispatchEvent),
         ) -> Result<GuardedCommandResult, BrokerOpError>,
     {
@@ -2209,6 +2215,11 @@ impl Broker {
         } else {
             None
         };
+        let observation = receipt_id
+            .as_deref()
+            .map(|id| self.store.helper_observation_target(session_id, id))
+            .transpose()?
+            .flatten();
         let mut pending_not_started_dispatch = false;
         let mut terminal_dispatch_recorded = false;
         let run_result = {
@@ -2243,7 +2254,7 @@ impl Broker {
                     ),
                 }
             };
-            run(&session, &mut dispatch)
+            run(&session, observation, &mut dispatch)
         };
         let status = match run_result {
             Ok(status) => status,
@@ -3072,7 +3083,7 @@ mod generic_guarded_exec_tests {
                 session.id,
                 &["/bin/sh".into(), "-c".into(), "exit 0".into()],
                 true,
-                |_session, _dispatch| {
+                |_session, _observation, _dispatch| {
                     Ok(GuardedCommandResult {
                         exit_code: None,
                         succeeded: false,
@@ -3120,7 +3131,7 @@ mod generic_guarded_exec_tests {
                 session.id,
                 &["fake-command".into()],
                 true,
-                |_session, dispatch| {
+                |_session, _observation, dispatch| {
                     dispatch(GuardedExecDispatchEvent::NotStarted);
                     if matches!(failure, Failure::CommandUnknownWithVerifiedCleanup) {
                         dispatch(GuardedExecDispatchEvent::OutcomeUnknown("verified"));
@@ -3411,7 +3422,7 @@ mod generic_guarded_exec_tests {
         );
         assert_eq!(
             std::fs::read_to_string(helper_arg).unwrap(),
-            "--aethyme-inline-exec-supervisor-v3"
+            "--aethyme-inline-exec-supervisor-v4"
         );
         assert!(!marker.exists(), "the command ran with an old v1 helper");
     }

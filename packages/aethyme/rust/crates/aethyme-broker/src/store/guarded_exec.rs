@@ -13,6 +13,7 @@ const RETAIN_TERMINAL_RECEIPTS_PER_SESSION: i64 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct GuardedExecReceipt {
+    pub helper_observation: Option<HelperObservation>,
     pub receipt_id: String,
     pub session_id: i64,
     pub phase: String,
@@ -27,7 +28,169 @@ pub(crate) struct GuardedExecReceipt {
     pub updated_at_ms: i64,
 }
 
+/// Observation of the directly supervised child only. This never completes
+/// the caller's ownership audit or proves that descendants were cleaned up.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HelperObservation {
+    pub direct_child_outcome: String,
+    pub exit_code: Option<i32>,
+    pub observed_at_ms: i64,
+    pub process_group_cleanup: String,
+    pub ownership_audit: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HelperObservationTarget {
+    database: std::path::PathBuf,
+    device: u64,
+    inode: u64,
+    session_id: i64,
+    receipt_id: String,
+    created_at_ms: i64,
+}
+
+impl HelperObservationTarget {
+    #[cfg(unix)]
+    pub(crate) fn record(&self, outcome: &str, exit_code: Option<i32>) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+        if !matches!(outcome, "succeeded" | "failed" | "cancelled")
+            || (outcome == "succeeded" && exit_code != Some(0))
+            || (outcome == "failed" && exit_code == Some(0))
+            || !self.database.is_absolute()
+            || self.receipt_id.len() != 32
+            || !self.receipt_id.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(std::io::Error::other("invalid helper observation target"));
+        }
+        let check_identity = || -> std::io::Result<()> {
+            let metadata = std::fs::symlink_metadata(&self.database)?;
+            if !metadata.is_file() || metadata.dev() != self.device || metadata.ino() != self.inode
+            {
+                return Err(std::io::Error::other(
+                    "helper observation database identity changed",
+                ));
+            }
+            Ok(())
+        };
+        check_identity()?;
+        // Fresh connection in the exec'd helper: never reuse a parent's SQLite
+        // connection and never create or migrate a database from this path.
+        let mut conn = rusqlite::Connection::open_with_flags(
+            &self.database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(std::io::Error::other)?;
+        conn.busy_timeout(std::time::Duration::from_millis(250))
+            .map_err(std::io::Error::other)?;
+        conn.pragma_update(None, "foreign_keys", true)
+            .map_err(std::io::Error::other)?;
+        check_identity()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        let binding: Option<i64> = tx
+            .query_row(
+                "SELECT created_at_ms FROM guarded_exec_receipts
+             WHERE receipt_id = ?1 AND session_id = ?2 AND phase != 'not_started'",
+                params![self.receipt_id, self.session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(std::io::Error::other)?;
+        if binding != Some(self.created_at_ms) {
+            return Err(std::io::Error::other(
+                "helper observation receipt binding changed",
+            ));
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO guarded_exec_helper_observations
+             (receipt_id, session_id, receipt_created_at_ms, direct_child_outcome, exit_code, observed_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![self.receipt_id, self.session_id, self.created_at_ms, outcome, exit_code,
+                    super::now_ms().max(self.created_at_ms)],
+        ).map_err(std::io::Error::other)?;
+        // Bound diagnostics independently of unresolved parent receipts.
+        tx.execute(
+            "DELETE FROM guarded_exec_helper_observations WHERE session_id = ?1 AND receipt_id IN (
+                 SELECT receipt_id FROM guarded_exec_helper_observations WHERE session_id = ?1
+                 ORDER BY observed_at_ms DESC, receipt_id DESC LIMIT -1 OFFSET 100)",
+            [self.session_id],
+        )
+        .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)
+    }
+}
+
 impl super::BrokerStore {
+    pub(crate) fn helper_observation_target(
+        &self,
+        session_id: i64,
+        receipt_id: &str,
+    ) -> Result<Option<HelperObservationTarget>, BrokerError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if self.path == std::path::Path::new(":memory:") {
+                return Ok(None);
+            }
+            let database = self.path.canonicalize().map_err(|source| BrokerError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+            let metadata =
+                std::fs::symlink_metadata(&database).map_err(|source| BrokerError::Io {
+                    path: database.clone(),
+                    source,
+                })?;
+            let created_at_ms = self.conn.query_row(
+                "SELECT created_at_ms FROM guarded_exec_receipts WHERE receipt_id = ?1 AND session_id = ?2",
+                params![receipt_id, session_id], |row| row.get(0),
+            )?;
+            Ok(Some(HelperObservationTarget {
+                database,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                session_id,
+                receipt_id: receipt_id.into(),
+                created_at_ms,
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            let _unused = (session_id, receipt_id);
+            Ok(None)
+        }
+    }
+
+    fn load_helper_observation(&self, receipt: &mut GuardedExecReceipt) -> Result<(), BrokerError> {
+        receipt.helper_observation = self
+            .conn
+            .query_row(
+                "SELECT direct_child_outcome, exit_code, observed_at_ms
+             FROM guarded_exec_helper_observations
+             WHERE receipt_id = ?1 AND session_id = ?2 AND receipt_created_at_ms = ?3",
+                params![
+                    receipt.receipt_id,
+                    receipt.session_id,
+                    receipt.created_at_ms
+                ],
+                |row| {
+                    Ok(HelperObservation {
+                        direct_child_outcome: row.get(0)?,
+                        exit_code: row.get(1)?,
+                        observed_at_ms: row.get(2)?,
+                        process_group_cleanup: "unknown".into(),
+                        ownership_audit: "not_run_by_helper".into(),
+                    })
+                },
+            )
+            .optional()?;
+        Ok(())
+    }
+
     /// Commit the pre-dispatch record. A failure here must stop the command
     /// before any child is spawned.
     pub(crate) fn begin_guarded_exec_receipt(
@@ -193,7 +356,8 @@ impl super::BrokerStore {
         session_id: i64,
         receipt_id: &str,
     ) -> Result<Option<GuardedExecReceipt>, BrokerError> {
-        self.conn
+        let mut receipt = self
+            .conn
             .query_row(
                 "SELECT receipt_id, session_id, phase, command_outcome, exit_code,
                         ownership_audit, process_group_cleanup, created_at_ms, updated_at_ms
@@ -203,7 +367,11 @@ impl super::BrokerStore {
                 guarded_exec_receipt_from_row,
             )
             .optional()
-            .map_err(BrokerError::from)
+            .map_err(BrokerError::from)?;
+        if let Some(receipt) = receipt.as_mut() {
+            self.load_helper_observation(receipt)?;
+        }
+        Ok(receipt)
     }
 
     pub(crate) fn guarded_exec_receipts(
@@ -223,8 +391,11 @@ impl super::BrokerStore {
             params![session_id, limit.clamp(1, MAX_RECEIPT_LIST_LIMIT)],
             guarded_exec_receipt_from_row,
         )?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(BrokerError::from)
+        let mut receipts = rows.collect::<Result<Vec<_>, _>>()?;
+        for receipt in &mut receipts {
+            self.load_helper_observation(receipt)?;
+        }
+        Ok(receipts)
     }
 }
 
@@ -266,6 +437,7 @@ fn guarded_exec_receipt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Gu
             "not_applicable"
         };
     Ok(GuardedExecReceipt {
+        helper_observation: None,
         receipt_id: row.get(0)?,
         session_id: row.get(1)?,
         phase,
@@ -277,6 +449,38 @@ fn guarded_exec_receipt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Gu
         created_at_ms: row.get(7)?,
         updated_at_ms: row.get(8)?,
     })
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn helper_observation_fixture() -> (
+    tempfile::TempDir,
+    super::BrokerStore,
+    String,
+    HelperObservationTarget,
+) {
+    let owner = tempfile::tempdir().unwrap();
+    let path = owner.path().join("broker.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    crate::schema::migrate(&conn).unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON; INSERT INTO sessions (
+        id, worktree_path, branch, origin, status, created_at, updated_at, last_activity_at
+    ) VALUES (1, '/synthetic', 'agent/synthetic', 'adopted', 'active', 1, 1, 1);",
+    )
+    .unwrap();
+    let mut store = super::BrokerStore {
+        conn,
+        path,
+        _snapshot_dir: None,
+        binding_scope: None,
+    };
+    let receipt = store.begin_guarded_exec_receipt(1).unwrap();
+    store.mark_guarded_exec_running(1, &receipt).unwrap();
+    let target = store
+        .helper_observation_target(1, &receipt)
+        .unwrap()
+        .unwrap();
+    (owner, store, receipt, target)
 }
 
 #[cfg(test)]
@@ -301,6 +505,161 @@ mod tests {
             _snapshot_dir: None,
             binding_scope: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_observations_are_immutable_and_do_not_complete_parent_audit() {
+        let (_owner, store, receipt, target) = helper_observation_fixture();
+        target.record("failed", Some(7)).unwrap();
+        target.record("succeeded", Some(0)).unwrap();
+        let row = store.guarded_exec_receipt(1, &receipt).unwrap().unwrap();
+        assert_eq!(row.phase, "running");
+        assert_eq!(row.command_outcome, "unknown");
+        assert_eq!(row.ownership_audit, "not_run");
+        assert_eq!(row.process_group_cleanup, "unknown");
+        let encoded = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            encoded["helper_observation"]["direct_child_outcome"],
+            "failed"
+        );
+        assert_eq!(encoded["helper_observation"]["exit_code"], 7);
+        assert_eq!(
+            encoded["helper_observation"]["process_group_cleanup"],
+            "unknown"
+        );
+        assert_eq!(
+            encoded["helper_observation"]["ownership_audit"],
+            "not_run_by_helper"
+        );
+        let observed = row.helper_observation.unwrap();
+        assert_eq!(observed.direct_child_outcome, "failed");
+        assert_eq!(observed.exit_code, Some(7));
+        assert_eq!(observed.process_group_cleanup, "unknown");
+        assert!(store.guarded_exec_receipt(2, &receipt).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_observation_refuses_changed_binding_and_database_identity() {
+        let (owner, store, receipt, target) = helper_observation_fixture();
+        let mut wrong = target.clone();
+        wrong.created_at_ms += 1;
+        assert!(
+            wrong
+                .record("succeeded", Some(0))
+                .unwrap_err()
+                .to_string()
+                .contains("binding changed")
+        );
+        wrong = target.clone();
+        wrong.session_id = 2;
+        assert!(
+            wrong
+                .record("succeeded", Some(0))
+                .unwrap_err()
+                .to_string()
+                .contains("binding changed")
+        );
+        assert!(
+            store
+                .guarded_exec_receipt(1, &receipt)
+                .unwrap()
+                .unwrap()
+                .helper_observation
+                .is_none()
+        );
+        std::fs::rename(&target.database, owner.path().join("retained.db")).unwrap();
+        std::fs::write(&target.database, b"replacement").unwrap();
+        assert!(
+            target
+                .record("succeeded", Some(0))
+                .unwrap_err()
+                .to_string()
+                .contains("identity changed")
+        );
+        assert_eq!(std::fs::read(&target.database).unwrap(), b"replacement");
+        std::fs::remove_file(&target.database).unwrap();
+        assert!(target.record("succeeded", Some(0)).is_err());
+        assert!(
+            !target.database.exists(),
+            "observation must not create a database"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_observation_lock_contention_retains_unknown() {
+        let (_owner, store, receipt, target) = helper_observation_fixture();
+        store.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(target.record("cancelled", None).is_err());
+        store.conn.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            store
+                .guarded_exec_receipt(1, &receipt)
+                .unwrap()
+                .unwrap()
+                .helper_observation
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_observations_have_an_independent_bounded_retention_budget() {
+        let (_owner, mut store, first, target) = helper_observation_fixture();
+        target.record("failed", Some(1)).unwrap();
+        let mut newest = first.clone();
+        for _ in 0..104 {
+            newest = store.begin_guarded_exec_receipt(1).unwrap();
+            store
+                .helper_observation_target(1, &newest)
+                .unwrap()
+                .unwrap()
+                .record("cancelled", None)
+                .unwrap();
+        }
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM guarded_exec_helper_observations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 100);
+        assert!(
+            store
+                .guarded_exec_receipt(1, &first)
+                .unwrap()
+                .unwrap()
+                .helper_observation
+                .is_none()
+        );
+        assert!(
+            store
+                .guarded_exec_receipt(1, &newest)
+                .unwrap()
+                .unwrap()
+                .helper_observation
+                .is_some()
+        );
+        store
+            .conn
+            .execute(
+                "DELETE FROM guarded_exec_receipts WHERE receipt_id = ?1",
+                [newest],
+            )
+            .unwrap();
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM guarded_exec_helper_observations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 99);
     }
 
     #[test]
