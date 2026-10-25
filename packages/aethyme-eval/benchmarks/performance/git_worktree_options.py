@@ -38,14 +38,18 @@ class Experiment:
                         GIT_COMMITTER_EMAIL="fixture@example.invalid",
                         GIT_TERMINAL_PROMPT="0")
 
-    def run(self, repo, *args, git=None, required=True):
+    def run(self, repo, *args, git=None, required=True, input_text=None):
         repo = repo.resolve(strict=True)
         if not repo.is_relative_to(self.root):
             raise ValueError("command escaped the owned Playground")
         argv = [git or self.git, "-C", str(repo), *args]
         before = resource.getrusage(resource.RUSAGE_CHILDREN)
         start = time.perf_counter_ns()
-        result = subprocess.run(argv, env=self.env, capture_output=True, timeout=20)
+        payload = input_text.encode("utf-8") if input_text is not None else None
+        if payload is not None and len(payload) > 4 * 1024 * 1024:
+            raise ValueError("synthetic command input exceeded four MiB")
+        result = subprocess.run(argv, env=self.env, input=payload,
+                                capture_output=True, timeout=20)
         elapsed = (time.perf_counter_ns() - start) / 1e6
         after = resource.getrusage(resource.RUSAGE_CHILDREN)
         receipt = dict(argv=argv, returncode=result.returncode, elapsed_ms=elapsed,
@@ -53,6 +57,8 @@ class Experiment:
                                             - before.ru_utime - before.ru_stime),
                        stdout=result.stdout.decode("utf-8", errors="replace"),
                        stderr=result.stderr.decode("utf-8", errors="replace"))
+        if payload is not None:
+            receipt.update(stdin_bytes=len(payload), stdin_sha256=hashlib.sha256(payload).hexdigest())
         self.commands.append(receipt)
         with (self.output / "commands.jsonl").open("a") as stream:
             stream.write(json.dumps(receipt) + "\n")
