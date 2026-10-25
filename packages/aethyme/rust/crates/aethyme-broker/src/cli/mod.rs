@@ -548,6 +548,8 @@ Usage:
   aethyme broker watch pr list [--all] [--json]
   aethyme broker watch pr show|poll|pause|resume|stop --id <watch-id> [--json]
   aethyme broker watch pr tick [--limit <1..100>] [--json]
+  aethyme broker watch pr service plan --broker-bin <absolute-router> [--seconds <120..3600>] [--json]
+      Read-only macOS service plan. Does not install or activate a scheduler.
   aethyme broker watch pr batches --id <watch-id> [--all] [--json]
   aethyme broker watch pr ack --id <batch-id> --outcome <addressed|stale|non-actionable|superseded> --reason <text> [--json]
       Persist a metadata-only PR watch and inspect it with one-shot polling.
@@ -1485,6 +1487,7 @@ struct Parsed {
     message: Option<String>,
     entry: Option<i64>,
     confirm: Option<String>,
+    broker_bin: Option<PathBuf>,
     delivery_mode: Option<String>,
     delivery_plan: Option<String>,
     operation: Option<String>,
@@ -1640,6 +1643,7 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         message: None,
         entry: None,
         confirm: None,
+        broker_bin: None,
         delivery_mode: None,
         delivery_plan: None,
         operation: None,
@@ -2093,6 +2097,11 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
                         .ok_or(UsageError::Message("--task requires a value".into()))?
                         .clone(),
                 )
+            }
+            "--broker-bin" => {
+                parsed.broker_bin = Some(PathBuf::from(iter.next().ok_or_else(|| {
+                    UsageError::Message("--broker-bin requires an absolute router path".into())
+                })?));
             }
             "--cmd" => {
                 parsed.cmd = Some(

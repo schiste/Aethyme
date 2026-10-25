@@ -36,6 +36,16 @@ consumer. This file exists so that doesn't happen again.
    `scripts/eval/verify-playground.sh` against any deployed
    playground; it asserts a subset of the contracts below.
 
+## PR-watch service plan (#887)
+
+`aethyme broker advanced watch pr service plan --broker-bin <absolute-router>`
+adds an operator-only read-only macOS launchd planning surface. Optional
+`--seconds 120..3600` defaults to 300; `--json` emits the versioned
+`aethyme.pr-watch-service-plan/v1` schema. The canonical plan digest binds
+repository/user identity, executable and embedded helper hashes, paths and
+unit content. No installation or activation consumer exists yet. See
+`docs/guides/pr-watch-service.md` for fields, digest construction and limits.
+
 ## Direct-child helper observations (#713)
 
 `aethyme broker advanced exec-status --session <id> [--receipt <id>] --json`

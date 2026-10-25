@@ -15,6 +15,7 @@ pub(super) const VALUE_FLAGS: &[&str] = &[
     "--ai-provider",
     "--base",
     "--before",
+    "--broker-bin",
     "--checks-timeout",
     "--claim",
     "--cleanup-command",
@@ -449,6 +450,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("watch pr resume", &["--id"]),
     ("watch pr stop", &["--id"]),
     ("watch pr tick", &["--limit"]),
+    ("watch pr service plan", &["--broker-bin", "--seconds"]),
     ("watch pr batches", &["--id", "--all"]),
     ("watch pr ack", &["--id", "--outcome", "--reason"]),
     (

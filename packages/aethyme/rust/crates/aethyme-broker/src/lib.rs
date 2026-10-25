@@ -166,6 +166,8 @@ pub use pr_monitoring::{
 };
 mod pr_projection;
 mod pr_watch;
+#[cfg(unix)]
+mod pr_watch_service;
 mod preparation;
 mod promotion_record;
 mod quality_report;
