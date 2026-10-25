@@ -40,8 +40,14 @@ than 200 live sessions the report returns empty groups with
 `memory_observation = session_inventory_over_budget`; it skips process sampling.
 The inventory count is still read from the repository database.
 
-The report joins recorded session holders, derived activity and one process
-sample. These are observations made at different instants, not an atomic host
+The report joins recorded session holders, activity metadata and one process
+sample. It does not run the ordinary per-session PID/group liveness probes or
+start a separate fallback `ps` for each owner. Inactivity uses the newest
+recorded command or Git metadata timestamp and the ordinary idle-age threshold;
+recorded exited owners are inactive. Fresh activity protects an owner even
+when its stored status says idle or stale. A recently active owner whose process
+disappeared stays protected until the inactivity threshold. These are
+observational recommendations, never a session-state transition. These are observations made at different instants, not an atomic host
 snapshot. Missing holder records cannot establish sharing, and foreign agents
 or repositories are outside this repository's owner inventory. Output cannot
 authorize cleanup or establish that an idle agent can safely be terminated.
