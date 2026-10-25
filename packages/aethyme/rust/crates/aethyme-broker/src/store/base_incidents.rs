@@ -51,7 +51,11 @@ fn proof(conn: &rusqlite::Connection, id: i64) -> Result<GateProof, BrokerError>
         .ok_or_else(|| invalid("gate run is missing or was reclaimed"))?;
     let profile = record
         .3
-        .filter(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+        .filter(|value| {
+            value
+                .strip_prefix("sha256:")
+                .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
         .ok_or_else(|| {
             invalid(
                 "gate run lacks a complete execution-profile digest; rerun a profile-bound gate",
@@ -354,7 +358,7 @@ mod tests {
             &store,
             "fail",
             &"b".repeat(40),
-            Some(&"c".repeat(64)),
+            Some(&format!("sha256:{}", "c".repeat(64))),
             Some("test_failure"),
         );
         let first = confirm(&mut store, 1, run).unwrap();
@@ -379,32 +383,45 @@ mod tests {
             (
                 "fail",
                 "d".repeat(40),
-                Some("c".repeat(64)),
+                Some(format!("sha256:{}", "c".repeat(64))),
                 Some("test_failure"),
             ),
-            ("pass", "b".repeat(40), Some("c".repeat(64)), None),
+            (
+                "pass",
+                "b".repeat(40),
+                Some(format!("sha256:{}", "c".repeat(64))),
+                None,
+            ),
             ("fail", "b".repeat(40), None, Some("test_failure")),
             (
                 "fail",
                 "b".repeat(40),
-                Some("c".repeat(64)),
+                Some(format!("sha256:{}", "c".repeat(64))),
                 Some("cached_prior_fail"),
             ),
             (
                 "fail",
                 "b".repeat(40),
-                Some("c".repeat(64)),
+                Some(format!("sha256:{}", "c".repeat(64))),
                 Some("environment"),
             ),
         ] {
             let run = run(&store, status, &tree, profile.as_deref(), class);
             assert!(confirm(&mut store, 1, run).is_err());
         }
-        let valid = run(
+        let bare_digest = run(
             &store,
             "fail",
             &"b".repeat(40),
             Some(&"c".repeat(64)),
+            Some("test_failure"),
+        );
+        assert!(confirm(&mut store, 1, bare_digest).is_err());
+        let valid = run(
+            &store,
+            "fail",
+            &"b".repeat(40),
+            Some(&format!("sha256:{}", "c".repeat(64))),
             Some("test_failure"),
         );
         assert!(confirm(&mut store, 99, valid).is_err());
@@ -418,17 +435,29 @@ mod tests {
             &store,
             "fail",
             &"b".repeat(40),
-            Some(&"c".repeat(64)),
+            Some(&format!("sha256:{}", "c".repeat(64))),
             Some("test_failure"),
         );
         let incident = confirm(&mut store, 1, failed).unwrap();
-        let wrong_profile = run(&store, "pass", &"e".repeat(40), Some(&"d".repeat(64)), None);
+        let wrong_profile = run(
+            &store,
+            "pass",
+            &"e".repeat(40),
+            Some(&format!("sha256:{}", "d".repeat(64))),
+            None,
+        );
         assert!(
             store
                 .resolve_base_incident(incident.id, wrong_profile, &"f".repeat(40), &"e".repeat(40))
                 .is_err()
         );
-        let pass = run(&store, "pass", &"e".repeat(40), Some(&"c".repeat(64)), None);
+        let pass = run(
+            &store,
+            "pass",
+            &"e".repeat(40),
+            Some(&format!("sha256:{}", "c".repeat(64))),
+            None,
+        );
         assert!(
             store
                 .resolve_base_incident(incident.id, pass, &"f".repeat(40), &"b".repeat(40))
@@ -463,7 +492,7 @@ mod tests {
             &store,
             "fail",
             &"b".repeat(40),
-            Some(&"c".repeat(64)),
+            Some(&format!("sha256:{}", "c".repeat(64))),
             Some("build_failure"),
         );
         for i in 0..MAX_OPEN_BASE_FAILURE_INCIDENTS {
@@ -523,10 +552,16 @@ mod tests {
             &store,
             "fail",
             &"b".repeat(40),
-            Some(&"c".repeat(64)),
+            Some(&format!("sha256:{}", "c".repeat(64))),
             Some("test_failure"),
         );
-        let pass = run(&store, "pass", &"b".repeat(40), Some(&"c".repeat(64)), None);
+        let pass = run(
+            &store,
+            "pass",
+            &"b".repeat(40),
+            Some(&format!("sha256:{}", "c".repeat(64))),
+            None,
+        );
         let open = confirm(&mut store, 1, failed).unwrap();
         for i in 0..=RETAIN_RESOLVED_BASE_FAILURE_INCIDENTS {
             let incident = store
