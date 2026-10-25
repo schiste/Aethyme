@@ -1397,7 +1397,10 @@ mod tests {
             .set_len(super::HOST_RESOURCE_INPUT_MAX_BYTES + 1)
             .unwrap();
         let error = super::read_resource_json::<serde_json::Value>(&path).unwrap_err();
-        assert!(error.to_string().contains("exceeds"), "{error}");
+        assert!(
+            matches!(error, super::UsageError::Message(ref message) if message.contains("exceeds")),
+            "{error:?}"
+        );
         assert!(super::read_resource_json::<serde_json::Value>(dir.path()).is_err());
     }
 
@@ -1415,7 +1418,10 @@ mod tests {
                 .unwrap();
         })
         .unwrap_err();
-        assert!(error.to_string().contains("exceeds"), "{error}");
+        assert!(
+            matches!(error, super::UsageError::Message(ref message) if message.contains("exceeds")),
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -1432,8 +1438,8 @@ mod tests {
         })
         .unwrap_err();
         assert!(
-            error.to_string().contains("changed while reading"),
-            "{error}"
+            matches!(error, super::UsageError::Message(ref message) if message.contains("changed while reading")),
+            "{error:?}"
         );
     }
 
