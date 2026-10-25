@@ -2617,12 +2617,47 @@ fn run_selections_with_admission<CachedEventAdmission, GateAdmission>(
     session_id: Option<i64>,
     cache_policy: CachePolicy,
     runtime: GateRuntimeContext<'_>,
-    mut database_write_admission: CachedEventAdmission,
-    mut gate_admission: GateAdmission,
+    database_write_admission: CachedEventAdmission,
+    gate_admission: GateAdmission,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError>
 where
     CachedEventAdmission: FnMut(&BrokerStore, &Path) -> Option<String>,
     GateAdmission: FnMut(&BrokerStore, &Path, &GitRepo, &Gate) -> Option<String>,
+{
+    run_selections_with_profile_capture(
+        store,
+        main_root,
+        checkout,
+        selections,
+        session_id,
+        cache_policy,
+        runtime,
+        database_write_admission,
+        gate_admission,
+        crate::gate_profile::ExecutionProfile::capture,
+    )
+}
+
+/// The telemetry/cache ordering tests supply a fixed profile, rather than
+/// depending on unrelated host tool probes completing before their deadline.
+/// Production callers always pass the real bounded capture above.
+#[allow(clippy::too_many_arguments)]
+fn run_selections_with_profile_capture<CachedEventAdmission, GateAdmission, CaptureProfile>(
+    store: &mut BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    selections: Vec<Selection<'_>>,
+    session_id: Option<i64>,
+    cache_policy: CachePolicy,
+    runtime: GateRuntimeContext<'_>,
+    mut database_write_admission: CachedEventAdmission,
+    mut gate_admission: GateAdmission,
+    mut capture_profile: CaptureProfile,
+) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError>
+where
+    CachedEventAdmission: FnMut(&BrokerStore, &Path) -> Option<String>,
+    GateAdmission: FnMut(&BrokerStore, &Path, &GitRepo, &Gate) -> Option<String>,
+    CaptureProfile: FnMut(&Path, Option<&std::ffi::OsStr>) -> crate::gate_profile::ExecutionProfile,
 {
     let progress = runtime.progress;
     let admission_host = runtime.admission_host;
@@ -2664,10 +2699,7 @@ where
         };
         let worker_id = gate_worker_id(session_id, &gate.name);
         if gate.cache && execution_profile.is_none() {
-            execution_profile = Some(crate::gate_profile::ExecutionProfile::capture(
-                checkout.root(),
-                subprocess_path.as_deref(),
-            ));
+            execution_profile = Some(capture_profile(checkout.root(), subprocess_path.as_deref()));
         }
         let profile = if gate.cache {
             execution_profile.as_ref()
@@ -4973,11 +5005,7 @@ mod tests {
         let mut store = BrokerStore::open(&database).unwrap();
         let gate = synthetic_gate("cached", true, "false");
         let tree = checkout.working_tree_hash().unwrap();
-        let subprocess_path = crate::git::sanitized_subprocess_path();
-        let execution_profile = crate::gate_profile::ExecutionProfile::capture(
-            checkout.root(),
-            subprocess_path.as_deref(),
-        );
+        let execution_profile = crate::gate_profile::ExecutionProfile::fixture_complete();
         let cache_provenance = execution_profile.provenance();
         assert_eq!(
             cache_provenance.execution_profile_digest.as_deref(),
@@ -4986,7 +5014,7 @@ mod tests {
         );
         assert!(
             execution_profile.digest().is_some(),
-            "this cache-hit regression requires complete bounded profile probes"
+            "the telemetry fixture must supply a complete profile"
         );
         store
             .record_gate_result_with_execution_profile(
@@ -5012,7 +5040,8 @@ mod tests {
         let progress = Lines::default();
         let admission_host = SequencedAdmissionHost::new(vec![None]);
 
-        let outcomes = run_selections_with_admission(
+        let profile_captures = std::cell::Cell::new(0);
+        let outcomes = run_selections_with_profile_capture(
             &mut store,
             &checkout_root,
             &checkout,
@@ -5031,9 +5060,14 @@ mod tests {
             },
             |_, _| Some("broker database is below the gate reserve".to_string()),
             |_, _, _, _| panic!("a cache hit cannot dispatch a gate"),
+            |_, _| {
+                profile_captures.set(profile_captures.get() + 1);
+                execution_profile.clone()
+            },
         )
         .unwrap();
 
+        assert_eq!(profile_captures.get(), 1);
         assert_eq!(outcomes.len(), 1);
         assert!(outcomes[0].cached);
         assert_eq!(outcomes[0].status, GateStatus::Pass);
