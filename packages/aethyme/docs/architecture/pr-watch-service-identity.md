@@ -14,7 +14,8 @@ launchd unit. Generation is derived without a self-reference:
 
 The generated unit invokes Python with `-I -B`: isolated imports, no user site
 packages or PYTHONPATH influence, and no bytecode caches in the helper directory.
-It sets the health opt-in, the generation, and the expected canonical broker
+It explicitly sets the reviewed HOME so runtime configuration and adapter lookup
+use the planned user namespace. It sets the health opt-in, generation and expected canonical broker
 executable SHA-256. Planning still writes nothing and never activates a service.
 
 The monitor requires `AETHYME_PR_MONITOR_GENERATION` and

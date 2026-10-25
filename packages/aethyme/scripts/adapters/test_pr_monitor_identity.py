@@ -156,7 +156,7 @@ class IdentityControls(unittest.TestCase):
             program = b'#!/bin/sh\ncase "$*" in\n*"deliveries list"*) printf "[]\\n" ;;\n*) printf "tick\\n" ;;\nesac\n'
             broker, expected = self.executable(directory, program)
             result = subprocess.run([sys.executable, "-I", "-B", str(root / "aethyme-pr-monitor.py")],
-                env={"PATH": "/usr/bin:/bin", "AETHYME_PR_MONITOR_REPO": directory,
+                env={"PATH": "/usr/bin:/bin", "HOME": directory, "AETHYME_PR_MONITOR_REPO": directory,
                      "AETHYME_BROKER_BIN": str(broker),
                      "AETHYME_PR_MONITOR_BROKER_SHA256": expected,
                      "AETHYME_PR_MONITOR_GENERATION": GENERATION,

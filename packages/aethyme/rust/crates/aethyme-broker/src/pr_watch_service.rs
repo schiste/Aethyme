@@ -197,6 +197,7 @@ impl Plan {
         let python = xml(text(&self.python)?)?;
         let monitor = xml(text(&self.directory.join("aethyme-pr-monitor.py"))?)?;
         let repository = xml(text(&self.repository)?)?;
+        let home = xml(text(&self.home)?)?;
         let broker = xml(text(&self.broker)?)?;
         Ok(format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -205,6 +206,7 @@ impl Plan {
 <key>Label</key><string>{label}</string>
 <key>ProgramArguments</key><array><string>{python}</string><string>-I</string><string>-B</string><string>{monitor}</string></array>
 <key>EnvironmentVariables</key><dict>
+<key>HOME</key><string>{home}</string>
 <key>AETHYME_PR_MONITOR_REPO</key><string>{repository}</string>
 <key>AETHYME_BROKER_BIN</key><string>{broker}</string>
 <key>AETHYME_PR_MONITOR_BROKER_SHA256</key><string>{broker_sha256}</string>
@@ -253,6 +255,7 @@ mod tests {
         assert_eq!(first.digest, second.digest);
         assert_eq!(first.digest.len(), 64);
         assert_eq!(first.generation.len(), 64);
+        assert!(first.unit.contains("<key>HOME</key>"));
         assert_eq!(first.generation, second.generation);
         assert_ne!(first.generation, first.digest);
         assert!(first.unit.contains(&format!(
