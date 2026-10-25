@@ -530,9 +530,9 @@ fn run_graph_impact_inner(args: &[String]) -> Result<(), String> {
     let mode = if let Some(index) = args.iter().position(|argument| argument == "--mode") {
         let value = args
             .get(index + 1)
-            .ok_or_else(|| "--mode requires calls or imports".to_string())?;
+            .ok_or_else(|| "--mode requires calls, imports or documents".to_string())?;
         aethyme_broker::GraphImpactMode::parse(value)
-            .ok_or_else(|| "--mode must be calls or imports".to_string())?
+            .ok_or_else(|| "--mode must be calls, imports or documents".to_string())?
     } else {
         aethyme_broker::GraphImpactMode::Calls
     };
@@ -596,13 +596,16 @@ fn run_graph_impact_inner(args: &[String]) -> Result<(), String> {
             "Impact: {} direct, {} transitive, {} {}",
             report.impact.direct.len(),
             report.impact.transitive.len(),
-            if mode == aethyme_broker::GraphImpactMode::Calls {
-                report.impact.callers.len()
-            } else {
-                report.impact.importers.len()
+            match mode {
+                aethyme_broker::GraphImpactMode::Calls => report.impact.callers.len(),
+                aethyme_broker::GraphImpactMode::Imports => report.impact.importers.len(),
+                aethyme_broker::GraphImpactMode::Documents => report.impact.documents.len(),
             },
             mode.label().to_ascii_lowercase()
         );
+        if !report.impact.documents.is_empty() {
+            println!("Documents: {}", report.impact.documents.join(", "));
+        }
         if !report.impact.tests.is_empty() {
             println!("Tests: {}", report.impact.tests.join(", "));
         }

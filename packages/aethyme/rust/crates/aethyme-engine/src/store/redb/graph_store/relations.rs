@@ -95,8 +95,25 @@ pub(super) fn function_ids_for_path_from<D: ReadableDatabase>(
     path: &str,
     limit: usize,
 ) -> Result<BoundedFunctionIds, GraphStoreError> {
+    exact_path_ids_from(db, FUNCTIONS_BY_PATH, path, limit)
+}
+
+pub(super) fn node_ids_for_path_from<D: ReadableDatabase>(
+    db: &D,
+    path: &str,
+    limit: usize,
+) -> Result<BoundedNodeIds, GraphStoreError> {
+    exact_path_ids_from(db, NODES_BY_PATH, path, limit)
+}
+
+fn exact_path_ids_from<D: ReadableDatabase>(
+    db: &D,
+    definition: MultimapTableDefinition<&str, &str>,
+    path: &str,
+    limit: usize,
+) -> Result<BoundedNodeIds, GraphStoreError> {
     let txn = db.begin_read()?;
-    let table = txn.open_multimap_table(FUNCTIONS_BY_PATH)?;
+    let table = txn.open_multimap_table(definition)?;
     let mut ids = Vec::new();
     for row in table.get(path)? {
         if ids.len() == limit {

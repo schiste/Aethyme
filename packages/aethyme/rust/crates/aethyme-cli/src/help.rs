@@ -183,8 +183,8 @@ Usage:
   aethyme graph refresh recover --plan <plan-sha256> [--repo <path>]
       Recover an interrupted refresh from its journal.
   aethyme graph impact --repo <path> --revision <rev> --diff <file|text>
-                       [--mode calls|imports] [--budget <n>] [--json]
-      Impact report for a diff: callers/importers, tests, configs, risk hints (budget default 128).
+                       [--mode calls|imports|documents] [--budget <n>] [--json]
+      Impact report for a diff: callers/importers/documents, tests, configs, risk hints (budget default 128).
   aethyme graph node <repo_path> <target> [--json-output]
       Show one node. <target>: node id, file path, area, or symbol (path::name or name).
   aethyme graph children <repo_path> <target> [--json-output]

@@ -498,6 +498,21 @@ impl RepositoryMap {
         let snapshot = snapshot_from_files(root_path, &files);
         let file_index: HashMap<&str, &FileNode> =
             files.iter().map(|f| (f.path.as_str(), f)).collect();
+        // Fragment identities retain their indexing repository name after a
+        // checkout moves. Structure overlays use the current checkout name.
+        // Translate actual code-file endpoints through the exact indexed path;
+        // non-code owners keep their separate Doc/Config projections below.
+        for fragment in &fragments {
+            for node in fragment.nodes() {
+                if let Node::File(file) = node
+                    && file.path() == fragment.file_path()
+                    && let Some(runtime_file) = file_index.get(file.path())
+                {
+                    model_id_by_schema
+                        .insert(file.id().as_str().to_string(), runtime_file.id.clone());
+                }
+            }
+        }
         let file_id_of = |path: &str| -> String {
             file_index
                 .get(path)
@@ -1881,6 +1896,69 @@ mod tests {
         for doc in docs {
             assert!(store.get_node(&doc.id).unwrap().is_some());
         }
+    }
+
+    #[test]
+    fn persisted_import_file_endpoints_survive_checkout_relocation() {
+        use crate::store::redb::graph_store::GraphStore;
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("indexed-name");
+        let relocated = temp.path().join("materialized-name");
+        fs::create_dir_all(original.join("src")).unwrap();
+        fs::write(
+            original.join("src/store.rs"),
+            "pub fn helper() -> u32 { 1 }\n",
+        )
+        .unwrap();
+        fs::write(
+            original.join("src/api.rs"),
+            "use crate::store::helper;\npub fn caller() -> u32 { helper() }\n",
+        )
+        .unwrap();
+        RepositoryMap::build_from_fragments(&original).unwrap();
+        fs::rename(&original, &relocated).unwrap();
+        let (map, _) = RepositoryMap::build_from_fragments(&relocated).unwrap();
+        let importer = map
+            .files
+            .iter()
+            .find(|file| file.path == "src/api.rs")
+            .unwrap();
+        let helper = map
+            .functions
+            .iter()
+            .find(|function| function.name == "helper")
+            .unwrap();
+        let links = map
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Imports && edge.to == helper.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            links.len(),
+            1,
+            "the real linker resolves the named import to a Function"
+        );
+        assert_eq!(
+            links[0].from.as_str(),
+            importer.id.as_str(),
+            "produced import sources must resolve to the runtime File, not an old schema id"
+        );
+        let (again, _) = RepositoryMap::build_from_fragments(&relocated).unwrap();
+        assert_eq!(map.edges, again.edges);
+        crate::index_store::materialize_graph_store(&relocated, &map, "fixture").unwrap();
+        let store = GraphStore::open_read_only(&relocated).unwrap();
+        let incoming = store.edges_to(helper.id.as_str()).unwrap();
+        let imports = incoming
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Imports)
+            .collect::<Vec<_>>();
+        assert_eq!(imports.len(), 1);
+        let endpoint = store
+            .node_display(imports[0].other.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(endpoint.id, importer.id);
+        assert_eq!(endpoint.path.as_deref(), Some("src/api.rs"));
     }
 
     #[test]

@@ -1064,3 +1064,65 @@ fn graph_impact_with_a_broker_records_its_evaluation_event() {
         .count();
     assert_eq!(recorded, 1, "{events}");
 }
+
+/// Use persisted producer output, materialization and the real CLI rather than
+/// constructing a passing documentation capability report by hand.
+#[test]
+fn documentation_impact_consumes_produced_links_and_withholds_stale_results() {
+    let (_temporary, repo) = fixture();
+    fs::write(
+        repo.join("README.md"),
+        "# Answer\n\nUse `answer()`; see [implementation](app.py#answer).\n",
+    )
+    .unwrap();
+    commit_all(&repo, "document the answer");
+    let planned = plan(&repo);
+    success(run(
+        &repo,
+        &[
+            "graph",
+            "refresh",
+            "execute",
+            "--repo",
+            ".",
+            "--confirm",
+            planned["plan_sha256"].as_str().unwrap(),
+        ],
+    ));
+    let diff = impact_diff(&repo);
+    let query = |revision| {
+        run(
+            &repo,
+            &[
+                "graph",
+                "impact",
+                "--repo",
+                ".",
+                "--revision",
+                revision,
+                "--diff",
+                diff.to_str().unwrap(),
+                "--mode",
+                "documents",
+                "--json",
+            ],
+        )
+    };
+    let report: Value = serde_json::from_str(&success(query("HEAD"))).unwrap();
+    assert_eq!(report["request"]["mode"], "documents", "{report}");
+    assert_eq!(
+        report["impact"]["documents"],
+        serde_json::json!(["README.md"]),
+        "{report}"
+    );
+    assert!(
+        matches!(report["status"].as_str(), Some("complete" | "partial")),
+        "{report}"
+    );
+    assert_eq!(report["impact"]["callers"], serde_json::json!([]));
+    assert_eq!(report["impact"]["importers"], serde_json::json!([]));
+    let stale: Value = serde_json::from_str(&success(query("HEAD~1"))).unwrap();
+    assert_eq!(stale["status"], "stale", "{stale}");
+    assert_eq!(stale["impact"]["documents"], serde_json::json!([]));
+    assert!(!repo.join(".aethyme/broker.db").exists());
+}

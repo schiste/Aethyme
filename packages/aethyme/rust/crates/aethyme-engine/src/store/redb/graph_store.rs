@@ -48,7 +48,8 @@ use crate::model::unresolved::UnresolvedNode;
 /// Bumped when the on-disk format changes incompatibly. We re-create the file
 /// rather than try to migrate.
 // v11 requires section endpoints; old derived stores must be rematerialized.
-const SCHEMA_VERSION: u32 = 11;
+// Schema 12 additionally binds actual persisted File endpoints after relocation.
+const SCHEMA_VERSION: u32 = 12;
 
 /// Public compatibility identity used by the immutable materialization cache.
 pub const GRAPH_STORE_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
@@ -170,14 +171,17 @@ pub struct BoundedAdjacency {
     pub truncated: bool,
 }
 
-/// Strictly bounded callable ids contained by one exact repository-relative
+/// Strictly bounded node ids contained by one exact repository-relative
 /// file path. The multimap value order is deterministic, so callers can use
 /// this directly as seed order without scanning a broader path prefix.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BoundedFunctionIds {
+pub struct BoundedNodeIds {
     pub ids: Vec<String>,
     pub truncated: bool,
 }
+
+/// Compatibility name for the callable-only exact-path query.
+pub type BoundedFunctionIds = BoundedNodeIds;
 
 #[derive(Debug)]
 pub enum GraphStoreError {

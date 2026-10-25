@@ -117,6 +117,7 @@ pub fn impact_analysis_envelope(
             ("transitive", strings(&set.transitive)),
             ("callers", strings(&set.callers)),
             ("importers", strings(&set.importers)),
+            ("documents", strings(&set.documents)),
             ("tests", strings(&set.tests)),
             ("configs", strings(&set.configs)),
             ("manifests", strings(&set.manifests)),
