@@ -239,6 +239,8 @@ pub struct RepositoryDeliveryEnvelope {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryWatchPollResult {
+    #[serde(default)]
+    pub budget_deferred: bool,
     pub watch_id: i64,
     pub display_repository: String,
     pub open_pull_requests: usize,
@@ -249,6 +251,9 @@ pub struct RepositoryWatchPollResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryWatchTickReport {
+    /// Includes listing or auto-watch work deferred without a provider call.
+    #[serde(default)]
+    pub deferred_watch_count: usize,
     pub schema_version: u32,
     pub tick_at: i64,
     pub due_watch_count: usize,
@@ -276,6 +281,16 @@ impl RepositoryWatchProvider for GithubCliRepositoryWatchProvider {
         repository: &str,
         limit: usize,
     ) -> Result<Vec<RepositoryPullRequest>, PullRequestWatchError> {
+        Self::list_with_deadline(repository, limit, std::time::Duration::from_secs(3))
+    }
+}
+
+impl GithubCliRepositoryWatchProvider {
+    pub(crate) fn list_with_deadline(
+        repository: &str,
+        limit: usize,
+        deadline: std::time::Duration,
+    ) -> Result<Vec<RepositoryPullRequest>, PullRequestWatchError> {
         let mut command = Command::new("gh");
         command.args([
             "pr",
@@ -289,11 +304,7 @@ impl RepositoryWatchProvider for GithubCliRepositoryWatchProvider {
             "--json",
             "number,title,author,url,headRefOid,isDraft",
         ]);
-        inspect_repository_pr_list(
-            &mut command,
-            std::time::Duration::from_secs(3),
-            4 * 1024 * 1024,
-        )
+        inspect_repository_pr_list(&mut command, deadline, 4 * 1024 * 1024)
     }
 }
 
@@ -593,14 +604,18 @@ impl Broker {
         now_ms: i64,
         limit: usize,
     ) -> Result<RepositoryWatchTickReport, BrokerOpError> {
-        let due: Vec<RepositoryWatch> = self
+        let mut due: Vec<RepositoryWatch> = self
             .repository_watches(false)?
             .into_iter()
             .filter(|watch| watch.status == RepositoryWatchStatus::Active)
             .filter(|watch| watch.next_poll_at.is_none_or(|due| due <= now_ms))
-            .take(limit.max(1))
             .collect();
+        // Previously deferred listings precede watches just polled; a fixed
+        // listing prefix must not starve later repositories indefinitely.
+        due.sort_by_key(|watch| (watch.next_poll_at, watch.id));
+        due.truncate(limit.max(1));
         let mut report = RepositoryWatchTickReport {
+            deferred_watch_count: 0,
             schema_version: REPOSITORY_WATCH_SCHEMA_VERSION,
             tick_at: now_ms,
             due_watch_count: due.len(),
@@ -611,9 +626,12 @@ impl Broker {
         };
         for watch in due {
             let result = self.poll_repository_watch_once(&watch, provider, pr_provider, now_ms)?;
+            if result.budget_deferred {
+                report.deferred_watch_count += 1;
+            }
             if result.error_code.is_some() {
                 report.failed_watch_count += 1;
-            } else {
+            } else if !result.budget_deferred {
                 report.polled_watch_count += 1;
             }
             report.event_count += result.events.len();
@@ -630,6 +648,7 @@ impl Broker {
         now_ms: i64,
     ) -> Result<RepositoryWatchPollResult, BrokerOpError> {
         let mut result = RepositoryWatchPollResult {
+            budget_deferred: false,
             watch_id: watch.id,
             display_repository: watch.display_repository.clone(),
             open_pull_requests: 0,
@@ -650,6 +669,10 @@ impl Broker {
         let open = match provider.list_open(&watch.display_repository, REPOSITORY_WATCH_LIST_LIMIT)
         {
             Ok(open) => open,
+            Err(PullRequestWatchError::TickBudgetExhausted) => {
+                result.budget_deferred = true;
+                return Ok(result);
+            }
             Err(error) => {
                 let code = match error {
                     PullRequestWatchError::Provider(detail)
@@ -816,6 +839,14 @@ impl Broker {
                     now_ms,
                 ) {
                     Ok(created) => result.auto_watched.push(created.id),
+                    Err(BrokerOpError::PullRequestWatch(
+                        PullRequestWatchError::TickBudgetExhausted,
+                    )) => {
+                        // Events and outbox entries were committed before
+                        // initialization. Leave that durable intent for retry.
+                        result.budget_deferred = true;
+                        break;
+                    }
                     // Preserve the event and retry at the next due repository
                     // poll. Store only a safe code, never provider stderr.
                     Err(_) => result.error_code = Some("auto_watch_start_failed".into()),

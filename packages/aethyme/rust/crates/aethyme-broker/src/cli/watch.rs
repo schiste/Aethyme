@@ -216,22 +216,34 @@ pub(super) fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
                 .map(|limit| limit as usize)
                 .unwrap_or(crate::DEFAULT_PR_SCHEDULER_LIMIT);
             let now = now_ms();
-            let report = broker.tick_pull_request_watches(
-                &crate::GithubCliPullRequestWatchProvider,
-                now,
-                limit,
-            )?;
+            let budget = crate::watch_tick_budget::WatchTickBudget::new();
+            let pr_provider = budget.provider(crate::watch_tick_budget::Phase::PullRequests);
+            let repository_provider =
+                budget.provider(crate::watch_tick_budget::Phase::Repositories);
+            let report = broker.tick_pull_request_watches(&pr_provider, now, limit)?;
             // Repository watches share the tick, so the one host scheduler that
             // already runs `watch pr tick` covers them too (#606).
             let repository = broker.tick_repository_watches(
-                &crate::GithubCliRepositoryWatchProvider,
-                &crate::GithubCliPullRequestWatchProvider,
+                &repository_provider,
+                &repository_provider,
                 now,
                 limit,
             )?;
+            let next_tick_at = broker
+                .repository_watches(false)?
+                .into_iter()
+                .filter(|watch| watch.status == crate::RepositoryWatchStatus::Active)
+                .filter_map(|watch| watch.next_poll_at)
+                .chain(report.next_tick_at)
+                .min();
             if parsed.json {
                 let mut value = serde_json::to_value(&report)?;
                 if let Some(object) = value.as_object_mut() {
+                    object.insert("next_tick_at".into(), serde_json::to_value(next_tick_at)?);
+                    object.insert(
+                        "provider_budget".into(),
+                        serde_json::to_value(budget.report())?,
+                    );
                     object.insert(
                         "repository_watches".into(),
                         serde_json::to_value(&repository)?,
@@ -241,11 +253,12 @@ pub(super) fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
             } else {
                 if repository.due_watch_count > 0 {
                     out!(
-                        "Repository watch tick: {} due, {} polled, {} failed, {} new event(s).",
+                        "Repository watch tick: {} due, {} polled, {} failed, {} new event(s), {} deferred.",
                         repository.due_watch_count,
                         repository.polled_watch_count,
                         repository.failed_watch_count,
                         repository.event_count,
+                        repository.deferred_watch_count,
                     );
                 }
                 out!(
@@ -258,7 +271,14 @@ pub(super) fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
                 if let Some(retry_at) = report.rate_limit_until {
                     out!("Provider rate limit: retry no earlier than {retry_at}.");
                 }
-                match report.next_tick_at {
+                let provider_budget = budget.report();
+                out!(
+                    "Provider budget: {}/{} calls; PR and repository work each allow {} calls; deferred work retries on its next due tick.",
+                    provider_budget.calls,
+                    provider_budget.max_calls,
+                    provider_budget.max_calls_per_phase
+                );
+                match next_tick_at {
                     Some(next) => out!("Next due tick: {next}."),
                     None => out!("Next due tick: none."),
                 }
