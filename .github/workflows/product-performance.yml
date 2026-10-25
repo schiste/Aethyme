@@ -37,7 +37,9 @@ jobs:
           workspaces: packages/aethyme/rust
 
       - name: Check warning-only broker budget policy
-        run: python3 -m unittest discover -s packages/aethyme-eval/benchmarks/performance -p 'test_broker_latency.py'
+        run: |
+          python3 -m unittest discover -s packages/aethyme-eval/benchmarks/performance -p 'test_broker_latency.py'
+          python3 -m unittest discover -s packages/aethyme-eval/benchmarks/performance -p 'test_broker_reuse.py'
 
       - name: Compare the recorded product revision with this checkout
         run: |
