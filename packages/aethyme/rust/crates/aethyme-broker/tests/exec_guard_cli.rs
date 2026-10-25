@@ -243,6 +243,20 @@ fn completed_cli_exec_exposes_a_queryable_receipt_without_command_details() {
     assert_eq!(value["receipt"]["command_outcome"], "succeeded");
     assert_eq!(value["receipt"]["ownership_audit"], "passed");
     assert_eq!(value["receipt"]["process_group_cleanup"], "verified");
+    let observed = value["receipt"]
+        .get("helper_observation")
+        .expect("the CLI receipt includes the nullable helper observation");
+    assert_eq!(observed["direct_child_outcome"], "succeeded");
+    assert_eq!(observed["exit_code"], 0);
+    assert_eq!(observed["ownership_audit"], "not_run_by_helper");
+    assert_eq!(observed["process_group_cleanup"], "unknown");
+    assert!(
+        observed["observed_at_ms"].as_i64().unwrap()
+            >= value["receipt"]["created_at_ms"].as_i64().unwrap()
+    );
+    for field in ["pid", "command", "argv", "environment", "output"] {
+        assert!(observed.get(field).is_none(), "helper exposes {field}");
+    }
     for secret_or_authority_field in ["pid", "command", "argv", "environment", "output"] {
         assert!(
             value["receipt"].get(secret_or_authority_field).is_none(),
@@ -296,6 +310,7 @@ fn failed_to_spawn_command_records_a_not_started_receipt() {
     assert_eq!(receipt["ownership_audit"], "not_run");
     assert_eq!(receipt["process_group_cleanup"], "not_applicable");
     assert!(receipt["exit_code"].is_null());
+    assert!(receipt.get("helper_observation").unwrap().is_null());
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -381,30 +396,55 @@ fn disconnected_exec_keeps_a_running_receipt_queryable_without_revalidation() {
     std::fs::write(&release_marker, b"release\n").unwrap();
     let receipt_id = receipt_result.unwrap_or_else(|reason| panic!("{reason}"));
 
-    let status = run(
-        repo.path(),
-        state.path(),
-        &[
-            "advanced",
-            "exec-status",
-            "--session",
-            id,
-            "--receipt",
-            &receipt_id,
-            "--json",
-        ],
-    );
-    assert!(
-        status.status.success(),
-        "exec-status: {}",
-        String::from_utf8_lossy(&status.stderr)
-    );
-    let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let observation_deadline = Instant::now() + Duration::from_secs(15);
+    let value = loop {
+        let status = run(
+            repo.path(),
+            state.path(),
+            &[
+                "advanced",
+                "exec-status",
+                "--session",
+                id,
+                "--receipt",
+                &receipt_id,
+                "--json",
+            ],
+        );
+        assert!(
+            status.status.success(),
+            "exec-status: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        let observed = value["receipt"]
+            .get("helper_observation")
+            .expect("the CLI receipt includes the nullable helper observation");
+        if !observed.is_null() {
+            break value;
+        }
+        assert!(
+            Instant::now() < observation_deadline,
+            "the helper never recorded its direct-child observation: {value}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
     let receipt = &value["receipt"];
     assert_eq!(receipt["receipt_id"], receipt_id);
     assert_eq!(receipt["phase"], "running");
     assert_eq!(receipt["command_outcome"], "unknown");
     assert_eq!(receipt["process_revalidation"], "not_revalidated");
+    let observed = &receipt["helper_observation"];
+    // The release marker can let the child exit normally before the helper
+    // observes control EOF. Either observation still leaves the caller's audit
+    // unresolved, and neither grants process-group cleanup authority.
+    assert!(matches!(
+        observed["direct_child_outcome"].as_str(),
+        Some("cancelled" | "succeeded")
+    ));
+    assert_eq!(observed["process_group_cleanup"], "unknown");
+    assert_eq!(observed["ownership_audit"], "not_run_by_helper");
+    assert!(observed["observed_at_ms"].is_i64());
     assert!(receipt.get("pid").is_none());
 }
 
