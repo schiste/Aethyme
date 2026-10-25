@@ -1108,130 +1108,133 @@ fn caller_frontier(
     Ok(lookup)
 }
 
+#[derive(Default)]
+struct ImportFrontierState {
+    queue: VecDeque<FrontierNode>,
+    visited: BTreeSet<String>,
+    expanded_files: BTreeSet<String>,
+    test_targets: BTreeSet<String>,
+    truncated: bool,
+}
+
+fn enqueue_import_subjects(
+    store: &ReadOnlyGraphStore,
+    state: &mut ImportFrontierState,
+    path: &str,
+    changed_file: &str,
+    depth: usize,
+    max_nodes: usize,
+) -> Result<(), GraphStoreError> {
+    if !state.expanded_files.insert(path.to_string()) {
+        return Ok(());
+    }
+    let seeds = store.node_ids_for_path(path, max_nodes.saturating_sub(state.visited.len()))?;
+    state.truncated |= seeds.truncated || seeds.ids.is_empty();
+    for id in seeds.ids {
+        if !state.visited.insert(id.clone()) {
+            continue;
+        }
+        let Some(display) = store.node_display(&id)? else {
+            state.truncated = true;
+            continue;
+        };
+        if display.path.as_deref() != Some(path) {
+            state.truncated = true;
+            continue;
+        }
+        if display.kind == StoredNodeKind::Function {
+            state.test_targets.insert(id.clone());
+        }
+        state.queue.push_back(FrontierNode {
+            changed_file: changed_file.to_string(),
+            node_id: id,
+            depth,
+        });
+    }
+    Ok(())
+}
+
 fn import_frontier(
     store: &ReadOnlyGraphStore,
     query: &GraphImpactQuery<'_>,
 ) -> Result<GraphImpactLookup, GraphStoreError> {
-    let mut changed_files = query.changed_files.to_vec();
-    changed_files.sort();
-    changed_files.dedup();
-    let changed_set = changed_files.iter().cloned().collect::<BTreeSet<_>>();
-
-    let mut queue = VecDeque::new();
-    let mut visited = BTreeSet::new();
-    let mut truncated = false;
-    let mut remaining_raw_rows = query.max_nodes;
-    let mut relevant_files = changed_set.clone();
-    for changed_file in &changed_files {
-        if visited.len() == query.max_nodes {
-            truncated = true;
+    let changed_files = query.changed_files.iter().cloned().collect::<BTreeSet<_>>();
+    let mut state = ImportFrontierState::default();
+    for (path_index, path) in changed_files.iter().enumerate() {
+        if path_index >= query.max_nodes || state.visited.len() >= query.max_nodes {
+            state.truncated = true;
             break;
         }
-        let Some(file) = store.resolve_file_path(changed_file)? else {
-            continue;
-        };
-        if visited.insert(file.id.clone()) {
-            queue.push_back(FrontierNode {
-                changed_file: changed_file.clone(),
-                node_id: file.id,
-                depth: 0,
-            });
-        }
+        enqueue_import_subjects(store, &mut state, path, path, 0, query.max_nodes)?;
     }
-    let seed_count = visited.len();
-
+    let seed_count = state.visited.len();
+    let mut remaining_raw_rows = query.max_nodes;
     let mut chains = Vec::new();
-    let mut importer_files = HashSet::new();
-    'walk: while let Some(current) = queue.pop_front() {
+    'walk: while let Some(current) = state.queue.pop_front() {
         let importers = file_importers(
             store,
             &current.node_id,
             &mut remaining_raw_rows,
-            &mut truncated,
+            &mut state.truncated,
         )?;
-        if current.depth >= query.max_depth {
-            if importers
-                .iter()
-                .any(|(importer_id, _)| !visited.contains(importer_id))
+        for (_, importer_file) in importers {
+            if changed_files.contains(&importer_file)
+                || state.expanded_files.contains(&importer_file)
             {
-                truncated = true;
-            }
-            continue;
-        }
-
-        for (importer_id, importer_file) in importers {
-            if visited.contains(&importer_id) {
                 continue;
             }
-            if visited.len() == query.max_nodes {
-                truncated = true;
-                break 'walk;
+            if current.depth >= query.max_depth
+                || chains.len() >= query.max_results
+                || state.visited.len() >= query.max_nodes
+            {
+                state.truncated = true;
+                if current.depth < query.max_depth {
+                    break 'walk;
+                }
+                continue;
             }
-            visited.insert(importer_id.clone());
             let depth = current.depth + 1;
-            queue.push_back(FrontierNode {
-                changed_file: current.changed_file.clone(),
-                node_id: importer_id,
-                depth,
-            });
-
-            if changed_set.contains(&importer_file) || !importer_files.insert(importer_file.clone())
-            {
-                continue;
-            }
-            relevant_files.insert(importer_file.clone());
-            if chains.len() == query.max_results {
-                truncated = true;
-                break 'walk;
-            }
             chains.push(GraphImpactChain {
                 changed_file: current.changed_file.clone(),
-                caller_file: importer_file,
+                caller_file: importer_file.clone(),
                 depth,
             });
-        }
-    }
-
-    let mut test_targets = BTreeSet::new();
-    for file_path in relevant_files {
-        let remaining_nodes = query.max_nodes.saturating_sub(visited.len());
-        let functions = store.function_ids_for_path(&file_path, remaining_nodes)?;
-        truncated |= functions.truncated;
-        for function_id in functions.ids {
-            if visited.contains(&function_id) {
-                test_targets.insert(function_id);
-                continue;
-            }
-            if visited.len() == query.max_nodes {
-                truncated = true;
-                break;
-            }
-            visited.insert(function_id.clone());
-            test_targets.insert(function_id);
+            enqueue_import_subjects(
+                store,
+                &mut state,
+                &importer_file,
+                &current.changed_file,
+                depth,
+                query.max_nodes,
+            )?;
         }
     }
     let mut test_paths = BTreeSet::new();
-    let test_targets = test_targets.into_iter().collect::<Vec<_>>();
+    let test_targets = state.test_targets.into_iter().collect::<Vec<_>>();
     let mut test_traversal = TestPathTraversal {
-        visited_nodes: &mut visited,
+        visited_nodes: &mut state.visited,
         remaining_raw_rows: &mut remaining_raw_rows,
         max_nodes: query.max_nodes,
         max_results: query.max_results.saturating_sub(chains.len()),
         test_paths: &mut test_paths,
-        truncated: &mut truncated,
+        truncated: &mut state.truncated,
     };
     collect_test_paths(store, &test_targets, &mut test_traversal)?;
     let explanation = format!(
-        "walked incoming Imports and Tests edges from {seed_count} changed-file file(s); returned {} importer file(s) and {} test file(s) with depth <= {}, nodes <= {}, and raw adjacency rows <= {}",
+        "walked incoming Imports and Tests edges from {seed_count} changed-file subjects; returned {} importer file(s) and {} test file(s) with depth <= {}, nodes <= {}, and raw adjacency rows <= {}; missing subjects or invalid endpoints require fallback",
         chains.len(),
         test_paths.len(),
         query.max_depth,
         query.max_nodes,
         query.max_nodes
     );
-    let mut lookup =
-        GraphImpactLookup::ready_with_chains(chains, visited.len(), truncated, explanation)
-            .with_mode(GraphImpactMode::Imports);
+    let mut lookup = GraphImpactLookup::ready_with_chains(
+        chains,
+        state.visited.len(),
+        state.truncated,
+        explanation,
+    )
+    .with_mode(GraphImpactMode::Imports);
     lookup.test_paths = test_paths.into_iter().collect();
     Ok(lookup)
 }
@@ -1382,12 +1385,15 @@ fn file_importers(
     for edge in adjacency {
         let importer_id = edge.other.as_str();
         let Some(display) = store.node_display(importer_id)? else {
+            *truncated = true;
             continue;
         };
         if display.kind != StoredNodeKind::File {
+            *truncated = true;
             continue;
         }
-        let Some(path) = display.path else {
+        let Some(path) = display.path.filter(|path| is_safe_repo_relative(path)) else {
+            *truncated = true;
             continue;
         };
         importers.push((importer_id.to_string(), path));
@@ -1977,6 +1983,333 @@ mod tests {
                 .explanation
                 .contains("incoming Imports and Tests edges")
         );
+    }
+
+    fn symbol_import_fixture() -> tempfile::TempDir {
+        use aethyme_engine::model::{
+            class::ClassNode,
+            edge::Edge,
+            file::{FileNode, FileRole},
+            function::FunctionNode,
+            intern::InternedStr,
+        };
+        use aethyme_engine::store::redb::graph_store::{
+            insert_class, insert_edge, insert_file, insert_function,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(root.path()).unwrap();
+        let files = [
+            "src/core.rs",
+            "src/adapter.rs",
+            "src/service.rs",
+            "src/classes.rs",
+            "src/core.rs.other",
+            "src/unrelated.rs",
+            "qa/contract_checks.rs",
+        ]
+        .map(|path| {
+            FileNode::new(
+                "Repo",
+                path,
+                Some("rust".into()),
+                FileRole::Source,
+                10,
+                100,
+                false,
+                None,
+            )
+        });
+        let function = |file: &FileNode, name: &str| {
+            FunctionNode::new(
+                "Repo",
+                InternedStr::from(file.id.clone()),
+                InternedStr::from(file.path.clone()),
+                None,
+                None,
+                "rust".into(),
+                name.into(),
+                1,
+                format!("fn {name}()").into(),
+            )
+        };
+        let core = function(&files[0], "helper");
+        let adapter = function(&files[1], "adapt");
+        let sibling = function(&files[4], "unrelated");
+        let test = function(&files[6], "contract_check");
+        let class = ClassNode::new(
+            "Repo",
+            files[0].id.clone().into(),
+            files[0].path.clone().into(),
+            None,
+            "rust".into(),
+            "Thing".into(),
+            2,
+            "struct Thing".into(),
+        );
+        let mut index = store.begin_index().unwrap();
+        for file in &files {
+            insert_file(&mut index, file).unwrap();
+        }
+        for node in [&core, &adapter, &sibling, &test] {
+            insert_function(&mut index, node).unwrap();
+        }
+        insert_class(&mut index, &class).unwrap();
+        for (source, target, kind) in [
+            (files[1].id.as_str(), core.id.as_str(), EdgeKind::Imports),
+            (files[3].id.as_str(), class.id.as_str(), EdgeKind::Imports),
+            (files[2].id.as_str(), adapter.id.as_str(), EdgeKind::Imports),
+            (
+                files[0].id.as_str(),
+                files[2].id.as_str(),
+                EdgeKind::Imports,
+            ),
+            (files[5].id.as_str(), sibling.id.as_str(), EdgeKind::Imports),
+            (test.id.as_str(), adapter.id.as_str(), EdgeKind::Tests),
+        ] {
+            insert_edge(
+                &mut index,
+                &Edge::new(source, target, kind, 1000, "fixture"),
+            )
+            .unwrap();
+        }
+        index.commit().unwrap();
+        drop(store);
+        root
+    }
+
+    fn symbol_import_lookup(
+        root: &Path,
+        depth: usize,
+        nodes: usize,
+        results: usize,
+    ) -> GraphImpactLookup {
+        GraphStoreImpactProvider.lookup(&GraphImpactQuery {
+            repo_root: root,
+            changed_files: &["src/core.rs".into()],
+            mode: GraphImpactMode::Imports,
+            max_depth: depth,
+            max_nodes: nodes,
+            max_results: results,
+        })
+    }
+
+    #[test]
+    fn imports_follow_function_and_class_targets_with_cycles_tests_and_exact_paths() {
+        let root = symbol_import_fixture();
+        let first = symbol_import_lookup(root.path(), 4, 64, 16);
+        let second = symbol_import_lookup(root.path(), 4, 64, 16);
+        assert_eq!(first.status, GraphImpactStatus::Ready);
+        assert_eq!(first.chains, second.chains);
+        assert_eq!(first.visited_nodes, second.visited_nodes);
+        assert!(!first.truncated, "{}", first.explanation);
+        assert_eq!(
+            first
+                .impacted_paths
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["src/adapter.rs", "src/classes.rs", "src/service.rs"])
+        );
+        for chain in first.chains {
+            assert_eq!(chain.changed_file, "src/core.rs");
+            assert_eq!(
+                chain.depth,
+                if chain.caller_file == "src/service.rs" {
+                    2
+                } else {
+                    1
+                }
+            );
+        }
+        assert_eq!(first.test_paths, vec!["qa/contract_checks.rs"]);
+    }
+
+    #[test]
+    fn imports_report_incomplete_depth_node_result_and_missing_seed_bounds() {
+        let root = symbol_import_fixture();
+        let depth = symbol_import_lookup(root.path(), 1, 64, 16);
+        assert!(depth.truncated);
+        assert!(
+            !depth
+                .impacted_paths
+                .iter()
+                .any(|path| path == "src/service.rs")
+        );
+        for (max_depth, max_nodes, max_results) in [(0, 64, 16), (4, 0, 16), (4, 1, 16), (4, 64, 0)]
+        {
+            let lookup = symbol_import_lookup(root.path(), max_depth, max_nodes, max_results);
+            assert!(lookup.truncated);
+            assert!(lookup.impacted_paths.is_empty());
+            assert!(lookup.visited_nodes <= max_nodes);
+            assert!(lookup.test_paths.len() <= max_results);
+        }
+        let changed = (0..8)
+            .map(|n| format!("absent/{n}.rs"))
+            .chain(std::iter::once("src/core.rs".into()))
+            .collect::<Vec<_>>();
+        let missing = GraphStoreImpactProvider.lookup(&GraphImpactQuery {
+            repo_root: root.path(),
+            changed_files: &changed,
+            mode: GraphImpactMode::Imports,
+            max_depth: 4,
+            max_nodes: 8,
+            max_results: 16,
+        });
+        assert!(missing.truncated);
+        assert_eq!(
+            missing.visited_nodes, 0,
+            "missing paths must consume lookup allowance"
+        );
+        assert!(missing.impacted_paths.is_empty());
+    }
+
+    #[test]
+    fn imports_do_not_report_changed_files_omitted_by_the_lookup_budget() {
+        let root = symbol_import_fixture();
+        let changed = std::iter::once("src/core.rs".to_string())
+            .chain((0..7).map(|n| format!("src/czzz{n}.rs")))
+            .chain(std::iter::once("src/service.rs".into()))
+            .collect::<Vec<_>>();
+        let lookup = GraphStoreImpactProvider.lookup(&GraphImpactQuery {
+            repo_root: root.path(),
+            changed_files: &changed,
+            mode: GraphImpactMode::Imports,
+            max_depth: 4,
+            max_nodes: 8,
+            max_results: 16,
+        });
+        assert!(lookup.truncated);
+        assert!(
+            lookup
+                .impacted_paths
+                .iter()
+                .any(|path| path == "src/adapter.rs")
+        );
+        assert!(
+            !lookup
+                .impacted_paths
+                .iter()
+                .any(|path| path == "src/service.rs"),
+            "changed paths are never importer results, even if not seeded"
+        );
+    }
+
+    #[test]
+    fn imports_invalid_file_endpoints_are_partial_instead_of_silently_empty() {
+        use aethyme_engine::model::{
+            edge::Edge,
+            file::{FileNode, FileRole},
+            function::FunctionNode,
+        };
+        use aethyme_engine::store::redb::graph_store::{insert_edge, insert_file, insert_function};
+        for endpoint in ["missing", "function", "unsafe"] {
+            let root = tempfile::tempdir().unwrap();
+            let store = GraphStore::open(root.path()).unwrap();
+            let source = FileNode::new(
+                "Repo",
+                "src/core.rs",
+                Some("rust".into()),
+                FileRole::Source,
+                1,
+                1,
+                false,
+                None,
+            );
+            let mut index = store.begin_index().unwrap();
+            insert_file(&mut index, &source).unwrap();
+            let importer_id = match endpoint {
+                "function" => {
+                    let function = FunctionNode::new(
+                        "Repo",
+                        source.id.clone().into(),
+                        source.path.clone().into(),
+                        None,
+                        None,
+                        "rust".into(),
+                        "bad".into(),
+                        1,
+                        "fn bad()".into(),
+                    );
+                    insert_function(&mut index, &function).unwrap();
+                    function.id.to_string()
+                }
+                "unsafe" => {
+                    let file = FileNode::new(
+                        "Repo",
+                        "../escape.rs",
+                        Some("rust".into()),
+                        FileRole::Source,
+                        1,
+                        1,
+                        false,
+                        None,
+                    );
+                    insert_file(&mut index, &file).unwrap();
+                    file.id.to_string()
+                }
+                _ => "missing:file:endpoint".into(),
+            };
+            insert_edge(
+                &mut index,
+                &Edge::new(
+                    &importer_id,
+                    source.id.as_str(),
+                    EdgeKind::Imports,
+                    1000,
+                    "fixture",
+                ),
+            )
+            .unwrap();
+            index.commit().unwrap();
+            drop(store);
+            let lookup = symbol_import_lookup(root.path(), 4, 64, 16);
+            assert!(
+                lookup.truncated,
+                "invalid {endpoint} endpoint must not appear complete"
+            );
+            assert!(lookup.impacted_paths.is_empty());
+        }
+    }
+
+    #[test]
+    fn imports_exact_subject_budget_does_not_requery_already_seeded_functions() {
+        use aethyme_engine::model::{
+            file::{FileNode, FileRole},
+            function::FunctionNode,
+        };
+        use aethyme_engine::store::redb::graph_store::{insert_file, insert_function};
+        let root = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(root.path()).unwrap();
+        let file = FileNode::new(
+            "Repo",
+            "src/core.rs",
+            Some("rust".into()),
+            FileRole::Source,
+            1,
+            1,
+            false,
+            None,
+        );
+        let function = FunctionNode::new(
+            "Repo",
+            file.id.clone().into(),
+            file.path.clone().into(),
+            None,
+            None,
+            "rust".into(),
+            "helper".into(),
+            1,
+            "fn helper()".into(),
+        );
+        let mut index = store.begin_index().unwrap();
+        insert_file(&mut index, &file).unwrap();
+        insert_function(&mut index, &function).unwrap();
+        index.commit().unwrap();
+        drop(store);
+        let lookup = symbol_import_lookup(root.path(), 4, 2, 16);
+        assert_eq!(lookup.visited_nodes, 2);
+        assert!(!lookup.truncated);
+        assert!(lookup.impacted_paths.is_empty());
     }
 
     fn document_fixture() -> tempfile::TempDir {

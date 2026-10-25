@@ -1126,3 +1126,81 @@ fn documentation_impact_consumes_produced_links_and_withholds_stale_results() {
     assert_eq!(stale["impact"]["documents"], serde_json::json!([]));
     assert!(!repo.join(".aethyme/broker.db").exists());
 }
+
+#[test]
+fn import_impact_consumes_produced_symbol_targets_across_two_files() {
+    let (temporary, repo) = fixture();
+    fs::create_dir(repo.join("src")).unwrap();
+    for (path, source) in [
+        ("src/core.rs", "pub fn helper() -> u32 { 1 }\n"),
+        (
+            "src/adapter.rs",
+            "use crate::core::helper;\npub fn adapt() -> u32 { helper() }\n",
+        ),
+        (
+            "src/service.rs",
+            "use crate::adapter::adapt;\npub fn serve() -> u32 { adapt() }\n",
+        ),
+    ] {
+        fs::write(repo.join(path), source).unwrap();
+    }
+    commit_all(&repo, "add real named Rust imports");
+    let planned = plan(&repo);
+    success(run(
+        &repo,
+        &[
+            "graph",
+            "refresh",
+            "execute",
+            "--repo",
+            ".",
+            "--confirm",
+            planned["plan_sha256"].as_str().unwrap(),
+        ],
+    ));
+    let diff = temporary.path().join("changed-paths.txt");
+    fs::write(&diff, "src/core.rs\n").unwrap();
+    let query = |revision| {
+        run(
+            &repo,
+            &[
+                "graph",
+                "impact",
+                "--repo",
+                ".",
+                "--revision",
+                revision,
+                "--diff",
+                diff.to_str().unwrap(),
+                "--mode",
+                "imports",
+                "--json",
+            ],
+        )
+    };
+    let report: Value = serde_json::from_str(&success(query("HEAD"))).unwrap();
+    assert_eq!(report["request"]["mode"], "imports");
+    assert_eq!(
+        report["impact"]["importers"],
+        serde_json::json!(["src/adapter.rs", "src/service.rs"]),
+        "{report}"
+    );
+    assert_eq!(
+        report["impact"]["direct"],
+        serde_json::json!(["src/adapter.rs"]),
+        "{report}"
+    );
+    assert_eq!(
+        report["impact"]["transitive"],
+        serde_json::json!(["src/service.rs"]),
+        "{report}"
+    );
+    assert!(
+        matches!(report["status"].as_str(), Some("complete" | "partial")),
+        "{report}"
+    );
+    let stale: Value = serde_json::from_str(&success(query("HEAD~1"))).unwrap();
+    assert_eq!(stale["status"], "stale", "{stale}");
+    assert_eq!(stale["impact"]["importers"], serde_json::json!([]));
+    assert!(!repo.join(".aethyme/broker.db").exists());
+}
