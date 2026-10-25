@@ -1635,7 +1635,7 @@ fn service_plan_flags_are_scoped_to_the_read_only_plan_command() {
 #[test]
 fn invalid_service_plan_requests_refuse_before_broker_discovery() {
     for (args, expected) in [
-        (vec!["pr", "service", "activate"], "requires plan"),
+        (vec!["pr", "service", "unknown-action"], "requires plan"),
         (vec!["pr", "service", "plan", "extra"], "requires plan"),
         (vec!["pr", "service", "plan"], "requires --broker-bin"),
         (
