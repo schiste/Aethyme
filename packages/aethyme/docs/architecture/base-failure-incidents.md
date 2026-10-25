@@ -75,8 +75,12 @@ or unknown base. A matching commit does not establish profile equivalence with
 the current agent. Missing owner inventory is reported as absent, not dead.
 Opening an ordinary CLI broker still follows normal startup policy.
 
-Start/pre-push/gate notices, ownership handoff and automatic resolution after a
-proven base run still need integration. Issue #760 remains open. The existing path-overlap warnings and generated-file claims do
+Start/adopt entrypoints and session/all/named gate execution print the same
+bounded notices on stderr without probing owner liveness. Valid pre-push content
+gates use the all-gates path; deletion-only pushes run no content gates. Notices
+preserve existing argument, policy-trust, selection and gate-result refusals.
+Ownership handoff and automatic resolution after a proven base run still need
+integration. Issue #760 remains open. The existing path-overlap warnings and generated-file claims do
 not provide those incident notices.
 
 Deterministic tests cover duplicate ownership, unqualified/mismatched proof

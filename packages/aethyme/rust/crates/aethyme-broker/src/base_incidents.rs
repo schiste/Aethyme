@@ -124,7 +124,7 @@ impl Broker {
 impl Broker {
     pub(crate) fn base_failure_incident_status_advice(
         &self,
-        agents: &[crate::AgentView],
+        agents: Option<&[crate::AgentView]>,
     ) -> Vec<crate::StatusAdvice> {
         let records = match self.base_failure_incidents() {
             Ok(records) => records
@@ -153,13 +153,13 @@ impl Broker {
             .map(|(commit, _)| commit);
         let mut advice = records.iter().take(8).map(|record| {
             let base_matches = current_base.as_deref() == Some(record.base_commit.as_str());
-            let owner_present = agents.iter().any(|a| a.session.id == record.owner_session_id);
+            let owner_present = agents.map(|agents| agents.iter().any(|a| a.session.id == record.owner_session_id));
             crate::StatusAdvice {
                 id: "base.failure-incident", severity: if base_matches { crate::StatusAdviceSeverity::Warning } else { crate::StatusAdviceSeverity::Notice },
                 reason: if base_matches { "recorded_failure_on_fetched_base" } else { "prior_base_failure_not_requalified" },
                 summary: format!("Incident {}: {} failed on recorded base {}; repair owner session {}{}. {}",
                     record.id, record.gate_name, record.base_commit, record.owner_session_id,
-                    if owner_present { "" } else { " (absent from current session inventory)" },
+                    match owner_present { Some(true) => "", Some(false) => " (absent from current session inventory)", None => " (owner liveness not checked)" },
                     if base_matches { "Fetched base matches; compare the recorded profile before diagnosing again. Gates still run." }
                     else { "Current base is different or unknown; this failure has not been requalified. Gates still run." }),
                 session_id: Some(record.owner_session_id), queue_entry_id: None,
@@ -184,5 +184,15 @@ impl Broker {
             });
         }
         advice
+    }
+}
+
+impl Broker {
+    /// Shared stderr notice for start/adopt and gate execution. Deliberately
+    /// avoids a process/session inventory audit just to render an observation.
+    pub(crate) fn warn_base_failure_incidents(&self) {
+        for advice in self.base_failure_incident_status_advice(None) {
+            eprintln!("[base-failure] {}", advice.summary);
+        }
     }
 }

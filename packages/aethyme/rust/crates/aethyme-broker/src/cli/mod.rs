@@ -2396,6 +2396,7 @@ fn open_broker_for_explicit_worktree_root_recovery() -> Result<Broker, UsageErro
 /// stale installed broker. The check is advisory and writes to stderr so a
 /// `--json` session report remains machine-readable.
 fn warn_stale_broker_binary(broker: &Broker) {
+    broker.warn_base_failure_incidents();
     if let Some(warning) = crate::version::broker_start_warning(broker.main_root()) {
         eprintln!("warning: {warning}");
     }

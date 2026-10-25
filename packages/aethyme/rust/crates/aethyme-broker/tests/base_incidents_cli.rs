@@ -311,3 +311,46 @@ fn cli_refuses_feature_pass_until_that_tree_is_the_fetched_default() {
             .any(|a| a["id"] == "base.failure-incident")
     );
 }
+
+#[test]
+fn start_and_gate_entrypoints_emit_incident_notice_without_claiming_owner_liveness() {
+    let (root, owner, failed) = fixture();
+    json(cli(
+        &root,
+        &[
+            "gates",
+            "incidents",
+            "confirm",
+            &failed.to_string(),
+            "unit::broken",
+            "--session",
+            &owner.to_string(),
+            "--json",
+        ],
+    ));
+    for args in [
+        vec!["gates", "run", "--all", "--json"],
+        vec![
+            "start",
+            "--adopt",
+            "--allow-main-checkout",
+            "--task",
+            "notice check",
+            "--short-name",
+            "notice check",
+            "--json",
+        ],
+    ] {
+        let result = cli(&root, &args);
+        let stderr = String::from_utf8(result.stderr).unwrap();
+        assert!(stderr.contains("[base-failure] Incident"), "{stderr}");
+        assert!(
+            stderr.contains(&format!("repair owner session {owner}")),
+            "{stderr}"
+        );
+        assert!(stderr.contains("owner liveness not checked"), "{stderr}");
+        // Gate policy is deliberately untrusted and the checkout already has
+        // an owner. The notices must not turn either refusal into success.
+        assert!(!result.status.success());
+    }
+}
