@@ -67,6 +67,9 @@ expect_exact_performance_path 'performance budget policy' 'packages/aethyme-eval
 expect_exact_performance_path 'standalone Python benchmark' 'packages/aethyme-eval/benchmarks/performance/broker_latency.py'
 expect_exact_performance_path 'Python benchmark tests' 'packages/aethyme-eval/benchmarks/performance/test_broker_latency.py'
 expect_exact_performance_path 'performance report guide' 'packages/aethyme/docs/guides/broker-performance.md'
+expect_exact_performance_path 'Git config experiment' 'packages/aethyme-eval/benchmarks/performance/git_worktree_config.py'
+expect_exact_performance_path 'Git config controls' 'packages/aethyme-eval/benchmarks/performance/test_git_worktree_config.py'
+expect_exact_performance_path 'Git config assessment' 'packages/aethyme/docs/architecture/git-worktree-config-assessment.md'
 
 init_case 'modified performance budget policy'
 mkdir -p "$repo/packages/aethyme-eval/benchmarks/performance"
@@ -118,6 +121,10 @@ expect_full_path 'Cargo build profile' '.cargo/config.toml'
 expect_full_path 'gate policy' '.aethyme/gates.toml'
 expect_full_path 'Rust performance fixture' 'packages/aethyme-eval/benchmarks/performance/fixture/src/rust/src/lib.rs'
 expect_full_path 'unlisted benchmark file' 'packages/aethyme-eval/benchmarks/performance/other.py'
+expect_full_path 'shared Git benchmark dependency' 'packages/aethyme-eval/benchmarks/performance/git_worktree_options.py'
+expect_full_path 'Git config lookalike' 'packages/aethyme-eval/benchmarks/performance/git_worktree_config_extra.py'
+expect_full_path 'classifier itself' '.github/scripts/performance-fast-lane.sh'
+expect_full_path 'validator itself' '.github/scripts/validate-performance-fast-lane.sh'
 
 init_case 'performance mixed with Rust'
 mkdir -p "$repo/packages/aethyme-eval/benchmarks/performance" \

@@ -76,6 +76,9 @@ while :; do
     packages/aethyme-eval/benchmarks/performance/broker-budgets.json|\
     packages/aethyme-eval/benchmarks/performance/broker_latency.py|\
     packages/aethyme-eval/benchmarks/performance/test_broker_latency.py|\
+    packages/aethyme-eval/benchmarks/performance/git_worktree_config.py|\
+    packages/aethyme-eval/benchmarks/performance/test_git_worktree_config.py|\
+    packages/aethyme/docs/architecture/git-worktree-config-assessment.md|\
     packages/aethyme/docs/guides/broker-performance.md)
       performance_paths=$((performance_paths + 1))
       ;;
