@@ -27,6 +27,7 @@ mod artifact_catalog;
 mod artifact_claim;
 mod atomic_file;
 pub mod attribution;
+pub mod base_incidents;
 mod blockers;
 mod bounded_output;
 mod broker;
