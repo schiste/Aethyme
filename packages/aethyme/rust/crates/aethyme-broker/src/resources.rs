@@ -2922,19 +2922,9 @@ impl HostResourceCoordinator {
         self.recover_request_inner(request, false)
     }
 
-    /// Recover the original supervised grant after a lost acquisition reply.
-    /// The exact request must come from the caller's private durable journal,
-    /// under its recovery lock. The returned token is private control material,
-    /// never public inventory. Recovery does not acquire, renew, release or
-    /// quarantine anything, and a historical grant is not permission to dispatch.
-    /// An unreleased grant must still have its generation-bound durable hold.
-    pub fn recover_supervised_request(
-        &self,
-        request: &HostResourceRequest,
-    ) -> Result<Option<HostResourceGrant>, HostResourceError> {
-        self.recover_request_inner(request, true)
-    }
-
+    // Keep supervised recovery internal until a durable service journal and
+    // recovery lock bind the caller. An exact request is identity, not a public
+    // capability to retrieve another controller's private ownership token.
     fn recover_request_inner(
         &self,
         request: &HostResourceRequest,
@@ -7493,7 +7483,7 @@ mod tests {
         let before = recovery_snapshot(&coordinator);
         for _ in 0..2 {
             assert_eq!(
-                coordinator.recover_supervised_request(&request).unwrap(),
+                coordinator.recover_request_inner(&request, true).unwrap(),
                 Some(original.clone())
             );
             assert_eq!(recovery_snapshot(&coordinator), before);
@@ -7515,7 +7505,7 @@ mod tests {
         let mut changed = request.clone();
         changed.run_id.push_str("-different");
         assert!(matches!(
-            coordinator.recover_supervised_request(&changed),
+            coordinator.recover_request_inner(&changed, true),
             Err(HostResourceError::IdempotencyMismatch(_))
         ));
         assert_eq!(recovery_snapshot(&coordinator), before);
@@ -7534,7 +7524,7 @@ mod tests {
         let grant = coordinator.acquire(&ordinary).unwrap();
         let before = recovery_snapshot(&coordinator);
         assert!(matches!(
-            coordinator.recover_supervised_request(&ordinary),
+            coordinator.recover_request_inner(&ordinary, true),
             Err(HostResourceError::IdempotencyMismatch(_))
         ));
         assert_eq!(coordinator.recover_request(&ordinary).unwrap(), Some(grant));
@@ -7548,7 +7538,7 @@ mod tests {
         let request = capacity_request("never-admitted", "workers", 1, 1, None);
         let before = recovery_snapshot(&coordinator);
         assert_eq!(
-            coordinator.recover_supervised_request(&request).unwrap(),
+            coordinator.recover_request_inner(&request, true).unwrap(),
             None
         );
         assert_eq!(coordinator.recover_request(&request).unwrap(), None);
@@ -7576,7 +7566,7 @@ mod tests {
             .unwrap();
         let before = recovery_snapshot(&coordinator);
         let recovered = coordinator
-            .recover_supervised_request(&request)
+            .recover_request_inner(&request, true)
             .unwrap()
             .unwrap();
         assert_eq!(recovered.lease.state, HostLeaseState::Quarantined);
@@ -7623,7 +7613,7 @@ mod tests {
             .unwrap();
         let before = recovery_snapshot(&coordinator);
         let recovered = coordinator
-            .recover_supervised_request(&request)
+            .recover_request_inner(&request, true)
             .unwrap()
             .unwrap();
         assert_eq!(recovered.lease, terminal);
@@ -7663,7 +7653,7 @@ mod tests {
             }
             let before = recovery_snapshot(&coordinator);
             assert!(
-                matches!(coordinator.recover_supervised_request(&request), Err(HostResourceError::InvalidRequest(message)) if message == "supervised recovery requires its generation-bound hold")
+                matches!(coordinator.recover_request_inner(&request, true), Err(HostResourceError::InvalidRequest(message)) if message == "supervised recovery requires its generation-bound hold")
             );
             assert_eq!(recovery_snapshot(&coordinator), before);
         }
