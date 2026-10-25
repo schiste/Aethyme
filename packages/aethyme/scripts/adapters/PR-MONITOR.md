@@ -70,3 +70,21 @@ write failure is reported without replacing the monitor result. Records do not
 authorize retries, process cleanup, lease release, provider freshness, or
 exactly-once delivery. Service generation binding, freshness interpretation and
 scheduler lifecycle status remain future installer responsibilities for #887.
+
+## Service generation and pinned executable
+
+An installed generated unit sets `AETHYME_PR_MONITOR_GENERATION` and
+`AETHYME_PR_MONITOR_BROKER_SHA256` together. Both are 64 lowercase hex digits.
+The monitor verifies a bounded regular executable through an absolute no-follow
+path before any broker command. Path replacement or changed bytes refuse the
+pass. Identity hashing shares the pass deadline; empty optional values preserve
+manual invocation defaults. The generated unit uses Python `-I -B` to isolate
+imports and avoid bytecode caches.
+
+Health adds optional `generation` (configured value or null) and `identity`
+(`not_configured`, `verified`, `failed`). Missing fields mean an unbound legacy
+record. A valid generation is retained even when the runtime check fails, but a
+verified identity never implies delivery or freshness. Use immutable versioned
+runtime paths: verification does not make a later exec atomic with replacement.
+See `docs/architecture/pr-watch-service-identity.md` for generation construction,
+limits and the Python launcher/paired-engine distinction.
