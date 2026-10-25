@@ -34,7 +34,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 56;
+pub const SCHEMA_VERSION: i64 = 57;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -1880,6 +1880,21 @@ CREATE INDEX IF NOT EXISTS base_failure_incidents_open_base
     ON base_failure_incidents(base_commit, resolved_at, id);
 ";
 
+// Direct-child observations are diagnostic only. Existing receipt, audit and
+// cleanup transitions are unchanged, so this additive table keeps the floor.
+const MIGRATION_V57: &str = "
+CREATE TABLE IF NOT EXISTS guarded_exec_helper_observations (
+    receipt_id TEXT PRIMARY KEY REFERENCES guarded_exec_receipts(receipt_id) ON DELETE CASCADE,
+    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    receipt_created_at_ms INTEGER NOT NULL,
+    direct_child_outcome TEXT NOT NULL CHECK (direct_child_outcome IN ('succeeded', 'failed', 'cancelled')),
+    exit_code INTEGER,
+    observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= receipt_created_at_ms)
+);
+CREATE INDEX IF NOT EXISTS guarded_exec_helper_observations_latest
+    ON guarded_exec_helper_observations(session_id, observed_at_ms DESC, receipt_id DESC);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1937,6 +1952,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V54,
     MIGRATION_V55,
     MIGRATION_V56,
+    MIGRATION_V57,
 ];
 
 /// Migrations that only add columns. One is skipped when every column it adds
@@ -1965,6 +1981,7 @@ const TABLE_MIGRATIONS: &[(i64, &str, &[&str])] = &[
     (53, MIGRATION_V53, &["spawned_worktree_instances"]),
     (55, MIGRATION_V55, &["guarded_exec_receipts"]),
     (56, MIGRATION_V56, &["base_failure_incidents"]),
+    (57, MIGRATION_V57, &["guarded_exec_helper_observations"]),
 ];
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, BrokerError> {
@@ -2601,6 +2618,40 @@ mod tests {
         assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 52).unwrap());
         assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 51).unwrap());
         assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 42).unwrap());
+    }
+
+    #[test]
+    fn v57_helper_observations_preserve_existing_receipts_and_floor() {
+        let conn = migrated_through(56);
+        set_meta(&conn, "min_compatible_schema", 54);
+        conn.execute_batch(
+            "INSERT INTO sessions (
+            id, worktree_path, branch, origin, status, created_at, updated_at, last_activity_at
+        ) VALUES (1, '/synthetic', 'agent/synthetic', 'adopted', 'active', 1, 1, 1);
+        INSERT INTO guarded_exec_receipts VALUES (
+            '01234567890123456789012345678901', 1, 'running', 'unknown', NULL,
+            'not_run', 'unknown', 1, 1);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert!(table_exists(&conn, "guarded_exec_helper_observations").unwrap());
+        assert!(schema_is_compatible_with(&conn, 56, 54).unwrap());
+        assert!(!schema_is_compatible_with(&conn, 56, 53).unwrap());
+        let phase: String = conn
+            .query_row("SELECT phase FROM guarded_exec_receipts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(phase, "running");
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM guarded_exec_helper_observations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

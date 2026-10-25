@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
 
-const FLAG: &str = "--aethyme-inline-exec-supervisor-v3";
-const FRAME_MAGIC: &[u8; 4] = b"AIX3";
+const FLAG: &str = "--aethyme-inline-exec-supervisor-v4";
+const FRAME_MAGIC: &[u8; 4] = b"AIX4";
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 // Polling for an idle control channel is short, but once a frame starts the
@@ -41,6 +41,7 @@ enum ParentFrame {
         cwd: PathBuf,
         command: Vec<String>,
         environment: Vec<(String, String)>,
+        observation: Option<crate::store::guarded_exec::HelperObservationTarget>,
     },
     Ping,
     Abort,
@@ -52,6 +53,7 @@ enum ParentFrameRef<'a> {
         cwd: &'a Path,
         command: &'a [String],
         environment: &'a [(String, String)],
+        observation: Option<&'a crate::store::guarded_exec::HelperObservationTarget>,
     },
     Ping,
     Abort,
@@ -365,12 +367,30 @@ pub(crate) struct InlineExecSupervisor {
     control: Option<std::os::unix::net::UnixStream>,
     process_group: i32,
     terminalized: bool,
+    observation: Option<crate::store::guarded_exec::HelperObservationTarget>,
 }
 
 #[cfg(not(unix))]
 pub(crate) struct InlineExecSupervisor;
 
 impl InlineExecSupervisor {
+    pub(crate) fn with_observation(
+        self,
+        target: Option<crate::store::guarded_exec::HelperObservationTarget>,
+    ) -> Self {
+        #[cfg(unix)]
+        {
+            let mut supervisor = self;
+            supervisor.observation = target;
+            supervisor
+        }
+        #[cfg(not(unix))]
+        {
+            std::mem::drop(target);
+            self
+        }
+    }
+
     #[cfg(unix)]
     pub(crate) fn start(executable: &Path) -> Result<Self, InlineExecError> {
         Self::start_with_stdin(
@@ -531,6 +551,7 @@ impl InlineExecSupervisor {
             control: Some(parent),
             process_group,
             terminalized: false,
+            observation: None,
         };
         let ready = read_frame_until(
             supervisor
@@ -657,6 +678,7 @@ impl InlineExecSupervisor {
             cwd: &cwd,
             command,
             environment,
+            observation: self.observation.as_ref(),
         };
         if let Err(error) = write_frame_until(
             self.control.as_mut().expect("control stream is present"),
@@ -1042,6 +1064,7 @@ fn run_helper() -> io::Result<u8> {
         cwd,
         command,
         environment,
+        observation,
     } = request
     else {
         write_frame(
@@ -1123,6 +1146,7 @@ fn run_helper() -> io::Result<u8> {
     };
     if let Err(error) = write_frame(&mut control, &HelperFrame::Started) {
         stop_owned_command(&mut child);
+        observe_direct_child(observation.as_ref(), &mut child, true);
         if let Err(cleanup_error) = terminate_owned_group_from_live_helper() {
             crate::warn_unrecorded(
                 "stop command after start confirmation could not be delivered",
@@ -1135,6 +1159,7 @@ fn run_helper() -> io::Result<u8> {
     if std::env::var_os("AETHYME_TEST_INLINE_FAIL_AFTER_LAUNCH").is_some() {
         std::thread::sleep(std::time::Duration::from_millis(100));
         stop_owned_command(&mut child);
+        observe_direct_child(observation.as_ref(), &mut child, true);
         write_frame(
             &mut control,
             &HelperFrame::ExecutionUnknown {
@@ -1146,6 +1171,7 @@ fn run_helper() -> io::Result<u8> {
     loop {
         if !matches!(watcher.try_wait(), Ok(None)) {
             stop_owned_command(&mut child);
+            observe_direct_child(observation.as_ref(), &mut child, true);
             if let Err(error) = write_frame(
                 &mut control,
                 &HelperFrame::ExecutionUnknown {
@@ -1162,6 +1188,7 @@ fn run_helper() -> io::Result<u8> {
         }
         match child.try_wait() {
             Ok(Some(status)) => {
+                observe_direct_child(observation.as_ref(), &mut child, false);
                 write_frame(
                     &mut control,
                     &HelperFrame::Exited {
@@ -1173,6 +1200,7 @@ fn run_helper() -> io::Result<u8> {
             Ok(None) => {}
             Err(error) => {
                 stop_owned_command(&mut child);
+                observe_direct_child(observation.as_ref(), &mut child, true);
                 write_frame(
                     &mut control,
                     &HelperFrame::ExecutionUnknown {
@@ -1182,20 +1210,30 @@ fn run_helper() -> io::Result<u8> {
                 return Ok(125);
             }
         }
-        if let Some(parent_frame) = read_frame_timeout::<ParentFrame>(
+        let parent_frame = match read_frame_timeout::<ParentFrame>(
             &mut control,
             std::time::Duration::from_millis(100),
             None,
-        )? {
+        ) {
+            Ok(frame) => frame,
+            Err(error) => {
+                stop_owned_command(&mut child);
+                observe_direct_child(observation.as_ref(), &mut child, true);
+                return Err(error);
+            }
+        };
+        if let Some(parent_frame) = parent_frame {
             match parent_frame {
                 ParentFrame::Ping => {}
                 ParentFrame::Abort => {
                     stop_owned_command(&mut child);
+                    observe_direct_child(observation.as_ref(), &mut child, true);
                     write_frame(&mut control, &HelperFrame::Aborted)?;
                     return Ok(125);
                 }
                 ParentFrame::Run { .. } => {
                     stop_owned_command(&mut child);
+                    observe_direct_child(observation.as_ref(), &mut child, true);
                     write_frame(
                         &mut control,
                         &HelperFrame::ExecutionUnknown {
@@ -1206,6 +1244,37 @@ fn run_helper() -> io::Result<u8> {
                 }
             }
         }
+    }
+}
+
+#[cfg(unix)]
+fn observe_direct_child(
+    target: Option<&crate::store::guarded_exec::HelperObservationTarget>,
+    child: &mut std::process::Child,
+    cancelled: bool,
+) {
+    let Some(target) = target else {
+        return;
+    };
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            let outcome = if cancelled {
+                "cancelled"
+            } else if status.success() {
+                "succeeded"
+            } else {
+                "failed"
+            };
+            crate::warn_unrecorded(
+                "persist direct-child helper observation",
+                target.record(outcome, status.code()),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => crate::warn_unrecorded(
+            "inspect direct child for helper observation",
+            Err::<(), _>(error),
+        ),
     }
 }
 
@@ -2175,11 +2244,35 @@ mod tests {
     }
 
     #[test]
+    fn direct_child_exit_is_persisted_before_parent_completion() {
+        let (_owner, store, receipt, target) =
+            crate::store::guarded_exec::helper_observation_fixture();
+        let result = start_helper()
+            .with_observation(Some(target))
+            .run(
+                Path::new("/"),
+                &["/bin/sh".into(), "-c".into(), "exit 7".into()],
+                &[],
+                || Ok(()),
+            )
+            .unwrap();
+        assert_eq!(result.exit_code, Some(7));
+        let row = store.guarded_exec_receipt(1, &receipt).unwrap().unwrap();
+        assert_eq!(row.phase, "running");
+        let observed = row.helper_observation.unwrap();
+        assert_eq!(observed.direct_child_outcome, "failed");
+        assert_eq!(observed.exit_code, Some(7));
+        assert_eq!(observed.process_group_cleanup, "unknown");
+    }
+
+    #[test]
     fn control_disconnect_stops_command_and_waits_for_group_cleanup() {
         use std::time::{Duration, Instant};
 
         let owner = tempfile::tempdir().unwrap();
         let output = owner.path().join("disconnected-descendant.txt");
+        let (_db_owner, store, receipt, observation) =
+            crate::store::guarded_exec::helper_observation_fixture();
         let mut supervisor = start_helper();
         write_frame_until(
             supervisor.control.as_mut().unwrap(),
@@ -2191,6 +2284,7 @@ mod tests {
                     "(i=0; while [ \"$i\" -lt 500 ]; do printf x >> \"$OUTPUT_PATH\"; sleep 0.02; i=$((i + 1)); done) & wait".into(),
                 ],
                 environment: &[("OUTPUT_PATH".into(), output.to_string_lossy().into_owned())],
+                observation: Some(&observation),
             },
             Instant::now() + READY_TIMEOUT,
         )
@@ -2233,6 +2327,18 @@ mod tests {
             bytes_after_cleanup,
             "the cleanup watcher left an in-group writer alive"
         );
+        let row = store.guarded_exec_receipt(1, &receipt).unwrap().unwrap();
+        assert_eq!(
+            row.phase, "running",
+            "the helper cannot complete the parent audit"
+        );
+        assert_eq!(row.command_outcome, "unknown");
+        let observed = row
+            .helper_observation
+            .expect("caller loss must retain the direct-child cancellation observation");
+        assert_eq!(observed.direct_child_outcome, "cancelled");
+        assert_eq!(observed.process_group_cleanup, "unknown");
+        assert_eq!(observed.ownership_audit, "not_run_by_helper");
     }
 
     #[test]
@@ -2425,6 +2531,7 @@ mod tests {
             cwd: Path::new("/"),
             command: &command,
             environment: &[],
+            observation: None,
         };
         let started = Instant::now();
         let error = write_frame_until(
