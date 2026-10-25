@@ -158,6 +158,55 @@ class DeliveryBounds(unittest.TestCase):
                 adapter.main()
         fake.close.assert_called_once()
 
+    def test_tool_result_shapes_fail_with_typed_protocol_errors(self):
+        malformed = [
+            ({"isError": True, "content": []}, "returned an error"),
+            ({"isError": "false", "content": []}, "non-boolean isError"),
+            ({"content": None}, "malformed content"),
+            ({"content": {}}, "malformed content"),
+            ({"content": ["text"]}, "malformed content"),
+            ({"content": [{"type": "text", "text": 7}]}, "non-text text content"),
+            ({"content": [{"type": "text", "text": "{}"},
+                          {"type": "text", "text": None}]}, "non-text text content"),
+        ]
+        for result, message in malformed:
+            with self.subTest(result=result), patch.object(adapter.Chau7Client, "_request", return_value=result):
+                with self.assertRaisesRegex(adapter.Chau7Error, message):
+                    client(Socket([])).call_tool("synthetic", {})
+
+    def run_delivery_replies(self, replies):
+        real_client = client(Socket([]))
+        claimed = {"claimed": True, "delivery_id": 7, "generation": 2,
+                   "action": {"action": "send", "tab_id": "synthetic", "prompt": "fixture"}}
+        tab_reply = {"content": [{"type": "text", "text": "[]"}]}
+        with patch.object(adapter.sys, "argv", ["adapter", "--worker", "fixture"]), \
+                patch.object(adapter, "Chau7Client", return_value=real_client), \
+                patch.object(real_client, "_request", side_effect=[tab_reply] + replies) as request, \
+                patch.object(adapter, "dispatch_once", side_effect=[claimed, {"claimed": False}]), \
+                patch.object(adapter, "complete") as complete, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(adapter.main(), 0)
+        self.assertTrue(real_client._sock.closed)
+        complete.assert_called_once()
+        return [call.args[1]["name"] for call in request.call_args_list], complete.call_args
+
+    def test_failed_send_never_submits_or_acknowledges_delivery(self):
+        calls, completion = self.run_delivery_replies([{"isError": True, "content": []}])
+        self.assertEqual(calls, ["tab_list", "tab_send_input"])
+        self.assertEqual(completion.args[5:], ("retry", "transport_failed"))
+
+    def test_failed_submit_is_not_acknowledged_as_delivered(self):
+        calls, completion = self.run_delivery_replies([
+            {"content": []}, {"isError": True, "content": []}])
+        self.assertEqual(calls, ["tab_list", "tab_send_input", "tab_submit_prompt"])
+        self.assertEqual(completion.args[5:], ("retry", "transport_failed"))
+
+    def test_successful_send_and_submit_acknowledge_delivery_once(self):
+        calls, completion = self.run_delivery_replies([
+            {"isError": False, "content": []}, {"content": []}])
+        self.assertEqual(calls, ["tab_list", "tab_send_input", "tab_submit_prompt"])
+        self.assertEqual(completion.args[5:], ("delivered",))
+
     def test_broker_stdin_and_both_output_streams_round_trip(self):
         result = adapter.run_broker(
             [sys.executable, "-c", "import sys; print(len(sys.stdin.read())); print('diagnostic', file=sys.stderr)"],
