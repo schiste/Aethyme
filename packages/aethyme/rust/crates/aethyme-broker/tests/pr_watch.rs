@@ -1223,8 +1223,9 @@ impl aethyme_broker::RepositoryWatchProvider for ResultRepositoryProvider {
 #[test]
 fn repository_listing_budget_preserves_watch_cursor_and_existing_event() {
     let (_root, mut broker, session_id) = broker_fixture();
+    // include_existing skips the initial listing: the first provider call is
+    // the tick being deferred, not watch creation.
     let provider = ResultRepositoryProvider(Mutex::new(VecDeque::from([
-        Ok(vec![repository_pr()]),
         Err(PullRequestWatchError::TickBudgetExhausted),
         Ok(vec![repository_pr()]),
     ])));
@@ -1257,6 +1258,7 @@ fn repository_listing_budget_preserves_watch_cursor_and_existing_event() {
     assert_eq!(resumed.polled_watch_count, 1);
     assert_eq!(resumed.event_count, 1);
     assert_eq!(broker.repository_watch_events(watch.id).unwrap().len(), 1);
+    assert!(provider.0.lock().unwrap().is_empty());
 }
 
 #[test]

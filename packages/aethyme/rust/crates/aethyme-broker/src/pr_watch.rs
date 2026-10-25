@@ -368,9 +368,15 @@ impl GithubCliPullRequestWatchProvider {
             match crate::bounded_output::output_limited(&mut command, deadline, 4 * 1024 * 1024)? {
                 crate::bounded_output::LimitedOutput::Completed(output) => output,
                 crate::bounded_output::LimitedOutput::Deadline => {
-                    return Err(PullRequestWatchError::Provider(
-                        "PR observation exceeded its deadline".into(),
-                    ));
+                    let reason = if deadline == std::time::Duration::from_secs(3) {
+                        "PR observation exceeded its three-second deadline".to_string()
+                    } else {
+                        format!(
+                            "PR observation exceeded its {}ms deadline",
+                            deadline.as_millis()
+                        )
+                    };
+                    return Err(PullRequestWatchError::Provider(reason));
                 }
                 crate::bounded_output::LimitedOutput::OutputLimit => {
                     return Err(PullRequestWatchError::Provider(
