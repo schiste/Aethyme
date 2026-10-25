@@ -207,6 +207,9 @@ fn pressure_report_does_not_probe_each_session_pid() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    // The override names a container, while the broker binds a new repository
+    // root beneath it. Fresh binding requires that container to exist.
+    std::fs::create_dir_all(fixture.worktree_root()).unwrap();
     let started = common::broker_cli_for_fixture(
         CLI,
         &["start", "--task", "pressure fixture", "--json"],
@@ -218,7 +221,9 @@ fn pressure_report_does_not_probe_each_session_pid() {
     .unwrap();
     assert!(
         started.status.success(),
-        "{}",
+        "start failed ({:?}): stdout={}\nstderr={}",
+        started.status.code(),
+        String::from_utf8_lossy(&started.stdout),
         String::from_utf8_lossy(&started.stderr)
     );
     let value: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
