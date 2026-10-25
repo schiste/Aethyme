@@ -233,7 +233,7 @@ pub(super) fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
                 .repository_watches(false)?
                 .into_iter()
                 .filter(|watch| watch.status == crate::RepositoryWatchStatus::Active)
-                .filter_map(|watch| watch.next_poll_at)
+                .map(|watch| watch.next_poll_at.unwrap_or(now))
                 .chain(report.next_tick_at)
                 .min();
             if parsed.json {

@@ -822,7 +822,16 @@ fn an_empty_delivery_poll_records_no_command_telemetry() {
 #[test]
 fn cli_tick_refuses_a_competing_owner_then_succeeds_after_release() {
     const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
-    let (root, broker, _session_id) = broker_fixture();
+    let (root, mut broker, session_id) = broker_fixture();
+    let repository = broker
+        .start_repository_watch(
+            session_id,
+            "owner/future",
+            &aethyme_broker::RepositoryWatchOptions::default(),
+            &FakeRepositoryProvider(Mutex::new(VecDeque::from([vec![]]))),
+            4_000_000_000_000,
+        )
+        .unwrap();
     let run_dir = root.path().join(".aethyme/run");
     std::fs::create_dir_all(&run_dir).unwrap();
     let claim = std::fs::OpenOptions::new()
@@ -867,6 +876,7 @@ fn cli_tick_refuses_a_competing_owner_then_succeeds_after_release() {
     assert_eq!(report["provider_budget"]["max_calls_per_phase"], 4);
     assert_eq!(report["provider_budget"]["deadline_ms"], 30_000);
     assert_eq!(report["provider_budget"]["calls"], 0);
+    assert_eq!(report["next_tick_at"], repository.next_poll_at.unwrap());
 }
 
 struct FakeRepositoryProvider(Mutex<VecDeque<Vec<aethyme_broker::RepositoryPullRequest>>>);
