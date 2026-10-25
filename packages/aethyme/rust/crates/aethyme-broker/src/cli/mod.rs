@@ -304,6 +304,10 @@ Usage:
       limit. Any cleanup must succeed, and the child and optional cleanup
       groups must be observed absent; otherwise reconcile the exact
       generation after reviewing cleanup.
+  aethyme broker resources artifact-run <path> --session <id> [--wait <duration>] [--cleanup-command <shell>] [--json] -- <command> ...
+      Hold a strict cooperative claim on one generated file through command
+      and cleanup. Other sessions cannot take it over merely because of idle
+      activity. Run from the named session's own worktree root.
   aethyme broker resources renew <grant.json> --ttl <seconds> [--json]
   aethyme broker resources release <grant.json> [--json]
       Renew or release with the exact grant returned by acquire. Tokens are

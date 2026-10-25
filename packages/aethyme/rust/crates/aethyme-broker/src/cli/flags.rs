@@ -292,6 +292,10 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("resources pressure", &[]),
     ("resources acquire", &["--wait", "--grant-out"]),
     ("resources run", &["--wait", "--cleanup-command", "--"]),
+    (
+        "resources artifact-run",
+        &["--session", "--wait", "--cleanup-command", "--"],
+    ),
     ("resources renew", &["--ttl"]),
     ("resources release", &["--ttl"]),
     ("resources list", &["--all"]),

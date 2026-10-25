@@ -26,6 +26,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- For commands protected by repository-relative artifact claims, verify that
+  the named session owns the checkout and the generator runs at its root. Test
+  nested-directory and wrong-worktree refusals before dispatch; a normalized
+  resource key alone cannot align a child command's relative output paths.
 - Git configuration values such as `remote.*.uploadpack` and `core.sshCommand`
   contain shell commands. Quote embedded executable paths for that shell,
   separately from the argv used to set the value. Exercise transport fixtures
