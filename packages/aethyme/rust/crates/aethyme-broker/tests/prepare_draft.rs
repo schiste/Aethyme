@@ -210,7 +210,15 @@ fn storage_guidance_distinguishes_shared_stores_from_worktree_allocations() {
         touch(tmp.path(), "package.json", "{}\n");
         touch(tmp.path(), lockfile, contents);
         let draft = init::draft_prepare_config(tmp.path()).expect("node draft");
-        let prose = draft.split_whitespace().collect::<Vec<_>>().join(" ");
+        let prose = draft
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix('#'))
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(prose.contains("same filesystem"));
         assert!(prose.contains("does not guarantee deduplication"));
         assert!(prose.contains("The command must use"));
