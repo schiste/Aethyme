@@ -289,7 +289,7 @@ impl OpenSessionArtifactLapState {
         match value {
             None | Some("") => Self::Clear,
             Some("retrying") => Self::Retrying,
-            Some("failed") | Some(_) => Self::Failed,
+            _ => Self::Failed,
         }
     }
 
@@ -5626,12 +5626,18 @@ impl Broker {
         };
         let raw_through = self.artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_THROUGH_KEY)?;
         let starts_fresh_lap = matches!(raw_through.as_deref(), None | Some("") | Some("0"));
-        if starts_fresh_lap && lap_state == OpenSessionArtifactLapState::Failed {
-            lap_state = lap_state.begin_fresh_lap();
-            self.artifact_sweep_meta_set(
-                OPEN_SESSION_ARTIFACT_LAP_STATE_KEY,
-                lap_state.metadata_value(),
-            )?;
+        if starts_fresh_lap {
+            if cursor != 0 {
+                cursor = 0;
+                self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_CURSOR_KEY, "0")?;
+            }
+            if lap_state == OpenSessionArtifactLapState::Failed {
+                lap_state = lap_state.begin_fresh_lap();
+                self.artifact_sweep_meta_set(
+                    OPEN_SESSION_ARTIFACT_LAP_STATE_KEY,
+                    lap_state.metadata_value(),
+                )?;
+            }
         }
         let through = match raw_through.as_deref() {
             None | Some("") | Some("0") => {
