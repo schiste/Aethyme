@@ -16,21 +16,18 @@ version and the target, oldest first. Each schema migration runs on first open
 and is one-way, so rollback is limited to the oldest binary that still reads
 the newest schema you have opened.
 
-Breaking releases: [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
+Breaking releases: [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
 [v0.7.25](#v0725), [v0.7.23](#v0723), [v0.7.22](#v0722), [v0.7.19](#v0719),
 [v0.7.18](#v0718), [v0.7.16](#v0716), [v0.7.9](#v079), [v0.7.8](#v078),
 [v0.7.4](#v074), [v0.7.2](#v072),
 [v0.7.1](#v071), [v0.5.0](#v050), [v0.3.0](#v030),
 [v0.2.2](#v022), [v0.2.0](#v020).
 
-Unreleased migration note: [schema 55 guarded-exec receipts and schema 54
-worktree-root binding](#unreleased-schema-55-guarded-exec-receipts-and-schema-54-worktree-root-binding).
+## v0.8.31
 
-## Unreleased: schema 55 guarded-exec receipts and schema 54 worktree-root binding
-
-These notes describe the implementation on main; no release version has been
-assigned. They are not a report that an existing database has been migrated or
-that rollout has occurred.
+This release includes the durable worktree-root and guarded-execution changes
+previously documented as unreleased, plus additive incident and helper records.
+Install the matching router and engine as one pair.
 
 ### Compatibility
 
@@ -41,11 +38,13 @@ inspect the filesystem, choose a worktree root, create a repository UUID
 marker, or bind a root. Existing session, operation, and queue rows are
 retained.
 
-The current broker schema is version 55. Its additive migration creates
+The broker schema is version 57. The v55 additive migration creates
 observational receipts for guarded `broker exec`; receipts do not authorize
 process cleanup or session transitions and contain no command, environment, or
-output data. This migration does not raise `MIN_COMPATIBLE_SCHEMA`. A
-schema-52-compatible writer can continue to use a schema-55 database while its
+output data. This migration does not raise `MIN_COMPATIBLE_SCHEMA`. Schemas
+56 and 57 add observational base-failure incidents and direct-child
+helper outcomes; neither changes gate authority or raises the global floor. A
+schema-52-compatible writer can continue to use a schema-57 database while its
 stored compatibility floor remains 52 and no other feature has raised that
 floor.
 Explicitly binding a legacy root or reserving a fresh root raises the stored
@@ -56,9 +55,9 @@ own binding row, but the compatibility floor applies to the shared database.
 
 A placement or binding plan can open the database and therefore may apply
 pending migrations and attach its unbound row, even though the plan does not
-create or bind a worktree root. These notes describe source behavior only; no
-live broker database was migrated and no deployment has occurred for the
-schema-55 change.
+create or bind a worktree root. Verify the actual database version and stored
+compatibility floor during each deployment; the release version alone does not
+establish either value.
 
 ### Before migrating or binding
 
@@ -71,11 +70,10 @@ wherever that database can be opened, before applying a migration or root
 binding. Preserve the repository's Git common directory, selected worktree
 root, and host worktree registry; the binding workflow does not relocate them.
 
-### Migrate and bind
+### Migrate and verify
 
-The first normal writable open applies the additive v55 migration and any
-earlier pending migrations. It does not bind a legacy root. Inspect the selected
-placement with
+The first normal writable open applies pending migrations through v57. It does
+not bind a legacy root. Inspect the selected placement with
 `aethyme broker advanced worktree-root --json`. For an existing legacy root,
 review `aethyme broker advanced worktree-root binding plan <exact-root>
 <keyed_container|direct_root> --json`, then apply only its displayed digest:
@@ -100,6 +98,12 @@ sidecar states. It does not discard unknown files, reset the database, or
 select a different root. Do not repair a refusal by editing markers or binding
 rows by hand.
 
+For repositories with committed graph authority, update the committed engine
+pin and regenerate fragments through the new pair's reviewed `graph refresh
+plan` / `graph refresh execute --confirm <sha256>` workflow. Do not rewrite
+fragments solely to suppress a version mismatch. Repositories with graph
+authority disabled do not need a fragment refresh.
+
 ### Rollback
 
 Before a root-binding transition, a migrated database can be opened by an
@@ -114,7 +118,7 @@ writers stopped: restore the database from a pre-transition backup together
 with its corresponding repository UUID marker, worktree-root marker, and host
 registry state. Restoring only the database is not a supported rollback. That
 recovery procedure has not been run against an existing user database as part
-of this unreleased note.
+of this release-note preparation.
 
 ## Installing or updating (every release)
 

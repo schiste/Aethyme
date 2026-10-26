@@ -4,6 +4,26 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.31] - 2026-10-26
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0831).
+
+### Fixed
+
+- Routine text, compact and summary status use a read-only observation path instead of repeating startup maintenance; successful Git identity and configuration reads are reused within the invocation.
+- Verify-only worktree startup selects the freshly fetched default branch without reconciling historical integration promotions. Native allocation remains independent of the general Git write lock held by unrelated commit hooks.
+- Startup cleanup pages historical sessions, resumes deferred work fairly, and preserves spawned-worktree identity and uncertain process-use protections.
+- Checkout and preparation-cache reclamation validate repository-root ownership, retain active users, reject incomplete liveness scans, and serialize root deletion with worktree allocation.
+- Fresh-base diagnostics retain fetch failures and actionable recovery guidance; guarded execution records bounded helper observations after caller loss.
+- Graph consumers retain revision-bound documentation sections, typed import endpoints and addressable configuration references, including after checkout relocation.
+- PR observation bounds provider work and preserves legacy commit-status failures and merge-state changes. Explicit opt-in service plans bind their runtime identity and installed generation.
+
+### Changed
+
+- Broker schema 57 adds worktree-root binding, guarded-exec receipts, base-failure incidents and helper observations. Root binding can raise the stored compatibility floor to 54; review the upgrade procedure before changing databases or runtimes.
+- Shared preparation caches follow the selected worktree volume. Storage admission and bounded cleanup retain conservative ownership and rollback rules.
+- Performance diagnostics retain workload, binary and source identity; latency budgets remain warnings rather than ordinary test timing assertions.
+
 ## [0.8.30] - 2026-10-22
 
 ### Fixed
