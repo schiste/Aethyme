@@ -15,6 +15,16 @@ so verify which executable resumed agents will use; the repo-local selector
 does not change their PATH. Preserve concurrent work and never automatically
 restore a pre-upgrade database over newer activity.
 
+Checkout capacity is configured with `[worktrees] max_checkouts = <count>` in
+`.aethyme/config.toml` on the fetched default branch. A working-copy edit alone
+may not change the effective cap: land the configuration and refresh upstream
+before claiming it is active. Keep a finite limit while reclaiming a backlog;
+raising capacity does not reclaim storage. For closed checkouts, targeted
+`broker finish cleanup <session-id> --json` avoids the bulk plan's recursive
+size inventory while retaining fresh delivery and live-owner checks. Inspect
+ignored artifacts before cleanup and preserve evidence that cannot be rebuilt;
+never use `--force` merely to clear a capacity refusal.
+
 Follow this protocol:
 
 When `aethyme broker advanced hooks install` is active (or its pre-commit command is
