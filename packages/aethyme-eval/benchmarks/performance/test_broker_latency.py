@@ -3,9 +3,12 @@ import copy
 import json
 from pathlib import Path
 import unittest
+import tempfile
+from unittest.mock import patch
 
 from broker_latency import (
     assess,
+    run_playground,
     parse_doctor_diagnostics,
     parse_status_diagnostics,
     summarize_diagnostic,
@@ -14,6 +17,24 @@ from broker_latency import (
     validate_session_count,
     validate_resource_inventory,
 )
+
+
+class PlaygroundSetupTests(unittest.TestCase):
+    def test_worktree_root_exists_before_first_child(self):
+        class StopBeforeDispatch(Exception):
+            pass
+
+        def inspect_child(*args, **kwargs):
+            worktree_root = Path(kwargs['env']['AETHYME_WORKTREE_ROOT'])
+            self.assertTrue(worktree_root.is_dir(),
+                            'worktree root must exist before dispatch')
+            raise StopBeforeDispatch()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch('broker_latency.subprocess.run', side_effect=inspect_child) as child:
+                with self.assertRaises(StopBeforeDispatch):
+                    run_playground(Path('/usr/bin/true'), 1, Path(temporary))
+                child.assert_called_once()
 
 
 class BudgetPolicyTests(unittest.TestCase):

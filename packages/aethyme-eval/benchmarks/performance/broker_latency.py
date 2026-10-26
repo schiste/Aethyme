@@ -396,7 +396,8 @@ def run_playground(binary, samples, output, aged_released_resource_leases=0,
     with tempfile.TemporaryDirectory(prefix='aethyme-broker-latency-') as temporary:
         root = Path(temporary).resolve()
         repo, home, tools = (root / name for name in ('repo', 'home', 'bin'))
-        for path in (repo, home, tools, root / 'preparation', root / 'tmp'):
+        for path in (repo, home, tools, root / 'preparation', root / 'tmp',
+                     root / 'worktrees'):
             path.mkdir()
         shutil.copytree(HERE / 'fixture', repo, dirs_exist_ok=True)
         # Allow only process/platform basics, never inherited credentials, proxies,
