@@ -387,6 +387,18 @@ impl Broker {
         session_id: i64,
         confirm: &str,
     ) -> Result<CleanupResolveOutcome, BrokerOpError> {
+        self.cleanup_resolve_apply_with_post_archive_hook(session_id, confirm, || {})
+    }
+
+    fn cleanup_resolve_apply_with_post_archive_hook<F>(
+        &mut self,
+        session_id: i64,
+        confirm: &str,
+        after_archive_verified: F,
+    ) -> Result<CleanupResolveOutcome, BrokerOpError>
+    where
+        F: FnOnce(),
+    {
         if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BrokerOpError::CleanupResolveConfirmationNotSha256);
         }
@@ -417,6 +429,7 @@ impl Broker {
             });
         }
         std::fs::rename(&partial, &archive).map_err(|error| io_error(&archive, error))?;
+        after_archive_verified();
 
         // The archive is complete and verified. Cleanup rechecks protected
         // ignored content under the lifecycle claim before removing the tree.
@@ -923,5 +936,47 @@ mod tests {
         let mut expected = b"symlink\0".to_vec();
         expected.extend_from_slice(tmp.path().join("secret").as_os_str().as_encoded_bytes());
         assert_eq!(described.sha256, sha256_hex(&expected));
+    }
+
+    #[test]
+    fn ignored_content_added_after_archive_verification_keeps_the_worktree() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join(".gitignore"), "/.aethyme/\n/private.txt\n").unwrap();
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("archive cleanup recheck fixture", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        std::fs::write(worktree.join("new.txt"), "recover me\n").unwrap();
+        broker.close(session.id).unwrap();
+
+        let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+        let digest = plan.digest.clone();
+        let late_ignored = worktree.join("private.txt");
+        let outcome = broker
+            .cleanup_resolve_apply_with_post_archive_hook(session.id, &digest, move || {
+                std::fs::write(&late_ignored, "preserve me\n").unwrap();
+            })
+            .unwrap();
+
+        assert!(!outcome.worktree_removed);
+        assert!(outcome.cleanup_error.as_deref().is_some_and(|error| {
+            error.contains("archive resolution refuses protected ignored content")
+        }));
+        assert!(outcome.archive.join(MANIFEST_FILE).is_file());
+        assert!(outcome.archive.join("untracked/new.txt").is_file());
+        assert!(worktree.is_dir());
+        assert_eq!(
+            std::fs::read(worktree.join("private.txt")).unwrap(),
+            b"preserve me\n"
+        );
     }
 }

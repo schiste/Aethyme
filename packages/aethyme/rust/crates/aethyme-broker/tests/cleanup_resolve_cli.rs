@@ -417,7 +417,7 @@ fn strict_cleanup_policy_refuses_ignored_directory_during_archive_resolution() {
 
 #[cfg(unix)]
 #[test]
-fn default_opaque_ignored_directory_does_not_block_or_expand_the_archive_plan() {
+fn default_opaque_ignored_directory_is_removed_without_following_nested_symlinks() {
     let tmp = repo();
     let (id, worktree) = dirty_closed_session(tmp.path());
     let opaque = worktree.join("opaque-cache");
@@ -437,8 +437,16 @@ fn default_opaque_ignored_directory_does_not_block_or_expand_the_archive_plan() 
         .map(|file| file["path"].as_str().unwrap())
         .collect();
     assert_eq!(untracked, ["data.bin", "link", "notes/todo.txt"]);
-    assert_eq!(std::fs::read(target).unwrap(), b"untouched\n");
     assert!(opaque.join("nested.bin").is_file());
+
+    let outcome = json(&apply(
+        tmp.path(),
+        &id,
+        reviewed["digest"].as_str().unwrap(),
+    ));
+    assert_eq!(outcome["worktree_removed"], true, "{outcome}");
+    assert!(!worktree.exists());
+    assert_eq!(std::fs::read(target).unwrap(), b"untouched\n");
 }
 
 /// Any failure between the confirmed plan and removal keeps the worktree.
