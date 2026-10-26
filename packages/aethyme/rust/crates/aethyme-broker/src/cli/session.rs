@@ -2101,7 +2101,7 @@ fn render_cleanup_resolve_plan(plan: &crate::CleanupResolvePlan) {
         human_bytes(plan.untracked_bytes),
     );
     out!("  archive root: {}", plan.archive_root.display());
-    out!("  ignored files (build output, caches) are not archived");
+    out!("  ignored paths allowed by cleanup policy are not archived");
     out!("  apply: {}", plan.apply_command);
     out!("  discard instead: {}", plan.discard_command);
 }

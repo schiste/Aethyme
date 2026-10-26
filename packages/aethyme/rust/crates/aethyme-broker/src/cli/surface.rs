@@ -102,6 +102,10 @@ pub const ADVANCED_VERBS: &[(&str, &str)] = &[
     ),
     ("ship", "plan or execute a reviewed full-SHA publication"),
     ("review", "plan, run, record and route pull request reviews"),
+    (
+        "review-thread",
+        "reply to or resolve one inline pull request review thread",
+    ),
     ("gates", "validate, draft, scope, run and diagnose gates"),
     ("hooks", "install, remove or inspect the managed git hooks"),
     (
@@ -486,7 +490,7 @@ fn internal_help(verb: &str, action: Option<&str>) -> Option<String> {
     }
     let (_, summary) = ADVANCED_VERBS.iter().find(|(name, _)| *name == verb)?;
     let public = format!("aethyme broker advanced {verb}");
-    let internal = if verb == "worktree-root" {
+    let internal = if matches!(verb, "worktree-root" | "review-thread") {
         format!("advanced {verb}")
     } else {
         verb.to_string()
