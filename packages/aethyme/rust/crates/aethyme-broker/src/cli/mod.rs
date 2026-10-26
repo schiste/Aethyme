@@ -1043,10 +1043,15 @@ pub fn with_status_read_context<T>(args: &[String], operation: impl FnOnce() -> 
 
 fn routine_status(args: &[String]) -> bool {
     args.first().map(String::as_str) == Some("status")
-        && args[1..]
+        && args[1..].iter().all(|arg| {
+            matches!(
+                arg.as_str(),
+                "--json" | "--json-output" | "--summary" | "--compact"
+            )
+        })
+        && (!args
             .iter()
-            .all(|arg| matches!(arg.as_str(), "--json" | "--summary" | "--compact"))
-        && (!args.iter().any(|arg| arg == "--json")
+            .any(|arg| matches!(arg.as_str(), "--json" | "--json-output"))
             || args
                 .iter()
                 .any(|arg| matches!(arg.as_str(), "--summary" | "--compact")))

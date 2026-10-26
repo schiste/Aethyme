@@ -146,13 +146,23 @@ fn routine_status_keeps_abandoned_prepared_operation_visible_without_reaping_it(
         .unwrap();
     let payload = json(&child.output().unwrap());
     assert_eq!(
-        broker.store().coordinated_operation(row.id).unwrap().status,
+        broker
+            .store()
+            .coordinated_operation(row.id)
+            .unwrap()
+            .expect("prepared operation retained")
+            .status,
         OperationStatus::Prepared,
         "routine status performed startup recovery"
     );
-    assert!(
-        payload.to_string().contains("coordinated"),
-        "pending operation omitted: {payload}"
+    assert_eq!(payload["coordinated_operations"]["count"], 1);
+    assert_eq!(
+        payload["coordinated_operations"]["records"][0]["id"],
+        row.id
+    );
+    assert_eq!(
+        payload["coordinated_operations"]["records"][0]["status"],
+        "prepared"
     );
 }
 
@@ -263,4 +273,33 @@ fn status_context_is_scoped_to_one_invocation_even_in_one_process() {
         "identity leaked between status invocations"
     );
     assert!(Path::new(&moved).is_dir());
+}
+
+#[test]
+fn observation_does_not_record_events_and_timing_requires_explicit_opt_in() {
+    let f = fixture();
+    let broker = common::open_fixture_repository_broker(&f).unwrap();
+    let before = broker.store().events_after(0, 1000).unwrap().len();
+    let metrics = f.path().join(".aethyme/logs/command-metrics.jsonl");
+    let before_metrics = std::fs::read(&metrics).unwrap_or_default();
+    // --json-output is the supported alias, including on the observation path.
+    json(
+        &command(&f, &["status", "--summary", "--json-output"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(broker.store().events_after(0, 1000).unwrap().len(), before);
+    assert_eq!(std::fs::read(&metrics).unwrap_or_default(), before_metrics);
+    json(
+        &command(&f, &["status", "--summary", "--json-output"])
+            .env("AETHYME_MEASURE_OUTPUT", "1")
+            .output()
+            .unwrap(),
+    );
+    let after_metrics = std::fs::read_to_string(&metrics).unwrap();
+    assert_eq!(
+        after_metrics.lines().count(),
+        String::from_utf8(before_metrics).unwrap().lines().count() + 1
+    );
+    assert_eq!(broker.store().events_after(0, 1000).unwrap().len(), before);
 }
