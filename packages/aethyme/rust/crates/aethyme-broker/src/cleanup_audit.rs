@@ -68,6 +68,13 @@ pub struct AuditTarget {
     pub warnings: Vec<String>,
 }
 
+/// The immutable audit target and command-local landing cache shared while
+/// classifying each row in one audit.
+struct AuditLandingContext<'a> {
+    target: &'a AuditTarget,
+    cache: &'a mut LandingVerdictCache,
+}
+
 /// Who, if anyone, accounts for an item.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -550,14 +557,17 @@ impl Broker {
                 continue;
             }
             claimed.insert(path_key(&path));
+            let mut landing_context = AuditLandingContext {
+                target: &target,
+                cache: &mut *landing_cache,
+            };
             if let Some(item) = self.audit_session(
                 &session,
                 &path,
                 registration(&path),
                 inventory.is_ok(),
                 plan_items.get(&session.id).copied(),
-                &target,
-                landing_cache,
+                &mut landing_context,
             ) {
                 items.push(item);
             }
@@ -673,8 +683,7 @@ impl Broker {
         registration: Option<&GitWorktreeInfo>,
         inventory_known: bool,
         plan_item: Option<&CleanupWorktreePlan>,
-        target: &AuditTarget,
-        landing_cache: &mut LandingVerdictCache,
+        landing: &mut AuditLandingContext<'_>,
     ) -> Option<AuditItem> {
         let repo = self.repo_handle();
         let present = path.exists();
@@ -726,9 +735,9 @@ impl Broker {
             .chain(branch_tip.iter())
             .map(String::as_str)
             .collect();
-        let committed = self.classify_heads(&heads, target, landing_cache);
+        let committed = self.classify_heads(&heads, landing.target, landing.cache);
         if let Some(committed) = &committed {
-            evidence.push(describe_committed(committed, target));
+            evidence.push(describe_committed(committed, landing.target));
         }
         let plan_eligible = plan_item.is_some_and(CleanupWorktreePlan::eligible);
         if let Some(plan_item) = plan_item {
@@ -779,7 +788,7 @@ impl Broker {
                 checkout,
                 inspection_error.as_deref(),
                 plan_item,
-                target,
+                landing.target,
                 (tracked_changes, untracked_files),
                 id,
             )
