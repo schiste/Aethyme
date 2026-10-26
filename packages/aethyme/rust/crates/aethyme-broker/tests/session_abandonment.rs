@@ -294,10 +294,10 @@ fn legacy_shared_daemon_binding_is_unknown_not_a_live_task_or_a_dead_holder() {
         table.is_alive(&shared),
         "fixture service is genuinely running"
     );
-    assert!(
-        session_holder::recorded_holder(broker.store(), session.id)
-            .unwrap()
-            .is_none()
+    assert_eq!(
+        session_holder::recorded_holder(broker.store(), session.id).unwrap(),
+        Some(shared.clone()),
+        "ambiguous ownership history must remain visible for admission"
     );
     let (observation, _) =
         lease_liveness::observe_holder(broker.store(), session.id, Some(&table), now_ms()).unwrap();
@@ -319,8 +319,17 @@ fn legacy_shared_daemon_binding_is_unknown_not_a_live_task_or_a_dead_holder() {
         "unidentified must not become permission to delete"
     );
     let caller = session_holder::Caller::Agent(table.process(5000).unwrap());
+    let refused = session_holder::admit(broker.store(), session.id, &caller, &table, false);
+    assert!(matches!(
+        refused,
+        Err(aethyme_broker::BrokerOpError::SessionHeldByAnotherAgent { .. })
+    ));
+    assert_eq!(
+        session_holder::recorded_holder(broker.store(), session.id).unwrap(),
+        Some(shared)
+    );
     let admitted =
-        session_holder::admit(broker.store(), session.id, &caller, &table, false).unwrap();
+        session_holder::admit(broker.store(), session.id, &caller, &table, true).unwrap();
     assert!(matches!(
         admitted,
         session_holder::HolderCheck::Bound { .. }

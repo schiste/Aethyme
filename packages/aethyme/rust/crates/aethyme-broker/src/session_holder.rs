@@ -204,7 +204,7 @@ impl ProcessTable {
 /// running one of them.
 /// A shared app-server transports many independent tasks. Its process lifetime
 /// cannot establish that any one broker session is still being worked on.
-fn is_shared_agent_service(args: &str) -> bool {
+pub(crate) fn is_shared_agent_service(args: &str) -> bool {
     let mut words = args.split_whitespace();
     let Some(first) = words.next() else {
         return false;
@@ -372,10 +372,7 @@ pub fn recorded_holder(
     Ok(event
         .payload_json
         .as_deref()
-        .and_then(|payload| serde_json::from_str::<AgentProcess>(payload).ok())
-        // Legacy events may name a shared daemon. Preserve the event, but do
-        // not mistake service uptime for this session's holder identity.
-        .filter(|agent| !is_shared_agent_service(&agent.command)))
+        .and_then(|payload| serde_json::from_str::<AgentProcess>(payload).ok()))
 }
 
 /// Record `caller` as the session's holder, unconditionally. For `start` and
@@ -424,7 +421,10 @@ pub fn admit(
     if &holder == agent {
         return Ok(HolderCheck::Held);
     }
-    let why = if !table.is_alive(&holder) {
+    let shared_service = is_shared_agent_service(&holder.command);
+    let why = if shared_service && take_over {
+        reason::TAKE_OVER
+    } else if !shared_service && !table.is_alive(&holder) {
         reason::HOLDER_GONE
     } else if take_over {
         reason::TAKE_OVER
