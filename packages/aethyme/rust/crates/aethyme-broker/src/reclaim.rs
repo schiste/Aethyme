@@ -14,6 +14,8 @@
 //! coordinated lifecycle protocol.
 
 use std::collections::BTreeSet;
+use std::ffi::OsString;
+use std::fs::{DirEntry, FileType};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -40,8 +42,9 @@ pub(crate) struct BoundedReclaimScan {
 }
 
 /// A bounded depth-first cursor for one worktree scan. Each frame records a
-/// directory identity and the last entry inspected so a later pass can resume
-/// without retaining an unbounded list of directories or paths.
+/// directory identity, the last yielded entry, its ordinal, and a rolling
+/// digest of the yielded prefix so a later pass can resume without retaining
+/// an unbounded list of directories or paths.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ReclaimScanFrontier {
     frames: Vec<ReclaimScanFrame>,
@@ -63,6 +66,11 @@ impl ReclaimScanFrontier {
                     && frame.after_entry_ordinal
                         <= RESUMABLE_RECLAIM_SCAN_REPLAY_ENTRY_BUDGET_PER_DIRECTORY
                     && (frame.after_entry.is_some() == (frame.after_entry_ordinal > 0))
+                    && (frame.after_entry.is_some() == frame.after_entry_prefix_digest.is_some())
+                    && frame
+                        .after_entry_prefix_digest
+                        .as_deref()
+                        .is_none_or(valid_reclaim_prefix_digest)
             })
     }
 
@@ -74,6 +82,7 @@ impl ReclaimScanFrontier {
                     relative: path.to_owned(),
                     after_entry: Some(format!("entry-{ordinal}")),
                     after_entry_ordinal: ordinal + 1,
+                    after_entry_prefix_digest: Some(initial_reclaim_prefix_digest()),
                     identity: ReclaimDirectoryIdentity {
                         #[cfg(unix)]
                         device: 0,
@@ -94,7 +103,158 @@ struct ReclaimScanFrame {
     relative: String,
     after_entry: Option<String>,
     after_entry_ordinal: usize,
+    #[serde(default)]
+    after_entry_prefix_digest: Option<String>,
     identity: ReclaimDirectoryIdentity,
+}
+
+const RECLAIM_PREFIX_DIGEST_HEX_LEN: usize = 64;
+
+fn valid_reclaim_prefix_digest(value: &str) -> bool {
+    value.len() == RECLAIM_PREFIX_DIGEST_HEX_LEN
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn initial_reclaim_prefix_digest() -> String {
+    format!("{:x}", Sha256::digest(b"aethyme-reclaim-prefix-v1\0"))
+}
+
+fn extend_reclaim_prefix_digest(previous: &str, fingerprint: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"aethyme-reclaim-prefix-step-v1\0");
+    digest.update((previous.len() as u64).to_be_bytes());
+    digest.update(previous.as_bytes());
+    digest.update((fingerprint.len() as u64).to_be_bytes());
+    digest.update(fingerprint);
+    format!("{:x}", digest.finalize())
+}
+
+fn append_length_delimited(output: &mut Vec<u8>, value: &[u8]) {
+    output.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    output.extend_from_slice(value);
+}
+
+fn append_error_kind(output: &mut Vec<u8>, kind: io::ErrorKind) {
+    let encoded = format!("{kind:?}");
+    append_length_delimited(output, encoded.as_bytes());
+}
+
+fn read_dir_item_fingerprint(
+    raw_name: Option<&[u8]>,
+    file_type_tag: Result<u8, io::ErrorKind>,
+    read_error: Option<io::ErrorKind>,
+) -> Vec<u8> {
+    let mut fingerprint = Vec::with_capacity(64 + raw_name.map_or(0, |name| name.len()));
+    if let Some(error) = read_error {
+        // Distinguish a failed iterator item from every successfully yielded
+        // entry, and preserve its error kind as a length-delimited field.
+        fingerprint.push(0);
+        append_error_kind(&mut fingerprint, error);
+        return fingerprint;
+    }
+
+    fingerprint.push(1);
+    append_length_delimited(&mut fingerprint, raw_name.unwrap_or_default());
+    match file_type_tag {
+        Ok(tag) => {
+            fingerprint.push(2);
+            fingerprint.push(tag);
+        }
+        Err(error) => {
+            fingerprint.push(3);
+            append_error_kind(&mut fingerprint, error);
+        }
+    }
+    fingerprint
+}
+
+fn reclaim_file_type_tag(file_type: &FileType) -> u8 {
+    if file_type.is_symlink() {
+        3
+    } else if file_type.is_dir() {
+        1
+    } else if file_type.is_file() {
+        2
+    } else {
+        4
+    }
+}
+
+struct ReclaimReadDirItem {
+    name: Option<OsString>,
+    path: Option<PathBuf>,
+    file_type: Option<FileType>,
+    entry_error: Option<io::ErrorKind>,
+    file_type_error: Option<io::ErrorKind>,
+    fingerprint: Vec<u8>,
+}
+
+impl ReclaimReadDirItem {
+    fn capture(entry: &io::Result<DirEntry>) -> Self {
+        match entry {
+            Err(error) => {
+                let kind = error.kind();
+                Self {
+                    name: None,
+                    path: None,
+                    file_type: None,
+                    entry_error: Some(kind),
+                    file_type_error: None,
+                    fingerprint: read_dir_item_fingerprint(None, Err(kind), Some(kind)),
+                }
+            }
+            Ok(entry) => {
+                let name = entry.file_name();
+                let path = entry.path();
+                let (file_type, file_type_error, file_type_tag) = match entry.file_type() {
+                    Ok(file_type) => {
+                        let tag = reclaim_file_type_tag(&file_type);
+                        (Some(file_type), None, Ok(tag))
+                    }
+                    Err(error) => {
+                        let kind = error.kind();
+                        (None, Some(kind), Err(kind))
+                    }
+                };
+                let fingerprint =
+                    read_dir_item_fingerprint(Some(name.as_encoded_bytes()), file_type_tag, None);
+                Self {
+                    name: Some(name),
+                    path: Some(path),
+                    file_type,
+                    entry_error: None,
+                    file_type_error,
+                    fingerprint,
+                }
+            }
+        }
+    }
+
+    fn is_incomplete(&self) -> bool {
+        self.entry_error.is_some()
+            || self.file_type_error.is_some()
+            || self
+                .name
+                .as_ref()
+                .is_none_or(|name| name.to_str().is_none())
+    }
+
+    fn mark_incomplete(&self, incomplete: &mut ReclaimScanIncomplete, scope: &str) {
+        if self.entry_error.is_some() {
+            incomplete.mark("entry_unavailable", scope);
+            return;
+        }
+        if self
+            .name
+            .as_ref()
+            .is_some_and(|name| name.to_str().is_none())
+        {
+            incomplete.mark("non_utf8_entry", scope);
+        }
+        if self.file_type_error.is_some() {
+            incomplete.mark("entry_unavailable", scope);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,22 +271,30 @@ enum ReclaimMarkerReplayProgress {
 struct ReclaimMarkerReplay<'a> {
     marker: &'a str,
     expected_ordinal: usize,
+    expected_prefix_digest: &'a str,
     observed_ordinal: usize,
+    observed_prefix_digest: String,
 }
 
 impl<'a> ReclaimMarkerReplay<'a> {
-    fn new(marker: &'a str, expected_ordinal: usize) -> Self {
+    fn new(marker: &'a str, expected_ordinal: usize, expected_prefix_digest: &'a str) -> Self {
         Self {
             marker,
             expected_ordinal,
+            expected_prefix_digest,
             observed_ordinal: 0,
+            observed_prefix_digest: initial_reclaim_prefix_digest(),
         }
     }
 
-    fn observe(&mut self, name: Option<&str>) -> ReclaimMarkerReplayProgress {
+    fn observe(&mut self, name: Option<&str>, fingerprint: &[u8]) -> ReclaimMarkerReplayProgress {
         self.observed_ordinal = self.observed_ordinal.saturating_add(1);
+        self.observed_prefix_digest =
+            extend_reclaim_prefix_digest(&self.observed_prefix_digest, fingerprint);
         if name == Some(self.marker) {
-            return if self.observed_ordinal == self.expected_ordinal {
+            return if self.observed_ordinal == self.expected_ordinal
+                && self.observed_prefix_digest == self.expected_prefix_digest
+            {
                 ReclaimMarkerReplayProgress::Matched
             } else {
                 ReclaimMarkerReplayProgress::Changed
@@ -1067,24 +1235,22 @@ pub(crate) fn scan_worktree_resumable(
         budget.complete = false;
         incomplete.mark("git_checkout_unavailable", "");
     }
-    let mut walk = Walk {
-        worktree,
-        checkout: checkout.as_ref(),
-        active,
-        extras,
-        sizing: Sizing::Skip,
-        budget: &mut budget,
+    let mut frames = match frontier {
+        Some(frontier) if reclaim_frontier_is_current(worktree, &frontier) => frontier.frames,
+        Some(_) => {
+            budget.complete = false;
+            incomplete.mark("cursor_changed", "");
+            Vec::new()
+        }
+        None => Vec::new(),
     };
-    let mut frames = frontier
-        .filter(|frontier| reclaim_frontier_is_current(worktree, frontier))
-        .map(|frontier| frontier.frames)
-        .unwrap_or_default();
     if frames.is_empty() {
         match directory_identity(worktree) {
             Ok(identity) => frames.push(ReclaimScanFrame {
                 relative: String::new(),
                 after_entry: None,
                 after_entry_ordinal: 0,
+                after_entry_prefix_digest: None,
                 identity,
             }),
             Err(_) => {
@@ -1094,7 +1260,7 @@ pub(crate) fn scan_worktree_resumable(
         }
     }
     let mut replay_entries_examined = 0usize;
-    while let Some(mut frame) = frames.pop() {
+    'worktree: while let Some(mut frame) = frames.pop() {
         if budget.expired() {
             budget.complete = false;
             budget.stopped = true;
@@ -1112,9 +1278,12 @@ pub(crate) fn scan_worktree_resumable(
                 // A changed directory invalidates its old marker. Restart
                 // just this subtree; a fresh scan will either finish it or
                 // persist a new cursor under the new identity.
+                budget.complete = false;
+                incomplete.mark("cursor_changed", &frame.relative);
                 frame.identity = identity;
                 frame.after_entry = None;
                 frame.after_entry_ordinal = 0;
+                frame.after_entry_prefix_digest = None;
             }
             Ok(_) => {}
             Err(_) => {
@@ -1133,9 +1302,19 @@ pub(crate) fn scan_worktree_resumable(
         };
         let mut entries = entries;
         if let Some(marker) = frame.after_entry.as_deref() {
+            let Some(expected_prefix_digest) = frame.after_entry_prefix_digest.as_deref() else {
+                budget.complete = false;
+                incomplete.mark("cursor_changed", &frame.relative);
+                frame.after_entry = None;
+                frame.after_entry_ordinal = 0;
+                frame.after_entry_prefix_digest = None;
+                frames.push(frame);
+                continue;
+            };
             let mut found_marker = false;
             let mut replay_limit_reached = false;
-            let mut replay = ReclaimMarkerReplay::new(marker, frame.after_entry_ordinal);
+            let mut replay =
+                ReclaimMarkerReplay::new(marker, frame.after_entry_ordinal, expected_prefix_digest);
             for entry in &mut entries {
                 if budget.expired() {
                     budget.complete = false;
@@ -1151,17 +1330,13 @@ pub(crate) fn scan_worktree_resumable(
                     break;
                 }
                 replay_entries_examined = replay_entries_examined.saturating_add(1);
-                let progress = match entry {
-                    Ok(entry) => {
-                        let name = entry.file_name();
-                        replay.observe(name.to_str())
-                    }
-                    Err(_) => {
-                        budget.complete = false;
-                        incomplete.mark("entry_unavailable", &frame.relative);
-                        replay.observe(None)
-                    }
-                };
+                let item = ReclaimReadDirItem::capture(entry);
+                if item.is_incomplete() {
+                    budget.complete = false;
+                    item.mark_incomplete(&mut incomplete, &frame.relative);
+                }
+                let name = item.name.as_ref().and_then(|name| name.to_str());
+                let progress = replay.observe(name, &item.fingerprint);
                 match progress {
                     ReclaimMarkerReplayProgress::Searching => {}
                     ReclaimMarkerReplayProgress::Matched => {
@@ -1187,15 +1362,21 @@ pub(crate) fn scan_worktree_resumable(
                 // If the marker is missing or moved to another ordinal,
                 // restart this directory rather than silently skipping its
                 // prefix.
+                budget.complete = false;
                 incomplete.mark("cursor_changed", &frame.relative);
                 frame.after_entry = None;
                 frame.after_entry_ordinal = 0;
+                frame.after_entry_prefix_digest = None;
                 frames.push(frame);
                 continue;
             }
         }
-        let mut descended = false;
+        let mut prefix_digest = frame
+            .after_entry_prefix_digest
+            .clone()
+            .unwrap_or_else(initial_reclaim_prefix_digest);
         let mut saved_marker_ordinal = frame.after_entry_ordinal;
+        let mut saved_marker_digest = prefix_digest.clone();
         for entry in &mut entries {
             if budget.expired() {
                 budget.complete = false;
@@ -1216,35 +1397,55 @@ pub(crate) fn scan_worktree_resumable(
                 incomplete.mark("entry_budget", &frame.relative);
                 break;
             }
+            let item = ReclaimReadDirItem::capture(entry);
+            prefix_digest = extend_reclaim_prefix_digest(&prefix_digest, &item.fingerprint);
             frame.after_entry_ordinal = frame.after_entry_ordinal.saturating_add(1);
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => {
-                    budget.complete = false;
-                    incomplete.mark("entry_unavailable", &frame.relative);
-                    continue;
-                }
-            };
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            if item.entry_error.is_some() {
                 budget.complete = false;
-                incomplete.mark("non_utf8_entry", &frame.relative);
+                item.mark_incomplete(&mut incomplete, &frame.relative);
+                continue;
+            }
+            let Some(name) = item
+                .name
+                .as_ref()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+            else {
+                budget.complete = false;
+                item.mark_incomplete(&mut incomplete, &frame.relative);
                 continue;
             };
             frame.after_entry = Some(name.clone());
+            frame.after_entry_prefix_digest = Some(prefix_digest.clone());
             saved_marker_ordinal = frame.after_entry_ordinal;
-            let kind = match entry.file_type() {
-                Ok(kind) => kind,
-                Err(_) => {
+            saved_marker_digest = prefix_digest.clone();
+            let kind = match item.file_type.as_ref() {
+                Some(kind) => kind,
+                None => {
                     budget.complete = false;
-                    incomplete.mark("entry_unavailable", &frame.relative);
+                    item.mark_incomplete(&mut incomplete, &frame.relative);
                     continue;
                 }
             };
             if !kind.is_dir() || kind.is_symlink() || name == ".git" {
                 continue;
             }
-            let path = entry.path();
-            if walk.inspect_directory(&path, &mut found) {
+            let Some(path) = item.path.as_deref() else {
+                budget.complete = false;
+                incomplete.mark("entry_unavailable", &frame.relative);
+                continue;
+            };
+            if {
+                let mut walk = Walk {
+                    worktree,
+                    checkout: checkout.as_ref(),
+                    active,
+                    extras,
+                    sizing: Sizing::Skip,
+                    budget: &mut budget,
+                };
+                walk.inspect_directory(path, &mut found)
+            } {
                 let relative = match path.strip_prefix(worktree).ok().and_then(Path::to_str) {
                     Some(relative) => relative.to_owned(),
                     None => {
@@ -1260,18 +1461,19 @@ pub(crate) fn scan_worktree_resumable(
                     incomplete.mark("depth_limit", &relative);
                     continue;
                 }
-                match directory_identity(&path) {
+                match directory_identity(path) {
                     Ok(identity) => {
                         frame.after_entry_ordinal = saved_marker_ordinal;
+                        frame.after_entry_prefix_digest = Some(saved_marker_digest.clone());
                         frames.push(frame);
                         frames.push(ReclaimScanFrame {
                             relative,
                             after_entry: None,
                             after_entry_ordinal: 0,
+                            after_entry_prefix_digest: None,
                             identity,
                         });
-                        descended = true;
-                        break;
+                        continue 'worktree;
                     }
                     Err(_) => {
                         budget.complete = false;
@@ -1284,11 +1486,12 @@ pub(crate) fn scan_worktree_resumable(
                 break;
             }
         }
-        if descended {
-            continue;
-        }
         if budget.stopped {
             frame.after_entry_ordinal = saved_marker_ordinal;
+            frame.after_entry_prefix_digest = frame
+                .after_entry
+                .as_ref()
+                .map(|_| saved_marker_digest.clone());
             frames.push(frame);
             break;
         }
@@ -2298,6 +2501,7 @@ mod scan_tests {
                 relative: String::new(),
                 after_entry: Some("marker".to_owned()),
                 after_entry_ordinal: RESUMABLE_RECLAIM_SCAN_REPLAY_ENTRY_BUDGET_PER_DIRECTORY + 1,
+                after_entry_prefix_digest: Some(initial_reclaim_prefix_digest()),
                 identity: directory_identity(tmp.path()).unwrap(),
             }],
         };
@@ -2306,35 +2510,108 @@ mod scan_tests {
     }
 
     #[test]
-    fn replay_rejects_a_marker_at_a_different_ordinal_and_counts_unrepresentable_entries() {
+    fn replay_requires_exact_ordinal_and_rolling_prefix_fingerprint() {
+        fn fingerprint(name: &[u8], type_tag: u8) -> Vec<u8> {
+            read_dir_item_fingerprint(Some(name), Ok(type_tag), None)
+        }
+
+        fn digest(entries: &[(&[u8], u8)]) -> String {
+            entries.iter().fold(
+                initial_reclaim_prefix_digest(),
+                |digest, (name, type_tag)| {
+                    extend_reclaim_prefix_digest(&digest, &fingerprint(name, *type_tag))
+                },
+            )
+        }
+
         // The saved cursor says `marker` was the third yielded item, but a
         // reordered directory now reports it second. It must restart rather
         // than resume after the moved marker and omit the intervening entry.
-        let mut reordered = ReclaimMarkerReplay::new("marker", 3);
+        let expected_prefix = digest(&[(b"first", 1), (b"second", 1), (b"marker", 1)]);
+        let mut reordered = ReclaimMarkerReplay::new("marker", 3, &expected_prefix);
         assert_eq!(
-            reordered.observe(Some("first")),
+            reordered.observe(Some("first"), &fingerprint(b"first", 1)),
             ReclaimMarkerReplayProgress::Searching
         );
         assert_eq!(
-            reordered.observe(Some("marker")),
+            reordered.observe(Some("marker"), &fingerprint(b"marker", 1)),
             ReclaimMarkerReplayProgress::Changed
         );
 
-        // Non-UTF8 names and iterator errors have no usable marker, but still
-        // occupy positions in the ReadDir stream and therefore count toward
-        // the saved ordinal on both scan and replay.
-        let mut stable_with_unrepresentable_entry = ReclaimMarkerReplay::new("marker", 3);
+        // Even when the marker remains at ordinal three, a different prefix
+        // item must invalidate it. The digest binds both order and type.
+        let mut same_ordinal_changed_prefix =
+            ReclaimMarkerReplay::new("marker", 3, &expected_prefix);
         assert_eq!(
-            stable_with_unrepresentable_entry.observe(Some("first")),
+            same_ordinal_changed_prefix
+                .observe(Some("replacement"), &fingerprint(b"replacement", 1),),
             ReclaimMarkerReplayProgress::Searching
         );
         assert_eq!(
-            stable_with_unrepresentable_entry.observe(None),
+            same_ordinal_changed_prefix.observe(Some("second"), &fingerprint(b"second", 1)),
             ReclaimMarkerReplayProgress::Searching
         );
         assert_eq!(
-            stable_with_unrepresentable_entry.observe(Some("marker")),
+            same_ordinal_changed_prefix.observe(Some("marker"), &fingerprint(b"marker", 1)),
+            ReclaimMarkerReplayProgress::Changed
+        );
+
+        let mut changed_type = ReclaimMarkerReplay::new("marker", 3, &expected_prefix);
+        changed_type.observe(Some("first"), &fingerprint(b"first", 3));
+        changed_type.observe(Some("second"), &fingerprint(b"second", 1));
+        assert_eq!(
+            changed_type.observe(Some("marker"), &fingerprint(b"marker", 1)),
+            ReclaimMarkerReplayProgress::Changed
+        );
+
+        // Raw non-UTF8 name bytes are fingerprinted even though they cannot
+        // produce a marker string; scan and replay count that yielded item.
+        let expected_non_utf8_prefix = digest(&[(b"first", 1), (&[0xff], 1), (b"marker", 1)]);
+        let mut stable_with_non_utf8_entry =
+            ReclaimMarkerReplay::new("marker", 3, &expected_non_utf8_prefix);
+        assert_eq!(
+            stable_with_non_utf8_entry.observe(Some("first"), &fingerprint(b"first", 1)),
+            ReclaimMarkerReplayProgress::Searching
+        );
+        assert_eq!(
+            stable_with_non_utf8_entry.observe(None, &fingerprint(&[0xff], 1)),
+            ReclaimMarkerReplayProgress::Searching
+        );
+        assert_eq!(
+            stable_with_non_utf8_entry.observe(Some("marker"), &fingerprint(b"marker", 1)),
             ReclaimMarkerReplayProgress::Matched
+        );
+
+        let mut different_non_utf8_prefix =
+            ReclaimMarkerReplay::new("marker", 3, &expected_non_utf8_prefix);
+        different_non_utf8_prefix.observe(Some("first"), &fingerprint(b"first", 1));
+        different_non_utf8_prefix.observe(None, &fingerprint(&[0xfe], 1));
+        assert_eq!(
+            different_non_utf8_prefix.observe(Some("marker"), &fingerprint(b"marker", 1)),
+            ReclaimMarkerReplayProgress::Changed
+        );
+
+        let not_found = io::ErrorKind::NotFound;
+        let permission_denied = io::ErrorKind::PermissionDenied;
+        let expected_error_digest = extend_reclaim_prefix_digest(
+            &extend_reclaim_prefix_digest(
+                &extend_reclaim_prefix_digest(
+                    &initial_reclaim_prefix_digest(),
+                    &fingerprint(b"first", 1),
+                ),
+                &read_dir_item_fingerprint(None, Err(not_found), Some(not_found)),
+            ),
+            &fingerprint(b"marker", 1),
+        );
+        let mut changed_error = ReclaimMarkerReplay::new("marker", 3, &expected_error_digest);
+        changed_error.observe(Some("first"), &fingerprint(b"first", 1));
+        changed_error.observe(
+            None,
+            &read_dir_item_fingerprint(None, Err(permission_denied), Some(permission_denied)),
+        );
+        assert_eq!(
+            changed_error.observe(Some("marker"), &fingerprint(b"marker", 1)),
+            ReclaimMarkerReplayProgress::Changed
         );
     }
 
@@ -2342,17 +2619,57 @@ mod scan_tests {
     fn resumable_frontier_requires_marker_and_ordinal_to_be_consistent() {
         let tmp = tempfile::tempdir().unwrap();
         let identity = directory_identity(tmp.path()).unwrap();
-        for (after_entry, after_entry_ordinal) in [(Some("marker"), 0), (None, 1)] {
+        for (after_entry, after_entry_ordinal, after_entry_prefix_digest) in [
+            (Some("marker"), 0, None),
+            (None, 1, None),
+            (Some("marker"), 1, None),
+        ] {
             let frontier = ReclaimScanFrontier {
                 frames: vec![ReclaimScanFrame {
                     relative: String::new(),
                     after_entry: after_entry.map(str::to_owned),
                     after_entry_ordinal,
+                    after_entry_prefix_digest,
                     identity: identity.clone(),
                 }],
             };
             assert!(!frontier.is_bounded());
         }
+    }
+
+    #[test]
+    fn resumable_scan_restarts_a_legacy_marker_without_a_prefix_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("session");
+        checkout(&worktree, "target/\n");
+        let candidate = worktree.join("target");
+        write(&candidate.join("CACHEDIR.TAG"), 1);
+        let frontier = ReclaimScanFrontier {
+            frames: vec![ReclaimScanFrame {
+                relative: String::new(),
+                after_entry: Some("legacy-marker".into()),
+                after_entry_ordinal: 1,
+                after_entry_prefix_digest: None,
+                identity: directory_identity(&worktree).unwrap(),
+            }],
+        };
+
+        let scan = scan_worktree_resumable(
+            &worktree,
+            &[],
+            &[],
+            Instant::now() + Duration::from_secs(2),
+            128,
+            Some(frontier),
+        );
+
+        assert!(!scan.complete, "legacy cursors restart as incomplete");
+        assert_eq!(scan.incomplete_reason.as_deref(), Some("cursor_changed"));
+        assert!(
+            scan.candidates
+                .iter()
+                .any(|candidate| candidate.path == worktree.join("target"))
+        );
     }
 
     #[test]

@@ -300,8 +300,8 @@ impl OpenSessionArtifactLapState {
         }
     }
 
-    fn after_frontier_page_persistence(self, persisted: bool) -> Self {
-        if persisted { self } else { Self::Failed }
+    fn mark_failed(self) -> Self {
+        Self::Failed
     }
 
     fn finish_lap(self) -> Self {
@@ -403,11 +403,22 @@ fn persist_open_session_artifact_frontiers(
     broker: &mut Broker,
     frontier_set: &OpenSessionArtifactFrontierSet,
 ) -> Result<bool, BrokerOpError> {
+    #[cfg(test)]
+    if FAIL_NEXT_OPEN_SESSION_ARTIFACT_FRONTIER_WRITE.with(|fail| fail.replace(false)) {
+        return Ok(false);
+    }
     let Some(encoded) = encode_open_session_artifact_frontiers(frontier_set) else {
         return Ok(false);
     };
     broker.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_FRONTIERS_KEY, &encoded)?;
     Ok(true)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_NEXT_OPEN_SESSION_ARTIFACT_FRONTIER_WRITE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
 }
 
 impl Default for OpenSessionArtifactFrontierSet {
@@ -5652,9 +5663,6 @@ impl Broker {
                     OPEN_SESSION_ARTIFACT_THROUGH_KEY,
                     &through.to_string(),
                 )?;
-                if through == 0 {
-                    cursor = 0;
-                }
                 through
             }
             Some(value) => match value.parse::<i64>() {
@@ -5910,7 +5918,7 @@ impl Broker {
                 pass.complete = false;
                 pass.frontier_state_write_limited =
                     pass.frontier_state_write_limited.saturating_add(1);
-                lap_state = lap_state.after_frontier_page_persistence(false);
+                lap_state = lap_state.mark_failed();
                 // Record the dropped page before moving the durable cursor.
                 // A later empty window must not mistake this lap for a full
                 // census; only a fresh lap can clear the marker.
@@ -5932,7 +5940,6 @@ impl Broker {
         }
 
         if reached_lap_end {
-            cursor = 0;
             self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_CURSOR_KEY, "0")?;
             self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_THROUGH_KEY, "0")?;
         } else {
@@ -5950,7 +5957,7 @@ impl Broker {
             if !persisted {
                 pass.frontier_state_write_limited =
                     pass.frontier_state_write_limited.saturating_add(1);
-                lap_state = lap_state.after_frontier_page_persistence(false);
+                lap_state = lap_state.mark_failed();
                 self.artifact_sweep_meta_set(
                     OPEN_SESSION_ARTIFACT_LAP_STATE_KEY,
                     lap_state.metadata_value(),
@@ -7904,9 +7911,7 @@ mod tests {
     }
 
     #[test]
-    fn frontier_write_failure_on_final_page_requires_a_fresh_full_lap() {
-        let through = 32;
-        let cursor_before_final_page = through - OPEN_SESSION_ARTIFACT_PAGE_SIZE as i64;
+    fn final_session_frontier_page_can_exceed_repository_storage_cap() {
         let oversized_final_page = OpenSessionArtifactFrontierSet {
             schema_version: 1,
             entries: (0..OPEN_SESSION_ARTIFACT_PAGE_SIZE)
@@ -7930,34 +7935,139 @@ mod tests {
             oversized_final_page.entries.len(),
             OPEN_SESSION_ARTIFACT_PAGE_SIZE
         );
+        // This final page of sixteen wide frontiers exceeds the repository
+        // cap, even though its individual records and frame count are valid.
         assert!(encode_open_session_artifact_frontiers(&oversized_final_page).is_none());
-        let lap = OpenSessionArtifactLapState::Clear;
+    }
 
-        // The final page exceeds the 2 MiB frontier cap. Its cursor may
-        // advance, but the failed serialization remains durable.
-        let failed_lap = lap.after_frontier_page_persistence(
-            encode_open_session_artifact_frontiers(&oversized_final_page).is_some(),
-        );
-        let cursor_after_final_page = through;
-        assert!(cursor_before_final_page < cursor_after_final_page);
-        assert_eq!(
-            cursor_after_final_page, through,
-            "the following page is empty"
-        );
-        assert_eq!(failed_lap.finish_lap(), OpenSessionArtifactLapState::Failed);
-        assert!(failed_lap.finish_lap().is_incomplete());
+    #[test]
+    fn failed_frontier_write_is_durable_across_open_session_passes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+        let worktree = temporary.path().join("session-worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
 
-        // An empty tail page cannot clear the missed-work marker. A new lap
-        // reprocesses the omitted session IDs; only its successful completion
-        // clears the marker.
-        let retrying_lap = failed_lap.finish_lap().begin_fresh_lap();
-        assert_eq!(retrying_lap, OpenSessionArtifactLapState::Retrying);
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        broker
+            .store()
+            .register_session(&crate::NewSession {
+                worktree_path: worktree.to_string_lossy().into_owned(),
+                branch: "agent/frontier-capacity-test".into(),
+                origin: crate::SessionOrigin::Adopted,
+                task: Some("frontier persistence fixture".into()),
+                diff_base: None,
+                adoption_base: None,
+                adopted_head: None,
+                repository_contract: None,
+                pid: Some(i64::from(std::process::id())),
+                command: None,
+                log_path: None,
+                agent_identity: None,
+            })
+            .unwrap();
+        let policy = crate::RetentionPolicy {
+            idle_session_artifact_hours: 24,
+            ..crate::RetentionPolicy::default()
+        };
+        let progress_before = broker
+            .artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_PROGRESS_KEY)
+            .unwrap()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+
+        FAIL_NEXT_OPEN_SESSION_ARTIFACT_FRONTIER_WRITE.with(|fail| fail.set(true));
+        let first = broker
+            .run_idle_open_session_artifact_pass_bounded(
+                &policy,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        assert!(!first.complete);
         assert_eq!(
-            retrying_lap
-                .after_frontier_page_persistence(true)
-                .finish_lap(),
+            OpenSessionArtifactLapState::parse(
+                broker
+                    .artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_LAP_STATE_KEY)
+                    .unwrap()
+                    .as_deref()
+            ),
+            OpenSessionArtifactLapState::Failed
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("0"),
+            "the failed final page advanced to the lap boundary"
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_THROUGH_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("0"),
+            "the failed page completed its current high-water lap"
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_PROGRESS_KEY)
+                .unwrap()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0),
+            progress_before,
+            "a failed page does not claim persisted discovery progress"
+        );
+
+        drop(broker);
+        let mut broker = storage.open(&root).unwrap();
+        assert_eq!(
+            OpenSessionArtifactLapState::parse(
+                broker
+                    .artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_LAP_STATE_KEY)
+                    .unwrap()
+                    .as_deref()
+            ),
+            OpenSessionArtifactLapState::Failed,
+            "the failed-lap marker survives reopening the broker"
+        );
+        let retried = broker
+            .run_idle_open_session_artifact_pass_bounded(
+                &policy,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        assert!(retried.complete, "the second full census retries the page");
+        assert_eq!(
+            OpenSessionArtifactLapState::parse(
+                broker
+                    .artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_LAP_STATE_KEY)
+                    .unwrap()
+                    .as_deref()
+            ),
             OpenSessionArtifactLapState::Clear
         );
+        assert!(
+            broker
+                .artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_PROGRESS_KEY)
+                .unwrap()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0)
+                > progress_before,
+            "the fresh lap persisted progress after reprocessing the page"
+        );
+        assert!(!FAIL_NEXT_OPEN_SESSION_ARTIFACT_FRONTIER_WRITE.with(|fail| fail.get()));
     }
 
     #[test]
