@@ -430,6 +430,15 @@ broker. Other agents may be working in sibling worktrees right now. The
 `aethyme` router and its engine sibling are installed once for the user;
 check the paired runtime with `aethyme --version` and
 `aethyme-engine-cli --version`.
+When investigating retained worktrees, distinguish task identity from shared
+service uptime. A shared agent daemon can outlive many tasks; its PID alone
+proves neither that each task is active nor that its checkout is disposable.
+Check the saved holder identity, current task activity and process-use evidence
+separately. A lease without an expiry is not proof of activity. Preserve raw
+ownership history and explicit takeover requirements when liveness is unknown;
+never clear leases or force removal merely because a holder is ambiguous. Use
+native reclamation plans, which independently protect recent work and open files.
+
 Before starting or delegating a fix for shared CI failures or generated
 files, use `aethyme broker status --compact --json` and open PRs on affected
 paths. Read the matching task, claimed paths and PR diff even when the graph
