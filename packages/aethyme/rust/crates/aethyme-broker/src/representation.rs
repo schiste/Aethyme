@@ -335,6 +335,12 @@ fn find_landing_within(
     )
 }
 
+fn landing_search_budget_expired(detail: impl std::fmt::Display) -> BrokerOpError {
+    BrokerOpError::RepresentationUnavailable {
+        reason: format!("landing search stopped at the time budget {detail}"),
+    }
+}
+
 fn find_landing_with_limits(
     repo: &GitRepo,
     content: &SessionContent,
@@ -354,8 +360,8 @@ fn find_landing_with_limits(
 
     let unavailable = |what: String| BrokerOpError::RepresentationUnavailable { reason: what };
     if Instant::now() >= deadline {
-        return Err(unavailable(
-            "landing search stopped before reading its base snapshot".into(),
+        return Err(landing_search_budget_expired(
+            "before reading its base snapshot",
         ));
     }
 
@@ -395,8 +401,8 @@ fn find_landing_with_limits(
 
     for (batch_index, batch) in window.chunks(CANDIDATE_BATCH).enumerate() {
         if Instant::now() >= deadline {
-            return Err(unavailable(format!(
-                "landing search stopped at the time budget after {} of {} candidate commits",
+            return Err(landing_search_budget_expired(format!(
+                "after {} of {} candidate commits",
                 batch_index * CANDIDATE_BATCH,
                 window.len()
             )));
@@ -1522,7 +1528,7 @@ mod tests {
         assert!(matches!(
             error,
             BrokerOpError::RepresentationUnavailable { ref reason }
-                if reason == "landing search stopped before reading its base snapshot"
+                if reason == "landing search stopped at the time budget before reading its base snapshot"
         ));
     }
 
