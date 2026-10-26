@@ -4,6 +4,19 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.33] - 2026-10-26
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0833).
+
+### Fixed
+
+- Closed-worktree cleanup treats every Git-ignored directory as disposable by default, without recursively inspecting generated dependency fixtures, databases or symlinks. Tracked changes, nonignored files, unpublished commits, active owners and the primary checkout remain protected.
+- Finish-time and interrupted cleanup recheck ignored-content policy. Artifact-root links are classified without following their targets.
+
+### Added
+
+- `[cleanup] strict = true` preserves all ignored leftovers and pauses automatic ignored-artifact sweeps, including queued removals. Remove residue manually or review an explicit discard when exact parity is required.
+
 ## [0.8.32] - 2026-10-26
 
 ### Changed

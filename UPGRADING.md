@@ -16,12 +16,37 @@ version and the target, oldest first. Each schema migration runs on first open
 and is one-way, so rollback is limited to the oldest binary that still reads
 the newest schema you have opened.
 
-Breaking releases: [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
+Breaking releases: [v0.8.33](#v0833), [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
 [v0.7.25](#v0725), [v0.7.23](#v0723), [v0.7.22](#v0722), [v0.7.19](#v0719),
 [v0.7.18](#v0718), [v0.7.16](#v0716), [v0.7.9](#v079), [v0.7.8](#v078),
 [v0.7.4](#v074), [v0.7.2](#v072),
 [v0.7.1](#v071), [v0.5.0](#v050), [v0.3.0](#v030),
 [v0.2.2](#v022), [v0.2.0](#v020).
+
+## v0.8.33
+
+### Ignored directories are disposable by default
+
+Every Git-ignored directory inside a broker session checkout is now eligible for
+disposal when the checkout otherwise passes ownership, delivery, source-cleanliness
+and liveness checks. This includes ignored datasets, saved session records and
+unknown folders, regardless of their names or nested contents. Standalone ignored
+files outside recognized output roots remain protected.
+
+To preserve every ignored leftover, set this in the primary checkout's
+`.aethyme/config.toml` **before** using the new runtime:
+
+```toml
+[cleanup]
+strict = true
+```
+
+Strict mode also pauses automatic artifact sweeps; it does not prevent explicit
+reviewed artifact cleanup or force-discard operations. Move irreplaceable records
+outside disposable checkouts, or enable strict mode before upgrading. The primary
+checkout and live work remain protected. No database migration or compatibility
+floor change is introduced by this release; the v0.8.31 schema guidance still
+applies when upgrading from older versions.
 
 ## v0.8.31
 

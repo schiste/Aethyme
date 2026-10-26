@@ -21,9 +21,12 @@ may not change the effective cap: land the configuration and refresh upstream
 before claiming it is active. Keep a finite limit while reclaiming a backlog;
 raising capacity does not reclaim storage. For closed checkouts, targeted
 `broker finish cleanup <session-id> --json` avoids the bulk plan's recursive
-size inventory while retaining fresh delivery and live-owner checks. Inspect
-ignored artifacts before cleanup and preserve evidence that cannot be rebuilt;
-never use `--force` merely to clear a capacity refusal.
+size inventory while retaining fresh delivery and live-owner checks. From v0.8.33, default cleanup treats every Git-ignored directory as disposable
+without inspecting its contents, including saved records and datasets. Preserve
+irreplaceable evidence outside disposable checkouts before closing them, or set
+`[cleanup] strict = true` in the primary checkout to retain ignored leftovers and
+pause automatic artifact sweeps. `auto_remove = false` only disables whole-checkout
+removal. Never use `--force` merely to clear a capacity refusal.
 
 Follow this protocol:
 

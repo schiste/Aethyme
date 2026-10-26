@@ -4733,10 +4733,8 @@ impl Broker {
         pressure_request: bool,
     ) -> Result<(), BrokerOpError> {
         let root = self.main_root().to_path_buf();
-        if !crate::AutoCleanupPolicy::artifact_sweep_allowed(&root) {
-            return Ok(());
-        }
-        let artifact_pending = self.artifact_sweep_backlog_pending()?;
+        let artifact_pending = self.artifact_sweep_backlog_pending()?
+            && crate::AutoCleanupPolicy::artifact_sweep_allowed(&root);
         let checkout_cleanup_pending = self.auto_checkout_cleanup_recovery_requested()?;
         if crate::host_state::path_is_ephemeral(&root)
             || artifact_worker_process_is_suppressed()
@@ -4843,7 +4841,8 @@ impl Broker {
             self.write_artifact_sweep_worker_status("refused_ephemeral_repository")?;
             return Ok(());
         }
-        let artifact_pending = self.artifact_sweep_backlog_pending()?;
+        let artifact_pending = self.artifact_sweep_backlog_pending()?
+            && crate::AutoCleanupPolicy::artifact_sweep_allowed(self.main_root());
         let checkout_cleanup_pending = self.auto_checkout_cleanup_recovery_requested()?;
         if !(artifact_pending || checkout_cleanup_pending) {
             self.write_artifact_sweep_worker_status("no_backlog")?;
@@ -5413,14 +5412,41 @@ impl Broker {
         removal_deadline_override: Option<Instant>,
         discovery_entry_budget: usize,
     ) -> Result<(ArtifactSweepOutcome, usize), BrokerOpError> {
-        if policy.artifact_sweep_budget_ms == 0
-            || !crate::AutoCleanupPolicy::artifact_sweep_allowed(self.main_root())
-        {
+        if policy.artifact_sweep_budget_ms == 0 {
             return Ok((
                 ArtifactSweepOutcome {
                     directories_reclaimed: 0,
                     complete: true,
                     auto_cleanup: None,
+                },
+                0,
+            ));
+        }
+        if !crate::AutoCleanupPolicy::artifact_sweep_allowed(self.main_root()) {
+            // Strict mode pauses the artifact lane without consuming its pending
+            // generation. Ignored-free checkouts may still satisfy their own
+            // cleanup policy, under the same bounded lock/proof discipline.
+            let (budget_ms, _urgency) = self.artifact_sweep_budget(policy, scope);
+            let budget_deadline = Instant::now() + Duration::from_millis(budget_ms);
+            let deadline = discovery_deadline_override
+                .unwrap_or(budget_deadline)
+                .min(removal_deadline_override.unwrap_or(budget_deadline));
+            let auto_cleanup = if scope_runs_checkout_cleanup(scope) {
+                if let Ok(_lock) = GcLock::acquire(self.main_root()) {
+                    let report = self.auto_remove_disposable_checkouts(Some(deadline))?;
+                    self.persist_auto_checkout_cleanup_request(scope, &report)?;
+                    Some(report)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            return Ok((
+                ArtifactSweepOutcome {
+                    directories_reclaimed: 0,
+                    complete: false,
+                    auto_cleanup,
                 },
                 0,
             ));
@@ -8885,6 +8911,97 @@ mod tests {
             !selected.contains(&abandoned_worktree.to_string_lossy().into_owned()),
             "the unrepresented cache owner must remain ineligible for whole-checkout cleanup"
         );
+    }
+
+    #[test]
+    fn strict_policy_blocks_real_autonomous_artifact_sweep_until_disabled() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", ".gitignore", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        git(&root, &["remote", "add", "origin", "."]);
+        git(
+            &root,
+            &["fetch", "-q", "origin", "main:refs/remotes/origin/main"],
+        );
+        git(&root, &["remote", "set-head", "origin", "main"]);
+        git(&root, &["rev-parse", "refs/remotes/origin/HEAD"]);
+
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[cleanup]\nstrict = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nauto_cleanup_worktrees_on_finish = false\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 1\n",
+        )
+        .unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let abandoned = broker
+            .start_worktree("strict artifact sweep fixture", None)
+            .unwrap();
+        let worktree = PathBuf::from(&abandoned.worktree_path);
+        std::fs::write(worktree.join("unrepresented.txt"), "local\n").unwrap();
+        git(&worktree, &["add", "unrepresented.txt"]);
+        git(&worktree, &["commit", "-qm", "unrepresented"]);
+        broker
+            .close_abandoning_unpushed(abandoned.id, "fixture backlog owner")
+            .unwrap();
+
+        let cache = worktree.join("target");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
+        std::fs::write(cache.join("payload"), b"known ignored cache").unwrap();
+        assert!(cache.join("CACHEDIR.TAG").is_file());
+
+        let disposable = broker
+            .start_worktree("ignored-free closed checkout", None)
+            .unwrap();
+        let disposable_worktree = PathBuf::from(&disposable.worktree_path);
+        broker.close(disposable.id).unwrap();
+        let strict_report = broker.gc_sweep_artifacts().unwrap();
+        assert!(
+            !disposable_worktree.exists(),
+            "strict mode must still remove an eligible ignored-free checkout: {strict_report:#?}"
+        );
+        assert!(strict_report.auto_cleanup.as_ref().is_some_and(|report| {
+            report
+                .removed
+                .iter()
+                .any(|removed| removed.sessions.contains(&disposable.id))
+        }));
+        assert_eq!(
+            strict_report.directories_reclaimed, 0,
+            "strict policy must suppress the real autonomous artifact sweep"
+        );
+        assert!(cache.join("payload").is_file());
+        assert!(worktree.join("unrepresented.txt").is_file());
+        assert!(worktree.join("README.md").is_file());
+
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[cleanup]\nstrict = false\n",
+        )
+        .unwrap();
+        let disposable_report = broker.gc_sweep_artifacts().unwrap();
+        assert_eq!(
+            disposable_report.directories_reclaimed, 1,
+            "the same eligible ignored target should be reclaimed after strict is disabled"
+        );
+        assert!(!cache.exists());
+        assert!(
+            worktree.join("unrepresented.txt").is_file(),
+            "artifact reclamation must leave the checkout protected by its unrepresented commit"
+        );
+        assert!(worktree.join("README.md").is_file());
     }
 
     #[test]
