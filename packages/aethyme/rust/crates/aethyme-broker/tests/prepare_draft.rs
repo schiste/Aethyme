@@ -100,28 +100,95 @@ fn every_drafted_config_is_accepted_by_the_real_reader() {
             // Declining is always allowed; emitting something invalid is not.
             continue;
         };
-        assert!(
-            !draft.contains("repository_shared\n"),
-            "{name}: a draft must default to the safe per-worktree policy"
-        );
-        // The budget is emitted commented out, so a draft that mentions it must
-        // also not activate it: a fresh repository should never silently start
-        // rotating a store it has not used.
-        assert!(
-            !draft.lines().any(|line| {
-                let line = line.trim();
-                !line.starts_with('#') && line.starts_with("max_bytes")
-            }),
-            "{name}: the draft must not activate a cache budget by default:\n{draft}"
-        );
-        assert!(
-            draft.contains("# [shared_cache]"),
-            "{name}: the draft must document the budget it can opt into:\n{draft}"
-        );
-        assert!(
-            draft.contains("schema_version = 1"),
+        // The generator validates its output with the real config reader before
+        // returning it. Parse once here to assert the policy represented by the
+        // TOML, rather than assuming every ecosystem must use a local cache.
+        let parsed: toml::Value = toml::from_str(&draft).expect("valid prepare TOML");
+        assert_eq!(
+            parsed
+                .get("schema_version")
+                .and_then(toml::Value::as_integer),
+            Some(1),
             "{name}: missing schema version:\n{draft}"
         );
+        let steps = parsed
+            .get("steps")
+            .and_then(toml::Value::as_array)
+            .expect("draft has steps");
+        if matches!(*name, "pnpm" | "node-and-rust") {
+            let shared_cache = parsed
+                .get("shared_cache")
+                .and_then(toml::Value::as_table)
+                .expect("pnpm selects a shared cache");
+            assert_eq!(
+                shared_cache.get("root").and_then(toml::Value::as_str),
+                Some("worktree_volume"),
+                "{name}: pnpm store must be on the selected worktree volume:\n{draft}"
+            );
+            assert!(
+                !shared_cache.contains_key("max_bytes"),
+                "{name}: do not override the shared cache threshold:\n{draft}"
+            );
+            let step = steps
+                .iter()
+                .find(|step| {
+                    step.get("name").and_then(toml::Value::as_str)
+                        == Some("javascript-dependencies")
+                })
+                .expect("pnpm dependency step");
+            assert_eq!(
+                step.get("cache").and_then(toml::Value::as_str),
+                Some("repository_shared"),
+                "{name}: pnpm store must be repository shared:\n{draft}"
+            );
+            assert!(
+                step.get("outputs")
+                    .and_then(toml::Value::as_array)
+                    .is_some_and(|outputs| {
+                        outputs
+                            .iter()
+                            .any(|output| output.as_str() == Some("node_modules/"))
+                    }),
+                "{name}: node_modules stays a per-worktree output:\n{draft}"
+            );
+            for (field, expected_install) in [
+                ("command", "pnpm install --frozen-lockfile"),
+                (
+                    "offline_command",
+                    "pnpm install --offline --frozen-lockfile",
+                ),
+            ] {
+                let command = step
+                    .get(field)
+                    .and_then(toml::Value::as_array)
+                    .expect("pnpm command");
+                assert_eq!(command.first().and_then(toml::Value::as_str), Some("sh"));
+                assert_eq!(command.get(1).and_then(toml::Value::as_str), Some("-c"));
+                let script = command
+                    .get(2)
+                    .and_then(toml::Value::as_str)
+                    .expect("pnpm shell command");
+                assert!(script.contains(expected_install), "{field}: {script}");
+                assert!(
+                    script.contains("--store-dir \"$AETHYME_PREPARE_CACHE_DIR/pnpm-store\""),
+                    "{field}: {script}"
+                );
+            }
+        } else {
+            assert!(
+                parsed.get("shared_cache").is_none(),
+                "{name}: local-cache drafts should not declare shared-cache placement:\n{draft}"
+            );
+            assert!(
+                steps.iter().all(|step| {
+                    step.get("cache")
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or("worktree_local")
+                        == "worktree_local"
+                }),
+                "{name}: npm, Yarn, and uv drafts stay worktree local:\n{draft}"
+            );
+        }
         // No absolute paths and no timestamps: generated files must be
         // byte-identical across machines and runs.
         assert!(
@@ -145,7 +212,7 @@ fn storage_guidance_distinguishes_shared_stores_from_worktree_allocations() {
         let draft = init::draft_prepare_config(tmp.path()).expect("node draft");
         assert!(draft.contains("same filesystem"));
         assert!(draft.contains("does not guarantee deduplication"));
-        assert!(draft.contains("The command must explicitly"));
+        assert!(draft.contains("The command must use"));
         assert!(draft.contains("separate copy per session"));
         assert!(draft.contains("not a storage quota"));
         assert!(draft.contains("a running install can exceed it"));
