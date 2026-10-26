@@ -4,6 +4,14 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.34] - 2026-10-26
+
+### Fixed
+
+- Adoption and reuse skip submission-provenance hashing when a session is behind or diverged from integration, preserving drift guidance while avoiding unnecessary history work under the lifecycle lock.
+- General artifact sweeps reserve part of their existing time budget for whole-checkout cleanup so cache discovery cannot consume the entire pass first. Cleanup ownership, delivery and liveness checks remain in force.
+- Default-branch refreshes have a bounded 30-second admission window. Fresh starts also honor a shorter configured Git timeout, and timeout diagnostics distinguish general limits from caller caps. Unknown write outcomes still require reconciliation.
+
 ## [0.8.33] - 2026-10-26
 
 **Breaking:** see [UPGRADING.md](UPGRADING.md#v0833).
