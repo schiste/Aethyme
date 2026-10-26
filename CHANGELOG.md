@@ -4,6 +4,12 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.32] - 2026-10-26
+
+### Changed
+
+- Broker operating guidance documents the existing configurable checkout cap, its fetched-default-branch authority, and targeted cleanup of closed checkouts. Runtime behavior and database compatibility are unchanged from v0.8.31.
+
 ## [0.8.31] - 2026-10-26
 
 **Breaking:** see [UPGRADING.md](UPGRADING.md#v0831).
