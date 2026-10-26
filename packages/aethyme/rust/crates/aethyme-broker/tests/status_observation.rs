@@ -278,7 +278,7 @@ fn status_context_is_scoped_to_one_invocation_even_in_one_process() {
 #[test]
 fn observation_does_not_record_events_and_timing_requires_explicit_opt_in() {
     let f = fixture();
-    let broker = common::open_fixture_repository_broker(&f).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&f).unwrap();
     let before = broker.store().events_after(0, 1000).unwrap().len();
     let metrics = f.path().join(".aethyme/logs/command-metrics.jsonl");
     let before_metrics = std::fs::read(&metrics).unwrap_or_default();
