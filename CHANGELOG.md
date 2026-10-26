@@ -4,6 +4,15 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.35] - 2026-10-26
+
+### Fixed
+
+- Shared Codex app-server processes no longer count as individual task holders. Legacy bindings retain ownership safeguards and require explicit takeover rather than allowing the shared daemon to prove task activity.
+- Cleanup reports distinguish closed sessions from physically removed worktrees, including when delivery or process checks retain a checkout.
+- Full cleanup audits reuse complete landing evidence within the command, avoiding repeated history queries while retaining fresh ownership and liveness checks.
+- Archive cleanup refuses protected ignored residue that the archive does not preserve, and rechecks this protection before checkout removal.
+
 ## [0.8.34] - 2026-10-26
 
 ### Fixed
