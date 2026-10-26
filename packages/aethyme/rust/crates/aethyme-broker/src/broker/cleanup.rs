@@ -267,14 +267,21 @@ impl Broker {
         worktree_path: &Path,
     ) -> Result<(CleanupDisposition, String, Option<CleanupProvenance>), BrokerOpError> {
         let delivery_targets = self.cleanup_delivery_targets()?;
-        self.cleanup_eligibility_with_targets(session_id, worktree_path, &delivery_targets)
+        let mut landing_cache = crate::representation::LandingVerdictCache::default();
+        self.cleanup_eligibility_with_targets_and_cache(
+            session_id,
+            worktree_path,
+            &delivery_targets,
+            &mut landing_cache,
+        )
     }
 
-    fn cleanup_eligibility_with_targets(
+    fn cleanup_eligibility_with_targets_and_cache(
         &self,
         session_id: i64,
         worktree_path: &Path,
         delivery_targets: &[String],
+        landing_cache: &mut crate::representation::LandingVerdictCache,
     ) -> Result<(CleanupDisposition, String, Option<CleanupProvenance>), BrokerOpError> {
         if worktree_path == self.main_root.as_path() {
             return Ok((
@@ -329,8 +336,12 @@ impl Broker {
 
         let session_head = checkout.head_commit()?;
         let session = self.store.session(session_id)?;
-        let (provenance, reason) =
-            self.cleanup_provenance(&session, &session_head, delivery_targets)?;
+        let (provenance, reason) = self.cleanup_provenance_with_cache(
+            &session,
+            &session_head,
+            delivery_targets,
+            landing_cache,
+        )?;
         let disposition = match provenance.representation {
             CleanupRepresentation::Represented => CleanupDisposition::Eligible,
             CleanupRepresentation::Pending => CleanupDisposition::PendingCommits,
@@ -370,6 +381,22 @@ impl Broker {
         session_head: &str,
         delivery_targets: &[String],
     ) -> Result<(CleanupProvenance, String), BrokerOpError> {
+        let mut landing_cache = crate::representation::LandingVerdictCache::default();
+        self.cleanup_provenance_with_cache(
+            session,
+            session_head,
+            delivery_targets,
+            &mut landing_cache,
+        )
+    }
+
+    fn cleanup_provenance_with_cache(
+        &self,
+        session: &Session,
+        session_head: &str,
+        delivery_targets: &[String],
+        landing_cache: &mut crate::representation::LandingVerdictCache,
+    ) -> Result<(CleanupProvenance, String), BrokerOpError> {
         let (mut provenance, reason) =
             self.cleanup_provenance_from_ancestry(session, session_head, delivery_targets)?;
         if matches!(
@@ -386,8 +413,12 @@ impl Broker {
             // `in_target` while this plan held the same worktree as unproven.
             // Every positive names fixed commits, so the plan digest over this
             // reason stays stable until a delivery target moves.
-            if let Some((target, evidence, landed_by)) =
-                self.landing_on_delivery_targets(session_head, delivery_targets)?
+            if let Some((target, evidence, landed_by)) = self
+                .landing_on_delivery_targets_with_cache(
+                    session_head,
+                    delivery_targets,
+                    landing_cache,
+                )?
             {
                 provenance.representation = CleanupRepresentation::Represented;
                 provenance.pending_commit_count = 0;
@@ -466,6 +497,16 @@ impl Broker {
         head: &str,
         delivery_targets: &[String],
     ) -> Result<Option<(String, crate::LandingEvidence, Option<String>)>, BrokerOpError> {
+        let mut landing_cache = crate::representation::LandingVerdictCache::default();
+        self.landing_on_delivery_targets_with_cache(head, delivery_targets, &mut landing_cache)
+    }
+
+    fn landing_on_delivery_targets_with_cache(
+        &self,
+        head: &str,
+        delivery_targets: &[String],
+        landing_cache: &mut crate::representation::LandingVerdictCache,
+    ) -> Result<Option<(String, crate::LandingEvidence, Option<String>)>, BrokerOpError> {
         if let Some(target) = delivery_targets
             .iter()
             .find(|target| self.repo.is_ancestor(head, target))
@@ -480,11 +521,13 @@ impl Broker {
             if let crate::LandingVerdict::Landed {
                 evidence,
                 landed_by,
-            } = crate::representation::work_landed_within(
+            } = crate::representation::work_landed_with_cache(
                 &self.repo,
                 head,
                 target,
                 self.landing_deadline.get(),
+                crate::representation::LandingSearchProfile::default(),
+                landing_cache,
             )? {
                 return Ok(Some((target.clone(), evidence, landed_by)));
             }
@@ -713,6 +756,7 @@ impl Broker {
         session: &Session,
         session_head: &str,
         delivery_targets: CleanupDeliveryTargets<'_>,
+        landing_cache: &mut crate::representation::LandingVerdictCache,
     ) -> Result<(CleanupDisposition, String, Option<CleanupProvenance>), BrokerOpError> {
         let owned_delivery_targets;
         let delivery_targets = match delivery_targets {
@@ -730,7 +774,12 @@ impl Broker {
             }
         };
         Ok(
-            match self.cleanup_provenance(session, session_head, delivery_targets) {
+            match self.cleanup_provenance_with_cache(
+                session,
+                session_head,
+                delivery_targets,
+                landing_cache,
+            ) {
                 Ok((provenance, reason)) => {
                     let disposition = match provenance.representation {
                         CleanupRepresentation::Represented => CleanupDisposition::Eligible,
@@ -768,12 +817,14 @@ impl Broker {
         scan: crate::SizeScan,
         records: &mut crate::measurement::SizeRecords,
     ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
+        let mut landing_cache = crate::representation::LandingVerdictCache::default();
         self.cleanup_item_scanned_with_tips(
             session,
             scan,
             records,
             None,
             CleanupDeliveryTargets::Fresh,
+            &mut landing_cache,
         )
     }
 
@@ -788,6 +839,7 @@ impl Broker {
         records: &mut crate::measurement::SizeRecords,
         branch_tips: Option<&std::collections::BTreeMap<String, String>>,
         delivery_targets: CleanupDeliveryTargets<'_>,
+        landing_cache: &mut crate::representation::LandingVerdictCache,
     ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
         let worktree_path = PathBuf::from(&session.worktree_path);
         let worktree_present = worktree_path.exists();
@@ -831,7 +883,12 @@ impl Broker {
             )
         } else if worktree_present {
             if let Some(proof) = self.interrupted_finish_orphan_cleanup_proof(session) {
-                self.branch_provenance_disposition(session, &proof.head, delivery_targets)?
+                self.branch_provenance_disposition(
+                    session,
+                    &proof.head,
+                    delivery_targets,
+                    landing_cache,
+                )?
             } else {
                 match self.is_orphaned_worktree_of_this_repository_checked(&worktree_path) {
                     Err(error) => (
@@ -852,13 +909,20 @@ impl Broker {
                     Ok(false) => {
                         let eligibility = match delivery_targets {
                             CleanupDeliveryTargets::Snapshot(targets) => self
-                                .cleanup_eligibility_with_targets(
+                                .cleanup_eligibility_with_targets_and_cache(
                                     session.id,
                                     &worktree_path,
                                     targets,
+                                    landing_cache,
                                 ),
                             CleanupDeliveryTargets::Fresh => {
-                                self.cleanup_eligibility(session.id, &worktree_path)
+                                let targets = self.cleanup_delivery_targets()?;
+                                self.cleanup_eligibility_with_targets_and_cache(
+                                    session.id,
+                                    &worktree_path,
+                                    &targets,
+                                    landing_cache,
+                                )
                             }
                             CleanupDeliveryTargets::SnapshotUnavailable => Ok((
                                 CleanupDisposition::InspectionFailed,
@@ -882,7 +946,12 @@ impl Broker {
             // commit provenance. Existing orphan directories take the
             // proof-bound branch above because their remaining bytes are not
             // described by the commit alone.
-            self.branch_provenance_disposition(session, session_head, delivery_targets)?
+            self.branch_provenance_disposition(
+                session,
+                session_head,
+                delivery_targets,
+                landing_cache,
+            )?
         } else {
             unreachable!("entries without a worktree or a branch return None above")
         };
@@ -1022,6 +1091,16 @@ impl Broker {
         scan: crate::SizeScan,
         budget: Option<std::time::Duration>,
     ) -> Result<CleanupPlan, BrokerOpError> {
+        let mut landing_cache = crate::representation::LandingVerdictCache::default();
+        self.cleanup_plan_scanned_within_and_cache(scan, budget, &mut landing_cache)
+    }
+
+    pub(crate) fn cleanup_plan_scanned_within_and_cache(
+        &self,
+        scan: crate::SizeScan,
+        budget: Option<std::time::Duration>,
+        landing_cache: &mut crate::representation::LandingVerdictCache,
+    ) -> Result<CleanupPlan, BrokerOpError> {
         debug_assert!(
             budget.is_none() || !scan.measures(),
             "a measuring plan authorizes removal and must inspect every worktree"
@@ -1075,6 +1154,7 @@ impl Broker {
                         .as_deref()
                         .map(CleanupDeliveryTargets::Snapshot)
                         .unwrap_or(CleanupDeliveryTargets::SnapshotUnavailable),
+                    landing_cache,
                 )?;
                 // A landing search the deadline stopped reads as a failed
                 // inspection; it is the budget, so say so instead (#460).
