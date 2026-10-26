@@ -219,7 +219,7 @@ pub enum GitError {
     /// repository is known from it; the host, a remote or a lock is wedged.
     #[error(
         "git {args} did not finish within {seconds}s and was killed \
-         (set AETHYME_GIT_TIMEOUT_SECS to change the limit)"
+         (AETHYME_GIT_TIMEOUT_SECS changes the general limit; caller caps may be shorter)"
     )]
     TimedOut { args: String, seconds: u64 },
 
@@ -250,7 +250,7 @@ fn git_timeout_from(value: Option<&str>) -> Duration {
         .unwrap_or(DEFAULT_GIT_TIMEOUT)
 }
 
-fn git_timeout() -> Duration {
+pub(crate) fn git_timeout() -> Duration {
     let configured = git_timeout_from(std::env::var(GIT_TIMEOUT_ENV).ok().as_deref());
     GIT_DEADLINE.with(|deadline| match deadline.get() {
         Some(deadline) => deadline
@@ -5988,6 +5988,10 @@ mod timeout_tests {
         );
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(error.to_string().contains(GIT_TIMEOUT_ENV), "{error}");
+        assert!(
+            error.to_string().contains("caller caps may be shorter"),
+            "{error}"
+        );
     }
 
     #[test]
