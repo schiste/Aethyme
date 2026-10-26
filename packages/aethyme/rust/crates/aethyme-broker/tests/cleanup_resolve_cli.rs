@@ -322,46 +322,55 @@ fn a_stale_digest_is_refused_and_nothing_moves() {
 }
 
 #[test]
-fn protected_ignored_file_alone_refuses_archive_resolution() {
+fn protected_ignored_file_alone_is_archived_before_removal() {
     let tmp = repo();
     let (id, worktree) = closed_session(tmp.path(), "ignored-only fixture");
     let protected = worktree.join("private.txt");
     std::fs::write(&protected, "keep this file\n").unwrap();
 
-    let error = refused_plan(tmp.path(), &id);
-    assert!(
-        error.contains("archive resolution refuses protected ignored content"),
-        "{error}"
+    let reviewed = plan(tmp.path(), &id);
+    assert_eq!(reviewed["ignored_files"].as_array().unwrap().len(), 1);
+    assert_eq!(reviewed["ignored_files"][0]["path"], "private.txt");
+    assert_eq!(reviewed["ignored_bytes"], b"keep this file\n".len() as u64);
+    let outcome = json(&apply(
+        tmp.path(),
+        &id,
+        reviewed["digest"].as_str().unwrap(),
+    ));
+    assert_eq!(outcome["worktree_removed"], true);
+    assert!(!worktree.exists());
+    let archive = PathBuf::from(outcome["archive"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read(archive.join("ignored/private.txt")).unwrap(),
+        b"keep this file\n"
     );
-    assert!(error.contains("private.txt"), "{error}");
-    assert_eq!(std::fs::read(&protected).unwrap(), b"keep this file\n");
-    assert!(worktree.is_dir());
 }
 
 #[test]
-fn protected_ignored_file_with_dirty_work_refuses_archive_resolution() {
+fn protected_ignored_file_is_archived_alongside_dirty_work() {
     let tmp = repo();
     let (id, worktree) = dirty_closed_session(tmp.path());
     let protected = worktree.join("private.txt");
     std::fs::write(&protected, "keep alongside the patch\n").unwrap();
 
-    let error = refused_plan(tmp.path(), &id);
-    assert!(
-        error.contains("archive resolution refuses protected ignored content"),
-        "{error}"
-    );
-    assert!(error.contains("private.txt"), "{error}");
-    assert!(worktree.join("README.md").is_file());
-    assert!(worktree.join("notes/todo.txt").is_file());
+    let reviewed = plan(tmp.path(), &id);
+    assert_eq!(reviewed["ignored_files"].as_array().unwrap().len(), 1);
+    let outcome = json(&apply(
+        tmp.path(),
+        &id,
+        reviewed["digest"].as_str().unwrap(),
+    ));
+    assert_eq!(outcome["worktree_removed"], true);
+    let archive = PathBuf::from(outcome["archive"].as_str().unwrap());
     assert_eq!(
-        std::fs::read(&protected).unwrap(),
+        std::fs::read(archive.join("ignored/private.txt")).unwrap(),
         b"keep alongside the patch\n"
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn protected_ignored_symlink_refuses_without_following_its_target() {
+fn protected_ignored_symlink_is_archived_without_following_its_target() {
     let tmp = repo();
     let (id, worktree) = closed_session(tmp.path(), "ignored symlink fixture");
     let outside = tempfile::tempdir().unwrap();
@@ -370,17 +379,18 @@ fn protected_ignored_symlink_refuses_without_following_its_target() {
     let link = worktree.join("private-link");
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
-    let error = refused_plan(tmp.path(), &id);
-    assert!(
-        error.contains("archive resolution refuses protected ignored content"),
-        "{error}"
-    );
-    assert!(error.contains("private-link"), "{error}");
-    assert!(
-        std::fs::symlink_metadata(&link)
-            .unwrap()
-            .file_type()
-            .is_symlink()
+    let reviewed = plan(tmp.path(), &id);
+    assert_eq!(reviewed["ignored_files"].as_array().unwrap().len(), 1);
+    let outcome = json(&apply(
+        tmp.path(),
+        &id,
+        reviewed["digest"].as_str().unwrap(),
+    ));
+    assert_eq!(outcome["worktree_removed"], true);
+    let archive = PathBuf::from(outcome["archive"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read_link(archive.join("ignored/private-link")).unwrap(),
+        target
     );
     assert_eq!(std::fs::read(&target).unwrap(), b"outside data\n");
 }
@@ -400,10 +410,6 @@ fn strict_cleanup_policy_refuses_ignored_directory_during_archive_resolution() {
     std::fs::write(ignored.join("private.bin"), b"retain under strict policy").unwrap();
 
     let error = refused_plan(tmp.path(), &id);
-    assert!(
-        error.contains("archive resolution refuses protected ignored content"),
-        "{error}"
-    );
     assert!(
         error.contains("strict cleanup requires no ignored leftovers"),
         "{error}"

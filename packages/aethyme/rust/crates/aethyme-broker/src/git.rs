@@ -415,6 +415,34 @@ fn parse_nul_paths(out: &str) -> Vec<String> {
         .collect()
 }
 
+/// Parse a NUL-delimited path listing used as a destructive cleanup proof.
+/// Unlike `parse_nul_paths`, this must reject any path that the current
+/// `String` path API cannot represent rather than silently dropping it.
+fn parse_nul_paths_strict(out: &[u8], args: &[&str]) -> Result<Vec<String>, GitError> {
+    let refuse = |reason: &str| GitError::Git {
+        args: args.join(" "),
+        stderr: format!("refusing incomplete ignored-path inventory: {reason}"),
+    };
+    if out.is_empty() {
+        return Ok(Vec::new());
+    }
+    if out.last() != Some(&0) {
+        return Err(refuse("the NUL-delimited listing has no final terminator"));
+    }
+    let mut paths = Vec::new();
+    for path in out[..out.len() - 1].split(|byte| *byte == 0) {
+        if path.is_empty() {
+            return Err(refuse("the NUL-delimited listing contains an empty path"));
+        }
+        if path.contains(&b'\n') {
+            return Err(refuse("a path contains a newline"));
+        }
+        let path = std::str::from_utf8(path).map_err(|_| refuse("a path is not valid UTF-8"))?;
+        paths.push(path.to_owned());
+    }
+    Ok(paths)
+}
+
 /// The `git` this process runs, and why it is trusted.
 ///
 /// `Command::new("git")` resolves through the inherited PATH, which on a
@@ -4331,6 +4359,22 @@ impl GitRepo {
         )?))
     }
 
+    /// Ignored roots via `ls-files`, with ignored directories collapsed. The
+    /// listing is a cleanup proof: unsupported path names fail closed instead
+    /// of being dropped by the display-oriented path parser.
+    pub fn ignored_paths_readonly(&self) -> Result<Vec<String>, GitError> {
+        let args = [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ];
+        let output = run_git_bytes(&self.root, &args)?;
+        parse_nul_paths_strict(&output, &args)
+    }
+
     /// Tracked paths whose working content differs from HEAD, limited to
     /// `paths`. Untracked files are not included.
     pub fn dirty_tracked_among(&self, paths: &[String]) -> Result<Vec<String>, GitError> {
@@ -5244,6 +5288,61 @@ mod nul_path_tests {
     fn empty_output_yields_no_paths() {
         assert!(parse_nul_paths("").is_empty());
         assert!(parse_nul_paths("\0\0").is_empty());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod ignored_paths_readonly_tests {
+    use super::GitRepo;
+    use std::os::unix::ffi::OsStringExt;
+    use std::process::Command;
+
+    fn ignored_repo() -> (tempfile::TempDir, GitRepo) {
+        let root = tempfile::tempdir().expect("temporary repository");
+        let output = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root.path())
+            .output()
+            .expect("git init");
+        assert!(
+            output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::write(root.path().join(".gitignore"), "ignored-*\n").expect("write ignore rules");
+        let repo = GitRepo::discover(root.path()).expect("discover repository");
+        (root, repo)
+    }
+
+    #[test]
+    fn ignored_listing_collapses_directories_and_keeps_standalone_files() {
+        let (root, repo) = ignored_repo();
+        std::fs::write(root.path().join("ignored-file"), "data").unwrap();
+        std::fs::create_dir(root.path().join("ignored-dir")).unwrap();
+        std::fs::write(root.path().join("ignored-dir/nested"), "data").unwrap();
+
+        let mut paths = repo.ignored_paths_readonly().unwrap();
+        paths.sort();
+        assert_eq!(paths, vec!["ignored-dir/", "ignored-file"]);
+    }
+
+    #[test]
+    fn newline_in_ignored_standalone_path_fails_closed() {
+        let (root, repo) = ignored_repo();
+        std::fs::write(root.path().join("ignored-line\nbreak"), "data").unwrap();
+
+        let error = repo.ignored_paths_readonly().unwrap_err();
+        assert!(error.to_string().contains("newline"), "{error}");
+    }
+
+    #[test]
+    fn non_utf8_ignored_standalone_path_fails_closed() {
+        let (root, repo) = ignored_repo();
+        let name = std::ffi::OsString::from_vec(b"ignored-\xff".to_vec());
+        std::fs::write(root.path().join(name), "data").unwrap();
+
+        let error = repo.ignored_paths_readonly().unwrap_err();
+        assert!(error.to_string().contains("not valid UTF-8"), "{error}");
     }
 }
 

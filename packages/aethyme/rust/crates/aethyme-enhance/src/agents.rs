@@ -512,6 +512,11 @@ blocked.
    back as a warning naming the holder, with the `note send` command to
    coordinate.
 
+   Cleanup and archive inventories are deletion proofs: path enumeration must
+   preserve every path or fail closed. Do not use a parser that silently drops
+   newline or non-UTF-8 paths; use lossless NUL-delimited bytes and reject paths
+   the consumer cannot represent.
+
    Orchestration with no path -- a release, a merge chain -- is claimed by
    name instead: `aethyme broker advanced ownership claim "release v1.2.0"
    --session <your-session-id> --reason "<why>"`. `status` shows every claim,

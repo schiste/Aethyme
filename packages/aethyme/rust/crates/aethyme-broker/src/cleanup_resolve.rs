@@ -13,13 +13,14 @@
 //! prints what would be preserved and a digest; confirming that digest writes
 //! a recovery archive (a bundle of the commits no delivery target holds, the
 //! staged and unstaged patches, a copy of the untracked files Git does not
-//! ignore, a manifest and restore steps), reads every part of it back, and only
+//! ignore, protected standalone ignored files and links, a manifest and restore
+//! steps), reads every part of it back, and only
 //! then asks cleanup to remove the worktree under its lifecycle claim. A failed
 //! verification leaves the worktree exactly where it was.
 //!
-//! Ignored paths are deliberately not archived. Cleanup policy must classify
-//! every ignored root as disposable before archive resolution may remove the
-//! worktree; protected paths or strict-policy leftovers leave it in place.
+//! Ignored directories remain opaque and follow the ordinary cleanup policy.
+//! Protected standalone ignored files and links are archived; strict-policy
+//! leftovers leave the worktree in place.
 
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -32,7 +33,8 @@ use crate::git::GitRepo;
 use crate::types::SessionOrigin;
 use crate::{Broker, BrokerOpError, CleanupDisposition};
 
-pub const CLEANUP_RESOLVE_SCHEMA_VERSION: u32 = 1;
+pub const CLEANUP_RESOLVE_SCHEMA_VERSION: u32 = 2;
+const LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 1;
 
 /// Directory beneath the host state directory holding one subdirectory of
 /// archives per repository.
@@ -41,11 +43,31 @@ const BUNDLE_FILE: &str = "commits.bundle";
 const STAGED_PATCH_FILE: &str = "staged.patch";
 const UNSTAGED_PATCH_FILE: &str = "unstaged.patch";
 const UNTRACKED_DIRECTORY: &str = "untracked";
+const IGNORED_DIRECTORY: &str = "ignored";
 pub(crate) const MANIFEST_FILE: &str = "manifest.json";
 const README_FILE: &str = "README.md";
 
-/// One untracked path the archive preserves.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// One path from Git's collapsed ignored-root listing and the classification
+/// assigned by the current cleanup policy.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IgnoredPath {
+    pub path: String,
+    pub classification: IgnoredPathClassification,
+}
+
+/// The disposition of an ignored root in the reviewed cleanup plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IgnoredPathClassification {
+    DisposableDirectory,
+    DisposableOutput,
+    PreservedFile,
+}
+
+/// One untracked or protected ignored path the archive preserves.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArchivedFile {
     /// Relative to the worktree root.
     pub path: String,
@@ -60,8 +82,8 @@ pub struct ArchivedFile {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CleanupResolvePlan {
     pub schema_version: u32,
-    /// Binds the head, the delivery targets and the exact content of every
-    /// patch and untracked file, so any change after review refuses the apply.
+    /// Binds the head, delivery targets, patches, untracked files, ignored
+    /// root classifications, protected ignored files and cleanup policy.
     pub digest: String,
     pub session_id: i64,
     pub worktree_path: String,
@@ -82,6 +104,14 @@ pub struct CleanupResolvePlan {
     pub unstaged_patch_sha256: String,
     pub untracked_files: Vec<ArchivedFile>,
     pub untracked_bytes: u64,
+    /// Every Git ignored root and the policy classification used to decide
+    /// whether it is archived or discarded as generated output.
+    pub ignored_paths: Vec<IgnoredPath>,
+    /// Protected standalone ignored files and links, stored under `ignored/`.
+    pub ignored_files: Vec<ArchivedFile>,
+    pub ignored_bytes: u64,
+    /// Digest of the strict/regenerable policy inputs bound into `digest`.
+    pub ignored_policy_sha256: String,
     /// The directory the archive will be written beneath.
     pub archive_root: PathBuf,
     pub apply_command: String,
@@ -115,6 +145,15 @@ struct DigestInput<'a> {
     staged_patch_sha256: &'a str,
     unstaged_patch_sha256: &'a str,
     untracked_files: &'a [ArchivedFile],
+    ignored_paths: &'a [IgnoredPath],
+    ignored_files: &'a [ArchivedFile],
+    ignored_policy: &'a IgnoredPolicyProof<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct IgnoredPolicyProof<'a> {
+    strict: bool,
+    regenerable: &'a [String],
 }
 
 #[derive(serde::Serialize)]
@@ -129,6 +168,7 @@ struct PatchRecord<'a> {
 #[derive(serde::Serialize)]
 struct RecoveryManifest<'a> {
     schema_version: u32,
+    plan_digest: &'a str,
     created_at_ms: i64,
     aethyme_version: &'static str,
     repository: String,
@@ -148,6 +188,10 @@ struct RecoveryManifest<'a> {
     unstaged_patch: PatchRecord<'a>,
     untracked_directory: &'static str,
     untracked_files: &'a [ArchivedFile],
+    ignored_directory: &'static str,
+    ignored_paths: &'a [IgnoredPath],
+    ignored_files: &'a [ArchivedFile],
+    ignored_policy_sha256: &'a str,
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -206,9 +250,92 @@ fn describe_untracked(full: &Path, relative: &str) -> std::io::Result<Option<Arc
     }))
 }
 
+fn ignored_inventory(
+    checkout: &GitRepo,
+    worktree: &Path,
+    policy: &crate::AutoCleanupPolicy,
+    session_id: i64,
+) -> Result<(Vec<IgnoredPath>, Vec<ArchivedFile>), BrokerOpError> {
+    let refuse = |reason: String| BrokerOpError::CleanupResolveRefused {
+        id: session_id,
+        reason,
+    };
+    let mut roots = Vec::new();
+    let mut files = Vec::new();
+    for relative in checkout.ignored_paths_readonly()? {
+        let trimmed = relative.trim_end_matches('/');
+        if !is_contained_relative(trimmed) {
+            return Err(refuse(format!(
+                "Git reported an ignored path outside the worktree: {relative:?}"
+            )));
+        }
+        let full = worktree.join(trimmed);
+        let metadata = std::fs::symlink_metadata(&full).map_err(|error| io_error(&full, error))?;
+        let file_type = metadata.file_type();
+        if !metadata.is_dir() && !metadata.is_file() && !file_type.is_symlink() {
+            return Err(refuse(format!(
+                "ignored path {relative} is a special file, which an archive cannot preserve"
+            )));
+        }
+        if relative.ends_with('/') && (!metadata.is_dir() || file_type.is_symlink()) {
+            return Err(refuse(format!(
+                "Git listed ignored path {relative} as a directory, but it is not one"
+            )));
+        }
+        let classification = match crate::auto_cleanup::classify_ignored_for_recovery(
+            worktree, &relative, policy,
+        )
+        .map_err(refuse)?
+        {
+            crate::auto_cleanup::RecoveryIgnoredClassification::DisposableDirectory => {
+                if !metadata.is_dir() || file_type.is_symlink() {
+                    return Err(refuse(format!(
+                        "ignored path {relative} was classified as a directory but is not one"
+                    )));
+                }
+                IgnoredPathClassification::DisposableDirectory
+            }
+            crate::auto_cleanup::RecoveryIgnoredClassification::DisposableOutput => {
+                if metadata.is_dir() && !file_type.is_symlink() {
+                    IgnoredPathClassification::DisposableDirectory
+                } else {
+                    IgnoredPathClassification::DisposableOutput
+                }
+            }
+            crate::auto_cleanup::RecoveryIgnoredClassification::Preserve(_) => {
+                let Some(file) =
+                    describe_untracked(&full, &relative).map_err(|error| io_error(&full, error))?
+                else {
+                    return Err(refuse(format!(
+                        "ignored path {relative} is neither a regular file nor a symbolic link"
+                    )));
+                };
+                files.push(file);
+                IgnoredPathClassification::PreservedFile
+            }
+            crate::auto_cleanup::RecoveryIgnoredClassification::StrictRefusal => {
+                return Err(refuse(format!(
+                    "strict cleanup requires no ignored leftovers; remove {relative} manually or review an explicit discard"
+                )));
+            }
+        };
+        roots.push(IgnoredPath {
+            path: relative,
+            classification,
+        });
+    }
+    roots.sort_by(|left, right| left.path.cmp(&right.path));
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok((roots, files))
+}
+
 /// A relative path that stays inside the directory it is joined to.
 fn is_contained_relative(path: &str) -> bool {
     !path.is_empty()
+        && !path.contains('\0')
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
         && Path::new(path)
             .components()
             .all(|component| matches!(component, Component::Normal(_)))
@@ -296,8 +423,6 @@ impl Broker {
             ));
         }
         self.refuse_live_checkout(session_id, &worktree)?;
-        self.ensure_archive_ignored_content_is_discardable(session_id, &worktree)?;
-
         let checkout = GitRepo::discover(&worktree)?;
         let head = checkout.head_commit()?;
         let delivery_targets = self.cleanup_delivery_targets()?;
@@ -334,6 +459,19 @@ impl Broker {
         untracked_files.sort_by(|left, right| left.path.cmp(&right.path));
         let untracked_bytes = untracked_files.iter().map(|file| file.bytes).sum();
 
+        let ignored_policy = crate::AutoCleanupPolicy::load(self.main_root())
+            .map_err(|reason| refuse(format!("cannot read ignored cleanup policy: {reason}")))?;
+        let ignored_policy_proof = IgnoredPolicyProof {
+            strict: ignored_policy.strict,
+            regenerable: &ignored_policy.regenerable,
+        };
+        let (ignored_paths, ignored_files) =
+            ignored_inventory(&checkout, &worktree, &ignored_policy, session_id)?;
+        let ignored_bytes = ignored_files.iter().map(|file| file.bytes).sum();
+        let ignored_policy_bytes =
+            serde_json::to_vec(&ignored_policy_proof).map_err(|error| refuse(error.to_string()))?;
+        let ignored_policy_sha256 = sha256_hex(&ignored_policy_bytes);
+
         let staged_patch_sha256 = sha256_hex(&staged);
         let unstaged_patch_sha256 = sha256_hex(&unstaged);
         let digest_input = DigestInput {
@@ -347,9 +485,12 @@ impl Broker {
             staged_patch_sha256: &staged_patch_sha256,
             unstaged_patch_sha256: &unstaged_patch_sha256,
             untracked_files: &untracked_files,
+            ignored_paths: &ignored_paths,
+            ignored_files: &ignored_files,
+            ignored_policy: &ignored_policy_proof,
         };
         let mut hasher = Sha256::new();
-        hasher.update(b"aethyme-cleanup-resolve-v1\0");
+        hasher.update(b"aethyme-cleanup-resolve-v2\0");
         hasher
             .update(serde_json::to_vec(&digest_input).map_err(|error| refuse(error.to_string()))?);
         let digest = format!("{:x}", hasher.finalize());
@@ -375,6 +516,10 @@ impl Broker {
             unstaged_patch_bytes: unstaged.len() as u64,
             unstaged_patch_sha256,
             untracked_files,
+            ignored_paths,
+            ignored_files,
+            ignored_bytes,
+            ignored_policy_sha256,
             untracked_bytes,
             archive_root: self.recovery_archive_root()?,
         })
@@ -431,10 +576,10 @@ impl Broker {
         std::fs::rename(&partial, &archive).map_err(|error| io_error(&archive, error))?;
         after_archive_verified();
 
-        // The archive is complete and verified. Cleanup rechecks protected
-        // ignored content under the lifecycle claim before removing the tree.
+        // The archive is complete and verified. Cleanup recomputes the full
+        // plan under the lifecycle claim immediately before removing the tree.
         let cleanup_error = self
-            .cleanup_after_recovery_archive(session_id)
+            .cleanup_after_recovery_archive(session_id, &plan.digest, &archive)
             .err()
             .map(|e| e.to_string());
         let worktree_removed = cleanup_error.is_none();
@@ -445,6 +590,7 @@ impl Broker {
             "disposition": plan.disposition.as_str(),
             "unlanded_commits": plan.unlanded_commits.len(),
             "untracked_files": plan.untracked_files.len(),
+            "ignored_files": plan.ignored_files.len(),
             "worktree_removed": worktree_removed,
         })
         .to_string();
@@ -462,26 +608,50 @@ impl Broker {
     }
 }
 
-/// The parts of a stored `manifest.json` expiry needs, read owned. An
-/// archive whose manifest does not parse into this is reported, never
-/// proposed: the broker cannot say whose work it holds.
+/// The complete manifest shape the broker has written. Unknown fields are
+/// refused so a newer archive cannot be treated as empty by an older reader.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredManifest {
     schema_version: u32,
     created_at_ms: i64,
+    aethyme_version: String,
     repository: String,
     session_id: i64,
+    task: Option<String>,
+    worktree_path: String,
     branch_ref: String,
+    disposition: String,
     head: String,
+    base: Option<String>,
+    delivery_targets: Vec<String>,
+    landing: serde_json::Value,
+    bundle: Option<String>,
+    unlanded_commits: Vec<String>,
     staged_patch: StoredPatch,
     unstaged_patch: StoredPatch,
+    untracked_directory: String,
+    untracked_files: Vec<ArchivedFile>,
+    /// Absent only in legacy schema v1. `None` in schema v2 is incomplete and
+    /// therefore cannot establish that an archive holds no ignored data.
     #[serde(default)]
-    untracked_files: Vec<serde_json::Value>,
+    ignored_directory: Option<String>,
+    #[serde(default)]
+    ignored_paths: Option<Vec<IgnoredPath>>,
+    #[serde(default)]
+    ignored_files: Option<Vec<ArchivedFile>>,
+    #[serde(default)]
+    ignored_policy_sha256: Option<String>,
+    #[serde(default)]
+    plan_digest: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredPatch {
+    file: String,
     bytes: u64,
+    sha256: String,
 }
 
 /// An archive the broker can vouch for: this repository wrote it, for a
@@ -491,8 +661,8 @@ pub(crate) struct OwnedRecoveryArchive {
     pub session_id: i64,
     pub head: String,
     pub created_at_ms: i64,
-    /// Staged, unstaged or untracked changes -- work no commit carries, so no
-    /// delivery target can ever hold it.
+    /// Staged, unstaged, untracked or protected ignored changes -- work no
+    /// commit carries, so no delivery target can ever hold it.
     pub holds_uncommitted: bool,
 }
 
@@ -508,6 +678,438 @@ fn same_path(left: &Path, right: &Path) -> bool {
     let canonical =
         |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     canonical(left) == canonical(right)
+}
+
+const MAX_RECOVERY_ARCHIVE_TREE_ENTRIES: usize = 250_000;
+const MAX_RECOVERY_ARCHIVE_TREE_DEPTH: usize = 128;
+const MAX_RECOVERY_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_git_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn read_recovery_manifest(path: &Path) -> Result<Vec<u8>, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect manifest: {error}"))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("manifest is not a regular file".into());
+    }
+    if metadata.len() > MAX_RECOVERY_MANIFEST_BYTES {
+        return Err("manifest exceeds the ownership check byte bound".into());
+    }
+    std::fs::read(path).map_err(|error| format!("cannot read manifest: {error}"))
+}
+
+fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
+    if manifest.session_id <= 0
+        || manifest.created_at_ms < 0
+        || manifest.aethyme_version.is_empty()
+        || manifest.worktree_path.is_empty()
+        || !Path::new(&manifest.worktree_path).is_absolute()
+        || manifest.branch_ref.is_empty()
+        || !matches!(
+            manifest.disposition.as_str(),
+            "dirty" | "pending_commits" | "unproven_provenance"
+        )
+        || !valid_git_object_id(&manifest.head)
+        || manifest
+            .base
+            .as_deref()
+            .is_some_and(|base| !valid_git_object_id(base))
+        || manifest
+            .task
+            .as_deref()
+            .is_some_and(|task| task.contains('\0'))
+        || manifest.landing.is_null()
+        || !manifest
+            .delivery_targets
+            .iter()
+            .all(|target| valid_git_object_id(target))
+        || !manifest
+            .unlanded_commits
+            .iter()
+            .all(|commit| valid_git_object_id(commit))
+        || manifest.bundle.is_some() != !manifest.unlanded_commits.is_empty()
+    {
+        return Err("manifest has an incomplete or malformed archive identity".into());
+    }
+    Ok(())
+}
+
+fn validate_archived_files(label: &str, files: &[ArchivedFile]) -> Result<(), String> {
+    let mut previous: Option<&str> = None;
+    for file in files {
+        if !is_contained_relative(&file.path) {
+            return Err(format!(
+                "{label} path {:?} is not a contained relative path",
+                file.path
+            ));
+        }
+        if previous.is_some_and(|previous| previous >= file.path.as_str()) {
+            return Err(format!("{label} paths are not unique and sorted"));
+        }
+        if previous.is_some_and(|previous| {
+            file.path
+                .strip_prefix(previous)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        }) {
+            return Err(format!("{label} paths overlap as parent and child"));
+        }
+        if !valid_sha256(&file.sha256) || (file.symlink && file.bytes != 0) {
+            return Err(format!(
+                "{label} entry {:?} has an invalid identity",
+                file.path
+            ));
+        }
+        previous = Some(&file.path);
+    }
+    Ok(())
+}
+
+fn recovery_archive_expected_files(
+    manifest: &StoredManifest,
+) -> Result<std::collections::BTreeSet<PathBuf>, String> {
+    if manifest.untracked_directory != UNTRACKED_DIRECTORY
+        || manifest.staged_patch.file != STAGED_PATCH_FILE
+        || manifest.unstaged_patch.file != UNSTAGED_PATCH_FILE
+        || !valid_sha256(&manifest.staged_patch.sha256)
+        || !valid_sha256(&manifest.unstaged_patch.sha256)
+    {
+        return Err("manifest names an unexpected archive component".into());
+    }
+    if manifest
+        .bundle
+        .as_deref()
+        .is_some_and(|bundle| bundle != BUNDLE_FILE)
+    {
+        return Err("manifest names an unexpected commit bundle".into());
+    }
+    validate_archived_files("untracked", &manifest.untracked_files)?;
+
+    let ignored_files = match manifest.schema_version {
+        LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+            if manifest.ignored_directory.is_some()
+                || manifest.ignored_paths.is_some()
+                || manifest.ignored_files.is_some()
+                || manifest.ignored_policy_sha256.is_some()
+                || manifest.plan_digest.is_some()
+            {
+                return Err("legacy manifest unexpectedly contains ignored archive fields".into());
+            }
+            &[][..]
+        }
+        CLEANUP_RESOLVE_SCHEMA_VERSION => {
+            if manifest.ignored_directory.as_deref() != Some(IGNORED_DIRECTORY) {
+                return Err("schema v2 manifest is missing its ignored directory identity".into());
+            }
+            let files = manifest
+                .ignored_files
+                .as_deref()
+                .ok_or_else(|| "schema v2 manifest is missing ignored_files".to_string())?;
+            validate_archived_files("ignored", files)?;
+            let ignored_paths = manifest
+                .ignored_paths
+                .as_deref()
+                .ok_or_else(|| "schema v2 manifest is missing ignored_paths".to_string())?;
+            if !manifest
+                .ignored_policy_sha256
+                .as_deref()
+                .is_some_and(valid_sha256)
+                || !manifest.plan_digest.as_deref().is_some_and(valid_sha256)
+            {
+                return Err(
+                    "schema v2 manifest has an invalid plan or ignored policy identity".into(),
+                );
+            }
+            let mut previous: Option<&str> = None;
+            let mut preserved = Vec::new();
+            for path in ignored_paths {
+                let trimmed = path.path.trim_end_matches('/');
+                if !is_contained_relative(trimmed)
+                    || previous.is_some_and(|previous| previous >= path.path.as_str())
+                {
+                    return Err("schema v2 ignored roots are invalid or unsorted".into());
+                }
+                if path.classification == IgnoredPathClassification::PreservedFile {
+                    if path.path.ends_with('/') {
+                        return Err("schema v2 preserved ignored path is a directory".into());
+                    }
+                    preserved.push(path.path.as_str());
+                }
+                previous = Some(&path.path);
+            }
+            if preserved.len() != files.len()
+                || preserved
+                    .iter()
+                    .zip(files)
+                    .any(|(path, file)| *path != file.path)
+            {
+                return Err("schema v2 ignored classifications do not match ignored_files".into());
+            }
+            files
+        }
+        version => return Err(format!("manifest schema {version} is not supported")),
+    };
+
+    let mut expected = std::collections::BTreeSet::from([
+        PathBuf::from(MANIFEST_FILE),
+        PathBuf::from(README_FILE),
+        PathBuf::from(STAGED_PATCH_FILE),
+        PathBuf::from(UNSTAGED_PATCH_FILE),
+    ]);
+    if manifest.bundle.is_some() {
+        expected.insert(PathBuf::from(BUNDLE_FILE));
+    }
+    expected.extend(
+        manifest
+            .untracked_files
+            .iter()
+            .map(|file| PathBuf::from(UNTRACKED_DIRECTORY).join(&file.path)),
+    );
+    expected.extend(
+        ignored_files
+            .iter()
+            .map(|file| PathBuf::from(IGNORED_DIRECTORY).join(&file.path)),
+    );
+    Ok(expected)
+}
+
+/// Enumerate archive files without following links. Incomplete or unexpectedly
+/// large trees stay unowned so retention never assumes their contents away.
+fn recovery_archive_file_set(root: &Path) -> Result<std::collections::BTreeSet<PathBuf>, String> {
+    let mut files = std::collections::BTreeSet::new();
+    let mut pending = vec![(PathBuf::new(), 0_usize)];
+    let mut visited = 0_usize;
+    while let Some((relative_dir, depth)) = pending.pop() {
+        if depth > MAX_RECOVERY_ARCHIVE_TREE_DEPTH {
+            return Err("archive directory depth exceeds the ownership check bound".into());
+        }
+        let directory = root.join(&relative_dir);
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|error| format!("cannot read {}: {error}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("cannot read archive entry: {error}"))?;
+            visited += 1;
+            if visited > MAX_RECOVERY_ARCHIVE_TREE_ENTRIES {
+                return Err("archive entry count exceeds the ownership check bound".into());
+            }
+            let name = entry.file_name();
+            let relative = relative_dir.join(name);
+            let metadata = std::fs::symlink_metadata(entry.path())
+                .map_err(|error| format!("cannot inspect {}: {error}", entry.path().display()))?;
+            if metadata.is_dir() {
+                pending.push((relative, depth + 1));
+            } else if metadata.is_file() || metadata.file_type().is_symlink() {
+                files.insert(relative);
+            } else {
+                return Err(format!(
+                    "archive contains a special file: {}",
+                    entry.path().display()
+                ));
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn verify_recovery_archive_tree(root: &Path, manifest: &StoredManifest) -> Result<(), String> {
+    let expected = recovery_archive_expected_files(manifest)?;
+    let actual = recovery_archive_file_set(root)?;
+    if actual != expected {
+        let unexpected = actual.difference(&expected).next();
+        let missing = expected.difference(&actual).next();
+        return Err(match (unexpected, missing) {
+            (Some(path), _) => format!("archive contains an unlisted file: {}", path.display()),
+            (_, Some(path)) => format!("archive is missing a listed file: {}", path.display()),
+            _ => "archive file inventory does not match its manifest".into(),
+        });
+    }
+    for path in [
+        MANIFEST_FILE,
+        README_FILE,
+        STAGED_PATCH_FILE,
+        UNSTAGED_PATCH_FILE,
+    ]
+    .into_iter()
+    .chain(manifest.bundle.as_deref())
+    {
+        let path = root.join(path);
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "archive component is not a regular file: {}",
+                path.display()
+            ));
+        }
+    }
+    for (name, expected_bytes) in [
+        (STAGED_PATCH_FILE, manifest.staged_patch.bytes),
+        (UNSTAGED_PATCH_FILE, manifest.unstaged_patch.bytes),
+    ] {
+        let path = root.join(name);
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        if metadata.len() != expected_bytes {
+            return Err(format!(
+                "{name} byte length does not match its manifest entry"
+            ));
+        }
+    }
+    for (directory, files) in [
+        (UNTRACKED_DIRECTORY, manifest.untracked_files.as_slice()),
+        (
+            IGNORED_DIRECTORY,
+            manifest.ignored_files.as_deref().unwrap_or_default(),
+        ),
+    ] {
+        for file in files {
+            let path = root.join(directory).join(&file.path);
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+            if metadata.file_type().is_symlink() != file.symlink
+                || (!file.symlink && !metadata.is_file())
+            {
+                return Err(format!(
+                    "archive entry {} has a different file type than its manifest",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Verify that the archive still contains the exact reviewed plan. Called
+/// after writing and again under the lifecycle claim immediately before the
+/// worktree is removed.
+pub(crate) fn verify_recovery_archive_for_plan(
+    repository: &GitRepo,
+    root: &Path,
+    plan: &CleanupResolvePlan,
+) -> Result<(), String> {
+    let root_metadata = std::fs::symlink_metadata(root)
+        .map_err(|error| format!("cannot inspect archive directory: {error}"))?;
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        return Err("archive path is not a real directory".into());
+    }
+    if root
+        .extension()
+        .is_some_and(|extension| extension == "partial")
+    {
+        return Err("archive is incomplete".into());
+    }
+    if !root
+        .parent()
+        .is_some_and(|parent| same_path(parent, &plan.archive_root))
+    {
+        return Err("archive is outside the reviewed archive root".into());
+    }
+    verify_recovery_archive_payload_for_plan(repository, root, plan)
+}
+
+/// Verify archive payload and manifest against a plan without imposing a
+/// final archive path. The writer uses this only for its owned `.partial`
+/// directory; the final removal path uses the stricter wrapper above.
+fn verify_recovery_archive_payload_for_plan(
+    repository: &GitRepo,
+    root: &Path,
+    plan: &CleanupResolvePlan,
+) -> Result<(), String> {
+    let bytes = read_recovery_manifest(&root.join(MANIFEST_FILE))?;
+    let manifest: StoredManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("unreadable {MANIFEST_FILE}: {error}"))?;
+    validate_manifest_identity(&manifest)?;
+    verify_recovery_archive_tree(root, &manifest)?;
+    let expected_landing = serde_json::to_value(&plan.landing)
+        .map_err(|error| format!("cannot encode reviewed landing verdict: {error}"))?;
+    if manifest.schema_version != CLEANUP_RESOLVE_SCHEMA_VERSION
+        || manifest.plan_digest.as_deref() != Some(plan.digest.as_str())
+        || manifest.session_id != plan.session_id
+        || !same_path(Path::new(&manifest.repository), repository.root())
+        || manifest.worktree_path != plan.worktree_path
+        || manifest.branch_ref != plan.branch_ref
+        || manifest.disposition != plan.disposition.as_str()
+        || manifest.head != plan.head
+        || manifest.delivery_targets != plan.delivery_targets
+        || manifest.unlanded_commits != plan.unlanded_commits
+        || manifest.landing != expected_landing
+        || manifest.staged_patch.bytes != plan.staged_patch_bytes
+        || manifest.staged_patch.sha256 != plan.staged_patch_sha256
+        || manifest.unstaged_patch.bytes != plan.unstaged_patch_bytes
+        || manifest.unstaged_patch.sha256 != plan.unstaged_patch_sha256
+        || manifest.untracked_files != plan.untracked_files
+        || manifest.ignored_paths.as_deref() != Some(plan.ignored_paths.as_slice())
+        || manifest.ignored_files.as_deref() != Some(plan.ignored_files.as_slice())
+        || manifest.ignored_policy_sha256.as_deref() != Some(plan.ignored_policy_sha256.as_str())
+    {
+        return Err("archive manifest does not match the reviewed resolve plan".into());
+    }
+
+    for (name, expected_bytes, expected_sha256) in [
+        (
+            STAGED_PATCH_FILE,
+            plan.staged_patch_bytes,
+            plan.staged_patch_sha256.as_str(),
+        ),
+        (
+            UNSTAGED_PATCH_FILE,
+            plan.unstaged_patch_bytes,
+            plan.unstaged_patch_sha256.as_str(),
+        ),
+    ] {
+        let path = root.join(name);
+        let actual = describe_untracked(&path, name)
+            .map_err(|error| format!("cannot verify {name}: {error}"))?
+            .ok_or_else(|| format!("{name} is not a regular file"))?;
+        if actual.bytes != expected_bytes || actual.sha256 != expected_sha256 {
+            return Err(format!("{name} differs from the reviewed plan"));
+        }
+    }
+    for (directory, files) in [
+        (UNTRACKED_DIRECTORY, plan.untracked_files.as_slice()),
+        (IGNORED_DIRECTORY, plan.ignored_files.as_slice()),
+    ] {
+        for expected in files {
+            let path = root.join(directory).join(&expected.path);
+            let actual = describe_untracked(&path, &expected.path)
+                .map_err(|error| format!("cannot verify {}: {error}", path.display()))?
+                .ok_or_else(|| format!("{} is not a regular file or symlink", path.display()))?;
+            if &actual != expected {
+                return Err(format!("{} differs from the reviewed plan", path.display()));
+            }
+        }
+    }
+    if manifest.bundle.is_some() {
+        let bundle = root.join(BUNDLE_FILE);
+        let heads = repository
+            .verify_bundle(&bundle)
+            .map_err(|error| format!("{BUNDLE_FILE} does not verify: {error}"))?;
+        if !heads.contains(&plan.head) {
+            return Err(format!("{BUNDLE_FILE} does not hold {}", plan.head));
+        }
+    }
+    let expected_readme = restore_readme(plan, manifest.bundle.is_some());
+    let readme_path = root.join(README_FILE);
+    let readme_metadata = std::fs::symlink_metadata(&readme_path)
+        .map_err(|error| format!("cannot inspect {README_FILE}: {error}"))?;
+    if readme_metadata.len() != expected_readme.len() as u64 {
+        return Err(format!(
+            "{README_FILE} differs from the reviewed restore steps"
+        ));
+    }
+    let readme = std::fs::read(&readme_path)
+        .map_err(|error| format!("cannot read {README_FILE}: {error}"))?;
+    if readme != expected_readme.as_bytes() {
+        return Err(format!(
+            "{README_FILE} differs from the reviewed restore steps"
+        ));
+    }
+    Ok(())
 }
 
 impl Broker {
@@ -536,21 +1138,21 @@ impl Broker {
             return Err(format!("not directly under {}", root.display()));
         }
         let manifest_path = dir.join(MANIFEST_FILE);
-        let manifest_metadata = std::fs::symlink_metadata(&manifest_path)
-            .map_err(|_| "no broker manifest; made outside the broker".to_string())?;
-        if !manifest_metadata.is_file() {
-            return Err("manifest is not a regular file".into());
-        }
-        let bytes = std::fs::read(&manifest_path)
-            .map_err(|error| format!("cannot read manifest: {error}"))?;
+        let bytes = read_recovery_manifest(&manifest_path)
+            .map_err(|reason| format!("no broker manifest; {reason}"))?;
         let manifest: StoredManifest = serde_json::from_slice(&bytes)
             .map_err(|error| format!("unreadable manifest: {error}"))?;
-        if manifest.schema_version != CLEANUP_RESOLVE_SCHEMA_VERSION {
+        if !matches!(
+            manifest.schema_version,
+            LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION | CLEANUP_RESOLVE_SCHEMA_VERSION
+        ) {
             return Err(format!(
-                "manifest schema {} is not {CLEANUP_RESOLVE_SCHEMA_VERSION}",
+                "manifest schema {} is not supported",
                 manifest.schema_version
             ));
         }
+        validate_manifest_identity(&manifest)?;
+        verify_recovery_archive_tree(dir, &manifest)?;
         if !same_path(Path::new(&manifest.repository), self.main_root()) {
             return Err(format!(
                 "manifest names another repository: {}",
@@ -575,7 +1177,11 @@ impl Broker {
             created_at_ms: manifest.created_at_ms,
             holds_uncommitted: manifest.staged_patch.bytes > 0
                 || manifest.unstaged_patch.bytes > 0
-                || !manifest.untracked_files.is_empty(),
+                || !manifest.untracked_files.is_empty()
+                || manifest
+                    .ignored_files
+                    .as_deref()
+                    .is_some_and(|files| !files.is_empty()),
         })
     }
 
@@ -701,7 +1307,15 @@ fn write_verified_archive(
 
     let worktree = Path::new(&plan.worktree_path);
     let untracked_root = dir.join(UNTRACKED_DIRECTORY);
+    std::fs::create_dir_all(&untracked_root)
+        .map_err(|error| format!("cannot create {UNTRACKED_DIRECTORY}: {error}"))?;
     for file in &plan.untracked_files {
+        if !is_contained_relative(&file.path) {
+            return Err(format!(
+                "untracked archive path is invalid: {:?}",
+                file.path
+            ));
+        }
         let source = worktree.join(&file.path);
         let target = untracked_root.join(&file.path);
         if let Some(parent) = target.parent() {
@@ -724,8 +1338,38 @@ fn write_verified_archive(
         }
     }
 
+    let ignored_root = dir.join(IGNORED_DIRECTORY);
+    std::fs::create_dir_all(&ignored_root)
+        .map_err(|error| format!("cannot create {IGNORED_DIRECTORY}: {error}"))?;
+    for file in &plan.ignored_files {
+        if !is_contained_relative(&file.path) {
+            return Err(format!("ignored archive path is invalid: {:?}", file.path));
+        }
+        let source = worktree.join(&file.path);
+        let target = ignored_root.join(&file.path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        }
+        let copied = if file.symlink {
+            std::fs::read_link(&source).and_then(|link| std::os::unix::fs::symlink(link, &target))
+        } else {
+            std::fs::copy(&source, &target).map(|_| ())
+        };
+        copied.map_err(|error| format!("cannot copy ignored {}: {error}", file.path))?;
+        let archived = describe_untracked(&target, &file.path)
+            .map_err(|error| format!("cannot read back ignored {}: {error}", file.path))?;
+        if archived.as_ref() != Some(file) {
+            return Err(format!(
+                "ignored {} changed while it was archived, or did not copy intact",
+                file.path
+            ));
+        }
+    }
+
     let manifest = RecoveryManifest {
         schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
+        plan_digest: &plan.digest,
         created_at_ms: now_ms(),
         aethyme_version: env!("CARGO_PKG_VERSION"),
         repository: repository.root().to_string_lossy().into_owned(),
@@ -755,6 +1399,10 @@ fn write_verified_archive(
         },
         untracked_directory: UNTRACKED_DIRECTORY,
         untracked_files: &plan.untracked_files,
+        ignored_directory: IGNORED_DIRECTORY,
+        ignored_paths: &plan.ignored_paths,
+        ignored_files: &plan.ignored_files,
+        ignored_policy_sha256: &plan.ignored_policy_sha256,
     };
     let manifest =
         serde_json::to_vec_pretty(&manifest).map_err(|error| format!("manifest: {error}"))?;
@@ -763,6 +1411,7 @@ fn write_verified_archive(
         README_FILE,
         restore_readme(plan, bundle.is_some()).as_bytes(),
     )?;
+    verify_recovery_archive_payload_for_plan(repository, dir, plan)?;
     Ok(())
 }
 
@@ -783,14 +1432,17 @@ fn restore_readme(plan: &CleanupResolvePlan, has_bundle: bool) -> String {
         "# Recovery archive for broker session {id}\n\n\
          Written by `aethyme broker finish cleanup resolve {id} --archive` before the worktree\n\
          `{path}` was removed. `{MANIFEST_FILE}` lists every part with its SHA-256.\n\
-         Ignored paths allowed by cleanup policy were not archived; reinstall dependencies if needed.\n\n\
+         Policy-approved ignored output was not archived; reinstall generated dependencies if needed.\n\
+         Protected standalone ignored paths are listed in `manifest.json` and stored in `{IGNORED_DIRECTORY}/`.\n\n\
          To restore into a NEW checkout of the same repository (never over a checkout in use):\n\n\
          1. Check out the session head:\n{checkout}\
          2. Re-apply the staged changes, then the unstaged ones (skip an empty patch):\n\
             git apply --index <this-archive>/{STAGED_PATCH_FILE}\n\
             git apply <this-archive>/{UNSTAGED_PATCH_FILE}\n\
          3. Copy back the untracked files:\n\
-            cp -R <this-archive>/{UNTRACKED_DIRECTORY}/. .\n",
+            cp -R <this-archive>/{UNTRACKED_DIRECTORY}/. .\n\
+         4. Copy back protected ignored files and links, if present:\n\
+            cp -R <this-archive>/{IGNORED_DIRECTORY}/. .\n",
         id = plan.session_id,
         path = plan.worktree_path,
     )
@@ -833,7 +1485,7 @@ mod tests {
             .unwrap();
         let plan = CleanupResolvePlan {
             schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
-            digest: String::new(),
+            digest: sha256_hex(b"test reviewed plan"),
             session_id: 1,
             worktree_path: tmp.path().to_string_lossy().into_owned(),
             branch_ref: "refs/heads/main".into(),
@@ -852,6 +1504,10 @@ mod tests {
             unstaged_patch_sha256: sha256_hex(&unstaged),
             untracked_bytes: untracked.bytes,
             untracked_files: vec![untracked],
+            ignored_paths: Vec::new(),
+            ignored_files: Vec::new(),
+            ignored_bytes: 0,
+            ignored_policy_sha256: sha256_hex(b"{}"),
             archive_root: PathBuf::new(),
             apply_command: String::new(),
             discard_command: String::new(),
@@ -868,6 +1524,77 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.path().join("untracked/new.txt")).unwrap(),
             b"untracked\n"
+        );
+    }
+
+    #[test]
+    fn archive_ownership_rejects_unlisted_files_and_keeps_legacy_v1_readable() {
+        let (_tmp, repo, plan) = staged_checkout();
+        let dir = tempfile::tempdir().unwrap();
+        write_verified_archive(&repo, &repo, &plan, None, dir.path()).unwrap();
+        let manifest_path = dir.path().join(MANIFEST_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let mut malformed = value.clone();
+        malformed["ignored_policy_sha256"] = serde_json::json!("invalid");
+        let malformed: StoredManifest = serde_json::from_value(malformed).unwrap();
+        assert!(
+            recovery_archive_expected_files(&malformed)
+                .unwrap_err()
+                .contains("invalid plan or ignored policy identity")
+        );
+
+        value["schema_version"] = serde_json::json!(LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION);
+        value.as_object_mut().unwrap().remove("ignored_directory");
+        value.as_object_mut().unwrap().remove("ignored_paths");
+        value.as_object_mut().unwrap().remove("ignored_files");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("ignored_policy_sha256");
+        value.as_object_mut().unwrap().remove("plan_digest");
+        std::fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let legacy: StoredManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        verify_recovery_archive_tree(dir.path(), &legacy).unwrap();
+
+        std::fs::write(dir.path().join("unlisted.bin"), b"work").unwrap();
+        let error = verify_recovery_archive_tree(dir.path(), &legacy).unwrap_err();
+        assert!(error.contains("unlisted file"), "{error}");
+
+        value["schema_version"] = serde_json::json!(CLEANUP_RESOLVE_SCHEMA_VERSION);
+        let missing_v2_field: StoredManifest = serde_json::from_value(value.clone()).unwrap();
+        assert!(
+            recovery_archive_expected_files(&missing_v2_field)
+                .unwrap_err()
+                .contains("missing ignored directory identity")
+        );
+
+        value["schema_version"] = serde_json::json!(CLEANUP_RESOLVE_SCHEMA_VERSION + 1);
+        let future: StoredManifest = serde_json::from_value(value).unwrap();
+        assert!(
+            recovery_archive_expected_files(&future)
+                .unwrap_err()
+                .contains("not supported")
+        );
+    }
+
+    #[test]
+    fn archive_ownership_rejects_patch_length_mismatch() {
+        let (_tmp, repo, plan) = staged_checkout();
+        let dir = tempfile::tempdir().unwrap();
+        write_verified_archive(&repo, &repo, &plan, None, dir.path()).unwrap();
+        let manifest_path = dir.path().join(MANIFEST_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert!(plan.staged_patch_bytes > 0);
+        value["staged_patch"]["bytes"] = serde_json::json!(0);
+        let forged: StoredManifest = serde_json::from_value(value).unwrap();
+
+        let error = verify_recovery_archive_tree(dir.path(), &forged).unwrap_err();
+        assert!(
+            error.contains("staged.patch byte length does not match"),
+            "{error}"
         );
     }
 
@@ -968,9 +1695,12 @@ mod tests {
             .unwrap();
 
         assert!(!outcome.worktree_removed);
-        assert!(outcome.cleanup_error.as_deref().is_some_and(|error| {
-            error.contains("archive resolution refuses protected ignored content")
-        }));
+        assert!(
+            outcome
+                .cleanup_error
+                .as_deref()
+                .is_some_and(|error| { error.contains("changed after archive verification") })
+        );
         assert!(outcome.archive.join(MANIFEST_FILE).is_file());
         assert!(outcome.archive.join("untracked/new.txt").is_file());
         assert!(worktree.is_dir());
@@ -978,5 +1708,174 @@ mod tests {
             std::fs::read(worktree.join("private.txt")).unwrap(),
             b"preserve me\n"
         );
+    }
+
+    #[test]
+    fn archive_changed_after_initial_readback_keeps_the_worktree() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join(".gitignore"), "/private.txt\n").unwrap();
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("archive recheck fixture", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        std::fs::write(worktree.join("private.txt"), "reviewed data\n").unwrap();
+        broker.close(session.id).unwrap();
+
+        let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+        let archive_root = plan.archive_root.clone();
+        let outcome = broker
+            .cleanup_resolve_apply_with_post_archive_hook(session.id, &plan.digest, move || {
+                let archive = std::fs::read_dir(&archive_root)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                std::fs::write(archive.join("ignored/private.txt"), "altered data\n").unwrap();
+            })
+            .unwrap();
+
+        assert!(!outcome.worktree_removed);
+        assert!(
+            outcome
+                .cleanup_error
+                .as_deref()
+                .is_some_and(|error| { error.contains("archive changed before worktree removal") })
+        );
+        assert!(worktree.is_dir());
+        assert_eq!(
+            std::fs::read(worktree.join("private.txt")).unwrap(),
+            b"reviewed data\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_ignored_files_and_links_are_archived_and_block_gc_expiry() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            repository.join(".gitignore"),
+            "/private.txt\n/private-link\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("archive protected ignored paths", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        std::fs::write(worktree.join("private.txt"), "preserve me\n").unwrap();
+        std::os::unix::fs::symlink("../outside-secret", worktree.join("private-link")).unwrap();
+        broker.close(session.id).unwrap();
+
+        let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+        assert_eq!(plan.ignored_files.len(), 2);
+        assert_eq!(plan.ignored_bytes, b"preserve me\n".len() as u64);
+        assert_eq!(plan.ignored_paths.len(), 2);
+        assert!(
+            plan.ignored_paths
+                .iter()
+                .all(|path| path.classification == IgnoredPathClassification::PreservedFile)
+        );
+        let outcome = broker
+            .cleanup_resolve_apply(session.id, &plan.digest)
+            .unwrap();
+        assert!(outcome.worktree_removed);
+        assert_eq!(
+            std::fs::read(outcome.archive.join("ignored/private.txt")).unwrap(),
+            b"preserve me\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(outcome.archive.join("ignored/private-link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let archived = broker.owned_recovery_archive(&outcome.archive).unwrap();
+        assert!(archived.holds_uncommitted);
+        assert!(!broker.recovery_archive_landed(&archived));
+    }
+
+    #[test]
+    fn ignored_directories_stay_collapsed_and_strict_policy_refuses_leftovers() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path();
+        git(repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            repository.join(".gitignore"),
+            "/opaque-cache/\n/private.txt\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(repository, &["add", "-A"]);
+        git(repository, &["commit", "-qm", "initial"]);
+        std::fs::create_dir_all(repository.join("opaque-cache/nested")).unwrap();
+        std::fs::write(repository.join("opaque-cache/nested/data"), "discardable").unwrap();
+        std::fs::write(repository.join("private.txt"), "preserve").unwrap();
+
+        let checkout = GitRepo::discover(repository).unwrap();
+        let default_policy = crate::AutoCleanupPolicy::default();
+        let (roots, files) = ignored_inventory(&checkout, repository, &default_policy, 1).unwrap();
+        assert!(roots.iter().any(|root| {
+            root.path == "opaque-cache/"
+                && root.classification == IgnoredPathClassification::DisposableDirectory
+        }));
+        assert!(
+            !roots
+                .iter()
+                .any(|root| root.path.starts_with("opaque-cache/nested"))
+        );
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "private.txt");
+
+        let strict = crate::AutoCleanupPolicy {
+            strict: true,
+            ..Default::default()
+        };
+        assert!(ignored_inventory(&checkout, repository, &strict, 1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignored_special_files_fail_closed() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path();
+        git(repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join(".gitignore"), "/private.pipe\n").unwrap();
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(repository, &["add", "-A"]);
+        git(repository, &["commit", "-qm", "initial"]);
+        let status = std::process::Command::new("mkfifo")
+            .arg(repository.join("private.pipe"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let checkout = GitRepo::discover(repository).unwrap();
+        let error = ignored_inventory(
+            &checkout,
+            repository,
+            &crate::AutoCleanupPolicy::default(),
+            1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("special file"), "{error}");
     }
 }
