@@ -318,6 +318,15 @@ impl Broker {
             ));
         }
 
+        let ignored_verdict = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root())
+            .and_then(|policy| crate::auto_cleanup::ignored_content_reason(worktree_path, &policy));
+        match ignored_verdict {
+            Ok(None) => {}
+            Ok(Some(reason)) | Err(reason) => {
+                return Ok((CleanupDisposition::Dirty, reason, None));
+            }
+        }
+
         let session_head = checkout.head_commit()?;
         let session = self.store.session(session_id)?;
         let (provenance, reason) =
@@ -1714,9 +1723,12 @@ impl Broker {
             return None;
         }
         let checkout = GitRepo::discover(&canonical_path).ok()?;
+        let cleanup_policy = crate::AutoCleanupPolicy::load(self.main_root()).ok()?;
         if checkout.root() != canonical_path
             || checkout.finish_cleanup_recovery_proof(&proof.branch_ref)? != proof
-            || !checkout.has_only_unstaged_tracked_deletions().ok()?
+            || !checkout
+                .has_only_unstaged_tracked_deletions(&cleanup_policy)
+                .ok()?
             || checkout.dirty_paths().ok()?.is_empty()
             || self.repo.resolve_ref(&proof.branch_ref).as_deref()
                 != Some(proof.branch_tip.as_str())
@@ -1922,6 +1934,23 @@ impl Broker {
             });
         }
 
+        let policy = crate::AutoCleanupPolicy::load(self.main_root()).map_err(|reason| {
+            BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason,
+            }
+        })?;
+        if let Some(reason) = crate::auto_cleanup::ignored_content_reason(&worktree_path, &policy)
+            .map_err(|reason| BrokerOpError::DirtyWorktree {
+            id: session.id,
+            reason,
+        })? {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason,
+            });
+        }
+
         // `--force` is confined to this validated interrupted finish. The
         // exact registered checkout, represented head, and unstaged-deletion
         // only status were rechecked immediately above. Preserve Git's
@@ -1995,6 +2024,19 @@ impl Broker {
             return Err(BrokerOpError::DirtyWorktree {
                 id: session.id,
                 reason: "the interrupted orphan cleanup identity or safety checks changed; inspect the remaining files before retrying".into(),
+            });
+        }
+
+        let policy = crate::AutoCleanupPolicy::load(self.main_root()).map_err(|reason| {
+            BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason,
+            }
+        })?;
+        if policy.strict {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason: "strict cleanup preserves interrupted orphan residue; Git metadata is unavailable to classify it, so remove it manually".into(),
             });
         }
 

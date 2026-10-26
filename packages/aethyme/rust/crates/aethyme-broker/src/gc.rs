@@ -4733,6 +4733,9 @@ impl Broker {
         pressure_request: bool,
     ) -> Result<(), BrokerOpError> {
         let root = self.main_root().to_path_buf();
+        if !crate::AutoCleanupPolicy::artifact_sweep_allowed(&root) {
+            return Ok(());
+        }
         let artifact_pending = self.artifact_sweep_backlog_pending()?;
         let checkout_cleanup_pending = self.auto_checkout_cleanup_recovery_requested()?;
         if crate::host_state::path_is_ephemeral(&root)
@@ -5410,7 +5413,9 @@ impl Broker {
         removal_deadline_override: Option<Instant>,
         discovery_entry_budget: usize,
     ) -> Result<(ArtifactSweepOutcome, usize), BrokerOpError> {
-        if policy.artifact_sweep_budget_ms == 0 {
+        if policy.artifact_sweep_budget_ms == 0
+            || !crate::AutoCleanupPolicy::artifact_sweep_allowed(self.main_root())
+        {
             return Ok((
                 ArtifactSweepOutcome {
                     directories_reclaimed: 0,
@@ -5880,6 +5885,16 @@ impl Broker {
                     continue;
                 }
                 if !interrupted_paths_valid {
+                    session_scan_complete = false;
+                    continue;
+                }
+                // A strict-policy switch revokes automatic deletion, including
+                // resuming a previously authorized partial artifact removal.
+                if !crate::AutoCleanupPolicy::artifact_sweep_allowed(self.main_root()) {
+                    blocked_interrupted_paths.push(BlockedInterruptedPath {
+                        path: Some(dir_key),
+                        reason: "cleanup_policy_requires_manual_removal",
+                    });
                     session_scan_complete = false;
                     continue;
                 }

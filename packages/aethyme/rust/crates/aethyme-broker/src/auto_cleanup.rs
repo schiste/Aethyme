@@ -13,8 +13,8 @@
 //!    grace does not hold, one of unknown liveness does), and no gate runs.
 //! 3. **Clean.** No tracked, staged or untracked change, no stash made on the
 //!    branch, no rebase, merge, cherry-pick, revert or bisect in progress, and
-//!    no ignored file outside the regenerable set. A `.env` or a kept data
-//!    file is ignored by Git and still somebody's work.
+//!    no protected standalone ignored file. All Git-ignored directories are
+//!    disposable by default; strict mode instead requires no ignored residue.
 //! 4. **Contained.** Every commit is in the *fetched remote* default branch,
 //!    by ancestry or by the verbatim content/patch proof. A commit that only
 //!    reached local integration or a local branch is not contained.
@@ -32,7 +32,9 @@ use std::time::Instant;
 use crate::types::{Session, SessionCleanupState, SessionOrigin};
 use crate::{Broker, BrokerOpError, GitRepo};
 
-/// Build-output directories, each recognised by its exact name **and** the
+/// Fallback classification for ignored files and artifact-root symlinks.
+/// Ignored directories are disposable independently of this catalog unless
+/// strict mode is enabled. Each fallback is recognised by its exact name and the
 /// evidence that proves what it is (#588). A name alone proves nothing:
 /// `build/` and `dist/` routinely hold source, assets or data that a
 /// repository happens to ignore, so they count only beside the manifest that
@@ -69,11 +71,6 @@ const BUILD_MANIFESTS: &[&str] = &[
     "pyproject.toml",
     "CMakeLists.txt",
 ];
-
-/// Most entries a single regenerable directory may hold before it counts as
-/// unclassifiable. Classification walks it looking for sensitive files and
-/// escaping symlinks; a tree too large to walk is kept, not assumed safe.
-const CLASSIFY_ENTRY_CAP: usize = 300_000;
 
 /// Paths a configured `regenerable` glob must never match: secrets, data and
 /// ordinary root files. A glob that matches any of them is rejected at load.
@@ -173,6 +170,9 @@ fn auto_cleanup_lap_range<T>(
 pub struct AutoCleanupPolicy {
     /// On by default. `false` turns automatic checkout removal off.
     pub auto_remove: bool,
+    /// Require a checkout with no ignored leftovers. Otherwise all Git-ignored
+    /// directories are disposable without inspecting their contents.
+    pub strict: bool,
     /// Extra globs, relative to the worktree root, that count as regenerable
     /// in addition to [`BUILT_IN_REGENERABLE`].
     pub regenerable: Vec<String>,
@@ -185,6 +185,7 @@ impl Default for AutoCleanupPolicy {
     fn default() -> Self {
         Self {
             auto_remove: true,
+            strict: false,
             regenerable: Vec::new(),
             keep: Vec::new(),
         }
@@ -219,6 +220,11 @@ impl AutoCleanupPolicy {
                     policy.auto_remove = value
                         .as_bool()
                         .ok_or_else(|| "[cleanup] auto_remove must be true or false".to_string())?;
+                }
+                "strict" => {
+                    policy.strict = value
+                        .as_bool()
+                        .ok_or_else(|| "[cleanup] strict must be true or false".to_string())?;
                 }
                 "regenerable" | "keep" => {
                     let list = value
@@ -255,6 +261,12 @@ impl AutoCleanupPolicy {
         Ok(policy)
     }
 
+    /// Strict mode (or an unreadable policy) leaves ignored output to an
+    /// explicit reviewed cleanup instead of a background artifact sweep.
+    pub(crate) fn artifact_sweep_allowed(main_root: &Path) -> bool {
+        Self::load(main_root).is_ok_and(|policy| !policy.strict)
+    }
+
     fn glob_set(globs: &[String]) -> globset::GlobSet {
         let mut builder = globset::GlobSetBuilder::new();
         for glob in globs {
@@ -287,15 +299,6 @@ impl AutoCleanupPolicy {
     }
 }
 
-/// A file name that is somebody's secret or data, wherever it sits.
-fn is_sensitive_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.starts_with(".env")
-        || [".key", ".pem", ".sqlite", ".sqlite3", ".db"]
-            .iter()
-            .any(|suffix| lower.ends_with(suffix))
-}
-
 /// Whether `relative_dir` (no trailing slash) is a recognised build-output
 /// directory of `worktree`, by [`BUILT_IN_REGENERABLE`]'s evidence rules or a
 /// configured glob. `Some(true)` marks a Cargo target directory, where the
@@ -308,6 +311,20 @@ fn regenerable_dir(
     let path = worktree.join(relative_dir);
     let name = Path::new(relative_dir).file_name()?.to_str()?;
     let parent = path.parent()?;
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    if !metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return None;
+    }
+    // Never probe an artifact-root symlink's target for a witness. Known
+    // dependency/cache links themselves are disposable; their targets are not.
+    if metadata.file_type().is_symlink() {
+        return match name {
+            "node_modules" | ".pnpm-store" | ".venv" | "__pycache__" | ".pytest_cache"
+            | ".mypy_cache" | ".ruff_cache" => Some(false),
+            _ if policy.configured_regenerable_dir(relative_dir) => Some(false),
+            _ => None,
+        };
+    }
     let recognised = match name {
         "node_modules" | "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".ruff_cache" => {
             Some(false)
@@ -354,83 +371,40 @@ fn enclosing_regenerable(
     })
 }
 
-/// Walk a build-output directory without following symlinks. Anything that
-/// is somebody's -- a sensitive file, Aethyme state, a symlink that leaves the
-/// worktree -- or anything that cannot be read, keeps the checkout.
-fn scan_regenerable_dir(
-    worktree: &Path,
-    relative_dir: &str,
-    cargo_target: bool,
-    budget: &mut usize,
-) -> Result<(), String> {
-    let root = std::fs::canonicalize(worktree)
-        .map_err(|error| format!("cannot resolve {}: {error}", worktree.display()))?;
-    let mut stack = vec![worktree.join(relative_dir)];
-    while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir)
-            .map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
-        for entry in entries {
-            let entry = entry.map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
-            if *budget == 0 {
-                return Err(format!(
-                    "{relative_dir} holds more than {CLASSIFY_ENTRY_CAP} entries; too large to classify"
-                ));
-            }
-            *budget -= 1;
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let display = path
-                .strip_prefix(worktree)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
-            let kind = entry
-                .file_type()
-                .map_err(|error| format!("cannot stat {display}: {error}"))?;
-            if kind.is_symlink() {
-                let target = std::fs::canonicalize(&path)
-                    .map_err(|_| format!("symlink {display} cannot be resolved"))?;
-                if !target.starts_with(&root) {
-                    return Err(format!(
-                        "symlink {display} points outside the worktree, to {}",
-                        target.display()
-                    ));
-                }
-                continue;
-            }
-            if name == ".aethyme" && !cargo_target {
-                return Err(format!("{display} holds Aethyme state"));
-            }
-            if is_sensitive_name(&name) {
-                return Err(format!("{display} looks like a secret or data file"));
-            }
-            if kind.is_dir() {
-                stack.push(path);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Whether one ignored entry (as `git ls-files --directory` prints it, with a
-/// trailing `/` for a directory) is disposable: `Ok(())` when it is Finder
-/// metadata or lies inside a recognised build-output directory and holds
-/// nothing of anyone's; otherwise the reason it keeps the checkout.
+/// Classify an entry from Git's ignored listing. Directories are disposable
+/// opaque output by default, including local data and session records inside
+/// them. Standalone files need the existing metadata/artifact classification.
+/// Strict mode keeps every ignored leftover for explicit operator cleanup.
 pub(crate) fn classify_ignored(
     worktree: &Path,
     relative: &str,
     policy: &AutoCleanupPolicy,
-    budget: &mut usize,
 ) -> Result<(), String> {
-    let is_dir = relative.ends_with('/');
+    if policy.strict {
+        return Err(format!(
+            "strict cleanup requires no ignored leftovers; remove {relative} manually or review an explicit discard"
+        ));
+    }
     let trimmed = relative.trim_end_matches('/');
+    if trimmed.is_empty()
+        || Path::new(trimmed)
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(format!("invalid ignored path {relative:?}"));
+    }
     let name = trimmed.rsplit('/').next().unwrap_or(trimmed);
-    if !is_dir && name == ".DS_Store" {
+    if !relative.ends_with('/') && name == ".DS_Store" {
         return Ok(());
     }
-    let path = worktree.join(trimmed);
-    let metadata = std::fs::symlink_metadata(&path)
+    let metadata = std::fs::symlink_metadata(worktree.join(trimmed))
         .map_err(|error| format!("cannot stat ignored path {relative}: {error}"))?;
+    // Git produced this ignored path. An ignored directory is disposable by
+    // default regardless of its name, size or nested contents. Do not follow
+    // symlinks to discover whether they happen to target a directory.
+    if metadata.is_dir() {
+        return Ok(());
+    }
     let Some((_enclosing, cargo_target)) = enclosing_regenerable(worktree, trimmed, policy) else {
         return Err(format!(
             "ignored path {relative} is not inside a recognised build-output directory"
@@ -439,23 +413,10 @@ pub(crate) fn classify_ignored(
     if trimmed.split('/').any(|component| component == ".aethyme") && !cargo_target {
         return Err(format!("{relative} holds Aethyme state"));
     }
-    if metadata.file_type().is_symlink() {
-        let root = std::fs::canonicalize(worktree)
-            .map_err(|error| format!("cannot resolve worktree: {error}"))?;
-        let target = std::fs::canonicalize(&path)
-            .map_err(|_| format!("symlink {relative} cannot be resolved"))?;
-        if !target.starts_with(&root) {
-            return Err(format!("symlink {relative} points outside the worktree"));
-        }
-        return Ok(());
-    }
-    if metadata.is_dir() {
-        return scan_regenerable_dir(worktree, trimmed, cargo_target, budget);
-    }
-    if is_sensitive_name(name) {
-        return Err(format!("{relative} looks like a secret or data file"));
-    }
-    // A plain file inside a recognised build-output directory.
+    // The policy declares this output disposable. Package fixtures routinely
+    // contain keys, databases, dangling links and hundreds of thousands of files;
+    // inspecting those contents both invents blockers and scales with the output.
+    // Worktree removal unlinks symlinks; it never follows their targets.
     Ok(())
 }
 
@@ -870,7 +831,8 @@ pub(crate) fn unclean_reason(
         .filter(|entry| entry.len() > 3)
         .filter(|entry| {
             // Finder metadata is not somebody's change.
-            !(entry.starts_with("?? ") && entry[3..].rsplit('/').next() == Some(".DS_Store"))
+            policy.strict
+                || !(entry.starts_with("?? ") && entry[3..].rsplit('/').next() == Some(".DS_Store"))
         })
         .map(|entry| entry[3..].to_string())
         .collect::<Vec<_>>();
@@ -910,6 +872,15 @@ pub(crate) fn unclean_reason(
         }
     }
 
+    ignored_content_reason(worktree, policy)
+}
+
+/// Shared ignored-content verdict for automatic and finish-time cleanup.
+/// Callers still prove tracked cleanliness, ownership, liveness and delivery.
+pub(crate) fn ignored_content_reason(
+    worktree: &Path,
+    policy: &AutoCleanupPolicy,
+) -> Result<Option<String>, String> {
     let ignored = git(
         worktree,
         &[
@@ -921,12 +892,11 @@ pub(crate) fn unclean_reason(
             "-z",
         ],
     )?;
-    // Default-deny: every ignored entry must be shown disposable.
-    let mut budget = CLASSIFY_ENTRY_CAP;
+    // Git supplies ignored roots; never recursively walk their contents.
     for relative in ignored.split('\0').filter(|path| !path.is_empty()) {
-        if let Err(reason) = classify_ignored(worktree, relative, policy, &mut budget) {
+        if let Err(reason) = classify_ignored(worktree, relative, policy) {
             return Ok(Some(format!(
-                "ignored content outside the regenerable set: {reason}"
+                "ignored content requires explicit cleanup: {reason}"
             )));
         }
     }
@@ -1824,8 +1794,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn classify(root: &Path, relative: &str, policy: &AutoCleanupPolicy) -> Result<(), String> {
-        let mut budget = super::CLASSIFY_ENTRY_CAP;
-        classify_ignored(root, relative, policy, &mut budget)
+        classify_ignored(root, relative, policy)
     }
 
     fn touch(root: &Path, relative: &str) {
@@ -2267,79 +2236,86 @@ mod tests {
     }
 
     #[test]
-    fn pnpm_store_requires_a_witness_and_keeps_sensitive_content() {
+    fn ignored_directories_are_opaque_disposable_output_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let policy = AutoCleanupPolicy::default();
-        std::fs::create_dir(root.join(".pnpm-store")).unwrap();
-        assert!(classify(root, ".pnpm-store/", &policy).is_err());
-        touch(root, ".pnpm-store/v10/files/00/content");
-        assert_eq!(classify(root, ".pnpm-store/", &policy), Ok(()));
-        touch(root, ".pnpm-store/.env");
-        assert!(classify(root, ".pnpm-store/", &policy).is_err());
-        std::fs::remove_file(root.join(".pnpm-store/.env")).unwrap();
-        touch(root, ".pnpm-store/.aethyme/state.json");
-        assert!(classify(root, ".pnpm-store/", &policy).is_err());
-    }
-
-    #[test]
-    fn build_output_counts_only_with_the_evidence_that_proves_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let policy = AutoCleanupPolicy::default();
-        touch(root, "node_modules/pkg/index.js");
-        touch(root, "Cargo.toml");
-        touch(root, "target/debug/app");
-        touch(root, "py/__pycache__/m.pyc");
-        touch(root, ".DS_Store");
-        for ok in ["node_modules/", "target/", "py/__pycache__/", ".DS_Store"] {
-            assert_eq!(classify(root, ok, &policy), Ok(()), "{ok}");
+        assert!(!policy.strict);
+        for path in [
+            "node_modules/pkg/server.pem",
+            ".pnpm-store/.env",
+            "unknown-data/local.sqlite",
+            ".chau7/sessions/transcript.json",
+            ".aethyme/state.json",
+            "assets/build/logo.svg",
+            "target-notes/plan.md",
+        ] {
+            touch(root, path);
         }
-        // `build/` with no manifest beside it is somebody's directory.
-        touch(root, "assets/build/logo.svg");
-        assert!(classify(root, "assets/build/", &policy).is_err());
-        touch(root, "web/package.json");
-        touch(root, "web/build/app.js");
-        assert_eq!(classify(root, "web/build/", &policy), Ok(()));
-        // A Cargo-less `target/` is not a Cargo target directory.
-        touch(root, "data/target/run.csv");
-        assert!(classify(root, "data/target/", &policy).is_err());
-        // Whole components only: no prefix or substring matches.
-        touch(root, "target-notes/a.md");
-        touch(root, "my_build/x");
-        touch(root, "targets.json");
-        for blocked in ["target-notes/", "my_build/", "targets.json"] {
-            assert!(classify(root, blocked, &policy).is_err(), "{blocked}");
+        for path in [
+            "node_modules/",
+            ".pnpm-store/",
+            "unknown-data/",
+            ".chau7/",
+            ".aethyme/",
+            "assets/build/",
+            "target-notes/",
+        ] {
+            assert_eq!(classify(root, path, &policy), Ok(()), "{path}");
         }
-    }
-
-    #[test]
-    fn secrets_state_and_escaping_symlinks_block_even_inside_build_output() {
-        let dir = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let policy = AutoCleanupPolicy::default();
-        touch(root, ".env");
-        assert!(classify(root, ".env", &policy).is_err());
-        touch(root, "node_modules/pkg/server.pem");
-        assert!(classify(root, "node_modules/", &policy).is_err());
-        std::fs::remove_file(root.join("node_modules/pkg/server.pem")).unwrap();
-        touch(root, "node_modules/.aethyme/state.json");
-        assert!(classify(root, "node_modules/", &policy).is_err());
-        std::fs::remove_dir_all(root.join("node_modules/.aethyme")).unwrap();
+        // No recursive scan: an unresolvable package-fixture link is ignored.
         #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(outside.path(), root.join("node_modules/escape")).unwrap();
-            let reason = classify(root, "node_modules/", &policy).unwrap_err();
-            assert!(reason.contains("outside the worktree"), "{reason}");
-            std::fs::remove_file(root.join("node_modules/escape")).unwrap();
-            std::os::unix::fs::symlink(
-                root.join("node_modules/pkg"),
-                root.join("node_modules/inside"),
-            )
-            .unwrap();
-        }
+        std::os::unix::fs::symlink(
+            root.join("does-not-exist"),
+            root.join("node_modules/dangling"),
+        )
+        .unwrap();
         assert_eq!(classify(root, "node_modules/", &policy), Ok(()));
+    }
+
+    #[test]
+    fn standalone_ignored_files_and_invalid_paths_remain_protected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = AutoCleanupPolicy::default();
+        for path in [".env", "private.sqlite", "notes.txt", "node_modules"] {
+            touch(root, path);
+            assert!(classify(root, path, &policy).is_err(), "{path}");
+        }
+        touch(root, ".DS_Store");
+        assert_eq!(classify(root, ".DS_Store", &policy), Ok(()));
+        for path in ["../unknown-data/", "/unknown-data/", "node_modules/../.env"] {
+            assert!(classify(root, path, &policy).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn strict_cleanup_requires_no_ignored_leftovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = AutoCleanupPolicy {
+            strict: true,
+            ..Default::default()
+        };
+        touch(root, "node_modules/pkg/index.js");
+        touch(root, "unknown-data/local.sqlite");
+        touch(root, ".DS_Store");
+        for path in ["node_modules/", "unknown-data/", ".DS_Store"] {
+            let reason = classify(root, path, &policy).unwrap_err();
+            assert!(reason.contains("strict cleanup"), "{path}: {reason}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dependency_root_links_are_classified_without_following_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::os::unix::fs::symlink(root.join("missing"), root.join("node_modules")).unwrap();
+        assert_eq!(classify(root, "node_modules", &Default::default()), Ok(()));
+        // A link with an unknown name is not assumed to point at a directory.
+        std::os::unix::fs::symlink(root.join("missing"), root.join("unknown-link")).unwrap();
+        assert!(classify(root, "unknown-link", &Default::default()).is_err());
     }
 
     #[test]
@@ -2371,6 +2347,15 @@ mod tests {
             write(&format!("[cleanup]\nregenerable = [{rejected}]\n"));
             assert!(AutoCleanupPolicy::load(dir.path()).is_err(), "{rejected}");
         }
+        write("[cleanup]\nstrict = true\n");
+        assert!(AutoCleanupPolicy::load(dir.path()).unwrap().strict);
+        assert!(!AutoCleanupPolicy::artifact_sweep_allowed(dir.path()));
+        write("[cleanup]\nstrict = false\n");
+        assert!(!AutoCleanupPolicy::load(dir.path()).unwrap().strict);
+        assert!(AutoCleanupPolicy::artifact_sweep_allowed(dir.path()));
+        write("[cleanup]\nstrict = 1\n");
+        assert!(AutoCleanupPolicy::load(dir.path()).is_err());
+        assert!(!AutoCleanupPolicy::artifact_sweep_allowed(dir.path()));
         write("[cleanup]\nauto_remove = \"yes\"\n");
         assert!(AutoCleanupPolicy::load(dir.path()).is_err());
         write("[cleanup]\nautoremove = true\n");

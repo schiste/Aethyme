@@ -209,21 +209,17 @@ fn an_ignored_pnpm_store_does_not_keep_a_merged_closed_checkout() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn sensitive_content_in_an_ignored_pnpm_store_keeps_the_checkout() {
+fn sensitive_fixture_content_in_an_ignored_pnpm_store_is_discarded() {
     let fx = pnpm_store_fixture(true);
     let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     std::fs::create_dir_all(worktree.join(".pnpm-store")).unwrap();
-    let secret = worktree.join(".pnpm-store/.env");
-    std::fs::write(&secret, "private").unwrap();
+    std::fs::write(worktree.join(".pnpm-store/.env"), "private").unwrap();
     let report = run(&mut broker);
-    assert!(report.removed.is_empty(), "{report:#?}");
-    assert!(
-        kept_reason(&report, &worktree).contains("secret"),
-        "{report:#?}"
-    );
-    assert_eq!(std::fs::read_to_string(secret).unwrap(), "private");
+    assert_eq!(report.removed.len(), 1, "{report:#?}");
+    assert!(!worktree.exists());
 }
 
 #[test]
@@ -422,13 +418,13 @@ fn an_untracked_file_keeps_the_checkout() {
 }
 
 #[test]
-fn a_valuable_ignored_file_keeps_the_checkout() {
+fn standalone_ignored_root_files_still_keep_the_checkout() {
     let fx = fixture();
     let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     std::fs::write(worktree.join(".env"), "SECRET=1\n").unwrap();
     let report = run(&mut broker);
-    assert!(kept_reason(&report, &worktree).contains("outside the regenerable set"));
+    assert!(kept_reason(&report, &worktree).contains("requires explicit cleanup"));
     assert!(worktree.exists());
 }
 
@@ -941,7 +937,7 @@ fn removal_past_the_selection_deadline_defers_all_but_the_first() {
 }
 
 #[test]
-fn auto_remove_false_disables_it_and_keep_pins_and_regenerable_globs_apply() {
+fn auto_remove_false_disables_it_and_keep_pins_apply() {
     let fx = fixture();
     let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
@@ -959,38 +955,6 @@ fn auto_remove_false_disables_it_and_keep_pins_and_regenerable_globs_apply() {
     let report = run(&mut broker);
     assert!(kept_reason(&report, &worktree).contains("pinned"));
     assert!(worktree.exists());
-
-    // An ignored cache directory outside the built-in set keeps it until it
-    // is declared regenerable.
-    git(
-        &fx.repo,
-        &[
-            "config",
-            "core.excludesFile",
-            fx.repo.join("excludes").to_str().unwrap(),
-        ],
-    );
-    std::fs::write(fx.repo.join("excludes"), ".gradle-cache/\n").unwrap();
-    std::fs::create_dir_all(worktree.join(".gradle-cache")).unwrap();
-    std::fs::write(worktree.join(".gradle-cache/x"), "x").unwrap();
-    std::fs::write(&config, "[cleanup]\n").unwrap();
-    let report = run(&mut broker);
-    assert!(kept_reason(&report, &worktree).contains(".gradle-cache"));
-    #[cfg(unix)]
-    {
-        std::fs::write(
-            &config,
-            "[cleanup]\nregenerable = [\".gradle-cache/**\", \".gradle-cache\"]\n",
-        )
-        .unwrap();
-        let report = run(&mut broker);
-        assert_eq!(report.removed.len(), 1, "{report:#?}");
-        assert!(!worktree.exists());
-    }
-    #[cfg(not(unix))]
-    {
-        assert!(worktree.exists());
-    }
 }
 
 #[test]
@@ -1038,41 +1002,37 @@ fn ignore(fx: &Fixture, pattern: &str) {
     std::fs::write(exclude, text).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
-fn ignored_code_under_build_without_a_manifest_keeps_the_checkout() {
+fn ignored_directories_are_disposable_without_names_or_witnesses() {
     let fx = fixture();
     let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     ignore(&fx, "build/");
+    ignore(&fx, "target-notes/");
+    ignore(&fx, "saved-sessions/");
     std::fs::create_dir_all(worktree.join("build")).unwrap();
     std::fs::write(worktree.join("build/generate.py"), "print('mine')\n").unwrap();
-    let report = run(&mut broker);
-    assert!(
-        kept_reason(&report, &worktree).contains("not inside a recognised build-output directory"),
-        "{report:#?}"
-    );
-    assert!(worktree.join("build/generate.py").exists());
-}
-
-#[test]
-fn a_prefix_named_directory_is_not_build_output() {
-    let fx = fixture();
-    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
-    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
-    ignore(&fx, "target-notes/");
     std::fs::create_dir_all(worktree.join("target-notes")).unwrap();
     std::fs::write(worktree.join("target-notes/plan.md"), "notes\n").unwrap();
+    std::fs::create_dir_all(worktree.join("saved-sessions")).unwrap();
+    std::fs::write(worktree.join("saved-sessions/session.db"), "private\n").unwrap();
+    std::fs::create_dir_all(worktree.join("node_modules/pkg/.aethyme")).unwrap();
+    std::fs::write(worktree.join("node_modules/.env.local"), "secret\n").unwrap();
+    std::fs::write(
+        worktree.join("node_modules/pkg/.aethyme/state.json"),
+        "local session\n",
+    )
+    .unwrap();
+
     let report = run(&mut broker);
-    assert!(
-        kept_reason(&report, &worktree).contains("target-notes"),
-        "{report:#?}"
-    );
-    assert!(worktree.exists());
+    assert_eq!(report.removed.len(), 1, "{report:#?}");
+    assert!(!worktree.exists());
 }
 
 #[cfg(unix)]
 #[test]
-fn a_symlink_leaving_the_worktree_keeps_it() {
+fn an_escaping_symlink_inside_an_ignored_directory_is_unlinked_without_following() {
     let fx = fixture();
     let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
@@ -1081,11 +1041,100 @@ fn a_symlink_leaving_the_worktree_keeps_it() {
     std::fs::create_dir_all(worktree.join("node_modules")).unwrap();
     std::os::unix::fs::symlink(elsewhere.path(), worktree.join("node_modules/linked")).unwrap();
     let report = run(&mut broker);
+    assert_eq!(report.removed.len(), 1, "{report:#?}");
+    assert!(!worktree.exists());
+    assert!(elsewhere.path().join("precious.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_known_root_symlink_is_unlinked_without_following_its_external_target() {
+    let fx = fixture();
+    ignore(&fx, "node_modules");
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::write(elsewhere.path().join("precious.txt"), "keep\n").unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), worktree.join("node_modules")).unwrap();
+
+    let report = run(&mut broker);
+    assert_eq!(report.removed.len(), 1, "{report:#?}");
+    assert!(!worktree.exists());
+    assert!(elsewhere.path().join("precious.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn strict_mode_keeps_ignored_files_and_directories_until_they_are_removed() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    ignore(&fx, ".DS_Store");
+    ignore(&fx, "saved-sessions/");
+    std::fs::write(
+        fx.repo.join(".aethyme/config.toml"),
+        "[cleanup]\nstrict = true\n",
+    )
+    .unwrap();
+
+    let finder_metadata = worktree.join(".DS_Store");
+    std::fs::write(&finder_metadata, "local\n").unwrap();
+    let report = run(&mut broker);
     assert!(
-        kept_reason(&report, &worktree).contains("outside the worktree"),
+        kept_reason(&report, &worktree).contains("strict cleanup"),
         "{report:#?}"
     );
-    assert!(elsewhere.path().join("precious.txt").exists());
+    assert!(finder_metadata.exists());
+
+    std::fs::remove_file(&finder_metadata).unwrap();
+    let known_directory = worktree.join("node_modules");
+    std::fs::create_dir_all(&known_directory).unwrap();
+    std::fs::write(known_directory.join("package.json"), "{}\n").unwrap();
+    let report = run(&mut broker);
+    assert!(
+        kept_reason(&report, &worktree).contains("strict cleanup"),
+        "{report:#?}"
+    );
+    assert!(known_directory.exists());
+
+    std::fs::remove_dir_all(&known_directory).unwrap();
+    let unknown_directory = worktree.join("saved-sessions");
+    std::fs::create_dir_all(&unknown_directory).unwrap();
+    std::fs::write(unknown_directory.join("session.json"), "{}\n").unwrap();
+    let report = run(&mut broker);
+    assert!(
+        kept_reason(&report, &worktree).contains("strict cleanup"),
+        "{report:#?}"
+    );
+    assert!(unknown_directory.exists());
+
+    std::fs::remove_dir_all(&unknown_directory).unwrap();
+    let report = run(&mut broker);
+    assert_eq!(report.removed.len(), 1, "{report:#?}");
+    assert!(!worktree.exists());
+}
+
+#[test]
+fn explicit_non_force_cleanup_obeys_strict_mode() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (session_id, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    std::fs::write(
+        fx.repo.join(".aethyme/config.toml"),
+        "[cleanup]\nstrict = true\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(worktree.join("node_modules")).unwrap();
+    std::fs::write(worktree.join("node_modules/.env"), "secret\n").unwrap();
+
+    let error = broker.cleanup(session_id, false).unwrap_err();
+    assert!(error.to_string().contains("strict cleanup"), "{error}");
+    assert!(worktree.join("node_modules/.env").exists());
+    assert!(worktree.exists());
+
+    std::fs::remove_dir_all(worktree.join("node_modules")).unwrap();
+    broker.cleanup(session_id, false).unwrap();
+    assert!(!worktree.exists());
 }
 
 #[test]
@@ -1308,7 +1357,13 @@ fn automatic_cleanup_releases_checkout_after_grace_expires() {
 #[cfg(unix)]
 #[test]
 fn apply_preserves_selected_checkout_after_cleanup_policy_changes() {
-    for change in ["disabled", "pinned", "withdrawn_regenerable", "unreadable"] {
+    for change in [
+        "disabled",
+        "pinned",
+        "withdrawn_regenerable",
+        "strict",
+        "unreadable",
+    ] {
         let fx = fixture();
         let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
         let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
@@ -1329,6 +1384,7 @@ fn apply_preserves_selected_checkout_after_cleanup_policy_changes() {
                 worktree.file_name().unwrap().to_string_lossy()
             ),
             "withdrawn_regenerable" => "[cleanup]\nregenerable = []\n".to_owned(),
+            "strict" => "[cleanup]\nstrict = true\n".to_owned(),
             "unreadable" => "[cleanup\n".to_owned(),
             _ => unreachable!(),
         };
