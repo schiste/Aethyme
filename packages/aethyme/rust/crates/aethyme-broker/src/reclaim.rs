@@ -1330,7 +1330,7 @@ pub(crate) fn scan_worktree_resumable(
                     break;
                 }
                 replay_entries_examined = replay_entries_examined.saturating_add(1);
-                let item = ReclaimReadDirItem::capture(entry);
+                let item = ReclaimReadDirItem::capture(&entry);
                 if item.is_incomplete() {
                     budget.complete = false;
                     item.mark_incomplete(&mut incomplete, &frame.relative);
@@ -1397,7 +1397,7 @@ pub(crate) fn scan_worktree_resumable(
                 incomplete.mark("entry_budget", &frame.relative);
                 break;
             }
-            let item = ReclaimReadDirItem::capture(entry);
+            let item = ReclaimReadDirItem::capture(&entry);
             prefix_digest = extend_reclaim_prefix_digest(&prefix_digest, &item.fingerprint);
             frame.after_entry_ordinal = frame.after_entry_ordinal.saturating_add(1);
             if item.entry_error.is_some() {
