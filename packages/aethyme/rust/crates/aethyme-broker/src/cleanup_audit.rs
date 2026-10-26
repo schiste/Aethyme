@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::git::{GitRepo, GitWorktreeInfo};
-use crate::representation::{self, LandingVerdict};
+use crate::representation::{self, LandingSearchProfile, LandingVerdict, LandingVerdictCache};
 use crate::{Broker, BrokerOpError, CleanupPlan, CleanupWorktreePlan, Session, SessionOrigin};
 
 pub const CLEANUP_AUDIT_SCHEMA_VERSION: u32 = 1;
@@ -66,6 +66,13 @@ pub struct AuditTarget {
     /// Commits the local branch holds that the upstream does not.
     pub local_ahead_upstream: u64,
     pub warnings: Vec<String>,
+}
+
+/// The immutable audit target and command-local landing cache shared while
+/// classifying each row in one audit.
+struct AuditLandingContext<'a> {
+    target: &'a AuditTarget,
+    cache: &'a mut LandingVerdictCache,
 }
 
 /// Who, if anyone, accounts for an item.
@@ -390,9 +397,17 @@ impl Broker {
         &self,
         head: &str,
         tip: &str,
+        landing_cache: &mut LandingVerdictCache,
     ) -> Result<Option<(LandingEvidence, Option<String>)>, BrokerOpError> {
         Ok(
-            match representation::work_landed(self.repo_handle(), head, tip)? {
+            match representation::work_landed_with_cache(
+                self.repo_handle(),
+                head,
+                tip,
+                None,
+                LandingSearchProfile::default(),
+                landing_cache,
+            )? {
                 LandingVerdict::Landed {
                     evidence,
                     landed_by,
@@ -402,10 +417,15 @@ impl Broker {
         )
     }
 
-    fn classify_committed(&self, head: &str, target: &AuditTarget) -> CommittedWork {
+    fn classify_committed(
+        &self,
+        head: &str,
+        target: &AuditTarget,
+        landing_cache: &mut LandingVerdictCache,
+    ) -> CommittedWork {
         let result = (|| -> Result<CommittedWork, BrokerOpError> {
             if let Some((evidence, landed_by)) =
-                self.landing_evidence(head, &target.proof_commit)?
+                self.landing_evidence(head, &target.proof_commit, landing_cache)?
             {
                 return Ok(CommittedWork::InTarget {
                     evidence,
@@ -420,7 +440,9 @@ impl Broker {
             for (name, commit) in others {
                 if let Some(commit) = commit
                     && commit != &target.proof_commit
-                    && self.landing_evidence(head, commit)?.is_some()
+                    && self
+                        .landing_evidence(head, commit, landing_cache)?
+                        .is_some()
                 {
                     refs.push(name.clone());
                 }
@@ -449,12 +471,17 @@ impl Broker {
 
     /// The worst verdict over a checkout's head and its branch tip, which can
     /// diverge when the checkout is detached.
-    fn classify_heads(&self, heads: &[&str], target: &AuditTarget) -> Option<CommittedWork> {
+    fn classify_heads(
+        &self,
+        heads: &[&str],
+        target: &AuditTarget,
+        landing_cache: &mut LandingVerdictCache,
+    ) -> Option<CommittedWork> {
         let mut seen = BTreeSet::new();
         heads
             .iter()
             .filter(|head| seen.insert(**head))
-            .map(|head| self.classify_committed(head, target))
+            .map(|head| self.classify_committed(head, target, landing_cache))
             .max_by_key(CommittedWork::severity)
     }
 
@@ -475,8 +502,24 @@ impl Broker {
             BrokerOpError,
         >,
     ) -> Result<CleanupAudit, BrokerOpError> {
+        let mut landing_cache = LandingVerdictCache::default();
+        self.cleanup_audit_with_cache_and_reconciliation(&mut landing_cache, reconcile)
+    }
+
+    fn cleanup_audit_with_cache_and_reconciliation(
+        &self,
+        landing_cache: &mut LandingVerdictCache,
+        reconcile: impl FnOnce() -> Result<
+            crate::worktree_reconcile::WorktreeReconciliation,
+            BrokerOpError,
+        >,
+    ) -> Result<CleanupAudit, BrokerOpError> {
         let target = self.cleanup_audit_target()?;
-        let plan = self.cleanup_plan()?;
+        let plan = self.cleanup_plan_scanned_within_and_cache(
+            crate::SizeScan::Measure,
+            None,
+            landing_cache,
+        )?;
         let repo = self.repo_handle();
         let main_root = path_key(&self.main_root_path());
         let inventory = repo.worktree_inventory().map_err(BrokerOpError::from);
@@ -514,13 +557,17 @@ impl Broker {
                 continue;
             }
             claimed.insert(path_key(&path));
+            let mut landing_context = AuditLandingContext {
+                target: &target,
+                cache: &mut *landing_cache,
+            };
             if let Some(item) = self.audit_session(
                 &session,
                 &path,
                 registration(&path),
                 inventory.is_ok(),
                 plan_items.get(&session.id).copied(),
-                &target,
+                &mut landing_context,
             ) {
                 items.push(item);
             }
@@ -532,7 +579,7 @@ impl Broker {
                 continue;
             }
             claimed.insert(key);
-            items.push(self.audit_unowned_registration(entry, &target));
+            items.push(self.audit_unowned_registration(entry, &target, landing_cache));
         }
 
         let reconciliation = reconcile()?;
@@ -636,7 +683,7 @@ impl Broker {
         registration: Option<&GitWorktreeInfo>,
         inventory_known: bool,
         plan_item: Option<&CleanupWorktreePlan>,
-        target: &AuditTarget,
+        landing: &mut AuditLandingContext<'_>,
     ) -> Option<AuditItem> {
         let repo = self.repo_handle();
         let present = path.exists();
@@ -688,9 +735,9 @@ impl Broker {
             .chain(branch_tip.iter())
             .map(String::as_str)
             .collect();
-        let committed = self.classify_heads(&heads, target);
+        let committed = self.classify_heads(&heads, landing.target, landing.cache);
         if let Some(committed) = &committed {
-            evidence.push(describe_committed(committed, target));
+            evidence.push(describe_committed(committed, landing.target));
         }
         let plan_eligible = plan_item.is_some_and(CleanupWorktreePlan::eligible);
         if let Some(plan_item) = plan_item {
@@ -741,7 +788,7 @@ impl Broker {
                 checkout,
                 inspection_error.as_deref(),
                 plan_item,
-                target,
+                landing.target,
                 (tracked_changes, untracked_files),
                 id,
             )
@@ -773,6 +820,7 @@ impl Broker {
         &self,
         entry: &GitWorktreeInfo,
         target: &AuditTarget,
+        landing_cache: &mut LandingVerdictCache,
     ) -> AuditItem {
         let path = entry.path.to_string_lossy().into_owned();
         let branch = entry.branch.as_deref().map(|branch| {
@@ -819,7 +867,7 @@ impl Broker {
         });
         let (head, tracked_changes, untracked_files, committed, disposition) = match checkout {
             Ok((head, tracked, untracked)) => {
-                let committed = self.classify_committed(&head, target);
+                let committed = self.classify_committed(&head, target, landing_cache);
                 let disposition = if tracked + untracked > 0 {
                     AuditDisposition::Dirty
                 } else {
@@ -1039,6 +1087,10 @@ mod tests {
     use super::*;
 
     fn git(repository: &Path, args: &[&str]) {
+        let _ = git_text(repository, args);
+    }
+
+    fn git_text(repository: &Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
             .args(args)
             .current_dir(repository)
@@ -1049,6 +1101,7 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     #[test]
@@ -1088,5 +1141,78 @@ mod tests {
                 .as_str()
                 .is_some_and(|warning| warning.contains("worktree-root reconciliation incomplete"))
         }));
+    }
+
+    #[test]
+    fn cleanup_audit_reuses_the_cleanup_plans_complete_landing_proof() {
+        let repository = tempfile::tempdir().unwrap();
+        git(repository.path(), &["init", "-q", "-b", "main"]);
+        git(repository.path(), &["config", "user.name", "Fixture"]);
+        git(
+            repository.path(),
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        git(
+            repository.path(),
+            &["commit", "--allow-empty", "-qm", "initial"],
+        );
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(repository.path()).unwrap();
+        let session = broker.start_worktree("squashed work", None).unwrap();
+        let worktree = Path::new(&session.worktree_path);
+        std::fs::write(worktree.join("feature.txt"), "session content\n").unwrap();
+        git(worktree, &["add", "feature.txt"]);
+        git(worktree, &["commit", "-qm", "session feature"]);
+        let head = git_text(worktree, &["rev-parse", "HEAD"]);
+
+        git(
+            repository.path(),
+            &["merge", "--squash", session.branch.as_str()],
+        );
+        git(
+            repository.path(),
+            &["commit", "-qm", "squash session feature"],
+        );
+        let target = git_text(repository.path(), &["rev-parse", "HEAD"]);
+        broker.close(session.id).unwrap();
+
+        let mut cache = LandingVerdictCache::default();
+        let audit = broker
+            .cleanup_audit_with_cache_and_reconciliation(&mut cache, || {
+                broker.reconcile_worktree_directories(true)
+            })
+            .unwrap();
+
+        let item = audit
+            .items
+            .iter()
+            .find(|item| {
+                matches!(
+                    &item.owner,
+                    AuditOwner::Session { session_id, .. } if *session_id == session.id
+                )
+            })
+            .expect("the closed session remains in the audit");
+        assert_eq!(audit.target.proof_commit, target);
+        assert_eq!(item.head.as_deref(), Some(head.as_str()));
+        assert_eq!(item.disposition, AuditDisposition::InTarget);
+        assert!(
+            item.removable,
+            "the audit still agrees with plan eligibility"
+        );
+        assert!(matches!(
+            &item.committed,
+            Some(CommittedWork::InTarget {
+                evidence: crate::LandingEvidence::Content,
+                landed_by: Some(landed_by),
+            }) if landed_by == &target
+        ));
+        assert_eq!(
+            audit.cleanup_plan_digest,
+            broker.cleanup_plan().unwrap().digest,
+            "sharing a complete proof leaves the standalone cleanup plan unchanged"
+        );
+        assert!(cache.hits() > 0, "audit reuses the plan's exact proof");
     }
 }
