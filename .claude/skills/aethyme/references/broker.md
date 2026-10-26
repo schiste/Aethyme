@@ -28,6 +28,15 @@ irreplaceable evidence outside disposable checkouts before closing them, or set
 pause automatic artifact sweeps. `auto_remove = false` only disables whole-checkout
 removal. Never use `--force` merely to clear a capacity refusal.
 
+When investigating retained worktrees, distinguish task identity from shared
+service uptime. A shared agent daemon can outlive many tasks; its PID alone
+proves neither that each task is active nor that its checkout is disposable.
+Check the saved holder identity, current task activity and process-use evidence
+separately. A lease without an expiry is not proof of activity. Preserve raw
+ownership history and explicit takeover requirements when liveness is unknown;
+never clear leases or force removal merely because a holder is ambiguous. Use
+native reclamation plans, which independently protect recent work and open files.
+
 Before starting or delegating a fix for shared CI failures or generated
 files, use `aethyme broker status --compact --json` and open PRs on affected
 paths. Read the matching task, claimed paths and PR diff even when the graph
