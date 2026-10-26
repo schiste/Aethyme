@@ -29,7 +29,10 @@
 //!   session produced (a squash or a cherry-pick of the net diff);
 //! - **patch equivalence**: every session commit has a patch-identical commit
 //!   on the branch, and one branch commit has all of them in its history (a
-//!   rebase before merge, which changes every blob the base touched, #408).
+//!   rebase before merge, which changes every blob the base touched, #408);
+//! - **net-patch equivalence**: one branch commit has a patch identical to the
+//!   complete cumulative diff from the session base to its head (a multi-commit
+//!   squash after the target changed the same files).
 //!
 //! [`work_landed`] is the one entry point for "did this work land": the
 //! representation scan, the cleanup audit and the cleanup plan all ask it, so
@@ -66,7 +69,9 @@ pub const DEFAULT_SEARCH_CAP: usize = 2_000;
 const MAX_LANDING_SEARCH_BUDGET: Duration = Duration::from_secs(30);
 /// A large but finite complete commit listing for oldest-first search.
 const MAX_LANDING_CANDIDATE_LIST_BYTES: usize = 16 * 1024 * 1024;
-const LANDING_SEARCH_ALGORITHM_VERSION: u8 = 2;
+/// A complete net diff must fit in this bound before it can be compared.
+const MAX_LANDING_NET_PATCH_BYTES: usize = 16 * 1024 * 1024;
+const LANDING_SEARCH_ALGORITHM_VERSION: u8 = 3;
 
 fn landing_query_count(candidate_count: usize, path_count: usize) -> Option<usize> {
     candidate_count
@@ -134,6 +139,10 @@ pub enum LandingOutcome {
 }
 
 /// How work reached a branch.
+///
+/// Serialized evidence is descriptive, not an operator-selected assertion. A
+/// consumer that does not recognize a variant must treat it as unavailable and
+/// keep the worktree rather than assuming that an unknown proof is sufficient.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LandingEvidence {
@@ -144,6 +153,9 @@ pub enum LandingEvidence {
     /// Every session commit's patch is on the branch under another SHA
     /// (rebase or cherry-pick delivery).
     PatchEquivalent,
+    /// One branch commit has a patch ID equal to the session's complete
+    /// base-to-head net patch (multi-commit squash delivery).
+    NetPatchEquivalent,
     /// The head changes nothing the branch does not already hold.
     NoNetChange,
 }
@@ -154,6 +166,7 @@ impl LandingEvidence {
             Self::Ancestry => "ancestry",
             Self::Content => "content",
             Self::PatchEquivalent => "patch equivalence",
+            Self::NetPatchEquivalent => "cumulative patch equivalence",
             Self::NoNetChange => "no net change",
         }
     }
@@ -161,15 +174,16 @@ impl LandingEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Landing {
-    /// The commit that carried the work: the earliest holding the content, or,
-    /// for patch equivalence, the earliest whose history holds every
-    /// equivalent patch.
+    /// The commit that carried the work: the earliest holding exact content,
+    /// the earliest whose history holds every per-commit equivalent patch, or
+    /// the earliest whose patch matches the complete cumulative patch.
     pub commit: String,
     pub subject: String,
     /// Candidates examined before this one; 0 means the oldest candidate.
     pub position: usize,
     pub paths: usize,
-    /// Content, or patch equivalence when no single commit holds the content.
+    /// Content, patch equivalence, or net-patch equivalence when no single
+    /// commit holds the exact session content.
     pub evidence: LandingEvidence,
 }
 
@@ -447,22 +461,37 @@ fn find_landing_with_limits(
         }
     }
 
-    // A truncated window says nothing about the history beyond it, and the
-    // patch comparison would have to read all of that history.
-    if !truncated
-        && let Some((commit, position)) = patch_landing(repo, content, branch_tip, window)?
-    {
-        return Ok(LandingSearch {
-            outcome: LandingOutcome::Landed(Landing {
-                subject: subject(repo, &commit),
-                commit,
-                position,
-                paths: paths.len(),
-                evidence: LandingEvidence::PatchEquivalent,
-            }),
-            examined: window.len(),
-            truncated: false,
-        });
+    // A truncated window says nothing about history beyond it. Both patch
+    // tiers require a complete candidate set and share the same deadline.
+    if !truncated {
+        if let Some((commit, position)) = patch_landing(repo, content, branch_tip, window)? {
+            return Ok(LandingSearch {
+                outcome: LandingOutcome::Landed(Landing {
+                    subject: subject(repo, &commit),
+                    commit,
+                    position,
+                    paths: paths.len(),
+                    evidence: LandingEvidence::PatchEquivalent,
+                }),
+                examined: window.len(),
+                truncated: false,
+            });
+        }
+        if let Some((commit, position)) =
+            net_patch_landing(repo, content, window, MAX_LANDING_NET_PATCH_BYTES)?
+        {
+            return Ok(LandingSearch {
+                outcome: LandingOutcome::Landed(Landing {
+                    subject: subject(repo, &commit),
+                    commit,
+                    position,
+                    paths: paths.len(),
+                    evidence: LandingEvidence::NetPatchEquivalent,
+                }),
+                examined: window.len(),
+                truncated: false,
+            });
+        }
     }
 
     Ok(LandingSearch {
@@ -570,6 +599,70 @@ fn patch_landing(
         .iter()
         .position(|candidate| covering.contains(candidate))
         .map(|position| (candidates[position].clone(), position)))
+}
+
+/// The earliest candidate whose first-parent patch is identical to the
+/// session's complete cumulative base-to-head patch.
+///
+/// This complements [`patch_landing`]: after a rebase, a squash commit can
+/// carry the combined result of several session commits even though no
+/// individual session commit has a matching patch on the target. The net
+/// patch and every candidate patch are computed with Git's existing
+/// `--verbatim` patch-ID semantics. The source endpoints and candidate list
+/// are immutable commit IDs for this search; a bounded or incomplete diff is
+/// an error, never evidence of absence. Empty patches have no identity and
+/// cannot match.
+fn net_patch_landing(
+    repo: &GitRepo,
+    content: &SessionContent,
+    candidates: &[String],
+    max_patch_bytes: usize,
+) -> Result<Option<(String, usize)>, BrokerOpError> {
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let unavailable = |source: crate::GitError| {
+        if matches!(&source, crate::GitError::TimedOut { .. }) {
+            landing_search_budget_expired(format!(
+                "while comparing the complete net patch: {source}"
+            ))
+        } else {
+            BrokerOpError::RepresentationUnavailable {
+                reason: format!("cannot compare the complete net patch: {source}"),
+            }
+        }
+    };
+    let unavailable_reason = |reason: &str| BrokerOpError::RepresentationUnavailable {
+        reason: format!("cannot compare the complete net patch: {reason}"),
+    };
+    // Freeze every patch endpoint before asking Git to compare content. The
+    // candidate list comes from the bounded rev-list snapshot; reject anything
+    // that is not already a full immutable commit ID rather than letting a
+    // moving ref or revision expression change the proof mid-search.
+    let base = full_commit_oid(&content.base)
+        .ok_or_else(|| unavailable_reason("session base is not a full commit ID"))?;
+    let head = full_commit_oid(&content.head)
+        .ok_or_else(|| unavailable_reason("session head is not a full commit ID"))?;
+    let pinned_candidates = candidates
+        .iter()
+        .map(|candidate| {
+            full_commit_oid(candidate)
+                .ok_or_else(|| unavailable_reason("candidate is not a full commit ID"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(session_patch) = repo
+        .patch_id_between_bounded(&base, &head, max_patch_bytes)
+        .map_err(unavailable)?
+    else {
+        return Ok(None);
+    };
+    let candidate_patches = repo
+        .first_parent_patch_ids(&pinned_candidates)
+        .map_err(unavailable)?;
+    Ok(pinned_candidates
+        .iter()
+        .position(|candidate| candidate_patches.get(candidate) == Some(&session_patch))
+        .map(|position| (pinned_candidates[position].clone(), position)))
 }
 
 /// The answer to "did this head's work land on `target`".
@@ -1712,6 +1805,286 @@ mod tests {
                 landed_by: Some(squash.clone()),
             }
         );
+    }
+
+    fn two_commit_squash_with_target_change(
+        include_all_session_hunks: bool,
+    ) -> (tempfile::TempDir, GitRepo, String, String, String) {
+        let (tmp, repo, _) = seeded();
+        let base_lines = (0..20)
+            .map(|index| format!("line {index:02}\n"))
+            .collect::<Vec<_>>();
+        write(tmp.path(), "shared.txt", &base_lines.concat());
+        let base = commit(tmp.path(), "shared file baseline");
+
+        git(tmp.path(), &["checkout", "-q", "-b", "session"]);
+        let mut first = base_lines.clone();
+        first[5] = "session first hunk\n".into();
+        write(tmp.path(), "shared.txt", &first.concat());
+        commit(tmp.path(), "session first hunk");
+        let mut session = first;
+        session[15] = "session second hunk\n".into();
+        write(tmp.path(), "shared.txt", &session.concat());
+        let head = commit(tmp.path(), "session second hunk");
+
+        git(tmp.path(), &["checkout", "-q", "main"]);
+        let mut target = base_lines;
+        target[0] = "target changed the same file\n".into();
+        write(tmp.path(), "shared.txt", &target.concat());
+        commit(tmp.path(), "target changed the same file");
+        if include_all_session_hunks {
+            target[5] = "session first hunk\n".into();
+            target[15] = "session second hunk\n".into();
+        } else {
+            target[5] = "session first hunk\n".into();
+        }
+        write(tmp.path(), "shared.txt", &target.concat());
+        let squash = commit(tmp.path(), "squashed session changes");
+
+        (tmp, repo, base, head, squash)
+    }
+
+    #[test]
+    fn multi_commit_squash_is_found_by_its_complete_net_patch() {
+        let (_tmp, repo, base, head, squash) = two_commit_squash_with_target_change(true);
+        assert_ne!(
+            repo.blob_at(&squash, "shared.txt"),
+            repo.blob_at(&head, "shared.txt"),
+            "the target's separate change keeps exact content from matching"
+        );
+        let content = session_content(&repo, &base, &head).unwrap();
+        let search = find_landing(&repo, &content, &squash, DEFAULT_SEARCH_CAP).unwrap();
+        let landing = search
+            .landing()
+            .expect("the complete two-commit net patch is present");
+        assert_eq!(landing.commit, squash);
+        assert_eq!(landing.evidence, LandingEvidence::NetPatchEquivalent);
+    }
+
+    #[test]
+    fn cumulative_patch_evidence_has_a_distinct_json_value() {
+        let verdict = LandingVerdict::Landed {
+            evidence: LandingEvidence::NetPatchEquivalent,
+            landed_by: Some("a".repeat(40)),
+        };
+
+        let json = serde_json::to_value(verdict).unwrap();
+
+        assert_eq!(json["state"], "landed");
+        assert_eq!(json["evidence"], "net_patch_equivalent");
+        assert_eq!(json["landed_by"], "a".repeat(40));
+    }
+
+    #[test]
+    fn a_squash_missing_one_session_hunk_is_not_landed_by_net_patch() {
+        let (_tmp, repo, base, head, squash) = two_commit_squash_with_target_change(false);
+        let content = session_content(&repo, &base, &head).unwrap();
+        let search = find_landing(&repo, &content, &squash, DEFAULT_SEARCH_CAP).unwrap();
+        assert!(matches!(search.outcome, LandingOutcome::NotFound { .. }));
+    }
+
+    #[test]
+    fn a_truncated_candidate_window_cannot_accept_a_net_patch_match() {
+        let (_tmp, repo, base, head, squash) = two_commit_squash_with_target_change(true);
+        let content = session_content(&repo, &base, &head).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let _git_deadline = crate::git::limit_git_until(deadline);
+
+        let search = find_landing_with_limits(
+            &repo,
+            &content,
+            &squash,
+            1,
+            deadline,
+            crate::git::MAX_GIT_BATCH_QUERY_COUNT,
+            MAX_LANDING_CANDIDATE_LIST_BYTES,
+        )
+        .unwrap();
+
+        assert!(search.truncated);
+        assert!(matches!(search.outcome, LandingOutcome::NotFound { .. }));
+    }
+
+    #[test]
+    fn empty_net_patch_has_no_patch_identity() {
+        let (_tmp, repo, base) = seeded();
+        assert_eq!(
+            repo.patch_id_between_bounded(&base, &base, MAX_LANDING_NET_PATCH_BYTES)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn net_patch_search_requires_pinned_full_commit_ids() {
+        let (tmp, repo, base) = seeded();
+        write(tmp.path(), "session.txt", "session content\n");
+        let head = commit(tmp.path(), "session change");
+        let mut content = session_content(&repo, &base, &head).unwrap();
+        content.base = "main".into();
+
+        let error = net_patch_landing(
+            &repo,
+            &content,
+            std::slice::from_ref(&head),
+            MAX_LANDING_NET_PATCH_BYTES,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            BrokerOpError::RepresentationUnavailable { ref reason }
+                if reason.contains("session base is not a full commit ID")
+        ));
+    }
+
+    #[test]
+    fn net_patch_budget_failures_are_unavailable() {
+        let (_tmp, repo, base, head, squash) = two_commit_squash_with_target_change(true);
+        let content = session_content(&repo, &base, &head).unwrap();
+        let candidates = repo.commits_between_oldest(&base, &squash).unwrap();
+
+        let oversized = net_patch_landing(&repo, &content, &candidates, 1).unwrap_err();
+        assert!(matches!(
+            oversized,
+            BrokerOpError::RepresentationUnavailable { ref reason }
+                if reason.contains("complete net patch") && reason.contains("output exceeded 1 bytes")
+        ));
+
+        let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        let _git_deadline = crate::git::limit_git_until(expired);
+        let timed_out =
+            net_patch_landing(&repo, &content, &candidates, MAX_LANDING_NET_PATCH_BYTES)
+                .unwrap_err();
+        assert!(matches!(
+            timed_out,
+            BrokerOpError::RepresentationUnavailable { ref reason }
+                if reason.contains("time budget") && reason.contains("complete net patch")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn net_patch_ids_preserve_binary_mode_and_rename_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (tmp, repo, _) = seeded();
+        std::fs::write(tmp.path().join("image.bin"), [0, 1, 2, 255]).unwrap();
+        write(tmp.path(), "run.sh", "#!/bin/sh\necho ok\n");
+        write(tmp.path(), "old.txt", "renamed content\n");
+        commit(tmp.path(), "patch fidelity baseline");
+        let base = git(tmp.path(), &["rev-parse", "HEAD"]);
+
+        let apply_session_net_patch = |root: &Path, binary: &[u8], mode: u32, rename: bool| {
+            std::fs::write(root.join("image.bin"), binary).unwrap();
+            std::fs::set_permissions(root.join("run.sh"), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+            if rename {
+                std::fs::rename(root.join("old.txt"), root.join("new.txt")).unwrap();
+            } else {
+                write(root, "new.txt", "renamed content\n");
+            }
+        };
+
+        git(tmp.path(), &["checkout", "-q", "-b", "session"]);
+        apply_session_net_patch(tmp.path(), &[0, 1, 3, 255], 0o755, true);
+        let session_head = commit(tmp.path(), "binary mode and rename change");
+        let session_patch = repo
+            .patch_id_between_bounded(&base, &session_head, MAX_LANDING_NET_PATCH_BYTES)
+            .unwrap()
+            .expect("nonempty session patch has an identity");
+
+        let (matching, binary_mismatch, mode_mismatch, rename_mismatch) = {
+            let root = tmp.path();
+            git(root, &["checkout", "-q", "-b", "candidate-match", &base]);
+            apply_session_net_patch(root, &[0, 1, 3, 255], 0o755, true);
+            let matching = commit(root, "matching binary mode rename patch");
+
+            git(
+                root,
+                &["checkout", "-q", "-b", "candidate-binary-mismatch", &base],
+            );
+            apply_session_net_patch(root, &[0, 1, 4, 255], 0o755, true);
+            let binary_mismatch = commit(root, "different binary patch");
+
+            git(
+                root,
+                &["checkout", "-q", "-b", "candidate-mode-mismatch", &base],
+            );
+            apply_session_net_patch(root, &[0, 1, 3, 255], 0o644, true);
+            let mode_mismatch = commit(root, "missing executable mode change");
+
+            git(
+                root,
+                &["checkout", "-q", "-b", "candidate-rename-mismatch", &base],
+            );
+            apply_session_net_patch(root, &[0, 1, 3, 255], 0o755, false);
+            let rename_mismatch = commit(root, "addition instead of rename");
+            (matching, binary_mismatch, mode_mismatch, rename_mismatch)
+        };
+        let candidates = vec![
+            matching.clone(),
+            binary_mismatch.clone(),
+            mode_mismatch.clone(),
+            rename_mismatch.clone(),
+        ];
+        let candidate_patches = repo.first_parent_patch_ids(&candidates).unwrap();
+
+        assert_eq!(candidate_patches.get(&matching), Some(&session_patch));
+        for candidate in [binary_mismatch, mode_mismatch, rename_mismatch] {
+            assert_ne!(
+                candidate_patches.get(&candidate),
+                Some(&session_patch),
+                "candidate {candidate} must preserve the distinction in its full patch"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_mode_only_net_patch_has_identity_and_rejects_a_content_change() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (tmp, repo, _) = seeded();
+        write(tmp.path(), "run.sh", "#!/bin/sh\necho ok\n");
+        commit(tmp.path(), "mode baseline");
+        let base = git(tmp.path(), &["rev-parse", "HEAD"]);
+
+        git(tmp.path(), &["checkout", "-q", "-b", "session"]);
+        std::fs::set_permissions(
+            tmp.path().join("run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let head = commit(tmp.path(), "mode-only session change");
+        let session_patch = repo
+            .patch_id_between_bounded(&base, &head, MAX_LANDING_NET_PATCH_BYTES)
+            .unwrap()
+            .expect("mode-only changes have a patch identity");
+
+        git(
+            tmp.path(),
+            &["checkout", "-q", "-b", "matching-mode", &base],
+        );
+        std::fs::set_permissions(
+            tmp.path().join("run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let matching = commit(tmp.path(), "matching mode-only change");
+
+        git(
+            tmp.path(),
+            &["checkout", "-q", "-b", "different-content", &base],
+        );
+        write(tmp.path(), "run.sh", "#!/bin/sh\necho different\n");
+        let different = commit(tmp.path(), "content change without mode change");
+        let candidate_patches = repo
+            .first_parent_patch_ids(&[matching.clone(), different.clone()])
+            .unwrap();
+
+        assert_eq!(candidate_patches.get(&matching), Some(&session_patch));
+        assert_ne!(candidate_patches.get(&different), Some(&session_patch));
     }
 
     #[test]

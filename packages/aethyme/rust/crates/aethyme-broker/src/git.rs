@@ -3904,6 +3904,173 @@ impl GitRepo {
             .map(str::to_string))
     }
 
+    /// Bounded verbatim patch ID for the complete cumulative diff `from..to`.
+    ///
+    /// The full diff must fit in `max_diff_bytes` before it is hashed. It is
+    /// staged into an anonymous file, then passed to `patch-id` through its
+    /// bounded file-backed stdin path. Both Git processes share one effective
+    /// deadline, including any shorter caller deadline. Empty diffs have no
+    /// identity; output limits and timeouts are errors, never partial IDs.
+    ///
+    /// `--full-index` preserves old and new blob IDs for binary changes, and
+    /// the remaining diff options match [`Self::first_parent_patch_ids`], so
+    /// the cumulative patch and candidate patches use the same patch-ID
+    /// semantics.
+    pub(crate) fn patch_id_between_bounded(
+        &self,
+        from: &str,
+        to: &str,
+        max_diff_bytes: usize,
+    ) -> Result<Option<String>, GitError> {
+        let pipeline_args = "diff --full-index --no-color | patch-id --verbatim";
+        let started = Instant::now();
+        let deadline = effective_git_deadline(pipeline_args, git_timeout(), started)?;
+        let diff_args = ["diff", "--full-index", "--no-color", from, to, "--"];
+        let mut diff = git_command();
+        diff.args(diff_args)
+            .current_dir(&self.root)
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        let budget = remaining_git_budget(pipeline_args, deadline)?;
+        let output = match crate::bounded_output::output_limited(&mut diff, budget, max_diff_bytes)
+            .map_err(|source| GitError::Spawn {
+                args: pipeline_args.into(),
+                source,
+            })? {
+            crate::bounded_output::LimitedOutput::Completed(output) => output,
+            crate::bounded_output::LimitedOutput::Deadline => {
+                note_git_timeout();
+                return Err(GitError::TimedOut {
+                    args: pipeline_args.into(),
+                    seconds: budget.as_secs().max(1),
+                });
+            }
+            crate::bounded_output::LimitedOutput::OutputLimit => {
+                return Err(GitError::Git {
+                    args: pipeline_args.into(),
+                    stderr: format!("Git diff output exceeded {max_diff_bytes} bytes per stream"),
+                });
+            }
+        };
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: "diff --full-index --no-color".into(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        if Instant::now() >= deadline {
+            note_git_timeout();
+            return Err(GitError::TimedOut {
+                args: pipeline_args.into(),
+                seconds: deadline.saturating_duration_since(started).as_secs().max(1),
+            });
+        }
+        if output.stdout.is_empty() {
+            return Ok(None);
+        }
+
+        let mut input = tempfile::tempfile().map_err(|source| GitError::Spawn {
+            args: "patch-id --verbatim stdin".into(),
+            source,
+        })?;
+        for chunk in output.stdout.chunks(GIT_BATCH_INPUT_CHUNK_BYTES) {
+            if Instant::now() >= deadline {
+                note_git_timeout();
+                return Err(GitError::TimedOut {
+                    args: pipeline_args.into(),
+                    seconds: deadline.saturating_duration_since(started).as_secs().max(1),
+                });
+            }
+            input.write_all(chunk).map_err(|source| GitError::Spawn {
+                args: "patch-id --verbatim stdin".into(),
+                source,
+            })?;
+        }
+        input
+            .seek(SeekFrom::Start(0))
+            .map_err(|source| GitError::Spawn {
+                args: "patch-id --verbatim stdin".into(),
+                source,
+            })?;
+        let budget = remaining_git_budget(pipeline_args, deadline)?;
+        let mut patch_id = git_command();
+        patch_id
+            .args(PATCH_ID_ARGS)
+            .current_dir(&self.root)
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        let output = match crate::bounded_output::output_with_input_limited(
+            &mut patch_id,
+            input,
+            budget,
+            MAX_GIT_BATCH_OUTPUT_BYTES,
+        )
+        .map_err(|source| GitError::Spawn {
+            args: pipeline_args.into(),
+            source,
+        })? {
+            crate::bounded_output::LimitedOutput::Completed(output) => output,
+            crate::bounded_output::LimitedOutput::Deadline => {
+                note_git_timeout();
+                return Err(GitError::TimedOut {
+                    args: pipeline_args.into(),
+                    seconds: budget.as_secs().max(1),
+                });
+            }
+            crate::bounded_output::LimitedOutput::OutputLimit => {
+                return Err(GitError::Git {
+                    args: pipeline_args.into(),
+                    stderr: format!(
+                        "patch-id output exceeded {MAX_GIT_BATCH_OUTPUT_BYTES} bytes per stream"
+                    ),
+                });
+            }
+        };
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: "patch-id --verbatim".into(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        if Instant::now() >= deadline {
+            note_git_timeout();
+            return Err(GitError::TimedOut {
+                args: pipeline_args.into(),
+                seconds: deadline.saturating_duration_since(started).as_secs().max(1),
+            });
+        }
+
+        let text = std::str::from_utf8(&output.stdout).map_err(|_| GitError::Git {
+            args: "patch-id --verbatim".into(),
+            stderr: "patch-id returned non-UTF-8 output".into(),
+        })?;
+        let mut lines = text.lines();
+        let Some(line) = lines.next() else {
+            return Err(GitError::Git {
+                args: "patch-id --verbatim".into(),
+                stderr: "nonempty complete diff produced no patch identity".into(),
+            });
+        };
+        let mut fields = line.split_ascii_whitespace();
+        let (Some(patch_id), Some(unattributed_commit)) = (fields.next(), fields.next()) else {
+            return Err(GitError::Git {
+                args: "patch-id --verbatim".into(),
+                stderr: "patch-id returned an incomplete identity".into(),
+            });
+        };
+        if fields.next().is_some()
+            || lines.next().is_some()
+            || !matches!(patch_id.len(), 40 | 64)
+            || !patch_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !matches!(unattributed_commit.len(), 40 | 64)
+            || !unattributed_commit.bytes().all(|byte| byte == b'0')
+        {
+            return Err(GitError::Git {
+                args: "patch-id --verbatim".into(),
+                stderr: "patch-id returned a malformed or ambiguous identity".into(),
+            });
+        }
+        Ok(Some(patch_id.to_ascii_lowercase()))
+    }
+
     /// Whether two commits have identical content for the supplied paths.
     ///
     /// Reads a path list, not an exit code, and that shape is the substance

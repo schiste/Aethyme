@@ -434,7 +434,7 @@ pub struct AutoRemovedCheckout {
     /// The upstream commit that contains the head: the ref tip for an
     /// ancestry proof, the landing commit for a content or patch proof.
     pub containing_commit: String,
-    /// `ancestry`, `content`, `patch equivalence` or `no net change`.
+    /// `ancestry`, `content`, `patch equivalence`, `cumulative patch equivalence` or `no net change`.
     pub proof: String,
     /// Bytes the last recorded measurement held for the worktree, when one
     /// exists. Removal does not walk the tree to count them.

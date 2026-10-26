@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-10-25
+Last Updated: 2026-10-27
 
 When code outside the `packages/aethyme/` Rust source tree invokes an
 Aethyme command, it crosses a process boundary. Static
@@ -84,6 +84,12 @@ authority. Gate/preparation and legacy interactive execution do not gain this
 observation unless they use the receipt-bearing supervised path.
 
 ## Inventory
+
+### Cleanup-resolution landing verdicts (extended 2026-10-27)
+
+| Reader | Invokes / assumes | Failure mode |
+|---|---|---|
+| Operators and automation reading `landing` from `aethyme broker finish cleanup resolve <session-id> --archive --json` plans and recovery `manifest.json` files | `landing` is a `LandingVerdict`: `state: landed` carries `evidence` (`ancestry`, `content`, `patch_equivalent`, `net_patch_equivalent`, or `no_net_change`) and optional `landed_by`; `state: not_landed` carries `examined` and `truncated`. `net_patch_equivalent` means one candidate commit matches the complete cumulative session patch. | Readers that do not recognize an evidence value must treat the verdict as unavailable and retain the worktree. They must never interpret an unknown value as proof that automatic removal is safe. |
 
 ### Reviewed worktree identity recovery (#847)
 
