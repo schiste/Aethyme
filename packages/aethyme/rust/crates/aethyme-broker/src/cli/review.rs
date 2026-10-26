@@ -187,87 +187,6 @@ pub(super) fn run_review_thread(mut parsed: Parsed) -> Result<(), UsageError> {
     run_git_gh(parsed, "gh")
 }
 
-#[cfg(test)]
-mod review_thread_command_tests {
-    use super::*;
-
-    #[test]
-    fn generated_thread_commands_use_only_the_allowlisted_graphql_mutations() {
-        let lookup = review_thread_gh_args(
-            crate::gh_ref_guard::REVIEW_THREAD_LOOKUP_QUERY,
-            "PRRT_kwDOabc",
-            None,
-        );
-        let reply = review_thread_gh_args(
-            crate::gh_ref_guard::REVIEW_THREAD_REPLY_QUERY,
-            "PRRT_kwDOabc",
-            Some("reply text"),
-        );
-        let resolve = review_thread_gh_args(
-            crate::gh_ref_guard::REVIEW_THREAD_RESOLVE_QUERY,
-            "PRRT_kwDOabc",
-            None,
-        );
-        assert_eq!(
-            crate::classify_gh(&lookup),
-            Some(crate::OperationEffect::Read)
-        );
-        assert_eq!(
-            crate::gh_ref_guard::assess(&lookup, "o/r"),
-            crate::gh_ref_guard::Verdict::NoRefWrite
-        );
-        for args in [&reply, &resolve] {
-            assert_eq!(
-                crate::classify_gh(args),
-                Some(crate::OperationEffect::Write)
-            );
-            assert_eq!(
-                crate::gh_ref_guard::assess(args, "o/r"),
-                crate::gh_ref_guard::Verdict::SafeWrite
-            );
-        }
-    }
-
-    #[test]
-    fn thread_preflight_requires_the_exact_repository_and_pull_request() {
-        let response = serde_json::json!({
-            "data": {
-                "node": {
-                    "id": "PRRT_kwDOabc",
-                    "pullRequest": {
-                        "number": 42,
-                        "repository": { "nameWithOwner": "Owner/Repo" }
-                    }
-                }
-            }
-        });
-        assert!(review_thread_matches_target(
-            &response,
-            "PRRT_kwDOabc",
-            "owner/repo",
-            42
-        ));
-        assert!(!review_thread_matches_target(
-            &response,
-            "PRRT_other",
-            "owner/repo",
-            42
-        ));
-        assert!(!review_thread_matches_target(
-            &response,
-            "PRRT_kwDOabc",
-            "owner/other",
-            42
-        ));
-        assert!(!review_thread_matches_target(
-            &response,
-            "PRRT_kwDOabc",
-            "owner/repo",
-            7
-        ));
-    }
-}
-
 /// `broker review plan` -- evaluate the review policies against a change and
 /// print what they would do.
 ///
@@ -2588,4 +2507,85 @@ fn read_pull_request_head(root: &Path, repository: &str, pull_request: i64) -> O
     }
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
     json["headRefOid"].as_str().map(String::from)
+}
+
+#[cfg(test)]
+mod review_thread_command_tests {
+    use super::*;
+
+    #[test]
+    fn generated_thread_commands_use_only_the_allowlisted_graphql_mutations() {
+        let lookup = review_thread_gh_args(
+            crate::gh_ref_guard::REVIEW_THREAD_LOOKUP_QUERY,
+            "PRRT_kwDOabc",
+            None,
+        );
+        let reply = review_thread_gh_args(
+            crate::gh_ref_guard::REVIEW_THREAD_REPLY_QUERY,
+            "PRRT_kwDOabc",
+            Some("reply text"),
+        );
+        let resolve = review_thread_gh_args(
+            crate::gh_ref_guard::REVIEW_THREAD_RESOLVE_QUERY,
+            "PRRT_kwDOabc",
+            None,
+        );
+        assert_eq!(
+            crate::classify_gh(&lookup),
+            Some(crate::OperationEffect::Read)
+        );
+        assert_eq!(
+            crate::gh_ref_guard::assess(&lookup, "o/r"),
+            crate::gh_ref_guard::Verdict::NoRefWrite
+        );
+        for args in [&reply, &resolve] {
+            assert_eq!(
+                crate::classify_gh(args),
+                Some(crate::OperationEffect::Write)
+            );
+            assert_eq!(
+                crate::gh_ref_guard::assess(args, "o/r"),
+                crate::gh_ref_guard::Verdict::SafeWrite
+            );
+        }
+    }
+
+    #[test]
+    fn thread_preflight_requires_the_exact_repository_and_pull_request() {
+        let response = serde_json::json!({
+            "data": {
+                "node": {
+                    "id": "PRRT_kwDOabc",
+                    "pullRequest": {
+                        "number": 42,
+                        "repository": { "nameWithOwner": "Owner/Repo" }
+                    }
+                }
+            }
+        });
+        assert!(review_thread_matches_target(
+            &response,
+            "PRRT_kwDOabc",
+            "owner/repo",
+            42
+        ));
+        assert!(!review_thread_matches_target(
+            &response,
+            "PRRT_other",
+            "owner/repo",
+            42
+        ));
+        assert!(!review_thread_matches_target(
+            &response,
+            "PRRT_kwDOabc",
+            "owner/other",
+            42
+        ));
+        assert!(!review_thread_matches_target(
+            &response,
+            "PRRT_kwDOabc",
+            "owner/repo",
+            7
+        ));
+    }
 }
