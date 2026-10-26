@@ -119,15 +119,40 @@ fn the_installed_id_matches_the_shipped_manifests() {
     assert_eq!(MARKETPLACE_NAME, marketplace["name"].as_str().unwrap());
 }
 
+/// GitHub exports an empty base on push/workflow-dispatch runs. Only a
+/// nonempty pull-request base overrides this repository's default branch.
+fn plugin_base_ref(pr_base: Option<&str>) -> String {
+    let branch = pr_base
+        .filter(|branch| !branch.trim().is_empty())
+        .unwrap_or("main");
+    format!("refs/remotes/origin/{branch}")
+}
+
+#[test]
+fn plugin_base_ref_uses_main_without_a_pull_request_base() {
+    for pr_base in [None, Some(""), Some(" \t\n")] {
+        assert_eq!(plugin_base_ref(pr_base), "refs/remotes/origin/main");
+    }
+}
+
+#[test]
+fn plugin_base_ref_preserves_the_explicit_pull_request_target() {
+    for branch in ["main", "release/0.8", "feature/plugin-hooks"] {
+        assert_eq!(
+            plugin_base_ref(Some(branch)),
+            format!("refs/remotes/origin/{branch}")
+        );
+    }
+}
+
 /// Claude Code caches a plugin by its declared version. Keep this check on the
 /// full pull-request diff: it catches the failure from #687 before packaging,
 /// even when each individual hook commit was otherwise valid.
 #[test]
 fn changed_plugin_hooks_require_a_strictly_newer_plugin_version() {
     let root = aethyme_testkit::paths::repo_root();
-    let base_ref = std::env::var("GITHUB_BASE_REF")
-        .map(|branch| format!("refs/remotes/origin/{branch}"))
-        .unwrap_or_else(|_| "refs/remotes/origin/main".to_string());
+    let pr_base = std::env::var("GITHUB_BASE_REF").ok();
+    let base_ref = plugin_base_ref(pr_base.as_deref());
     let merge_base = git_output(&root, &["merge-base", "HEAD", &base_ref]);
     assert!(
         merge_base.status.success(),
