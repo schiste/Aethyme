@@ -222,6 +222,11 @@ fn eligible_pinned_session_contract(
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    aethyme_broker::cli::with_status_read_context(&args, || main_with_args(&args))
+}
+
+fn main_with_args(args: &[String]) -> ExitCode {
+    let args = args.to_vec();
     if let Some(code) = aethyme_broker::agent_supervisor::dispatch(&args) {
         return ExitCode::from(code);
     }

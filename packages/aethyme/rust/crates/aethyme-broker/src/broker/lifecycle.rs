@@ -4689,6 +4689,14 @@ impl Broker {
         })
     }
 
+    /// Observe current coordination state without startup recovery, GC, or
+    /// initialization. Keep the same strict durable root identity checks.
+    pub(crate) fn open_status_snapshot(path_inside_repo: &Path) -> Result<Self, BrokerOpError> {
+        let broker = Self::open_snapshot(path_inside_repo)?;
+        broker.validate_bound_repository_worktree_root()?;
+        Ok(broker)
+    }
+
     /// Open only far enough to migrate compatible broker storage and backfill
     /// the immutable contract of live pre-v9 sessions. The CLI uses this for
     /// an explicitly requested session continuation; unlike normal open it

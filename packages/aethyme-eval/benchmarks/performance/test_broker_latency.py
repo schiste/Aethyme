@@ -45,7 +45,7 @@ class BudgetPolicyTests(unittest.TestCase):
     def test_approved_limits_and_warning_policy(self):
         self.assertEqual(self.budgets['enforcement'], 'warning')
         self.assertEqual({k: v['limit_ms'] for k, v in self.budgets['budgets'].items()},
-                         {'routine_status': 500, 'guard_overhead': 500,
+                         {'routine_status': 150, 'guard_overhead': 500,
                           'unchanged_sync': 1000, 'push': 500})
 
     def test_exact_limit_is_within_budget(self):

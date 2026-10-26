@@ -300,13 +300,15 @@ pub(crate) fn repository_config_text(main_root: &Path) -> Option<String> {
 /// fetched default branch) or `working_copy` (the main checkout's file, used
 /// when there is no fetched default branch or it does not hold the file).
 pub(crate) fn repository_config_with_source(main_root: &Path) -> Option<(String, &'static str)> {
-    committed_config_text(main_root)
-        .map(|text| (text, "committed"))
-        .or_else(|| {
-            std::fs::read_to_string(main_root.join(".aethyme/config.toml"))
-                .ok()
-                .map(|text| (text, "working_copy"))
-        })
+    crate::status_reads::configuration(main_root, || {
+        committed_config_text(main_root)
+            .map(|text| (text, "committed"))
+            .or_else(|| {
+                std::fs::read_to_string(main_root.join(".aethyme/config.toml"))
+                    .ok()
+                    .map(|text| (text, "working_copy"))
+            })
+    })
 }
 
 /// `.aethyme/config.toml` as committed on the fetched default branch, if there

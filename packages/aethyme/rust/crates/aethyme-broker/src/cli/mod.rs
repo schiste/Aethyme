@@ -1025,9 +1025,44 @@ pub fn run_resolved(args: &[String]) -> u8 {
     run_resolved_with_mode(args, CompatibilityMode::Normal)
 }
 
-/// Dispatch an internal command produced by `resolve` using a router-selected
-/// compatibility mode.
+/// Share setup reads across the router preflight and routine status dispatch.
+/// Only ordinary compact/summary observation is eligible; audits and mutations
+/// retain fresh reads and their established initialization paths.
+pub fn with_status_read_context<T>(args: &[String], operation: impl FnOnce() -> T) -> T {
+    let args = if args.first().map(String::as_str) == Some("broker") {
+        &args[1..]
+    } else {
+        args
+    };
+    if routine_status(args) {
+        crate::status_reads::with_context(operation)
+    } else {
+        operation()
+    }
+}
+
+fn routine_status(args: &[String]) -> bool {
+    args.first().map(String::as_str) == Some("status")
+        && args[1..].iter().all(|arg| {
+            matches!(
+                arg.as_str(),
+                "--json" | "--json-output" | "--summary" | "--compact"
+            )
+        })
+        && (!args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--json" | "--json-output"))
+            || args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--summary" | "--compact")))
+}
+
+/// Dispatch an internal command with the router-selected compatibility mode.
 pub fn run_resolved_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
+    with_status_read_context(args, || run_with_status_context(args, mode))
+}
+
+fn run_with_status_context(args: &[String], mode: CompatibilityMode) -> u8 {
     let before = crate::cli_output::snapshot();
     let code = run_resolved_with_mode_inner(args, mode);
     crate::cli_output::exit_code_after_output(before, code)
@@ -1195,7 +1230,7 @@ pub fn report_dispatch_error(args: &[String], code: u8, message: &str) -> u8 {
 /// inspect it. A linked session worktree is never moved here; it has the
 /// explicit `broker sync --session <id>` path instead.
 fn maybe_fast_forward_main_checkout(args: &[String], mode: &CompatibilityMode) {
-    if !matches!(mode, CompatibilityMode::Normal) {
+    if !matches!(mode, CompatibilityMode::Normal) || routine_status(args) {
         return;
     }
     // Only the everyday public commands keep the checkout current. Hooks run
@@ -2498,6 +2533,11 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
     } else {
         None
     };
+    // Routine status is an observation, including advisory delivery. Do not
+    // migrate/create storage or mark notes delivered merely by polling it.
+    if routine_status(args) {
+        parsed.read_only_snapshot = true;
+    }
     surface_command_advisories(subcommand, &parsed);
     admit_session_holder(subcommand, &parsed)?;
 
