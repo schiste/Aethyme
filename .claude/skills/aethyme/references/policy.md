@@ -28,6 +28,10 @@ Explore, `graph`, `task`, `intents`, `facts`, `analyze`, and `deploy`.
 
 ## Orientation Skills
 
+The Aethyme skill trees under `.claude/skills/aethyme` and
+`.codex/skills/aethyme` are checked for byte parity. Mirror skill and
+reference edits in both locations.
+
 If `.codex/skills/repo-onboarding/SKILL.md` or
 `.claude/skills/repo-onboarding/SKILL.md` exists, load it first when the
 repository is unfamiliar or the request asks for a repo overview, setup,
@@ -50,11 +54,15 @@ Use typed commit messages.
 - Non-substantive commits (`test`, `docs`, `build`, `chore`, `revert`) may use a subject-only message; structured bodies remain optional.
 - Section content may start on the header line (`Problem: text`) or the following line (`Problem:` then `text`).
 
+Before committing a substantive change, write the final message to a file and
+run `aethyme repo lint-commit-message <message-file>`. The linter checks the
+type, scope, summary, and required section headers; each header needs its colon.
+
 Useful commands:
 
 ```bash
 aethyme repo commit-message-template --type fix --scope <scope>
-aethyme repo lint-commit-message .git/COMMIT_EDITMSG
+aethyme repo lint-commit-message <message-file>
 ```
 
 ## Branch And Review Practices
