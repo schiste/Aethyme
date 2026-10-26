@@ -364,6 +364,10 @@ Before `status`, `start`, `sync`, `push`, `submit` or `finish` runs from the pri
 
 This setting is a user-facing broker config contract. Changes to its accepted values, trust source, default, or existing-PR behavior require updating the config template and the session-push contract tests.
 
+### Review-thread conversation commands
+
+`aethyme broker advanced review-thread reply <thread-id> --session <id> --repo <owner/name> --pr <number> --message <text> --reason <text>` and `aethyme broker advanced review-thread resolve <thread-id> --session <id> --repo <owner/name> --pr <number> --reason <text>` add dedicated commands for inline pull-request conversations. Before either mutation, the broker looks up the thread and verifies that its repository and pull-request number match the supplied target. Both mutations use exact allowlisted GraphQL queries and a per-thread coordination lock; the durable journal retains the query and thread ID so it can recover that lock after a restart, while redacting reply text. General PR comments remain available through `broker advanced gh`; arbitrary GraphQL remains refused as unverifiable. Renaming or changing these commands, their target verification, or their journal contract requires updating the CLI reference and the broker's review-thread contract tests.
+
 ### Skill template files (canonical sources, deployed by the `aethyme-enhance` crate)
 
 | Source | Deployed to | Invokes | Failure mode if entry point removed |

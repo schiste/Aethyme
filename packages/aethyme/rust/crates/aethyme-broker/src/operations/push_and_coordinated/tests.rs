@@ -6,6 +6,23 @@ fn scope(args: &[&str]) -> Option<String> {
     resource_lock_scope(OperationProvider::Github, &gh(args))
 }
 
+fn review_thread_api(query: &str, thread_id: &str, body: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "api".to_string(),
+        "--method".to_string(),
+        "POST".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("query={query}"),
+        "-f".to_string(),
+        format!("threadId={thread_id}"),
+    ];
+    if let Some(body) = body {
+        args.extend(["-f".to_string(), format!("body={body}")]);
+    }
+    args
+}
+
 fn issue_plan(identity: &str, watermark: Option<i64>) -> CreatePlan {
     CreatePlan {
         collection: "issue".into(),
@@ -501,6 +518,61 @@ fn comment_and_review_writes_resolve_to_a_per_resource_scope() {
     assert_eq!(
         scope(&["api", "repos/o/r/issues/12/comments", "-f", "body=hi"]).as_deref(),
         Some("issue/12/comments")
+    );
+
+    let reply = review_thread_api(
+        crate::gh_ref_guard::REVIEW_THREAD_REPLY_QUERY,
+        "PRRT_kwDOabc",
+        Some("Thanks"),
+    );
+    let resolve = review_thread_api(
+        crate::gh_ref_guard::REVIEW_THREAD_RESOLVE_QUERY,
+        "PRRT_kwDOabc",
+        None,
+    );
+    let other_thread = review_thread_api(
+        crate::gh_ref_guard::REVIEW_THREAD_RESOLVE_QUERY,
+        "PRRT_kwDOdef",
+        None,
+    );
+    let lookup = review_thread_api(
+        crate::gh_ref_guard::REVIEW_THREAD_LOOKUP_QUERY,
+        "PRRT_kwDOabc",
+        None,
+    );
+    let reply_scope = resource_lock_scope(OperationProvider::Github, &reply);
+    assert!(
+        reply_scope
+            .as_deref()
+            .is_some_and(|scope| scope.starts_with("pull/review-thread/")),
+        "review-thread GraphQL writes need a thread-specific lock"
+    );
+    assert_eq!(
+        resource_lock_scope(OperationProvider::Github, &resolve),
+        reply_scope,
+        "reply and resolve on one thread must serialize together"
+    );
+    assert_ne!(
+        resource_lock_scope(OperationProvider::Github, &other_thread),
+        resource_lock_scope(OperationProvider::Github, &reply),
+        "different threads may proceed independently"
+    );
+    assert_eq!(
+        resource_lock_scope(
+            OperationProvider::Github,
+            &review_thread_api(
+                "mutation { createRef(input: {}) { ref { id } } }",
+                "PRRT_kwDOabc",
+                None
+            )
+        ),
+        None,
+        "unknown GraphQL mutations must keep the repository-wide lock"
+    );
+    assert_eq!(
+        resource_lock_scope(OperationProvider::Github, &lookup),
+        None,
+        "the verified target lookup is read-only and does not need a write lock"
     );
 }
 
@@ -1750,6 +1822,27 @@ fn redaction_keeps_audit_shape_without_secret_values() {
     .unwrap();
     assert!(value.contains("[REDACTED]"));
     assert!(!value.contains("super-secret"));
+}
+
+#[test]
+fn review_thread_journal_retains_scope_inputs_and_redacts_the_reply_body() {
+    let args = review_thread_api(
+        crate::gh_ref_guard::REVIEW_THREAD_REPLY_QUERY,
+        "PRRT_kwDOabc",
+        Some("private inline reply"),
+    );
+    let value = redacted_command(OperationProvider::Github, &args).unwrap();
+    assert!(value.contains(crate::gh_ref_guard::REVIEW_THREAD_REPLY_QUERY));
+    assert!(value.contains("threadId=PRRT_kwDOabc"));
+    assert!(!value.contains("private inline reply"));
+
+    let stored: Vec<String> = serde_json::from_str(&value).unwrap();
+    let expected_scope = crate::gh_ref_guard::review_thread_resource_scope(&args).unwrap();
+    assert_eq!(
+        resource_lock_scope(OperationProvider::Github, &stored[1..]).as_deref(),
+        Some(expected_scope.as_str()),
+        "a journaled operation must recompute its exact thread scope after restart"
+    );
 }
 
 fn assert_redacted(provider: OperationProvider, argv: &[&str], kept: &[&str], secret: &str) {

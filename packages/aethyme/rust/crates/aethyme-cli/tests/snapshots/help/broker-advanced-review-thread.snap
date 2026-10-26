@@ -1,0 +1,9 @@
+exit: 0
+--- stdout
+  aethyme broker advanced review-thread reply <thread-id> --session <id> --repo <owner/name> --pr <number> --message <text> --reason <text> [--no-wait|--queue-timeout <seconds>] [--json]
+      Reply to one inline review thread through a narrowly allowlisted GraphQL
+      mutation after verifying its repository and pull request. The broker
+      serializes writes for that thread and redacts the reply body from its journal.
+  aethyme broker advanced review-thread resolve <thread-id> --session <id> --repo <owner/name> --pr <number> --reason <text> [--no-wait|--queue-timeout <seconds>] [--json]
+      Verify and resolve one inline review thread through the same coordinated lane.
+--- stderr

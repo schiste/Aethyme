@@ -655,6 +655,12 @@ Usage:
   aethyme broker review abandon --session <id> --reason <text> [--json]
       Explicitly retire a stuck lifecycle without deleting its audit history,
       freeing the PR for fresh registration. Only the reason digest is stored.
+  aethyme broker advanced review-thread reply <thread-id> --session <id> --repo <owner/name> --pr <number> --message <text> --reason <text> [--no-wait|--queue-timeout <seconds>] [--json]
+      Reply to one inline review thread through a narrowly allowlisted GraphQL
+      mutation after verifying its repository and pull request. The broker
+      serializes writes for that thread and redacts the reply body from its journal.
+  aethyme broker advanced review-thread resolve <thread-id> --session <id> --repo <owner/name> --pr <number> --reason <text> [--no-wait|--queue-timeout <seconds>] [--json]
+      Verify and resolve one inline review thread through the same coordinated lane.
   aethyme broker submit --session <id> [--no-cache] [--verify-only] [--json]
       Submit the session's head commit: simulate the merge onto the local
       integration branch, run affected gates on the merged tree, and
@@ -2558,6 +2564,7 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         }
         "deliveries" => run_deliveries(parsed)?,
         "review" => run_review(parsed)?,
+        "review-thread" => run_review_thread(parsed)?,
         "prepare" => run_prepare(parsed)?,
         "console" => run_console(parsed)?,
         "resources" => run_resources(parsed)?,
@@ -2623,7 +2630,16 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
 }
 
 /// Commands that act for a session, and so must come from its holder (#393).
-const HOLDER_GUARDED: &[&str] = &["submit", "push", "sync", "finish", "close", "git", "gh"];
+const HOLDER_GUARDED: &[&str] = &[
+    "submit",
+    "push",
+    "sync",
+    "finish",
+    "close",
+    "git",
+    "gh",
+    "review-thread",
+];
 
 /// Refuse a command for a session that another live agent process holds,
 /// unless `--take-over`. Anything this check cannot establish -- no broker

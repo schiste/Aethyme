@@ -276,6 +276,31 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
         &["--session", "--to-session", "--reason"],
     ),
     ("review abandon", &["--session", "--reason"]),
+    (
+        "review-thread reply",
+        &[
+            "--session",
+            "--repo",
+            "--pr",
+            "--message",
+            "--reason",
+            "--no-wait",
+            "--queue-timeout",
+            "--take-over",
+        ],
+    ),
+    (
+        "review-thread resolve",
+        &[
+            "--session",
+            "--repo",
+            "--pr",
+            "--reason",
+            "--no-wait",
+            "--queue-timeout",
+            "--take-over",
+        ],
+    ),
     ("prepare", &["--session", "--offline", "--wait"]),
     // `status` reads `--offline` and `--wait` only to refuse them by name.
     ("prepare status", &["--session", "--offline", "--wait"]),
