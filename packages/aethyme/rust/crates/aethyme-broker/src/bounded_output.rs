@@ -1077,7 +1077,7 @@ mod tests {
         assert!(matches!(
             output_with_input_limited(
                 Command::new("sh").args(["-c", "exec sleep 30"]),
-                file_input(b""),
+                file_input(b"HEAD:src/slow-read.rs\n"),
                 Duration::from_millis(80),
                 64,
             )
