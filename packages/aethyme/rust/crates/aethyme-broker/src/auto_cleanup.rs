@@ -394,7 +394,9 @@ pub(crate) fn classify_ignored(
         return Err(format!("invalid ignored path {relative:?}"));
     }
     let name = trimmed.rsplit('/').next().unwrap_or(trimmed);
-    if !relative.ends_with('/') && name == ".DS_Store" {
+    if (!relative.ends_with('/') && name == ".DS_Store")
+        || crate::runtime_paths::is_broker_runtime_path(relative)
+    {
         return Ok(());
     }
     let metadata = std::fs::symlink_metadata(worktree.join(trimmed))
@@ -2284,6 +2286,13 @@ mod tests {
         }
         touch(root, ".DS_Store");
         assert_eq!(classify(root, ".DS_Store", &policy), Ok(()));
+        touch(root, ".aethyme/generated/experience-status.md");
+        assert_eq!(
+            classify(root, ".aethyme/generated/experience-status.md", &policy),
+            Ok(())
+        );
+        touch(root, ".aethyme/local-state.json");
+        assert!(classify(root, ".aethyme/local-state.json", &policy).is_err());
         for path in ["../unknown-data/", "/unknown-data/", "node_modules/../.env"] {
             assert!(classify(root, path, &policy).is_err(), "{path}");
         }
@@ -2300,7 +2309,13 @@ mod tests {
         touch(root, "node_modules/pkg/index.js");
         touch(root, "unknown-data/local.sqlite");
         touch(root, ".DS_Store");
-        for path in ["node_modules/", "unknown-data/", ".DS_Store"] {
+        touch(root, ".aethyme/generated/experience-status.md");
+        for path in [
+            "node_modules/",
+            "unknown-data/",
+            ".DS_Store",
+            ".aethyme/generated/experience-status.md",
+        ] {
             let reason = classify(root, path, &policy).unwrap_err();
             assert!(reason.contains("strict cleanup"), "{path}: {reason}");
         }

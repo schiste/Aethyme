@@ -122,7 +122,8 @@ the directory goes:
    branch, no rebase, merge, cherry-pick, revert or bisect in progress, and no
    protected standalone ignored file. By default every Git-ignored directory
    is disposable, regardless of name or contents; `.DS_Store` and recognized
-   artifact files or links are disposable too. With `strict = true`, every
+   artifact files or links and catalogued broker runtime output are disposable
+   too. With `strict = true`, every
    ignored leftover keeps the checkout.
 4. **Contained** -- every commit is in the fetched remote default branch, by
    ancestry or by the verbatim content/patch proof. Local `main` and the

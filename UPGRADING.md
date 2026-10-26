@@ -25,13 +25,17 @@ Breaking releases: [v0.8.33](#v0833), [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.
 
 ## v0.8.33
 
-### Ignored directories are disposable by default
+### Compatibility
+
+Ignored directories are disposable by default
 
 Every Git-ignored directory inside a broker session checkout is now eligible for
 disposal when the checkout otherwise passes ownership, delivery, source-cleanliness
 and liveness checks. This includes ignored datasets, saved session records and
 unknown folders, regardless of their names or nested contents. Standalone ignored
 files outside recognized output roots remain protected.
+
+### Migrate and verify
 
 To preserve every ignored leftover, set this in the primary checkout's
 `.aethyme/config.toml` **before** using the new runtime:
@@ -41,12 +45,25 @@ To preserve every ignored leftover, set this in the primary checkout's
 strict = true
 ```
 
+Upgrade every client and background worker before relying on strict mode; older
+binaries do not implement this new policy. Verify the router and engine both
+report v0.8.33.
+
 Strict mode also pauses automatic artifact sweeps; it does not prevent explicit
 reviewed artifact cleanup or force-discard operations. Move irreplaceable records
 outside disposable checkouts, or enable strict mode before upgrading. The primary
 checkout and live work remain protected. No database migration or compatibility
 floor change is introduced by this release; the v0.8.31 schema guidance still
 applies when upgrading from older versions.
+
+### Rollback
+
+This release introduces no database migration or new compatibility floor. A prior
+schema-compatible binary can still read the database, but it does not implement
+strict cleanup. Before rollback, stop cleanup workers and preserve irreplaceable
+ignored records outside disposable checkouts; remove the new `strict` key only
+once its retention guarantee is no longer required. Follow the v0.8.31 rollback
+limits for databases previously migrated or bound by that release.
 
 ## v0.8.31
 
