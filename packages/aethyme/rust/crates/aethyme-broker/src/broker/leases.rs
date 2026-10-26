@@ -433,6 +433,17 @@ impl Broker {
         self.agent_views(self.store.live_sessions()?, now_ms)
     }
 
+    /// Derive liveness for a caller-owned bounded page of sessions. Detached
+    /// maintenance uses this instead of materializing the full live-session
+    /// set before it can begin its own work budget.
+    pub(crate) fn agents_snapshot_for_sessions(
+        &self,
+        sessions: Vec<crate::Session>,
+        now_ms: i64,
+    ) -> Result<Vec<AgentView>, BrokerOpError> {
+        self.agent_views(sessions, now_ms)
+    }
+
     fn agent_views(
         &self,
         sessions: Vec<Session>,

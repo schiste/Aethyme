@@ -106,10 +106,8 @@ pub struct RetentionPolicy {
     /// held -- never against whether committed work survives.
     pub session_abandoned_after_hours: u32,
     /// Minimum inactivity in hours before the detached, pressure-only artifact
-    /// worker may reclaim a witnessed cache from an open session. It still
-    /// requires current idle-agent, holder, resource, Git, and process-use
-    /// evidence; `0` disables this lane. It never removes the checkout or
-    /// releases its leases.
+    /// worker scans an open session for potential artifact candidates. This
+    /// diagnostic lane does not remove files; `0` disables the scan.
     pub idle_session_artifact_hours: u32,
     /// Wall-clock budget for the autonomous artifact sweep. `0` disables it.
     pub artifact_sweep_budget_ms: u64,

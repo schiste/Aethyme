@@ -9,9 +9,9 @@
 //!
 //! The `gc reclaim` command reports candidates and only removes what an
 //! operator reviewed, following the same digest-bound plan/apply contract as
-//! `gc`. Its bounded scanner is also used by the detached pressure worker,
-//! which has separate activity, holder, resource, and process-use guards and
-//! removes only witnessed unattended artifacts.
+//! `gc`. The detached pressure worker also uses a bounded, resumable scan to
+//! report potential candidates; automatic removal requires a separate,
+//! coordinated lifecycle protocol.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -24,12 +24,101 @@ const RECLAIM_PLAN_SCHEMA_VERSION: u8 = 1;
 const RECLAIM_PLAN_FILENAME_PREFIX: &str = ".aethyme-reclaim-plan-";
 const RECLAIM_PLAN_FILENAME_SUFFIX: &str = ".json";
 pub(crate) const BOUNDED_RECLAIM_SCAN_ENTRY_BUDGET: usize = 16_384;
+const RESUMABLE_RECLAIM_SCAN_MAX_DEPTH: usize = 64;
+const RESUMABLE_RECLAIM_FRONTIER_MAX_FRAMES: usize = RESUMABLE_RECLAIM_SCAN_MAX_DEPTH + 1;
+const RESUMABLE_RECLAIM_SCAN_REPLAY_ENTRY_BUDGET_PER_DIRECTORY: usize = 16_384;
+const RESUMABLE_RECLAIM_SCAN_MAX_REPLAY_ENTRIES: usize =
+    RESUMABLE_RECLAIM_SCAN_REPLAY_ENTRY_BUDGET_PER_DIRECTORY
+        * RESUMABLE_RECLAIM_FRONTIER_MAX_FRAMES;
+const RESUMABLE_RECLAIM_FRONTIER_MAX_PATH_BYTES: usize = 4_096;
 
 #[derive(Debug)]
 pub(crate) struct BoundedReclaimScan {
     pub candidates: Vec<ReclaimCandidate>,
     pub complete: bool,
     pub entries_examined: usize,
+}
+
+/// A bounded depth-first cursor for one worktree scan. Each frame records a
+/// directory identity and the last entry inspected so a later pass can resume
+/// without retaining an unbounded list of directories or paths.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ReclaimScanFrontier {
+    frames: Vec<ReclaimScanFrame>,
+}
+
+impl ReclaimScanFrontier {
+    pub(crate) fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub(crate) fn is_bounded(&self) -> bool {
+        self.frames.len() <= RESUMABLE_RECLAIM_FRONTIER_MAX_FRAMES
+            && self.frames.iter().all(|frame| {
+                frame.relative.len() <= RESUMABLE_RECLAIM_FRONTIER_MAX_PATH_BYTES
+                    && frame
+                        .after_entry
+                        .as_ref()
+                        .is_none_or(|name| name.len() <= RESUMABLE_RECLAIM_FRONTIER_MAX_PATH_BYTES)
+                    && frame.after_entry_ordinal
+                        <= RESUMABLE_RECLAIM_SCAN_REPLAY_ENTRY_BUDGET_PER_DIRECTORY
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ReclaimScanFrame {
+    relative: String,
+    after_entry: Option<String>,
+    after_entry_ordinal: usize,
+    identity: ReclaimDirectoryIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ReclaimDirectoryIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    length: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct ResumableReclaimScan {
+    pub candidates: Vec<ReclaimCandidate>,
+    pub complete: bool,
+    /// All directory entries consumed in this pass, including cursor replay.
+    pub entries_examined: usize,
+    /// Newly inspected entries, excluding cursor replay.
+    pub new_entries_examined: usize,
+    /// Entries replayed to restore saved directory cursors.
+    pub replay_entries_examined: usize,
+    /// Count and first location/reason for scope left uninspected this pass.
+    pub incomplete_scopes: usize,
+    pub incomplete_reason: Option<String>,
+    pub incomplete_scope: Option<String>,
+    pub frontier: Option<ReclaimScanFrontier>,
+}
+
+#[derive(Debug, Default)]
+struct ReclaimScanIncomplete {
+    count: usize,
+    reason: Option<String>,
+    scope: Option<String>,
+}
+
+impl ReclaimScanIncomplete {
+    fn mark(&mut self, reason: &str, scope: &str) {
+        self.count = self.count.saturating_add(1);
+        if self.reason.is_none() {
+            self.reason = Some(reason.to_owned());
+            if scope.len() <= RESUMABLE_RECLAIM_FRONTIER_MAX_PATH_BYTES {
+                self.scope = Some(scope.to_owned());
+            }
+        }
+    }
 }
 
 /// The part of a candidate that determines whether an apply would touch it.
@@ -883,6 +972,319 @@ pub(crate) fn scan_worktree_bounded(
     )
 }
 
+/// Resume a bounded scan from a small, serializable directory frontier.
+/// Directory identities invalidate cursors when the tree changed between
+/// passes. Replaying a directory prefix is bounded by the caller's deadline;
+/// only newly inspected entries consume the discovery budget.
+pub(crate) fn scan_worktree_resumable(
+    worktree: &Path,
+    active: &[PathBuf],
+    extras: &[String],
+    deadline: Instant,
+    entry_budget: usize,
+    frontier: Option<ReclaimScanFrontier>,
+) -> ResumableReclaimScan {
+    let mut found = Vec::new();
+    let mut budget = WalkBudget {
+        deadline: Some(deadline),
+        entry_budget: entry_budget.clamp(1, BOUNDED_RECLAIM_SCAN_ENTRY_BUDGET),
+        entries_examined: 0,
+        complete: true,
+        stopped: false,
+    };
+    let mut incomplete = ReclaimScanIncomplete::default();
+    let checkout = {
+        let _git_deadline = crate::git::limit_git_until(deadline);
+        own_checkout(worktree)
+    };
+    if checkout.is_none() {
+        budget.complete = false;
+        incomplete.mark("git_checkout_unavailable", "");
+    }
+    let mut walk = Walk {
+        worktree,
+        checkout: checkout.as_ref(),
+        active,
+        extras,
+        sizing: Sizing::Skip,
+        budget: &mut budget,
+    };
+    let mut frames = frontier
+        .filter(|frontier| reclaim_frontier_is_current(worktree, frontier))
+        .map(|frontier| frontier.frames)
+        .unwrap_or_default();
+    if frames.is_empty() {
+        match directory_identity(worktree) {
+            Ok(identity) => frames.push(ReclaimScanFrame {
+                relative: String::new(),
+                after_entry: None,
+                after_entry_ordinal: 0,
+                identity,
+            }),
+            Err(_) => {
+                budget.complete = false;
+                incomplete.mark("worktree_unavailable", "");
+            }
+        }
+    }
+    let mut replay_entries_examined = 0usize;
+    while let Some(mut frame) = frames.pop() {
+        if budget.expired() {
+            budget.complete = false;
+            budget.stopped = true;
+            incomplete.mark("deadline", &frame.relative);
+            frames.push(frame);
+            break;
+        }
+        let directory = if frame.relative.is_empty() {
+            worktree.to_path_buf()
+        } else {
+            worktree.join(&frame.relative)
+        };
+        match directory_identity(&directory) {
+            Ok(identity) if identity != frame.identity => {
+                // A changed directory invalidates its old marker. Restart
+                // just this subtree; a fresh scan will either finish it or
+                // persist a new cursor under the new identity.
+                frame.identity = identity;
+                frame.after_entry = None;
+                frame.after_entry_ordinal = 0;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                budget.complete = false;
+                incomplete.mark("directory_unavailable", &frame.relative);
+                continue;
+            }
+        }
+        let entries = match read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(_) => {
+                budget.complete = false;
+                incomplete.mark("directory_unavailable", &frame.relative);
+                continue;
+            }
+        };
+        let mut entries = entries;
+        if let Some(marker) = frame.after_entry.as_deref() {
+            let mut found_marker = false;
+            let mut replay_limit_reached = false;
+            let mut replayed_in_frame = 0usize;
+            for entry in &mut entries {
+                if budget.expired() {
+                    budget.complete = false;
+                    budget.stopped = true;
+                    incomplete.mark("deadline", &frame.relative);
+                    break;
+                }
+                if replayed_in_frame >= RESUMABLE_RECLAIM_SCAN_REPLAY_ENTRY_BUDGET_PER_DIRECTORY {
+                    budget.complete = false;
+                    replay_limit_reached = true;
+                    break;
+                }
+                replay_entries_examined = replay_entries_examined.saturating_add(1);
+                let Ok(entry) = entry else {
+                    budget.complete = false;
+                    incomplete.mark("entry_unavailable", &frame.relative);
+                    replayed_in_frame = replayed_in_frame.saturating_add(1);
+                    if replayed_in_frame >= frame.after_entry_ordinal {
+                        break;
+                    }
+                    continue;
+                };
+                replayed_in_frame = replayed_in_frame.saturating_add(1);
+                if entry.file_name().to_str() == Some(marker) {
+                    found_marker = true;
+                    break;
+                }
+                if replayed_in_frame >= frame.after_entry_ordinal {
+                    break;
+                }
+            }
+            if budget.stopped {
+                frames.push(frame);
+                break;
+            }
+            if replay_limit_reached {
+                // This directory needs too much prefix replay for one bounded
+                // pass. Skip its remaining scope so sibling directories and
+                // later worktrees can still advance.
+                incomplete.mark("replay_limit", &frame.relative);
+                continue;
+            }
+            if !found_marker {
+                // Some filesystems do not promise stable enumeration order.
+                // If the marker cannot be replayed, restart this directory
+                // rather than silently skipping its prefix.
+                incomplete.mark("cursor_changed", &frame.relative);
+                frame.after_entry = None;
+                frame.after_entry_ordinal = 0;
+                frames.push(frame);
+                continue;
+            }
+        }
+        let mut descended = false;
+        for entry in &mut entries {
+            if budget.expired() {
+                budget.complete = false;
+                budget.stopped = true;
+                incomplete.mark("deadline", &frame.relative);
+                break;
+            }
+            if frame.after_entry_ordinal >= RESUMABLE_RECLAIM_SCAN_REPLAY_ENTRY_BUDGET_PER_DIRECTORY
+            {
+                // This frame cannot be resumed without exceeding the replay
+                // budget. Drop the rest of this directory and keep its
+                // ancestors so they can continue with later siblings.
+                budget.complete = false;
+                incomplete.mark("replay_limit", &frame.relative);
+                break;
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    budget.complete = false;
+                    incomplete.mark("entry_unavailable", &frame.relative);
+                    continue;
+                }
+            };
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                budget.complete = false;
+                incomplete.mark("non_utf8_entry", &frame.relative);
+                continue;
+            };
+            if !budget.examine_entry() {
+                incomplete.mark("entry_budget", &frame.relative);
+                break;
+            }
+            frame.after_entry = Some(name.clone());
+            frame.after_entry_ordinal = frame.after_entry_ordinal.saturating_add(1);
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(_) => {
+                    budget.complete = false;
+                    incomplete.mark("entry_unavailable", &frame.relative);
+                    continue;
+                }
+            };
+            if !kind.is_dir() || kind.is_symlink() || name == ".git" {
+                continue;
+            }
+            let path = entry.path();
+            if walk.inspect_directory(&path, &mut found) {
+                let relative = match path.strip_prefix(worktree).ok().and_then(Path::to_str) {
+                    Some(relative) => relative.to_owned(),
+                    None => {
+                        budget.complete = false;
+                        incomplete.mark("non_utf8_path", &frame.relative);
+                        continue;
+                    }
+                };
+                if frames.len() >= RESUMABLE_RECLAIM_SCAN_MAX_DEPTH {
+                    // Keep scanning siblings, but never claim that a subtree
+                    // deeper than this bounded frontier was fully inspected.
+                    budget.complete = false;
+                    incomplete.mark("depth_limit", &relative);
+                    continue;
+                }
+                match directory_identity(&path) {
+                    Ok(identity) => {
+                        frames.push(frame);
+                        frames.push(ReclaimScanFrame {
+                            relative,
+                            after_entry: None,
+                            after_entry_ordinal: 0,
+                            identity,
+                        });
+                        descended = true;
+                        break;
+                    }
+                    Err(_) => {
+                        budget.complete = false;
+                        incomplete.mark("directory_unavailable", &relative);
+                    }
+                }
+            }
+            if budget.stopped {
+                incomplete.mark("deadline", &frame.relative);
+                break;
+            }
+        }
+        if descended {
+            continue;
+        }
+        if budget.stopped {
+            frames.push(frame);
+            break;
+        }
+    }
+    found.sort_by_key(|candidate| std::cmp::Reverse(candidate.bytes));
+    ResumableReclaimScan {
+        candidates: found,
+        complete: budget.complete && frames.is_empty(),
+        entries_examined: budget.entries_examined + replay_entries_examined,
+        new_entries_examined: budget.entries_examined,
+        replay_entries_examined,
+        incomplete_scopes: incomplete.count,
+        incomplete_reason: incomplete.reason,
+        incomplete_scope: incomplete.scope,
+        frontier: (!frames.is_empty()).then_some(ReclaimScanFrontier { frames }),
+    }
+}
+
+fn directory_identity(path: &Path) -> io::Result<ReclaimDirectoryIdentity> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::other("scan path is not a directory"));
+    }
+    #[cfg(not(unix))]
+    let modified = metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(ReclaimDirectoryIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            length: metadata.len(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(ReclaimDirectoryIdentity {
+            modified_seconds: modified.as_secs().min(i64::MAX as u64) as i64,
+            modified_nanoseconds: modified.subsec_nanos() as i64,
+            length: metadata.len(),
+        })
+    }
+}
+
+fn reclaim_frontier_is_current(worktree: &Path, frontier: &ReclaimScanFrontier) -> bool {
+    if frontier.frames.is_empty() || !frontier.is_bounded() {
+        return false;
+    }
+    frontier.frames.iter().enumerate().all(|(index, frame)| {
+        let relative = Path::new(&frame.relative);
+        let valid_relative = !relative.is_absolute()
+            && relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)));
+        let parent_matches = index == 0
+            || relative.parent().is_some_and(|parent| {
+                parent == Path::new(&frontier.frames[index - 1].relative)
+                    && frontier.frames[index - 1].after_entry.as_deref()
+                        == relative.file_name().and_then(|name| name.to_str())
+            });
+        valid_relative
+            && parent_matches
+            && directory_identity(&worktree.join(relative)).is_ok_and(|id| id == frame.identity)
+    })
+}
+
 fn scan_worktree_with_limits(
     worktree: &Path,
     active: &[PathBuf],
@@ -1575,6 +1977,41 @@ impl WalkBudget {
 }
 
 impl Walk<'_> {
+    /// Inspect a directory as a possible candidate. Returns `true` when the
+    /// caller should descend into it.
+    fn inspect_directory(&mut self, path: &Path, found: &mut Vec<ReclaimCandidate>) -> bool {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            self.budget.complete = false;
+            return false;
+        };
+        if !is_artefact_directory_with_extras(name, self.extras) {
+            return true;
+        }
+        let bytes = match self.sizing {
+            Sizing::Measure => directory_bytes(path),
+            Sizing::Skip => 0,
+        };
+        let mut candidate = classify(path, self.worktree, bytes, self.active);
+        if candidate.reclaimable {
+            let protection = if let Some(deadline) = self.budget.deadline {
+                let _git_deadline = crate::git::limit_git_until(deadline);
+                git_protection(self.checkout, self.worktree, path)
+            } else {
+                git_protection(self.checkout, self.worktree, path)
+            };
+            if self.budget.expired() {
+                self.budget.complete = false;
+                self.budget.stopped = true;
+            }
+            if let Some(reason) = protection {
+                candidate.reclaimable = false;
+                candidate.reason = reason;
+            }
+        }
+        found.push(candidate);
+        false
+    }
+
     fn collect(&mut self, dir: &Path, found: &mut Vec<ReclaimCandidate>, depth: usize) {
         // Build trees are shallow relative to a repository; this bounds the
         // walk on a directory whose whole problem is that it is enormous.
@@ -1618,37 +2055,14 @@ impl Walk<'_> {
                 continue;
             }
             let path = entry.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 self.budget.complete = false;
                 continue;
             };
             if name == ".git" {
                 continue;
             }
-            if is_artefact_directory_with_extras(name, self.extras) {
-                let bytes = match self.sizing {
-                    Sizing::Measure => directory_bytes(&path),
-                    Sizing::Skip => 0,
-                };
-                let mut candidate = classify(&path, self.worktree, bytes, self.active);
-                if candidate.reclaimable {
-                    let protection = if let Some(deadline) = self.budget.deadline {
-                        let _git_deadline = crate::git::limit_git_until(deadline);
-                        git_protection(self.checkout, self.worktree, &path)
-                    } else {
-                        git_protection(self.checkout, self.worktree, &path)
-                    };
-                    if self.budget.expired() {
-                        self.budget.complete = false;
-                        self.budget.stopped = true;
-                        break;
-                    }
-                    if let Some(reason) = protection {
-                        candidate.reclaimable = false;
-                        candidate.reason = reason;
-                    }
-                }
-                found.push(candidate);
+            if !self.inspect_directory(&path, found) {
                 if self.budget.expired() {
                     self.budget.complete = false;
                     self.budget.stopped = true;
@@ -1759,6 +2173,139 @@ mod scan_tests {
         std::fs::create_dir_all(worktree).unwrap();
         git(worktree, &["init", "-q"]);
         std::fs::write(worktree.join(".gitignore"), gitignore).unwrap();
+    }
+
+    #[test]
+    fn resumable_scan_finds_a_deep_ignored_candidate_after_repeated_entry_caps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("session");
+        checkout(&worktree, "target/\n");
+        let candidate = worktree.join("packages/p299/rust/src/a/b/c/d/target");
+        std::fs::create_dir_all(&candidate).unwrap();
+        write(&candidate.join("CACHEDIR.TAG"), 1);
+        for index in 0..300 {
+            std::fs::create_dir_all(worktree.join(format!("packages/p{index:02}/src"))).unwrap();
+        }
+
+        let mut frontier = None;
+        let mut found_candidate = false;
+        for _ in 0..1_024 {
+            let scan = scan_worktree_resumable(
+                &worktree,
+                &[],
+                &[],
+                Instant::now() + Duration::from_secs(2),
+                4,
+                frontier,
+            );
+            assert!(scan.new_entries_examined <= 4);
+            assert!(scan.replay_entries_examined <= RESUMABLE_RECLAIM_SCAN_MAX_REPLAY_ENTRIES);
+            assert!(scan.entries_examined <= 4 + RESUMABLE_RECLAIM_SCAN_MAX_REPLAY_ENTRIES);
+            found_candidate |= scan
+                .candidates
+                .iter()
+                .any(|found| found.path == candidate && found.reclaimable);
+            frontier = scan.frontier;
+            if scan.complete {
+                break;
+            }
+        }
+
+        assert!(found_candidate, "deep candidate was never visited");
+        assert!(frontier.is_none(), "stable checkout should finish its scan");
+    }
+
+    #[test]
+    fn resumable_frontier_rejects_a_cursor_over_the_replay_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let frontier = ReclaimScanFrontier {
+            frames: vec![ReclaimScanFrame {
+                relative: String::new(),
+                after_entry: Some("marker".to_owned()),
+                after_entry_ordinal: RESUMABLE_RECLAIM_SCAN_REPLAY_ENTRY_BUDGET_PER_DIRECTORY + 1,
+                identity: directory_identity(tmp.path()).unwrap(),
+            }],
+        };
+
+        assert!(!frontier.is_bounded());
+    }
+
+    #[test]
+    fn resumable_scan_reports_an_overwide_uninspected_scope_and_scans_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("session");
+        checkout(&worktree, "target/\n");
+        let wide = worktree.join("packages/wide");
+        std::fs::create_dir_all(&wide).unwrap();
+        for index in 0..20_500 {
+            std::fs::create_dir(wide.join(format!("d{index:05}"))).unwrap();
+        }
+        let late_child = std::fs::read_dir(&wide)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .nth(20_499)
+            .unwrap();
+        let deep_candidate = wide.join(late_child).join("target");
+        std::fs::create_dir_all(&deep_candidate).unwrap();
+
+        for index in 0..128 {
+            std::fs::create_dir(worktree.join(format!("sibling-{index:03}"))).unwrap();
+        }
+        let root_entries = std::fs::read_dir(&worktree)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let packages_index = root_entries
+            .iter()
+            .position(|name| name == "packages")
+            .unwrap();
+        let sibling = root_entries
+            .iter()
+            .skip(packages_index + 1)
+            .find(|name| name.starts_with("sibling-"))
+            .expect("fixture has a sibling after the wide subtree");
+        let sibling_candidate = worktree.join(sibling).join("target");
+        std::fs::create_dir_all(&sibling_candidate).unwrap();
+
+        let mut frontier = None;
+        let mut found_sibling = false;
+        let mut replay_limited_scope = None;
+        for _ in 0..12 {
+            let scan = scan_worktree_resumable(
+                &worktree,
+                &[],
+                &[],
+                Instant::now() + Duration::from_secs(5),
+                4_096,
+                frontier,
+            );
+            assert!(scan.replay_entries_examined <= RESUMABLE_RECLAIM_SCAN_MAX_REPLAY_ENTRIES);
+            found_sibling |= scan
+                .candidates
+                .iter()
+                .any(|candidate| candidate.path == sibling_candidate && candidate.reclaimable);
+            if scan.incomplete_reason.as_deref() == Some("replay_limit") {
+                replay_limited_scope = scan.incomplete_scope.clone();
+                assert!(scan.incomplete_scopes > 0);
+                assert!(!scan.complete);
+            }
+            assert!(
+                !scan
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.path == deep_candidate)
+            );
+            frontier = scan.frontier;
+            if replay_limited_scope.is_some() && found_sibling {
+                break;
+            }
+        }
+
+        assert!(
+            found_sibling,
+            "the wide directory must not starve its siblings"
+        );
+        assert_eq!(replay_limited_scope.as_deref(), Some("packages/wide"));
     }
 
     #[test]

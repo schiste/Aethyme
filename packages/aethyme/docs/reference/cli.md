@@ -1792,15 +1792,19 @@ before. Set it to `0` to restore the previous behaviour, where a session held
 its worktree, its branch, and its leases until a human intervened.
 
 `idle_session_artifact_hours` defaults to 24 and sets the inactivity threshold
-for the detached, pressure-only artifact worker to consider caches in open
-sessions. It removes only witnessed, Git-ignored, untracked caches after fresh
-idle-agent and task-holder checks, a complete resource-writer inventory, a
-complete process-use snapshot with no open worktree files, and the same recent
-Git-index guard used by reviewed `gc reclaim`. `0` disables this lane. It only
-runs when free-space or inode headroom is below the gate threshold; it does
-not use `retained_bytes_budget`, which remains a separate retention-policy
-follow-up. It never removes an open checkout or releases its leases. The sweep
-event's `idle_open_session_directories` field reports the number removed.
+for the detached, pressure-only worker to scan open sessions for potential
+artifact candidates. The sweep event reports the bounded count in
+`idle_open_session_artifact_recommendations`; that count is a discovery result,
+not proof of current use or permission to remove files. This diagnostic scan
+does not remove open-session artifacts, close checkouts, or release leases.
+Its event reports incomplete-scope, replay/depth-limit, pending-frontier, and
+frontier-state read/write-limit counts. A false `open_session_scan_complete`
+means the census or a worktree scan remains incomplete; persisted per-worktree
+frontiers retain a bounded first incomplete scope and reason for resumption.
+`0` disables the scan. It only runs when free-space or inode headroom is below
+the gate threshold; it does not use `retained_bytes_budget`, which remains a
+separate retention-policy follow-up. Use reviewed `broker gc reclaim` for
+open-session artifact removal.
 
 When a session closes, its accepted-checkpoint pin is released in the same
 terminal transaction. The accepted session head, integration commit, tree, and

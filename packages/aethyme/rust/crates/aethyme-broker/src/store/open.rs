@@ -64,6 +64,22 @@ fn canonical_main_root(repo_root: &Path) -> Result<PathBuf, BrokerError> {
 }
 
 impl BrokerStore {
+    /// Set a temporary SQLite lock-wait bound for a maintenance tranche. The
+    /// caller restores the normal store timeout after the tranche returns.
+    pub(crate) fn set_bounded_busy_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), BrokerError> {
+        self.conn.busy_timeout(timeout)?;
+        Ok(())
+    }
+
+    pub(crate) fn restore_default_busy_timeout(&self) -> Result<(), BrokerError> {
+        self.conn
+            .busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        Ok(())
+    }
+
     /// A controller may outlive a compatible open and then wait behind an
     /// upgrade. Re-read compatibility before changing checkout ownership.
     pub(crate) fn require_live_schema_compatible(&self) -> Result<(), BrokerError> {
@@ -834,6 +850,40 @@ impl BrokerStore {
             "{SESSION_SELECT} WHERE status <> 'cleaned' ORDER BY id"
         ))?;
         let rows = stmt.query_map([], session_from_row)?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row??);
+        }
+        Ok(sessions)
+    }
+
+    /// Highest currently live session id, for a stable bounded maintenance
+    /// census. Sessions created after this value are handled on the next lap.
+    pub(crate) fn live_session_max_id(&self) -> Result<i64, BrokerError> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM sessions WHERE status <> 'cleaned'",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Read one keyset page of live sessions without materializing history.
+    /// The fixed cap prevents callers from turning this maintenance helper
+    /// into an unbounded liveness snapshot.
+    pub(crate) fn live_session_page(
+        &self,
+        after: i64,
+        through: i64,
+        limit: usize,
+    ) -> Result<Vec<Session>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SESSION_SELECT} WHERE status <> 'cleaned' AND id > ?1 AND id <= ?2
+             ORDER BY id LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(
+            params![after, through, limit.clamp(1, 32) as i64],
+            session_from_row,
+        )?;
         let mut sessions = Vec::new();
         for row in rows {
             sessions.push(row??);

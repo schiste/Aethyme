@@ -141,11 +141,21 @@ const ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY: &str = "gc.artifact_sweep.recovery_
 /// Round-robin position for the detached worker's pressure-only open-session
 /// artifact lane. This never changes session ownership or checkout state.
 const OPEN_SESSION_ARTIFACT_CURSOR_KEY: &str = "gc.artifact_sweep.open_session_cursor_id";
-/// Whether the previous open-session lap encountered evidence it could not
-/// classify. A complete lap clears this; an incomplete lap starts another
-/// bounded pass from the beginning.
-const OPEN_SESSION_ARTIFACT_LAP_INCOMPLETE_KEY: &str =
-    "gc.artifact_sweep.open_session_lap_incomplete";
+/// High-water mark for the current keyset census. New sessions enter the next
+/// lap rather than extending the current one indefinitely.
+const OPEN_SESSION_ARTIFACT_THROUGH_KEY: &str = "gc.artifact_sweep.open_session_through_id";
+/// Bounded, repository-wide DFS frontiers for open-session diagnostic scans.
+const OPEN_SESSION_ARTIFACT_FRONTIERS_KEY: &str = "gc.artifact_sweep.open_session_frontiers_v1";
+/// Last emitted recommendation state, which keeps worker retries from
+/// appending an identical event on every pass.
+const OPEN_SESSION_ARTIFACT_RESULT_KEY: &str = "gc.artifact_sweep.open_session_result_v1";
+/// Rotating cursor for pruning frontiers whose session identity was replaced
+/// or closed since it was last scanned.
+const OPEN_SESSION_ARTIFACT_PRUNE_CURSOR_KEY: &str =
+    "gc.artifact_sweep.open_session_frontier_prune_id";
+/// Monotonic marker so the worker recognizes progress inside one worktree
+/// even when the session cursor stays on the same ID.
+const OPEN_SESSION_ARTIFACT_PROGRESS_KEY: &str = "gc.artifact_sweep.open_session_frontier_progress";
 /// Retry time for an automatic continuation that made no filesystem progress.
 const ARTIFACT_SWEEP_RETRY_AFTER_KEY: &str = "gc.artifact_sweep.retry_after_ms";
 /// Separate durable request for whole-checkout cleanup deferred by an ordinary
@@ -178,11 +188,24 @@ const AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE: Duration = Duration::from_secs(60);
 /// Each whole-checkout pass has its own bounded tranche; the cursor resumes
 /// after candidates inspected before this deadline.
 const AUTO_CHECKOUT_CLEANUP_WORKER_PASS_BUDGET: Duration = Duration::from_secs(30);
-/// The detached artifact worker reserves a bounded tail for one open-session
-/// worktree proof and removal. This expensive path never runs inline.
+/// The detached artifact worker reserves a bounded tail for open-session
+/// candidate discovery. This diagnostic path never runs inline.
 const OPEN_SESSION_ARTIFACT_WORKER_RESERVE: Duration = Duration::from_secs(30);
-const OPEN_SESSION_RESOURCE_INVENTORY_ENTRY_BUDGET: usize = 4_096;
-const OPEN_SESSION_ARTIFACT_WORKTREE_BUDGET: usize = 64;
+const OPEN_SESSION_ARTIFACT_PAGE_SIZE: usize = 16;
+const OPEN_SESSION_ARTIFACT_SESSION_BUDGET: usize = 32;
+const OPEN_SESSION_ARTIFACT_SCAN_ENTRY_BUDGET: usize = 4_096;
+const OPEN_SESSION_ARTIFACT_FRONTIER_PRUNE_BUDGET: usize = 16;
+const OPEN_SESSION_ARTIFACT_FRONTIER_MAX_RECORDS: usize = 1_024;
+const OPEN_SESSION_ARTIFACT_FRONTIER_MAX_FRAMES: usize = 8_192;
+const OPEN_SESSION_ARTIFACT_FRONTIER_MAX_BYTES: usize = 2 * 1024 * 1024;
+const OPEN_SESSION_ARTIFACT_FRONTIER_MAX_PATH_BYTES: usize = 4_096;
+const OPEN_SESSION_ARTIFACT_FRONTIER_MAX_REASON_BYTES: usize = 64;
+const OPEN_SESSION_ARTIFACT_FRONTIER_MAX_AGE_MS: i64 = 30 * 24 * 3_600_000;
+/// Bound each SQLite wait and reserve for the pass's bounded set of store
+/// operations. Filesystem/Git discovery stops before this tail so lock waits
+/// cannot consume the entire scanner deadline.
+const OPEN_SESSION_ARTIFACT_DB_WAIT_PER_OPERATION: Duration = Duration::from_millis(20);
+const OPEN_SESSION_ARTIFACT_DB_WAIT_RESERVE: Duration = Duration::from_secs(3);
 /// A general foreground sweep reserves up to one cleanup-worker pass for
 /// whole-checkout work, while leaving at least half of the pass for caches.
 const AUTO_CHECKOUT_CLEANUP_FOREGROUND_RESERVE: Duration = AUTO_CHECKOUT_CLEANUP_WORKER_PASS_BUDGET;
@@ -230,7 +253,7 @@ pub struct ArtifactSweepOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenSessionArtifactEvidence {
-    Eligible,
+    InactiveCandidate,
     Retain,
     Unknown,
 }
@@ -238,8 +261,110 @@ enum OpenSessionArtifactEvidence {
 #[derive(Debug, Default)]
 struct OpenSessionArtifactPass {
     complete: bool,
-    directories_reclaimed: usize,
-    entries_reclaimed: usize,
+    ran: bool,
+    worktrees_scanned: usize,
+    recommendations: usize,
+    uninspected_scopes: usize,
+    replay_limited_scopes: usize,
+    depth_limited_scopes: usize,
+    pending_frontiers: usize,
+    frontier_state_unavailable: usize,
+    frontier_state_write_limited: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct OpenSessionArtifactFrontierSet {
+    schema_version: u8,
+    entries: Vec<OpenSessionArtifactFrontierEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct OpenSessionArtifactFrontierEntry {
+    session_id: i64,
+    worktree_path: String,
+    updated_at_ms: i64,
+    frontier: Option<crate::reclaim::ReclaimScanFrontier>,
+    retry: bool,
+    incomplete_scope: Option<String>,
+    incomplete_reason: Option<String>,
+}
+
+fn mark_open_session_frontier_retry(
+    frontier_set: &mut OpenSessionArtifactFrontierSet,
+    session: &crate::Session,
+    now: i64,
+    reason: &str,
+) {
+    frontier_set
+        .entries
+        .retain(|entry| entry.session_id != session.id);
+    frontier_set.entries.push(OpenSessionArtifactFrontierEntry {
+        session_id: session.id,
+        worktree_path: session.worktree_path.clone(),
+        updated_at_ms: now,
+        frontier: None,
+        retry: true,
+        incomplete_scope: None,
+        incomplete_reason: Some(reason.to_owned()),
+    });
+    frontier_set.entries.sort_by_key(|entry| entry.session_id);
+}
+
+fn encode_open_session_artifact_frontiers(
+    frontier_set: &OpenSessionArtifactFrontierSet,
+) -> Option<String> {
+    if frontier_set.schema_version != 1
+        || frontier_set.entries.len() > OPEN_SESSION_ARTIFACT_FRONTIER_MAX_RECORDS
+        || frontier_set
+            .entries
+            .iter()
+            .filter_map(|entry| entry.frontier.as_ref())
+            .any(|frontier| !frontier.is_bounded())
+        || frontier_set
+            .entries
+            .iter()
+            .filter_map(|entry| entry.frontier.as_ref())
+            .map(crate::reclaim::ReclaimScanFrontier::frame_count)
+            .sum::<usize>()
+            > OPEN_SESSION_ARTIFACT_FRONTIER_MAX_FRAMES
+        || frontier_set
+            .entries
+            .windows(2)
+            .any(|pair| pair[0].session_id >= pair[1].session_id)
+        || frontier_set.entries.iter().any(|entry| {
+            entry.worktree_path.len() > OPEN_SESSION_ARTIFACT_FRONTIER_MAX_PATH_BYTES
+                || entry.incomplete_scope.as_ref().is_some_and(|scope| {
+                    scope.len() > OPEN_SESSION_ARTIFACT_FRONTIER_MAX_PATH_BYTES
+                })
+                || entry.incomplete_reason.as_ref().is_some_and(|reason| {
+                    reason.len() > OPEN_SESSION_ARTIFACT_FRONTIER_MAX_REASON_BYTES
+                })
+        })
+    {
+        return None;
+    }
+    let encoded = serde_json::to_string(frontier_set).ok()?;
+    (encoded.len() <= OPEN_SESSION_ARTIFACT_FRONTIER_MAX_BYTES).then_some(encoded)
+}
+
+fn persist_open_session_artifact_frontiers(
+    broker: &mut Broker,
+    frontier_set: &OpenSessionArtifactFrontierSet,
+) -> Result<bool, BrokerOpError> {
+    let Some(encoded) = encode_open_session_artifact_frontiers(frontier_set) else {
+        return Ok(false);
+    };
+    broker.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_FRONTIERS_KEY, &encoded)?;
+    Ok(true)
+}
+
+impl Default for OpenSessionArtifactFrontierSet {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            entries: Vec::new(),
+        }
+    }
 }
 
 fn open_session_activity_evidence(
@@ -262,52 +387,9 @@ fn open_session_activity_evidence(
     }
     let idle_ms = i64::from(idle_hours).saturating_mul(3_600_000);
     if now.saturating_sub(activity_at) >= idle_ms {
-        OpenSessionArtifactEvidence::Eligible
+        OpenSessionArtifactEvidence::InactiveCandidate
     } else {
         OpenSessionArtifactEvidence::Retain
-    }
-}
-
-fn open_session_holder_evidence(
-    event: Option<&crate::Event>,
-    process_table: Option<&crate::session_holder::ProcessTable>,
-) -> OpenSessionArtifactEvidence {
-    let Some(process_table) = process_table else {
-        return OpenSessionArtifactEvidence::Unknown;
-    };
-    let Some(event) = event else {
-        return OpenSessionArtifactEvidence::Eligible;
-    };
-    let Some(payload) = event.payload_json.as_deref() else {
-        return OpenSessionArtifactEvidence::Unknown;
-    };
-    let Ok(holder) = serde_json::from_str::<crate::session_holder::AgentProcess>(payload) else {
-        return OpenSessionArtifactEvidence::Unknown;
-    };
-    if crate::session_holder::is_shared_agent_service(&holder.command) {
-        return OpenSessionArtifactEvidence::Eligible;
-    }
-    if process_table.is_alive(&holder) {
-        OpenSessionArtifactEvidence::Retain
-    } else {
-        OpenSessionArtifactEvidence::Eligible
-    }
-}
-
-fn open_session_resource_evidence(
-    leases: Option<&[crate::HostResourceLease]>,
-    worktree_fingerprint: &str,
-) -> OpenSessionArtifactEvidence {
-    let Some(leases) = leases else {
-        return OpenSessionArtifactEvidence::Unknown;
-    };
-    if leases.iter().any(|lease| {
-        lease.worktree_fingerprint == worktree_fingerprint
-            && lease.state != crate::HostLeaseState::Released
-    }) {
-        OpenSessionArtifactEvidence::Retain
-    } else {
-        OpenSessionArtifactEvidence::Eligible
     }
 }
 
@@ -2810,6 +2892,16 @@ impl Broker {
         Ok(self.store().meta_get(&key)?)
     }
 
+    fn artifact_sweep_meta_get_bounded(
+        &mut self,
+        legacy_key: &str,
+        max_bytes: usize,
+    ) -> Result<Option<String>, BrokerOpError> {
+        self.ensure_artifact_sweep_namespace()?;
+        let key = self.artifact_sweep_key(legacy_key)?;
+        bounded_legacy_artifact_sweep_meta_get(self.store(), &key, max_bytes)
+    }
+
     fn artifact_sweep_meta_set(
         &mut self,
         legacy_key: &str,
@@ -5289,8 +5381,8 @@ impl Broker {
                 return Ok(());
             }
             passes = passes.saturating_add(1);
-            let open_cursor_before =
-                self.artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_CURSOR_KEY)?;
+            let open_progress_before =
+                self.artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_PROGRESS_KEY)?;
             let (outcome, pass_entries_reclaimed) = match sweep_pass(self, policy, remaining) {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -5298,9 +5390,9 @@ impl Broker {
                     return Ok(());
                 }
             };
-            let open_cursor_after =
-                self.artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_CURSOR_KEY)?;
-            let open_cursor_advanced = open_cursor_before != open_cursor_after;
+            let open_progress_after =
+                self.artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_PROGRESS_KEY)?;
+            let open_discovery_advanced = open_progress_before != open_progress_after;
             entries_reclaimed = entries_reclaimed.saturating_add(pass_entries_reclaimed);
             if max_duration.is_some_and(|limit| started_at.elapsed() >= limit) {
                 self.defer_artifact_sweep_worker(&format!(
@@ -5331,7 +5423,7 @@ impl Broker {
                 ))?;
                 return Ok(());
             }
-            if pass_entries_reclaimed == 0 && !open_cursor_advanced {
+            if pass_entries_reclaimed == 0 && !open_discovery_advanced {
                 no_progress_passes = no_progress_passes.saturating_add(1);
                 if no_progress_passes >= ARTIFACT_SWEEP_WORKER_NO_PROGRESS_PASSES {
                     self.defer_artifact_sweep_worker(&format!(
@@ -5345,10 +5437,8 @@ impl Broker {
                     .unwrap_or(sleep);
                 std::thread::sleep(sleep.min(remaining));
             } else {
-                // Moving the bounded open-worktree cursor is real discovery
-                // progress even when the worktree has no currently removable
-                // cache, so a large cohort is not cut off after three quiet
-                // sessions.
+                // Only a successfully recorded scan/frontier advance is
+                // discovery progress. A retry-only cursor wrap cools down.
                 no_progress_passes = 0;
             }
         }
@@ -5396,419 +5486,445 @@ impl Broker {
         Ok(cursor != 0 || partial != 0 || self.artifact_sweep_recovery_requested()?)
     }
 
-    /// Visit a bounded batch of open worktrees per detached pass. The cursor
-    /// advances even when evidence is unknown, so one blocked checkout cannot
-    /// starve later sessions; an incomplete lap is retried on the next lap.
+    /// Inspect a bounded keyset page of open sessions and persist one compact
+    /// resumable DFS frontier per unfinished worktree. This reports candidates
+    /// only; it does not inspect holders/resources or remove anything.
     fn run_idle_open_session_artifact_pass(
         &mut self,
         policy: &RetentionPolicy,
         deadline: Instant,
     ) -> Result<OpenSessionArtifactPass, BrokerOpError> {
-        let raw_cursor = self.artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_CURSOR_KEY)?;
-        let cursor = match raw_cursor.as_deref() {
-            None | Some("") | Some("0") => 0,
-            Some(value) => match value.parse::<i64>() {
-                Ok(cursor) if cursor > 0 => cursor,
-                _ => {
-                    return Ok(OpenSessionArtifactPass {
-                        complete: false,
-                        ..OpenSessionArtifactPass::default()
-                    });
-                }
-            },
-        };
-        let lap_incomplete = match self
-            .artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_LAP_INCOMPLETE_KEY)?
-            .as_deref()
-        {
-            None | Some("") | Some("0") => false,
-            Some("1") => true,
-            Some(_) => {
-                return Ok(OpenSessionArtifactPass {
-                    complete: false,
-                    ..OpenSessionArtifactPass::default()
-                });
-            }
-        };
-        let sessions = match self.store().live_sessions() {
-            Ok(sessions) => sessions
-                .into_iter()
-                .filter(|session| session.cleanup_state == crate::SessionCleanupState::Open)
-                .collect::<Vec<_>>(),
-            Err(_) => {
-                return Ok(OpenSessionArtifactPass {
-                    complete: false,
-                    ..OpenSessionArtifactPass::default()
-                });
-            }
-        };
-        if sessions.is_empty() {
-            self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_CURSOR_KEY, "0")?;
-            self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_LAP_INCOMPLETE_KEY, "")?;
-            return Ok(OpenSessionArtifactPass {
-                complete: true,
-                ..OpenSessionArtifactPass::default()
-            });
-        }
-        let initial_agents = match self.agents_snapshot(now_ms()) {
-            Ok(agents) => agents,
-            Err(_) => {
-                return Ok(OpenSessionArtifactPass {
-                    complete: false,
-                    ..OpenSessionArtifactPass::default()
-                });
-            }
-        };
-        let mut pass = OpenSessionArtifactPass {
-            complete: false,
-            ..OpenSessionArtifactPass::default()
-        };
-        let mut after = cursor;
-        let mut visited = 0usize;
-        let mut lap_incomplete = lap_incomplete;
-        while visited < OPEN_SESSION_ARTIFACT_WORKTREE_BUDGET && Instant::now() < deadline {
-            let Some(session) = sessions.iter().find(|session| session.id > after) else {
-                self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_CURSOR_KEY, "0")?;
-                self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_LAP_INCOMPLETE_KEY, "")?;
-                pass.complete = !lap_incomplete;
-                return Ok(pass);
-            };
-            let session_pass = self.reclaim_idle_open_session_artifact(
-                session,
-                &initial_agents,
-                policy,
-                deadline,
-            )?;
-            after = session.id;
-            visited = visited.saturating_add(1);
-            self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_CURSOR_KEY, &after.to_string())?;
-            pass.directories_reclaimed = pass
-                .directories_reclaimed
-                .saturating_add(session_pass.directories_reclaimed);
-            pass.entries_reclaimed = pass
-                .entries_reclaimed
-                .saturating_add(session_pass.entries_reclaimed);
-            if !session_pass.complete {
-                lap_incomplete = true;
-                self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_LAP_INCOMPLETE_KEY, "1")?;
-            }
-        }
-        // Hitting either work bound leaves a durable cursor for the next
-        // detached continuation. Unknown work remains incomplete throughout.
-        self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_CURSOR_KEY, &after.to_string())?;
-        Ok(pass)
+        let discovery_deadline = deadline
+            .checked_sub(OPEN_SESSION_ARTIFACT_DB_WAIT_RESERVE)
+            .unwrap_or(deadline);
+        self.store()
+            .set_bounded_busy_timeout(OPEN_SESSION_ARTIFACT_DB_WAIT_PER_OPERATION)?;
+        let result = self.run_idle_open_session_artifact_pass_bounded(policy, discovery_deadline);
+        self.store().restore_default_busy_timeout()?;
+        result
     }
 
-    fn reclaim_idle_open_session_artifact(
+    fn run_idle_open_session_artifact_pass_bounded(
         &mut self,
-        session: &crate::Session,
-        initial_agents: &[crate::AgentView],
         policy: &RetentionPolicy,
         deadline: Instant,
     ) -> Result<OpenSessionArtifactPass, BrokerOpError> {
         let mut pass = OpenSessionArtifactPass {
             complete: true,
+            ran: policy.idle_session_artifact_hours > 0,
             ..OpenSessionArtifactPass::default()
         };
         if policy.idle_session_artifact_hours == 0 || Instant::now() >= deadline {
             pass.complete = policy.idle_session_artifact_hours == 0;
             return Ok(pass);
         }
-        let root = PathBuf::from(&session.worktree_path);
-        match std::fs::symlink_metadata(&root) {
-            Ok(metadata) if metadata.file_type().is_dir() => {}
-            Ok(_) => return Ok(pass),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(pass),
-            Err(_) => {
-                pass.complete = false;
-                return Ok(pass);
-            }
-        }
 
-        // A valid holder identity is stronger than quiet-time inference. A
-        // shared Codex app-server lifetime is not task activity; old task
-        // holders are compared by PID and start time to reject PID reuse.
-        let Some(initial_agent) = initial_agents
-            .iter()
-            .find(|agent| agent.session.id == session.id)
-        else {
-            pass.complete = false;
-            return Ok(pass);
-        };
-        match open_session_activity_evidence(
-            initial_agent.derived_status,
-            initial_agent.activity_at,
-            now_ms(),
-            policy.idle_session_artifact_hours,
+        let (raw_frontiers, frontier_value_valid) = match self.artifact_sweep_meta_get_bounded(
+            OPEN_SESSION_ARTIFACT_FRONTIERS_KEY,
+            OPEN_SESSION_ARTIFACT_FRONTIER_MAX_BYTES,
         ) {
-            OpenSessionArtifactEvidence::Eligible => {}
-            OpenSessionArtifactEvidence::Retain => return Ok(pass),
-            OpenSessionArtifactEvidence::Unknown => {
-                pass.complete = false;
-                return Ok(pass);
+            Ok(value) => (value, true),
+            Err(BrokerOpError::InvalidStorageContext { .. }) => (None, false),
+            Err(error) => return Err(error),
+        };
+        let mut frontier_set = match raw_frontiers.filter(|value| !value.is_empty()) {
+            None => OpenSessionArtifactFrontierSet::default(),
+            Some(value) if value.len() <= OPEN_SESSION_ARTIFACT_FRONTIER_MAX_BYTES => {
+                match serde_json::from_str::<OpenSessionArtifactFrontierSet>(&value) {
+                    Ok(set)
+                        if set.schema_version == 1
+                            && encode_open_session_artifact_frontiers(&set).is_some() =>
+                    {
+                        set
+                    }
+                    _ => {
+                        pass.complete = false;
+                        pass.frontier_state_unavailable =
+                            pass.frontier_state_unavailable.saturating_add(1);
+                        OpenSessionArtifactFrontierSet::default()
+                    }
+                }
             }
-        }
-        let initial_active = initial_agents
-            .iter()
-            .filter(|agent| agent.derived_status == crate::SessionStatus::Active)
-            .map(|agent| PathBuf::from(&agent.session.worktree_path))
-            .collect::<Vec<_>>();
-        if overlaps_live_worktree(&root, &initial_active) {
-            return Ok(pass);
-        }
-        match {
-            let _git_deadline = crate::git::limit_git_until(deadline);
-            self.is_broker_owned_worktree_checked(session, &root)
-        } {
-            Ok(true) => {}
-            Ok(false) => return Ok(pass),
-            Err(_) => {
+            Some(_) => {
                 pass.complete = false;
-                return Ok(pass);
+                pass.frontier_state_unavailable = pass.frontier_state_unavailable.saturating_add(1);
+                OpenSessionArtifactFrontierSet::default()
             }
+        };
+        if !frontier_value_valid {
+            pass.complete = false;
+        }
+        let mut prune_complete =
+            self.prune_open_session_artifact_frontiers(&mut frontier_set, deadline)?;
+
+        let raw_cursor = self.artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_CURSOR_KEY)?;
+        let mut cursor = match raw_cursor.as_deref() {
+            None | Some("") | Some("0") => 0,
+            Some(value) => match value.parse::<i64>() {
+                Ok(cursor) if cursor >= 0 => cursor,
+                _ => {
+                    pass.complete = false;
+                    return Ok(pass);
+                }
+            },
+        };
+        let raw_through = self.artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_THROUGH_KEY)?;
+        let through = match raw_through.as_deref() {
+            None | Some("") | Some("0") => {
+                let through = match self.store().live_session_max_id() {
+                    Ok(through) => through,
+                    Err(_) => {
+                        pass.complete = false;
+                        return Ok(pass);
+                    }
+                };
+                self.artifact_sweep_meta_set(
+                    OPEN_SESSION_ARTIFACT_THROUGH_KEY,
+                    &through.to_string(),
+                )?;
+                if through == 0 {
+                    cursor = 0;
+                }
+                through
+            }
+            Some(value) => match value.parse::<i64>() {
+                Ok(through) if through >= 0 => through,
+                _ => {
+                    pass.complete = false;
+                    return Ok(pass);
+                }
+            },
+        };
+        if cursor > through {
+            cursor = 0;
+            self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_CURSOR_KEY, "0")?;
         }
 
-        let mut candidates = crate::reclaim::scan_worktree_bounded(
-            &root,
-            &initial_active,
-            &policy.artefact_directories,
-            deadline,
-            crate::reclaim::BOUNDED_RECLAIM_SCAN_ENTRY_BUDGET,
-        );
-        if !candidates.complete {
-            pass.complete = false;
-        }
-        let mut reclaimable = candidates
-            .candidates
-            .drain(..)
-            .filter(|candidate| {
-                candidate.reclaimable
-                    && candidate
-                        .path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .and_then(|name| {
-                            crate::artifact_catalog::unattended_witness(
-                                name,
-                                &policy.artefact_directories,
-                            )
-                        })
-                        .is_some()
-            })
-            .collect::<Vec<_>>();
-        reclaimable.sort_by(|left, right| left.path.cmp(&right.path));
-        if reclaimable.is_empty() {
-            return Ok(pass);
-        }
+        let mut visited = 0usize;
+        let mut ledger_writable = true;
+        let mut reached_lap_end = false;
+        while visited < OPEN_SESSION_ARTIFACT_SESSION_BUDGET && Instant::now() < deadline {
+            let limit =
+                OPEN_SESSION_ARTIFACT_PAGE_SIZE.min(OPEN_SESSION_ARTIFACT_SESSION_BUDGET - visited);
+            let page = match self.store().live_session_page(cursor, through, limit) {
+                Ok(page) => page,
+                Err(_) => {
+                    pass.complete = false;
+                    break;
+                }
+            };
+            if page.is_empty() {
+                reached_lap_end = true;
+                break;
+            }
+            let agents = match self.agents_snapshot_for_sessions(page.clone(), now_ms()) {
+                Ok(agents) => agents,
+                Err(_) => {
+                    pass.complete = false;
+                    break;
+                }
+            };
+            let before_page = frontier_set.clone();
+            let mut scanner_advanced = false;
+            let mut page_made_progress = false;
+            for session in page {
+                if visited >= OPEN_SESSION_ARTIFACT_SESSION_BUDGET || Instant::now() >= deadline {
+                    break;
+                }
+                cursor = session.id;
+                visited = visited.saturating_add(1);
+                if session.cleanup_state != crate::SessionCleanupState::Open {
+                    frontier_set
+                        .entries
+                        .retain(|entry| entry.session_id != session.id);
+                    page_made_progress = true;
+                    continue;
+                }
+                let root = PathBuf::from(&session.worktree_path);
+                let Some(agent) = agents.iter().find(|agent| agent.session.id == session.id) else {
+                    mark_open_session_frontier_retry(
+                        &mut frontier_set,
+                        &session,
+                        now_ms(),
+                        "agent_snapshot_missing",
+                    );
+                    pass.complete = false;
+                    continue;
+                };
+                match open_session_activity_evidence(
+                    agent.derived_status,
+                    agent.activity_at,
+                    now_ms(),
+                    policy.idle_session_artifact_hours,
+                ) {
+                    OpenSessionArtifactEvidence::InactiveCandidate => {}
+                    OpenSessionArtifactEvidence::Retain => {
+                        frontier_set
+                            .entries
+                            .retain(|entry| entry.session_id != session.id);
+                        page_made_progress = true;
+                        continue;
+                    }
+                    OpenSessionArtifactEvidence::Unknown => {
+                        mark_open_session_frontier_retry(
+                            &mut frontier_set,
+                            &session,
+                            now_ms(),
+                            "activity_unknown",
+                        );
+                        pass.complete = false;
+                        continue;
+                    }
+                }
+                match std::fs::symlink_metadata(&root) {
+                    Ok(metadata)
+                        if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+                    Ok(_) => {
+                        frontier_set
+                            .entries
+                            .retain(|entry| entry.session_id != session.id);
+                        page_made_progress = true;
+                        continue;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        frontier_set
+                            .entries
+                            .retain(|entry| entry.session_id != session.id);
+                        page_made_progress = true;
+                        continue;
+                    }
+                    Err(_) => {
+                        mark_open_session_frontier_retry(
+                            &mut frontier_set,
+                            &session,
+                            now_ms(),
+                            "worktree_metadata_unavailable",
+                        );
+                        pass.complete = false;
+                        continue;
+                    }
+                }
+                match {
+                    let _git_deadline = crate::git::limit_git_until(deadline);
+                    self.is_broker_owned_worktree_checked(&session, &root)
+                } {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        frontier_set
+                            .entries
+                            .retain(|entry| entry.session_id != session.id);
+                        page_made_progress = true;
+                        continue;
+                    }
+                    Err(_) => {
+                        mark_open_session_frontier_retry(
+                            &mut frontier_set,
+                            &session,
+                            now_ms(),
+                            "worktree_ownership_unavailable",
+                        );
+                        pass.complete = false;
+                        continue;
+                    }
+                }
 
-        // Refresh session activity after discovery. A current activity signal
-        // is positive evidence to retain the worktree for this pass.
-        let fresh_agents = match self.agents_snapshot(now_ms()) {
-            Ok(agents) => agents,
-            Err(_) => {
-                pass.complete = false;
-                return Ok(pass);
-            }
-        };
-        let Some(fresh_agent) = fresh_agents
-            .iter()
-            .find(|agent| agent.session.id == session.id)
-        else {
-            pass.complete = false;
-            return Ok(pass);
-        };
-        match open_session_activity_evidence(
-            fresh_agent.derived_status,
-            fresh_agent.activity_at,
-            now_ms(),
-            policy.idle_session_artifact_hours,
-        ) {
-            OpenSessionArtifactEvidence::Eligible => {}
-            OpenSessionArtifactEvidence::Retain => return Ok(pass),
-            OpenSessionArtifactEvidence::Unknown => {
-                pass.complete = false;
-                return Ok(pass);
-            }
-        }
-        let fresh_active = fresh_agents
-            .iter()
-            .filter(|agent| agent.derived_status == crate::SessionStatus::Active)
-            .map(|agent| PathBuf::from(&agent.session.worktree_path))
-            .collect::<Vec<_>>();
-        if overlaps_live_worktree(&root, &fresh_active) {
-            return Ok(pass);
-        }
-        let open_files = crate::reclaim::open_file_snapshot_under_until(&root, deadline);
-        match &open_files {
-            crate::reclaim::OpenFileSnapshot::Complete(open_files) => {
-                crate::reclaim::protect_worktrees_with_open_file_uses(&mut reclaimable, open_files);
-            }
-            crate::reclaim::OpenFileSnapshot::Incomplete { .. } => {
-                pass.complete = false;
-                return Ok(pass);
-            }
-        }
-        if !reclaimable.iter().any(|candidate| candidate.reclaimable) {
-            return Ok(pass);
-        }
-        let final_agents = match self.agents_snapshot(now_ms()) {
-            Ok(agents) => agents,
-            Err(_) => {
-                pass.complete = false;
-                return Ok(pass);
-            }
-        };
-        let Some(final_agent) = final_agents
-            .iter()
-            .find(|agent| agent.session.id == session.id)
-        else {
-            pass.complete = false;
-            return Ok(pass);
-        };
-        match open_session_activity_evidence(
-            final_agent.derived_status,
-            final_agent.activity_at,
-            now_ms(),
-            policy.idle_session_artifact_hours,
-        ) {
-            OpenSessionArtifactEvidence::Eligible => {}
-            OpenSessionArtifactEvidence::Retain => return Ok(pass),
-            OpenSessionArtifactEvidence::Unknown => {
-                pass.complete = false;
-                return Ok(pass);
-            }
-        }
-        let final_active = final_agents
-            .iter()
-            .filter(|agent| agent.derived_status == crate::SessionStatus::Active)
-            .map(|agent| PathBuf::from(&agent.session.worktree_path))
-            .collect::<Vec<_>>();
-        if overlaps_live_worktree(&root, &final_active) {
-            return Ok(pass);
-        }
-        if deadline.saturating_duration_since(Instant::now()) < Duration::from_secs(2) {
-            pass.complete = false;
-            return Ok(pass);
-        }
-        let Some(process_table) = crate::session_holder::ProcessTable::snapshot() else {
-            pass.complete = false;
-            return Ok(pass);
-        };
-        let holder_event = match self.store().latest_session_holder_event(session.id) {
-            Ok(event) => event,
-            Err(_) => {
-                pass.complete = false;
-                return Ok(pass);
-            }
-        };
-        match open_session_holder_evidence(holder_event.as_ref(), Some(&process_table)) {
-            OpenSessionArtifactEvidence::Eligible => {}
-            OpenSessionArtifactEvidence::Retain => return Ok(pass),
-            OpenSessionArtifactEvidence::Unknown => {
-                pass.complete = false;
-                return Ok(pass);
-            }
-        }
-
-        let resource_db_path = self.storage_context().host_resource_db_path.clone();
-        let Some(resource_db_path) = resource_db_path.filter(|path| path.is_file()) else {
-            pass.complete = false;
-            return Ok(pass);
-        };
-        let resource_leases = crate::HostResourceCoordinator::open_read_only(&resource_db_path)
-            .ok()
-            .and_then(|coordinator| {
-                coordinator
-                    .list_until(false, OPEN_SESSION_RESOURCE_INVENTORY_ENTRY_BUDGET, || {
-                        Instant::now() >= deadline
+                let saved = frontier_set
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry.session_id == session.id
+                            && entry.worktree_path == session.worktree_path
+                            && now_ms().saturating_sub(entry.updated_at_ms)
+                                <= OPEN_SESSION_ARTIFACT_FRONTIER_MAX_AGE_MS
                     })
-                    .ok()
-                    .flatten()
-            });
-        match open_session_resource_evidence(
-            resource_leases.as_deref(),
-            &crate::worktree_fingerprint(&root),
-        ) {
-            OpenSessionArtifactEvidence::Eligible => {}
-            OpenSessionArtifactEvidence::Retain => return Ok(pass),
-            OpenSessionArtifactEvidence::Unknown => {
+                    .and_then(|entry| (!entry.retry).then(|| entry.frontier.clone()).flatten());
+                let previous_frontier = saved.clone();
+                frontier_set
+                    .entries
+                    .retain(|entry| entry.session_id != session.id);
+                let scan = crate::reclaim::scan_worktree_resumable(
+                    &root,
+                    &[],
+                    &policy.artefact_directories,
+                    deadline,
+                    OPEN_SESSION_ARTIFACT_SCAN_ENTRY_BUDGET,
+                    saved,
+                );
+                scanner_advanced |= scan
+                    .frontier
+                    .as_ref()
+                    .is_some_and(|frontier| previous_frontier.as_ref() != Some(frontier));
+                pass.uninspected_scopes = pass
+                    .uninspected_scopes
+                    .saturating_add(scan.incomplete_scopes);
+                if scan.incomplete_reason.as_deref() == Some("replay_limit") {
+                    pass.replay_limited_scopes = pass.replay_limited_scopes.saturating_add(1);
+                }
+                if scan.incomplete_reason.as_deref() == Some("depth_limit") {
+                    pass.depth_limited_scopes = pass.depth_limited_scopes.saturating_add(1);
+                }
+                pass.worktrees_scanned = pass.worktrees_scanned.saturating_add(1);
+                pass.recommendations = pass.recommendations.saturating_add(
+                    scan.candidates
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.reclaimable
+                                && candidate
+                                    .path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .and_then(|name| {
+                                        crate::artifact_catalog::unattended_witness(
+                                            name,
+                                            &policy.artefact_directories,
+                                        )
+                                    })
+                                    .is_some()
+                        })
+                        .count(),
+                );
+                if scan.complete {
+                    page_made_progress = true;
+                    continue;
+                }
                 pass.complete = false;
-                return Ok(pass);
+                frontier_set.entries.push(OpenSessionArtifactFrontierEntry {
+                    session_id: session.id,
+                    worktree_path: session.worktree_path,
+                    updated_at_ms: now_ms(),
+                    retry: scan.frontier.is_none(),
+                    incomplete_scope: scan.incomplete_scope,
+                    incomplete_reason: scan.incomplete_reason,
+                    frontier: scan.frontier,
+                });
+                frontier_set.entries.sort_by_key(|entry| entry.session_id);
+            }
+
+            if !persist_open_session_artifact_frontiers(self, &frontier_set)? {
+                frontier_set = before_page;
+                ledger_writable = false;
+                pass.complete = false;
+                pass.frontier_state_write_limited =
+                    pass.frontier_state_write_limited.saturating_add(1);
+            } else if page_made_progress || scanner_advanced {
+                let progress = self
+                    .artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_PROGRESS_KEY)?
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                self.artifact_sweep_meta_set(
+                    OPEN_SESSION_ARTIFACT_PROGRESS_KEY,
+                    &progress.to_string(),
+                )?;
+            }
+            self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_CURSOR_KEY, &cursor.to_string())?;
+            if visited >= OPEN_SESSION_ARTIFACT_SESSION_BUDGET || Instant::now() >= deadline {
+                break;
             }
         }
-        crate::reclaim::protect_recently_worked_worktrees(
-            &mut reclaimable,
-            now_ms(),
-            crate::reclaim::RECENT_WORK_WINDOW_MS,
-        );
-        let Some(candidate) = reclaimable
-            .into_iter()
-            .find(|candidate| candidate.reclaimable)
-        else {
-            return Ok(pass);
-        };
-        if !crate::reclaim::is_within(&root, &candidate.path)
-            || !std::fs::symlink_metadata(&candidate.path)
-                .is_ok_and(|metadata| metadata.file_type().is_dir())
-        {
-            pass.complete = false;
-            return Ok(pass);
+
+        if reached_lap_end {
+            cursor = 0;
+            self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_CURSOR_KEY, "0")?;
+            self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_THROUGH_KEY, "0")?;
+        } else {
+            self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_CURSOR_KEY, &cursor.to_string())?;
         }
-        let current_session = match self.store().session(session.id) {
-            Ok(current)
-                if current.cleanup_state == crate::SessionCleanupState::Open
-                    && current.worktree_path == session.worktree_path =>
-            {
-                current
+
+        let pending_frontiers = !frontier_set.entries.is_empty();
+        pass.pending_frontiers = frontier_set.entries.len();
+        pass.complete = reached_lap_end
+            && prune_complete
+            && ledger_writable
+            && !pending_frontiers
+            && pass.complete;
+        if reached_lap_end && !pending_frontiers && prune_complete && ledger_writable {
+            // A complete census has no unresolved frontier. The next detached
+            // pass captures a new high-water mark and starts a fresh lap.
+            self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_FRONTIERS_KEY, "")?;
+        } else {
+            let persisted = persist_open_session_artifact_frontiers(self, &frontier_set)?;
+            if !persisted {
+                pass.frontier_state_write_limited =
+                    pass.frontier_state_write_limited.saturating_add(1);
             }
-            Ok(_) => return Ok(pass),
-            Err(_) => {
-                pass.complete = false;
-                return Ok(pass);
-            }
-        };
-        match {
-            let _git_deadline = crate::git::limit_git_until(deadline);
-            self.is_broker_owned_worktree_checked(&current_session, &root)
-        } {
-            Ok(true) => {}
-            Ok(false) => return Ok(pass),
-            Err(_) => {
-                pass.complete = false;
-                return Ok(pass);
-            }
-        }
-        let witness = candidate
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| {
-                crate::artifact_catalog::unattended_witness(name, &policy.artefact_directories)
-            })
-            .filter(|witness| witness.confirms(&candidate.path));
-        let Some(witness) = witness else {
-            pass.complete = false;
-            return Ok(pass);
-        };
-        match remove_condemned_tree_with_progress(
-            &candidate.path,
-            witness.deferrable_entry(),
-            Some(deadline),
-        ) {
-            Ok((TreeRemoval::Complete, count)) => {
-                pass.directories_reclaimed = 1;
-                pass.entries_reclaimed = count;
-            }
-            Ok((TreeRemoval::Interrupted, count)) => {
-                pass.complete = false;
-                pass.entries_reclaimed = count;
-            }
-            Err(error) => {
-                pass.complete = false;
-                pass.entries_reclaimed = error.entries_reclaimed;
-            }
+            prune_complete &= persisted;
+            pass.complete &= prune_complete;
         }
         Ok(pass)
+    }
+
+    /// Prune a bounded rotating slice of frontier identities. Replaced,
+    /// closed, deleted, and old rows no longer retain traversal state.
+    fn prune_open_session_artifact_frontiers(
+        &mut self,
+        frontier_set: &mut OpenSessionArtifactFrontierSet,
+        deadline: Instant,
+    ) -> Result<bool, BrokerOpError> {
+        if frontier_set.entries.is_empty() {
+            return Ok(true);
+        }
+        let raw_cursor = self.artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_PRUNE_CURSOR_KEY)?;
+        let cursor = raw_cursor
+            .as_deref()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value >= 0)
+            .unwrap_or(0);
+        let mut ids = frontier_set
+            .entries
+            .iter()
+            .filter(|entry| entry.session_id > cursor)
+            .map(|entry| entry.session_id)
+            .chain(
+                frontier_set
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.session_id <= cursor)
+                    .map(|entry| entry.session_id),
+            )
+            .take(OPEN_SESSION_ARTIFACT_FRONTIER_PRUNE_BUDGET)
+            .collect::<Vec<_>>();
+        ids.dedup();
+        let now = now_ms();
+        let mut last = cursor;
+        let mut complete = true;
+        for id in ids {
+            if Instant::now() >= deadline {
+                complete = false;
+                break;
+            }
+            last = id;
+            let Some(entry) = frontier_set
+                .entries
+                .iter()
+                .find(|entry| entry.session_id == id)
+            else {
+                continue;
+            };
+            let identity_is_current = now.saturating_sub(entry.updated_at_ms)
+                <= OPEN_SESSION_ARTIFACT_FRONTIER_MAX_AGE_MS
+                && match self.store().session(id) {
+                    Ok(session) => {
+                        session.cleanup_state == crate::SessionCleanupState::Open
+                            && session.worktree_path == entry.worktree_path
+                    }
+                    Err(crate::BrokerError::SessionNotFound(_)) => false,
+                    Err(_) => {
+                        complete = false;
+                        true
+                    }
+                };
+            if !identity_is_current {
+                frontier_set.entries.retain(|entry| entry.session_id != id);
+            }
+        }
+        if last != cursor {
+            self.artifact_sweep_meta_set(
+                OPEN_SESSION_ARTIFACT_PRUNE_CURSOR_KEY,
+                &last.to_string(),
+            )?;
+        }
+        Ok(complete)
     }
 
     /// Whether the millisecond stamp under `key` is set and younger than
@@ -6728,15 +6844,56 @@ impl Broker {
                 self.artifact_sweep_meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, &now.to_string())?;
             }
         }
-        let mut idle_open_session_directories = 0usize;
+        let mut idle_open_session_recommendations = 0usize;
+        let mut idle_open_session_worktrees_scanned = 0usize;
+        let mut open_pass_uninspected_scopes = 0usize;
+        let mut open_pass_replay_limited_scopes = 0usize;
+        let mut open_pass_depth_limited_scopes = 0usize;
+        let mut open_pass_pending_frontiers = 0usize;
+        let mut open_pass_frontier_state_unavailable = 0usize;
+        let mut open_pass_frontier_state_write_limited = 0usize;
+        let mut open_session_scan_ran = false;
+        let mut open_session_scan_complete = false;
         if let Some(open_deadline) = open_session_deadline {
             let open_pass = self.run_idle_open_session_artifact_pass(policy, open_deadline)?;
-            idle_open_session_directories = open_pass.directories_reclaimed;
-            entries_reclaimed = entries_reclaimed.saturating_add(open_pass.entries_reclaimed);
+            idle_open_session_recommendations = open_pass.recommendations;
+            idle_open_session_worktrees_scanned = open_pass.worktrees_scanned;
+            open_pass_uninspected_scopes = open_pass.uninspected_scopes;
+            open_pass_replay_limited_scopes = open_pass.replay_limited_scopes;
+            open_pass_depth_limited_scopes = open_pass.depth_limited_scopes;
+            open_pass_pending_frontiers = open_pass.pending_frontiers;
+            open_pass_frontier_state_unavailable = open_pass.frontier_state_unavailable;
+            open_pass_frontier_state_write_limited = open_pass.frontier_state_write_limited;
+            open_session_scan_ran = open_pass.ran;
+            open_session_scan_complete = open_pass.complete;
             if !open_pass.complete {
                 scan_completed = false;
                 self.artifact_sweep_meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, &now.to_string())?;
             }
+        }
+        let open_session_result_state = open_session_scan_ran.then(|| {
+            format!(
+                "{}:{}:{}:{}:{}:{}:{}:{}",
+                idle_open_session_recommendations,
+                u8::from(open_session_scan_complete),
+                open_pass_uninspected_scopes,
+                open_pass_replay_limited_scopes,
+                open_pass_depth_limited_scopes,
+                open_pass_pending_frontiers,
+                open_pass_frontier_state_unavailable,
+                open_pass_frontier_state_write_limited
+            )
+        });
+        let previous_open_session_result =
+            self.artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_RESULT_KEY)?;
+        let open_session_result_changed = open_session_result_state
+            .as_deref()
+            .is_some_and(|state| previous_open_session_result.as_deref() != Some(state));
+        if open_session_result_changed {
+            self.artifact_sweep_meta_set(
+                OPEN_SESSION_ARTIFACT_RESULT_KEY,
+                open_session_result_state.as_deref().unwrap_or_default(),
+            )?;
         }
         blocked_interrupted_paths.sort_by(|left, right| {
             left.path
@@ -6773,9 +6930,9 @@ impl Broker {
         let blocked_state_changed =
             previous_blocked_state.as_deref().unwrap_or("") != blocked_state;
         if !removed.is_empty()
-            || idle_open_session_directories > 0
             || !revoked_interrupted_paths.is_empty()
             || blocked_state_changed
+            || open_session_result_changed
         {
             let mut revoked_interrupted_paths = revoked_interrupted_paths;
             revoked_interrupted_paths.sort_by(|left, right| {
@@ -6794,10 +6951,18 @@ impl Broker {
                 })
                 .collect::<Vec<_>>();
             let payload = serde_json::json!({
-                "directories": removed.len() + idle_open_session_directories,
+                "directories": removed.len(),
                 "idle_days": policy.artifact_reclaim_days,
                 "closed_session_directories": removed.len(),
-                "idle_open_session_directories": idle_open_session_directories,
+                "idle_open_session_artifact_recommendations": idle_open_session_recommendations,
+                "idle_open_session_worktrees_scanned": idle_open_session_worktrees_scanned,
+                "idle_open_session_uninspected_scopes": open_pass_uninspected_scopes,
+                "idle_open_session_replay_limited_scopes": open_pass_replay_limited_scopes,
+                "idle_open_session_depth_limited_scopes": open_pass_depth_limited_scopes,
+                "idle_open_session_pending_frontiers": open_pass_pending_frontiers,
+                "idle_open_session_frontier_state_unavailable": open_pass_frontier_state_unavailable,
+                "idle_open_session_frontier_state_write_limited": open_pass_frontier_state_write_limited,
+                "open_session_scan_complete": open_session_scan_ran.then_some(open_session_scan_complete),
                 "idle_session_artifact_hours": policy.idle_session_artifact_hours,
                 "complete": scan_completed,
                 "revoked_interrupted_paths": revoked,
@@ -6842,7 +7007,7 @@ impl Broker {
         };
         Ok((
             ArtifactSweepOutcome {
-                directories_reclaimed: removed.len() + idle_open_session_directories,
+                directories_reclaimed: removed.len(),
                 complete: scan_completed,
                 auto_cleanup,
             },
@@ -7542,7 +7707,7 @@ mod tests {
         let old = now - 25 * 3_600_000;
         assert_eq!(
             open_session_activity_evidence(crate::SessionStatus::Idle, old, now, 24),
-            OpenSessionArtifactEvidence::Eligible
+            OpenSessionArtifactEvidence::InactiveCandidate
         );
         assert_eq!(
             open_session_activity_evidence(crate::SessionStatus::Active, old, now, 24),
@@ -7559,91 +7724,54 @@ mod tests {
     }
 
     #[test]
-    fn open_artifact_holder_check_ignores_shared_daemon_but_checks_task_identity() {
-        let table = crate::session_holder::ProcessTable::parse(
-            "100 1 Mon Oct 26 10:00:00 2026 /opt/codex app-server --managed-daemon\n\
-             200 1 Mon Oct 26 10:01:00 2026 /opt/codex exec task\n",
-        );
-        let no_holder = open_session_holder_evidence(None, Some(&table));
-        assert_eq!(no_holder, OpenSessionArtifactEvidence::Eligible);
-
-        let shared = crate::Event {
-            id: 1,
+    fn open_session_frontier_storage_limits_apply_across_the_repository() {
+        let too_many_records = OpenSessionArtifactFrontierSet {
             schema_version: 1,
-            ts: 1,
-            kind: crate::events::SESSION_HOLDER_BOUND.into(),
-            session_id: Some(1),
-            payload_json: Some(
-                r#"{"pid":100,"started":"Mon Oct 26 10:00:00 2026","command":"/opt/codex app-server --managed-daemon"}"#.into(),
-            ),
+            entries: (0..=OPEN_SESSION_ARTIFACT_FRONTIER_MAX_RECORDS)
+                .map(|session_id| OpenSessionArtifactFrontierEntry {
+                    session_id: session_id as i64,
+                    worktree_path: "/worktree".into(),
+                    updated_at_ms: 1,
+                    frontier: None,
+                    retry: true,
+                    incomplete_scope: Some("packages/wide".into()),
+                    incomplete_reason: Some("replay_limit".into()),
+                })
+                .collect(),
         };
-        assert_eq!(
-            open_session_holder_evidence(Some(&shared), Some(&table)),
-            OpenSessionArtifactEvidence::Eligible
-        );
+        assert!(encode_open_session_artifact_frontiers(&too_many_records).is_none());
 
-        let task = crate::Event {
-            payload_json: Some(
-                r#"{"pid":200,"started":"Mon Oct 26 10:01:00 2026","command":"/opt/codex exec task"}"#.into(),
-            ),
-            ..shared.clone()
+        let unsorted_ids = OpenSessionArtifactFrontierSet {
+            schema_version: 1,
+            entries: [2, 1]
+                .into_iter()
+                .map(|session_id| OpenSessionArtifactFrontierEntry {
+                    session_id,
+                    worktree_path: "/worktree".into(),
+                    updated_at_ms: 1,
+                    frontier: None,
+                    retry: true,
+                    incomplete_scope: None,
+                    incomplete_reason: Some("activity_unknown".into()),
+                })
+                .collect(),
         };
-        assert_eq!(
-            open_session_holder_evidence(Some(&task), Some(&table)),
-            OpenSessionArtifactEvidence::Retain
-        );
-        let recycled_pid = crate::Event {
-            payload_json: Some(
-                r#"{"pid":200,"started":"Mon Oct 26 09:01:00 2026","command":"/opt/codex exec task"}"#.into(),
-            ),
-            ..task
-        };
-        assert_eq!(
-            open_session_holder_evidence(Some(&recycled_pid), Some(&table)),
-            OpenSessionArtifactEvidence::Eligible
-        );
-        assert_eq!(
-            open_session_holder_evidence(Some(&shared), None),
-            OpenSessionArtifactEvidence::Unknown
-        );
-        let malformed = crate::Event {
-            payload_json: Some("{}".into()),
-            ..shared
-        };
-        assert_eq!(
-            open_session_holder_evidence(Some(&malformed), Some(&table)),
-            OpenSessionArtifactEvidence::Unknown
-        );
-    }
+        assert!(encode_open_session_artifact_frontiers(&unsorted_ids).is_none());
 
-    #[test]
-    fn open_artifact_resource_guard_requires_a_complete_unheld_inventory() {
-        let lease = crate::HostResourceLease {
-            lease_id: "lease".into(),
-            request_id: "request".into(),
-            repository: "owner/repo".into(),
-            worktree_fingerprint: "worktree".into(),
-            run_id: "run".into(),
-            generation: 1,
-            state: crate::HostLeaseState::Active,
-            holder_pid: None,
-            created_at: 1,
-            expires_at: i64::MAX,
-            released_at: None,
-            allocations: Vec::new(),
+        let too_long_path = OpenSessionArtifactFrontierSet {
+            schema_version: 1,
+            entries: vec![OpenSessionArtifactFrontierEntry {
+                session_id: 1,
+                worktree_path: "/".to_owned()
+                    + &"x".repeat(OPEN_SESSION_ARTIFACT_FRONTIER_MAX_PATH_BYTES),
+                updated_at_ms: 1,
+                frontier: None,
+                retry: true,
+                incomplete_scope: None,
+                incomplete_reason: Some("worktree_metadata_unavailable".into()),
+            }],
         };
-        assert_eq!(
-            open_session_resource_evidence(Some(&[lease.clone()]), "worktree"),
-            OpenSessionArtifactEvidence::Retain
-        );
-        assert_eq!(
-            open_session_resource_evidence(Some(&[lease]), "other"),
-            OpenSessionArtifactEvidence::Eligible
-        );
-        assert_eq!(
-            open_session_resource_evidence(None, "worktree"),
-            OpenSessionArtifactEvidence::Unknown
-        );
+        assert!(encode_open_session_artifact_frontiers(&too_long_path).is_none());
     }
 
     #[test]
@@ -8698,6 +8826,59 @@ mod tests {
                 .as_deref(),
             Some(retry_generation.as_str()),
             "a later eligible pass completes the retained request"
+        );
+    }
+
+    #[test]
+    fn worker_cools_down_when_only_the_retry_cursor_moves_and_wraps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        let policy = load_retention_policy(root).unwrap();
+        let mut passes = 0;
+
+        broker
+            .run_artifact_sweep_recovery_worker_loop(
+                &policy,
+                1,
+                Some(8),
+                None,
+                |broker, _policy, _remaining| {
+                    passes += 1;
+                    let cursor = broker
+                        .artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_CURSOR_KEY)?
+                        .and_then(|value| value.parse::<i64>().ok())
+                        .unwrap_or(0);
+                    let next = if cursor >= 2 { 0 } else { cursor + 1 };
+                    broker.artifact_sweep_meta_set(
+                        OPEN_SESSION_ARTIFACT_CURSOR_KEY,
+                        &next.to_string(),
+                    )?;
+                    Ok((
+                        ArtifactSweepOutcome {
+                            directories_reclaimed: 0,
+                            complete: false,
+                            auto_cleanup: None,
+                        },
+                        0,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(passes, ARTIFACT_SWEEP_WORKER_NO_PROGRESS_PASSES);
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("no_progress passes=3 entries=0")
         );
     }
 

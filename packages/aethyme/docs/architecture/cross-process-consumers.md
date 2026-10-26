@@ -202,13 +202,26 @@ The broker starts the private `broker gc __continue-artifacts <canonical-main-ro
 
 Changing the private command, marker, canonical-root argument, runtime-alignment check, or lock handoff without updating both launcher and child can strand cleanup requests or run a mismatched binary. The child must leave incomplete requests retryable and must not report them complete.
 
-The nine durable cache-sweep keys are scoped by a SHA-256 namespace derived
-from the complete captured broker storage context. Linked worktrees in the
-same repository and using the same captured context share sweep state; a
+The nine original durable cache-sweep keys are scoped by a SHA-256 namespace
+derived from the complete captured broker storage context. Linked worktrees in
+the same repository and using the same captured context share sweep state; a
 different effective host-storage configuration gets a separate cursor and
 worker generation. The repository-local namespace registry is transactional,
 append-only and capped at 64 entries. A full or invalid registry refuses the
 sweep without reading or changing scoped state; entries are never evicted.
+
+The detached worker also performs bounded, read-only artifact discovery for
+open sessions when filesystem pressure and `idle_session_artifact_hours`
+permit it. It pages the live-session ledger and stores a capped per-worktree
+scan frontier in that same captured-context namespace. The existing
+`broker.gc.artifacts-swept` event gains recommendation, scanned-worktree,
+incomplete-scope, replay/depth-limit, pending-frontier, and frontier-state
+read/write-limit counts, plus `open_session_scan_complete` when the diagnostic
+lane ran. These fields report observations only: this lane does not remove
+open-session artifacts, close sessions, or release leases. A false completion
+value or nonzero incomplete count means coverage is partial; zero
+recommendations is not a complete inventory unless the completion field is
+true. Event readers must accept these additive fields.
 
 The nine pre-namespace keys are inspected with bounded, read-only checks and
 are never migrated or rewritten automatically. `gc sweep --json` adds

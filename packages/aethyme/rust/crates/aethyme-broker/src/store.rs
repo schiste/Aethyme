@@ -752,6 +752,50 @@ mod gate_result_clear_metadata_tests {
     }
 
     #[test]
+    fn live_session_pages_are_keyset_bounded_and_stop_at_the_captured_high_water() {
+        let directory = tempfile::tempdir().unwrap();
+        init_fixture_repository(directory.path());
+        let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
+        let first = insert_gc_fixture_session(&mut store, &directory.path().join("one"));
+        let cleaned = insert_gc_fixture_session(&mut store, &directory.path().join("two"));
+        let third = insert_gc_fixture_session(&mut store, &directory.path().join("three"));
+        let through = store.live_session_max_id().unwrap();
+        assert_eq!(through, third);
+        store
+            .set_session_status(cleaned, crate::SessionStatus::Cleaned, None)
+            .unwrap();
+        let later = insert_gc_fixture_session(&mut store, &directory.path().join("later"));
+        assert!(later > through);
+
+        let first_page = store.live_session_page(0, through, 1).unwrap();
+        assert_eq!(
+            first_page
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            [first]
+        );
+        let second_page = store.live_session_page(first, through, 32).unwrap();
+        assert_eq!(
+            second_page
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            [third]
+        );
+        assert!(
+            store
+                .live_session_page(third, through, 32)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.live_session_page(0, later, usize::MAX).unwrap().len(),
+            3
+        );
+    }
+
+    #[test]
     fn session_base_observation_is_removed_when_session_closes() {
         let directory = tempfile::tempdir().unwrap();
         init_fixture_repository(directory.path());
