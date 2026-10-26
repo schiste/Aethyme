@@ -238,6 +238,9 @@ const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// large repository. Patch bodies themselves are streamed between Git.
 const MAX_GIT_BATCH_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_GIT_BATCH_INPUT_BYTES: usize = 16 * 1024 * 1024;
+/// A single exact-tree landing search may ask for at most this many objects.
+/// The same ceiling is enforced by `objects_at_many` before it allocates input.
+pub(crate) const MAX_GIT_BATCH_QUERY_COUNT: usize = 100_000;
 
 /// The deadline for one git invocation, from the value of
 /// [`GIT_TIMEOUT_ENV`]. A missing, unparsable or zero value keeps the
@@ -1882,6 +1885,7 @@ pub struct CommitShape {
 #[derive(Debug)]
 enum GitBatchInputError {
     TooLarge,
+    TooManyQueries,
     TimedOut,
     Io(std::io::Error),
 }
@@ -1973,6 +1977,71 @@ fn git_batch_input(
     Ok(file)
 }
 
+/// Stage `cat-file --batch-check` requests without constructing the complete
+/// query stream in memory. The count, bytes and deadline are checked before
+/// Git is started so an oversized exact-tree scan cannot turn into an
+/// unbounded write or wait.
+fn git_batch_check_input(
+    queries: &[(&str, &str)],
+    deadline: Instant,
+) -> Result<std::fs::File, GitBatchInputError> {
+    if queries.len() > MAX_GIT_BATCH_QUERY_COUNT {
+        return Err(GitBatchInputError::TooManyQueries);
+    }
+
+    checked_git_batch_check_input_len(queries, MAX_GIT_BATCH_INPUT_BYTES, deadline)?;
+
+    let mut file = tempfile::tempfile().map_err(GitBatchInputError::Io)?;
+    let mut buffer = Vec::with_capacity(GIT_BATCH_INPUT_CHUNK_BYTES);
+    for (rev, path) in queries {
+        append_git_batch_bytes(&mut file, &mut buffer, rev.as_bytes(), deadline)?;
+        append_git_batch_bytes(&mut file, &mut buffer, b":", deadline)?;
+        append_git_batch_bytes(&mut file, &mut buffer, path.as_bytes(), deadline)?;
+        append_git_batch_bytes(&mut file, &mut buffer, b"\n", deadline)?;
+    }
+    if !buffer.is_empty() {
+        file.write_all(&buffer).map_err(GitBatchInputError::Io)?;
+    }
+    if Instant::now() >= deadline {
+        return Err(GitBatchInputError::TimedOut);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(GitBatchInputError::Io)?;
+    if Instant::now() >= deadline {
+        return Err(GitBatchInputError::TimedOut);
+    }
+    Ok(file)
+}
+
+/// Check the complete query stream size before creating or writing the
+/// temporary file. Each line includes the revision, path, separator and
+/// newline, so long paths count against the same input bound.
+fn checked_git_batch_check_input_len(
+    queries: &[(&str, &str)],
+    max_bytes: usize,
+    deadline: Instant,
+) -> Result<usize, GitBatchInputError> {
+    let mut total = 0_usize;
+    for (rev, path) in queries {
+        if Instant::now() >= deadline {
+            return Err(GitBatchInputError::TimedOut);
+        }
+        let line_bytes = rev
+            .len()
+            .checked_add(path.len())
+            .and_then(|bytes| bytes.checked_add(2))
+            .ok_or(GitBatchInputError::TooLarge)?;
+        if line_bytes > max_bytes {
+            return Err(GitBatchInputError::TooLarge);
+        }
+        total = total
+            .checked_add(line_bytes)
+            .filter(|bytes| *bytes <= max_bytes)
+            .ok_or(GitBatchInputError::TooLarge)?;
+    }
+    Ok(total)
+}
+
 fn git_batch_input_error(
     args: &str,
     started: Instant,
@@ -1983,6 +2052,10 @@ fn git_batch_input_error(
         GitBatchInputError::TooLarge => GitError::Git {
             args: args.to_string(),
             stderr: format!("Git batch input exceeded {MAX_GIT_BATCH_INPUT_BYTES} bytes"),
+        },
+        GitBatchInputError::TooManyQueries => GitError::Git {
+            args: args.to_string(),
+            stderr: format!("Git batch exceeded {MAX_GIT_BATCH_QUERY_COUNT} queries"),
         },
         GitBatchInputError::TimedOut => {
             note_git_timeout();
@@ -3071,6 +3144,66 @@ impl GitRepo {
             .collect())
     }
 
+    /// Commits reachable from `to` but not `from`, oldest first, with bounded
+    /// process time and captured output. An incomplete listing is an error;
+    /// callers must not interpret it as a complete history window.
+    pub(crate) fn commits_between_oldest_bounded(
+        &self,
+        from: &str,
+        to: &str,
+        max_output_bytes: usize,
+    ) -> Result<Vec<String>, GitError> {
+        let range = format!("{from}..{to}");
+        let args = "rev-list --reverse";
+        let started = Instant::now();
+        let deadline = effective_git_deadline(args, git_timeout(), started)?;
+        let budget = remaining_git_budget(args, deadline)?;
+        let mut command = git_command();
+        command
+            .args(["rev-list", "--reverse", &range])
+            .current_dir(&self.root);
+        let output =
+            match crate::bounded_output::output_limited(&mut command, budget, max_output_bytes)
+                .map_err(|source| GitError::Spawn {
+                    args: args.into(),
+                    source,
+                })? {
+                crate::bounded_output::LimitedOutput::Completed(output) => output,
+                crate::bounded_output::LimitedOutput::Deadline => {
+                    note_git_timeout();
+                    return Err(GitError::TimedOut {
+                        args: args.into(),
+                        seconds: budget.as_secs().max(1),
+                    });
+                }
+                crate::bounded_output::LimitedOutput::OutputLimit => {
+                    return Err(GitError::Git {
+                        args: args.into(),
+                        stderr: format!(
+                            "Git command output exceeded {max_output_bytes} bytes per stream"
+                        ),
+                    });
+                }
+            };
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: args.into(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        if Instant::now() >= deadline {
+            note_git_timeout();
+            return Err(GitError::TimedOut {
+                args: args.into(),
+                seconds: deadline.saturating_duration_since(started).as_secs().max(1),
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect())
+    }
+
     /// Commits reachable from `head` but not `excluded`, oldest first.
     /// Unlike a `from..to` range this remains meaningful when the two
     /// histories have diverged.
@@ -3216,12 +3349,19 @@ impl GitRepo {
     /// Comparing blob ids is how "this change is already present" is decided
     /// without replaying the patch.
     pub fn blob_at(&self, rev: &str, path: &str) -> Option<String> {
-        run_git(
-            &self.root,
-            &["rev-parse", "--verify", "--quiet", &format!("{rev}:{path}")],
-        )
-        .ok()
-        .filter(|value| !value.is_empty())
+        self.blob_at_for_batch(rev, path).ok().flatten()
+    }
+
+    /// [`Self::blob_at`] while preserving failures that make an ownership
+    /// comparison incomplete. A quiet missing-path result is the only Git
+    /// failure interpreted as absence; timeouts and other failures propagate.
+    fn blob_at_for_batch(&self, rev: &str, path: &str) -> Result<Option<String>, GitError> {
+        let spec = format!("{rev}:{path}");
+        match run_git(&self.root, &["rev-parse", "--verify", "--quiet", &spec]) {
+            Ok(value) => Ok((!value.is_empty()).then_some(value)),
+            Err(GitError::Git { stderr, .. }) if stderr.is_empty() => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// [`GitRepo::blob_at`] for many `(rev, path)` pairs, answered in input
@@ -3242,17 +3382,32 @@ impl GitRepo {
     /// needs Git 2.42, above [`crate::MINIMUM_GIT_VERSION`]. A query holding a
     /// newline would be split in two, and Git strips a trailing carriage
     /// return from each line, so those rare queries are read one at a time.
+    /// The full list is bounded by count, staged input bytes, output bytes and
+    /// the active Git deadline; inability to complete any path read is an
+    /// error, never an absent object.
     pub fn objects_at_many(
         &self,
         queries: &[(&str, &str)],
     ) -> Result<Vec<Option<String>>, GitError> {
+        let args = "cat-file --batch-check";
+        if queries.len() > MAX_GIT_BATCH_QUERY_COUNT {
+            return Err(GitError::Git {
+                args: args.into(),
+                stderr: format!("Git batch exceeded {MAX_GIT_BATCH_QUERY_COUNT} queries"),
+            });
+        }
+        let started = Instant::now();
+        let deadline = effective_git_deadline(args, git_timeout(), started)?;
+        let _deadline = limit_git_until(deadline);
+        checked_git_batch_check_input_len(queries, MAX_GIT_BATCH_INPUT_BYTES, deadline)
+            .map_err(|error| git_batch_input_error(args, started, deadline, error))?;
         let line_safe = |text: &str| !text.contains(['\n', '\r']);
         let (batched, single): (Vec<usize>, Vec<usize>) = (0..queries.len())
             .partition(|&index| line_safe(queries[index].0) && line_safe(queries[index].1));
         let mut answers = vec![None; queries.len()];
         for index in single {
             let (rev, path) = queries[index];
-            answers[index] = self.blob_at(rev, path);
+            answers[index] = self.blob_at_for_batch(rev, path)?;
         }
         let read = self.batch_check_objects(
             &batched
@@ -3263,10 +3418,18 @@ impl GitRepo {
         for (index, answer) in batched.into_iter().zip(read) {
             answers[index] = answer;
         }
+        if Instant::now() >= deadline {
+            note_git_timeout();
+            return Err(GitError::TimedOut {
+                args: args.into(),
+                seconds: deadline.saturating_duration_since(started).as_secs().max(1),
+            });
+        }
         Ok(answers)
     }
 
-    /// One `cat-file --batch-check` over queries that hold no line breaks.
+    /// One bounded `cat-file --batch-check` over queries that hold no line
+    /// breaks.
     fn batch_check_objects(
         &self,
         queries: &[(&str, &str)],
@@ -3275,45 +3438,48 @@ impl GitRepo {
             return Ok(Vec::new());
         }
         let args = "cat-file --batch-check=%(objectname) %(objecttype)";
-        let mut child = git_command()
-            .args(["cat-file", "--batch-check=%(objectname) %(objecttype)"])
-            .current_dir(&self.root)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|source| GitError::Spawn {
+        if queries.len() > MAX_GIT_BATCH_QUERY_COUNT {
+            return Err(GitError::Git {
                 args: args.into(),
-                source,
-            })?;
-        let mut input = String::new();
-        for (rev, path) in queries {
-            input.push_str(rev);
-            input.push(':');
-            input.push_str(path);
-            input.push('\n');
+                stderr: format!("Git batch exceeded {MAX_GIT_BATCH_QUERY_COUNT} queries"),
+            });
         }
-        let mut stdin = child.stdin.take().ok_or_else(|| GitError::Git {
-            args: args.into(),
-            stderr: "failed to open cat-file stdin".into(),
-        })?;
-        // Written from a thread: a long query list fills the output pipe
-        // before the input is consumed, and a single thread would deadlock.
-        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
-        let output = child.wait_with_output().map_err(|source| GitError::Spawn {
+        let started = Instant::now();
+        let deadline = effective_git_deadline(args, git_timeout(), started)?;
+        let input = git_batch_check_input(queries, deadline)
+            .map_err(|error| git_batch_input_error(args, started, deadline, error))?;
+        let budget = remaining_git_budget(args, deadline)?;
+        let mut command = git_command();
+        command
+            .args(["cat-file", "--batch-check=%(objectname) %(objecttype)"])
+            .current_dir(&self.root);
+        let output = match crate::bounded_output::output_with_input_limited(
+            &mut command,
+            input,
+            budget,
+            MAX_GIT_BATCH_OUTPUT_BYTES,
+        )
+        .map_err(|source| GitError::Spawn {
             args: args.into(),
             source,
-        })?;
-        writer
-            .join()
-            .map_err(|_| GitError::Git {
-                args: args.into(),
-                stderr: "cat-file stdin writer panicked".into(),
-            })?
-            .map_err(|source| GitError::Spawn {
-                args: args.into(),
-                source,
-            })?;
+        })? {
+            crate::bounded_output::LimitedOutput::Completed(output) => output,
+            crate::bounded_output::LimitedOutput::Deadline => {
+                note_git_timeout();
+                return Err(GitError::TimedOut {
+                    args: args.into(),
+                    seconds: budget.as_secs().max(1),
+                });
+            }
+            crate::bounded_output::LimitedOutput::OutputLimit => {
+                return Err(GitError::Git {
+                    args: args.into(),
+                    stderr: format!(
+                        "Git batch output exceeded {MAX_GIT_BATCH_OUTPUT_BYTES} bytes per stream"
+                    ),
+                });
+            }
+        };
         if !output.status.success() {
             return Err(GitError::Git {
                 args: args.into(),
@@ -3338,6 +3504,13 @@ impl GitRepo {
             return Err(GitError::Git {
                 args: args.into(),
                 stderr: format!("expected {} answers, read {}", queries.len(), answers.len()),
+            });
+        }
+        if Instant::now() >= deadline {
+            note_git_timeout();
+            return Err(GitError::TimedOut {
+                args: args.into(),
+                seconds: deadline.saturating_duration_since(started).as_secs().max(1),
             });
         }
         Ok(answers)
@@ -7466,5 +7639,77 @@ mod graph_snapshot_tests {
         walk(root, root, &mut rows);
         rows.sort();
         rows
+    }
+}
+
+#[cfg(test)]
+mod object_batch_bound_tests {
+    use super::*;
+
+    #[test]
+    fn object_query_byte_limit_includes_path_and_delimiters_before_staging() {
+        let queries = [("rev", "path")];
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        assert_eq!(
+            checked_git_batch_check_input_len(&queries, 9, deadline).unwrap(),
+            9
+        );
+        assert!(matches!(
+            checked_git_batch_check_input_len(&queries, 8, deadline),
+            Err(GitBatchInputError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn object_query_count_is_refused_before_repo_access() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: root.path().to_path_buf(),
+        };
+        let queries = vec![("HEAD", "file.txt"); MAX_GIT_BATCH_QUERY_COUNT + 1];
+
+        let error = repo.objects_at_many(&queries).unwrap_err();
+
+        assert!(matches!(
+            error,
+            GitError::Git { ref stderr, .. }
+                if stderr.contains("exceeded 100000 queries")
+        ));
+    }
+
+    #[test]
+    fn oversized_newline_object_path_is_refused_before_git() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: root.path().to_path_buf(),
+        };
+        let path = format!("line\nbreak{}", "x".repeat(MAX_GIT_BATCH_INPUT_BYTES));
+        let queries = [("HEAD", path.as_str())];
+
+        let error = repo.objects_at_many(&queries).unwrap_err();
+
+        assert!(matches!(
+            error,
+            GitError::Git { ref stderr, .. }
+                if stderr.contains("input exceeded 16777216 bytes")
+        ));
+    }
+
+    #[test]
+    fn object_query_observes_an_expired_deadline_as_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: root.path().to_path_buf(),
+        };
+        let deadline = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        let _git_deadline = limit_git_until(deadline);
+
+        let error = repo.objects_at_many(&[("HEAD", "file.txt")]).unwrap_err();
+
+        assert!(matches!(
+            error,
+            GitError::TimedOut { ref args, .. } if args.contains("cat-file")
+        ));
     }
 }
