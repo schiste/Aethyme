@@ -51,7 +51,11 @@ fn repo() -> isolation::FixtureRepo {
     let tmp = isolation::FixtureRepo::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
-    std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
+    std::fs::write(
+        tmp.path().join(".gitignore"),
+        "/.aethyme/\n/target/\n/private.txt\n/private-link\n/opaque-cache/\n",
+    )
+    .unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
     tmp
@@ -81,6 +85,14 @@ fn dirty_closed_session(repo: &Path) -> (String, PathBuf) {
     (session.id.to_string(), worktree)
 }
 
+fn closed_session(repo: &Path, task: &str) -> (String, PathBuf) {
+    let mut broker = isolation::open(repo);
+    let session = broker.start_worktree(task, None).unwrap();
+    let worktree = PathBuf::from(&session.worktree_path);
+    broker.close(session.id).unwrap();
+    (session.id.to_string(), worktree)
+}
+
 fn plan(repo: &Path, id: &str) -> serde_json::Value {
     json(&run(
         repo,
@@ -102,6 +114,15 @@ fn apply(repo: &Path, id: &str, digest: &str) -> Output {
             "--json",
         ],
     )
+}
+
+fn refused_plan(repo: &Path, id: &str) -> String {
+    let refused = run(
+        repo,
+        &["finish", "cleanup", "resolve", id, "--archive", "--json"],
+    );
+    assert!(!refused.status.success());
+    json_error::message(&refused)
 }
 
 fn archive_root(repo: &Path, plan: &serde_json::Value) -> PathBuf {
@@ -298,6 +319,126 @@ fn a_stale_digest_is_refused_and_nothing_moves() {
         archive_entries(&archive_root(tmp.path(), &reviewed)).is_empty(),
         "nothing was archived"
     );
+}
+
+#[test]
+fn protected_ignored_file_alone_refuses_archive_resolution() {
+    let tmp = repo();
+    let (id, worktree) = closed_session(tmp.path(), "ignored-only fixture");
+    let protected = worktree.join("private.txt");
+    std::fs::write(&protected, "keep this file\n").unwrap();
+
+    let error = refused_plan(tmp.path(), &id);
+    assert!(
+        error.contains("archive resolution refuses protected ignored content"),
+        "{error}"
+    );
+    assert!(error.contains("private.txt"), "{error}");
+    assert_eq!(std::fs::read(&protected).unwrap(), b"keep this file\n");
+    assert!(worktree.is_dir());
+}
+
+#[test]
+fn protected_ignored_file_with_dirty_work_refuses_archive_resolution() {
+    let tmp = repo();
+    let (id, worktree) = dirty_closed_session(tmp.path());
+    let protected = worktree.join("private.txt");
+    std::fs::write(&protected, "keep alongside the patch\n").unwrap();
+
+    let error = refused_plan(tmp.path(), &id);
+    assert!(
+        error.contains("archive resolution refuses protected ignored content"),
+        "{error}"
+    );
+    assert!(error.contains("private.txt"), "{error}");
+    assert!(worktree.join("README.md").is_file());
+    assert!(worktree.join("notes/todo.txt").is_file());
+    assert_eq!(
+        std::fs::read(&protected).unwrap(),
+        b"keep alongside the patch\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn protected_ignored_symlink_refuses_without_following_its_target() {
+    let tmp = repo();
+    let (id, worktree) = closed_session(tmp.path(), "ignored symlink fixture");
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("outside.txt");
+    std::fs::write(&target, "outside data\n").unwrap();
+    let link = worktree.join("private-link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let error = refused_plan(tmp.path(), &id);
+    assert!(
+        error.contains("archive resolution refuses protected ignored content"),
+        "{error}"
+    );
+    assert!(error.contains("private-link"), "{error}");
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"outside data\n");
+}
+
+#[test]
+fn strict_cleanup_policy_refuses_ignored_directory_during_archive_resolution() {
+    let tmp = repo();
+    let (id, worktree) = closed_session(tmp.path(), "strict ignored fixture");
+    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[cleanup]\nstrict = true\n",
+    )
+    .unwrap();
+    let ignored = worktree.join("opaque-cache");
+    std::fs::create_dir_all(&ignored).unwrap();
+    std::fs::write(ignored.join("private.bin"), b"retain under strict policy").unwrap();
+
+    let error = refused_plan(tmp.path(), &id);
+    assert!(
+        error.contains("archive resolution refuses protected ignored content"),
+        "{error}"
+    );
+    assert!(
+        error.contains("strict cleanup requires no ignored leftovers"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(ignored.join("private.bin")).unwrap(),
+        b"retain under strict policy"
+    );
+    assert!(worktree.is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn default_opaque_ignored_directory_does_not_block_or_expand_the_archive_plan() {
+    let tmp = repo();
+    let (id, worktree) = dirty_closed_session(tmp.path());
+    let opaque = worktree.join("opaque-cache");
+    std::fs::create_dir_all(&opaque).unwrap();
+    std::fs::write(opaque.join("nested.bin"), b"not recursively inspected").unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("outside.txt");
+    std::fs::write(&target, "untouched\n").unwrap();
+    std::os::unix::fs::symlink(&target, opaque.join("external-link")).unwrap();
+
+    let reviewed = plan(tmp.path(), &id);
+    assert_eq!(reviewed["disposition"], "dirty");
+    let untracked: Vec<&str> = reviewed["untracked_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(untracked, ["data.bin", "link", "notes/todo.txt"]);
+    assert_eq!(std::fs::read(target).unwrap(), b"untouched\n");
+    assert!(opaque.join("nested.bin").is_file());
 }
 
 /// Any failure between the confirmed plan and removal keeps the worktree.

@@ -2236,7 +2236,52 @@ impl Broker {
         let _lifecycle_claim = self.claim_worktree_lifecycle()?;
         let session = self.store.session(session_id)?;
         ensure_lifecycle_session_unchanged(session_id, &initial_session, &session)?;
-        self.cleanup_under_lifecycle_claim(&session, force)
+        self.cleanup_under_lifecycle_claim(&session, force, false)
+    }
+
+    /// Remove a worktree only after an archive was written and verified.
+    /// Protected ignored content is checked again under the lifecycle claim,
+    /// immediately before the force removal path.
+    pub(crate) fn cleanup_after_recovery_archive(
+        &mut self,
+        session_id: i64,
+    ) -> Result<(), BrokerOpError> {
+        let initial_session = self.store.session(session_id)?;
+        let _lifecycle_claim = self.claim_worktree_lifecycle()?;
+        let session = self.store.session(session_id)?;
+        ensure_lifecycle_session_unchanged(session_id, &initial_session, &session)?;
+        self.cleanup_under_lifecycle_claim(&session, true, true)
+    }
+
+    /// Refuse archive removal when cleanup policy cannot prove that every
+    /// ignored root is disposable. Archive resolution does not capture ignored
+    /// residue, so this check must pass before it may remove the checkout.
+    pub(crate) fn ensure_archive_ignored_content_is_discardable(
+        &self,
+        session_id: i64,
+        worktree_path: &Path,
+    ) -> Result<(), BrokerOpError> {
+        let refuse = |reason: String| BrokerOpError::CleanupResolveRefused {
+            id: session_id,
+            reason,
+        };
+        let policy = crate::AutoCleanupPolicy::load(self.main_root()).map_err(|reason| {
+            refuse(format!(
+                "cannot verify ignored content before archive cleanup: {reason}"
+            ))
+        })?;
+        if let Some(reason) = crate::auto_cleanup::ignored_content_reason(worktree_path, &policy)
+            .map_err(|reason| {
+                refuse(format!(
+                    "cannot verify ignored content before archive cleanup: {reason}"
+                ))
+            })?
+        {
+            return Err(refuse(format!(
+                "archive resolution refuses protected ignored content: {reason}"
+            )));
+        }
+        Ok(())
     }
 
     /// Perform cleanup while the caller holds the repository lifecycle claim.
@@ -2246,9 +2291,17 @@ impl Broker {
         &mut self,
         session: &Session,
         force: bool,
+        archive_resolution: bool,
     ) -> Result<(), BrokerOpError> {
         let session_id = session.id;
         let worktree_path = PathBuf::from(&session.worktree_path);
+        if archive_resolution && session.origin != SessionOrigin::Spawned {
+            return Err(BrokerOpError::CleanupResolveRefused {
+                id: session_id,
+                reason: "only broker-spawned worktrees can be removed after archive resolution"
+                    .into(),
+            });
+        }
         if !force && let Some(proof) = self.interrupted_finish_cleanup_proof(session) {
             return self.resume_interrupted_finish_cleanup(session, &proof);
         }
@@ -2281,6 +2334,9 @@ impl Broker {
         // the live-checkout check below and the removal.
         let mut records = crate::measurement::SizeRecords::default();
         let item = self.cleanup_item_scanned(session, crate::SizeScan::Recorded, &mut records)?;
+        if archive_resolution && worktree_path_is_real_directory(&worktree_path, session_id)? {
+            self.ensure_archive_ignored_content_is_discardable(session_id, &worktree_path)?;
+        }
         if !force
             && let Some(item) = item.as_ref()
             && !item.eligible()
