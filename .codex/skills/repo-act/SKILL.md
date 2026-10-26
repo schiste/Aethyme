@@ -647,6 +647,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   session and a stored-active session whose derived status needs a transition;
   verify the active candidate stays protected and the read-only command leaves the
   transition row unchanged.
+- When making a routine command observation-only, audit callers and tests that
+  used it to trigger maintenance or telemetry. Exercise cleanup assertions through
+  an explicit refresh or maintenance entrypoint, and separately verify polling
+  leaves state unchanged. Preserve the original reclamation and protection checks.
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
 - Document any override-based maintainer note that affected the change plan.

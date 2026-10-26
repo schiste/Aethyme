@@ -193,6 +193,9 @@ fn status_queue_projection_separates_current_from_terminal_states() {
 #[test]
 fn telemetry_classification_tracks_semantic_mutability() {
     for command in [
+        args(&["status"]),
+        args(&["status", "--summary", "--json"]),
+        args(&["status", "--compact", "--json-output"]),
         args(&["certify"]),
         args(&["readiness", "--require", "agent-ready"]),
         args(&["hooks", "status"]),
@@ -275,7 +278,8 @@ fn telemetry_classification_tracks_semantic_mutability() {
             "--confirm",
             "digest",
         ]),
-        args(&["status"]),
+        args(&["status", "--json"]),
+        args(&["status", "--refresh"]),
         args(&["agents"]),
         args(&["leases"]),
         args(&["integration", "status"]),

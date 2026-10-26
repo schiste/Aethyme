@@ -2062,12 +2062,12 @@ fn the_autonomous_sweep_reclaims_build_caches_without_confirmation() {
     assert!(target.exists());
     enable_sweep(repo.path());
 
-    // Any broker command opens the broker, which runs the sweep. An open
+    // Explicit refresh uses normal broker startup, which runs the sweep. An open
     // spends at most a quarter of a second, so on a loaded machine one may
     // pause; clearing the spacing stamp stands in for the minutes the next
     // continuation would otherwise wait.
     for _ in 0..40 {
-        let output = run(repo.path(), container.path(), &["status"]);
+        let output = run(repo.path(), container.path(), &["status", "--refresh"]);
         assert!(
             output.status.success(),
             "status: {}",
@@ -2321,7 +2321,7 @@ fn inline_sweep_removes_closed_cache_and_preserves_an_idle_open_cache() {
     )
     .unwrap();
 
-    let output = run(repo.path(), container.path(), &["status"]);
+    let output = run(repo.path(), container.path(), &["status", "--refresh"]);
 
     assert!(
         output.status.success(),
@@ -2443,7 +2443,7 @@ fn a_bounded_open_leaves_a_truthful_state_and_explicit_sweep_finishes() {
         "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 50\n",
     )
     .unwrap();
-    let first = run(repo.path(), container.path(), &["status"]);
+    let first = run(repo.path(), container.path(), &["status", "--refresh"]);
     assert!(
         first.status.success(),
         "status: {}",
@@ -2458,7 +2458,7 @@ fn a_bounded_open_leaves_a_truthful_state_and_explicit_sweep_finishes() {
     // Repeated opens inside the spacing/cadence interval leave the observed
     // terminal state alone, whether this machine paused or completed the lap.
     for _ in 0..4 {
-        let output = run(repo.path(), container.path(), &["status"]);
+        let output = run(repo.path(), container.path(), &["status", "--refresh"]);
         assert!(
             output.status.success(),
             "status: {}",
@@ -2598,7 +2598,7 @@ fn broker_opens_preserve_the_completed_or_partial_sweep_state() {
     )
     .unwrap();
 
-    let first = run(repo.path(), container.path(), &["status"]);
+    let first = run(repo.path(), container.path(), &["status", "--refresh"]);
     assert!(
         first.status.success(),
         "status: {}",
@@ -2611,7 +2611,7 @@ fn broker_opens_preserve_the_completed_or_partial_sweep_state() {
     let queue = interrupted_paths(repo.path());
 
     for _ in 0..10 {
-        let output = run(repo.path(), container.path(), &["status"]);
+        let output = run(repo.path(), container.path(), &["status", "--refresh"]);
         assert!(
             output.status.success(),
             "status: {}",
@@ -2652,7 +2652,7 @@ fn gc_sweep_drains_the_backlog_and_stamps_the_cadence() {
     )
     .unwrap();
     assert!(
-        run(repo.path(), container.path(), &["status"])
+        run(repo.path(), container.path(), &["status", "--refresh"])
             .status
             .success()
     );
@@ -2754,7 +2754,7 @@ fn finish_continues_an_unfinished_sweep() {
     )
     .unwrap();
     assert!(
-        run(repo.path(), container.path(), &["status"])
+        run(repo.path(), container.path(), &["status", "--refresh"])
             .status
             .success()
     );
