@@ -64,6 +64,8 @@ pub const DEFAULT_SEARCH_CAP: usize = 2_000;
 /// One shared 30-second ceiling for a landing search, not its surrounding
 /// command. A configured or caller deadline may shorten it, never lengthen it.
 const MAX_LANDING_SEARCH_BUDGET: Duration = Duration::from_secs(30);
+/// A large but finite complete commit listing for oldest-first search.
+const MAX_LANDING_CANDIDATE_LIST_BYTES: usize = 16 * 1024 * 1024;
 const LANDING_SEARCH_ALGORITHM_VERSION: u8 = 2;
 
 fn landing_query_count(candidate_count: usize, path_count: usize) -> Option<usize> {
@@ -322,23 +324,25 @@ fn find_landing_within(
     let search_deadline =
         deadline.map_or(requested_deadline, |caller| caller.min(requested_deadline));
     let _git_deadline = crate::git::limit_git_until(search_deadline);
-    find_landing_with_query_budget(
+    find_landing_with_limits(
         repo,
         content,
         branch_tip,
         cap,
         search_deadline,
         crate::git::MAX_GIT_BATCH_QUERY_COUNT,
+        MAX_LANDING_CANDIDATE_LIST_BYTES,
     )
 }
 
-fn find_landing_with_query_budget(
+fn find_landing_with_limits(
     repo: &GitRepo,
     content: &SessionContent,
     branch_tip: &str,
     cap: usize,
     deadline: Instant,
     query_budget: usize,
+    candidate_list_byte_budget: usize,
 ) -> Result<LandingSearch, BrokerOpError> {
     if content.is_empty() {
         return Ok(LandingSearch {
@@ -367,7 +371,7 @@ fn find_landing_with_query_budget(
     }
 
     let candidates = repo
-        .commits_between_oldest(&content.base, branch_tip)
+        .commits_between_oldest_bounded(&content.base, branch_tip, candidate_list_byte_budget)
         .map_err(|source| {
             unavailable(format!(
                 "cannot list commits {}..{}: {source}",
@@ -1477,15 +1481,22 @@ mod tests {
         git(tmp.path(), &["checkout", "-q", "main"]);
         write(tmp.path(), "target.rs", "target change\n");
         let target = commit(tmp.path(), "target change");
+        let oldest_first = repo.commits_between_oldest(&base, &target).unwrap();
+        assert_eq!(
+            repo.commits_between_oldest_bounded(&base, &target, MAX_LANDING_CANDIDATE_LIST_BYTES,)
+                .unwrap(),
+            oldest_first
+        );
         let deadline = Instant::now() + Duration::from_secs(5);
         let _git_deadline = crate::git::limit_git_until(deadline);
-        let error = find_landing_with_query_budget(
+        let error = find_landing_with_limits(
             &repo,
             &content,
             &target,
             DEFAULT_SEARCH_CAP,
             deadline,
             1,
+            MAX_LANDING_CANDIDATE_LIST_BYTES,
         )
         .unwrap_err();
 
@@ -1512,6 +1523,38 @@ mod tests {
             error,
             BrokerOpError::RepresentationUnavailable { ref reason }
                 if reason == "landing search stopped before reading its base snapshot"
+        ));
+    }
+
+    #[test]
+    fn candidate_list_output_limit_is_unavailable_not_a_negative() {
+        let (tmp, repo, base) = seeded();
+        write(tmp.path(), "session.rs", "session change\n");
+        let head = commit(tmp.path(), "session change");
+        let content = session_content(&repo, &base, &head).unwrap();
+
+        git(tmp.path(), &["checkout", "-q", "--detach", &base]);
+        write(tmp.path(), "target.rs", "target change\n");
+        let target = commit(tmp.path(), "target change");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let _git_deadline = crate::git::limit_git_until(deadline);
+
+        let error = find_landing_with_limits(
+            &repo,
+            &content,
+            &target,
+            DEFAULT_SEARCH_CAP,
+            deadline,
+            crate::git::MAX_GIT_BATCH_QUERY_COUNT,
+            1,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            BrokerOpError::RepresentationUnavailable { ref reason }
+                if reason.contains("cannot list commits")
+                    && reason.contains("output exceeded 1 bytes")
         ));
     }
 

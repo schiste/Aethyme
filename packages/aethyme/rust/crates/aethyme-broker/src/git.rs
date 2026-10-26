@@ -3116,6 +3116,66 @@ impl GitRepo {
             .collect())
     }
 
+    /// Commits reachable from `to` but not `from`, oldest first, with bounded
+    /// process time and captured output. An incomplete listing is an error;
+    /// callers must not interpret it as a complete history window.
+    pub(crate) fn commits_between_oldest_bounded(
+        &self,
+        from: &str,
+        to: &str,
+        max_output_bytes: usize,
+    ) -> Result<Vec<String>, GitError> {
+        let range = format!("{from}..{to}");
+        let args = "rev-list --reverse";
+        let started = Instant::now();
+        let deadline = effective_git_deadline(args, git_timeout(), started)?;
+        let budget = remaining_git_budget(args, deadline)?;
+        let mut command = git_command();
+        command
+            .args(["rev-list", "--reverse", &range])
+            .current_dir(&self.root);
+        let output =
+            match crate::bounded_output::output_limited(&mut command, budget, max_output_bytes)
+                .map_err(|source| GitError::Spawn {
+                    args: args.into(),
+                    source,
+                })? {
+                crate::bounded_output::LimitedOutput::Completed(output) => output,
+                crate::bounded_output::LimitedOutput::Deadline => {
+                    note_git_timeout();
+                    return Err(GitError::TimedOut {
+                        args: args.into(),
+                        seconds: budget.as_secs().max(1),
+                    });
+                }
+                crate::bounded_output::LimitedOutput::OutputLimit => {
+                    return Err(GitError::Git {
+                        args: args.into(),
+                        stderr: format!(
+                            "Git command output exceeded {max_output_bytes} bytes per stream"
+                        ),
+                    });
+                }
+            };
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: args.into(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        if Instant::now() >= deadline {
+            note_git_timeout();
+            return Err(GitError::TimedOut {
+                args: args.into(),
+                seconds: deadline.saturating_duration_since(started).as_secs().max(1),
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect())
+    }
+
     /// Commits reachable from `head` but not `excluded`, oldest first.
     /// Unlike a `from..to` range this remains meaningful when the two
     /// histories have diverged.
@@ -3311,6 +3371,8 @@ impl GitRepo {
         let started = Instant::now();
         let deadline = effective_git_deadline(args, git_timeout(), started)?;
         let _deadline = limit_git_until(deadline);
+        checked_git_batch_check_input_len(queries, MAX_GIT_BATCH_INPUT_BYTES, deadline)
+            .map_err(|error| git_batch_input_error(args, started, deadline, error))?;
         let line_safe = |text: &str| !text.contains(['\n', '\r']);
         let (batched, single): (Vec<usize>, Vec<usize>) = (0..queries.len())
             .partition(|&index| line_safe(queries[index].0) && line_safe(queries[index].1));
@@ -7514,6 +7576,24 @@ mod object_batch_bound_tests {
             error,
             GitError::Git { ref stderr, .. }
                 if stderr.contains("exceeded 100000 queries")
+        ));
+    }
+
+    #[test]
+    fn oversized_newline_object_path_is_refused_before_git() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = GitRepo {
+            root: root.path().to_path_buf(),
+        };
+        let path = format!("line\nbreak{}", "x".repeat(MAX_GIT_BATCH_INPUT_BYTES));
+        let queries = [("HEAD", path.as_str())];
+
+        let error = repo.objects_at_many(&queries).unwrap_err();
+
+        assert!(matches!(
+            error,
+            GitError::Git { ref stderr, .. }
+                if stderr.contains("input exceeded 16777216 bytes")
         ));
     }
 
