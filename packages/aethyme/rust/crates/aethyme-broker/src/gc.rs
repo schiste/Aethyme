@@ -5422,35 +5422,6 @@ impl Broker {
                 0,
             ));
         }
-        if !crate::AutoCleanupPolicy::artifact_sweep_allowed(self.main_root()) {
-            // Strict mode pauses the artifact lane without consuming its pending
-            // generation. Ignored-free checkouts may still satisfy their own
-            // cleanup policy, under the same bounded lock/proof discipline.
-            let (budget_ms, _urgency) = self.artifact_sweep_budget(policy, scope);
-            let budget_deadline = Instant::now() + Duration::from_millis(budget_ms);
-            let deadline = discovery_deadline_override
-                .unwrap_or(budget_deadline)
-                .min(removal_deadline_override.unwrap_or(budget_deadline));
-            let auto_cleanup = if scope_runs_checkout_cleanup(scope) {
-                if let Ok(_lock) = GcLock::acquire(self.main_root()) {
-                    let report = self.auto_remove_disposable_checkouts(Some(deadline))?;
-                    self.persist_auto_checkout_cleanup_request(scope, &report)?;
-                    Some(report)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            return Ok((
-                ArtifactSweepOutcome {
-                    directories_reclaimed: 0,
-                    complete: false,
-                    auto_cleanup,
-                },
-                0,
-            ));
-        }
         let namespace = self.ensure_artifact_sweep_namespace()?;
         let closed_session_id = match scope {
             ArtifactSweepScope::ClosedSession(session_id) => Some(session_id),
@@ -5484,6 +5455,36 @@ impl Broker {
                     0,
                 ));
             }
+        }
+        if !crate::AutoCleanupPolicy::artifact_sweep_allowed(self.main_root()) {
+            // Strict mode pauses the artifact lane without consuming its pending
+            // generation. Ignored-free checkouts may still satisfy their own
+            // cleanup policy, under the same bounded lock/proof discipline.
+            let auto_cleanup = if scope_runs_checkout_cleanup(scope) {
+                if let Ok(_lock) = GcLock::acquire(self.main_root()) {
+                    let report = self.auto_remove_disposable_checkouts(Some(deadline))?;
+                    self.persist_auto_checkout_cleanup_request(scope, &report)?;
+                    if scope == ArtifactSweepScope::Inline {
+                        self.artifact_sweep_meta_set(
+                            ARTIFACT_SWEEP_PROGRESS_KEY,
+                            &now.to_string(),
+                        )?;
+                    }
+                    Some(report)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            return Ok((
+                ArtifactSweepOutcome {
+                    directories_reclaimed: 0,
+                    complete: false,
+                    auto_cleanup,
+                },
+                0,
+            ));
         }
         // A concurrent GC owns the artifact namespace; skip rather than race.
         let Ok(_lock) = GcLock::acquire(&main_root) else {
@@ -8967,6 +8968,19 @@ mod tests {
             .unwrap();
         let disposable_worktree = PathBuf::from(&disposable.worktree_path);
         broker.close(disposable.id).unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_STAMP_KEY, &now_ms().to_string())
+            .unwrap();
+        let policy = load_retention_policy(&root).unwrap();
+        let skipped = broker
+            .sweep_artifacts_autonomously(&policy, ArtifactSweepScope::Inline)
+            .unwrap();
+        assert!(
+            skipped.auto_cleanup.is_none(),
+            "strict inline mode must preserve the normal cadence"
+        );
+        assert!(disposable_worktree.exists());
+        assert!(cache.join("payload").exists());
         let strict_report = broker.gc_sweep_artifacts().unwrap();
         assert!(
             !disposable_worktree.exists(),
