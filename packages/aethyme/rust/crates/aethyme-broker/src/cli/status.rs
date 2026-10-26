@@ -93,7 +93,14 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         ));
     }
     let opened = std::time::Instant::now();
-    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let routine = !parsed.refresh && (parsed.compact || parsed.summary || !parsed.json);
+    let mut broker = if routine {
+        let cwd = std::env::current_dir()
+            .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;
+        Broker::open_status_snapshot(&cwd)?
+    } else {
+        open_broker(parsed.read_only_snapshot)?
+    };
     let open_ms = opened.elapsed().as_millis() as u64;
     // Routine text is the compact, recorded-observation path. Full JSON stays
     // on the established StatusView contract; --compact opts JSON callers into

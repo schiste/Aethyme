@@ -1,6 +1,6 @@
 # Broker latency budgets
 
-Last Updated: 2026-10-25
+Last Updated: 2026-10-26
 
 The machine-readable source is
 [`broker-budgets.json`](../../../aethyme-eval/benchmarks/performance/broker-budgets.json).
@@ -10,7 +10,7 @@ failures remain errors; missing data must not look like a fast command.
 
 | Action | Budget | Meaning |
 |---|---:|---|
-| Routine status | 500 ms | Complete `broker status --summary --json` process |
+| Routine status | 150 ms | Complete `broker status --summary --json` process |
 | Guard overhead | 500 ms | Complete guarded no-op process, including ownership audit |
 | Unchanged sync | 1,000 ms | Complete unchanged sync process, local transport |
 | Push | 500 ms | Complete push process, local transport; nightly profile uses an unchanged branch |
@@ -18,6 +18,28 @@ failures remain errors; missing data must not look like a fast command.
 For real remote transport, the agreed targets allow separately measured network
 time in addition to the sync and push budgets. The nightly profile below uses
 local transport and compares the full wall time directly with these limits.
+
+## Routine observation
+
+Default compact text, `status --compact --json` and `status --summary --json`
+observe current coordination state without fast-forwarding the main checkout,
+running startup recovery, resuming GC, or persisting liveness transitions.
+PID checks, activity metadata, pending operations, locks and source-unavailable
+warnings remain current observations. Deferred checks are unknown, not clean;
+`startup_recovery`, `checkout_sync` and `gc_resume` are explicitly listed.
+Full `status --json` and explicit `status --refresh` retain their existing paths.
+
+Repository identity and committed policy reads are shared only during one routine
+invocation, including router compatibility preflight. Nothing is reused across
+invocations. Routine observation does not create broker state or record outcome
+telemetry. `AETHYME_MEASURE_OUTPUT=1` retains the existing explicit opt-in for a
+metrics line. A pending committed capture fence remains visible as a warning;
+the ordinary mutation/audit paths continue to enforce or raise it.
+
+The 150 ms status target is warning-only. Deterministic entrypoint controls
+ratchet Git process count and observation behavior without timing assertions.
+Measure complete uninstrumented process wall time separately, including router
+preflight and exit work; `phase_timings_ms.command_total` covers only its handler.
 
 ## Automatic reporting
 

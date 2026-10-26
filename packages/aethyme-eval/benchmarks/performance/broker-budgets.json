@@ -4,7 +4,7 @@
   "statistic": "median",
   "unit": "milliseconds",
   "budgets": {
-    "routine_status": {"limit_ms": 500, "measurement": "complete_cli_wall"},
+    "routine_status": {"limit_ms": 150, "measurement": "complete_cli_wall"},
     "guard_overhead": {"limit_ms": 500, "measurement": "complete_cli_wall_noop_child"},
     "unchanged_sync": {"limit_ms": 1000, "measurement": "complete_cli_wall_local_transport"},
     "push": {"limit_ms": 500, "measurement": "complete_cli_wall_local_transport"}

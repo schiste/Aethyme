@@ -311,6 +311,9 @@ pub(super) fn output_measurement_opted_in() -> bool {
 }
 
 pub(super) fn command_records_metric(args: &[String]) -> bool {
+    if super::routine_status(args) {
+        return false;
+    }
     match args.first().map(String::as_str) {
         // Quick-test owns a temporary repository that is removed before the
         // dispatcher records telemetry; there is no durable repository target.

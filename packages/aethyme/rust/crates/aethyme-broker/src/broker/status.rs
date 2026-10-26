@@ -375,8 +375,11 @@ impl Broker {
             phase_started.elapsed().as_millis() as u64,
         );
         let phase_started = std::time::Instant::now();
+        let repository_config = crate::merge::repository_config_with_source(&self.main_root);
         let (promote_config, promote_config_warning) =
-            PromoteConfig::load_with_warning(&self.main_root);
+            PromoteConfig::from_text(repository_config.as_ref().map(|(text, _)| text.as_str()));
+        let fence =
+            self.collaboration_fence_state(FenceTrigger::Config(repository_config.as_ref()));
         let promotes = promote_config.mode.promotes_at_all();
         let summary = status_summary(
             &agents,
@@ -425,6 +428,20 @@ impl Broker {
             phase_started.elapsed().as_millis() as u64,
         );
         let phase_started = std::time::Instant::now();
+        if fence.as_ref().is_some_and(|fence| fence.state == "pending") {
+            advice.push(StatusAdvice {
+                id: "collaboration.fence-pending",
+                severity: StatusAdviceSeverity::Warning,
+                reason: "collaboration_fence_pending",
+                summary:
+                    "committed config requires capture; the compatibility floor is still pending"
+                        .into(),
+                session_id: None,
+                queue_entry_id: None,
+                evidence: Vec::new(),
+                commands: vec!["aethyme broker status --refresh".into()],
+            });
+        }
         advice.extend(self.blocker_status_advice_snapshot());
         phase_timings_ms.insert(
             "blockers".into(),
@@ -473,6 +490,9 @@ impl Broker {
                 "promoted_conflicts",
                 "disk_retention",
                 "cleanup_eligibility",
+                "startup_recovery",
+                "checkout_sync",
+                "gc_resume",
             ]
             .into_iter()
             .map(String::from)

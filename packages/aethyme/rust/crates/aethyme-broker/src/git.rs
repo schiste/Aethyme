@@ -1299,7 +1299,10 @@ fn parse_graph_snapshot_inventory(bytes: &[u8]) -> Result<(u64, u64), GitError> 
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, GitError> {
-    run_git_inner(cwd, None, args)
+    if active_git_deadline().is_some() || GRAPH_VERIFICATION_GIT.with(std::cell::Cell::get) {
+        return run_git_inner(cwd, None, args);
+    }
+    crate::status_reads::git_identity(cwd, args, || run_git_inner(cwd, None, args))
 }
 
 fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
