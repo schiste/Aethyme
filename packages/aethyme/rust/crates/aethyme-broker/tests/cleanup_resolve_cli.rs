@@ -4,6 +4,7 @@
 #[path = "common/isolation.rs"]
 mod isolation;
 
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -300,6 +301,59 @@ fn pending_commits_are_carried_by_a_verified_bundle() {
     assert!(
         events.contains(&archive.to_string_lossy().into_owned()),
         "the archive path is recorded in an event: {events}{stderr}"
+    );
+}
+
+#[test]
+fn untracked_newline_path_is_archived_without_truncating_the_inventory() {
+    let tmp = repo();
+    let (id, worktree) = closed_session(tmp.path(), "newline path fixture");
+    let relative = "untracked-line\nbreak.txt";
+    std::fs::write(worktree.join(relative), b"preserve newline path\n").unwrap();
+
+    let reviewed = plan(tmp.path(), &id);
+    assert_eq!(reviewed["untracked_files"].as_array().unwrap().len(), 1);
+    assert_eq!(reviewed["untracked_files"][0]["path"], relative);
+    let outcome = json(&apply(
+        tmp.path(),
+        &id,
+        reviewed["digest"].as_str().unwrap(),
+    ));
+    assert_eq!(outcome["worktree_removed"], true);
+    let archive = PathBuf::from(outcome["archive"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read(archive.join("untracked").join(relative)).unwrap(),
+        b"preserve newline path\n"
+    );
+}
+
+#[test]
+fn non_utf8_untracked_path_refuses_archive_resolution_before_cleanup() {
+    let tmp = repo();
+    let (id, worktree) = closed_session(tmp.path(), "non-utf8 path fixture");
+    let name = std::ffi::OsString::from_vec(b"untracked-\xff.txt".to_vec());
+    let path = worktree.join(name);
+    std::fs::write(&path, b"must remain").unwrap();
+
+    let error = refused_plan(tmp.path(), &id);
+    assert!(
+        error.contains("non-UTF-8 NUL-separated porcelain status"),
+        "{error}"
+    );
+    assert!(
+        path.is_file(),
+        "the unrepresentable file remains in the worktree"
+    );
+    let archive_root = tmp
+        .path()
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join("host-state/recovery-archives");
+    assert!(
+        archive_entries(&archive_root).is_empty(),
+        "no archive was created"
     );
 }
 
