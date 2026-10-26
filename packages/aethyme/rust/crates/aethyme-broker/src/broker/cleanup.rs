@@ -318,6 +318,15 @@ impl Broker {
             ));
         }
 
+        let ignored_verdict = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root())
+            .and_then(|policy| crate::auto_cleanup::ignored_content_reason(worktree_path, &policy));
+        match ignored_verdict {
+            Ok(None) => {}
+            Ok(Some(reason)) | Err(reason) => {
+                return Ok((CleanupDisposition::Dirty, reason, None));
+            }
+        }
+
         let session_head = checkout.head_commit()?;
         let session = self.store.session(session_id)?;
         let (provenance, reason) =
@@ -1714,9 +1723,12 @@ impl Broker {
             return None;
         }
         let checkout = GitRepo::discover(&canonical_path).ok()?;
+        let cleanup_policy = crate::AutoCleanupPolicy::load(self.main_root()).ok()?;
         if checkout.root() != canonical_path
             || checkout.finish_cleanup_recovery_proof(&proof.branch_ref)? != proof
-            || !checkout.has_only_unstaged_tracked_deletions().ok()?
+            || !checkout
+                .has_only_unstaged_tracked_deletions(&cleanup_policy)
+                .ok()?
             || checkout.dirty_paths().ok()?.is_empty()
             || self.repo.resolve_ref(&proof.branch_ref).as_deref()
                 != Some(proof.branch_tip.as_str())
@@ -1922,6 +1934,23 @@ impl Broker {
             });
         }
 
+        let policy = crate::AutoCleanupPolicy::load(self.main_root()).map_err(|reason| {
+            BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason,
+            }
+        })?;
+        if let Some(reason) = crate::auto_cleanup::ignored_content_reason(&worktree_path, &policy)
+            .map_err(|reason| BrokerOpError::DirtyWorktree {
+            id: session.id,
+            reason,
+        })? {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason,
+            });
+        }
+
         // `--force` is confined to this validated interrupted finish. The
         // exact registered checkout, represented head, and unstaged-deletion
         // only status were rechecked immediately above. Preserve Git's
@@ -1995,6 +2024,19 @@ impl Broker {
             return Err(BrokerOpError::DirtyWorktree {
                 id: session.id,
                 reason: "the interrupted orphan cleanup identity or safety checks changed; inspect the remaining files before retrying".into(),
+            });
+        }
+
+        let policy = crate::AutoCleanupPolicy::load(self.main_root()).map_err(|reason| {
+            BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason,
+            }
+        })?;
+        if policy.strict {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason: "strict cleanup preserves interrupted orphan residue; Git metadata is unavailable to classify it, so remove it manually".into(),
             });
         }
 
@@ -2664,6 +2706,63 @@ mod registered_removal_failure_tests {
         std::fs::remove_dir_all(gitdir).unwrap();
     }
 
+    fn repository_with_ignored_cleanup_fixture(root: &Path) -> std::path::PathBuf {
+        let repository = initialized_repository(root);
+        std::fs::write(
+            repository.join(".gitignore"),
+            "/.aethyme/\n/target/\n/local-dataset/\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("README.md"), "tracked fixture\n").unwrap();
+        git(&repository, &["add", ".gitignore", "README.md"]);
+        git(&repository, &["commit", "-qm", "cleanup fixture"]);
+        std::fs::create_dir_all(repository.join(".aethyme")).unwrap();
+        std::fs::write(
+            repository.join(".aethyme/config.toml"),
+            "[cleanup]\nstrict = false\n",
+        )
+        .unwrap();
+        repository
+    }
+
+    fn start_represented_cleanup_session(
+        broker: &mut crate::Broker,
+        label: &str,
+    ) -> (crate::Session, std::path::PathBuf) {
+        let session = broker.start_worktree(label, None).unwrap();
+        let worktree = Path::new(&session.worktree_path).to_path_buf();
+        std::fs::write(worktree.join("session-change.txt"), "represented\n").unwrap();
+        git(&worktree, &["add", "session-change.txt"]);
+        git(&worktree, &["commit", "-qm", "represented cleanup head"]);
+        assert!(
+            broker.submit(session.id).unwrap().promoted,
+            "recovery fixture must represent the session head before cleanup starts"
+        );
+        (session, worktree)
+    }
+
+    fn persist_finish_cleanup_intent(
+        broker: &mut crate::Broker,
+        session: &crate::Session,
+        worktree: &Path,
+    ) -> crate::events::FinishCleanupRecoveryProof {
+        let branch_ref = format!("refs/heads/{}", session.branch);
+        let checkout = crate::git::GitRepo::discover(worktree).unwrap();
+        let proof = checkout
+            .finish_cleanup_recovery_proof(&branch_ref)
+            .expect("the represented linked checkout must yield a durable recovery proof");
+        let payload = crate::events::session_finish_cleanup_started_payload_with_proof(
+            true,
+            true,
+            Some(&proof),
+        );
+        broker
+            .store()
+            .begin_finish_cleanup(session.id, &payload)
+            .unwrap();
+        proof
+    }
+
     fn advance_schema_floor(database: &Path) {
         let mut conn = rusqlite::Connection::open(database).unwrap();
         let tx = conn.transaction().unwrap();
@@ -2862,6 +2961,187 @@ mod registered_removal_failure_tests {
                 .is_none(),
             "explicit force should remove the owned session branch"
         );
+    }
+
+    #[test]
+    fn registered_finish_recovery_obeys_strict_policy_flip_and_manual_residue_removal() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "registered recovery strict flip");
+
+        let cache = worktree.join("target");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
+        std::fs::write(cache.join("payload"), b"known ignored output").unwrap();
+        let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        std::fs::remove_file(worktree.join("README.md")).unwrap();
+        let closed = broker.store().session(session.id).unwrap();
+        assert_eq!(
+            broker.interrupted_finish_cleanup_proof(&closed),
+            Some(proof.clone()),
+            "the represented interrupted finish must be recoverable before policy changes"
+        );
+        assert!(broker.store().live_sessions().unwrap().is_empty());
+
+        std::fs::write(
+            repository.join(".aethyme/config.toml"),
+            "[cleanup]\nstrict = true\n",
+        )
+        .unwrap();
+        let error = broker.cleanup(session.id, false).unwrap_err();
+        assert!(
+            worktree.exists(),
+            "strict policy unexpectedly removed the checkout with ignored residue: {error}"
+        );
+        assert!(cache.join("payload").is_file());
+        assert!(worktree.join("session-change.txt").is_file());
+        assert_eq!(
+            broker.store().session(session.id).unwrap().cleanup_state,
+            SessionCleanupState::Closed
+        );
+        assert!(broker.repo.resolve_ref(&proof.branch_ref).is_some());
+
+        // Strict mode permits finish recovery once the operator has removed
+        // every ignored leftover by hand.
+        std::fs::remove_dir_all(&cache).unwrap();
+        let closed = broker.store().session(session.id).unwrap();
+        assert_eq!(
+            broker.interrupted_finish_cleanup_proof(&closed),
+            Some(proof.clone())
+        );
+        broker.cleanup(session.id, false).unwrap();
+        assert!(!worktree.exists());
+        assert!(broker.repo.resolve_ref(&proof.branch_ref).is_none());
+    }
+
+    #[test]
+    fn orphan_finish_recovery_requires_strict_policy_to_be_disabled() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "orphan recovery strict flip");
+
+        let residue = worktree.join("local-dataset/saved-session.json");
+        std::fs::create_dir_all(residue.parent().unwrap()).unwrap();
+        std::fs::write(&residue, b"saved session data").unwrap();
+        let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        std::fs::remove_file(worktree.join("README.md")).unwrap();
+        remove_worktree_admin_directory(&worktree);
+        let closed = broker.store().session(session.id).unwrap();
+        assert_eq!(
+            broker.interrupted_finish_orphan_cleanup_proof(&closed),
+            Some(proof.clone()),
+            "the same-repository orphan must have a durable recovery proof before policy changes"
+        );
+        assert!(broker.store().live_sessions().unwrap().is_empty());
+
+        std::fs::write(
+            repository.join(".aethyme/config.toml"),
+            "[cleanup]\nstrict = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            broker.interrupted_finish_orphan_cleanup_proof(&closed),
+            Some(proof.clone()),
+            "the policy flip must not alter the identity proof"
+        );
+        let error = broker.cleanup(session.id, false).unwrap_err();
+        assert!(
+            error.to_string().contains("strict cleanup"),
+            "strict policy should retain orphan residue: {error}"
+        );
+        assert!(residue.is_file());
+        assert_eq!(
+            broker.store().session(session.id).unwrap().cleanup_state,
+            SessionCleanupState::Closed
+        );
+        assert!(broker.repo.resolve_ref(&proof.branch_ref).is_some());
+
+        std::fs::write(
+            repository.join(".aethyme/config.toml"),
+            "[cleanup]\nstrict = false\n",
+        )
+        .unwrap();
+        let closed = broker.store().session(session.id).unwrap();
+        assert_eq!(
+            broker.interrupted_finish_orphan_cleanup_proof(&closed),
+            Some(proof.clone())
+        );
+        broker.cleanup(session.id, false).unwrap();
+        assert!(!worktree.exists());
+        assert!(broker.repo.resolve_ref(&proof.branch_ref).is_none());
+    }
+
+    #[test]
+    fn interrupted_finish_recovery_still_refuses_an_unrepresented_session_head() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("unrepresented recovery protection", None)
+            .unwrap();
+        let worktree = Path::new(&session.worktree_path).to_path_buf();
+        std::fs::write(worktree.join("unpublished.txt"), "not submitted\n").unwrap();
+        git(&worktree, &["add", "unpublished.txt"]);
+        git(&worktree, &["commit", "-qm", "unrepresented session head"]);
+
+        let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        let targets = broker.cleanup_delivery_targets().unwrap();
+        let (provenance, _) = broker
+            .cleanup_provenance(&session, &proof.head, &targets)
+            .unwrap();
+        assert_ne!(
+            provenance.representation,
+            crate::CleanupRepresentation::Represented,
+            "this fixture intentionally leaves its session commit unsubmitted"
+        );
+        std::fs::remove_file(worktree.join("README.md")).unwrap();
+        let closed = broker.store().session(session.id).unwrap();
+        assert!(
+            broker.interrupted_finish_cleanup_proof(&closed).is_none(),
+            "a durable finish intent must not substitute for delivery representation"
+        );
+
+        assert!(broker.cleanup(session.id, false).is_err());
+        assert!(worktree.join("unpublished.txt").is_file());
+        assert!(broker.repo.resolve_ref(&proof.branch_ref).is_some());
+        assert_eq!(
+            broker.store().session(session.id).unwrap().cleanup_state,
+            SessionCleanupState::Closed
+        );
+    }
+
+    #[test]
+    fn registered_finish_recovery_discards_opaque_unknown_ignored_directory_by_default() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "opaque ignored recovery");
+
+        let residue = worktree.join("local-dataset/saved-session.json");
+        std::fs::create_dir_all(residue.parent().unwrap()).unwrap();
+        std::fs::write(&residue, b"opaque ignored directory payload").unwrap();
+        let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        std::fs::remove_file(worktree.join("README.md")).unwrap();
+        let closed = broker.store().session(session.id).unwrap();
+        assert_eq!(
+            broker.interrupted_finish_cleanup_proof(&closed),
+            Some(proof.clone()),
+            "unknown ignored directory contents are opaque in disposable mode"
+        );
+
+        broker.cleanup(session.id, false).unwrap();
+
+        assert!(!worktree.exists());
+        assert!(broker.repo.resolve_ref(&proof.branch_ref).is_none());
     }
 
     #[test]

@@ -4220,11 +4220,14 @@ impl GitRepo {
     }
 
     /// Whether every remaining non-ignored change is an unstaged deletion of
-    /// a tracked path, and each ignored path is broker runtime state or a
-    /// witnessed regenerable artifact. This narrow state is used only to
+    /// a tracked path, and each ignored path is disposable under the current
+    /// cleanup policy. This narrow state is used only to
     /// resume an authenticated finish cleanup after Git has already removed
     /// part of the worktree.
-    pub(crate) fn has_only_unstaged_tracked_deletions(&self) -> Result<bool, GitError> {
+    pub(crate) fn has_only_unstaged_tracked_deletions(
+        &self,
+        policy: &crate::AutoCleanupPolicy,
+    ) -> Result<bool, GitError> {
         require_trustworthy_porcelain()?;
         let entries = parse_porcelain_entries_z(&run_git_bytes(
             &self.root,
@@ -4237,63 +4240,8 @@ impl GitRepo {
             ],
         )?)?;
         Ok(only_unstaged_tracked_deletions(&entries, |path| {
-            self.safe_interrupted_cleanup_ignored_path(path)
-                .unwrap_or(false)
+            crate::auto_cleanup::classify_ignored(&self.root, path, policy).is_ok()
         }))
-    }
-
-    /// The ordinary cleanup path already permits broker runtime files and
-    /// catalogued regenerable output because they are ignored by Git. The
-    /// interrupted path keeps that policy narrow: arbitrary ignored content
-    /// is not covered by the recovery proof.
-    fn safe_interrupted_cleanup_ignored_path(&self, path: &str) -> Result<bool, GitError> {
-        use std::path::Component;
-
-        let relative = path.strip_suffix('/').unwrap_or(path);
-        let relative_path = Path::new(relative);
-        if relative.is_empty()
-            || relative_path.is_absolute()
-            || relative_path
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_)))
-        {
-            return Ok(false);
-        }
-        // Directory entries from `status --ignored=matching` retain their
-        // trailing slash; the runtime catalog uses it to distinguish an
-        // owned directory from a same-named regular file. Keep that suffix
-        // here after validating components using the normalized path above.
-        if crate::runtime_paths::is_broker_runtime_path(path) {
-            return Ok(true);
-        }
-
-        let mut candidate = PathBuf::new();
-        for component in relative_path.components() {
-            let Component::Normal(name) = component else {
-                return Ok(false);
-            };
-            candidate.push(name);
-            let Some(name) = name.to_str() else {
-                return Ok(false);
-            };
-            let Some(witness) = crate::artifact_catalog::unattended_witness(name, &[]) else {
-                continue;
-            };
-            let Some(candidate_relative) = candidate.to_str() else {
-                return Ok(false);
-            };
-            let candidate_path = self.root.join(&candidate);
-            let candidate_is_directory = fs::symlink_metadata(&candidate_path)
-                .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir());
-            if candidate_is_directory
-                && witness.confirms(&candidate_path)
-                && !self.is_tracked(candidate_relative)?
-                && self.path_is_ignored_checked(candidate_relative)?
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     /// Untracked paths from porcelain status. Used for the adoption-time

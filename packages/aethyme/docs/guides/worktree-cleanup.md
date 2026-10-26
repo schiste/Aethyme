@@ -1,6 +1,6 @@
 # Closed-session worktree cleanup
 
-Last Updated: 2026-10-24
+Last Updated: 2026-10-26
 
 Removing a session worktree is a reviewed operation, with one deterministic
 exception described under *Automatic removal* below. A closed session is not
@@ -21,7 +21,7 @@ is already proven safe, removes the checkout and its local session branch in the
 same step, unless `--keep-worktree` is given or the repository's retention policy
 sets `auto_cleanup_worktrees_on_finish = false`; an adopted worktree is always
 retained. Delivery changes the target refs, while cleanup
-proves the session's exact content against the fetched delivery targets. The
+proves the session's tracked content against the fetched delivery targets. The
 proof accepts ancestry for merge and fast-forward delivery and content or patch
 identity for squash and rebase delivery. If it cannot decide, it retains the
 work and reports the blocker.
@@ -120,8 +120,11 @@ the directory goes:
    lease that still holds covers it, and no gate is running.
 3. **Clean** -- no tracked, staged or untracked change, no stash made on its
    branch, no rebase, merge, cherry-pick, revert or bisect in progress, and no
-   ignored path outside the regenerable set (`target/`, `node_modules/`,
-   `.venv/`, `build/`, `dist/`, `.DS_Store`, plus `[cleanup] regenerable`).
+   protected standalone ignored file. By default every Git-ignored directory
+   is disposable, regardless of name or contents; `.DS_Store` and recognized
+   artifact files or links and catalogued broker runtime output are disposable
+   too. With `strict = true`, every
+   ignored leftover keeps the checkout.
 4. **Contained** -- every commit is in the fetched remote default branch, by
    ancestry or by the verbatim content/patch proof. Local `main` and the
    integration branch do not count.
@@ -134,8 +137,9 @@ Anything the sweep cannot decide keeps the checkout, with the reason in
 
 ```toml
 [cleanup]
-auto_remove = true             # the default; false turns it off
-regenerable = [".gradle/**"]   # extra rebuildable paths
+auto_remove = true             # the default; false turns checkout removal off
+strict = false                 # the default; all Git-ignored directories disposable
+regenerable = [".gradle/**"]    # extra artifact-file/link classification
 keep = ["*-investigation"]     # worktrees never removed automatically
 ```
 
@@ -146,8 +150,24 @@ Automatic apply reloads retention before removal, so a newly raised grace
 period or unreadable policy retains the checkout. Explicit `finish cleanup`
 remains available without waiting for the window.
 
-Build caches of inactive sessions are still reclaimed separately, even when a
-checkout must be kept.
+Ignored directories are treated as opaque: cleanup does not recursively inspect
+package fixtures, keys, databases, dangling links, or saved session records inside
+them. Ignoring a directory therefore opts its contents into disposal. Move
+irreplaceable records outside disposable checkouts, or enable `strict = true`.
+Standalone ignored files such as a root `.env` remain protected. Removal unlinks
+symlinks without deleting their external targets.
+
+Strict mode also disables automatic artifact sweeps, including already queued
+background removals. Remove the leftovers manually, or inspect an explicit
+reviewed artifact cleanup or force-discard operation. Changing strict mode after
+a checkout was selected invalidates that selection before removal; interrupted
+cleanup also rechecks the policy. If Git metadata is already gone, strict mode
+retains the orphan residue for manual inspection.
+
+With strict mode off, build caches of inactive sessions are still reclaimed
+separately, even when a checkout must be kept. `auto_remove = false` disables
+whole-checkout removal, while `strict = true` disables unattended ignored-artifact
+removal as well.
 
 ## Maintenance during broker open
 

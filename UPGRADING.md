@@ -16,12 +16,54 @@ version and the target, oldest first. Each schema migration runs on first open
 and is one-way, so rollback is limited to the oldest binary that still reads
 the newest schema you have opened.
 
-Breaking releases: [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
+Breaking releases: [v0.8.33](#v0833), [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
 [v0.7.25](#v0725), [v0.7.23](#v0723), [v0.7.22](#v0722), [v0.7.19](#v0719),
 [v0.7.18](#v0718), [v0.7.16](#v0716), [v0.7.9](#v079), [v0.7.8](#v078),
 [v0.7.4](#v074), [v0.7.2](#v072),
 [v0.7.1](#v071), [v0.5.0](#v050), [v0.3.0](#v030),
 [v0.2.2](#v022), [v0.2.0](#v020).
+
+## v0.8.33
+
+### Compatibility
+
+Ignored directories are disposable by default
+
+Every Git-ignored directory inside a broker session checkout is now eligible for
+disposal when the checkout otherwise passes ownership, delivery, source-cleanliness
+and liveness checks. This includes ignored datasets, saved session records and
+unknown folders, regardless of their names or nested contents. Unknown standalone ignored
+files outside recognized artifact or broker-runtime paths remain protected.
+
+### Migrate and verify
+
+To preserve every ignored leftover, set this in the primary checkout's
+`.aethyme/config.toml` **before** using the new runtime:
+
+```toml
+[cleanup]
+strict = true
+```
+
+Upgrade every client and background worker before relying on strict mode; older
+binaries do not implement this new policy. Verify the router and engine both
+report v0.8.33.
+
+Strict mode also pauses automatic artifact sweeps; it does not prevent explicit
+reviewed artifact cleanup or force-discard operations. Move irreplaceable records
+outside disposable checkouts, or enable strict mode before upgrading. The primary
+checkout and live work remain protected. No database migration or compatibility
+floor change is introduced by this release; the v0.8.31 schema guidance still
+applies when upgrading from older versions.
+
+### Rollback
+
+This release introduces no database migration or new compatibility floor. A prior
+schema-compatible binary can still read the database, but it does not implement
+strict cleanup. Before rollback, stop cleanup workers and preserve irreplaceable
+ignored records outside disposable checkouts; remove the new `strict` key only
+once its retention guarantee is no longer required. Follow the v0.8.31 rollback
+limits for databases previously migrated or bound by that release.
 
 ## v0.8.31
 
