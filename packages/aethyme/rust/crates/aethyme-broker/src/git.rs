@@ -440,6 +440,36 @@ fn parse_nul_paths(out: &str) -> Vec<String> {
         .collect()
 }
 
+/// Decode raw `-z` path output for cleanup-authority checks. Unlike the
+/// implicit-lease parser above, a newline is valid filename content here and
+/// must be preserved. Malformed framing and non-UTF-8 names refuse the check.
+fn parse_nul_paths_strict(out: &[u8], args: &[&str]) -> Result<Vec<String>, GitError> {
+    let invalid = || GitError::UntrustedOutput {
+        detail: format!(
+            "git {} emitted malformed or non-UTF-8 NUL-separated paths",
+            args.join(" ")
+        ),
+    };
+    if out.is_empty() {
+        return Ok(Vec::new());
+    }
+    if out.last() != Some(&0) {
+        return Err(invalid());
+    }
+
+    out[..out.len() - 1]
+        .split(|byte| *byte == 0)
+        .map(|path| {
+            if path.is_empty() {
+                return Err(invalid());
+            }
+            std::str::from_utf8(path)
+                .map(str::to_string)
+                .map_err(|_| invalid())
+        })
+        .collect()
+}
+
 /// The `git` this process runs, and why it is trusted.
 ///
 /// `Command::new("git")` resolves through the inherited PATH, which on a
@@ -3950,6 +3980,16 @@ impl GitRepo {
         }
         require_trustworthy_porcelain()?;
         const DIFF_ARGS: &str = "diff --literal-pathspecs --name-only --no-renames";
+        const DIFF_COMMAND: &[&str] = &[
+            "--literal-pathspecs",
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=none",
+            "-z",
+        ];
         let started = Instant::now();
         let deadline = effective_git_deadline(DIFF_ARGS, git_timeout(), started)?;
         let _deadline = limit_git_until(deadline);
@@ -4022,23 +4062,9 @@ impl GitRepo {
                 "--",
             ];
             args.extend(paths[start..end].iter().map(String::as_str));
-            let out = run_git(&self.root, &args)?;
-            if !out.is_empty() {
-                if !parse_nul_paths(&out).is_empty() {
-                    return Ok(false);
-                }
-                // Bytes that are neither a path nor nothing. [`parse_nul_paths`]
-                // is conservative for dirtiness -- it drops a decoration rather
-                // than let it become a lease -- but dropping it here would answer
-                // "identical", and this predicate's wrong answer costs work
-                // rather than bytes. Refuse instead of guessing.
-                return Err(GitError::UntrustedOutput {
-                    detail: format!(
-                        "{DIFF_ARGS} emitted {} bytes holding no path while comparing \
-                         {left} and {right}; a PATH wrapper is rewriting git output",
-                        out.len()
-                    ),
-                });
+            let out = run_git_bytes(&self.root, &args)?;
+            if !parse_nul_paths_strict(&out, DIFF_COMMAND)?.is_empty() {
+                return Ok(false);
             }
             start = end;
         }
@@ -4178,21 +4204,21 @@ impl GitRepo {
     /// Changed files between two commits (for affected-gate selection on
     /// a simulated merged tree).
     pub fn changed_between(&self, from: &str, to: &str) -> Result<Vec<String>, GitError> {
-        Ok(parse_nul_paths(&run_git(
-            &self.root,
-            &[
-                "diff",
-                "--name-only",
-                "--no-renames",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--ignore-submodules=none",
-                "-z",
-                from,
-                to,
-                "--",
-            ],
-        )?))
+        require_trustworthy_porcelain()?;
+        let args = [
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=none",
+            "-z",
+            from,
+            to,
+            "--",
+        ];
+        let out = run_git_bytes(&self.root, &args)?;
+        parse_nul_paths_strict(&out, &args)
     }
 
     /// Changed files for gate trigger evaluation. Rename collapsing is
@@ -5511,6 +5537,31 @@ mod nul_path_tests {
     fn empty_output_yields_no_paths() {
         assert!(parse_nul_paths("").is_empty());
         assert!(parse_nul_paths("\0\0").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod strict_nul_path_tests {
+    use super::{GitError, parse_nul_paths_strict};
+
+    #[test]
+    fn strict_nul_paths_preserve_newlines_and_reject_malformed_or_non_utf8() {
+        let args = ["diff", "--name-only", "-z"];
+        assert_eq!(
+            parse_nul_paths_strict(b"tracked\nname\0plain.txt\0", &args).unwrap(),
+            vec!["tracked\nname", "plain.txt"]
+        );
+        assert!(matches!(
+            parse_nul_paths_strict(b"invalid-\xffname\0", &args),
+            Err(GitError::UntrustedOutput { .. })
+        ));
+        for malformed in [&b"unterminated"[..], &b"path\0\0"[..]] {
+            assert!(matches!(
+                parse_nul_paths_strict(malformed, &args),
+                Err(GitError::UntrustedOutput { .. })
+            ));
+        }
+        assert!(parse_nul_paths_strict(b"", &args).unwrap().is_empty());
     }
 }
 
@@ -7338,6 +7389,61 @@ mod batched_commit_tests {
             changed.iter().any(|path| path == "after.txt"),
             "{changed:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_path_evidence_preserves_newline_names_from_real_git() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        let path = "tracked\nname.txt";
+        std::fs::write(root.join(path), "before\n").expect("write base");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "base"]);
+        let base = run(root, &["rev-parse", "HEAD"]);
+
+        run(root, &["switch", "-q", "-c", "session"]);
+        std::fs::write(root.join(path), "after\n").expect("modify newline path");
+        run(root, &["commit", "-qam", "change newline path"]);
+        let head = run(root, &["rev-parse", "HEAD"]);
+
+        let repo = GitRepo::discover(root).expect("repo");
+        let changed = repo.changed_between(&base, &head).expect("changed paths");
+        assert_eq!(changed, vec![path]);
+        assert!(
+            !repo
+                .paths_equal(&base, &head, &changed)
+                .expect("path comparison")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_path_evidence_refuses_non_utf8_names_from_real_git() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").expect("write base");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "base"]);
+        let base = run(root, &["rev-parse", "HEAD"]);
+
+        run(root, &["switch", "-q", "-c", "session"]);
+        let path = OsString::from_vec(b"invalid-\xff-name.txt".to_vec());
+        std::fs::write(root.join(path), "tracked\n").expect("write invalid UTF-8 path");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "add non-UTF-8 path"]);
+        let head = run(root, &["rev-parse", "HEAD"]);
+
+        let repo = GitRepo::discover(root).expect("repo");
+        assert!(matches!(
+            repo.changed_between(&base, &head),
+            Err(GitError::UntrustedOutput { .. })
+        ));
     }
 }
 
