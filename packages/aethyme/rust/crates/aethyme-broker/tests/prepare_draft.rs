@@ -210,14 +210,15 @@ fn storage_guidance_distinguishes_shared_stores_from_worktree_allocations() {
         touch(tmp.path(), "package.json", "{}\n");
         touch(tmp.path(), lockfile, contents);
         let draft = init::draft_prepare_config(tmp.path()).expect("node draft");
-        assert!(draft.contains("same filesystem"));
-        assert!(draft.contains("does not guarantee deduplication"));
-        assert!(draft.contains("The command must use"));
-        assert!(draft.contains("separate copy per session"));
-        assert!(draft.contains("not a storage quota"));
-        assert!(draft.contains("a running install can exceed it"));
-        assert!(!draft.contains("difference between one copy on disk"));
-        assert!(!draft.contains("to cap it;"));
+        let prose = draft.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(prose.contains("same filesystem"));
+        assert!(prose.contains("does not guarantee deduplication"));
+        assert!(prose.contains("The command must use"));
+        assert!(prose.contains("separate copy per session"));
+        assert!(prose.contains("not a storage quota"));
+        assert!(prose.contains("a running install can exceed it"));
+        assert!(!prose.contains("difference between one copy on disk"));
+        assert!(!prose.contains("to cap it;"));
     }
 }
 
