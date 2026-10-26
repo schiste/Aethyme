@@ -4,7 +4,7 @@ mod isolation;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::{GateStatus, NewGateResult, events};
+use aethyme_broker::{events, GateStatus, NewGateResult};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -245,12 +245,10 @@ fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
     assert_eq!(report["cleanup"]["branch_removed"], true);
     assert!(!worktree.exists());
     assert!(!branch_exists(tmp.path(), &branch));
-    assert!(
-        report["recommended_next_action"]
-            .as_str()
-            .unwrap()
-            .starts_with("aethyme broker advanced ship plan --entry ")
-    );
+    assert!(report["recommended_next_action"]
+        .as_str()
+        .unwrap()
+        .starts_with("aethyme broker advanced ship plan --entry "));
 
     let mut broker = isolation::open(tmp.path());
     let event = broker
@@ -1115,4 +1113,98 @@ fn invalid_finish_cleanup_proof_keeps_checkout_after_transient_git_errors() {
         branch_exists(tmp.path(), &branch),
         "a failed cleanup must preserve the branch"
     );
+}
+
+#[test]
+fn cleaned_ledger_does_not_claim_a_recreated_directory_was_removed() {
+    let (tmp, session_id, worktree, _) = promoted_fixture();
+    let first = run(
+        tmp.path(),
+        &["finish", "--session", &session_id.to_string(), "--json"],
+    );
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["cleanup"]["worktree_removed"], true);
+    assert!(!worktree.exists());
+    std::fs::create_dir_all(&worktree).unwrap();
+    let sentinel = worktree.join("unique-local-work.txt");
+    std::fs::write(&sentinel, b"preserve me").unwrap();
+    let output = run(
+        tmp.path(),
+        &["finish", "--session", &session_id.to_string(), "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "already_closed");
+    assert_eq!(report["closed"], true);
+    assert_eq!(report["cleanup"]["completed"], false);
+    assert_eq!(report["cleanup"]["worktree_removed"], false);
+    assert_eq!(report["cleanup"]["attempted"], false);
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve me");
+    assert!(report["next_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|command| command.as_str()
+            == Some(&format!("aethyme broker finish cleanup {session_id}"))));
+}
+
+#[cfg(unix)]
+#[test]
+fn cleaned_ledger_does_not_treat_a_dangling_symlink_as_absent() {
+    let (tmp, session_id, worktree, _) = promoted_fixture();
+    let first = run(
+        tmp.path(),
+        &["finish", "--session", &session_id.to_string(), "--json"],
+    );
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(!worktree.exists());
+    let missing_target = tmp.path().join("missing-symlink-target");
+    std::os::unix::fs::symlink(&missing_target, &worktree).unwrap();
+    let output = run(
+        tmp.path(),
+        &["finish", "--session", &session_id.to_string(), "--json"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "already_closed");
+    assert_eq!(report["cleanup"]["completed"], false);
+    assert_eq!(report["cleanup"]["worktree_removed"], false);
+    assert_eq!(std::fs::read_link(&worktree).unwrap(), missing_target);
+}
+
+#[test]
+fn cleaned_ledger_reports_verified_absence_on_repeat_finish() {
+    let (tmp, session_id, worktree, _) = promoted_fixture();
+    for _ in 0..2 {
+        let output = run(
+            tmp.path(),
+            &["finish", "--session", &session_id.to_string(), "--json"],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["cleanup"]["completed"], true);
+        assert_eq!(report["cleanup"]["worktree_removed"], true);
+        assert!(!worktree.exists());
+    }
 }

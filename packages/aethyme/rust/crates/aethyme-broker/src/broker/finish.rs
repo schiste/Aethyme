@@ -560,11 +560,31 @@ impl Broker {
         };
 
         if session.status == SessionStatus::Cleaned {
-            report.status = FinishStatus::AlreadyCleaned;
             report.closed = true;
-            report.cleanup.completed = true;
-            report.cleanup.worktree_removed = !worktree_path.exists();
-            report.summary = format!("session {session_id} is already physically cleaned");
+            // A historical ledger state cannot prove current path absence:
+            // the checkout may have been recreated or replaced by a symlink.
+            match std::fs::symlink_metadata(&worktree_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    report.status = FinishStatus::AlreadyCleaned;
+                    report.cleanup.completed = true;
+                    report.cleanup.worktree_removed = true;
+                    report.summary = format!("session {session_id} is already physically cleaned");
+                }
+                observation => {
+                    report.status = FinishStatus::AlreadyClosed;
+                    report.cleanup.kept = true;
+                    report.summary = format!(
+                        "session {session_id} is recorded cleaned, but physical cleanup is not confirmed"
+                    );
+                    report.warnings.push(match observation {
+                        Ok(_) => "the recorded worktree path exists; retain it until current ownership and cleanup eligibility are revalidated".into(),
+                        Err(error) => format!("cannot inspect the recorded worktree path: {error}; retain it pending verification"),
+                    });
+                    report
+                        .next_commands
+                        .push(format!("aethyme broker finish cleanup {session_id}"));
+                }
+            }
             self.finalize_finish_report(&mut report);
             return Ok(report);
         }
