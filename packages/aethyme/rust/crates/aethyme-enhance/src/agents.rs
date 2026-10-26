@@ -1220,9 +1220,9 @@ mod tests {
                 "{tag}: missing the working-agreement pointer:\n{doc}"
             );
             for required in [
-                "Before starting or delegating a shared CI or generated-file fix",
-                "`aethyme broker status --json` and open PRs on the affected paths.",
-                "Coordinate with the owning session before duplicating its work.",
+                "For routine coordination, use `aethyme broker status --compact --json`.",
+                "`aethyme broker status --json` when exact session or lease-path evidence is",
+                "Open PRs on affected paths and coordinate with the owning session\nbefore duplicating work.",
             ] {
                 assert!(
                     doc.contains(required),
