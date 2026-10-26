@@ -368,6 +368,17 @@ impl crate::Broker {
     }
 }
 
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', r"'\''"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,16 +393,5 @@ mod tests {
             start_refresh_budget(std::time::Duration::from_secs(5)),
             std::time::Duration::from_secs(5)
         );
-    }
-}
-
-fn shell_quote(value: &str) -> String {
-    if value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c))
-    {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', r"'\''"))
     }
 }
