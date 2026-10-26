@@ -1390,6 +1390,10 @@ fn redacted_command(provider: OperationProvider, args: &[String]) -> Result<Stri
         if hide_next {
             if retained_review_thread_fields.is_some_and(|fields| fields.contains(&index)) {
                 redacted.push(arg.clone());
+            } else if retained_review_thread_fields.is_some() && arg.starts_with("body=") {
+                // Keep the GraphQL field name so a journaled reply remains
+                // parseable for lock-scope recovery, while dropping its text.
+                redacted.push("body=[REDACTED]".into());
             } else {
                 redacted.push("[REDACTED]".into());
             }

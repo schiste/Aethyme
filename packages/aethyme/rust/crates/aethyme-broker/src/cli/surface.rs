@@ -490,7 +490,7 @@ fn internal_help(verb: &str, action: Option<&str>) -> Option<String> {
     }
     let (_, summary) = ADVANCED_VERBS.iter().find(|(name, _)| *name == verb)?;
     let public = format!("aethyme broker advanced {verb}");
-    let internal = if verb == "worktree-root" {
+    let internal = if matches!(verb, "worktree-root" | "review-thread") {
         format!("advanced {verb}")
     } else {
         verb.to_string()
