@@ -111,13 +111,15 @@ fn push_operation_wait() -> QueueWait {
     QueueWait::Seconds(60)
 }
 
-/// How long a default-branch refresh may queue for the repository lock.
+/// The total deadline for one coordinated default-branch refresh.
 ///
-/// Short on purpose: `start` and `sync` run it before an agent begins, and a
-/// busy lane must cost seconds, not the minute a push may wait. Falling back
-/// to the last fetched copy is always safe; the result says so.
+/// `QueueWait::Seconds` is shared across operation preparation, repository
+/// lock admission and the Git child process; it is not a queue-only budget.
+/// Thirty seconds leaves room for ordinary contention while keeping refreshes
+/// bounded. A timeout with an unknown write outcome still blocks writes until
+/// reconciliation; this budget never makes a cached ref safe to assume.
 fn fetch_operation_wait() -> QueueWait {
-    QueueWait::Seconds(10)
+    QueueWait::Seconds(30)
 }
 
 /// Where a session's branch stands relative to its remote, from local refs.
@@ -1098,6 +1100,11 @@ fn measure_pr_size(main_root: &Path, base_ref: &str, head: &str) -> Option<crate
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_branch_refresh_has_a_bounded_total_admission_deadline() {
+        assert!(matches!(fetch_operation_wait(), QueueWait::Seconds(30)));
+    }
 
     #[test]
     fn new_pull_request_mode_defaults_to_draft_and_accepts_ready() {
