@@ -465,6 +465,16 @@ impl Broker {
     /// under this repository's broker worktree roots. Nothing outside those
     /// is walked, so unrelated repositories on the host are never scanned.
     pub fn cleanup_audit(&self) -> Result<CleanupAudit, BrokerOpError> {
+        self.cleanup_audit_with_reconciliation(|| self.reconcile_worktree_directories(true))
+    }
+
+    fn cleanup_audit_with_reconciliation(
+        &self,
+        reconcile: impl FnOnce() -> Result<
+            crate::worktree_reconcile::WorktreeReconciliation,
+            BrokerOpError,
+        >,
+    ) -> Result<CleanupAudit, BrokerOpError> {
         let target = self.cleanup_audit_target()?;
         let plan = self.cleanup_plan()?;
         let repo = self.repo_handle();
@@ -525,7 +535,13 @@ impl Broker {
             items.push(self.audit_unowned_registration(entry, &target));
         }
 
-        let reconciliation = self.reconcile_worktree_directories(true)?;
+        let reconciliation = reconcile()?;
+        if !reconciliation.complete {
+            warnings.push(format!(
+                "worktree-root reconciliation incomplete: scanned {} root(s) and observed {} directory entries; unclaimed entries or byte estimates may be incomplete",
+                reconciliation.scanned_root_count, reconciliation.directory_count
+            ));
+        }
         for directory in &reconciliation.unclaimed {
             let path = PathBuf::from(&directory.path);
             if claimed.contains(&path_key(&path)) {
@@ -1016,4 +1032,61 @@ fn summarise(items: &[AuditItem]) -> AuditSummary {
         }
     }
     summary
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(repository: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repository)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn cleanup_audit_warns_when_root_reconciliation_is_incomplete() {
+        let repository = tempfile::tempdir().unwrap();
+        git(repository.path(), &["init", "-q", "-b", "main"]);
+        git(repository.path(), &["config", "user.name", "Fixture"]);
+        git(
+            repository.path(),
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        git(
+            repository.path(),
+            &["commit", "--allow-empty", "-qm", "initial"],
+        );
+
+        let storage = crate::test_storage::TestStorage::new();
+        let broker = storage.open(repository.path()).unwrap();
+        let mut incomplete = crate::worktree_reconcile::summarise(&[], 2);
+        incomplete.complete = false;
+        incomplete.sized = false;
+
+        let audit = broker
+            .cleanup_audit_with_reconciliation(|| Ok(incomplete))
+            .unwrap();
+
+        let warning = audit
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("worktree-root reconciliation incomplete"))
+            .expect("the audit must expose incomplete root reconciliation");
+        assert!(warning.contains("scanned 2 root(s)"), "{warning}");
+        assert!(warning.contains("may be incomplete"), "{warning}");
+        let json = serde_json::to_value(audit).unwrap();
+        assert!(json["warnings"].as_array().unwrap().iter().any(|warning| {
+            warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("worktree-root reconciliation incomplete"))
+        }));
+    }
 }
