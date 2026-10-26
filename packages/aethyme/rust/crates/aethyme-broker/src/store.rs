@@ -738,61 +738,124 @@ mod gate_result_clear_metadata_tests {
     }
 
     fn insert_gc_fixture_session(store: &mut BrokerStore, worktree_path: &Path) -> i64 {
+        insert_gc_fixture_session_with_status(store, worktree_path, "active")
+    }
+
+    fn insert_gc_fixture_session_with_status(
+        store: &mut BrokerStore,
+        worktree_path: &Path,
+        status: &str,
+    ) -> i64 {
         store
             .conn
             .execute(
                 "INSERT INTO sessions (
                      worktree_path, branch, origin, status,
                      created_at, updated_at, last_activity_at
-                 ) VALUES (?1, 'main', 'spawned', 'active', 1, 1, 1)",
-                [worktree_path.to_string_lossy().into_owned()],
+                 ) VALUES (?1, 'main', 'spawned', ?2, 1, 1, 1)",
+                params![worktree_path.to_string_lossy().into_owned(), status],
             )
             .unwrap();
         store.conn.last_insert_rowid()
     }
 
     #[test]
-    fn live_session_pages_are_keyset_bounded_and_stop_at_the_captured_high_water() {
+    fn live_session_windows_advance_across_cleaned_gaps_and_tails() {
         let directory = tempfile::tempdir().unwrap();
         init_fixture_repository(directory.path());
         let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
         let first = insert_gc_fixture_session(&mut store, &directory.path().join("one"));
-        let cleaned = insert_gc_fixture_session(&mut store, &directory.path().join("two"));
-        let third = insert_gc_fixture_session(&mut store, &directory.path().join("three"));
-        let through = store.live_session_max_id().unwrap();
-        assert_eq!(through, third);
-        store
-            .set_session_status(cleaned, crate::SessionStatus::Cleaned, None)
-            .unwrap();
-        let later = insert_gc_fixture_session(&mut store, &directory.path().join("later"));
-        assert!(later > through);
+        for index in 0..300 {
+            insert_gc_fixture_session_with_status(
+                &mut store,
+                &directory.path().join(format!("cleaned-gap-{index}")),
+                "cleaned",
+            );
+        }
+        let after_gap = insert_gc_fixture_session(&mut store, &directory.path().join("after-gap"));
+        for index in 0..40 {
+            insert_gc_fixture_session_with_status(
+                &mut store,
+                &directory.path().join(format!("cleaned-tail-{index}")),
+                "cleaned",
+            );
+        }
+        let high_water = store.session_id_high_water().unwrap();
+        assert!(high_water > after_gap);
 
-        let first_page = store.live_session_page(0, through, 1).unwrap();
+        let mut cursor = 0;
+        let mut windows_scanned = 0;
+        let mut live_ids = Vec::new();
+        while cursor < high_water {
+            let (page, scanned_through) = store
+                .live_session_id_window(cursor, high_water, 64, 32)
+                .unwrap();
+            assert!(scanned_through > cursor, "each bounded window advances");
+            assert!(scanned_through <= cursor + 64);
+            assert!(page.len() <= 32);
+            live_ids.extend(page.into_iter().map(|session| session.id));
+            cursor = scanned_through;
+            windows_scanned += 1;
+        }
+
+        assert_eq!(
+            windows_scanned, 6,
+            "cleaned gaps and tail use bounded windows"
+        );
+        assert_eq!(live_ids, [first, after_gap]);
+        assert_eq!(
+            cursor, high_water,
+            "the cleaned tail is included in the lap"
+        );
+    }
+
+    #[test]
+    fn live_session_window_stops_at_last_returned_id_when_more_rows_remain() {
+        let directory = tempfile::tempdir().unwrap();
+        init_fixture_repository(directory.path());
+        let mut store = BrokerStore::open_in_repo(directory.path()).unwrap();
+        let sessions = (0..40)
+            .map(|index| {
+                insert_gc_fixture_session(
+                    &mut store,
+                    &directory.path().join(format!("session-{index}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let high_water = store.session_id_high_water().unwrap();
+        let later = insert_gc_fixture_session(&mut store, &directory.path().join("later"));
+
+        let (first_page, first_watermark) = store
+            .live_session_id_window(0, high_water, 128, usize::MAX)
+            .unwrap();
         assert_eq!(
             first_page
                 .iter()
                 .map(|session| session.id)
                 .collect::<Vec<_>>(),
-            [first]
+            sessions[..32]
         );
-        let second_page = store.live_session_page(first, through, 32).unwrap();
+        assert_eq!(first_watermark, sessions[31]);
+        assert!(first_watermark < high_water);
+
+        let (second_page, second_watermark) = store
+            .live_session_id_window(first_watermark, high_water, 128, 32)
+            .unwrap();
         assert_eq!(
             second_page
                 .iter()
                 .map(|session| session.id)
                 .collect::<Vec<_>>(),
-            [third]
+            sessions[32..]
         );
-        assert!(
-            store
-                .live_session_page(third, through, 32)
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            store.live_session_page(0, later, usize::MAX).unwrap().len(),
-            3
-        );
+        assert_eq!(second_watermark, high_water);
+
+        let (next_lap, next_watermark) = store
+            .live_session_id_window(high_water, later, 128, 32)
+            .unwrap();
+        assert_eq!(next_lap.len(), 1);
+        assert_eq!(next_lap[0].id, later);
+        assert_eq!(next_watermark, later);
     }
 
     #[test]

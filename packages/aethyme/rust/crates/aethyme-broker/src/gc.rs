@@ -193,6 +193,8 @@ const AUTO_CHECKOUT_CLEANUP_WORKER_PASS_BUDGET: Duration = Duration::from_secs(3
 const OPEN_SESSION_ARTIFACT_WORKER_RESERVE: Duration = Duration::from_secs(30);
 const OPEN_SESSION_ARTIFACT_PAGE_SIZE: usize = 16;
 const OPEN_SESSION_ARTIFACT_SESSION_BUDGET: usize = 32;
+const OPEN_SESSION_ARTIFACT_ID_WINDOW_SIZE: i64 = 256;
+const OPEN_SESSION_ARTIFACT_ID_WINDOW_BUDGET: usize = 32;
 const OPEN_SESSION_ARTIFACT_SCAN_ENTRY_BUDGET: usize = 4_096;
 const OPEN_SESSION_ARTIFACT_FRONTIER_PRUNE_BUDGET: usize = 16;
 const OPEN_SESSION_ARTIFACT_FRONTIER_MAX_RECORDS: usize = 1_024;
@@ -5571,7 +5573,7 @@ impl Broker {
         let raw_through = self.artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_THROUGH_KEY)?;
         let through = match raw_through.as_deref() {
             None | Some("") | Some("0") => {
-                let through = match self.store().live_session_max_id() {
+                let through = match self.store().session_id_high_water() {
                     Ok(through) => through,
                     Err(_) => {
                         pass.complete = false;
@@ -5601,21 +5603,48 @@ impl Broker {
         }
 
         let mut visited = 0usize;
+        let mut windows_visited = 0usize;
         let mut ledger_writable = true;
         let mut reached_lap_end = false;
-        while visited < OPEN_SESSION_ARTIFACT_SESSION_BUDGET && Instant::now() < deadline {
+        while visited < OPEN_SESSION_ARTIFACT_SESSION_BUDGET
+            && windows_visited < OPEN_SESSION_ARTIFACT_ID_WINDOW_BUDGET
+            && Instant::now() < deadline
+        {
+            if cursor >= through {
+                reached_lap_end = true;
+                break;
+            }
             let limit =
                 OPEN_SESSION_ARTIFACT_PAGE_SIZE.min(OPEN_SESSION_ARTIFACT_SESSION_BUDGET - visited);
-            let page = match self.store().live_session_page(cursor, through, limit) {
-                Ok(page) => page,
+            let (page, scanned_through) = match self.store().live_session_id_window(
+                cursor,
+                through,
+                OPEN_SESSION_ARTIFACT_ID_WINDOW_SIZE,
+                limit,
+            ) {
+                Ok(window) => window,
                 Err(_) => {
                     pass.complete = false;
                     break;
                 }
             };
+            windows_visited = windows_visited.saturating_add(1);
             if page.is_empty() {
-                reached_lap_end = true;
-                break;
+                if scanned_through <= cursor {
+                    pass.complete = false;
+                    break;
+                }
+                cursor = scanned_through;
+                self.artifact_sweep_meta_set(
+                    OPEN_SESSION_ARTIFACT_CURSOR_KEY,
+                    &cursor.to_string(),
+                )?;
+                self.advance_open_session_artifact_progress()?;
+                if cursor >= through {
+                    reached_lap_end = true;
+                    break;
+                }
+                continue;
             }
             let agents = match self.agents_snapshot_for_sessions(page.clone(), now_ms()) {
                 Ok(agents) => agents,
@@ -5627,8 +5656,11 @@ impl Broker {
             let before_page = frontier_set.clone();
             let mut scanner_advanced = false;
             let mut page_made_progress = false;
+            let mut page_fully_processed = true;
+            let page_len = page.len();
             for session in page {
                 if visited >= OPEN_SESSION_ARTIFACT_SESSION_BUDGET || Instant::now() >= deadline {
+                    page_fully_processed = false;
                     break;
                 }
                 cursor = session.id;
@@ -5800,6 +5832,10 @@ impl Broker {
                 frontier_set.entries.sort_by_key(|entry| entry.session_id);
             }
 
+            if page_fully_processed && page_len > 0 {
+                cursor = scanned_through;
+            }
+
             if !persist_open_session_artifact_frontiers(self, &frontier_set)? {
                 frontier_set = before_page;
                 ledger_writable = false;
@@ -5807,17 +5843,13 @@ impl Broker {
                 pass.frontier_state_write_limited =
                     pass.frontier_state_write_limited.saturating_add(1);
             } else if page_made_progress || scanner_advanced {
-                let progress = self
-                    .artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_PROGRESS_KEY)?
-                    .and_then(|value| value.parse::<i64>().ok())
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                self.artifact_sweep_meta_set(
-                    OPEN_SESSION_ARTIFACT_PROGRESS_KEY,
-                    &progress.to_string(),
-                )?;
+                self.advance_open_session_artifact_progress()?;
             }
             self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_CURSOR_KEY, &cursor.to_string())?;
+            if cursor >= through {
+                reached_lap_end = true;
+                break;
+            }
             if visited >= OPEN_SESSION_ARTIFACT_SESSION_BUDGET || Instant::now() >= deadline {
                 break;
             }
@@ -5852,6 +5884,15 @@ impl Broker {
             pass.complete &= prune_complete;
         }
         Ok(pass)
+    }
+
+    fn advance_open_session_artifact_progress(&mut self) -> Result<(), BrokerOpError> {
+        let progress = self
+            .artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_PROGRESS_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_PROGRESS_KEY, &progress.to_string())
     }
 
     /// Prune a bounded rotating slice of frontier identities. Replaced,

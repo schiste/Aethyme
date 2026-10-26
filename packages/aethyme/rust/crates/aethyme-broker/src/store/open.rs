@@ -1,5 +1,7 @@
 use super::*;
 
+const LIVE_SESSION_ID_WINDOW_MAX_WIDTH: i64 = 256;
+
 fn write_session_base_observation(
     tx: &Transaction<'_>,
     session_id: i64,
@@ -857,38 +859,56 @@ impl BrokerStore {
         Ok(sessions)
     }
 
-    /// Highest currently live session id, for a stable bounded maintenance
-    /// census. Sessions created after this value are handled on the next lap.
-    pub(crate) fn live_session_max_id(&self) -> Result<i64, BrokerError> {
-        Ok(self.conn.query_row(
-            "SELECT COALESCE(MAX(id), 0) FROM sessions WHERE status <> 'cleaned'",
-            [],
-            |row| row.get(0),
-        )?)
+    /// Highest session id, including cleaned history, for a stable bounded
+    /// maintenance census. `id` is the rowid alias, so this is a rightmost
+    /// primary-key lookup rather than a scan over the live subset.
+    pub(crate) fn session_id_high_water(&self) -> Result<i64, BrokerError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM sessions", [], |row| {
+                row.get(0)
+            })?)
     }
 
-    /// Read one keyset page of live sessions without materializing history.
-    /// The fixed cap prevents callers from turning this maintenance helper
-    /// into an unbounded liveness snapshot.
-    pub(crate) fn live_session_page(
+    /// Read one bounded ID interval of live sessions. The primary-key range
+    /// bounds rows visited even when cleaned history is sparse; the returned
+    /// watermark advances across empty intervals and stops at the last row
+    /// when the result cap leaves part of this interval unread.
+    pub(crate) fn live_session_id_window(
         &self,
         after: i64,
-        through: i64,
+        high_water: i64,
+        window_size: i64,
         limit: usize,
-    ) -> Result<Vec<Session>, BrokerError> {
+    ) -> Result<(Vec<Session>, i64), BrokerError> {
+        let limit = limit.clamp(1, 32);
+        if after >= high_water {
+            return Ok((Vec::new(), high_water));
+        }
+        let window_width = window_size.clamp(1, LIVE_SESSION_ID_WINDOW_MAX_WIDTH);
+        let window_through = after.saturating_add(window_width).min(high_water);
+        // Force the rowid range: the partial live-worktree index is ordered
+        // by path and could otherwise turn sparse windows into a full live
+        // history walk on some query plans.
         let mut stmt = self.conn.prepare(&format!(
-            "{SESSION_SELECT} WHERE status <> 'cleaned' AND id > ?1 AND id <= ?2
+            "{SESSION_SELECT} NOT INDEXED WHERE status <> 'cleaned' AND id > ?1 AND id <= ?2
              ORDER BY id LIMIT ?3"
         ))?;
         let rows = stmt.query_map(
-            params![after, through, limit.clamp(1, 32) as i64],
+            params![after, window_through, limit.saturating_add(1) as i64],
             session_from_row,
         )?;
         let mut sessions = Vec::new();
         for row in rows {
             sessions.push(row??);
         }
-        Ok(sessions)
+        let scanned_through = if sessions.len() > limit {
+            sessions.truncate(limit);
+            sessions.last().map(|session| session.id).unwrap_or(after)
+        } else {
+            window_through
+        };
+        Ok((sessions, scanned_through))
     }
 
     /// All sessions already closed in broker state, oldest first.
