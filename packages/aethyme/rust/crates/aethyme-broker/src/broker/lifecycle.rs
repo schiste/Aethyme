@@ -6931,10 +6931,17 @@ impl Broker {
             .transpose()?
             .unwrap_or_default();
 
-        let submission_plan = self.store.session(session_id).ok().and_then(|session| {
-            self.build_submission_plan(&session, &session_head, &integration_head)
-                .ok()
-        });
+        // Only the Ahead guidance consumes submission provenance. Behind and
+        // diverged checkouts need a drift warning, not a patch-id scan of the
+        // repository's history while adoption holds the lifecycle claim.
+        let submission_plan = if matches!(relation, AdoptIntegrationRelation::Ahead) {
+            self.store.session(session_id).ok().and_then(|session| {
+                self.build_submission_plan(&session, &session_head, &integration_head)
+                    .ok()
+            })
+        } else {
+            None
+        };
         let pending_owned_commits = submission_plan
             .as_ref()
             .map(|plan| plan.pending_owned_commit_ids().len());

@@ -1571,6 +1571,88 @@ fn reuse_cli_exposes_structured_integration_drift_and_safe_guidance() {
 }
 
 #[test]
+fn reuse_behind_or_diverged_observes_drift_without_submission_patch_scans() {
+    for diverged in [false, true] {
+        let tmp = fixture();
+        let started = stdout(&run(tmp.path(), &["start", "--task", "first", "--json"]));
+        let started: serde_json::Value = serde_json::from_str(&started).unwrap();
+        let session = stored_session(&tmp, started["id"].as_i64().unwrap());
+        let worktree = Path::new(&session.worktree_path);
+        std::fs::write(worktree.join("session.txt"), "owned session change\n").unwrap();
+        git(worktree, &["add", "session.txt"]);
+        git(worktree, &["commit", "-qm", "session-owned change"]);
+        let session_head = git_output(worktree, &["rev-parse", "HEAD"]);
+
+        let integration_base = if diverged {
+            "main"
+        } else {
+            session_head.as_str()
+        };
+        git(
+            tmp.path(),
+            &["checkout", "-qb", "integration-work", integration_base],
+        );
+        std::fs::write(tmp.path().join("integration.txt"), "integration change\n").unwrap();
+        git(tmp.path(), &["add", "integration.txt"]);
+        git(tmp.path(), &["commit", "-qm", "integration change"]);
+        git(tmp.path(), &["branch", "aethyme/integration", "HEAD"]);
+        git(tmp.path(), &["checkout", "-q", "main"]);
+
+        let trace = tmp.path().join(".aethyme/reuse-trace.jsonl");
+        let output = common::broker_cli_for_fixture(
+            CLI,
+            &[
+                "start",
+                "--reuse",
+                session.worktree_path.as_str(),
+                "--task",
+                "inspect drift",
+                "--json",
+            ],
+            tmp.path(),
+        )
+        .current_dir(tmp.path())
+        .env("GIT_TRACE2_EVENT", &trace)
+        .output()
+        .unwrap();
+        let report: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+        assert_eq!(
+            report["integration_drift"]["relation"],
+            if diverged { "diverged" } else { "behind" }
+        );
+        assert!(report["integration_drift"]["warning"].is_string());
+        assert_eq!(
+            report["integration_drift"]["safe_next_action"],
+            "aethyme broker advanced integration status"
+        );
+        assert_eq!(git_output(worktree, &["rev-parse", "HEAD"]), session_head);
+
+        let events = std::fs::read_to_string(trace)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let commands = events
+            .iter()
+            .filter(|event| event["event"] == "start")
+            .filter_map(|event| event["argv"].as_array())
+            .collect::<Vec<_>>();
+        assert!(
+            commands
+                .iter()
+                .any(|argv| argv.get(1).is_some_and(|arg| arg == "rev-list")),
+            "trace must observe the real drift Git queries"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|argv| argv.get(1).is_some_and(|arg| arg == "patch-id")),
+            "drift guidance must not construct unused submission provenance: {commands:?}"
+        );
+    }
+}
+
+#[test]
 fn adopt_cli_syncs_reuse_to_integration_and_exposes_the_exact_transition() {
     let tmp = fixture();
     stdout(&run(tmp.path(), &["start", "--adopt", "--task", "first"]));
