@@ -6,8 +6,8 @@ command = ["python3", "--version"]
 
 [[steps]]
 name = "aethyme-eval"
-command = ["sh", "-c", "python3 -m venv packages/aethyme-eval/.venv && packages/aethyme-eval/.venv/bin/python -m pip install --quiet --disable-pip-version-check pytest"]
+command = ["sh", "-c", "python3 -m venv packages/aethyme-eval/.venv && packages/aethyme-eval/.venv/bin/python -m pip install --cache-dir \"$AETHYME_PREPARE_CACHE_DIR\" --quiet --disable-pip-version-check pytest==9.1.1"]
 inputs = ["packages/aethyme-eval/pyproject.toml"]
 outputs = ["packages/aethyme-eval/.venv/"]
-cache = "worktree_local"
+cache = "repository_shared"
 required_for_hooks = false
