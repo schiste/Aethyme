@@ -4,7 +4,7 @@ mod isolation;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::{events, GateStatus, NewGateResult};
+use aethyme_broker::{GateStatus, NewGateResult, events};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -245,10 +245,12 @@ fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
     assert_eq!(report["cleanup"]["branch_removed"], true);
     assert!(!worktree.exists());
     assert!(!branch_exists(tmp.path(), &branch));
-    assert!(report["recommended_next_action"]
-        .as_str()
-        .unwrap()
-        .starts_with("aethyme broker advanced ship plan --entry "));
+    assert!(
+        report["recommended_next_action"]
+            .as_str()
+            .unwrap()
+            .starts_with("aethyme broker advanced ship plan --entry ")
+    );
 
     let mut broker = isolation::open(tmp.path());
     let event = broker
@@ -1149,12 +1151,14 @@ fn cleaned_ledger_does_not_claim_a_recreated_directory_was_removed() {
     assert_eq!(report["cleanup"]["worktree_removed"], false);
     assert_eq!(report["cleanup"]["attempted"], false);
     assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve me");
-    assert!(report["next_commands"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|command| command.as_str()
-            == Some(&format!("aethyme broker finish cleanup {session_id}"))));
+    assert!(
+        report["next_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command.as_str()
+                == Some(&format!("aethyme broker finish cleanup {session_id}")))
+    );
 }
 
 #[cfg(unix)]
