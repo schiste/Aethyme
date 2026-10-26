@@ -1384,6 +1384,7 @@ fn prepare_draft_parts(main_root: &Path) -> Option<PrepareDraftParts> {
                      worktrees use the same filesystem and the installation mode permits it. \
                      The generated step uses a broker-managed store on the selected worktree \
                      filesystem; node_modules remains a per-worktree output. \
+                     `repository_shared` alone does not guarantee deduplication. \
                      pnpm's dev server accepts an ephemeral port with --port 0 and prints \
                      the bound one; prefer that over a fixed PORT in a gate.",
                 ));
