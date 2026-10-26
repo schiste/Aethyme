@@ -715,6 +715,159 @@ fn reclaim_refuses_legacy_unbound_root_before_planning_or_apply() {
     );
 }
 
+#[test]
+fn session_scoped_reclaim_refuses_out_of_root_sessions_with_typed_json_error() {
+    let (repo, container) = fixture("");
+    let started = run_as_is(
+        repo.path(),
+        container.path(),
+        &["start", "--task", "legacy reclaim scope", "--json"],
+    );
+    assert!(
+        started.status.success(),
+        "start: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let session: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    let session_id = session["id"].as_i64().unwrap();
+    let session_id_text = session_id.to_string();
+    let original_worktree = PathBuf::from(session["worktree_path"].as_str().unwrap());
+
+    let finished = run_as_is(
+        repo.path(),
+        container.path(),
+        &["finish", "--session", &session_id_text, "--keep-worktree"],
+    );
+    assert!(
+        finished.status.success(),
+        "finish: {}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+
+    let legacy_root = tempfile::tempdir().unwrap();
+    let legacy_worktree = legacy_root.path().join("legacy-session");
+    let original_arg = original_worktree.to_string_lossy().into_owned();
+    let legacy_arg = legacy_worktree.to_string_lossy().into_owned();
+    git(
+        repo.path(),
+        &["worktree", "move", &original_arg, &legacy_arg],
+    );
+    let target = legacy_worktree.join("rust/target");
+    std::fs::create_dir_all(&target).unwrap();
+    let artifact = target.join("legacy-cache.bin");
+    std::fs::write(&artifact, b"preserve this legacy cache\n").unwrap();
+    let legacy_path = legacy_worktree.canonicalize().unwrap();
+    let legacy_path_text = legacy_path.to_string_lossy().into_owned();
+    rusqlite::Connection::open(repo.path().join(".aethyme/broker.db"))
+        .unwrap()
+        .execute(
+            "UPDATE sessions SET worktree_path = ?2 WHERE id = ?1",
+            rusqlite::params![session_id, legacy_path_text],
+        )
+        .unwrap();
+
+    let read_root_plan = || {
+        let output = run_as_is(
+            repo.path(),
+            container.path(),
+            &["advanced", "worktree-root", "--json"],
+        );
+        assert!(
+            output.status.success(),
+            "worktree-root: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let root_identity = |plan: &serde_json::Value| {
+        (
+            plan["repository_root"].as_str().unwrap().to_owned(),
+            plan["repository_key"].as_str().unwrap().to_owned(),
+            plan["preferred_root"].as_str().map(str::to_owned),
+            plan["preferred_source"].as_str().map(str::to_owned),
+            plan["root_container"].as_str().map(str::to_owned),
+        )
+    };
+    let binding_before = read_root_plan();
+    let binding_identity_before = root_identity(&binding_before);
+    let bound_root = original_worktree.parent().unwrap().canonicalize().unwrap();
+    assert_eq!(
+        PathBuf::from(binding_before["preferred_root"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        bound_root,
+        "the root plan matches the root that held the started worktree"
+    );
+    let has_reclaim_snapshot = || {
+        std::fs::read_dir(&bound_root)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".aethyme-reclaim-plan-")
+            })
+    };
+    assert!(!has_reclaim_snapshot());
+
+    let plan = run_as_is(
+        repo.path(),
+        container.path(),
+        &[
+            "gc",
+            "reclaim",
+            "plan",
+            "--session",
+            &session_id_text,
+            "--json",
+        ],
+    );
+    assert_eq!(plan.status.code(), Some(3), "{plan:?}");
+    let plan_message = json_error::message(&plan);
+    assert!(
+        plan_message.contains("not an available direct child"),
+        "{plan_message}"
+    );
+    assert!(
+        plan_message.contains("bound worktree root"),
+        "{plan_message}"
+    );
+    assert!(
+        plan_message.contains("legacy-root reclamation is unsupported"),
+        "{plan_message}"
+    );
+
+    let confirmation = "a".repeat(64);
+    let apply = run_as_is(
+        repo.path(),
+        container.path(),
+        &[
+            "gc",
+            "reclaim",
+            "apply",
+            "--confirm",
+            &confirmation,
+            "--session",
+            &session_id_text,
+            "--json",
+        ],
+    );
+    assert_eq!(apply.status.code(), Some(3), "{apply:?}");
+    let apply_message = json_error::message(&apply);
+    assert_eq!(apply_message, plan_message);
+
+    assert_eq!(
+        std::fs::read(&artifact).unwrap(),
+        b"preserve this legacy cache\n"
+    );
+    assert_eq!(root_identity(&read_root_plan()), binding_identity_before);
+    assert!(
+        !has_reclaim_snapshot(),
+        "unsupported scope must not create a plan"
+    );
+}
+
 /// A worktree root left behind by a repository that no longer exists.
 fn stamp_root(container: &Path, key: &str, repository_root: &Path) -> PathBuf {
     let root = container.join(key);

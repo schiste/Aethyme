@@ -673,15 +673,35 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
             let worktree = std::path::PathBuf::from(&session.worktree_path);
             match crate::reclaim::worktree_in_root(&root, &worktree) {
                 Some(base) => Some((base, true)),
-                // Removed already, or placed on another root: nothing under
-                // this root to reclaim, as the whole-root plan would also say.
                 None => {
-                    eprintln!(
-                        "Note: session {session_id}'s worktree {} is not a directory under {}; nothing to reclaim for it here.",
-                        worktree.display(),
-                        root.display()
-                    );
-                    Some((worktree, false))
+                    // Preserve an empty scoped plan for a worktree that has
+                    // already been removed from this root. An existing
+                    // worktree at another root is an unsupported scope, not
+                    // a successful scan with zero candidates.
+                    let parent_is_bound_root = worktree.parent().is_some_and(|parent| {
+                        parent == root.as_path()
+                            || match (parent.canonicalize(), root.canonicalize()) {
+                                (Ok(parent), Ok(root)) => parent == root,
+                                _ => false,
+                            }
+                    });
+                    if !worktree.is_dir() && parent_is_bound_root {
+                        eprintln!(
+                            "Note: session {session_id}'s worktree {} is no longer present under {}; nothing to reclaim.",
+                            worktree.display(),
+                            root.display()
+                        );
+                        Some((worktree, false))
+                    } else {
+                        return Err(UsageError::Exit {
+                            message: format!(
+                                "session {session_id}'s recorded worktree {} is not an available direct child of the repository's bound worktree root {}. Session-scoped reclaim supports only worktrees directly under the current bound root; no plan or cleanup was performed. Inspect the binding with `aethyme broker advanced worktree-root --json`; legacy-root reclamation is unsupported.",
+                                worktree.display(),
+                                root.display()
+                            ),
+                            code: crate::exit_status::REFUSED,
+                        });
+                    }
                 }
             }
         }
