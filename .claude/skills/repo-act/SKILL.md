@@ -261,7 +261,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   Retain the local result before the public body write.
 - For tests that create broker worktrees, configure a fixture-owned worktree root
   outside the temporary repository (for example, a sibling under the fixture
-  TempDir); pass it explicitly to CLI children too. An inherited
+  TempDir); create that root before the first broker child and pass it explicitly
+  to CLI children too. Assert the precondition at the real fixture entrypoint,
+  before subprocess dispatch; configuring a path does not create its directory.
+  An inherited
   `AETHYME_WORKTREE_ROOT` can otherwise place worktrees outside the fixture and
   leave stale Git pointers after teardown. The environment override is a
   container: create it before startup, leaving its per-repository child absent
