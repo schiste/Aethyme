@@ -1357,12 +1357,14 @@ struct PrepareDraftParts {
     runtimes: String,
     steps: String,
     guidance: Vec<String>,
+    worktree_volume_shared_cache: bool,
 }
 
 fn prepare_draft_parts(main_root: &Path) -> Option<PrepareDraftParts> {
     let mut runtimes = String::new();
     let mut steps = String::new();
     let mut guidance: Vec<&'static str> = Vec::new();
+    let mut worktree_volume_shared_cache = false;
 
     // Node. `npm install` is deliberately not a draft: it rewrites the
     // lockfile, and a tracked lockfile rewrite is a tracked-file mutation
@@ -1372,16 +1374,16 @@ fn prepare_draft_parts(main_root: &Path) -> Option<PrepareDraftParts> {
         runtimes.push_str("\n[[runtimes]]\nname = \"node\"\ncommand = [\"node\", \"--version\"]\n");
         match node_runner(main_root) {
             NodeRunner::Pnpm => {
+                worktree_volume_shared_cache = true;
                 steps.push_str(&node_step(
-                    r#"["pnpm", "install", "--frozen-lockfile"]"#,
-                    r#"["pnpm", "install", "--offline", "--frozen-lockfile"]"#,
+                    r#"["sh", "-c", "pnpm install --frozen-lockfile --store-dir \"$AETHYME_PREPARE_CACHE_DIR/pnpm-store\""]"#,
+                    r#"["sh", "-c", "pnpm install --offline --frozen-lockfile --store-dir \"$AETHYME_PREPARE_CACHE_DIR/pnpm-store\""]"#,
                     r#"["package.json", "pnpm-lock.yaml"]"#,
+                    "repository_shared",
                     "pnpm can share package content through hard links when the store and \
                      worktrees use the same filesystem and the installation mode permits it. \
-                     A store on another filesystem causes copies; repository_shared does not \
-                     guarantee deduplication. To select this repository's store, set \
-                     repository_shared and pass --store-dir \"$AETHYME_PREPARE_CACHE_DIR\" \
-                     through sh -c. \
+                     The generated step uses a broker-managed store on the selected worktree \
+                     filesystem; node_modules remains a per-worktree output. \
                      pnpm's dev server accepts an ephemeral port with --port 0 and prints \
                      the bound one; prefer that over a fixed PORT in a gate.",
                 ));
@@ -1391,6 +1393,7 @@ fn prepare_draft_parts(main_root: &Path) -> Option<PrepareDraftParts> {
                     r#"["yarn", "install", "--frozen-lockfile"]"#,
                     r#"["yarn", "install", "--offline", "--frozen-lockfile"]"#,
                     r#"["package.json", "yarn.lock"]"#,
+                    "worktree_local",
                     "Yarn Berry spells the same guarantee --immutable; adjust if this repo uses it.",
                 ));
             }
@@ -1399,6 +1402,7 @@ fn prepare_draft_parts(main_root: &Path) -> Option<PrepareDraftParts> {
                     r#"["npm", "ci"]"#,
                     r#"["npm", "ci", "--offline"]"#,
                     r#"["package.json", "package-lock.json"]"#,
+                    "worktree_local",
                     "npm installs packages into each worktree. A shared download cache does \
                      not remove those copies. pnpm can share package content when its store \
                      and worktrees use the same filesystem and its installation mode permits \
@@ -1475,6 +1479,7 @@ fn prepare_draft_parts(main_root: &Path) -> Option<PrepareDraftParts> {
         runtimes,
         steps,
         guidance: guidance.into_iter().map(str::to_string).collect(),
+        worktree_volume_shared_cache,
     })
 }
 
@@ -1504,17 +1509,18 @@ pub fn draft_prepare_config(main_root: &Path) -> Option<String> {
          #\n\
          # cache = \"worktree_local\"    each worktree installs its own copy.\n\
          # cache = \"repository_shared\" exports AETHYME_PREPARE_CACHE_DIR and serializes\n\
-         #                            writers in host state. The command must explicitly\n\
-         #                            use that path as its package-manager store. Worktree\n\
-         #                            outputs can still allocate a separate copy per session.\n\
+         #                            writers through broker state. The command must use\n\
+         #                            that path as its package-manager store. Its root can\n\
+         #                            be on the host filesystem or selected worktree volume;\n\
+         #                            this pnpm draft selects the latter for same-filesystem\n\
+         #                            package imports. Worktree outputs can still allocate a\n\
+         #                            separate copy per session.\n\
          #                            Sharing a cache is not a storage quota.\n\
          #\n\
          # The store is keyed by preparation digest, so a repository whose lockfile\n\
-         # changes between branches grows one directory per distinct input set. Uncomment\n\
-         # to request rotation above this threshold before preparation. This is not a\n\
-         # write quota: a running install can exceed it, and worktree outputs are separate.\n\
-         # [shared_cache]\n\
-         # max_bytes = 21474836480\n\
+         # changes between branches grows one directory per distinct input set. max_bytes\n\
+         # defaults to 8 GiB and is a pre-run rotation threshold, not a write quota: a\n\
+         # running install can exceed it, and worktree outputs are separate.\n\
          #\n\
          # Nesting: this draft reads the repository root only. A manifest in a\n\
          # subdirectory needs its own step with repository-relative paths.\n\
@@ -1528,6 +1534,9 @@ pub fn draft_prepare_config(main_root: &Path) -> Option<String> {
         draft.push_str("# ");
         draft.push_str(note);
         draft.push('\n');
+    }
+    if parts.worktree_volume_shared_cache {
+        draft.push_str("\n[shared_cache]\nroot = \"worktree_volume\"\n");
     }
 
     if crate::preparation::parse_config(&draft).is_err() {
@@ -1550,7 +1559,13 @@ pub fn prepare_guidance(main_root: &Path) -> Vec<String> {
 
 /// One Node preparation step. The cache note is emitted as a comment so the
 /// shared-store trade-off is visible at the point a customer chooses a policy.
-fn node_step(command: &str, offline_command: &str, inputs: &str, cache_note: &str) -> String {
+fn node_step(
+    command: &str,
+    offline_command: &str,
+    inputs: &str,
+    cache: &str,
+    cache_note: &str,
+) -> String {
     format!(
         "\n[[steps]]\n\
          # {cache_note}\n\
@@ -1559,7 +1574,7 @@ fn node_step(command: &str, offline_command: &str, inputs: &str, cache_note: &st
          offline_command = {offline_command}\n\
          inputs = {inputs}\n\
          outputs = [\"node_modules/\"]\n\
-         cache = \"worktree_local\"\n\
+         cache = \"{cache}\"\n\
          required_for_hooks = true\n"
     )
 }
