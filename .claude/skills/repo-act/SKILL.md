@@ -112,7 +112,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - For startup profiling, use Git Trace2 event logs to count actual Git
   subprocess starts and group repeated argv. Stack-sample counts measure time in
   sampled frames, not invocation counts; keep instrumented traces and timings
-  separate from uninstrumented benchmark samples.
+  separate from uninstrumented benchmark samples. Enable tracing through the
+  child process's `GIT_TRACE2_EVENT`, not repository-local `trace2.eventTarget`,
+  which Git ignores. Require nonempty start events and a positive control that
+  captures the exact Git command shape the regression intends to forbid.
 - When combining Git identity queries, preserve checkout-context checks.
   `--git-common-dir` succeeds in bare repositories too; require an explicit
   true `--is-inside-work-tree` result when checkout evidence is needed. Compare

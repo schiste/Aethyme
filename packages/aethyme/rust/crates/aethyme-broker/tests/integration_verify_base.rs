@@ -315,6 +315,11 @@ fn start_does_not_inspect_files_in_a_thousand_landed_promotions() {
     git(&fixture.upstream, &["pull", "-q", "--ff-only"]);
     let upstream = fixture.merge_upstream(1);
 
+    // Keep the owner checkout and its accepted history consistent too.
+    git(
+        Path::new(&owner.worktree_path),
+        &["reset", "--hard", integration],
+    );
     let tree = git(&fixture.root, &["rev-parse", "fixture-history^{tree}"]);
     let mut parent = base;
     for commit in &commits {
@@ -480,14 +485,11 @@ done
     while !ready.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(
-        ready.exists(),
-        "coordinated commit never reached its pre-commit hook"
-    );
-    assert!(
-        !commit.is_finished(),
-        "commit must still hold the write lane"
-    );
+    if !ready.exists() || commit.is_finished() {
+        drop(release_hook);
+        let outcome = commit.join().unwrap();
+        panic!("coordinated commit did not stay in its hook: {outcome:?}");
+    }
 
     let (sender, receiver) = mpsc::channel();
     let start = std::thread::spawn(move || {
