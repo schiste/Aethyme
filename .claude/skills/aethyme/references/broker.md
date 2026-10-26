@@ -28,6 +28,14 @@ irreplaceable evidence outside disposable checkouts before closing them, or set
 pause automatic artifact sweeps. `auto_remove = false` only disables whole-checkout
 removal. Never use `--force` merely to clear a capacity refusal.
 
+Before starting or delegating a fix for shared CI failures or generated
+files, use `aethyme broker status --compact --json` and open PRs on affected
+paths. Read the matching task, claimed paths and PR diff even when the graph
+is unavailable. Coordinate with the owning session before starting duplicate
+work; use `aethyme broker advanced note send --to-session <id>` for a broker
+note. A known base failure still needs verification at its exact base commit;
+an overlap warning does not waive gates.
+
 Follow this protocol:
 
 When `aethyme broker advanced hooks install` is active (or its pre-commit command is
@@ -53,6 +61,11 @@ blocked.
    evidence detail before deciding what to edit. A deferred check is not a
    clean result.
 
+   If the execution tool reports the start command is still running, poll
+   that same command to completion before retrying; a pending result does not
+   mean it failed. Before editing, confirm the session's reported repository
+   and worktree root match the repository you intended.
+
    `cd` into the reported worktree before editing. If you are already in a
    dedicated worktree, use
    `aethyme broker start --adopt --task "<your task>" --short-name "<short name>" --path <planned-path>` instead.
@@ -62,7 +75,7 @@ blocked.
    Repeat `--path` for every file or trailing-slash directory known up front.
    The broker validates the whole set first, then creates the session plus
    explicit leases atomically. Omit `--path` only when no target is known yet.
-   If detailed `status --json` shows another session holding leases on the
+   If full `status --json` shows another session holding leases on the
    files you plan to change, prefer working elsewhere first or coordinate
    with its holder — overlapping edits can conflict at merge time.
    Coordinate the exact shared hunk with its holder; a sibling session's PR
