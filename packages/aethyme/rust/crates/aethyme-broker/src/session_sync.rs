@@ -96,10 +96,13 @@ fn sync_refused(reason: impl Into<String>) -> BrokerOpError {
     }
 }
 
-/// How long `start` waits for its default-branch refresh. Starting a session
-/// must cost seconds, not a network timeout. A failed refresh cannot authorize
-/// an implicit start from a cached remote-tracking ref.
-const START_REFRESH_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+/// Hard upper bound for the default-branch refresh before `start`. The general
+/// Git timeout may shorten this budget, but cannot raise it.
+const START_REFRESH_MAX_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn start_refresh_budget(configured_git_timeout: std::time::Duration) -> std::time::Duration {
+    configured_git_timeout.min(START_REFRESH_MAX_BUDGET)
+}
 
 /// What `start` learned refreshing the default branch before choosing a base.
 pub(crate) struct StartRefresh {
@@ -166,7 +169,7 @@ impl crate::Broker {
         match repo.fetch_branch_into_tracking_ref(
             &default.remote,
             &default.branch,
-            START_REFRESH_BUDGET,
+            start_refresh_budget(crate::git::git_timeout()),
         ) {
             Ok(()) => StartRefresh {
                 fetched: Some(true),
@@ -373,5 +376,22 @@ fn shell_quote(value: &str) -> String {
         value.to_string()
     } else {
         format!("'{}'", value.replace('\'', r"'\''"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_start_refresh_respects_the_git_timeout_and_its_hard_cap() {
+        assert_eq!(
+            start_refresh_budget(std::time::Duration::from_secs(600)),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            start_refresh_budget(std::time::Duration::from_secs(5)),
+            std::time::Duration::from_secs(5)
+        );
     }
 }
