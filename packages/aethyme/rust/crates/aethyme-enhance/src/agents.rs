@@ -663,6 +663,19 @@ blocked.
    `aethyme broker finish cleanup --all-cleaned` and apply the unchanged plan
    explicitly with `aethyme broker finish cleanup --all-cleaned --apply`.
 
+   For a storage audit, reconcile broker session paths, `git worktree list
+   --porcelain`, and directories under current and historical roots on every
+   relevant volume. Include temporary and merge-simulation checkouts; report
+   shared cache containers separately to avoid counting nested worktrees twice.
+   A closed or `cleaned` session is not proof of physical removal. Report each
+   path's cleanup result or blocker, keeping uninspected and unsupported scopes
+   unknown. Preserve complete audit output and disclose incomplete scans.
+   Filesystem birth time, descendant modification time, broker activity, and
+   source edits are different observations; label the date used. Walk without
+   following symlinks and distinguish summed file bytes from unique physical
+   space, since hardlinks and clones can share storage. Never authorize deletion
+   from age, a stale-session label, or a missing size estimate alone.
+
 7. **If a file named `.aethyme/broker-action-required.md` appears in your
    worktree**, read it immediately: your submission conflicted. It names
    the conflicting files, the blocking session, and the exact rebase
