@@ -733,7 +733,7 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
             .unlanded_commits
             .iter()
             .all(|commit| valid_git_object_id(commit))
-        || manifest.bundle.is_some() != !manifest.unlanded_commits.is_empty()
+        || manifest.bundle.is_some() == manifest.unlanded_commits.is_empty()
     {
         return Err("manifest has an incomplete or malformed archive identity".into());
     }
