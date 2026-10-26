@@ -611,6 +611,7 @@ fn artifact_sweep_deadlines(
     checkout_cleanup_reserve: Duration,
     discovery_override: Option<Instant>,
     removal_override: Option<Instant>,
+    checkout_cleanup_override: Option<Instant>,
 ) -> ArtifactSweepDeadlines {
     let budget_deadline = started_at + Duration::from_millis(budget_ms);
     let cache_deadline = budget_deadline
@@ -621,12 +622,13 @@ fn artifact_sweep_deadlines(
     // Keep the existing deadline override seam meaningful for tests. In
     // production, no override is supplied and checkout cleanup gets the
     // remainder of the original overall sweep budget.
-    let checkout_cleanup = match (discovery_override, removal_override) {
-        (None, None) => budget_deadline,
-        (discovery, removal) => discovery
-            .unwrap_or(budget_deadline)
-            .min(removal.unwrap_or(budget_deadline)),
-    };
+    let checkout_cleanup =
+        checkout_cleanup_override.unwrap_or_else(|| match (discovery_override, removal_override) {
+            (None, None) => budget_deadline,
+            (discovery, removal) => discovery
+                .unwrap_or(budget_deadline)
+                .min(removal.unwrap_or(budget_deadline)),
+        });
     ArtifactSweepDeadlines {
         discovery,
         removal,
@@ -5425,6 +5427,7 @@ impl Broker {
             scope,
             deadline_override,
             deadline_override,
+            deadline_override,
             ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
         )
     }
@@ -5442,6 +5445,26 @@ impl Broker {
             scope,
             Some(discovery_deadline),
             Some(removal_deadline),
+            None,
+            ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
+        )
+    }
+
+    #[cfg(test)]
+    fn sweep_artifacts_autonomously_with_test_lane_deadlines(
+        &mut self,
+        policy: &RetentionPolicy,
+        scope: ArtifactSweepScope,
+        discovery_deadline: Instant,
+        removal_deadline: Instant,
+        checkout_cleanup_deadline: Instant,
+    ) -> Result<(ArtifactSweepOutcome, usize), BrokerOpError> {
+        self.sweep_artifacts_autonomously_with_deadlines(
+            policy,
+            scope,
+            Some(discovery_deadline),
+            Some(removal_deadline),
+            Some(checkout_cleanup_deadline),
             ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
         )
     }
@@ -5453,7 +5476,14 @@ impl Broker {
         scope: ArtifactSweepScope,
         entry_budget: usize,
     ) -> Result<(ArtifactSweepOutcome, usize), BrokerOpError> {
-        self.sweep_artifacts_autonomously_with_deadlines(policy, scope, None, None, entry_budget)
+        self.sweep_artifacts_autonomously_with_deadlines(
+            policy,
+            scope,
+            None,
+            None,
+            None,
+            entry_budget,
+        )
     }
 
     fn sweep_artifacts_autonomously_with_deadlines(
@@ -5462,6 +5492,7 @@ impl Broker {
         scope: ArtifactSweepScope,
         discovery_deadline_override: Option<Instant>,
         removal_deadline_override: Option<Instant>,
+        checkout_cleanup_deadline_override: Option<Instant>,
         discovery_entry_budget: usize,
     ) -> Result<(ArtifactSweepOutcome, usize), BrokerOpError> {
         if policy.artifact_sweep_budget_ms == 0 {
@@ -5520,6 +5551,7 @@ impl Broker {
             checkout_cleanup_reserve,
             discovery_deadline_override,
             removal_deadline_override,
+            checkout_cleanup_deadline_override,
         );
         let discovery_deadline = deadlines.discovery;
         let removal_deadline = deadlines.removal;
@@ -8446,6 +8478,7 @@ mod tests {
                     ArtifactSweepScope::Drain,
                     None,
                     None,
+                    None,
                     ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
                 )
                 .unwrap();
@@ -8818,7 +8851,7 @@ mod tests {
         let budget_ms = 60_000;
         let reserve =
             foreground_checkout_cleanup_reserve(budget_ms, ArtifactSweepScope::Drain, true);
-        let deadlines = artifact_sweep_deadlines(started_at, budget_ms, reserve, None, None);
+        let deadlines = artifact_sweep_deadlines(started_at, budget_ms, reserve, None, None, None);
 
         assert_eq!(reserve, Duration::from_secs(30));
         assert_eq!(
@@ -8867,10 +8900,127 @@ mod tests {
             reserve,
             Some(override_deadline),
             None,
+            None,
         );
         assert_eq!(
             overridden.checkout_cleanup, override_deadline,
             "the existing test deadline override still caps both lanes"
+        );
+        let cache_deadline = started_at - Duration::from_millis(1);
+        let later_cleanup_deadline = started_at + Duration::from_secs(30);
+        let split = artifact_sweep_deadlines(
+            started_at,
+            budget_ms,
+            reserve,
+            Some(cache_deadline),
+            Some(cache_deadline),
+            Some(later_cleanup_deadline),
+        );
+        assert_eq!(split.discovery, cache_deadline);
+        assert_eq!(split.removal, cache_deadline);
+        assert_eq!(split.checkout_cleanup, later_cleanup_deadline);
+    }
+
+    #[test]
+    fn expired_cache_deadlines_still_dispatch_checkout_cleanup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", ".gitignore", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        git(&root, &["remote", "add", "origin", "."]);
+        git(
+            &root,
+            &["fetch", "-q", "origin", "main:refs/remotes/origin/main"],
+        );
+        git(&root, &["remote", "set-head", "origin", "main"]);
+
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[cleanup]\nauto_remove = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 1\nclosed_worktree_grace_hours = 0\nauto_cleanup_worktrees_on_finish = false\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 1\n",
+        )
+        .unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let cache_owner = broker
+            .start_worktree("unrepresented cache owner", None)
+            .unwrap();
+        let cache_owner_worktree = PathBuf::from(&cache_owner.worktree_path);
+        std::fs::write(cache_owner_worktree.join("unrepresented.txt"), "local\n").unwrap();
+        git(&cache_owner_worktree, &["add", "unrepresented.txt"]);
+        git(&cache_owner_worktree, &["commit", "-qm", "unrepresented"]);
+        broker
+            .close_abandoning_unpushed(cache_owner.id, "fixture cache owner")
+            .unwrap();
+        assert!(
+            broker
+                .store()
+                .active_leases()
+                .unwrap()
+                .iter()
+                .all(|lease| lease.session_id != cache_owner.id),
+            "the closed fixture owner must not retain active leases"
+        );
+
+        let cache = cache_owner_worktree.join("target");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
+        std::fs::write(cache.join("payload"), b"unreached cache backlog").unwrap();
+
+        let disposable = broker
+            .start_worktree("eligible closed checkout", None)
+            .unwrap();
+        let disposable_worktree = PathBuf::from(&disposable.worktree_path);
+        broker.close(disposable.id).unwrap();
+
+        let now = Instant::now();
+        let cache_deadline = now - Duration::from_millis(1);
+        let checkout_cleanup_deadline = now + Duration::from_secs(30);
+        let policy = load_retention_policy(&root).unwrap();
+        let (outcome, _) = broker
+            .sweep_artifacts_autonomously_with_test_lane_deadlines(
+                &policy,
+                ArtifactSweepScope::Drain,
+                cache_deadline,
+                cache_deadline,
+                checkout_cleanup_deadline,
+            )
+            .unwrap();
+
+        assert!(!outcome.complete, "expired cache discovery is incomplete");
+        assert_eq!(outcome.directories_reclaimed, 0);
+        assert!(
+            cache.join("payload").is_file(),
+            "the cache lane stays stopped"
+        );
+        let cleanup = outcome
+            .auto_cleanup
+            .expect("the independent checkout lane still runs");
+        assert!(cleanup.removed.iter().any(|removed| {
+            removed.sessions.contains(&disposable.id)
+                && removed.worktree == disposable_worktree.to_string_lossy().as_ref()
+        }));
+        assert!(
+            !disposable_worktree.exists(),
+            "the eligible clean checkout is removed"
+        );
+        assert!(
+            cache_owner_worktree.join("unrepresented.txt").is_file(),
+            "the owner with an unrepresented commit remains protected"
+        );
+        assert!(
+            cache.join("payload").is_file(),
+            "checkout cleanup does not consume the unscanned cache"
         );
     }
 
