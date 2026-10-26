@@ -7,21 +7,30 @@
 //! problem -- it presents as link errors and unrelated test failures whose
 //! verdict is cached (#156).
 //!
-//! Deletion is not automatic. A retained worktree may be retained precisely
-//! because someone intends to resume in it, and re-running a cold build is a
-//! real cost. So this reports candidates and only removes what an operator
-//! reviewed, following the same digest-bound plan/apply contract as `gc`.
+//! The `gc reclaim` command reports candidates and only removes what an
+//! operator reviewed, following the same digest-bound plan/apply contract as
+//! `gc`. Its bounded scanner is also used by the detached pressure worker,
+//! which has separate activity, holder, resource, and process-use guards and
+//! removes only witnessed unattended artifacts.
 
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
 const RECLAIM_PLAN_SCHEMA_VERSION: u8 = 1;
 const RECLAIM_PLAN_FILENAME_PREFIX: &str = ".aethyme-reclaim-plan-";
 const RECLAIM_PLAN_FILENAME_SUFFIX: &str = ".json";
+pub(crate) const BOUNDED_RECLAIM_SCAN_ENTRY_BUDGET: usize = 16_384;
+
+#[derive(Debug)]
+pub(crate) struct BoundedReclaimScan {
+    pub candidates: Vec<ReclaimCandidate>,
+    pub complete: bool,
+    pub entries_examined: usize,
+}
 
 /// The part of a candidate that determines whether an apply would touch it.
 /// Measured bytes deliberately do not belong here: a build may grow while the
@@ -424,6 +433,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bounded_scan_marks_an_entry_limited_worktree_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("first")).unwrap();
+        std::fs::create_dir(tmp.path().join("second")).unwrap();
+
+        let scan = scan_worktree_bounded(
+            tmp.path(),
+            &[],
+            &[],
+            Instant::now() + Duration::from_secs(1),
+            1,
+        );
+
+        assert!(!scan.complete);
+        assert_eq!(scan.entries_examined, 1);
+    }
+
+    #[test]
+    fn bounded_scan_deadline_before_discovery_is_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("target")).unwrap();
+
+        let scan = scan_worktree_bounded(tmp.path(), &[], &[], Instant::now(), 16);
+
+        assert!(!scan.complete);
+        assert!(scan.candidates.is_empty());
+    }
+
+    #[test]
+    fn bounded_scan_reports_deep_source_but_keeps_candidate_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("packages/deep/source/tree/that/continues"))
+            .unwrap();
+        std::fs::create_dir_all(tmp.path().join("target")).unwrap();
+        std::fs::write(tmp.path().join("target/CACHEDIR.TAG"), "cache").unwrap();
+
+        let scan = scan_worktree_bounded(
+            tmp.path(),
+            &[],
+            &[],
+            Instant::now() + Duration::from_secs(1),
+            BOUNDED_RECLAIM_SCAN_ENTRY_BUDGET,
+        );
+
+        assert!(!scan.complete);
+        assert!(
+            scan.candidates
+                .iter()
+                .any(|candidate| candidate.path.ends_with("target"))
+        );
+    }
+
     /// A heuristic like "large and gitignored" would also match a downloaded
     /// dataset or a local database. This command deletes; it stays narrow.
     #[test]
@@ -797,18 +859,74 @@ pub fn scan_worktree(
     extras: &[String],
     sizing: Sizing,
 ) -> Vec<ReclaimCandidate> {
+    scan_worktree_with_limits(worktree, active, extras, sizing, None, usize::MAX).candidates
+}
+
+/// Scan one worktree with a wall-clock, depth, and directory-entry bound.
+/// Candidates found before a limit expires still carry their own Git and
+/// worktree eligibility evidence; callers must keep the worktree cursor pending
+/// while `complete` is false.
+pub(crate) fn scan_worktree_bounded(
+    worktree: &Path,
+    active: &[PathBuf],
+    extras: &[String],
+    deadline: Instant,
+    entry_budget: usize,
+) -> BoundedReclaimScan {
+    scan_worktree_with_limits(
+        worktree,
+        active,
+        extras,
+        Sizing::Skip,
+        Some(deadline),
+        entry_budget,
+    )
+}
+
+fn scan_worktree_with_limits(
+    worktree: &Path,
+    active: &[PathBuf],
+    extras: &[String],
+    sizing: Sizing,
+    deadline: Option<Instant>,
+    entry_budget: usize,
+) -> BoundedReclaimScan {
     let mut found = Vec::new();
-    let checkout = own_checkout(worktree);
-    let walk = Walk {
+    let mut budget = WalkBudget {
+        deadline,
+        entry_budget,
+        entries_examined: 0,
+        complete: true,
+        stopped: false,
+    };
+    let checkout = if let Some(deadline) = deadline {
+        let _git_deadline = crate::git::limit_git_until(deadline);
+        own_checkout(worktree)
+    } else {
+        own_checkout(worktree)
+    };
+    if checkout.is_none() {
+        budget.complete = false;
+    }
+    if budget.expired() {
+        budget.complete = false;
+        budget.stopped = true;
+    }
+    let mut walk = Walk {
         worktree,
         checkout: checkout.as_ref(),
         active,
         extras,
         sizing,
+        budget: &mut budget,
     };
     walk.collect(worktree, &mut found, 0);
     found.sort_by_key(|candidate| std::cmp::Reverse(candidate.bytes));
-    found
+    BoundedReclaimScan {
+        candidates: found,
+        complete: budget.complete,
+        entries_examined: budget.entries_examined,
+    }
 }
 
 /// The Git checkout rooted exactly at `worktree`, if there is one.
@@ -1081,16 +1199,28 @@ const OPEN_FILE_SNAPSHOT_MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 /// nonzero-exit, malformed, or empty results remain `Incomplete` rather than
 /// being interpreted as no process use.
 pub(crate) fn open_file_snapshot_under(root: &Path) -> OpenFileSnapshot {
+    open_file_snapshot_under_until(root, Instant::now() + OPEN_FILE_SNAPSHOT_BUDGET)
+}
+
+/// Run the manual `lsof` safety check within a caller-owned deadline. Every
+/// binary fallback uses only the remaining time; a timeout stays incomplete.
+pub(crate) fn open_file_snapshot_under_until(root: &Path, deadline: Instant) -> OpenFileSnapshot {
     // `lsof` lives in /usr/sbin on macOS, which a trimmed PATH (a launchd
     // job, a test harness) leaves out; the standard locations are tried too
     // (#588). A successfully spawned but incomplete listing is not retried as
     // another binary and never becomes a successful empty snapshot.
     for program in ["lsof", "/usr/sbin/lsof", "/usr/bin/lsof", "/sbin/lsof"] {
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .min(OPEN_FILE_SNAPSHOT_BUDGET);
+        if remaining.is_zero() {
+            return incomplete_open_file_snapshot("lsof exceeded the caller's time limit");
+        }
         let mut command = std::process::Command::new(program);
         command.args(["-w", "-n", "-P", "-F0pcfnt"]);
         match crate::bounded_output::output_limited(
             &mut command,
-            OPEN_FILE_SNAPSHOT_BUDGET,
+            remaining,
             OPEN_FILE_SNAPSHOT_MAX_STREAM_BYTES,
         ) {
             Ok(output) => return snapshot_from_lsof_capture(output, root),
@@ -1416,27 +1546,80 @@ struct Walk<'a> {
     active: &'a [PathBuf],
     extras: &'a [String],
     sizing: Sizing,
+    budget: &'a mut WalkBudget,
+}
+
+struct WalkBudget {
+    deadline: Option<Instant>,
+    entry_budget: usize,
+    entries_examined: usize,
+    complete: bool,
+    stopped: bool,
+}
+
+impl WalkBudget {
+    fn expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    fn examine_entry(&mut self) -> bool {
+        if self.expired() || self.entries_examined >= self.entry_budget {
+            self.complete = false;
+            self.stopped = true;
+            return false;
+        }
+        self.entries_examined = self.entries_examined.saturating_add(1);
+        true
+    }
 }
 
 impl Walk<'_> {
-    fn collect(&self, dir: &Path, found: &mut Vec<ReclaimCandidate>, depth: usize) {
+    fn collect(&mut self, dir: &Path, found: &mut Vec<ReclaimCandidate>, depth: usize) {
         // Build trees are shallow relative to a repository; this bounds the
         // walk on a directory whose whole problem is that it is enormous.
-        if depth > 6 {
+        if self.budget.expired() {
+            self.budget.complete = false;
+            self.budget.stopped = true;
             return;
         }
-        let Ok(entries) = read_dir(dir) else {
+        if depth > 6 {
+            // A deeper subtree may hold an artifact; defer it rather than
+            // treating the manual scan's depth limit as a complete census.
+            self.budget.complete = false;
             return;
+        }
+        let entries = match read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => {
+                self.budget.complete = false;
+                return;
+            }
         };
-        for entry in entries.flatten() {
-            let Ok(kind) = entry.file_type() else {
-                continue;
+        for entry in entries {
+            if !self.budget.examine_entry() {
+                break;
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    self.budget.complete = false;
+                    continue;
+                }
+            };
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(_) => {
+                    self.budget.complete = false;
+                    continue;
+                }
             };
             if !kind.is_dir() || kind.is_symlink() {
                 continue;
             }
             let path = entry.path();
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                self.budget.complete = false;
                 continue;
             };
             if name == ".git" {
@@ -1448,16 +1631,38 @@ impl Walk<'_> {
                     Sizing::Skip => 0,
                 };
                 let mut candidate = classify(&path, self.worktree, bytes, self.active);
-                if candidate.reclaimable
-                    && let Some(reason) = git_protection(self.checkout, self.worktree, &path)
-                {
-                    candidate.reclaimable = false;
-                    candidate.reason = reason;
+                if candidate.reclaimable {
+                    let protection = if let Some(deadline) = self.budget.deadline {
+                        let _git_deadline = crate::git::limit_git_until(deadline);
+                        git_protection(self.checkout, self.worktree, &path)
+                    } else {
+                        git_protection(self.checkout, self.worktree, &path)
+                    };
+                    if self.budget.expired() {
+                        self.budget.complete = false;
+                        self.budget.stopped = true;
+                        break;
+                    }
+                    if let Some(reason) = protection {
+                        candidate.reclaimable = false;
+                        candidate.reason = reason;
+                    }
                 }
                 found.push(candidate);
+                if self.budget.expired() {
+                    self.budget.complete = false;
+                    self.budget.stopped = true;
+                    break;
+                }
                 continue;
             }
             self.collect(&path, found, depth + 1);
+            if self.budget.stopped {
+                if self.budget.expired() {
+                    self.budget.complete = false;
+                }
+                break;
+            }
         }
     }
 }

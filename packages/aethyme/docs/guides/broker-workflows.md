@@ -1319,12 +1319,17 @@ below the gate headroom -- is spent by commands that exist to reclaim disk:
 this split, a repository whose backlog outlasted one budget paid the full
 budget -- a minute under pressure -- on every command.
 
-Autonomous sweeps operate on closed sessions only. Quiet-agent time and shallow
-directory timestamps cannot prove a deeply nested cache is no longer being
-written by a build or development process. Use the reviewed `gc reclaim` plan
-and apply flow for build output in an open session. The legacy
-`idle_session_artifact_hours` setting is accepted for older configurations but
-does not authorize autonomous removal from open sessions.
+The detached artifact worker can also reclaim witnessed caches from an open
+session after `idle_session_artifact_hours` of inactivity, but only while the
+filesystem is below gate headroom and the worker has complete current evidence
+that the agent is idle, no task holder is running, no resource writer owns the
+worktree, Git still classifies the cache as ignored and untracked, and no
+process has a file open under the worktree. This lane scans and removes one
+worktree at a time. It never removes the checkout or releases session leases.
+The setting defaults to 24 hours; `0` disables this lane. It is triggered by
+free-space or inode pressure, not by `retained_bytes_budget`, which remains a
+separate retention-policy follow-up. Use reviewed `gc reclaim` for an explicit
+plan and apply flow.
 
 `gc apply` re-proves each build cache before removing it, and a cache that no
 longer qualifies — a session live again, a directory no longer carrying its

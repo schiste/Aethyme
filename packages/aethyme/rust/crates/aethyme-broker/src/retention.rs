@@ -105,10 +105,11 @@ pub struct RetentionPolicy {
     /// raising this trades disk against how long a dead session's disk is
     /// held -- never against whether committed work survives.
     pub session_abandoned_after_hours: u32,
-    /// Legacy configuration field retained so older `.aethyme/broker.toml`
-    /// files continue to parse. Autonomous sweeps always preserve caches from
-    /// open sessions because quiet-agent time and shallow directory timestamps
-    /// cannot prove that a deep build output tree is unused.
+    /// Minimum inactivity in hours before the detached, pressure-only artifact
+    /// worker may reclaim a witnessed cache from an open session. It still
+    /// requires current idle-agent, holder, resource, Git, and process-use
+    /// evidence; `0` disables this lane. It never removes the checkout or
+    /// releases its leases.
     pub idle_session_artifact_hours: u32,
     /// Wall-clock budget for the autonomous artifact sweep. `0` disables it.
     pub artifact_sweep_budget_ms: u64,

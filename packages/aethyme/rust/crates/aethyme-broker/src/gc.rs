@@ -138,6 +138,14 @@ const ARTIFACT_SWEEP_BLOCKED_PATHS_VALUE_MAX_BYTES: usize =
 const ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY: &str = "gc.artifact_sweep.recovery_requested_ms";
 /// Highest recovery request generation completed by the cache-only worker.
 const ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY: &str = "gc.artifact_sweep.recovery_completed_ms";
+/// Round-robin position for the detached worker's pressure-only open-session
+/// artifact lane. This never changes session ownership or checkout state.
+const OPEN_SESSION_ARTIFACT_CURSOR_KEY: &str = "gc.artifact_sweep.open_session_cursor_id";
+/// Whether the previous open-session lap encountered evidence it could not
+/// classify. A complete lap clears this; an incomplete lap starts another
+/// bounded pass from the beginning.
+const OPEN_SESSION_ARTIFACT_LAP_INCOMPLETE_KEY: &str =
+    "gc.artifact_sweep.open_session_lap_incomplete";
 /// Retry time for an automatic continuation that made no filesystem progress.
 const ARTIFACT_SWEEP_RETRY_AFTER_KEY: &str = "gc.artifact_sweep.retry_after_ms";
 /// Separate durable request for whole-checkout cleanup deferred by an ordinary
@@ -170,6 +178,11 @@ const AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE: Duration = Duration::from_secs(60);
 /// Each whole-checkout pass has its own bounded tranche; the cursor resumes
 /// after candidates inspected before this deadline.
 const AUTO_CHECKOUT_CLEANUP_WORKER_PASS_BUDGET: Duration = Duration::from_secs(30);
+/// The detached artifact worker reserves a bounded tail for one open-session
+/// worktree proof and removal. This expensive path never runs inline.
+const OPEN_SESSION_ARTIFACT_WORKER_RESERVE: Duration = Duration::from_secs(30);
+const OPEN_SESSION_RESOURCE_INVENTORY_ENTRY_BUDGET: usize = 4_096;
+const OPEN_SESSION_ARTIFACT_WORKTREE_BUDGET: usize = 64;
 /// A general foreground sweep reserves up to one cleanup-worker pass for
 /// whole-checkout work, while leaving at least half of the pass for caches.
 const AUTO_CHECKOUT_CLEANUP_FOREGROUND_RESERVE: Duration = AUTO_CHECKOUT_CLEANUP_WORKER_PASS_BUDGET;
@@ -213,6 +226,89 @@ pub struct ArtifactSweepOutcome {
     pub complete: bool,
     /// The checkout auto-cleanup pass that ran in this sweep (#588), if any.
     pub auto_cleanup: Option<crate::AutoCleanupReport>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenSessionArtifactEvidence {
+    Eligible,
+    Retain,
+    Unknown,
+}
+
+#[derive(Debug, Default)]
+struct OpenSessionArtifactPass {
+    complete: bool,
+    directories_reclaimed: usize,
+    entries_reclaimed: usize,
+}
+
+fn open_session_activity_evidence(
+    status: crate::SessionStatus,
+    activity_at: i64,
+    now: i64,
+    idle_hours: u32,
+) -> OpenSessionArtifactEvidence {
+    if idle_hours == 0 {
+        return OpenSessionArtifactEvidence::Retain;
+    }
+    if activity_at <= 0 {
+        return OpenSessionArtifactEvidence::Unknown;
+    }
+    if matches!(
+        status,
+        crate::SessionStatus::Active | crate::SessionStatus::Cleaned
+    ) {
+        return OpenSessionArtifactEvidence::Retain;
+    }
+    let idle_ms = i64::from(idle_hours).saturating_mul(3_600_000);
+    if now.saturating_sub(activity_at) >= idle_ms {
+        OpenSessionArtifactEvidence::Eligible
+    } else {
+        OpenSessionArtifactEvidence::Retain
+    }
+}
+
+fn open_session_holder_evidence(
+    event: Option<&crate::Event>,
+    process_table: Option<&crate::session_holder::ProcessTable>,
+) -> OpenSessionArtifactEvidence {
+    let Some(process_table) = process_table else {
+        return OpenSessionArtifactEvidence::Unknown;
+    };
+    let Some(event) = event else {
+        return OpenSessionArtifactEvidence::Eligible;
+    };
+    let Some(payload) = event.payload_json.as_deref() else {
+        return OpenSessionArtifactEvidence::Unknown;
+    };
+    let Ok(holder) = serde_json::from_str::<crate::session_holder::AgentProcess>(payload) else {
+        return OpenSessionArtifactEvidence::Unknown;
+    };
+    if crate::session_holder::is_shared_agent_service(&holder.command) {
+        return OpenSessionArtifactEvidence::Eligible;
+    }
+    if process_table.is_alive(&holder) {
+        OpenSessionArtifactEvidence::Retain
+    } else {
+        OpenSessionArtifactEvidence::Eligible
+    }
+}
+
+fn open_session_resource_evidence(
+    leases: Option<&[crate::HostResourceLease]>,
+    worktree_fingerprint: &str,
+) -> OpenSessionArtifactEvidence {
+    let Some(leases) = leases else {
+        return OpenSessionArtifactEvidence::Unknown;
+    };
+    if leases.iter().any(|lease| {
+        lease.worktree_fingerprint == worktree_fingerprint
+            && lease.state != crate::HostLeaseState::Released
+    }) {
+        OpenSessionArtifactEvidence::Retain
+    } else {
+        OpenSessionArtifactEvidence::Eligible
+    }
 }
 
 /// Result of an explicit `gc sweep`.
@@ -5193,6 +5289,8 @@ impl Broker {
                 return Ok(());
             }
             passes = passes.saturating_add(1);
+            let open_cursor_before =
+                self.artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_CURSOR_KEY)?;
             let (outcome, pass_entries_reclaimed) = match sweep_pass(self, policy, remaining) {
                 Ok(outcome) => outcome,
                 Err(error) => {
@@ -5200,6 +5298,9 @@ impl Broker {
                     return Ok(());
                 }
             };
+            let open_cursor_after =
+                self.artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_CURSOR_KEY)?;
+            let open_cursor_advanced = open_cursor_before != open_cursor_after;
             entries_reclaimed = entries_reclaimed.saturating_add(pass_entries_reclaimed);
             if max_duration.is_some_and(|limit| started_at.elapsed() >= limit) {
                 self.defer_artifact_sweep_worker(&format!(
@@ -5230,7 +5331,7 @@ impl Broker {
                 ))?;
                 return Ok(());
             }
-            if pass_entries_reclaimed == 0 {
+            if pass_entries_reclaimed == 0 && !open_cursor_advanced {
                 no_progress_passes = no_progress_passes.saturating_add(1);
                 if no_progress_passes >= ARTIFACT_SWEEP_WORKER_NO_PROGRESS_PASSES {
                     self.defer_artifact_sweep_worker(&format!(
@@ -5244,6 +5345,10 @@ impl Broker {
                     .unwrap_or(sleep);
                 std::thread::sleep(sleep.min(remaining));
             } else {
+                // Moving the bounded open-worktree cursor is real discovery
+                // progress even when the worktree has no currently removable
+                // cache, so a large cohort is not cut off after three quiet
+                // sessions.
                 no_progress_passes = 0;
             }
         }
@@ -5289,6 +5394,421 @@ impl Broker {
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         Ok(cursor != 0 || partial != 0 || self.artifact_sweep_recovery_requested()?)
+    }
+
+    /// Visit a bounded batch of open worktrees per detached pass. The cursor
+    /// advances even when evidence is unknown, so one blocked checkout cannot
+    /// starve later sessions; an incomplete lap is retried on the next lap.
+    fn run_idle_open_session_artifact_pass(
+        &mut self,
+        policy: &RetentionPolicy,
+        deadline: Instant,
+    ) -> Result<OpenSessionArtifactPass, BrokerOpError> {
+        let raw_cursor = self.artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_CURSOR_KEY)?;
+        let cursor = match raw_cursor.as_deref() {
+            None | Some("") | Some("0") => 0,
+            Some(value) => match value.parse::<i64>() {
+                Ok(cursor) if cursor > 0 => cursor,
+                _ => {
+                    return Ok(OpenSessionArtifactPass {
+                        complete: false,
+                        ..OpenSessionArtifactPass::default()
+                    });
+                }
+            },
+        };
+        let lap_incomplete = match self
+            .artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_LAP_INCOMPLETE_KEY)?
+            .as_deref()
+        {
+            None | Some("") | Some("0") => false,
+            Some("1") => true,
+            Some(_) => {
+                return Ok(OpenSessionArtifactPass {
+                    complete: false,
+                    ..OpenSessionArtifactPass::default()
+                });
+            }
+        };
+        let sessions = match self.store().live_sessions() {
+            Ok(sessions) => sessions
+                .into_iter()
+                .filter(|session| session.cleanup_state == crate::SessionCleanupState::Open)
+                .collect::<Vec<_>>(),
+            Err(_) => {
+                return Ok(OpenSessionArtifactPass {
+                    complete: false,
+                    ..OpenSessionArtifactPass::default()
+                });
+            }
+        };
+        if sessions.is_empty() {
+            self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_CURSOR_KEY, "0")?;
+            self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_LAP_INCOMPLETE_KEY, "")?;
+            return Ok(OpenSessionArtifactPass {
+                complete: true,
+                ..OpenSessionArtifactPass::default()
+            });
+        }
+        let initial_agents = match self.agents_snapshot(now_ms()) {
+            Ok(agents) => agents,
+            Err(_) => {
+                return Ok(OpenSessionArtifactPass {
+                    complete: false,
+                    ..OpenSessionArtifactPass::default()
+                });
+            }
+        };
+        let mut pass = OpenSessionArtifactPass {
+            complete: false,
+            ..OpenSessionArtifactPass::default()
+        };
+        let mut after = cursor;
+        let mut visited = 0usize;
+        let mut lap_incomplete = lap_incomplete;
+        while visited < OPEN_SESSION_ARTIFACT_WORKTREE_BUDGET && Instant::now() < deadline {
+            let Some(session) = sessions.iter().find(|session| session.id > after) else {
+                self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_CURSOR_KEY, "0")?;
+                self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_LAP_INCOMPLETE_KEY, "")?;
+                pass.complete = !lap_incomplete;
+                return Ok(pass);
+            };
+            let session_pass = self.reclaim_idle_open_session_artifact(
+                session,
+                &initial_agents,
+                policy,
+                deadline,
+            )?;
+            after = session.id;
+            visited = visited.saturating_add(1);
+            self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_CURSOR_KEY, &after.to_string())?;
+            pass.directories_reclaimed = pass
+                .directories_reclaimed
+                .saturating_add(session_pass.directories_reclaimed);
+            pass.entries_reclaimed = pass
+                .entries_reclaimed
+                .saturating_add(session_pass.entries_reclaimed);
+            if !session_pass.complete {
+                lap_incomplete = true;
+                self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_LAP_INCOMPLETE_KEY, "1")?;
+            }
+        }
+        // Hitting either work bound leaves a durable cursor for the next
+        // detached continuation. Unknown work remains incomplete throughout.
+        self.artifact_sweep_meta_set(OPEN_SESSION_ARTIFACT_CURSOR_KEY, &after.to_string())?;
+        Ok(pass)
+    }
+
+    fn reclaim_idle_open_session_artifact(
+        &mut self,
+        session: &crate::Session,
+        initial_agents: &[crate::AgentView],
+        policy: &RetentionPolicy,
+        deadline: Instant,
+    ) -> Result<OpenSessionArtifactPass, BrokerOpError> {
+        let mut pass = OpenSessionArtifactPass {
+            complete: true,
+            ..OpenSessionArtifactPass::default()
+        };
+        if policy.idle_session_artifact_hours == 0 || Instant::now() >= deadline {
+            pass.complete = policy.idle_session_artifact_hours == 0;
+            return Ok(pass);
+        }
+        let root = PathBuf::from(&session.worktree_path);
+        match std::fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => return Ok(pass),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(pass),
+            Err(_) => {
+                pass.complete = false;
+                return Ok(pass);
+            }
+        }
+
+        // A valid holder identity is stronger than quiet-time inference. A
+        // shared Codex app-server lifetime is not task activity; old task
+        // holders are compared by PID and start time to reject PID reuse.
+        let Some(initial_agent) = initial_agents
+            .iter()
+            .find(|agent| agent.session.id == session.id)
+        else {
+            pass.complete = false;
+            return Ok(pass);
+        };
+        match open_session_activity_evidence(
+            initial_agent.derived_status,
+            initial_agent.activity_at,
+            now_ms(),
+            policy.idle_session_artifact_hours,
+        ) {
+            OpenSessionArtifactEvidence::Eligible => {}
+            OpenSessionArtifactEvidence::Retain => return Ok(pass),
+            OpenSessionArtifactEvidence::Unknown => {
+                pass.complete = false;
+                return Ok(pass);
+            }
+        }
+        let initial_active = initial_agents
+            .iter()
+            .filter(|agent| agent.derived_status == crate::SessionStatus::Active)
+            .map(|agent| PathBuf::from(&agent.session.worktree_path))
+            .collect::<Vec<_>>();
+        if overlaps_live_worktree(&root, &initial_active) {
+            return Ok(pass);
+        }
+        match {
+            let _git_deadline = crate::git::limit_git_until(deadline);
+            self.is_broker_owned_worktree_checked(session, &root)
+        } {
+            Ok(true) => {}
+            Ok(false) => return Ok(pass),
+            Err(_) => {
+                pass.complete = false;
+                return Ok(pass);
+            }
+        }
+
+        let mut candidates = crate::reclaim::scan_worktree_bounded(
+            &root,
+            &initial_active,
+            &policy.artefact_directories,
+            deadline,
+            crate::reclaim::BOUNDED_RECLAIM_SCAN_ENTRY_BUDGET,
+        );
+        if !candidates.complete {
+            pass.complete = false;
+        }
+        let mut reclaimable = candidates
+            .candidates
+            .drain(..)
+            .filter(|candidate| {
+                candidate.reclaimable
+                    && candidate
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(|name| {
+                            crate::artifact_catalog::unattended_witness(
+                                name,
+                                &policy.artefact_directories,
+                            )
+                        })
+                        .is_some()
+            })
+            .collect::<Vec<_>>();
+        reclaimable.sort_by(|left, right| left.path.cmp(&right.path));
+        if reclaimable.is_empty() {
+            return Ok(pass);
+        }
+
+        // Refresh session activity after discovery. A current activity signal
+        // is positive evidence to retain the worktree for this pass.
+        let fresh_agents = match self.agents_snapshot(now_ms()) {
+            Ok(agents) => agents,
+            Err(_) => {
+                pass.complete = false;
+                return Ok(pass);
+            }
+        };
+        let Some(fresh_agent) = fresh_agents
+            .iter()
+            .find(|agent| agent.session.id == session.id)
+        else {
+            pass.complete = false;
+            return Ok(pass);
+        };
+        match open_session_activity_evidence(
+            fresh_agent.derived_status,
+            fresh_agent.activity_at,
+            now_ms(),
+            policy.idle_session_artifact_hours,
+        ) {
+            OpenSessionArtifactEvidence::Eligible => {}
+            OpenSessionArtifactEvidence::Retain => return Ok(pass),
+            OpenSessionArtifactEvidence::Unknown => {
+                pass.complete = false;
+                return Ok(pass);
+            }
+        }
+        let fresh_active = fresh_agents
+            .iter()
+            .filter(|agent| agent.derived_status == crate::SessionStatus::Active)
+            .map(|agent| PathBuf::from(&agent.session.worktree_path))
+            .collect::<Vec<_>>();
+        if overlaps_live_worktree(&root, &fresh_active) {
+            return Ok(pass);
+        }
+        let open_files = crate::reclaim::open_file_snapshot_under_until(&root, deadline);
+        match &open_files {
+            crate::reclaim::OpenFileSnapshot::Complete(open_files) => {
+                crate::reclaim::protect_worktrees_with_open_file_uses(&mut reclaimable, open_files);
+            }
+            crate::reclaim::OpenFileSnapshot::Incomplete { .. } => {
+                pass.complete = false;
+                return Ok(pass);
+            }
+        }
+        if !reclaimable.iter().any(|candidate| candidate.reclaimable) {
+            return Ok(pass);
+        }
+        let final_agents = match self.agents_snapshot(now_ms()) {
+            Ok(agents) => agents,
+            Err(_) => {
+                pass.complete = false;
+                return Ok(pass);
+            }
+        };
+        let Some(final_agent) = final_agents
+            .iter()
+            .find(|agent| agent.session.id == session.id)
+        else {
+            pass.complete = false;
+            return Ok(pass);
+        };
+        match open_session_activity_evidence(
+            final_agent.derived_status,
+            final_agent.activity_at,
+            now_ms(),
+            policy.idle_session_artifact_hours,
+        ) {
+            OpenSessionArtifactEvidence::Eligible => {}
+            OpenSessionArtifactEvidence::Retain => return Ok(pass),
+            OpenSessionArtifactEvidence::Unknown => {
+                pass.complete = false;
+                return Ok(pass);
+            }
+        }
+        let final_active = final_agents
+            .iter()
+            .filter(|agent| agent.derived_status == crate::SessionStatus::Active)
+            .map(|agent| PathBuf::from(&agent.session.worktree_path))
+            .collect::<Vec<_>>();
+        if overlaps_live_worktree(&root, &final_active) {
+            return Ok(pass);
+        }
+        if deadline.saturating_duration_since(Instant::now()) < Duration::from_secs(2) {
+            pass.complete = false;
+            return Ok(pass);
+        }
+        let Some(process_table) = crate::session_holder::ProcessTable::snapshot() else {
+            pass.complete = false;
+            return Ok(pass);
+        };
+        let holder_event = match self.store().latest_session_holder_event(session.id) {
+            Ok(event) => event,
+            Err(_) => {
+                pass.complete = false;
+                return Ok(pass);
+            }
+        };
+        match open_session_holder_evidence(holder_event.as_ref(), Some(&process_table)) {
+            OpenSessionArtifactEvidence::Eligible => {}
+            OpenSessionArtifactEvidence::Retain => return Ok(pass),
+            OpenSessionArtifactEvidence::Unknown => {
+                pass.complete = false;
+                return Ok(pass);
+            }
+        }
+
+        let resource_db_path = self.storage_context().host_resource_db_path.clone();
+        let Some(resource_db_path) = resource_db_path.filter(|path| path.is_file()) else {
+            pass.complete = false;
+            return Ok(pass);
+        };
+        let resource_leases = crate::HostResourceCoordinator::open_read_only(&resource_db_path)
+            .ok()
+            .and_then(|coordinator| {
+                coordinator
+                    .list_until(false, OPEN_SESSION_RESOURCE_INVENTORY_ENTRY_BUDGET, || {
+                        Instant::now() >= deadline
+                    })
+                    .ok()
+                    .flatten()
+            });
+        match open_session_resource_evidence(
+            resource_leases.as_deref(),
+            &crate::worktree_fingerprint(&root),
+        ) {
+            OpenSessionArtifactEvidence::Eligible => {}
+            OpenSessionArtifactEvidence::Retain => return Ok(pass),
+            OpenSessionArtifactEvidence::Unknown => {
+                pass.complete = false;
+                return Ok(pass);
+            }
+        }
+        crate::reclaim::protect_recently_worked_worktrees(
+            &mut reclaimable,
+            now_ms(),
+            crate::reclaim::RECENT_WORK_WINDOW_MS,
+        );
+        let Some(candidate) = reclaimable
+            .into_iter()
+            .find(|candidate| candidate.reclaimable)
+        else {
+            return Ok(pass);
+        };
+        if !crate::reclaim::is_within(&root, &candidate.path)
+            || !std::fs::symlink_metadata(&candidate.path)
+                .is_ok_and(|metadata| metadata.file_type().is_dir())
+        {
+            pass.complete = false;
+            return Ok(pass);
+        }
+        let current_session = match self.store().session(session.id) {
+            Ok(current)
+                if current.cleanup_state == crate::SessionCleanupState::Open
+                    && current.worktree_path == session.worktree_path =>
+            {
+                current
+            }
+            Ok(_) => return Ok(pass),
+            Err(_) => {
+                pass.complete = false;
+                return Ok(pass);
+            }
+        };
+        match {
+            let _git_deadline = crate::git::limit_git_until(deadline);
+            self.is_broker_owned_worktree_checked(&current_session, &root)
+        } {
+            Ok(true) => {}
+            Ok(false) => return Ok(pass),
+            Err(_) => {
+                pass.complete = false;
+                return Ok(pass);
+            }
+        }
+        let witness = candidate
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| {
+                crate::artifact_catalog::unattended_witness(name, &policy.artefact_directories)
+            })
+            .filter(|witness| witness.confirms(&candidate.path));
+        let Some(witness) = witness else {
+            pass.complete = false;
+            return Ok(pass);
+        };
+        match remove_condemned_tree_with_progress(
+            &candidate.path,
+            witness.deferrable_entry(),
+            Some(deadline),
+        ) {
+            Ok((TreeRemoval::Complete, count)) => {
+                pass.directories_reclaimed = 1;
+                pass.entries_reclaimed = count;
+            }
+            Ok((TreeRemoval::Interrupted, count)) => {
+                pass.complete = false;
+                pass.entries_reclaimed = count;
+            }
+            Err(error) => {
+                pass.complete = false;
+                pass.entries_reclaimed = error.entries_reclaimed;
+            }
+        }
+        Ok(pass)
     }
 
     /// Whether the millisecond stamp under `key` is set and younger than
@@ -5553,10 +6073,29 @@ impl Broker {
             removal_deadline_override,
             checkout_cleanup_deadline_override,
         );
-        let discovery_deadline = deadlines.discovery;
-        let removal_deadline = deadlines.removal;
+        let mut discovery_deadline = deadlines.discovery;
+        let mut removal_deadline = deadlines.removal;
         let checkout_cleanup_deadline = deadlines.checkout_cleanup;
-        let deadline = discovery_deadline.min(removal_deadline);
+        let mut deadline = discovery_deadline.min(removal_deadline);
+        let full_deadline = deadline;
+        let open_session_deadline = if scope == ArtifactSweepScope::AutomaticContinuation
+            && urgency == crate::disk_headroom::SweepUrgency::Pressured
+            && policy.idle_session_artifact_hours > 0
+        {
+            let available = full_deadline.saturating_duration_since(budget_started_at);
+            let reserve = OPEN_SESSION_ARTIFACT_WORKER_RESERVE.min(available / 3);
+            if reserve.is_zero() {
+                None
+            } else {
+                let cache_deadline = deadline.checked_sub(reserve).unwrap_or(budget_started_at);
+                discovery_deadline = discovery_deadline.min(cache_deadline);
+                removal_deadline = removal_deadline.min(cache_deadline);
+                deadline = discovery_deadline.min(removal_deadline);
+                Some(full_deadline)
+            }
+        } else {
+            None
+        };
         if !crate::AutoCleanupPolicy::artifact_sweep_allowed(self.main_root()) {
             // Strict mode pauses the artifact lane without consuming its pending
             // generation. Ignored-free checkouts may still satisfy their own
@@ -6189,6 +6728,16 @@ impl Broker {
                 self.artifact_sweep_meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, &now.to_string())?;
             }
         }
+        let mut idle_open_session_directories = 0usize;
+        if let Some(open_deadline) = open_session_deadline {
+            let open_pass = self.run_idle_open_session_artifact_pass(policy, open_deadline)?;
+            idle_open_session_directories = open_pass.directories_reclaimed;
+            entries_reclaimed = entries_reclaimed.saturating_add(open_pass.entries_reclaimed);
+            if !open_pass.complete {
+                scan_completed = false;
+                self.artifact_sweep_meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, &now.to_string())?;
+            }
+        }
         blocked_interrupted_paths.sort_by(|left, right| {
             left.path
                 .cmp(&right.path)
@@ -6223,7 +6772,11 @@ impl Broker {
             self.artifact_sweep_meta_get(ARTIFACT_SWEEP_BLOCKED_PATHS_KEY)?;
         let blocked_state_changed =
             previous_blocked_state.as_deref().unwrap_or("") != blocked_state;
-        if !removed.is_empty() || !revoked_interrupted_paths.is_empty() || blocked_state_changed {
+        if !removed.is_empty()
+            || idle_open_session_directories > 0
+            || !revoked_interrupted_paths.is_empty()
+            || blocked_state_changed
+        {
             let mut revoked_interrupted_paths = revoked_interrupted_paths;
             revoked_interrupted_paths.sort_by(|left, right| {
                 left.path
@@ -6241,10 +6794,10 @@ impl Broker {
                 })
                 .collect::<Vec<_>>();
             let payload = serde_json::json!({
-                "directories": removed.len(),
+                "directories": removed.len() + idle_open_session_directories,
                 "idle_days": policy.artifact_reclaim_days,
                 "closed_session_directories": removed.len(),
-                "idle_open_session_directories": 0,
+                "idle_open_session_directories": idle_open_session_directories,
                 "idle_session_artifact_hours": policy.idle_session_artifact_hours,
                 "complete": scan_completed,
                 "revoked_interrupted_paths": revoked,
@@ -6289,7 +6842,7 @@ impl Broker {
         };
         Ok((
             ArtifactSweepOutcome {
-                directories_reclaimed: removed.len(),
+                directories_reclaimed: removed.len() + idle_open_session_directories,
                 complete: scan_completed,
                 auto_cleanup,
             },
@@ -6981,6 +7534,116 @@ mod tests {
     fn test_worker_retry_pending(broker: &mut Broker, now: i64) -> Result<bool, BrokerOpError> {
         let namespace = broker.ensure_artifact_sweep_namespace()?;
         worker_retry_pending(broker.store(), &namespace, now)
+    }
+
+    #[test]
+    fn open_artifact_activity_requires_a_finite_idle_window_and_nonactive_status() {
+        let now = 100 * 3_600_000;
+        let old = now - 25 * 3_600_000;
+        assert_eq!(
+            open_session_activity_evidence(crate::SessionStatus::Idle, old, now, 24),
+            OpenSessionArtifactEvidence::Eligible
+        );
+        assert_eq!(
+            open_session_activity_evidence(crate::SessionStatus::Active, old, now, 24),
+            OpenSessionArtifactEvidence::Retain
+        );
+        assert_eq!(
+            open_session_activity_evidence(crate::SessionStatus::Idle, 0, now, 24),
+            OpenSessionArtifactEvidence::Unknown
+        );
+        assert_eq!(
+            open_session_activity_evidence(crate::SessionStatus::Idle, old, now, 0),
+            OpenSessionArtifactEvidence::Retain
+        );
+    }
+
+    #[test]
+    fn open_artifact_holder_check_ignores_shared_daemon_but_checks_task_identity() {
+        let table = crate::session_holder::ProcessTable::parse(
+            "100 1 Mon Oct 26 10:00:00 2026 /opt/codex app-server --managed-daemon\n\
+             200 1 Mon Oct 26 10:01:00 2026 /opt/codex exec task\n",
+        );
+        let no_holder = open_session_holder_evidence(None, Some(&table));
+        assert_eq!(no_holder, OpenSessionArtifactEvidence::Eligible);
+
+        let shared = crate::Event {
+            id: 1,
+            schema_version: 1,
+            ts: 1,
+            kind: crate::events::SESSION_HOLDER_BOUND.into(),
+            session_id: Some(1),
+            payload_json: Some(
+                r#"{"pid":100,"started":"Mon Oct 26 10:00:00 2026","command":"/opt/codex app-server --managed-daemon"}"#.into(),
+            ),
+        };
+        assert_eq!(
+            open_session_holder_evidence(Some(&shared), Some(&table)),
+            OpenSessionArtifactEvidence::Eligible
+        );
+
+        let task = crate::Event {
+            payload_json: Some(
+                r#"{"pid":200,"started":"Mon Oct 26 10:01:00 2026","command":"/opt/codex exec task"}"#.into(),
+            ),
+            ..shared.clone()
+        };
+        assert_eq!(
+            open_session_holder_evidence(Some(&task), Some(&table)),
+            OpenSessionArtifactEvidence::Retain
+        );
+        let recycled_pid = crate::Event {
+            payload_json: Some(
+                r#"{"pid":200,"started":"Mon Oct 26 09:01:00 2026","command":"/opt/codex exec task"}"#.into(),
+            ),
+            ..task
+        };
+        assert_eq!(
+            open_session_holder_evidence(Some(&recycled_pid), Some(&table)),
+            OpenSessionArtifactEvidence::Eligible
+        );
+        assert_eq!(
+            open_session_holder_evidence(Some(&shared), None),
+            OpenSessionArtifactEvidence::Unknown
+        );
+        let malformed = crate::Event {
+            payload_json: Some("{}".into()),
+            ..shared
+        };
+        assert_eq!(
+            open_session_holder_evidence(Some(&malformed), Some(&table)),
+            OpenSessionArtifactEvidence::Unknown
+        );
+    }
+
+    #[test]
+    fn open_artifact_resource_guard_requires_a_complete_unheld_inventory() {
+        let lease = crate::HostResourceLease {
+            lease_id: "lease".into(),
+            request_id: "request".into(),
+            repository: "owner/repo".into(),
+            worktree_fingerprint: "worktree".into(),
+            run_id: "run".into(),
+            generation: 1,
+            state: crate::HostLeaseState::Active,
+            holder_pid: None,
+            created_at: 1,
+            expires_at: i64::MAX,
+            released_at: None,
+            allocations: Vec::new(),
+        };
+        assert_eq!(
+            open_session_resource_evidence(Some(&[lease.clone()]), "worktree"),
+            OpenSessionArtifactEvidence::Retain
+        );
+        assert_eq!(
+            open_session_resource_evidence(Some(&[lease]), "other"),
+            OpenSessionArtifactEvidence::Eligible
+        );
+        assert_eq!(
+            open_session_resource_evidence(None, "worktree"),
+            OpenSessionArtifactEvidence::Unknown
+        );
     }
 
     #[test]
