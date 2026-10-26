@@ -766,7 +766,7 @@ fn session_scoped_reclaim_refuses_out_of_root_sessions_with_typed_json_error() {
         )
         .unwrap();
 
-    let read_bound_root = || {
+    let read_root_plan = || {
         let output = run_as_is(
             repo.path(),
             container.path(),
@@ -777,18 +777,29 @@ fn session_scoped_reclaim_refuses_out_of_root_sessions_with_typed_json_error() {
             "worktree-root: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["preferred_root"]
-            .as_str()
-            .map(PathBuf::from)
-            .unwrap()
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
     };
-    let binding_before = read_bound_root();
+    let root_identity = |plan: &serde_json::Value| {
+        (
+            plan["repository_root"].as_str().unwrap().to_owned(),
+            plan["repository_key"].as_str().unwrap().to_owned(),
+            plan["preferred_root"].as_str().map(str::to_owned),
+            plan["preferred_source"].as_str().map(str::to_owned),
+            plan["root_container"].as_str().map(str::to_owned),
+        )
+    };
+    let binding_before = read_root_plan();
+    let binding_identity_before = root_identity(&binding_before);
+    let bound_root = original_worktree.parent().unwrap().canonicalize().unwrap();
     assert_eq!(
-        binding_before.canonicalize().unwrap(),
-        container.path().canonicalize().unwrap()
+        PathBuf::from(binding_before["preferred_root"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        bound_root,
+        "the root plan matches the root that held the started worktree"
     );
     let has_reclaim_snapshot = || {
-        std::fs::read_dir(container.path())
+        std::fs::read_dir(&bound_root)
             .unwrap()
             .map(|entry| entry.unwrap())
             .any(|entry| {
@@ -850,7 +861,7 @@ fn session_scoped_reclaim_refuses_out_of_root_sessions_with_typed_json_error() {
         std::fs::read(&artifact).unwrap(),
         b"preserve this legacy cache\n"
     );
-    assert_eq!(read_bound_root(), binding_before);
+    assert_eq!(root_identity(&read_root_plan()), binding_identity_before);
     assert!(
         !has_reclaim_snapshot(),
         "unsupported scope must not create a plan"
