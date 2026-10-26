@@ -1377,12 +1377,22 @@ fn redacted_command(provider: OperationProvider, args: &[String]) -> Result<Stri
         "--raw-field",
         "--input",
     ];
+    // These two non-secret selectors are retained only for the exact
+    // allowlisted review-thread GraphQL mutations. The body stays redacted.
+    let retained_review_thread_fields = (provider == OperationProvider::Github)
+        .then(|| crate::gh_ref_guard::review_thread_mutation_fields(args))
+        .flatten()
+        .map(|(_, indices)| indices);
     let mut redacted = vec![provider_executable(provider).to_string()];
     let mut hide_next = false;
     let mut pending: Option<fn(&str) -> String> = None;
-    for arg in args {
+    for (index, arg) in args.iter().enumerate() {
         if hide_next {
-            redacted.push("[REDACTED]".into());
+            if retained_review_thread_fields.is_some_and(|fields| fields.contains(&index)) {
+                redacted.push(arg.clone());
+            } else {
+                redacted.push("[REDACTED]".into());
+            }
             hide_next = false;
             continue;
         }
@@ -1783,7 +1793,8 @@ impl Broker {
             Err(BrokerOpError::InvalidCoordinatedOperation {
                 reason: format!(
                     "refusing a gh command that may write a branch ref: {why}. Nothing was run. \
-                     Use the exact allowlisted `pr merge` or `api -X DELETE` form. An \
+                     Use the exact allowlisted `pr merge`, `api -X DELETE`, or review-thread \
+                     GraphQL form. An \
                      unverifiable write can be acknowledged with --destructive \
                      --ref-write-acknowledged only when no shared branch can be involved and the \
                      operator confirmed it touches no other live session's branch"

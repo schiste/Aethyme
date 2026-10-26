@@ -2,6 +2,272 @@
 
 use super::*;
 
+const REVIEW_THREAD_REPLY_USAGE: &str = "usage: aethyme broker advanced review-thread reply <thread-id> --session <id> --repo <owner/name> --pr <number> --message <text> --reason <text> [--no-wait|--queue-timeout <seconds>] [--json]";
+const REVIEW_THREAD_RESOLVE_USAGE: &str = "usage: aethyme broker advanced review-thread resolve <thread-id> --session <id> --repo <owner/name> --pr <number> --reason <text> [--no-wait|--queue-timeout <seconds>] [--json]";
+
+/// Construct only the GraphQL fields used by the two allowlisted mutations.
+fn review_thread_gh_args(query: &str, thread_id: &str, body: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "api".to_string(),
+        "--method".to_string(),
+        "POST".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("query={query}"),
+        "-f".to_string(),
+        format!("threadId={thread_id}"),
+    ];
+    if let Some(body) = body {
+        args.extend(["-f".to_string(), format!("body={body}")]);
+    }
+    args
+}
+
+fn review_thread_matches_target(
+    response: &serde_json::Value,
+    thread_id: &str,
+    repository: &str,
+    pull_request: i64,
+) -> bool {
+    let Some(node) = response.pointer("/data/node") else {
+        return false;
+    };
+    let Some(actual_repository) = node
+        .pointer("/pullRequest/repository/nameWithOwner")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    node.get("id").and_then(serde_json::Value::as_str) == Some(thread_id)
+        && node
+            .pointer("/pullRequest/number")
+            .and_then(serde_json::Value::as_i64)
+            == Some(pull_request)
+        && actual_repository.eq_ignore_ascii_case(repository)
+}
+
+fn validate_review_thread_target(
+    parsed: &Parsed,
+    thread_id: &str,
+    repository: &str,
+    pull_request: i64,
+    queue_wait: crate::QueueWait,
+) -> Result<(), UsageError> {
+    let session_id = parsed.session.expect("validated review-thread session");
+    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let report = broker
+        .run_coordinated_operation_with_wait(
+            crate::CoordinatedCommand {
+                session_id,
+                provider: crate::OperationProvider::Github,
+                repository: Some(repository.to_string()),
+                resolved_target: None,
+                scope: None,
+                declared_effect: None,
+                destructive_confirmed: false,
+                cross_session: None,
+                ref_write_acknowledged: false,
+                authorization_reason: None,
+                args: review_thread_gh_args(
+                    crate::gh_ref_guard::REVIEW_THREAD_LOOKUP_QUERY,
+                    thread_id,
+                    None,
+                ),
+            },
+            queue_wait,
+        )
+        .map_err(to_usage)?;
+    if !report.command_success || report.stdout_truncated || report.stderr_truncated {
+        return Err(UsageError::Message(format!(
+            "could not verify review thread {thread_id:?} against {repository}#{pull_request}: {}{}",
+            report.stderr,
+            if report.stderr_truncated {
+                " [stderr truncated]"
+            } else {
+                ""
+            }
+        )));
+    }
+    let response: serde_json::Value = serde_json::from_str(&report.stdout).map_err(|error| {
+        UsageError::Message(format!(
+            "could not parse the review-thread target response: {error}"
+        ))
+    })?;
+    if !review_thread_matches_target(&response, thread_id, repository, pull_request) {
+        return Err(UsageError::Exit {
+            message: format!(
+                "refusing to mutate review thread {thread_id:?}: it does not belong to {repository}#{pull_request}"
+            ),
+            code: crate::exit_status::REFUSED,
+        });
+    }
+    Ok(())
+}
+
+/// Reply to or resolve one exact GitHub review thread through the normal
+/// coordinated GitHub write lane. `gh_ref_guard` accepts only these two query
+/// shapes, and the operation lock is derived from the thread node ID.
+pub(super) fn run_review_thread(mut parsed: Parsed) -> Result<(), UsageError> {
+    let [action, thread_id] = parsed.positional.as_slice() else {
+        return Err(UsageError::Message(format!(
+            "review-thread needs `reply <thread-id>` or `resolve <thread-id>`\n{REVIEW_THREAD_REPLY_USAGE}\n{REVIEW_THREAD_RESOLVE_USAGE}"
+        )));
+    };
+    if !crate::gh_ref_guard::is_review_thread_node_id(thread_id) {
+        return Err(UsageError::Message(format!(
+            "review-thread ID must be a non-empty GitHub node ID\n{}",
+            if action == "resolve" {
+                REVIEW_THREAD_RESOLVE_USAGE
+            } else {
+                REVIEW_THREAD_REPLY_USAGE
+            }
+        )));
+    }
+    let (query, body) = match action.as_str() {
+        "reply" => {
+            let body = parsed.message.as_deref().ok_or_else(|| {
+                UsageError::Message(format!(
+                    "review-thread reply requires --message\n{REVIEW_THREAD_REPLY_USAGE}"
+                ))
+            })?;
+            if body.trim().is_empty() {
+                return Err(UsageError::Message(format!(
+                    "review-thread reply requires a non-empty --message\n{REVIEW_THREAD_REPLY_USAGE}"
+                )));
+            }
+            (crate::gh_ref_guard::REVIEW_THREAD_REPLY_QUERY, Some(body))
+        }
+        "resolve" => {
+            if parsed.message.is_some() {
+                return Err(UsageError::Message(format!(
+                    "review-thread resolve does not accept --message\n{REVIEW_THREAD_RESOLVE_USAGE}"
+                )));
+            }
+            (crate::gh_ref_guard::REVIEW_THREAD_RESOLVE_QUERY, None)
+        }
+        _ => {
+            return Err(UsageError::Message(format!(
+                "unknown review-thread action {action:?}; use `reply` or `resolve`\n{REVIEW_THREAD_REPLY_USAGE}\n{REVIEW_THREAD_RESOLVE_USAGE}"
+            )));
+        }
+    };
+    if parsed.session.is_none() || parsed.repository.is_none() || parsed.reason.is_none() {
+        return Err(UsageError::Message(format!(
+            "review-thread writes require --session, --repo, and --reason\n{}",
+            if action == "resolve" {
+                REVIEW_THREAD_RESOLVE_USAGE
+            } else {
+                REVIEW_THREAD_REPLY_USAGE
+            }
+        )));
+    }
+    let Some(pull_request) = parsed.pr_number.filter(|number| *number > 0) else {
+        return Err(UsageError::Message(format!(
+            "review-thread writes require a positive --pr number\n{}",
+            if action == "resolve" {
+                REVIEW_THREAD_RESOLVE_USAGE
+            } else {
+                REVIEW_THREAD_REPLY_USAGE
+            }
+        )));
+    };
+    let repository = parsed.repository.as_deref().expect("validated repository");
+    let queue_wait = match (parsed.no_wait, parsed.queue_timeout_seconds) {
+        (true, Some(_)) => {
+            return Err(UsageError::Message(
+                "--no-wait and --queue-timeout are mutually exclusive".into(),
+            ));
+        }
+        (true, None) => crate::QueueWait::Refuse,
+        (false, Some(seconds)) => crate::QueueWait::Seconds(seconds),
+        (false, None) => crate::QueueWait::Forever,
+    };
+    validate_review_thread_target(&parsed, thread_id, repository, pull_request, queue_wait)?;
+    parsed.exec_command = review_thread_gh_args(query, thread_id, body);
+    run_git_gh(parsed, "gh")
+}
+
+#[cfg(test)]
+mod review_thread_command_tests {
+    use super::*;
+
+    #[test]
+    fn generated_thread_commands_use_only_the_allowlisted_graphql_mutations() {
+        let lookup = review_thread_gh_args(
+            crate::gh_ref_guard::REVIEW_THREAD_LOOKUP_QUERY,
+            "PRRT_kwDOabc",
+            None,
+        );
+        let reply = review_thread_gh_args(
+            crate::gh_ref_guard::REVIEW_THREAD_REPLY_QUERY,
+            "PRRT_kwDOabc",
+            Some("reply text"),
+        );
+        let resolve = review_thread_gh_args(
+            crate::gh_ref_guard::REVIEW_THREAD_RESOLVE_QUERY,
+            "PRRT_kwDOabc",
+            None,
+        );
+        assert_eq!(
+            crate::classify_gh(&lookup),
+            Some(crate::OperationEffect::Read)
+        );
+        assert_eq!(
+            crate::gh_ref_guard::assess(&lookup, "o/r"),
+            crate::gh_ref_guard::Verdict::NoRefWrite
+        );
+        for args in [&reply, &resolve] {
+            assert_eq!(
+                crate::classify_gh(args),
+                Some(crate::OperationEffect::Write)
+            );
+            assert_eq!(
+                crate::gh_ref_guard::assess(args, "o/r"),
+                crate::gh_ref_guard::Verdict::SafeWrite
+            );
+        }
+    }
+
+    #[test]
+    fn thread_preflight_requires_the_exact_repository_and_pull_request() {
+        let response = serde_json::json!({
+            "data": {
+                "node": {
+                    "id": "PRRT_kwDOabc",
+                    "pullRequest": {
+                        "number": 42,
+                        "repository": { "nameWithOwner": "Owner/Repo" }
+                    }
+                }
+            }
+        });
+        assert!(review_thread_matches_target(
+            &response,
+            "PRRT_kwDOabc",
+            "owner/repo",
+            42
+        ));
+        assert!(!review_thread_matches_target(
+            &response,
+            "PRRT_other",
+            "owner/repo",
+            42
+        ));
+        assert!(!review_thread_matches_target(
+            &response,
+            "PRRT_kwDOabc",
+            "owner/other",
+            42
+        ));
+        assert!(!review_thread_matches_target(
+            &response,
+            "PRRT_kwDOabc",
+            "owner/repo",
+            7
+        ));
+    }
+}
+
 /// `broker review plan` -- evaluate the review policies against a change and
 /// print what they would do.
 ///

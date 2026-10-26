@@ -6,21 +6,24 @@
 //!
 //! - [`Verdict::NoRefWrite`]: the command and action are on a short list that
 //!   cannot write a branch ref, or the call is a `gh api` read whose every
-//!   token is on a read-only allowlist.
+//!   token is on a read-only allowlist, or the exact review-thread identity
+//!   lookup below.
 //! - [`Verdict::PrMerge`]: exactly `pr merge <N> (--merge|--squash|--rebase)
 //!   [-d|--delete-branch] [--match-head-commit <sha>]`, in any order, each at
 //!   most once and nothing else.
 //! - [`Verdict::DeleteBranch`]: exactly `api -X DELETE
 //!   repos/<owner>/<repo>/git/refs/heads/<branch>` for the target repository.
 //! - [`Verdict::SafeWrite`]: an exact `gh api -X POST|PATCH|DELETE` write to
-//!   one of a few comment, review, label and issue endpoints, which cannot
-//!   touch a git ref (see [`safe_write_endpoint`]).
+//!   one of a few comment, review, label and issue endpoints, or one of the
+//!   exact review-thread GraphQL mutations below, which cannot touch a git ref.
 //! - [`Verdict::Unverifiable`]: everything else. The caller refuses it when a
 //!   shared branch could be involved; operator acknowledgement cannot bypass
 //!   that protection.
 //!
 //! There is no fall-through that allows: every branch of [`assess`] that is
 //! not an exact match returns `Unverifiable`.
+
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Verdict {
@@ -41,8 +44,9 @@ pub(crate) enum Verdict {
     /// `release download [<tag>] [-p <pattern>]…`: files land in the working
     /// directory, which the caller requires to be the session worktree root.
     DownloadHere,
-    /// An exact `gh api` write to a comment, review, label or issue endpoint
-    /// of the target repository, which cannot touch a git ref.
+    /// An exact `gh api` write to a comment, review, label or issue endpoint,
+    /// or an allowlisted review-thread GraphQL mutation, which cannot touch a
+    /// git ref.
     SafeWrite,
     Unverifiable(String),
 }
@@ -432,7 +436,140 @@ fn is_safe_write(tokens: &[&str], repository: &str) -> bool {
     })
 }
 
+/// The only GraphQL mutations Aethyme supports for review-thread conversations.
+/// Keep these queries exact: GraphQL can perform unrelated writes, including
+/// ref updates, in the same request.
+pub(crate) const REVIEW_THREAD_REPLY_QUERY: &str = "mutation($threadId: ID!, $body: String!) { addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $threadId, body: $body}) { comment { id } } }";
+pub(crate) const REVIEW_THREAD_RESOLVE_QUERY: &str = "mutation($threadId: ID!) { resolveReviewThread(input: {threadId: $threadId}) { thread { id isResolved } } }";
+pub(crate) const REVIEW_THREAD_LOOKUP_QUERY: &str = "query($threadId: ID!) { node(id: $threadId) { ... on PullRequestReviewThread { id pullRequest { number repository { nameWithOwner } } } } }";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewThreadRequestKind {
+    Lookup,
+    Reply,
+    Resolve,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReviewThreadRequest<'a> {
+    kind: ReviewThreadRequestKind,
+    thread_id: &'a str,
+    query_value_index: usize,
+    thread_id_value_index: usize,
+}
+
+/// IDs are used as GraphQL variables and are retained as opaque, single-token
+/// values for lock-scope recovery.
+pub(crate) fn is_review_thread_node_id(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+/// Parse an exact review-thread lookup or mutation from the arguments after
+/// `gh api`. Unknown flags, extra GraphQL fields and additional mutations
+/// remain unverifiable.
+fn parse_review_thread_request(tokens: &[&str]) -> Option<ReviewThreadRequest<'_>> {
+    let mut method = None;
+    let mut endpoint = None;
+    let mut query: Option<(&str, usize)> = None;
+    let mut thread_id: Option<(&str, usize)> = None;
+    let mut body = None;
+    let mut index = 0;
+
+    while index < tokens.len() {
+        let token = tokens[index];
+        index += 1;
+        match token {
+            "-X" | "--method" if method.is_none() => {
+                method = Some(tokens.get(index).copied()?);
+                index += 1;
+            }
+            "-f" | "-F" => {
+                let value_index = index;
+                let field = *tokens.get(index)?;
+                index += 1;
+                let (name, value) = field.split_once('=')?;
+                // `-F key=@file` reads outside this command's reviewed input.
+                if token == "-F" && value.starts_with('@') {
+                    return None;
+                }
+                match name {
+                    "query" if query.is_none() => query = Some((value, value_index)),
+                    "threadId" if thread_id.is_none() => thread_id = Some((value, value_index)),
+                    "body" if body.is_none() => body = Some(value),
+                    _ => return None,
+                }
+            }
+            _ if token.starts_with('-') => return None,
+            _ if endpoint.is_none() => endpoint = Some(token),
+            _ => return None,
+        }
+    }
+
+    if method? != "POST" || endpoint? != "graphql" {
+        return None;
+    }
+    let (query, query_value_index) = query?;
+    let (thread_id, thread_id_value_index) = thread_id?;
+    if !is_review_thread_node_id(thread_id) {
+        return None;
+    }
+    let kind = match (query, body.is_some()) {
+        (REVIEW_THREAD_LOOKUP_QUERY, false) => ReviewThreadRequestKind::Lookup,
+        (REVIEW_THREAD_REPLY_QUERY, true) => ReviewThreadRequestKind::Reply,
+        (REVIEW_THREAD_RESOLVE_QUERY, false) => ReviewThreadRequestKind::Resolve,
+        _ => return None,
+    };
+    Some(ReviewThreadRequest {
+        kind,
+        thread_id,
+        query_value_index,
+        thread_id_value_index,
+    })
+}
+
+fn parsed_review_thread_request(args: &[String]) -> Option<ReviewThreadRequest<'_>> {
+    let tokens: Vec<&str> = args.iter().map(String::as_str).collect();
+    let ["api", rest @ ..] = tokens.as_slice() else {
+        return None;
+    };
+    parse_review_thread_request(rest)
+}
+
+pub(crate) fn is_review_thread_lookup(args: &[String]) -> bool {
+    parsed_review_thread_request(args)
+        .is_some_and(|request| request.kind == ReviewThreadRequestKind::Lookup)
+}
+
+/// Safe scope and the two non-secret GraphQL field values retained in the
+/// durable journal so a crashed operation's scope can be recomputed. Reply
+/// bodies are still redacted.
+pub(crate) fn review_thread_mutation_fields(args: &[String]) -> Option<(String, [usize; 2])> {
+    let parsed = parsed_review_thread_request(args)?;
+    if parsed.kind == ReviewThreadRequestKind::Lookup {
+        return None;
+    }
+    Some((
+        parsed.thread_id.to_string(),
+        [
+            parsed.query_value_index + 1,
+            parsed.thread_id_value_index + 1,
+        ],
+    ))
+}
+
+pub(crate) fn review_thread_resource_scope(args: &[String]) -> Option<String> {
+    let (thread_id, _) = review_thread_mutation_fields(args)?;
+    let digest = format!("{:x}", Sha256::digest(thread_id.as_bytes()));
+    Some(format!("pull/review-thread/{digest}"))
+}
+
 fn assess_api(tokens: &[&str], repository: &str) -> Verdict {
+    if let Some(request) = parse_review_thread_request(tokens) {
+        return match request.kind {
+            ReviewThreadRequestKind::Lookup => Verdict::NoRefWrite,
+            ReviewThreadRequestKind::Reply | ReviewThreadRequestKind::Resolve => Verdict::SafeWrite,
+        };
+    }
     if is_safe_write(tokens, repository) {
         return Verdict::SafeWrite;
     }
@@ -520,6 +657,61 @@ mod tests {
 
     fn unverifiable_line(line: &[&str]) -> bool {
         matches!(assess_line(line), Verdict::Unverifiable(_))
+    }
+
+    fn review_thread_call(query: &str, thread_id: &str, body: Option<&str>) -> Vec<String> {
+        let mut args = vec![
+            "api".to_string(),
+            "--method".to_string(),
+            "POST".to_string(),
+            "graphql".to_string(),
+            "-f".to_string(),
+            format!("query={query}"),
+            "-f".to_string(),
+            format!("threadId={thread_id}"),
+        ];
+        if let Some(body) = body {
+            args.extend(["-f".to_string(), format!("body={body}")]);
+        }
+        args
+    }
+
+    #[test]
+    fn only_exact_review_thread_graphql_mutations_are_safe_writes() {
+        let lookup = review_thread_call(REVIEW_THREAD_LOOKUP_QUERY, "PRRT_kwDOabc", None);
+        let reply = review_thread_call(
+            REVIEW_THREAD_REPLY_QUERY,
+            "PRRT_kwDOabc",
+            Some("Thanks for the review"),
+        );
+        let resolve = review_thread_call(REVIEW_THREAD_RESOLVE_QUERY, "PRRT_kwDOabc", None);
+        assert_eq!(assess(&lookup, "o/n"), Verdict::NoRefWrite);
+        assert!(is_review_thread_lookup(&lookup));
+        assert!(matches!(assess(&reply, "o/n"), Verdict::SafeWrite));
+        assert!(matches!(assess(&resolve, "o/n"), Verdict::SafeWrite));
+
+        for unsafe_call in [
+            review_thread_call(
+                "mutation { createRef(input: {}) { ref { id } } }",
+                "PRRT_kwDOabc",
+                None,
+            ),
+            review_thread_call(REVIEW_THREAD_REPLY_QUERY, "PRRT kwDOabc", Some("reply")),
+            review_thread_call(REVIEW_THREAD_REPLY_QUERY, "PRRT_kwDOabc", None),
+            review_thread_call(REVIEW_THREAD_RESOLVE_QUERY, "PRRT_kwDOabc", Some("extra")),
+        ] {
+            assert!(
+                matches!(assess(&unsafe_call, "o/n"), Verdict::Unverifiable(_)),
+                "unexpectedly accepted {unsafe_call:?}"
+            );
+        }
+
+        let mut extra_field = reply;
+        extra_field.extend(["-f".to_string(), "pullRequestId=PR_kwDOabc".to_string()]);
+        assert!(matches!(
+            assess(&extra_field, "o/n"),
+            Verdict::Unverifiable(_)
+        ));
     }
 
     #[test]

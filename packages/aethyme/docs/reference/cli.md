@@ -630,6 +630,8 @@ a reason.
 - `aethyme broker advanced review unlock --session <id> [--json]`
 - `aethyme broker advanced review reassign --session <closed-id> --to-session <live-id> --reason <text> [--json]`
 - `aethyme broker advanced review abandon --session <id> --reason <text> [--json]`
+- `aethyme broker advanced review-thread reply <thread-id> --session <id> --repo <owner/name> --pr <number> --message <text> --reason <text> [--no-wait|--queue-timeout <seconds>] [--json]`
+- `aethyme broker advanced review-thread resolve <thread-id> --session <id> --repo <owner/name> --pr <number> --reason <text> [--no-wait|--queue-timeout <seconds>] [--json]`
 - `aethyme broker advanced queue history [--limit <n>] [--before <id>] [--json]`
 - `aethyme broker advanced queue [--json]` (compatibility full-inventory view)
 - `aethyme broker advanced exposures plan [--json]`
@@ -2681,6 +2683,25 @@ available but mutations fail before provider access. Continue with
 only when the live session is at the exact bound commit. Otherwise use
 `review abandon --session <closed-id> --reason <text>` to retain the audit
 record while freeing the pull request for a fresh registration.
+
+Inline review-thread conversations use a separate coordinated surface:
+
+```bash
+aethyme broker advanced review-thread reply PRRT_kwDO... \
+  --session 111 --repo owner/name --pr 42 \
+  --message "Fixed in the latest commit." --reason "Address review feedback"
+aethyme broker advanced review-thread resolve PRRT_kwDO... \
+  --session 111 --repo owner/name --pr 42 --reason "Fix verified"
+```
+
+The broker looks up the supplied thread ID first and refuses unless its
+repository and pull request match `--repo` and `--pr`. Replies and resolution
+use exact allowlisted GraphQL mutations and serialize on that thread's
+coordinated-operation scope. The durable journal retains the query and thread
+ID to recover the scope after a restart, while redacting the reply body.
+Arbitrary GraphQL calls remain unverifiable and refused. These commands manage
+inline conversation only; the `review` commands above manage review requests
+and validation state.
 
 Authenticated `review_changes_requested` and `review_approved` external events
 advance the approval-backed lifecycle only when their repository, PR, and

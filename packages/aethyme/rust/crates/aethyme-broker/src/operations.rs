@@ -837,7 +837,8 @@ pub struct CoordinatedCommand {
     /// Broker-resolved identity for an internal remote Git workflow. This is
     /// distinct from the caller's `--repo owner/name` assertion.
     pub resolved_target: Option<crate::ResolvedRemoteTarget>,
-    /// Audit scope. V1 deliberately locks the whole repository regardless.
+    /// Optional audit label. The coordination lock is derived independently
+    /// from the command arguments and cannot be narrowed by this value.
     pub scope: Option<String>,
     pub declared_effect: Option<OperationEffect>,
     pub destructive_confirmed: bool,
@@ -2814,6 +2815,9 @@ fn gh_method(args: &[String]) -> Option<&str> {
 pub fn classify_gh(args: &[String]) -> Option<OperationEffect> {
     let command = args.first()?.as_str();
     let action = args.get(1).map(String::as_str);
+    if command == "api" && crate::gh_ref_guard::is_review_thread_lookup(args) {
+        return Some(OperationEffect::Read);
+    }
     // The two exact forms `gh_ref_guard` resolves to a branch delete are
     // destructive; anything else that may write a ref is refused by the
     // guard unless acknowledged (#393).
@@ -2962,14 +2966,17 @@ fn resource_lock_scope(provider: OperationProvider, args: &[String]) -> Option<S
 
 /// Resource scope for the `gh api` spelling of a comment or review write.
 ///
-/// Only the exact six-segment collection endpoints qualify. A longer path
-/// reaches something else (a reaction, a single comment's replies), and a
-/// shorter one is a collection this has no opinion about.
+/// Only exact six-segment REST collection endpoints and the two allowlisted
+/// single-thread GraphQL mutations qualify. Other paths and GraphQL queries
+/// remain repository-scoped.
 fn api_resource_scope(args: &[String]) -> Option<String> {
     let path = first_positional(args.get(1..)?)?;
     // A query string addresses the same resource; anything after `?` only
     // filters or paginates it.
     let path = path.split('?').next()?.trim_matches('/');
+    if path == "graphql" {
+        return crate::gh_ref_guard::review_thread_resource_scope(args);
+    }
     let segments: Vec<&str> = path.split('/').collect();
     if segments.len() != 6 || segments[0] != "repos" {
         return None;
@@ -3001,8 +3008,9 @@ fn coordination_lock_key(repository: &str, resource: Option<&str>) -> String {
 
 /// Recompute a recorded operation's resource scope from its stored command.
 ///
-/// `redacted_command` hides flag *values* only, so every operand this reads
-/// survives redaction. Recomputing beats trusting the stored `scope` column:
+/// `redacted_command` preserves the exact allowlisted thread query and ID, so
+/// every operand this reads survives redaction. Recomputing beats trusting the
+/// stored `scope` column:
 /// that column accepts a caller-declared string, and a caller must never be
 /// able to name its way out of the repository lock.
 fn stored_resource_scope(operation: &CoordinatedOperation) -> Option<String> {

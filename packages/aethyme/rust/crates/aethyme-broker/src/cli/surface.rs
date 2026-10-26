@@ -102,6 +102,10 @@ pub const ADVANCED_VERBS: &[(&str, &str)] = &[
     ),
     ("ship", "plan or execute a reviewed full-SHA publication"),
     ("review", "plan, run, record and route pull request reviews"),
+    (
+        "review-thread",
+        "reply to or resolve one inline pull request review thread",
+    ),
     ("gates", "validate, draft, scope, run and diagnose gates"),
     ("hooks", "install, remove or inspect the managed git hooks"),
     (
