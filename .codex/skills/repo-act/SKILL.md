@@ -398,6 +398,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   and required-measurement errors as incomplete. Do not silently skip unknown
   entries or substitute zero for a failed measurement; keep partial findings
   useful for diagnosis, but do not use them as complete evidence downstream.
+  Checkpoint completed roots during long multi-root scans. A root can disappear
+  after discovery: record that as incomplete and continue without discarding
+  earlier totals. Exercise a missing-root control before a long live scan.
 - Keep authoritative frozen plans, validation helpers, inputs and receipts on
   durable storage before execution; use temporary directories for scratch only.
   Before a long validation, choose a unique durable output directory outside

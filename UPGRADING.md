@@ -32,8 +32,8 @@ Ignored directories are disposable by default
 Every Git-ignored directory inside a broker session checkout is now eligible for
 disposal when the checkout otherwise passes ownership, delivery, source-cleanliness
 and liveness checks. This includes ignored datasets, saved session records and
-unknown folders, regardless of their names or nested contents. Standalone ignored
-files outside recognized output roots remain protected.
+unknown folders, regardless of their names or nested contents. Unknown standalone ignored
+files outside recognized artifact or broker-runtime paths remain protected.
 
 ### Migrate and verify
 
