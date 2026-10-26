@@ -331,9 +331,11 @@ const PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after an ed
 
 Other agents may be working in sibling worktrees.
 
-Before starting or delegating a shared CI or generated-file fix, check
-`aethyme broker status --json` and open PRs on the affected paths.
-Coordinate with the owning session before duplicating its work.
+For routine coordination, use `aethyme broker status --compact --json`.
+It groups advice and reports deferred checks as unknown. Use full
+`aethyme broker status --json` when exact session or lease-path evidence is
+needed. Open PRs on affected paths and coordinate with the owning session
+before duplicating work.
 
 1. `aethyme broker start --task "<task>"`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
@@ -361,9 +363,11 @@ const NON_PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after a
 
 Other agents may be working in sibling worktrees.
 
-Before starting or delegating a shared CI or generated-file fix, check
-`aethyme broker status --json` and open PRs on the affected paths.
-Coordinate with the owning session before duplicating its work.
+For routine coordination, use `aethyme broker status --compact --json`.
+It groups advice and reports deferred checks as unknown. Use full
+`aethyme broker status --json` when exact session or lease-path evidence is
+needed. Open PRs on affected paths and coordinate with the owning session
+before duplicating work.
 
 1. `aethyme broker start --task "<task>" [--short-name "<label>"]`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
@@ -427,7 +431,7 @@ broker. Other agents may be working in sibling worktrees right now. The
 check the paired runtime with `aethyme --version` and
 `aethyme-engine-cli --version`.
 Before starting or delegating a fix for shared CI failures or generated
-files, check `aethyme broker status --json` and open PRs on the affected
+files, use `aethyme broker status --compact --json` and open PRs on affected
 paths. Read the matching task, claimed paths and PR diff even when the graph
 is unavailable. Coordinate with the owning session before starting duplicate
 work; use `aethyme broker advanced note send --to-session <id>` for a broker
@@ -449,9 +453,20 @@ blocked.
    isolated broker worktree, and work from that checkout:
 
    ```bash
-   aethyme broker status --json    # who is working on what
+   aethyme broker status --compact --json  # concise coordination summary
    aethyme broker start --task "<your task>" --short-name "<short name>" --path <planned-path>
    ```
+
+   Routine status groups repeated advice categories, reports deferred checks
+   as unknown, and omits per-session evidence and lease paths. Use full
+   `aethyme broker status --json` when you need exact session, lease-path or
+   evidence detail before deciding what to edit. A deferred check is not a
+   clean result.
+
+   If the execution tool reports the start command is still running, poll
+   that same command to completion before retrying; a pending result does not
+   mean it failed. Before editing, confirm the session's reported repository
+   and worktree root match the repository you intended.
 
    `cd` into the reported worktree before editing. If you are already in a
    dedicated worktree, use
@@ -464,8 +479,8 @@ blocked.
    Repeat `--path` for every file or trailing-slash directory known up front.
    The broker validates the whole set first, then creates the session plus
    explicit leases atomically. Omit `--path` only when no target is known yet.
-   If `status` shows another session holding leases on the files you plan
-   to change, prefer working elsewhere first or say so in your report —
+   If full `status --json` shows another session holding leases on the files
+   you plan to change, prefer working elsewhere first or say so in your report —
    overlapping edits will conflict at merge time.
    When you edit a file another live session is changing, the broker tells you
    in context who, where and whether Git would conflict, never blocking the
@@ -1054,6 +1069,8 @@ mod tests {
         let doc = render_agents_document(Some(&repo)).unwrap();
         for needle in [
             "## Broker Coordination: before and after an edit",
+            "`aethyme broker status --compact --json`",
+            "`aethyme broker status --json` when exact session or lease-path evidence is",
             "`aethyme broker start --task \"<task>\" [--short-name \"<label>\"]`",
             "work only in the worktree it\n   reports",
             "follow the working agreement it prints.",
@@ -1084,6 +1101,13 @@ mod tests {
         // What left the root file lives in the reference, in current spellings.
         let reference = render_broker_reference();
         for moved in [
+            "aethyme broker status --compact --json",
+            "Routine status groups repeated advice categories",
+            "`aethyme broker status --json` when you need exact session, lease-path or",
+            "start command is still running",
+            "that same command to completion before retrying",
+            "session's reported repository",
+            "worktree root match the repository you intended",
             "aethyme broker status --json",
             "--path <planned-path>",
             "aethyme broker start --adopt --task",
@@ -1156,6 +1180,8 @@ mod tests {
         let doc = render_agents_document(Some(&repo)).unwrap();
         for needle in [
             "## Broker Coordination: before and after an edit",
+            "`aethyme broker status --compact --json`",
+            "`aethyme broker status --json` when exact session or lease-path evidence is",
             "Commit early and small, and after each commit run\n   `aethyme broker push --session <id>`",
             "open a draft PR with `aethyme broker push --session <id> --pr`",
             "keep pushing until it is ready. Run `aethyme broker sync --session <id>`\n   before resuming a reused session and whenever push reports the branch is\n   behind the default branch. Never leave work only in the worktree.",
@@ -1194,9 +1220,9 @@ mod tests {
                 "{tag}: missing the working-agreement pointer:\n{doc}"
             );
             for required in [
-                "Before starting or delegating a shared CI or generated-file fix",
-                "`aethyme broker status --json` and open PRs on the affected paths.",
-                "Coordinate with the owning session before duplicating its work.",
+                "For routine coordination, use `aethyme broker status --compact --json`.",
+                "`aethyme broker status --json` when exact session or lease-path evidence is",
+                "Open PRs on affected paths and coordinate with the owning session\nbefore duplicating work.",
             ] {
                 assert!(
                     doc.contains(required),
