@@ -467,7 +467,7 @@ pub(crate) fn is_review_thread_node_id(value: &str) -> bool {
 /// Parse an exact review-thread lookup or mutation from the arguments after
 /// `gh api`. Unknown flags, extra GraphQL fields and additional mutations
 /// remain unverifiable.
-fn parse_review_thread_request(tokens: &[&str]) -> Option<ReviewThreadRequest<'_>> {
+fn parse_review_thread_request<'a>(tokens: &[&'a str]) -> Option<ReviewThreadRequest<'a>> {
     let mut method = None;
     let mut endpoint = None;
     let mut query: Option<(&str, usize)> = None;
