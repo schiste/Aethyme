@@ -516,6 +516,8 @@ blocked.
    preserve every path or fail closed. Do not use a parser that silently drops
    newline or non-UTF-8 paths; use lossless NUL-delimited bytes and reject paths
    the consumer cannot represent.
+   Treat the proof as a complete literal Git path census plus committed file
+   type and mode evidence; diff-rendering settings are not source identity.
 
    Orchestration with no path -- a release, a merge chain -- is claimed by
    name instead: `aethyme broker advanced ownership claim "release v1.2.0"

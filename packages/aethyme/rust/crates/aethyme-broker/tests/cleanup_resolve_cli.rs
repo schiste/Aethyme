@@ -375,6 +375,78 @@ fn a_stale_digest_is_refused_and_nothing_moves() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_permission_mode_change_after_review_invalidates_the_plan() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = repo();
+    let (id, worktree) = closed_session(tmp.path(), "mode-change fixture");
+    let executable = worktree.join("tool.sh");
+    std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o751)).unwrap();
+
+    let reviewed = plan(tmp.path(), &id);
+    assert_eq!(reviewed["untracked_files"][0]["mode"], 0o751);
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let refused = apply(tmp.path(), &id, reviewed["digest"].as_str().unwrap());
+    assert!(!refused.status.success());
+    assert!(json_error::message(&refused).contains("digest"));
+    assert!(worktree.is_dir());
+    assert!(executable.is_file());
+    assert!(archive_entries(&archive_root(tmp.path(), &reviewed)).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_untracked_executable_mode_survives_archive_and_documented_restore() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = repo();
+    let (id, worktree) = closed_session(tmp.path(), "executable restore fixture");
+    let executable = worktree.join("tool.sh");
+    std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o751)).unwrap();
+    let reviewed = plan(tmp.path(), &id);
+    let outcome = json(&apply(
+        tmp.path(),
+        &id,
+        reviewed["digest"].as_str().unwrap(),
+    ));
+    let archive = PathBuf::from(outcome["archive"].as_str().unwrap());
+    assert_eq!(
+        std::fs::metadata(archive.join("untracked/tool.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o751
+    );
+
+    let restored = tempfile::tempdir().unwrap();
+    git(
+        restored.path(),
+        &["clone", "-q", &tmp.path().to_string_lossy(), "."],
+    );
+    let copied = Command::new("cp")
+        .args(["-pR"])
+        .arg(archive.join("untracked/."))
+        .arg(".")
+        .current_dir(restored.path())
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    assert_eq!(
+        std::fs::metadata(restored.path().join("tool.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o751
+    );
+}
+
 #[test]
 fn protected_ignored_file_alone_is_archived_before_removal() {
     let tmp = repo();
