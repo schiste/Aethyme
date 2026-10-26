@@ -7477,10 +7477,10 @@ impl Broker {
     ) -> Result<CreatedSessionWorktree, BrokerOpError> {
         let refresh = self.refresh_default_branch_before_start();
         refresh.require_fresh_implicit_base(explicit_base)?;
-        // Verify-only sessions start from the fetched default branch either
-        // way; advancing a disposable integration here keeps it from feeding
-        // a stale copy of main to this session's submit and finish (#352).
-        self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Start);
+        // Allocation needs a fresh base, not integration maintenance. In
+        // verify-only mode selection below already uses the fetched default.
+        // Reconciling here reads historical promotions and can wait on an
+        // unrelated writer; submit and sync refresh integration themselves.
         let selected_promote = crate::merge::PromoteConfig::load(&self.main_root);
         let mut start_base =
             self.select_session_start_base_with_promote(explicit_base, &selected_promote)?;
