@@ -46,6 +46,7 @@
 //!   about content, and letting it be declared would make the check ceremonial.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 
@@ -59,6 +60,7 @@ pub const REPRESENTATION_PLAN_SCHEMA_VERSION: u32 = 1;
 /// A search that hits the cap reports itself truncated and skips the
 /// patch-equivalence tier, whose cost grows with the same history.
 pub const DEFAULT_SEARCH_CAP: usize = 2_000;
+const LANDING_SEARCH_ALGORITHM_VERSION: u8 = 1;
 
 /// The net content a session produced.
 ///
@@ -526,6 +528,72 @@ pub enum LandingVerdict {
     },
 }
 
+/// The search behavior that a cached verdict answers. Keeping the cap and
+/// algorithm version in the key prevents a result from a narrower or changed
+/// search from answering a different query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LandingSearchProfile {
+    candidate_cap: usize,
+    algorithm_version: u8,
+}
+
+impl Default for LandingSearchProfile {
+    fn default() -> Self {
+        Self {
+            candidate_cap: DEFAULT_SEARCH_CAP,
+            algorithm_version: LANDING_SEARCH_ALGORITHM_VERSION,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct LandingCacheKey {
+    repository_root: PathBuf,
+    head: String,
+    source_base: Option<String>,
+    target: String,
+    profile: LandingSearchProfile,
+}
+
+/// Complete immutable history verdicts scoped to one broker command. This is
+/// intentionally not stored on `Broker` or persisted: callers create it for a
+/// plan/audit invocation and pass it only through that invocation.
+#[derive(Debug, Default)]
+pub(crate) struct LandingVerdictCache {
+    verdicts: BTreeMap<LandingCacheKey, LandingVerdict>,
+    #[cfg(test)]
+    hits: usize,
+}
+
+impl LandingVerdictCache {
+    fn get(&mut self, key: &LandingCacheKey) -> Option<LandingVerdict> {
+        let verdict = self.verdicts.get(key).cloned();
+        #[cfg(test)]
+        if verdict.is_some() {
+            self.hits += 1;
+        }
+        verdict
+    }
+
+    fn insert_complete(&mut self, key: LandingCacheKey, verdict: &LandingVerdict) {
+        if matches!(
+            verdict,
+            LandingVerdict::Landed { .. }
+                | LandingVerdict::NotLanded {
+                    truncated: false,
+                    ..
+                }
+        ) {
+            self.verdicts.insert(key, verdict.clone());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hits(&self) -> usize {
+        self.hits
+    }
+}
+
 impl LandingVerdict {
     pub fn is_landed(&self) -> bool {
         matches!(self, LandingVerdict::Landed { .. })
@@ -569,6 +637,82 @@ pub fn work_landed_within(
     target: &str,
     deadline: Option<std::time::Instant>,
 ) -> Result<LandingVerdict, BrokerOpError> {
+    work_landed_with_profile(
+        repo,
+        head,
+        target,
+        LandingSearchProfile::default(),
+        deadline,
+    )
+}
+
+/// Reuse a complete verdict for an exact immutable commit pair and search
+/// profile. Non-OID inputs use the ordinary path without caching; cleanup
+/// callers pass full commit OIDs captured from their target snapshots.
+pub(crate) fn work_landed_with_cache(
+    repo: &GitRepo,
+    head: &str,
+    target: &str,
+    deadline: Option<std::time::Instant>,
+    profile: LandingSearchProfile,
+    cache: &mut LandingVerdictCache,
+) -> Result<LandingVerdict, BrokerOpError> {
+    let (Some(head_oid), Some(target_oid)) = (full_commit_oid(head), full_commit_oid(target))
+    else {
+        return work_landed_with_profile(repo, head, target, profile, deadline);
+    };
+    let repository_root = repo.root().to_path_buf();
+
+    if repo.is_ancestor(&head_oid, &target_oid) {
+        let key = LandingCacheKey {
+            repository_root,
+            head: head_oid,
+            source_base: None,
+            target: target_oid,
+            profile,
+        };
+        if let Some(verdict) = cache.get(&key) {
+            return Ok(verdict);
+        }
+        let verdict = LandingVerdict::Landed {
+            evidence: LandingEvidence::Ancestry,
+            landed_by: None,
+        };
+        cache.insert_complete(key, &verdict);
+        return Ok(verdict);
+    }
+
+    let base = landing_base(repo, &head_oid, &target_oid)?;
+    let key = LandingCacheKey {
+        repository_root,
+        head: head_oid.clone(),
+        source_base: Some(base.clone()),
+        target: target_oid.clone(),
+        profile,
+    };
+    if let Some(verdict) = cache.get(&key) {
+        return Ok(verdict);
+    }
+
+    let verdict = work_landed_from_base(repo, &head_oid, &target_oid, &base, profile, deadline)?;
+    cache.insert_complete(key, &verdict);
+    Ok(verdict)
+}
+
+fn full_commit_oid(value: &str) -> Option<String> {
+    matches!(value.len(), 40 | 64)
+        .then_some(value)
+        .filter(|value| value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+}
+
+fn work_landed_with_profile(
+    repo: &GitRepo,
+    head: &str,
+    target: &str,
+    profile: LandingSearchProfile,
+    deadline: Option<std::time::Instant>,
+) -> Result<LandingVerdict, BrokerOpError> {
     if repo.is_ancestor(head, target) {
         return Ok(LandingVerdict::Landed {
             evidence: LandingEvidence::Ancestry,
@@ -576,8 +720,19 @@ pub fn work_landed_within(
         });
     }
     let base = landing_base(repo, head, target)?;
-    let content = session_content(repo, &base, head)?;
-    let search = find_landing_within(repo, &content, target, DEFAULT_SEARCH_CAP, deadline)?;
+    work_landed_from_base(repo, head, target, &base, profile, deadline)
+}
+
+fn work_landed_from_base(
+    repo: &GitRepo,
+    head: &str,
+    target: &str,
+    base: &str,
+    profile: LandingSearchProfile,
+    deadline: Option<std::time::Instant>,
+) -> Result<LandingVerdict, BrokerOpError> {
+    let content = session_content(repo, base, head)?;
+    let search = find_landing_within(repo, &content, target, profile.candidate_cap, deadline)?;
     Ok(match search.outcome {
         LandingOutcome::NothingToRepresent => LandingVerdict::Landed {
             evidence: LandingEvidence::NoNetChange,
@@ -666,6 +821,28 @@ mod tests {
         let base = commit(tmp.path(), "base");
         let repo = GitRepo::discover(tmp.path()).unwrap();
         (tmp, repo, base)
+    }
+
+    fn cached_landing_fixture() -> (tempfile::TempDir, GitRepo, String, String, String) {
+        let (tmp, repo, base) = seeded();
+        git(tmp.path(), &["checkout", "-q", "-b", "session"]);
+        write(tmp.path(), "landed.txt", "session content\n");
+        let head = commit(tmp.path(), "session content");
+
+        git(tmp.path(), &["checkout", "-q", "-b", "alternative", &base]);
+        write(tmp.path(), "alternative.txt", "unrelated target\n");
+        let alternative_target = commit(tmp.path(), "unrelated target");
+
+        git(tmp.path(), &["checkout", "-q", "main"]);
+        for index in 0..3 {
+            write(tmp.path(), &format!("filler-{index}.txt"), "filler\n");
+            if index == 2 {
+                write(tmp.path(), "landed.txt", "session content\n");
+            }
+            commit(tmp.path(), &format!("main candidate {index}"));
+        }
+        let landed_target = git(tmp.path(), &["rev-parse", "HEAD"]);
+        (tmp, repo, head, landed_target, alternative_target)
     }
 
     #[test]
@@ -938,6 +1115,143 @@ mod tests {
             matches!(&error, BrokerOpError::RepresentationUnavailable { reason } if reason.contains("time budget")),
             "{error}"
         );
+    }
+
+    #[test]
+    fn landing_verdict_cache_reuses_only_complete_exact_pair_and_profile() {
+        let (_tmp, repo, head, landed_target, alternative_target) = cached_landing_fixture();
+        let mut cache = LandingVerdictCache::default();
+        let narrow = LandingSearchProfile {
+            candidate_cap: 1,
+            ..LandingSearchProfile::default()
+        };
+        let truncated =
+            work_landed_with_cache(&repo, &head, &landed_target, None, narrow, &mut cache).unwrap();
+        assert!(matches!(
+            truncated,
+            LandingVerdict::NotLanded {
+                truncated: true,
+                ..
+            }
+        ));
+        assert!(
+            cache.verdicts.is_empty(),
+            "truncated negatives are not cached"
+        );
+
+        let repeated_truncated =
+            work_landed_with_cache(&repo, &head, &landed_target, None, narrow, &mut cache).unwrap();
+        assert!(matches!(
+            repeated_truncated,
+            LandingVerdict::NotLanded {
+                truncated: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            cache.hits(),
+            0,
+            "the incomplete result must be searched again"
+        );
+
+        let profile = LandingSearchProfile {
+            candidate_cap: 10,
+            ..LandingSearchProfile::default()
+        };
+        let landed =
+            work_landed_with_cache(&repo, &head, &landed_target, None, profile, &mut cache)
+                .unwrap();
+        assert!(matches!(
+            &landed,
+            LandingVerdict::Landed {
+                evidence: LandingEvidence::Content,
+                ..
+            }
+        ));
+        assert_eq!(cache.hits(), 0);
+
+        let other_profile = LandingSearchProfile {
+            candidate_cap: 11,
+            ..LandingSearchProfile::default()
+        };
+        let same_evidence_different_profile = work_landed_with_cache(
+            &repo,
+            &head,
+            &landed_target,
+            None,
+            other_profile,
+            &mut cache,
+        )
+        .unwrap();
+        assert_eq!(same_evidence_different_profile, landed);
+        assert_eq!(
+            cache.hits(),
+            0,
+            "a different search profile must not reuse the verdict"
+        );
+
+        assert_eq!(
+            work_landed_with_cache(&repo, &head, &landed_target, None, profile, &mut cache,)
+                .unwrap(),
+            landed
+        );
+        assert_eq!(cache.hits(), 1, "the identical immutable query is reused");
+
+        let not_landed =
+            work_landed_with_cache(&repo, &head, &alternative_target, None, profile, &mut cache)
+                .unwrap();
+        assert!(matches!(
+            &not_landed,
+            LandingVerdict::NotLanded {
+                truncated: false,
+                ..
+            }
+        ));
+        assert_eq!(cache.hits(), 1, "a different target must miss");
+        assert_eq!(
+            work_landed_with_cache(&repo, &head, &alternative_target, None, profile, &mut cache,)
+                .unwrap(),
+            not_landed
+        );
+        assert_eq!(cache.hits(), 2, "complete negative verdicts are reusable");
+    }
+
+    #[test]
+    fn landing_verdict_cache_does_not_retain_deadline_failures() {
+        let (_tmp, repo, head, landed_target, _) = cached_landing_fixture();
+        let mut cache = LandingVerdictCache::default();
+        let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let error = work_landed_with_cache(
+            &repo,
+            &head,
+            &landed_target,
+            Some(expired),
+            LandingSearchProfile::default(),
+            &mut cache,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            BrokerOpError::RepresentationUnavailable { ref reason }
+                if reason.contains("time budget")
+        ));
+        assert!(cache.verdicts.is_empty(), "failed searches are not cached");
+
+        let retry = work_landed_with_cache(
+            &repo,
+            &head,
+            &landed_target,
+            None,
+            LandingSearchProfile::default(),
+            &mut cache,
+        )
+        .unwrap();
+        assert!(
+            retry.is_landed(),
+            "a fresh complete retry finds the landing"
+        );
+        assert_eq!(cache.verdicts.len(), 1);
+        assert_eq!(cache.hits(), 0);
     }
 
     #[test]
