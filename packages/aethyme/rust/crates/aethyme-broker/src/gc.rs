@@ -146,6 +146,9 @@ const OPEN_SESSION_ARTIFACT_CURSOR_KEY: &str = "gc.artifact_sweep.open_session_c
 const OPEN_SESSION_ARTIFACT_THROUGH_KEY: &str = "gc.artifact_sweep.open_session_through_id";
 /// Bounded, repository-wide DFS frontiers for open-session diagnostic scans.
 const OPEN_SESSION_ARTIFACT_FRONTIERS_KEY: &str = "gc.artifact_sweep.open_session_frontiers_v1";
+/// Keeps a frontier serialization failure visible after the session cursor
+/// moves on, until a later full census has retried every session.
+const OPEN_SESSION_ARTIFACT_LAP_STATE_KEY: &str = "gc.artifact_sweep.open_session_lap_state_v1";
 /// Last emitted recommendation state, which keeps worker retries from
 /// appending an identical event on every pass.
 const OPEN_SESSION_ARTIFACT_RESULT_KEY: &str = "gc.artifact_sweep.open_session_result_v1";
@@ -272,6 +275,53 @@ struct OpenSessionArtifactPass {
     pending_frontiers: usize,
     frontier_state_unavailable: usize,
     frontier_state_write_limited: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenSessionArtifactLapState {
+    Clear,
+    Failed,
+    Retrying,
+}
+
+impl OpenSessionArtifactLapState {
+    fn parse(value: Option<&str>) -> Self {
+        match value {
+            None | Some("") => Self::Clear,
+            Some("retrying") => Self::Retrying,
+            Some("failed") | Some(_) => Self::Failed,
+        }
+    }
+
+    fn begin_fresh_lap(self) -> Self {
+        match self {
+            Self::Failed => Self::Retrying,
+            state => state,
+        }
+    }
+
+    fn after_frontier_page_persistence(self, persisted: bool) -> Self {
+        if persisted { self } else { Self::Failed }
+    }
+
+    fn finish_lap(self) -> Self {
+        match self {
+            Self::Retrying => Self::Clear,
+            state => state,
+        }
+    }
+
+    fn is_incomplete(self) -> bool {
+        self != Self::Clear
+    }
+
+    fn metadata_value(self) -> &'static str {
+        match self {
+            Self::Clear => "",
+            Self::Failed => "failed",
+            Self::Retrying => "retrying",
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -5558,6 +5608,10 @@ impl Broker {
         }
         let mut prune_complete =
             self.prune_open_session_artifact_frontiers(&mut frontier_set, deadline)?;
+        let mut lap_state = OpenSessionArtifactLapState::parse(
+            self.artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_LAP_STATE_KEY)?
+                .as_deref(),
+        );
 
         let raw_cursor = self.artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_CURSOR_KEY)?;
         let mut cursor = match raw_cursor.as_deref() {
@@ -5571,6 +5625,14 @@ impl Broker {
             },
         };
         let raw_through = self.artifact_sweep_meta_get(OPEN_SESSION_ARTIFACT_THROUGH_KEY)?;
+        let starts_fresh_lap = matches!(raw_through.as_deref(), None | Some("") | Some("0"));
+        if starts_fresh_lap && lap_state == OpenSessionArtifactLapState::Failed {
+            lap_state = lap_state.begin_fresh_lap();
+            self.artifact_sweep_meta_set(
+                OPEN_SESSION_ARTIFACT_LAP_STATE_KEY,
+                lap_state.metadata_value(),
+            )?;
+        }
         let through = match raw_through.as_deref() {
             None | Some("") | Some("0") => {
                 let through = match self.store().session_id_high_water() {
@@ -5842,6 +5904,14 @@ impl Broker {
                 pass.complete = false;
                 pass.frontier_state_write_limited =
                     pass.frontier_state_write_limited.saturating_add(1);
+                lap_state = lap_state.after_frontier_page_persistence(false);
+                // Record the dropped page before moving the durable cursor.
+                // A later empty window must not mistake this lap for a full
+                // census; only a fresh lap can clear the marker.
+                self.artifact_sweep_meta_set(
+                    OPEN_SESSION_ARTIFACT_LAP_STATE_KEY,
+                    lap_state.metadata_value(),
+                )?;
             } else if page_made_progress || scanner_advanced {
                 self.advance_open_session_artifact_progress()?;
             }
@@ -5865,11 +5935,6 @@ impl Broker {
 
         let pending_frontiers = !frontier_set.entries.is_empty();
         pass.pending_frontiers = frontier_set.entries.len();
-        pass.complete = reached_lap_end
-            && prune_complete
-            && ledger_writable
-            && !pending_frontiers
-            && pass.complete;
         if reached_lap_end && !pending_frontiers && prune_complete && ledger_writable {
             // A complete census has no unresolved frontier. The next detached
             // pass captures a new high-water mark and starts a fresh lap.
@@ -5879,10 +5944,27 @@ impl Broker {
             if !persisted {
                 pass.frontier_state_write_limited =
                     pass.frontier_state_write_limited.saturating_add(1);
+                lap_state = lap_state.after_frontier_page_persistence(false);
+                self.artifact_sweep_meta_set(
+                    OPEN_SESSION_ARTIFACT_LAP_STATE_KEY,
+                    lap_state.metadata_value(),
+                )?;
             }
             prune_complete &= persisted;
-            pass.complete &= prune_complete;
         }
+        if reached_lap_end {
+            lap_state = lap_state.finish_lap();
+        }
+        self.artifact_sweep_meta_set(
+            OPEN_SESSION_ARTIFACT_LAP_STATE_KEY,
+            lap_state.metadata_value(),
+        )?;
+        pass.complete = reached_lap_end
+            && prune_complete
+            && ledger_writable
+            && !pending_frontiers
+            && !lap_state.is_incomplete()
+            && pass.complete;
         Ok(pass)
     }
 
@@ -7813,6 +7895,63 @@ mod tests {
             }],
         };
         assert!(encode_open_session_artifact_frontiers(&too_long_path).is_none());
+    }
+
+    #[test]
+    fn frontier_write_failure_on_final_page_requires_a_fresh_full_lap() {
+        let through = 32;
+        let cursor_before_final_page = through - OPEN_SESSION_ARTIFACT_PAGE_SIZE as i64;
+        let oversized_final_page = OpenSessionArtifactFrontierSet {
+            schema_version: 1,
+            entries: (0..OPEN_SESSION_ARTIFACT_PAGE_SIZE)
+                .map(|session_id| OpenSessionArtifactFrontierEntry {
+                    session_id: session_id as i64 + 17,
+                    worktree_path: format!("/worktree-{session_id}"),
+                    updated_at_ms: 1,
+                    frontier: Some(
+                        crate::reclaim::ReclaimScanFrontier::test_with_repeated_long_paths(
+                            &"x".repeat(4_000),
+                            34,
+                        ),
+                    ),
+                    retry: false,
+                    incomplete_scope: Some("packages/wide".into()),
+                    incomplete_reason: Some("entry_budget".into()),
+                })
+                .collect(),
+        };
+        assert_eq!(
+            oversized_final_page.entries.len(),
+            OPEN_SESSION_ARTIFACT_PAGE_SIZE
+        );
+        assert!(encode_open_session_artifact_frontiers(&oversized_final_page).is_none());
+        let lap = OpenSessionArtifactLapState::Clear;
+
+        // The final page exceeds the 2 MiB frontier cap. Its cursor may
+        // advance, but the failed serialization remains durable.
+        let failed_lap = lap.after_frontier_page_persistence(
+            encode_open_session_artifact_frontiers(&oversized_final_page).is_some(),
+        );
+        let cursor_after_final_page = through;
+        assert!(cursor_before_final_page < cursor_after_final_page);
+        assert_eq!(
+            cursor_after_final_page, through,
+            "the following page is empty"
+        );
+        assert_eq!(failed_lap.finish_lap(), OpenSessionArtifactLapState::Failed);
+        assert!(failed_lap.finish_lap().is_incomplete());
+
+        // An empty tail page cannot clear the missed-work marker. A new lap
+        // reprocesses the omitted session IDs; only its successful completion
+        // clears the marker.
+        let retrying_lap = failed_lap.finish_lap().begin_fresh_lap();
+        assert_eq!(retrying_lap, OpenSessionArtifactLapState::Retrying);
+        assert_eq!(
+            retrying_lap
+                .after_frontier_page_persistence(true)
+                .finish_lap(),
+            OpenSessionArtifactLapState::Clear
+        );
     }
 
     #[test]

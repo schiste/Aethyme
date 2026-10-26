@@ -62,7 +62,30 @@ impl ReclaimScanFrontier {
                         .is_none_or(|name| name.len() <= RESUMABLE_RECLAIM_FRONTIER_MAX_PATH_BYTES)
                     && frame.after_entry_ordinal
                         <= RESUMABLE_RECLAIM_SCAN_REPLAY_ENTRY_BUDGET_PER_DIRECTORY
+                    && (frame.after_entry.is_some() == (frame.after_entry_ordinal > 0))
             })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_repeated_long_paths(path: &str, frame_count: usize) -> Self {
+        Self {
+            frames: (0..frame_count)
+                .map(|ordinal| ReclaimScanFrame {
+                    relative: path.to_owned(),
+                    after_entry: Some(format!("entry-{ordinal}")),
+                    after_entry_ordinal: ordinal + 1,
+                    identity: ReclaimDirectoryIdentity {
+                        #[cfg(unix)]
+                        device: 0,
+                        #[cfg(unix)]
+                        inode: 0,
+                        modified_seconds: 0,
+                        modified_nanoseconds: 0,
+                        length: 0,
+                    },
+                })
+                .collect(),
+        }
     }
 }
 
@@ -72,6 +95,49 @@ struct ReclaimScanFrame {
     after_entry: Option<String>,
     after_entry_ordinal: usize,
     identity: ReclaimDirectoryIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReclaimMarkerReplayProgress {
+    Searching,
+    Matched,
+    Changed,
+}
+
+/// Validates a resumable marker against its exact position in a directory's
+/// yielded `ReadDir` entries. The ordinal includes entries that cannot be
+/// represented as UTF-8 names and iterator errors, so replay and scan count
+/// the same stream even on filesystems with unstable ordering.
+struct ReclaimMarkerReplay<'a> {
+    marker: &'a str,
+    expected_ordinal: usize,
+    observed_ordinal: usize,
+}
+
+impl<'a> ReclaimMarkerReplay<'a> {
+    fn new(marker: &'a str, expected_ordinal: usize) -> Self {
+        Self {
+            marker,
+            expected_ordinal,
+            observed_ordinal: 0,
+        }
+    }
+
+    fn observe(&mut self, name: Option<&str>) -> ReclaimMarkerReplayProgress {
+        self.observed_ordinal = self.observed_ordinal.saturating_add(1);
+        if name == Some(self.marker) {
+            return if self.observed_ordinal == self.expected_ordinal {
+                ReclaimMarkerReplayProgress::Matched
+            } else {
+                ReclaimMarkerReplayProgress::Changed
+            };
+        }
+        if self.observed_ordinal >= self.expected_ordinal {
+            ReclaimMarkerReplayProgress::Changed
+        } else {
+            ReclaimMarkerReplayProgress::Searching
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1069,7 +1135,7 @@ pub(crate) fn scan_worktree_resumable(
         if let Some(marker) = frame.after_entry.as_deref() {
             let mut found_marker = false;
             let mut replay_limit_reached = false;
-            let mut replayed_in_frame = 0usize;
+            let mut replay = ReclaimMarkerReplay::new(marker, frame.after_entry_ordinal);
             for entry in &mut entries {
                 if budget.expired() {
                     budget.complete = false;
@@ -1077,28 +1143,32 @@ pub(crate) fn scan_worktree_resumable(
                     incomplete.mark("deadline", &frame.relative);
                     break;
                 }
-                if replayed_in_frame >= RESUMABLE_RECLAIM_SCAN_REPLAY_ENTRY_BUDGET_PER_DIRECTORY {
+                if replay.observed_ordinal
+                    >= RESUMABLE_RECLAIM_SCAN_REPLAY_ENTRY_BUDGET_PER_DIRECTORY
+                {
                     budget.complete = false;
                     replay_limit_reached = true;
                     break;
                 }
                 replay_entries_examined = replay_entries_examined.saturating_add(1);
-                let Ok(entry) = entry else {
-                    budget.complete = false;
-                    incomplete.mark("entry_unavailable", &frame.relative);
-                    replayed_in_frame = replayed_in_frame.saturating_add(1);
-                    if replayed_in_frame >= frame.after_entry_ordinal {
+                let progress = match entry {
+                    Ok(entry) => {
+                        let name = entry.file_name();
+                        replay.observe(name.to_str())
+                    }
+                    Err(_) => {
+                        budget.complete = false;
+                        incomplete.mark("entry_unavailable", &frame.relative);
+                        replay.observe(None)
+                    }
+                };
+                match progress {
+                    ReclaimMarkerReplayProgress::Searching => {}
+                    ReclaimMarkerReplayProgress::Matched => {
+                        found_marker = true;
                         break;
                     }
-                    continue;
-                };
-                replayed_in_frame = replayed_in_frame.saturating_add(1);
-                if entry.file_name().to_str() == Some(marker) {
-                    found_marker = true;
-                    break;
-                }
-                if replayed_in_frame >= frame.after_entry_ordinal {
-                    break;
+                    ReclaimMarkerReplayProgress::Changed => break,
                 }
             }
             if budget.stopped {
@@ -1114,8 +1184,9 @@ pub(crate) fn scan_worktree_resumable(
             }
             if !found_marker {
                 // Some filesystems do not promise stable enumeration order.
-                // If the marker cannot be replayed, restart this directory
-                // rather than silently skipping its prefix.
+                // If the marker is missing or moved to another ordinal,
+                // restart this directory rather than silently skipping its
+                // prefix.
                 incomplete.mark("cursor_changed", &frame.relative);
                 frame.after_entry = None;
                 frame.after_entry_ordinal = 0;
@@ -1124,6 +1195,7 @@ pub(crate) fn scan_worktree_resumable(
             }
         }
         let mut descended = false;
+        let mut saved_marker_ordinal = frame.after_entry_ordinal;
         for entry in &mut entries {
             if budget.expired() {
                 budget.complete = false;
@@ -1140,6 +1212,11 @@ pub(crate) fn scan_worktree_resumable(
                 incomplete.mark("replay_limit", &frame.relative);
                 break;
             }
+            if !budget.examine_entry() {
+                incomplete.mark("entry_budget", &frame.relative);
+                break;
+            }
+            frame.after_entry_ordinal = frame.after_entry_ordinal.saturating_add(1);
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(_) => {
@@ -1153,12 +1230,8 @@ pub(crate) fn scan_worktree_resumable(
                 incomplete.mark("non_utf8_entry", &frame.relative);
                 continue;
             };
-            if !budget.examine_entry() {
-                incomplete.mark("entry_budget", &frame.relative);
-                break;
-            }
             frame.after_entry = Some(name.clone());
-            frame.after_entry_ordinal = frame.after_entry_ordinal.saturating_add(1);
+            saved_marker_ordinal = frame.after_entry_ordinal;
             let kind = match entry.file_type() {
                 Ok(kind) => kind,
                 Err(_) => {
@@ -1189,6 +1262,7 @@ pub(crate) fn scan_worktree_resumable(
                 }
                 match directory_identity(&path) {
                     Ok(identity) => {
+                        frame.after_entry_ordinal = saved_marker_ordinal;
                         frames.push(frame);
                         frames.push(ReclaimScanFrame {
                             relative,
@@ -1214,6 +1288,7 @@ pub(crate) fn scan_worktree_resumable(
             continue;
         }
         if budget.stopped {
+            frame.after_entry_ordinal = saved_marker_ordinal;
             frames.push(frame);
             break;
         }
@@ -2228,6 +2303,56 @@ mod scan_tests {
         };
 
         assert!(!frontier.is_bounded());
+    }
+
+    #[test]
+    fn replay_rejects_a_marker_at_a_different_ordinal_and_counts_unrepresentable_entries() {
+        // The saved cursor says `marker` was the third yielded item, but a
+        // reordered directory now reports it second. It must restart rather
+        // than resume after the moved marker and omit the intervening entry.
+        let mut reordered = ReclaimMarkerReplay::new("marker", 3);
+        assert_eq!(
+            reordered.observe(Some("first")),
+            ReclaimMarkerReplayProgress::Searching
+        );
+        assert_eq!(
+            reordered.observe(Some("marker")),
+            ReclaimMarkerReplayProgress::Changed
+        );
+
+        // Non-UTF8 names and iterator errors have no usable marker, but still
+        // occupy positions in the ReadDir stream and therefore count toward
+        // the saved ordinal on both scan and replay.
+        let mut stable_with_unrepresentable_entry = ReclaimMarkerReplay::new("marker", 3);
+        assert_eq!(
+            stable_with_unrepresentable_entry.observe(Some("first")),
+            ReclaimMarkerReplayProgress::Searching
+        );
+        assert_eq!(
+            stable_with_unrepresentable_entry.observe(None),
+            ReclaimMarkerReplayProgress::Searching
+        );
+        assert_eq!(
+            stable_with_unrepresentable_entry.observe(Some("marker")),
+            ReclaimMarkerReplayProgress::Matched
+        );
+    }
+
+    #[test]
+    fn resumable_frontier_requires_marker_and_ordinal_to_be_consistent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let identity = directory_identity(tmp.path()).unwrap();
+        for (after_entry, after_entry_ordinal) in [(Some("marker"), 0), (None, 1)] {
+            let frontier = ReclaimScanFrontier {
+                frames: vec![ReclaimScanFrame {
+                    relative: String::new(),
+                    after_entry: after_entry.map(str::to_owned),
+                    after_entry_ordinal,
+                    identity: identity.clone(),
+                }],
+            };
+            assert!(!frontier.is_bounded());
+        }
     }
 
     #[test]
