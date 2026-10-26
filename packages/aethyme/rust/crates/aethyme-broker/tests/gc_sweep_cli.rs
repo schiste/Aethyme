@@ -766,8 +766,27 @@ fn session_scoped_reclaim_refuses_out_of_root_sessions_with_typed_json_error() {
         )
         .unwrap();
 
-    let binding_marker = container.path().join(".aethyme-worktree-root.json");
-    let binding_before = std::fs::read(&binding_marker).unwrap();
+    let read_bound_root = || {
+        let output = run_as_is(
+            repo.path(),
+            container.path(),
+            &["advanced", "worktree-root", "--json"],
+        );
+        assert!(
+            output.status.success(),
+            "worktree-root: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["preferred_root"]
+            .as_str()
+            .map(PathBuf::from)
+            .unwrap()
+    };
+    let binding_before = read_bound_root();
+    assert_eq!(
+        binding_before.canonicalize().unwrap(),
+        container.path().canonicalize().unwrap()
+    );
     let has_reclaim_snapshot = || {
         std::fs::read_dir(container.path())
             .unwrap()
@@ -831,7 +850,7 @@ fn session_scoped_reclaim_refuses_out_of_root_sessions_with_typed_json_error() {
         std::fs::read(&artifact).unwrap(),
         b"preserve this legacy cache\n"
     );
-    assert_eq!(std::fs::read(&binding_marker).unwrap(), binding_before);
+    assert_eq!(read_bound_root(), binding_before);
     assert!(
         !has_reclaim_snapshot(),
         "unsupported scope must not create a plan"
