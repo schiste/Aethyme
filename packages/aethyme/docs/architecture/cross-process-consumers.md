@@ -926,3 +926,14 @@ Consumers must allow this additional check/action. Text outside the section is
 preserved. Local-only and supporting-artifact-only deployment do not write the
 shared README. See the repository deployment guide for supported formats and
 refusals. This adds guidance only, with no agent dispatch or session-log export.
+
+### Complete committed entry checks (2026-10-27)
+
+The serialized internal `ContentVerdict` diagnostic adds `tree_entry_mismatch`
+with `paths`, the compared path scope, when object IDs agree but committed file
+modes or types differ. The list is a comparison scope, not a claim that every
+listed path differs. Consumers must treat this and any unknown verdict as
+unavailable for cleanup authorization, never as `present`. Exact-content
+landing evidence requires matching complete committed entries; executable bits
+and symlink types are part of the proof. Existing ancestry and patch proofs
+retain their separate requirements.
