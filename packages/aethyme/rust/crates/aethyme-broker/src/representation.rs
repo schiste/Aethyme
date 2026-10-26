@@ -935,8 +935,8 @@ mod tests {
     fn executable_mode_must_land_even_when_blob_identity_is_unchanged() {
         use std::os::unix::fs::PermissionsExt;
         let (tmp, repo, _) = seeded();
-        // Brackets are literal file-name bytes, not a pathspec expression.
-        let path = "[run].sh";
+        // Brackets are literal path bytes; newline must survive the NUL census.
+        let path = "[run]\n.sh";
         write(tmp.path(), path, "#!/bin/sh\nexit 0\n");
         let base = commit(tmp.path(), "regular non-executable baseline");
         git(tmp.path(), &["checkout", "-q", "-b", "session"]);
