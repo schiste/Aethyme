@@ -202,7 +202,28 @@ impl ProcessTable {
 /// Whether a command line is an agent runtime: its executable is `claude` or
 /// `codex` (including Codex's native `codex-*` binary), or it is `node`
 /// running one of them.
+/// A shared app-server transports many independent tasks. Its process lifetime
+/// cannot establish that any one broker session is still being worked on.
+pub(crate) fn is_shared_agent_service(args: &str) -> bool {
+    let mut words = args.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    let name = |word: &str| word.rsplit('/').next().unwrap_or(word).to_owned();
+    let executable = if name(first) == "node" {
+        words.next().unwrap_or("")
+    } else {
+        first
+    };
+    let executable = name(executable);
+    (executable == "codex" || executable.starts_with("codex-"))
+        && words.next() == Some("app-server")
+}
+
 fn is_agent_runtime(args: &str) -> bool {
+    if is_shared_agent_service(args) {
+        return false;
+    }
     let mut words = args.split_whitespace();
     let Some(first) = words.next() else {
         return false;
@@ -233,7 +254,9 @@ pub fn caller_in(table: &ProcessTable, agent_pid_override: Option<&str>) -> Call
         Some(value) => value.parse().ok().and_then(|pid| table.process(pid)),
         None => table.agent_root(std::process::id() as i64),
     };
-    identified.map_or(Caller::Unidentified, Caller::Agent)
+    identified
+        .filter(|agent| !is_shared_agent_service(&agent.command))
+        .map_or(Caller::Unidentified, Caller::Agent)
 }
 
 /// Why a holder was bound, as recorded in the `session.holder_bound` payload.
@@ -363,6 +386,9 @@ pub fn bind(
     let Caller::Agent(agent) = caller else {
         return Ok(HolderCheck::Unidentified);
     };
+    if is_shared_agent_service(&agent.command) {
+        return Ok(HolderCheck::Unidentified);
+    }
     let previous = recorded_holder(store, session_id)?;
     if previous.as_ref() == Some(agent) {
         return Ok(HolderCheck::Held);
@@ -383,6 +409,9 @@ pub fn admit(
     let Caller::Agent(agent) = caller else {
         return Ok(HolderCheck::Unidentified);
     };
+    if is_shared_agent_service(&agent.command) {
+        return Ok(HolderCheck::Unidentified);
+    }
     let Some(holder) = recorded_holder(store, session_id)? else {
         record(store, session_id, agent, reason::FIRST_USE, None)?;
         return Ok(HolderCheck::Bound {
@@ -392,7 +421,10 @@ pub fn admit(
     if &holder == agent {
         return Ok(HolderCheck::Held);
     }
-    let why = if !table.is_alive(&holder) {
+    let shared_service = is_shared_agent_service(&holder.command);
+    let why = if shared_service && take_over {
+        reason::TAKE_OVER
+    } else if !shared_service && !table.is_alive(&holder) {
         reason::HOLDER_GONE
     } else if take_over {
         reason::TAKE_OVER
@@ -790,6 +822,20 @@ mod tests {
         assert!(table.is_alive(&holder));
         holder.started = "Thu Oct  1 09:00:00 2026".into();
         assert!(!table.is_alive(&holder));
+    }
+
+    #[test]
+    fn shared_app_server_is_not_a_task_holder_or_agent_root() {
+        let text = "3731 1 Fri Oct 23 08:42:41 2026 /opt/codex app-server --listen local --managed-daemon\n4000 3731 Fri Oct 23 09:00:00 2026 /bin/zsh\n5000 3731 Fri Oct 23 09:01:00 2026 /opt/codex exec task\n6000 1 Fri Oct 23 09:02:00 2026 node /opt/codex app-server\n";
+        let table = ProcessTable::parse(text);
+        assert!(!table.agent_pids().contains(&3731));
+        assert!(!table.agent_pids().contains(&6000));
+        assert_eq!(table.agent_root(4000), None);
+        assert_eq!(table.agent_root(5000).unwrap().pid, 5000);
+        assert_eq!(caller_in(&table, Some("3731")), Caller::Unidentified);
+        assert!(matches!(caller_in(&table, Some("5000")), Caller::Agent(_)));
+        assert!(is_agent_runtime("codex exec app-server"));
+        assert!(is_agent_runtime("claude app-server"));
     }
 
     #[test]

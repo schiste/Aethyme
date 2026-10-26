@@ -206,6 +206,11 @@ pub fn observe_holder(
     let Some(holder) = crate::session_holder::recorded_holder(store, session_id)? else {
         return Ok((HolderObservation::NoRecordedHolder, None));
     };
+    if crate::session_holder::is_shared_agent_service(&holder.command) {
+        // A legacy shared-service binding remains an ownership record, but
+        // service uptime proves neither this task's activity nor its death.
+        return Ok((HolderObservation::NoRecordedHolder, Some(holder.pid)));
+    }
     let Some(table) = table else {
         return Ok((HolderObservation::ProcessTableUnavailable, Some(holder.pid)));
     };

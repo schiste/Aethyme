@@ -262,3 +262,83 @@ fn abandoning_an_adopted_session_releases_the_leases_it_was_holding() {
         "an abandoned session must stop blocking other agents"
     );
 }
+
+#[test]
+fn legacy_shared_daemon_binding_is_unknown_not_a_live_task_or_a_dead_holder() {
+    use aethyme_broker::{events, lease_liveness, session_holder};
+    let tmp = isolation::FixtureRepo::new();
+    fixture(tmp.path());
+    let mut broker = isolation::open(tmp.path());
+    let session = broker
+        .start_worktree("shared daemon fixture", None)
+        .unwrap();
+    broker
+        .store()
+        .claim_lease(session.id, "README.md", None)
+        .unwrap();
+    let table = session_holder::ProcessTable::parse(
+        "3731 1 Fri Oct 23 08:42:41 2026 /opt/codex app-server --listen local --managed-daemon\n5000 1 Fri Oct 23 09:00:00 2026 /opt/codex exec task\n",
+    );
+    let shared = table.process(3731).unwrap();
+    let payload =
+        events::session_holder_bound_payload(&shared, session_holder::reason::REGISTERED, None);
+    broker
+        .store()
+        .append_event(
+            events::SESSION_HOLDER_BOUND,
+            Some(session.id),
+            Some(&payload),
+        )
+        .unwrap();
+    assert!(
+        table.is_alive(&shared),
+        "fixture service is genuinely running"
+    );
+    assert_eq!(
+        session_holder::recorded_holder(broker.store(), session.id).unwrap(),
+        Some(shared.clone()),
+        "ambiguous ownership history must remain visible for admission"
+    );
+    let (observation, _) =
+        lease_liveness::observe_holder(broker.store(), session.id, Some(&table), now_ms()).unwrap();
+    assert_eq!(
+        observation,
+        lease_liveness::HolderObservation::NoRecordedHolder
+    );
+    let (state, evidence) = lease_liveness::classify(
+        false,
+        &observation,
+        None,
+        now_ms(),
+        now_ms(),
+        Default::default(),
+    );
+    assert_eq!(state, lease_liveness::LeaseLiveness::Unknown);
+    assert!(
+        evidence.holds,
+        "unidentified must not become permission to delete"
+    );
+    let caller = session_holder::Caller::Agent(table.process(5000).unwrap());
+    let refused = session_holder::admit(broker.store(), session.id, &caller, &table, false);
+    assert!(matches!(
+        refused,
+        Err(aethyme_broker::BrokerOpError::SessionHeldByAnotherAgent { .. })
+    ));
+    assert_eq!(
+        session_holder::recorded_holder(broker.store(), session.id).unwrap(),
+        Some(shared)
+    );
+    let admitted =
+        session_holder::admit(broker.store(), session.id, &caller, &table, true).unwrap();
+    assert!(matches!(
+        admitted,
+        session_holder::HolderCheck::Bound { .. }
+    ));
+    assert_eq!(
+        session_holder::recorded_holder(broker.store(), session.id)
+            .unwrap()
+            .unwrap()
+            .pid,
+        5000
+    );
+}
