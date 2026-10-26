@@ -45,6 +45,15 @@ fn fixture() -> common::FixtureRepository {
     std::fs::write(f.path().join("README.md"), "fixture\n").unwrap();
     git(&f, &["add", "README.md", ".gitignore"]);
     git(&f, &["commit", "-qm", "fixture"]);
+    git(&f, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(
+        &f,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
     f
 }
 fn command(f: &common::FixtureRepository, args: &[&str]) -> Command {
