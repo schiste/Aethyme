@@ -393,7 +393,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   apply. A `LibraryOverride` with no `root_container` is a direct repository
   root: inventory that root itself, not its children as keyed repositories.
   Test direct-root and keyed-container layouts, preserving existing keyed
-  confirmation digests.
+  confirmation digests. In CLI fixtures, derive the actual bound root from
+  `advanced worktree-root --json`'s `preferred_root` or the parent of a
+  worktree the CLI created; do not assume the configured root or
+  `root_container` is the directory a command scans. Reclaim review snapshots
+  are saved under the bound root. When an operation should preserve the
+  binding, compare stable identity fields, not transient availability
+  diagnostics.
 - When building a filesystem inventory, treat directory-iteration, metadata,
   and required-measurement errors as incomplete. Do not silently skip unknown
   entries or substitute zero for a failed measurement; keep partial findings
