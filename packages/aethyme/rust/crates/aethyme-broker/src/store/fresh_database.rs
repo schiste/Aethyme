@@ -445,6 +445,90 @@ mod unix {
         }
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SidecarMetadataViolation {
+        NotRegularFile,
+        WrongOwner,
+        ZeroLinks,
+        MultipleLinks,
+        GroupWritable,
+        WorldWritable,
+        IdentityChanged,
+    }
+
+    impl SidecarMetadataViolation {
+        fn description(self) -> &'static str {
+            match self {
+                Self::NotRegularFile => "not a regular file",
+                Self::WrongOwner => "not owned by the effective user",
+                Self::ZeroLinks => "has zero links",
+                Self::MultipleLinks => "has multiple links",
+                Self::GroupWritable => "is group-writable",
+                Self::WorldWritable => "is world-writable",
+                Self::IdentityChanged => "identity changed from the lstat snapshot",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum SidecarCheckStage {
+        Lstat,
+        Opened,
+        Named,
+    }
+
+    fn sidecar_metadata_violation(
+        metadata: &impl GuardMetadata,
+    ) -> Option<SidecarMetadataViolation> {
+        if !metadata.is_regular_file() {
+            return Some(SidecarMetadataViolation::NotRegularFile);
+        }
+        if metadata.owner_uid() != effective_uid() {
+            return Some(SidecarMetadataViolation::WrongOwner);
+        }
+        match metadata.link_count() {
+            0 => return Some(SidecarMetadataViolation::ZeroLinks),
+            1 => {}
+            _ => return Some(SidecarMetadataViolation::MultipleLinks),
+        }
+        if metadata.permission_mode() & 0o020 != 0 {
+            return Some(SidecarMetadataViolation::GroupWritable);
+        }
+        if metadata.permission_mode() & 0o002 != 0 {
+            return Some(SidecarMetadataViolation::WorldWritable);
+        }
+        None
+    }
+
+    fn sidecar_snapshot_violation(
+        metadata: &impl GuardMetadata,
+        expected: FileIdentity,
+    ) -> Option<SidecarMetadataViolation> {
+        sidecar_metadata_violation(metadata).or_else(|| {
+            (file_identity(metadata) != expected)
+                .then_some(SidecarMetadataViolation::IdentityChanged)
+        })
+    }
+
+    fn sidecar_check_refusal(
+        stage: SidecarCheckStage,
+        path: &Path,
+        violation: SidecarMetadataViolation,
+    ) -> BrokerError {
+        let prefix = match stage {
+            SidecarCheckStage::Lstat => {
+                "SQLite sidecar is not an owned, non-group/world-writable regular file with one link"
+            }
+            SidecarCheckStage::Opened => "SQLite sidecar changed while opening",
+            SidecarCheckStage::Named => "SQLite sidecar name changed while opening",
+        };
+        refusal(format!(
+            "{prefix}: {} (reason: {})",
+            path.display(),
+            violation.description()
+        ))
+    }
+
     fn sqlite_probe_error(path: &Path, label: &str, code: i32) -> BrokerError {
         if code == SQLITE_PROBE_CAPACITY_REFUSAL {
             return refusal(format!(
@@ -928,42 +1012,31 @@ mod unix {
             let Some(before) = lstat_optional(&sidecar)? else {
                 continue;
             };
-            if !before.file_type().is_file()
-                || before.uid() != effective_uid()
-                || before.nlink() != 1
-                || before.mode() & 0o022 != 0
-            {
-                return Err(refusal(format!(
-                    "SQLite sidecar is not an owned, non-group/world-writable regular file with one link: {}",
-                    sidecar.display()
-                )));
+            if let Some(violation) = sidecar_metadata_violation(&before) {
+                return Err(sidecar_check_refusal(
+                    SidecarCheckStage::Lstat,
+                    &sidecar,
+                    violation,
+                ));
             }
             let expected = file_identity(&before);
             let (_file, opened) =
                 SqliteProbeFile::open(&sidecar, SQLITE_PROBE_SIDECAR, "SQLite sidecar")?;
-            if !opened.is_regular_file()
-                || opened.owner_uid() != effective_uid()
-                || opened.link_count() != 1
-                || opened.permission_mode() & 0o022 != 0
-                || file_identity(&opened) != expected
-            {
-                return Err(refusal(format!(
-                    "SQLite sidecar changed while opening: {}",
-                    sidecar.display()
-                )));
+            if let Some(violation) = sidecar_snapshot_violation(&opened, expected) {
+                return Err(sidecar_check_refusal(
+                    SidecarCheckStage::Opened,
+                    &sidecar,
+                    violation,
+                ));
             }
             let named =
                 fs::symlink_metadata(&sidecar).map_err(|source| io_error(&sidecar, source))?;
-            if !named.file_type().is_file()
-                || named.uid() != effective_uid()
-                || named.nlink() != 1
-                || named.mode() & 0o022 != 0
-                || file_identity(&named) != expected
-            {
-                return Err(refusal(format!(
-                    "SQLite sidecar name changed while opening: {}",
-                    sidecar.display()
-                )));
+            if let Some(violation) = sidecar_snapshot_violation(&named, expected) {
+                return Err(sidecar_check_refusal(
+                    SidecarCheckStage::Named,
+                    &sidecar,
+                    violation,
+                ));
             }
         }
         verify_parent(paths)
@@ -2785,6 +2858,111 @@ mod unix {
         }
 
         #[test]
+        fn sidecar_metadata_diagnostics_identify_each_refusal_predicate() {
+            let regular_file_type = u32::try_from(u64::from(libc::S_IFREG))
+                .expect("regular file type fits in ProbeMetadata");
+            let symlink_file_type = u32::try_from(u64::from(libc::S_IFLNK))
+                .expect("symlink file type fits in ProbeMetadata");
+            let regular_mode = regular_file_type | 0o600;
+            let baseline = ProbeMetadata {
+                device: 1,
+                inode: 2,
+                size: 0,
+                links: 1,
+                uid: effective_uid(),
+                mode: regular_mode,
+            };
+            let cases = [
+                (
+                    ProbeMetadata {
+                        mode: symlink_file_type | 0o600,
+                        ..baseline
+                    },
+                    SidecarMetadataViolation::NotRegularFile,
+                    "not a regular file",
+                ),
+                (
+                    ProbeMetadata {
+                        uid: effective_uid().wrapping_add(1),
+                        ..baseline
+                    },
+                    SidecarMetadataViolation::WrongOwner,
+                    "not owned by the effective user",
+                ),
+                (
+                    ProbeMetadata {
+                        links: 0,
+                        ..baseline
+                    },
+                    SidecarMetadataViolation::ZeroLinks,
+                    "has zero links",
+                ),
+                (
+                    ProbeMetadata {
+                        links: 2,
+                        ..baseline
+                    },
+                    SidecarMetadataViolation::MultipleLinks,
+                    "has multiple links",
+                ),
+                (
+                    ProbeMetadata {
+                        mode: regular_mode | 0o020,
+                        ..baseline
+                    },
+                    SidecarMetadataViolation::GroupWritable,
+                    "is group-writable",
+                ),
+                (
+                    ProbeMetadata {
+                        mode: regular_mode | 0o002,
+                        ..baseline
+                    },
+                    SidecarMetadataViolation::WorldWritable,
+                    "is world-writable",
+                ),
+            ];
+            for (metadata, expected, description) in cases {
+                assert_eq!(sidecar_metadata_violation(&metadata), Some(expected));
+                assert_eq!(expected.description(), description);
+            }
+
+            let mut changed_identity = file_identity(&baseline);
+            changed_identity.inode = changed_identity.inode.wrapping_add(1);
+            assert_eq!(
+                sidecar_snapshot_violation(&baseline, changed_identity),
+                Some(SidecarMetadataViolation::IdentityChanged)
+            );
+            assert_eq!(
+                SidecarMetadataViolation::IdentityChanged.description(),
+                "identity changed from the lstat snapshot"
+            );
+
+            let path = Path::new("broker.db-wal");
+            for (stage, prefix) in [
+                (
+                    SidecarCheckStage::Lstat,
+                    "SQLite sidecar is not an owned, non-group/world-writable regular file with one link:",
+                ),
+                (
+                    SidecarCheckStage::Opened,
+                    "SQLite sidecar changed while opening:",
+                ),
+                (
+                    SidecarCheckStage::Named,
+                    "SQLite sidecar name changed while opening:",
+                ),
+            ] {
+                let message =
+                    sidecar_check_refusal(stage, path, SidecarMetadataViolation::MultipleLinks)
+                        .to_string();
+                assert!(message.contains(prefix), "stage prefix changed: {message}");
+                assert!(message.contains("broker.db-wal"));
+                assert!(message.contains("reason: has multiple links"));
+            }
+        }
+
+        #[test]
         fn regular_existing_wal_sidecars_are_accepted() {
             let repo = tempfile::tempdir().unwrap();
             init_repository(repo.path());
@@ -2801,6 +2979,27 @@ mod unix {
             let wal_path = append_suffix(&paths.final_path, "-wal");
             assert!(wal_path.is_file(), "the open connection retains its WAL");
             check_existing_sidecars(&paths, &paths.final_path).unwrap();
+
+            let original_mode = fs::metadata(&wal_path).unwrap().permissions().mode() & 0o7777;
+            for (added_mode, expected_reason) in [
+                (0o020, "reason: is group-writable"),
+                (0o002, "reason: is world-writable"),
+            ] {
+                fs::set_permissions(
+                    &wal_path,
+                    fs::Permissions::from_mode(original_mode | added_mode),
+                )
+                .unwrap();
+                let error = check_existing_sidecars(&paths, &paths.final_path)
+                    .expect_err("a writable SQLite sidecar must retain its refusal");
+                assert!(
+                    error.to_string().contains(expected_reason),
+                    "unexpected writable-sidecar refusal: {error}"
+                );
+                fs::set_permissions(&wal_path, fs::Permissions::from_mode(original_mode)).unwrap();
+                check_existing_sidecars(&paths, &paths.final_path)
+                    .expect("restoring the original permissions restores sidecar acceptance");
+            }
 
             let reopened = open_in_repo(repo.path(), &db_path).unwrap();
             assert_eq!(
@@ -2833,9 +3032,10 @@ mod unix {
                 Err(error) => error,
             };
             assert!(matches!(
-                error,
+                &error,
                 BrokerError::InvalidRepositoryWorktreeBinding(_)
             ));
+            assert!(error.to_string().contains("reason: not a regular file"));
             assert_eq!(fs::read(&sentinel).unwrap(), sentinel_before);
             assert_eq!(fs::read(&paths.final_path).unwrap(), database_before);
             assert!(
@@ -2866,9 +3066,11 @@ mod unix {
                 Err(error) => error,
             };
             assert!(matches!(
-                error,
+                &error,
                 BrokerError::InvalidRepositoryWorktreeBinding(_)
             ));
+            assert!(error.to_string().contains("with one link:"));
+            assert!(error.to_string().contains("reason: has multiple links"));
             assert_eq!(fs::read(&sentinel).unwrap(), sentinel_before);
             assert_eq!(fs::read(&paths.final_path).unwrap(), database_before);
             assert_eq!(fs::symlink_metadata(&wal_path).unwrap().nlink(), 2);
