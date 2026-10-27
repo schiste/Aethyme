@@ -313,9 +313,21 @@ impl Broker {
                                 session.branch
                             ))
                         })
-                        .filter(|proof| {
-                            item.as_ref().and_then(|item| item.branch_tip.as_deref())
-                                == Some(proof.branch_tip.as_str())
+                        .and_then(|mut proof| {
+                            if item.as_ref().and_then(|item| item.branch_tip.as_deref())
+                                != Some(proof.branch_tip.as_str())
+                            {
+                                return None;
+                            }
+                            let policy = crate::AutoCleanupPolicy::load(self.main_root()).ok()?;
+                            proof.disposable_ignored_root_prefixes =
+                                crate::auto_cleanup::disposable_ignored_directory_prefixes(
+                                    &worktree_path,
+                                    &policy,
+                                )
+                                .ok()?;
+                            proof.schema_version = 2;
+                            Some(proof)
                         })
                 } else {
                     None

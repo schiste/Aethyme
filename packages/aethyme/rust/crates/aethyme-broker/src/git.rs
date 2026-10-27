@@ -2357,6 +2357,17 @@ pub struct GitWorktreeInfo {
     pub prunable_reason: Option<String>,
 }
 
+/// One leaf in an exact committed tree. Used when a recovery path must prove
+/// that surviving tracked files still match the pinned commit after a linked
+/// worktree's own Git metadata has disappeared.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitTreeFile {
+    pub(crate) path: String,
+    pub(crate) mode: String,
+    pub(crate) object_id: String,
+}
+
 /// One effective git config entry with the scope and file that set it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigEntry {
@@ -2585,6 +2596,7 @@ impl GitRepo {
             branch_ref: branch_ref.to_string(),
             head,
             branch_tip,
+            disposable_ignored_root_prefixes: Vec::new(),
         })
     }
 
@@ -4426,6 +4438,68 @@ impl GitRepo {
             &self.root,
             &["ls-tree", "-r", "--name-only", "-z", commit],
         )?))
+    }
+
+    /// Files and gitlinks in an exact committed tree. Unlike `tracked_files_at`,
+    /// this bounded form retains the object IDs and modes needed to check a
+    /// partially removed worktree's surviving tracked payload.
+    #[cfg(unix)]
+    pub(crate) fn tracked_tree_files_at(
+        &self,
+        commit: &str,
+        deadline: Instant,
+    ) -> Result<Vec<GitTreeFile>, GitError> {
+        let args = ["ls-tree", "-r", "--full-tree", "-z", commit];
+        let mut command = git_command();
+        command
+            .args(args)
+            .current_dir(&self.root)
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        let output = run_git_process_output_limited(
+            &mut command,
+            &args,
+            deadline,
+            MAX_GIT_BATCH_OUTPUT_BYTES,
+        )?;
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        let invalid = || GitError::UntrustedOutput {
+            detail: format!("git {} returned a malformed tracked tree", args.join(" ")),
+        };
+        let mut entries = Vec::new();
+        for record in strict_git_listing_records(&output.stdout, &args)? {
+            let tab = record
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .ok_or_else(invalid)?;
+            let mut fields = record[..tab].split(|byte| *byte == b' ');
+            let mode = fields.next().ok_or_else(invalid)?;
+            let object_type = fields.next().ok_or_else(invalid)?;
+            let object_id = fields.next().ok_or_else(invalid)?;
+            if fields.next().is_some()
+                || !valid_tree_entry_mode_type(mode, object_type)
+                || !valid_git_object_id(object_id)
+            {
+                return Err(invalid());
+            }
+            let path = std::str::from_utf8(&record[tab + 1..]).map_err(|_| invalid())?;
+            if path.len() > MAX_IGNORED_PATH_BYTES {
+                return Err(invalid());
+            }
+            validate_relative_git_path(path, &args)?;
+            entries.push(GitTreeFile {
+                path: path.to_owned(),
+                mode: std::str::from_utf8(mode).map_err(|_| invalid())?.to_owned(),
+                object_id: std::str::from_utf8(object_id)
+                    .map_err(|_| invalid())?
+                    .to_owned(),
+            });
+        }
+        Ok(entries)
     }
 
     /// Inventory one exact tree before allocating an independent checkout.

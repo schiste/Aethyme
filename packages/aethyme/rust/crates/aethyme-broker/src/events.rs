@@ -215,6 +215,12 @@ pub(crate) struct FinishCleanupRecoveryProof {
     pub(crate) branch_ref: String,
     pub(crate) head: String,
     pub(crate) branch_tip: String,
+    /// Ignored directory roots that cleanup classified as disposable before
+    /// Git began removing this checkout. A later orphan retry may remove
+    /// entries beneath these exact prefixes; it must preserve newly appeared
+    /// ignored files and directories elsewhere.
+    #[serde(default)]
+    pub(crate) disposable_ignored_root_prefixes: Vec<String>,
 }
 
 /// Build the stable v1 payload for the start of finish cleanup.
