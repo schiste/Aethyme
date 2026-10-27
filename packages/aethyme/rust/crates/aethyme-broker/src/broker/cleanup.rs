@@ -283,6 +283,25 @@ impl Broker {
         delivery_targets: &[String],
         landing_cache: &mut crate::representation::LandingVerdictCache,
     ) -> Result<(CleanupDisposition, String, Option<CleanupProvenance>), BrokerOpError> {
+        self.cleanup_eligibility_with_status_limits(
+            session_id,
+            worktree_path,
+            delivery_targets,
+            landing_cache,
+            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+        )
+    }
+
+    fn cleanup_eligibility_with_status_limits(
+        &self,
+        session_id: i64,
+        worktree_path: &Path,
+        delivery_targets: &[String],
+        landing_cache: &mut crate::representation::LandingVerdictCache,
+        status_output_bytes: usize,
+        status_path_fields: usize,
+    ) -> Result<(CleanupDisposition, String, Option<CleanupProvenance>), BrokerOpError> {
         if worktree_path == self.main_root.as_path() {
             return Ok((
                 CleanupDisposition::UnsafePath,
@@ -317,12 +336,26 @@ impl Broker {
                 None,
             ));
         }
-        if checkout.is_dirty()? {
-            return Ok((
-                CleanupDisposition::Dirty,
-                "worktree has uncommitted or untracked changes".into(),
-                None,
-            ));
+        match checkout.is_dirty_until_with_limits(
+            std::time::Instant::now() + std::time::Duration::from_secs(15),
+            status_output_bytes,
+            status_path_fields,
+        ) {
+            Ok(false) => {}
+            Ok(true) => {
+                return Ok((
+                    CleanupDisposition::Dirty,
+                    "worktree has uncommitted or untracked changes".into(),
+                    None,
+                ));
+            }
+            Err(error) => {
+                return Ok((
+                    CleanupDisposition::InspectionFailed,
+                    self.cleanup_inspection_failure(&error),
+                    None,
+                ));
+            }
         }
 
         let ignored_verdict = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root())
@@ -813,6 +846,23 @@ impl Broker {
         scan: crate::SizeScan,
         records: &mut crate::measurement::SizeRecords,
     ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
+        self.cleanup_item_scanned_with_status_limits(
+            session,
+            scan,
+            records,
+            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+        )
+    }
+
+    pub(crate) fn cleanup_item_scanned_with_status_limits(
+        &self,
+        session: &Session,
+        scan: crate::SizeScan,
+        records: &mut crate::measurement::SizeRecords,
+        status_output_bytes: usize,
+        status_path_fields: usize,
+    ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
         let mut landing_cache = crate::representation::LandingVerdictCache::default();
         self.cleanup_item_scanned_with_tips(
             session,
@@ -821,6 +871,8 @@ impl Broker {
             None,
             CleanupDeliveryTargets::Fresh,
             &mut landing_cache,
+            status_output_bytes,
+            status_path_fields,
         )
     }
 
@@ -836,6 +888,8 @@ impl Broker {
         branch_tips: Option<&std::collections::BTreeMap<String, String>>,
         delivery_targets: CleanupDeliveryTargets<'_>,
         landing_cache: &mut crate::representation::LandingVerdictCache,
+        status_output_bytes: usize,
+        status_path_fields: usize,
     ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
         let worktree_path = PathBuf::from(&session.worktree_path);
         let worktree_present = worktree_path.exists();
@@ -905,19 +959,23 @@ impl Broker {
                     Ok(false) => {
                         let eligibility = match delivery_targets {
                             CleanupDeliveryTargets::Snapshot(targets) => self
-                                .cleanup_eligibility_with_targets_and_cache(
+                                .cleanup_eligibility_with_status_limits(
                                     session.id,
                                     &worktree_path,
                                     targets,
                                     landing_cache,
+                                    status_output_bytes,
+                                    status_path_fields,
                                 ),
                             CleanupDeliveryTargets::Fresh => {
                                 let targets = self.cleanup_delivery_targets()?;
-                                self.cleanup_eligibility_with_targets_and_cache(
+                                self.cleanup_eligibility_with_status_limits(
                                     session.id,
                                     &worktree_path,
                                     &targets,
                                     landing_cache,
+                                    status_output_bytes,
+                                    status_path_fields,
                                 )
                             }
                             CleanupDeliveryTargets::SnapshotUnavailable => Ok((
@@ -1151,6 +1209,8 @@ impl Broker {
                         .map(CleanupDeliveryTargets::Snapshot)
                         .unwrap_or(CleanupDeliveryTargets::SnapshotUnavailable),
                     landing_cache,
+                    crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+                    crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
                 )?;
                 // A landing search the deadline stopped reads as a failed
                 // inspection; it is the budget, so say so instead (#460).
@@ -2340,6 +2400,23 @@ impl Broker {
         force: bool,
         archive_guard: Option<(&str, &Path)>,
     ) -> Result<(), BrokerOpError> {
+        self.cleanup_under_lifecycle_claim_with_status_limits(
+            session,
+            force,
+            archive_guard,
+            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+        )
+    }
+
+    fn cleanup_under_lifecycle_claim_with_status_limits(
+        &mut self,
+        session: &Session,
+        force: bool,
+        archive_guard: Option<(&str, &Path)>,
+        status_output_bytes: usize,
+        status_path_fields: usize,
+    ) -> Result<(), BrokerOpError> {
         let session_id = session.id;
         let worktree_path = PathBuf::from(&session.worktree_path);
         if archive_guard.is_some() && session.origin != SessionOrigin::Spawned {
@@ -2358,8 +2435,16 @@ impl Broker {
         if session.origin == SessionOrigin::Adopted {
             if worktree_path_is_real_directory(&worktree_path, session_id)? {
                 if !force {
-                    let (disposition, reason, _) =
-                        self.cleanup_eligibility(session_id, &worktree_path)?;
+                    let targets = self.cleanup_delivery_targets()?;
+                    let mut landing_cache = crate::representation::LandingVerdictCache::default();
+                    let (disposition, reason, _) = self.cleanup_eligibility_with_status_limits(
+                        session_id,
+                        &worktree_path,
+                        &targets,
+                        &mut landing_cache,
+                        status_output_bytes,
+                        status_path_fields,
+                    )?;
                     if disposition != CleanupDisposition::Eligible {
                         return Err(BrokerOpError::DirtyWorktree {
                             id: session_id,
@@ -2380,7 +2465,13 @@ impl Broker {
         // not the byte count, and a walk here only widens the window between
         // the live-checkout check below and the removal.
         let mut records = crate::measurement::SizeRecords::default();
-        let item = self.cleanup_item_scanned(session, crate::SizeScan::Recorded, &mut records)?;
+        let item = self.cleanup_item_scanned_with_status_limits(
+            session,
+            crate::SizeScan::Recorded,
+            &mut records,
+            status_output_bytes,
+            status_path_fields,
+        )?;
         if !force
             && let Some(item) = item.as_ref()
             && !item.eligible()
@@ -2906,6 +2997,44 @@ mod registered_removal_failure_tests {
             if *found == crate::SCHEMA_VERSION + 1 && *supported == crate::SCHEMA_VERSION),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn incomplete_bounded_status_keeps_a_closed_cleanup_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = repository_with_ignored_cleanup_fixture(tmp.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "bounded status refusal");
+        broker.close(session.id).unwrap();
+
+        let first = worktree.join("untracked-one.txt");
+        let second = worktree.join("untracked-two.txt");
+        std::fs::write(&first, "keep one\n").unwrap();
+        std::fs::write(&second, "keep two\n").unwrap();
+        let closed_session = broker.store().session(session.id).unwrap();
+        let _claim = broker.claim_worktree_lifecycle().unwrap();
+
+        let error = broker
+            .cleanup_under_lifecycle_claim_with_status_limits(
+                &closed_session,
+                false,
+                None,
+                1024 * 1024,
+                1,
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("cleanup inspection failed"),
+            "an incomplete status inventory must become an explicit cleanup refusal: {error}"
+        );
+        assert!(
+            worktree.is_dir(),
+            "incomplete inspection removed the checkout"
+        );
+        assert_eq!(std::fs::read(first).unwrap(), b"keep one\n");
+        assert_eq!(std::fs::read(second).unwrap(), b"keep two\n");
     }
 
     #[test]
