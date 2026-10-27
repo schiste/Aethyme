@@ -2246,6 +2246,20 @@ fn fetch_completion_journal_survives_minimal_unknown_transition() {
     assert_eq!(details["fetch_reconciliation"], proof);
     assert_eq!(details["reason"], "process_ended_without_outcome");
     assert!(details.get("stderr").is_none());
+    assert!(
+        !store
+            .record_fetch_observation(operation.id, r#"{"schema_version":1}"#)
+            .unwrap(),
+        "late observations cannot resurrect an unknown or reconciled operation"
+    );
+    assert_eq!(
+        store
+            .coordinated_operation(operation.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        OperationStatus::OutcomeUnknown
+    );
 }
 
 #[test]
@@ -2301,4 +2315,202 @@ fn exact_fetch_profile_validates_git_config_and_observes_exact_refs() {
             .is_err(),
         "a second expanding refmap must force the wide lane"
     );
+}
+
+#[test]
+fn effective_hooks_path_allows_irrelevant_pre_push_but_refuses_reference_transaction() {
+    let (root, target) = push_fixture();
+    let hooks = root.path().join("custom-hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    std::fs::write(hooks.join("pre-push"), "#!/bin/sh\nexit 0\n").unwrap();
+    let config = Command::new("git")
+        .current_dir(root.path())
+        .args(["config", "core.hooksPath", "custom-hooks"])
+        .output()
+        .unwrap();
+    assert!(config.status.success());
+    let args = git_scopes::canonical_fetch_args("origin", "main").unwrap();
+    let deadline = AdmissionDeadline::start(QueueWait::Seconds(10));
+    git_scopes::validate_repository(root.path(), &args, deadline, &target.coordination_key)
+        .unwrap();
+    std::fs::write(hooks.join("reference-transaction"), "#!/bin/sh\nexit 0\n").unwrap();
+    assert!(
+        git_scopes::validate_repository(root.path(), &args, deadline, &target.coordination_key)
+            .is_err()
+    );
+}
+
+#[test]
+fn common_git_lane_identity_is_invariant_under_symlinked_checkout() {
+    let (root, _) = push_fixture();
+    let alias_parent = tempfile::tempdir().unwrap();
+    let alias = alias_parent.path().join("checkout-alias");
+    std::os::unix::fs::symlink(root.path(), &alias).unwrap();
+    assert_eq!(
+        git_scopes::common_lock_key(root.path()).unwrap(),
+        git_scopes::common_lock_key(&alias).unwrap()
+    );
+}
+
+#[test]
+fn strict_profiles_refuse_effective_url_rewrites() {
+    let (root, target) = push_fixture();
+    let config = Command::new("git")
+        .current_dir(root.path())
+        .args([
+            "config",
+            "url.ext::helper.insteadOf",
+            "https://example.test/",
+        ])
+        .output()
+        .unwrap();
+    assert!(config.status.success());
+    let args = git_scopes::canonical_fetch_args("origin", "main").unwrap();
+    assert!(
+        git_scopes::validate_repository(
+            root.path(),
+            &args,
+            AdmissionDeadline::start(QueueWait::Seconds(10)),
+            &target.coordination_key
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn completed_fetch_reconciles_only_with_actual_child_and_fresh_matching_refs() {
+    let (root, target) = push_fixture();
+    let host = tempfile::tempdir().unwrap();
+    let options = crate::BrokerOpenOptions::default()
+        .with_host_state_dir(host.path().join("state"))
+        .with_host_cache_dir(host.path().join("cache"))
+        .with_host_operation_database(host.path().join("operations.db"))
+        .with_worktree_root(host.path().join("worktrees"))
+        .with_collaboration_state(host.path().join("collaboration"));
+    let mut broker = Broker::open_with_options(root.path(), options).unwrap();
+    let connection =
+        rusqlite::Connection::open(crate::broker_db_path(root.path()).unwrap()).unwrap();
+    connection.execute_batch("INSERT INTO sessions (id, worktree_path, branch, origin, status, created_at, updated_at, last_activity_at) VALUES (37, '/repo/one', 'agent/one', 'adopted', 'active', 1, 1, 1);").unwrap();
+    drop(connection);
+    let push = Command::new("git")
+        .current_dir(root.path())
+        .args(["push", "origin", "HEAD:refs/heads/main"])
+        .output()
+        .unwrap();
+    assert!(push.status.success());
+    // Remove opportunistic tracking state so the pre/post evidence differs.
+    let delete = Command::new("git")
+        .current_dir(root.path())
+        .args(["update-ref", "-d", "refs/remotes/origin/main"])
+        .output()
+        .unwrap();
+    assert!(delete.status.success());
+    let args = git_scopes::canonical_fetch_args("origin", "main").unwrap();
+    let mut argv = vec!["git".to_owned()];
+    argv.extend(args.clone());
+    let operation = broker
+        .store()
+        .create_coordinated_operation(&crate::NewCoordinatedOperation {
+            session_id: 37,
+            provider: OperationProvider::Git,
+            repository: target.coordination_key.clone(),
+            scope: "fetch".into(),
+            effect: OperationEffect::Write,
+            authorization_reason: Some("test".into()),
+            command_json: serde_json::to_string(&argv).unwrap(),
+            pid: std::process::id() as i64,
+            host_operation_id: None,
+            identity_provenance: crate::OperationIdentityProvenance::VerifiedCanonical,
+        })
+        .unwrap();
+    let deadline = AdmissionDeadline::start(QueueWait::Seconds(15));
+    let mut journal = git_scopes::FetchJournal::prepare(
+        operation.id,
+        root.path(),
+        &args,
+        deadline,
+        &target.coordination_key,
+    )
+    .unwrap()
+    .unwrap();
+    let mut command = provider_command(OperationProvider::Git);
+    remove_inherited_git_config_overrides(&mut command);
+    command.current_dir(root.path()).args(&args);
+    let output = output_within_observed(
+        command,
+        deadline,
+        &target.coordination_key,
+        "test fetch",
+        None,
+        MAX_COORDINATED_OUTPUT_BYTES,
+        Some(&mut |observation| journal.observe(observation)),
+    )
+    .unwrap();
+    assert!(output.status.success());
+    assert!(
+        journal.proves_provider_completion(),
+        "actual child generation and wait must be captured"
+    );
+    let details = json!({"fetch_reconciliation": journal});
+    broker
+        .store()
+        .transition_coordinated_operation(
+            operation.id,
+            OperationStatus::Running,
+            None,
+            Some(&details.to_string()),
+        )
+        .unwrap();
+    let unknown = broker
+        .store()
+        .transition_coordinated_operation(
+            operation.id,
+            OperationStatus::OutcomeUnknown,
+            None,
+            Some(r#"{"reason":"simulated_parent_result_loss"}"#),
+        )
+        .unwrap();
+    let mut missing = unknown.clone();
+    missing.details_json = Some("{}".into());
+    assert!(!git_scopes::try_reconcile(&mut broker, &missing, root.path(), deadline).unwrap());
+    let mut wrong_generation: serde_json::Value =
+        serde_json::from_str(unknown.details_json.as_deref().unwrap()).unwrap();
+    wrong_generation["fetch_reconciliation"]["common_inode"] = json!(0);
+    let mut replaced = unknown.clone();
+    replaced.details_json = Some(wrong_generation.to_string());
+    assert!(!git_scopes::try_reconcile(&mut broker, &replaced, root.path(), deadline).unwrap());
+    let oid = crate::GitRepo::discover(root.path())
+        .unwrap()
+        .resolve_ref("HEAD")
+        .unwrap();
+    let delete = Command::new("git")
+        .current_dir(root.path())
+        .args(["update-ref", "-d", "refs/remotes/origin/main"])
+        .output()
+        .unwrap();
+    assert!(delete.status.success());
+    assert!(
+        !git_scopes::try_reconcile(&mut broker, &unknown, root.path(), deadline).unwrap(),
+        "matching child completion does not excuse ref drift"
+    );
+    let restore = Command::new("git")
+        .current_dir(root.path())
+        .args(["update-ref", "refs/remotes/origin/main", &oid])
+        .output()
+        .unwrap();
+    assert!(restore.status.success());
+    assert!(git_scopes::try_reconcile(&mut broker, &unknown, root.path(), deadline).unwrap());
+    let reconciled = broker
+        .store()
+        .coordinated_operation(operation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reconciled.status, OperationStatus::ReconciledSucceeded);
+    let proof: serde_json::Value =
+        serde_json::from_str(reconciled.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        proof["reconciliation"]["source"],
+        "observed_fetch_completion"
+    );
+    assert_eq!(proof["reconciliation"]["remote_source"], oid);
 }

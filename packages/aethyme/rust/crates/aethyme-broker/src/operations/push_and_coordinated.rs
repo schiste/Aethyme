@@ -1621,6 +1621,28 @@ impl Broker {
         };
         let destination = format!("refs/remotes/{remote}/{branch}");
         let source = format!("refs/heads/{branch}");
+        let fetch_args = git_scopes::canonical_fetch_args(&remote, &branch)
+            .filter(|args| {
+                self.store()
+                    .session(session_id)
+                    .ok()
+                    .is_some_and(|session| {
+                        git_scopes::validate_repository(
+                            &session.worktree_path,
+                            args,
+                            AdmissionDeadline::start(QueueWait::Seconds(5)),
+                            repository,
+                        )
+                        .is_ok()
+                    })
+            })
+            .unwrap_or_else(|| {
+                vec![
+                    "fetch".into(),
+                    remote.to_string(),
+                    format!("{source}:{destination}"),
+                ]
+            });
         let fetch = self.run_coordinated_operation(CoordinatedCommand {
             session_id,
             provider: OperationProvider::Git,
@@ -1634,11 +1656,7 @@ impl Broker {
             authorization_reason: Some(
                 "refresh the tracked target after an authorized pull-request merge".into(),
             ),
-            args: vec![
-                "fetch".into(),
-                remote.to_string(),
-                format!("{source}:{destination}"),
-            ],
+            args: fetch_args,
         });
         let fetch = match fetch {
             Ok(fetch) if fetch.ok() => fetch,
@@ -2778,12 +2796,19 @@ impl Broker {
             None
         };
         let mut host_guard = if is_remote_write {
-            Some(crate::HostOperationGuard::begin(
+            match crate::HostOperationGuard::begin_with_deadline(
                 &self.host_operation_database_path()?,
                 &lock_key,
                 request.provider,
                 effect,
-            )?)
+                admission.at,
+            ) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    self.resolve_unstarted_operation(queued_operation_id, "host_lane_unavailable");
+                    return Err(error.into());
+                }
+            }
         } else {
             None
         };

@@ -267,6 +267,8 @@ pub(super) fn validate_repository(
         "GIT_OBJECT_DIRECTORY",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_QUARANTINE_PATH",
+        "GIT_SHALLOW_FILE",
+        "GIT_GRAFT_FILE",
         "GIT_NAMESPACE",
         "GIT_REPLACE_REF_BASE",
         "GIT_EXEC_PATH",
@@ -295,9 +297,39 @@ pub(super) fn validate_repository(
             "shallow repository has an additional write footprint",
         ));
     }
-    for hook in ["reference-transaction", "pre-push"] {
-        if common
-            .join("hooks")
+    let hook_config = probe(
+        cwd,
+        &["config", "--path", "--null", "--get", "core.hooksPath"],
+        deadline,
+        repository,
+    )?;
+    let hook_directory = if hook_config.status.success() {
+        let text = std::str::from_utf8(&hook_config.stdout)
+            .map_err(|_| unavailable("non-UTF-8 hook directory"))?;
+        let Some(value) = text.strip_suffix('\0') else {
+            return Err(unavailable("incomplete hook directory"));
+        };
+        if value.is_empty() || value.contains('\0') || value.chars().any(char::is_control) {
+            return Err(unavailable("ambiguous hook directory"));
+        }
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        }
+    } else if hook_config.status.code() == Some(1) {
+        common.join("hooks")
+    } else {
+        return Err(unavailable("hook directory inventory failed"));
+    };
+    let hooks: &[&str] = if fetch_footprint(args).is_some() {
+        &["reference-transaction"]
+    } else {
+        &["reference-transaction", "pre-push"]
+    };
+    for hook in hooks {
+        if hook_directory
             .join(hook)
             .try_exists()
             .map_err(|_| unavailable("hook state is unreadable"))?
@@ -329,8 +361,10 @@ pub(super) fn validate_repository(
             return Err(unavailable("malformed Git configuration"));
         };
         let key = key.to_ascii_lowercase();
-        if key == "core.hookspath"
-            || key == "core.sshcommand"
+        if key == "core.hookspath" {
+            continue;
+        }
+        if key == "core.sshcommand"
             || key.starts_with("extensions.")
             || key.starts_with("url.")
             || key == "protocol.ext.allow"
@@ -428,6 +462,12 @@ impl FetchJournal {
     }
 }
 
+struct VerifiedFetch {
+    journal: FetchJournal,
+    local: Option<String>,
+    remote: Option<String>,
+}
+
 /// Recover only a fetch whose actual child completion was durably observed.
 /// Endpoint/ref equality without that witness never authorizes reconciliation.
 pub(super) fn try_reconcile(
@@ -441,98 +481,106 @@ pub(super) fn try_reconcile(
     {
         return Ok(false);
     }
-    let evidence =
-        (|| -> Result<Option<(FetchJournal, Option<String>, Option<String>)>, BrokerOpError> {
-            let Some(command) = serde_json::from_str::<Vec<String>>(&operation.command_json).ok()
-            else {
+    let evidence = (|| -> Result<Option<VerifiedFetch>, BrokerOpError> {
+        let Some(command) = serde_json::from_str::<Vec<String>>(&operation.command_json).ok()
+        else {
+            return Ok(None);
+        };
+        let Some(args) = command.get(1..) else {
+            return Ok(None);
+        };
+        let Some(footprint) = fetch_footprint(args) else {
+            return Ok(None);
+        };
+        let Some(journal) = operation
+            .details_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .and_then(|value| value.get("fetch_reconciliation").cloned())
+            .and_then(|value| serde_json::from_value::<FetchJournal>(value).ok())
+        else {
+            return Ok(None);
+        };
+        if journal.schema_version != 1
+            || journal.operation_id != operation.id
+            || journal.repository != operation.repository
+            || journal.footprint != footprint
+            || !journal.proves_provider_completion()
+            || !journal.matches_repository(cwd)
+        {
+            return Ok(None);
+        }
+        validate_repository(cwd, args, deadline, &operation.repository)?;
+        let target = crate::GitRepo::discover(cwd)?.resolve_remote_command_target(args, None)?;
+        if target.coordination_key != operation.repository {
+            return Ok(None);
+        }
+        let local = observe_ref(
+            cwd,
+            &footprint.destination_ref,
+            deadline,
+            &operation.repository,
+        )?;
+        let remote_output = probe(
+            cwd,
+            &[
+                "ls-remote",
+                "--refs",
+                "--",
+                &footprint.remote,
+                &footprint.source_ref,
+            ],
+            deadline,
+            &operation.repository,
+        )?;
+        if !remote_output.status.success() {
+            return Ok(None);
+        }
+        let remote_text = std::str::from_utf8(&remote_output.stdout)
+            .map_err(|_| unavailable("non-UTF-8 remote ref evidence"))?;
+        let mut remote = None;
+        for line in remote_text.lines() {
+            let Some((oid, name)) = line.split_once('\t') else {
                 return Ok(None);
             };
-            let Some(args) = command.get(1..) else {
-                return Ok(None);
-            };
-            let Some(footprint) = fetch_footprint(args) else {
-                return Ok(None);
-            };
-            let Some(journal) = operation
-                .details_json
-                .as_deref()
-                .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-                .and_then(|value| value.get("fetch_reconciliation").cloned())
-                .and_then(|value| serde_json::from_value::<FetchJournal>(value).ok())
-            else {
-                return Ok(None);
-            };
-            if journal.schema_version != 1
-                || journal.operation_id != operation.id
-                || journal.repository != operation.repository
-                || journal.footprint != footprint
-                || !journal.proves_provider_completion()
-                || !journal.matches_repository(cwd)
+            if name != footprint.source_ref
+                || oid.len() != 40
+                || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || remote.is_some()
             {
                 return Ok(None);
             }
-            validate_repository(cwd, args, deadline, &operation.repository)?;
-            let target =
-                crate::GitRepo::discover(cwd)?.resolve_remote_command_target(args, None)?;
-            if target.coordination_key != operation.repository {
-                return Ok(None);
-            }
-            let local = observe_ref(
-                cwd,
-                &footprint.destination_ref,
-                deadline,
-                &operation.repository,
-            )?;
-            let remote_output = probe(
-                cwd,
-                &[
-                    "ls-remote",
-                    "--refs",
-                    "--",
-                    &footprint.remote,
-                    &footprint.source_ref,
-                ],
-                deadline,
-                &operation.repository,
-            )?;
-            if !remote_output.status.success() {
-                return Ok(None);
-            }
-            let remote_text = std::str::from_utf8(&remote_output.stdout)
-                .map_err(|_| unavailable("non-UTF-8 remote ref evidence"))?;
-            let mut remote = None;
-            for line in remote_text.lines() {
-                let Some((oid, name)) = line.split_once('\t') else {
-                    return Ok(None);
-                };
-                if name != footprint.source_ref
-                    || oid.len() != 40
-                    || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    || remote.is_some()
-                {
-                    return Ok(None);
-                }
-                remote = Some(oid.to_owned());
-            }
-            let completion = journal.completion.as_ref().expect("validated completion");
-            let settled = if completion.success {
-                local.is_some() && local == remote
-            } else {
-                local == journal.pre_destination
-            };
-            Ok(settled.then_some((journal, local, remote)))
-        })();
+            remote = Some(oid.to_owned());
+        }
+        let completion = journal.completion.as_ref().expect("validated completion");
+        let settled = if completion.success {
+            local.is_some() && local == remote
+        } else {
+            local == journal.pre_destination
+        };
+        Ok(settled.then_some(VerifiedFetch {
+            journal,
+            local,
+            remote,
+        }))
+    })();
     // Failed/missing evidence leaves the original unknown outcome intact.
-    let Some((journal, local, remote)) = evidence.unwrap_or(None) else {
+    let Ok(Some(verified)) = evidence else {
         return Ok(false);
     };
+    let VerifiedFetch {
+        journal,
+        local,
+        remote,
+    } = verified;
     let completion = journal.completion.as_ref().expect("validated completion");
     let succeeded = completion.success;
     if let Some(host_id) = &operation.host_operation_id {
-        crate::reconcile_host_operation(
+        crate::host_operations::reconcile_host_operation_with_deadline(
             &broker.host_operation_database_path()?,
             host_id,
             succeeded,
+            deadline.at,
         )?;
     }
     let status = if succeeded {
@@ -549,13 +597,15 @@ pub(super) fn try_reconcile(
         "local_destination": local, "remote_source": remote, "observed_at": unix_now_ms(),
         "common_directory_identity_verified": true,
     });
-    broker.store().transition_coordinated_operation(
-        operation.id,
-        status,
-        completion.exit_code.map(i64::from),
-        Some(&details.to_string()),
-    )?;
-    Ok(true)
+    Ok(broker
+        .store()
+        .reconcile_observed_operation(
+            operation,
+            &details.to_string(),
+            status,
+            completion.exit_code.map(i64::from),
+        )?
+        .is_some())
 }
 
 #[cfg(test)]

@@ -107,7 +107,12 @@ child completion, unchanged identity/configuration, the same canonical remote
 and fresh exact local/remote ref evidence. Missing proof, signal termination,
 remote advancement or provider errors remain unknown; no fetch is retried and
 PID disappearance alone never grants authority. Legacy records gain no synthetic
-completion evidence. This protocol adds no schema migration or new deletion rights.
+completion evidence. Host-operation schema 2 adopts existing schema-1 rows and raises the writer
+floor because older host writers cannot honor parent/resource crash barriers.
+Already running broad writers retain their parent lock until completion; future
+old-runtime opens refuse schema 2. Deploy the matched router/engine to all local
+writers when activating this protocol. Broker operation details remain additive;
+this grants no new deletion rights.
 
 Coordination wait details retain schema 1 and add `blocked_scope`,
 `safe_next_action` and `missing_evidence`. Matching running operations supply the

@@ -655,6 +655,7 @@ fn output_within_capture_limit(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn output_within_observed(
     mut command: Command,
     deadline: AdmissionDeadline,

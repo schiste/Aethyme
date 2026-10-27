@@ -192,6 +192,31 @@ impl BrokerStore {
         expected: &CoordinatedOperation,
         details_json: &str,
     ) -> Result<Option<CoordinatedOperation>, BrokerError> {
+        self.record_unknown_operation_update(expected, details_json, None)
+    }
+
+    pub(crate) fn reconcile_observed_operation(
+        &mut self,
+        expected: &CoordinatedOperation,
+        details_json: &str,
+        status: OperationStatus,
+        exit_code: Option<i64>,
+    ) -> Result<Option<CoordinatedOperation>, BrokerError> {
+        if !matches!(
+            status,
+            OperationStatus::ReconciledSucceeded | OperationStatus::ReconciledFailed
+        ) {
+            return Ok(None);
+        }
+        self.record_unknown_operation_update(expected, details_json, Some((status, exit_code)))
+    }
+
+    fn record_unknown_operation_update(
+        &mut self,
+        expected: &CoordinatedOperation,
+        details_json: &str,
+        resolution: Option<(OperationStatus, Option<i64>)>,
+    ) -> Result<Option<CoordinatedOperation>, BrokerError> {
         if expected.status != OperationStatus::OutcomeUnknown {
             return Ok(None);
         }
@@ -221,10 +246,23 @@ impl BrokerStore {
             return Ok(None);
         }
         let now = now_ms();
+        let (status, exit_code) = resolution.unwrap_or((expected.status, expected.exit_code));
+        let finished_at = if resolution.is_some() {
+            Some(now)
+        } else {
+            expected.finished_at
+        };
         tx.execute(
-            "UPDATE coordinated_operations SET details_json = ?2, updated_at = ?3
-             WHERE id = ?1",
-            params![expected.id, details_json, now],
+            "UPDATE coordinated_operations SET details_json = ?2, updated_at = ?3,
+                 status = ?4, exit_code = ?5, finished_at = ?6 WHERE id = ?1",
+            params![
+                expected.id,
+                details_json,
+                now,
+                status.as_str(),
+                exit_code,
+                finished_at
+            ],
         )?;
         let payload = crate::events::operation_payload(
             expected.id,
@@ -232,13 +270,17 @@ impl BrokerStore {
             &expected.repository,
             &expected.scope,
             expected.effect,
-            expected.status,
-            expected.exit_code,
+            status,
+            exit_code,
         );
         insert_event(
             &tx,
             now,
-            "operation.inspected",
+            if resolution.is_some() {
+                "operation.fetch_reconciled"
+            } else {
+                "operation.inspected"
+            },
             Some(expected.session_id),
             Some(&payload),
         )?;
