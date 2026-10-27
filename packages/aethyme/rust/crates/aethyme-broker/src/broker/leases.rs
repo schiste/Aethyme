@@ -2196,7 +2196,7 @@ impl Broker {
         F: FnOnce(
             &crate::types::Session,
             Option<crate::store::guarded_exec::HelperObservationTarget>,
-            &mut Option<crate::artifact_use::ArtifactUseProducer>,
+            &mut Option<crate::file_lock::ArtifactUseProducer>,
             &mut dyn FnMut(GuardedExecDispatchEvent),
         ) -> Result<GuardedCommandResult, BrokerOpError>,
     {
@@ -2229,14 +2229,14 @@ impl Broker {
             .map(|id| self.store.helper_observation_target(session_id, id))
             .transpose()?
             .flatten();
-        let mut artifact_use = match crate::artifact_use::begin_artifact_use(
+        let mut artifact_use = match crate::file_lock::begin_artifact_use(
             self.main_root(),
             checkout.root(),
             session_id,
-            &crate::artifact_use::invocation_id("guarded-exec", session_id),
+            &crate::file_lock::invocation_id("guarded-exec", session_id),
         ) {
-            Ok(crate::artifact_use::ArtifactUseAdmission::Admitted(producer)) => Some(producer),
-            Ok(crate::artifact_use::ArtifactUseAdmission::ProtocolUnavailable) => None,
+            Ok(crate::file_lock::ArtifactUseAdmission::Admitted(producer)) => Some(producer),
+            Ok(crate::file_lock::ArtifactUseAdmission::ProtocolUnavailable) => None,
             Err(source) => {
                 if let Some(receipt_id) = receipt_id.as_deref() {
                     crate::warn_unrecorded(
@@ -3126,9 +3126,9 @@ mod generic_guarded_exec_tests {
                     }
                     let ready_seen = ready.exists();
                     let busy = matches!(
-                        crate::artifact_use::try_artifact_use_reclaimer(&main_root, &checkout,),
-                        Ok(crate::artifact_use::ArtifactUseReclaimTry::Blocked(
-                            crate::artifact_use::ArtifactUseReclaimBlock::Contended
+                        crate::file_lock::try_artifact_use_reclaimer(&main_root, &checkout,),
+                        Ok(crate::file_lock::ArtifactUseReclaimTry::Blocked(
+                            crate::file_lock::ArtifactUseReclaimBlock::Contended
                         ))
                     );
                     heartbeat_ready.store(ready_seen, Ordering::Release);
@@ -3149,12 +3149,12 @@ mod generic_guarded_exec_tests {
         assert!(saw_ready.load(Ordering::Acquire));
         assert!(was_busy.load(Ordering::Acquire));
         assert!(matches!(
-            crate::artifact_use::try_artifact_use_reclaimer(
+            crate::file_lock::try_artifact_use_reclaimer(
                 broker.main_root(),
                 Path::new(&session.worktree_path),
             )
             .unwrap(),
-            crate::artifact_use::ArtifactUseReclaimTry::Acquired(_)
+            crate::file_lock::ArtifactUseReclaimTry::Acquired(_)
         ));
     }
 
@@ -3192,12 +3192,12 @@ mod generic_guarded_exec_tests {
             "before-timeout"
         );
         assert!(matches!(
-            crate::artifact_use::try_artifact_use_reclaimer(
+            crate::file_lock::try_artifact_use_reclaimer(
                 broker.main_root(),
                 Path::new(&session.worktree_path),
             )
             .unwrap(),
-            crate::artifact_use::ArtifactUseReclaimTry::Acquired(_)
+            crate::file_lock::ArtifactUseReclaimTry::Acquired(_)
         ));
     }
 

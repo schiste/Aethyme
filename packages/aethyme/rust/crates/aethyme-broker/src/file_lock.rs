@@ -275,8 +275,8 @@ mod artifact_use;
 
 pub(crate) use artifact_use::{
     ArtifactUseAdmission, ArtifactUseMarker, ArtifactUseProducer, ArtifactUseReclaimBlock,
-    ArtifactUseReclaimTry, ArtifactUseReclaimer, ProcessStartIdentity, begin_artifact_use,
-    try_artifact_use_reclaimer,
+    ArtifactUseReclaimTry, ArtifactUseReclaimer, ArtifactUseScopeAdmission, ProcessStartIdentity,
+    begin_artifact_use, begin_artifact_use_scope, invocation_id, try_artifact_use_reclaimer,
 };
 
 #[cfg(test)]
