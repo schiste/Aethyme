@@ -1214,19 +1214,96 @@ fn missing_post_push_evidence_keeps_an_exact_push_unknown() {
 #[cfg(unix)]
 #[test]
 fn bounded_remote_write_timeout_is_journaled_unknown_and_blocks_retry() {
+    const CHILD_ENV: &str = "AETHYME_TEST_BOUNDED_REMOTE_TIMEOUT_CHILD";
+    const ARM_ENV: &str = "AETHYME_TEST_BOUNDED_REMOTE_TIMEOUT_ARM";
+    const HIT_ENV: &str = "AETHYME_TEST_BOUNDED_REMOTE_TIMEOUT_HIT";
+
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let control = shell_fixture_tempdir();
+        let bin = control.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let arm = control.path().join("armed");
+        let hit = control.path().join("provider-pid");
+        let sleeper = control.path().join("broker-timeout-sleeper");
+        std::os::unix::fs::symlink("/bin/sleep", &sleeper).unwrap();
+
+        let real_git = real_git_executable();
+        let proxy = bin.join("git");
+        write_executable(
+            &proxy,
+            &format!(
+                r#"#!/bin/sh
+if [ "${{1-}}" = "push" ] && [ -f {} ]; then
+    for arg do
+        if [ "$arg" = "--dry-run" ]; then
+            exec {} "$@"
+        fi
+    done
+    if ! (set -C; printf '%s\n' "$$" > {}); then
+        exit 125
+    fi
+    exec {} 60
+fi
+exec {} "$@"
+"#,
+                shell_path(&arm),
+                shell_path(&real_git),
+                shell_path(&hit),
+                shell_path(&sleeper),
+                shell_path(&real_git),
+            ),
+        );
+
+        let mut search_path = vec![bin];
+        search_path.extend(std::env::split_paths(
+            &std::env::var_os("PATH").expect("test runner provides PATH"),
+        ));
+        let child_path = std::env::join_paths(search_path).unwrap();
+        let stdout_path = control.path().join("child.stdout");
+        let stderr_path = control.path().join("child.stderr");
+        let stdout = std::fs::File::create(&stdout_path).unwrap();
+        let stderr = std::fs::File::create(&stderr_path).unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "bounded_remote_write_timeout_is_journaled_unknown_and_blocks_retry",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env(ARM_ENV, &arm)
+            .env(HIT_ENV, &hit)
+            .env("PATH", child_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(stdout))
+            .stderr(std::process::Stdio::from(stderr));
+        let mut child = NestedTimeoutTestChild::new(command.spawn().unwrap());
+        let (status, provider_seen_at) = wait_for_nested_timeout_test(&mut child, &hit);
+        let child_stdout = std::fs::read(&stdout_path).unwrap_or_default();
+        let child_stderr = std::fs::read(&stderr_path).unwrap_or_default();
+        let provider_check = proxy_sleep_stopped(&hit, &sleeper, provider_seen_at);
+        let status_ok = status.as_ref().is_some_and(|status| status.success());
+        let status =
+            status.map_or_else(|| "did not exit within its bound".into(), |s| s.to_string());
+        assert!(
+            status_ok && provider_check.is_ok(),
+            "nested timeout test status: {status}; provider cleanup: {}\nstdout:\n{}\nstderr:\n{}",
+            provider_check.err().unwrap_or_else(|| "clean".into()),
+            String::from_utf8_lossy(&child_stdout),
+            String::from_utf8_lossy(&child_stderr),
+        );
+        return;
+    }
+
     let tmp = shell_fixture_tempdir();
     let mut fixture = push_fixture(tmp.path(), "push-timeout");
     commit_push_fixture(&fixture, "timeout\n");
-    let receive_pack = tmp.path().join("sleeping-receive-pack");
-    write_executable(&receive_pack, "#!/bin/sh\nsleep 60\n");
-    git(
-        &fixture.worktree,
-        &[
-            "config",
-            "remote.origin.receivepack",
-            &shell_path(&receive_pack),
-        ],
-    );
+    let arm = std::path::PathBuf::from(std::env::var_os(ARM_ENV).unwrap());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(arm)
+        .unwrap();
 
     let started = Instant::now();
     let error = fixture
@@ -1263,6 +1340,194 @@ fn bounded_remote_write_timeout_is_journaled_unknown_and_blocks_retry() {
         serde_json::from_str(operation.details_json.as_deref().unwrap()).unwrap();
     assert_eq!(details["failure_class"], "coordinated_operation_timeout");
     assert_eq!(details["remote_outcome"], "unknown");
+
+    let shown = fixture
+        .broker
+        .show_coordinated_operation(operation_id)
+        .unwrap();
+    assert_eq!(
+        shown.reconciliation.state,
+        OperationReconciliationState::Required
+    );
+    assert!(!shown.reconciliation.automatic_retry_allowed);
+    let retry = fixture
+        .broker
+        .run_coordinated_operation_with_wait(
+            exact_push_request(
+                fixture.session_id,
+                &fixture.worktree,
+                &["HEAD:refs/heads/main"],
+            ),
+            QueueWait::Seconds(5),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        retry,
+        BrokerOpError::CoordinatedOperationBlocked {
+            operation_id: blocked_id,
+            ..
+        } if blocked_id == operation_id
+    ));
+}
+
+#[cfg(unix)]
+fn real_git_executable() -> std::path::PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").expect("test runner provides PATH"))
+        .map(|directory| directory.join("git"))
+        .find(|candidate| {
+            candidate.is_file()
+                && Command::new(candidate)
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+        })
+        .expect("test runner PATH contains a working Git")
+        .canonicalize()
+        .unwrap()
+}
+
+#[cfg(unix)]
+struct NestedTimeoutTestChild(Option<std::process::Child>);
+
+#[cfg(unix)]
+impl NestedTimeoutTestChild {
+    fn new(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let status = self
+            .0
+            .as_mut()
+            .expect("nested test child remains owned until observed")
+            .try_wait()?;
+        if status.is_some() {
+            self.0.take();
+        }
+        Ok(status)
+    }
+
+    fn stop_and_wait(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for NestedTimeoutTestChild {
+    fn drop(&mut self) {
+        self.stop_and_wait();
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_nested_timeout_test(
+    child: &mut NestedTimeoutTestChild,
+    provider_pid_file: &Path,
+) -> (Option<std::process::ExitStatus>, Option<Instant>) {
+    let started = Instant::now();
+    let mut provider_seen_at = None;
+    let mut provider_deadline = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return (Some(status), provider_seen_at),
+            Ok(None) => {}
+            Err(error) => panic!("polling nested timeout test: {error}"),
+        }
+        let now = Instant::now();
+        let deadline = if provider_pid_file.exists() {
+            let seen_at = *provider_seen_at.get_or_insert(now);
+            *provider_deadline.get_or_insert(seen_at + Duration::from_secs(65))
+        } else {
+            started + Duration::from_secs(60)
+        };
+        if now >= deadline {
+            child.stop_and_wait();
+            return (None, provider_seen_at);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn proxy_sleep_stopped(
+    provider_pid_file: &Path,
+    sleeper: &Path,
+    provider_seen_at: Option<Instant>,
+) -> Result<(), String> {
+    let pid_text = std::fs::read_to_string(provider_pid_file)
+        .map_err(|error| format!("armed proxy did not record its provider PID: {error}"))?;
+    let pid: i32 = pid_text
+        .trim()
+        .parse()
+        .map_err(|error| format!("proxy recorded an invalid provider PID: {error}"))?;
+    if pid <= 0 {
+        return Err(format!("proxy recorded an invalid provider PID: {pid}"));
+    }
+    let pid_arg = pid.to_string();
+    let sleeper_name = sleeper.file_name().unwrap().to_string_lossy();
+    let probe = || -> Result<Option<(String, String)>, String> {
+        let output = Command::new("/bin/ps")
+            .args(["-p", &pid_arg, "-o", "stat=,command="])
+            .output()
+            .map_err(|error| format!("inspect fixture-owned provider PID {pid}: {error}"))?;
+        let row = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !output.status.success() {
+            if output.status.code() == Some(1) && row.is_empty() && output.stderr.is_empty() {
+                return Ok(None);
+            }
+            return Err(format!(
+                "ps failed while checking fixture-owned provider PID {pid}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        if row.is_empty() {
+            return Ok(None);
+        }
+        let mut fields = row.split_whitespace();
+        let state = fields.next().unwrap_or_default().to_string();
+        let command = fields.collect::<Vec<_>>().join(" ");
+        Ok(Some((state, command)))
+    };
+    let Some((state, command)) = probe()? else {
+        return Ok(());
+    };
+    if state.starts_with('Z') {
+        return Ok(());
+    }
+    if !command.contains(sleeper_name.as_ref()) {
+        return Err(format!(
+            "fixture provider PID {pid} is alive but cannot be identified safely; expected sleeper name {sleeper_name:?}, observed state {state:?} and command {command:?}"
+        ));
+    }
+    let natural_exit_deadline =
+        provider_seen_at.unwrap_or_else(Instant::now) + Duration::from_secs(62);
+    while Instant::now() < natural_exit_deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        match probe()? {
+            None => {
+                return Err(format!(
+                    "broker returned while fixture sleeper PID {pid} was live; it exited only after its natural 60-second lifetime"
+                ));
+            }
+            Some((state, _)) if state.starts_with('Z') => {
+                return Err(format!(
+                    "broker returned while fixture sleeper PID {pid} was live; it became a zombie only after its natural 60-second lifetime"
+                ));
+            }
+            Some((_state, command)) if command.contains(sleeper_name.as_ref()) => {}
+            Some((state, command)) => {
+                return Err(format!(
+                    "fixture provider PID {pid} became ambiguous while waiting; observed state {state:?} and command {command:?}"
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "fixture provider PID {pid} outlived its natural 60-second lifetime"
+    ))
 }
 
 #[test]
