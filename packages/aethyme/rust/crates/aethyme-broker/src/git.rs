@@ -4790,18 +4790,27 @@ impl GitRepo {
         &self,
         policy: &crate::AutoCleanupPolicy,
     ) -> Result<bool, GitError> {
-        require_trustworthy_porcelain()?;
-        let entries = parse_porcelain_entries_z(&run_git_bytes(
-            &self.root,
-            &[
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=all",
-                "--ignored=matching",
-                "--ignore-submodules=none",
-            ],
-        )?)?;
+        self.has_only_unstaged_tracked_deletions_until_with_limits(
+            policy,
+            Instant::now() + Duration::from_secs(15),
+            MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            MAX_CLEANUP_STATUS_PATH_FIELDS,
+        )
+    }
+
+    pub(crate) fn has_only_unstaged_tracked_deletions_until_with_limits(
+        &self,
+        policy: &crate::AutoCleanupPolicy,
+        deadline: Instant,
+        max_output_bytes: usize,
+        max_path_fields: usize,
+    ) -> Result<bool, GitError> {
+        let entries = self.cleanup_status_entries_until_with_limits(
+            deadline,
+            max_output_bytes,
+            max_path_fields,
+            true,
+        )?;
         Ok(only_unstaged_tracked_deletions(&entries, |path| {
             crate::auto_cleanup::classify_ignored(&self.root, path, policy).is_ok()
         }))
@@ -4976,7 +4985,31 @@ impl GitRepo {
         max_output_bytes: usize,
         max_path_fields: usize,
     ) -> Result<(Vec<String>, Vec<String>), GitError> {
-        const ARGS: &[&str] = &[
+        let entries = self.cleanup_status_entries_until_with_limits(
+            deadline,
+            max_output_bytes,
+            max_path_fields,
+            false,
+        )?;
+        let mut dirty = Vec::with_capacity(entries.len());
+        let mut untracked = Vec::new();
+        for (status, path) in entries {
+            if status == [b'?', b'?'] {
+                untracked.push(path.clone());
+            }
+            dirty.push(path);
+        }
+        Ok((dirty, untracked))
+    }
+
+    fn cleanup_status_entries_until_with_limits(
+        &self,
+        deadline: Instant,
+        max_output_bytes: usize,
+        max_path_fields: usize,
+        include_matching_ignored: bool,
+    ) -> Result<Vec<([u8; 2], String)>, GitError> {
+        let mut args = vec![
             "-c",
             "core.fsmonitor=false",
             "-c",
@@ -4987,37 +5020,31 @@ impl GitRepo {
             "--untracked-files=all",
             "--ignore-submodules=none",
         ];
-
+        if include_matching_ignored {
+            args.push("--ignored=matching");
+        }
         let deadline = active_git_deadline().map_or(deadline, |active| active.min(deadline));
-        ensure_bounded_git_listing_before(deadline, ARGS)?;
+        ensure_bounded_git_listing_before(deadline, &args)?;
         if std::env::vars_os().any(|(key, _)| unsafe_graph_git_environment_key(&key)) {
             return Err(GitError::UntrustedOutput {
                 detail: "inherited Git routing overrides make cleanup status unknown".into(),
             });
         }
         require_trustworthy_porcelain()?;
-        ensure_bounded_git_listing_before(deadline, ARGS)?;
-        let mut command = ignored_paths_git_command(&self.root, ARGS);
+        ensure_bounded_git_listing_before(deadline, &args)?;
+        let mut command = ignored_paths_git_command(&self.root, &args);
         let output =
-            run_git_process_output_limited(&mut command, ARGS, deadline, max_output_bytes)?;
+            run_git_process_output_limited(&mut command, &args, deadline, max_output_bytes)?;
         if !output.status.success() {
             return Err(GitError::Git {
-                args: ARGS.join(" "),
+                args: args.join(" "),
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
             });
         }
 
         let entries = parse_porcelain_entries_z_with_path_limit(&output.stdout, max_path_fields)?;
-        ensure_bounded_git_listing_before(deadline, ARGS)?;
-        let mut dirty = Vec::with_capacity(entries.len());
-        let mut untracked = Vec::new();
-        for (status, path) in entries {
-            if status == [b'?', b'?'] {
-                untracked.push(path.clone());
-            }
-            dirty.push(path);
-        }
-        Ok((dirty, untracked))
+        ensure_bounded_git_listing_before(deadline, &args)?;
+        Ok(entries)
     }
 
     pub(crate) fn untracked_paths_until_with_limits(
@@ -6437,6 +6464,43 @@ mod bounded_cleanup_status_tests {
             .dirty_and_untracked_paths_until_with_limits(deadline, 4096, 1)
             .unwrap_err();
         assert!(matches!(path_error, GitError::UntrustedOutput { .. }));
+    }
+
+    #[test]
+    fn bounded_finish_status_keeps_matching_ignored_paths_in_its_proof() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            root.path().join(".gitignore"),
+            "/opaque-cache/\n/private.dat\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("tracked.txt"), "base\n").unwrap();
+        git(root.path(), &["add", "tracked.txt", ".gitignore"]);
+        git(root.path(), &["commit", "-qm", "initial"]);
+        std::fs::create_dir_all(root.path().join("opaque-cache")).unwrap();
+        std::fs::write(root.path().join("opaque-cache/output"), "discardable").unwrap();
+        std::fs::remove_file(root.path().join("tracked.txt")).unwrap();
+
+        let repo = GitRepo::discover(root.path()).unwrap();
+        let policy = crate::AutoCleanupPolicy::default();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        assert!(
+            repo.has_only_unstaged_tracked_deletions_until_with_limits(&policy, deadline, 4096, 2)
+                .unwrap()
+        );
+
+        let path_error = repo
+            .has_only_unstaged_tracked_deletions_until_with_limits(&policy, deadline, 4096, 1)
+            .unwrap_err();
+        assert!(matches!(path_error, GitError::UntrustedOutput { .. }));
+
+        std::fs::write(root.path().join("private.dat"), "preserve").unwrap();
+        assert!(
+            !repo
+                .has_only_unstaged_tracked_deletions_until_with_limits(&policy, deadline, 4096, 4)
+                .unwrap()
+        );
     }
 }
 

@@ -134,6 +134,12 @@ blocked.
    the consumer cannot represent.
    Treat the proof as a complete literal Git path census plus committed file
    type and mode evidence; diff-rendering settings are not source identity.
+   For cleanup eligibility, carry one absolute deadline and the same output and
+   path caps through status checks and proof rechecks; do not grant a late
+   recheck a fresh timeout. If finish cleanup is already deregistered and its
+   Git admin/index is gone, recovery must rely on the durable pre-removal proof
+   and fresh ownership/liveness checks because Git cannot produce another
+   status result.
    Before deleting a source checkout after archiving, sync archive files and
    directories bottom-up; after publishing the final archive, sync its
    directory, parent and storage anchor. Keep the source if any sync fails.
