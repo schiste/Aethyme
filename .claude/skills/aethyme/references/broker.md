@@ -189,6 +189,11 @@ blocked.
    verified and integrated. Never switch branches inside someone else's
    worktree; never edit files outside your own worktree.
 
+   When adding or changing a public broker verb or its JSON report, update the
+   generated CLI help snapshots and `docs/architecture/cross-process-consumers.md`.
+   The help snapshot test derives public verbs from the surface table; keep the
+   no-side-effect help coverage in sync as well.
+
    For a local commit in your own active session, use
    \`aethyme broker commit --session <your-session-id> -- <git-commit-args>\`.
    It checks the registered worktree and branch, audits complete bounded path

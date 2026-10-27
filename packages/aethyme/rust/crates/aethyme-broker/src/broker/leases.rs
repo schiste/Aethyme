@@ -3497,7 +3497,7 @@ mod generic_guarded_exec_tests {
             head_before
         );
         assert!(
-            !broker
+            broker
                 .store
                 .guarded_exec_receipts(session.id, 10)
                 .unwrap()
@@ -3512,6 +3512,204 @@ mod generic_guarded_exec_tests {
                 .0
                 .contains(&"tracked.txt".to_owned()),
             "the staged edit must remain available for the user"
+        );
+    }
+
+    #[test]
+    fn local_commit_refuses_foreign_cwd_and_closed_session_before_dispatch() {
+        let (repository, _storage, mut broker) = fixture();
+        let session = broker
+            .start_worktree("session-local commit scope refusal", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path)
+            .canonicalize()
+            .unwrap();
+        let head_before = GitRepo::discover(&worktree).unwrap().head_commit().unwrap();
+
+        let foreign_cwd = broker
+            .guarded_commit_for_cli(
+                session.id,
+                repository.path(),
+                &["-m".into(), "must not run".into()],
+                true,
+                false,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(foreign_cwd, BrokerOpError::SessionCommitRefused { .. }),
+            "{foreign_cwd}"
+        );
+
+        broker
+            .store
+            .set_session_status(session.id, crate::SessionStatus::Closed, None)
+            .unwrap();
+        let closed = broker
+            .guarded_commit_for_cli(
+                session.id,
+                &worktree,
+                &["-m".into(), "must not run".into()],
+                true,
+                false,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(closed, BrokerOpError::SessionCommitRefused { .. }),
+            "{closed}"
+        );
+        assert_eq!(
+            GitRepo::discover(&worktree).unwrap().head_commit().unwrap(),
+            head_before
+        );
+        assert!(
+            broker
+                .store
+                .guarded_exec_receipts(session.id, 10)
+                .unwrap()
+                .is_empty(),
+            "scope refusals must happen before a guarded-exec receipt is created"
+        );
+    }
+
+    #[test]
+    fn local_commit_refuses_inherited_git_routing_environment_before_dispatch() {
+        const CHILD_MODE: &str = "AETHYME_SESSION_COMMIT_ENV_TEST_CHILD";
+        const TEST: &str = "broker::leases::generic_guarded_exec_tests::local_commit_refuses_inherited_git_routing_environment_before_dispatch";
+        if std::env::var_os(CHILD_MODE).is_some() {
+            let (_repository, _storage, mut broker) = fixture();
+            let session = broker
+                .start_worktree("session-local commit environment refusal", None)
+                .unwrap();
+            let worktree = PathBuf::from(&session.worktree_path)
+                .canonicalize()
+                .unwrap();
+            let head_before = GitRepo::discover(&worktree).unwrap().head_commit().unwrap();
+
+            unsafe { std::env::set_var("GIT_DIR", "/untrusted/git-dir") };
+            let refusal = broker
+                .guarded_commit_for_cli(
+                    session.id,
+                    &worktree,
+                    &["-m".into(), "must not run".into()],
+                    true,
+                    false,
+                    None,
+                )
+                .unwrap_err();
+            unsafe { std::env::remove_var("GIT_DIR") };
+
+            assert!(
+                matches!(refusal, BrokerOpError::SessionCommitRefused { .. }),
+                "{refusal}"
+            );
+            assert_eq!(
+                GitRepo::discover(&worktree).unwrap().head_commit().unwrap(),
+                head_before
+            );
+            assert!(
+                broker
+                    .store
+                    .guarded_exec_receipts(session.id, 10)
+                    .unwrap()
+                    .is_empty(),
+                "environment refusal must happen before a receipt is created"
+            );
+            println!("AETHYME_SESSION_COMMIT_ENV_ASSERTIONS_OK");
+            return;
+        }
+
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", TEST, "--nocapture"]);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                child.env_remove(key);
+            }
+        }
+        let output = child.env(CHILD_MODE, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("AETHYME_SESSION_COMMIT_ENV_ASSERTIONS_OK"),
+            "the child must execute the assertions, not only exit successfully:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn local_commit_audits_a_foreign_path_added_by_a_hook_after_dispatch() {
+        let (repository, _storage, mut broker) = fixture();
+        git(repository.path(), &["config", "user.name", "Fixture"]);
+        git(
+            repository.path(),
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        let session = broker
+            .start_worktree("session-local commit hook ownership audit", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path)
+            .canonicalize()
+            .unwrap();
+        broker.claim_lease(session.id, "tracked.txt", None).unwrap();
+        std::fs::write(worktree.join("tracked.txt"), "leased edit\n").unwrap();
+        git(&worktree, &["add", "tracked.txt"]);
+
+        let hooks = tempfile::tempdir().unwrap();
+        let hook = hooks.path().join("pre-commit");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nprintf 'hook edit\\n' > hook-added.txt\ngit add -- hook-added.txt\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&hook, permissions).unwrap();
+        }
+        let hooks_path = hooks.path().to_string_lossy().into_owned();
+        git(&worktree, &["config", "core.hooksPath", &hooks_path]);
+
+        let head_before = GitRepo::discover(&worktree).unwrap().head_commit().unwrap();
+        let report = broker
+            .guarded_commit_for_cli(
+                session.id,
+                &worktree,
+                &["-m".into(), "hook adds an unowned path".into()],
+                true,
+                false,
+                None,
+            )
+            .unwrap();
+
+        assert!(report.execution.command_success, "{report:?}");
+        assert!(
+            !report.ok,
+            "the commit must not pass ownership audit: {report:?}"
+        );
+        assert!(report.post_commit_audit_complete, "{report:?}");
+        assert_ne!(report.head_after.as_deref(), Some(head_before.as_str()));
+        let paths = report
+            .committed_paths
+            .as_ref()
+            .expect("complete path census");
+        assert!(paths.iter().any(|path| path == "tracked.txt"), "{paths:?}");
+        assert!(
+            paths.iter().any(|path| path == "hook-added.txt"),
+            "{paths:?}"
+        );
+        assert!(!report.committed_ownership.as_ref().unwrap().ok);
+        assert!(worktree.join("hook-added.txt").is_file());
+        assert!(
+            !report.execution_receipt_id.is_empty(),
+            "the command's durable receipt remains available for investigation"
         );
     }
 

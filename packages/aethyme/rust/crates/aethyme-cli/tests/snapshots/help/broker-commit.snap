@@ -1,0 +1,8 @@
+exit: 0
+--- stdout
+  aethyme broker commit --session <id> [--non-interactive] [--timeout <1..86400 seconds>] [--json] -- <git-commit-args>
+      Run a local Git commit for the session's own checked-out branch. It
+      refuses inherited Git routing/config overrides, hook-bypass options,
+      incomplete path inventories, and paths outside current session ownership.
+      The command uses normal Git hooks and records a guarded-exec receipt.
+--- stderr

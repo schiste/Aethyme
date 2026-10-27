@@ -861,6 +861,30 @@ status; its inventory can be incomplete, declared by `inventory_complete` and
 and `command_total` including broker opening. See the status section in
 `../guides/broker-workflows.md`. Neither reporting mode authorizes deletion.
 
+### Session-local broker commit
+
+`aethyme broker commit --session <id> [--non-interactive] [--timeout <seconds>]
+[--json] -- <git-commit-args>` runs a local `git commit` only from that
+session's registered worktree and recorded, unprotected branch. It refuses
+inherited Git routing/configuration overrides, hook-bypass and history-rewrite
+options, incomplete path inventories, and paths outside current session
+ownership. Normal Git commit hooks run. The command uses a non-queueing
+session-local lane; session worktree removal refuses while that lane is held,
+while unrelated worktree starts and coordinated Git operations can proceed.
+
+With `--json`, a report includes `command_ran`, `outcome`, `execution`,
+`execution_receipt_id`, `head_before`, nullable `head_after`, nullable
+`committed_paths`, nullable `committed_ownership`, nullable
+`post_commit_audit_error`, `post_commit_audit_complete`, and `ok`. `outcome` is
+`passed`, `command_failed`, `ownership_failed`, or
+`post_commit_audit_unknown`. `execution` is the existing guarded-execution
+report; `execution_receipt_id` identifies its durable receipt. The committed
+path census and its ownership audit are separate from the post-command dirty
+path audit in `execution`. A report is returned only after the commit command
+ran; a nonzero result can mean the command failed, ownership failed, or the
+post-commit audit is unknown. Inspect the receipt and reported paths before
+retrying. A refusal before dispatch has no commit report or execution receipt.
+
 ### Lease scope and guarded-execution reporting
 
 Lease records returned by `aethyme broker advanced leases list --json` and by
