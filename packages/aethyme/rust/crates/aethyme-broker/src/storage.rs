@@ -6182,6 +6182,35 @@ mod tests {
         let fixture = ForeignCacheRootFixture::new();
         let context = fixture.invoking_storage_context();
         let plan = storage_plan_with_context(&fixture.invoking_root, &context).unwrap();
+        let placement = plan
+            .roots
+            .iter()
+            .find(|root| root.path == fixture.placement_root)
+            .expect("the reviewed plan must include the foreign placement root");
+        assert!(
+            placement.blockers.iter().all(|reason| {
+                !reason.contains("reserved worktree-volume preparation-cache root")
+            }),
+            "planning must recognize the validated reserved cache child"
+        );
+        assert!(
+            plan.candidates
+                .iter()
+                .all(|candidate| !candidate.path.starts_with(&fixture.placement_root)),
+            "the foreign placement root must remain outside the storage candidate set"
+        );
+        assert!(
+            plan.primary_candidates
+                .iter()
+                .all(|candidate| !candidate.path.starts_with(&fixture.placement_root)),
+            "the foreign placement root must remain outside the primary artifact set"
+        );
+        assert!(
+            plan.preparation_candidates
+                .iter()
+                .all(|candidate| candidate.path != fixture.foreign_cache_entry),
+            "foreign cache entries must remain outside the reviewed candidate set"
+        );
 
         let report =
             storage_apply_with_context(&fixture.invoking_root, &plan.digest, &context).unwrap();
