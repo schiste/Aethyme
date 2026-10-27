@@ -970,10 +970,10 @@ const MAX_RECOVERY_ARCHIVE_TREE_ENTRIES: usize = 250_000;
 const MAX_RECOVERY_ARCHIVE_TREE_DEPTH: usize = 128;
 const MAX_RECOVERY_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Check known archive data against the destination volume while keeping the
-/// existing gate/worktree free-space reserve. The optional commit bundle is
-/// excluded because Git writes it directly and its final size is not known at
-/// plan time; this is a known-minimum admission check, not a total archive cap.
+/// Check the known archive payload plus the configured reserve requirement
+/// against the destination volume. The optional commit bundle, filesystem
+/// allocation overhead, and concurrent writes are excluded, so this known-minimum
+/// admission check does not guarantee the reserve will remain available.
 fn require_recovery_archive_headroom(
     available_bytes: Option<u64>,
     known_payload_bytes: u64,
@@ -987,7 +987,7 @@ fn require_recovery_archive_headroom(
     })?;
     if available_bytes < required {
         return Err(format!(
-            "archive destination has {available_bytes} free bytes, below the {required} bytes needed for the known archive payload while preserving the {}-byte storage reserve; the worktree was left in place",
+            "archive destination has {available_bytes} free bytes, below the {required} bytes required for the known payload plus the {}-byte reserve. This known-minimum check excludes bundle size, filesystem allocation overhead, and concurrent writes, so it does not guarantee the reserve will remain available; the worktree was left in place",
             crate::DEFAULT_GATE_HEADROOM_BYTES
         ));
     }
