@@ -3354,6 +3354,14 @@ mod generic_guarded_exec_tests {
         (repository, storage, broker)
     }
 
+    struct ReleaseHookOnDrop(PathBuf);
+
+    impl Drop for ReleaseHookOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"continue");
+        }
+    }
+
     #[test]
     fn local_commit_hook_does_not_hold_the_repository_lock_needed_by_fetch() {
         use crate::operations::{CoordinatedCommand, QueueWait};
@@ -3420,6 +3428,7 @@ mod generic_guarded_exec_tests {
                 None,
             )
         });
+        let _release_hook = ReleaseHookOnDrop(release.clone());
         let hook_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !entered.exists() && std::time::Instant::now() < hook_deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
