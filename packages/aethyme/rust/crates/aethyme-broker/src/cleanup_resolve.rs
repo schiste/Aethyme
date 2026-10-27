@@ -2816,6 +2816,18 @@ fn restore_readme(plan: &CleanupResolvePlan, has_bundle: bool) -> String {
 mod tests {
     use super::*;
 
+    fn write_over_cap_bundle(
+        _checkout: &GitRepo,
+        _delivery_targets: &[String],
+        max_bytes: u64,
+        deadline: Instant,
+        file: &mut std::fs::File,
+    ) -> Result<u64, String> {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 123456789"]);
+        stream_recovery_command_stdout(&mut command, file, max_bytes, deadline)
+    }
+
     fn git(dir: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .args(args)
@@ -3671,11 +3683,7 @@ mod tests {
                 },
                 RecoveryBundleWriter {
                     max_bytes: 8,
-                    write_to: |_, _, max_bytes, deadline, file| {
-                        let mut command = Command::new("sh");
-                        command.args(["-c", "printf 123456789"]);
-                        stream_recovery_command_stdout(&mut command, file, max_bytes, deadline)
-                    },
+                    write_to: write_over_cap_bundle,
                 },
             )
             .unwrap_err()
