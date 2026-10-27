@@ -462,7 +462,7 @@ def _run_slow_hook_commits(playground, sessions, timings, semantic, hold_ms):
     for session, relative, contents, label in (
             (slow, slow_path, 'slow commit\n', 'slow'),
             (peer, peer_path, 'independent commit\n', 'peer')):
-        _cli(playground, ['broker', 'leases', 'claim', relative, '--session',
+        _cli(playground, ['broker', 'advanced', 'leases', 'claim', relative, '--session',
                           str(session['id']), '--json'], session['worktree'],
              f'commit-setup:{label}:claim')
         (Path(session['worktree']) / relative).write_text(contents)
@@ -1127,7 +1127,7 @@ def _measure_profile(role, repetition, identity, git, output, contracts,
 
             target = 'tracked.txt'
             plan_row = _cli(
-                playground, ['broker', 'leases', 'plan', target, '--session',
+                playground, ['broker', 'advanced', 'leases', 'plan', target, '--session',
                              str(sessions['lease_owner']['id']), '--json'],
                 sessions['lease_owner']['worktree'], 'action:lease_plan')
             plan_path = _lease_plan_payload(plan_row)
@@ -1139,7 +1139,7 @@ def _measure_profile(role, repetition, identity, git, output, contracts,
             }
 
             claim_row = _cli(
-                playground, ['broker', 'leases', 'claim', target, '--session',
+                playground, ['broker', 'advanced', 'leases', 'claim', target, '--session',
                              str(sessions['lease_owner']['id']), '--json'],
                 sessions['lease_owner']['worktree'], 'action:lease_claim')
             claim_report = _json(claim_row, 'lease claim')
@@ -1155,7 +1155,7 @@ def _measure_profile(role, repetition, identity, git, output, contracts,
             }
 
             release_row = _cli(
-                playground, ['broker', 'leases', 'release', target, '--session',
+                playground, ['broker', 'advanced', 'leases', 'release', target, '--session',
                              str(sessions['lease_owner']['id']), '--json'],
                 sessions['lease_owner']['worktree'], 'action:lease_release')
             _json(release_row, 'lease release')
@@ -1166,11 +1166,11 @@ def _measure_profile(role, repetition, identity, git, output, contracts,
             }
 
             overlap_target = 'tracked.txt'
-            _cli(playground, ['broker', 'leases', 'claim', overlap_target, '--session',
+            _cli(playground, ['broker', 'advanced', 'leases', 'claim', overlap_target, '--session',
                               str(sessions['lease_owner']['id']), '--json'],
                  sessions['lease_owner']['worktree'], 'overlap-setup:claim')
             overlap_row = _cli(
-                playground, ['broker', 'leases', 'plan', overlap_target, '--session',
+                playground, ['broker', 'advanced', 'leases', 'plan', overlap_target, '--session',
                              str(sessions['overlap_reader']['id']), '--json'],
                 sessions['overlap_reader']['worktree'], 'action:overlap_detail')
             overlap_path = _lease_plan_payload(overlap_row)
@@ -1182,7 +1182,7 @@ def _measure_profile(role, repetition, identity, git, output, contracts,
             if (overlap_path.get('would_conflict') is not True or not exact_owner):
                 raise RuntimeError('overlap plan omitted the exact claimed-path owner')
             _record(sample['timings_ms'], 'overlap_detail', overlap_row)
-            _cli(playground, ['broker', 'leases', 'release', overlap_target, '--session',
+            _cli(playground, ['broker', 'advanced', 'leases', 'release', overlap_target, '--session',
                               str(sessions['lease_owner']['id']), '--json'],
                  sessions['lease_owner']['worktree'], 'overlap-setup:release')
             sample['semantic']['overlap_detail'] = {
