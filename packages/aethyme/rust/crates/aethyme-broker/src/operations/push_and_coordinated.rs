@@ -1398,7 +1398,7 @@ pub(crate) fn github_command() -> Command {
 
 /// Do not let inherited command-scope Git config change what a coordinated
 /// pre-push hook check verifies relative to the real push.
-fn remove_inherited_git_config_overrides(command: &mut Command) {
+pub(super) fn remove_inherited_git_config_overrides(command: &mut Command) {
     command
         .env_remove("GIT_CONFIG_PARAMETERS")
         .env_remove("GIT_CONFIG_COUNT");

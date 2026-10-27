@@ -629,7 +629,7 @@ fn output_within(
 #[derive(Clone, Debug)]
 struct ProviderObservation {
     pid: u32,
-    identity: Option<crate::artifact_use::ProcessStartIdentity>,
+    identity: Option<crate::file_lock::artifact_use::ProcessStartIdentity>,
     // Only the owner of the actual Child handle may produce this witness.
     // A PID probe or disappearance is never converted into an exit result.
     exit: Option<(bool, Option<i32>)>,
@@ -682,7 +682,8 @@ fn output_within_observed(
         // SAFETY: getpgid only reads kernel process metadata for this child.
         let group = unsafe { libc::getpgid(child.id() as i32) };
         observation.identity =
-            crate::artifact_use::ProcessStartIdentity::capture(child.id() as i32, group).ok();
+            crate::file_lock::artifact_use::ProcessStartIdentity::capture(child.id() as i32, group)
+                .ok();
         if let Some(observer) = observer.as_mut() {
             observer(observation.clone());
         }

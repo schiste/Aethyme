@@ -4,6 +4,7 @@
 //! additionally hold that same lane shared, so old/wide writers still exclude
 //! them. Scope is derived from argv, never from the caller's audit label.
 
+use super::push_and_coordinated::remove_inherited_git_config_overrides;
 use super::*;
 
 pub(super) const FETCH_FLAGS: &[&str] = &[
@@ -141,7 +142,7 @@ pub(super) struct FetchJournal {
     pub common_device: u64,
     pub common_inode: u64,
     pub pre_destination: Option<String>,
-    pub provider: Option<crate::artifact_use::ProcessStartIdentity>,
+    pub provider: Option<crate::file_lock::artifact_use::ProcessStartIdentity>,
     pub completion: Option<FetchCompletion>,
 }
 
@@ -756,7 +757,7 @@ mod tests {
             completion: None,
         };
         assert!(!journal.proves_provider_completion());
-        journal.provider = Some(crate::artifact_use::ProcessStartIdentity {
+        journal.provider = Some(crate::file_lock::artifact_use::ProcessStartIdentity {
             pid: 123,
             process_group: 123,
             start_time: Some(99),
