@@ -3444,7 +3444,7 @@ mod generic_guarded_exec_tests {
             CoordinatedCommand {
                 session_id,
                 provider: OperationProvider::Git,
-                repository: None,
+                repository: Some("example/repo".into()),
                 resolved_target: None,
                 scope: None,
                 declared_effect: Some(OperationEffect::Write),
