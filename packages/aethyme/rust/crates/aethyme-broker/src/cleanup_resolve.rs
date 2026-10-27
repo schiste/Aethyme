@@ -738,19 +738,24 @@ impl Broker {
             confirm,
             after_archive_verified,
             sync_archive_directory,
+            |main_root, archive_root| {
+                crate::disk_headroom::available_headroom_at_or_above_for(main_root, archive_root)
+            },
         )
     }
 
-    fn cleanup_resolve_apply_with_hooks<F, S>(
+    fn cleanup_resolve_apply_with_hooks<F, S, H>(
         &mut self,
         session_id: i64,
         confirm: &str,
         after_archive_verified: F,
         sync_directory: S,
+        headroom_for: H,
     ) -> Result<CleanupResolveOutcome, BrokerOpError>
     where
         F: FnOnce(),
         S: Fn(&Path) -> std::io::Result<()>,
+        H: FnOnce(&Path, &Path) -> Option<crate::disk_headroom::DiskHeadroom>,
     {
         if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BrokerOpError::CleanupResolveConfirmationNotSha256);
@@ -777,11 +782,8 @@ impl Broker {
                     reason: format!("archive capacity preflight failed: {reason}"),
                 }
             })?;
-        let destination_headroom = crate::disk_headroom::available_headroom_at_or_above_for(
-            self.main_root(),
-            &archive_root,
-        )
-        .map(|headroom| headroom.bytes);
+        let destination_headroom =
+            headroom_for(self.main_root(), &archive_root).map(|headroom| headroom.bytes);
         require_recovery_archive_headroom(destination_headroom, known_payload_bytes).map_err(
             |reason| BrokerOpError::CleanupResolveRefused {
                 id: session_id,
@@ -2909,6 +2911,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn archive_capacity_refusal_queries_configured_destination_before_staging() {
+        for (case, headroom) in [
+            (
+                "insufficient",
+                Some(crate::disk_headroom::DiskHeadroom {
+                    bytes: 0,
+                    inodes: None,
+                }),
+            ),
+            ("unknown", None),
+        ] {
+            let owner = tempfile::tempdir().unwrap();
+            let repository = owner.path().join("repository");
+            std::fs::create_dir(&repository).unwrap();
+            git(&repository, &["init", "-q", "-b", "main"]);
+            std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+            git(&repository, &["add", "-A"]);
+            git(&repository, &["commit", "-qm", "initial"]);
+
+            let storage = crate::test_storage::TestStorage::new();
+            let mut broker = storage.open(&repository).unwrap();
+            let session = broker
+                .start_worktree("archive capacity refusal fixture", None)
+                .unwrap();
+            let worktree = PathBuf::from(&session.worktree_path);
+            let committed = worktree.join("committed.txt");
+            std::fs::write(&committed, "pending commit\n").unwrap();
+            git(&worktree, &["add", "committed.txt"]);
+            git(&worktree, &["commit", "-qm", "pending"]);
+            let source = worktree.join("preserve.txt");
+            std::fs::write(&source, "retain before archive staging\n").unwrap();
+            broker.close(session.id).unwrap();
+
+            let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+            assert!(
+                !plan.unlanded_commits.is_empty(),
+                "fixture must require a commit bundle"
+            );
+            assert!(plan.archive_root.starts_with(storage.host_state_dir()));
+            assert!(!plan.archive_root.starts_with(&repository));
+            let expected_repository = broker.main_root().to_path_buf();
+            let expected_archive_root = plan.archive_root.clone();
+            let error = broker
+                .cleanup_resolve_apply_with_hooks(
+                    session.id,
+                    &plan.digest,
+                    || panic!("capacity refusal must happen before archive verification"),
+                    sync_archive_directory,
+                    move |repository_root, destination| {
+                        assert_eq!(repository_root, expected_repository);
+                        assert_eq!(destination, expected_archive_root);
+                        headroom
+                    },
+                )
+                .unwrap_err()
+                .to_string();
+
+            assert!(
+                error.contains("archive capacity preflight failed"),
+                "{case}: {error}"
+            );
+            assert!(worktree.is_dir(), "{case}");
+            assert_eq!(
+                std::fs::read(&source).unwrap(),
+                b"retain before archive staging\n",
+                "{case}"
+            );
+            assert_eq!(
+                std::fs::read_dir(&plan.archive_root).unwrap().count(),
+                0,
+                "{case}: no partial archive or payload should be written"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn archive_root_sync_failure_keeps_the_original_worktree() {
@@ -2944,6 +3022,12 @@ mod tests {
                     } else {
                         sync_archive_directory(path)
                     }
+                },
+                |_, _| {
+                    Some(crate::disk_headroom::DiskHeadroom {
+                        bytes: u64::MAX,
+                        inodes: None,
+                    })
                 },
             )
             .unwrap_err()
