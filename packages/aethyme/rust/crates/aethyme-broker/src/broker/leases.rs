@@ -3385,7 +3385,7 @@ mod generic_guarded_exec_tests {
             &["config", "remote.origin.url", remote_url],
         );
         let local_remote = format!("url.file://{}.insteadOf", bare.path().to_string_lossy());
-        git(repository.path(), &[&local_remote, remote_url]);
+        git(repository.path(), &["config", &local_remote, remote_url]);
         git(repository.path(), &["push", "origin", "main"]);
 
         let hooks = tempfile::tempdir().unwrap();
