@@ -436,9 +436,7 @@ impl Broker {
             && matches!(report.status, FinishStatus::Closed | FinishStatus::Cleaned)
             && !self
                 .store
-                .active_leases()?
-                .iter()
-                .any(|lease| lease.session_id == session_id);
+                .has_unreleased_unexpired_lease_for_session_at(session_id, now_ms())?;
         if report.cleanup.completed || released_by_close {
             let released_at = now_ms();
             for lease in &mut report.leases_held {
@@ -519,11 +517,7 @@ impl Broker {
         let session = self.store.session(session_id)?;
         let worktree_path = PathBuf::from(&session.worktree_path);
         let at_ms = now_ms();
-        let queue = self.store.merge_queue()?;
-        let latest_for_session = queue
-            .iter()
-            .rev()
-            .find(|entry| entry.session_id == session_id);
+        let latest_for_session = self.store.latest_merge_queue_for_session(session_id)?;
         let retention_warning =
             finish_retention_warning(crate::git::active_git_deadline().is_some(), || {
                 retention_audit(self, at_ms)
@@ -542,9 +536,9 @@ impl Broker {
             closed: false,
             dirty_paths: Vec::new(),
             unsubmitted_commits: 0,
-            latest_queue_entry_id: latest_for_session.map(|entry| entry.id),
-            latest_queue_status: latest_for_session.map(|entry| entry.status),
-            delivery: self.finish_delivery(latest_for_session),
+            latest_queue_entry_id: latest_for_session.as_ref().map(|entry| entry.id),
+            latest_queue_status: latest_for_session.as_ref().map(|entry| entry.status),
+            delivery: self.finish_delivery(latest_for_session.as_ref()),
             representation: None,
             pending_work: FinishPendingWork::default(),
             leases_held: self.finish_leases(session_id, at_ms)?,
@@ -634,6 +628,13 @@ impl Broker {
         let head = checkout.head_commit()?;
         report.dirty_paths = checkout.dirty_paths()?;
 
+        let queue = self
+            .store
+            .latest_merge_queue_for_session_and_head(session_id, &head)?;
+        let latest_for_session = queue.last();
+        report.latest_queue_entry_id = latest_for_session.map(|entry| entry.id);
+        report.latest_queue_status = latest_for_session.map(|entry| entry.status);
+        report.delivery = self.finish_delivery(latest_for_session);
         let delivery = self.head_delivery(&session, &checkout, &head, &queue)?;
         if let Some(entry) = delivery.visible_entry {
             report.latest_queue_entry_id = Some(entry.id);
