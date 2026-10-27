@@ -1867,7 +1867,7 @@ fn archive_staging_nonce() -> String {
     format!("{nanos:x}-{:x}-{sequence:x}", std::process::id())
 }
 
-fn sync_archive_directory(path: &Path) -> std::io::Result<()> {
+fn sync_archive_directory(_path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -1875,11 +1875,10 @@ fn sync_archive_directory(path: &Path) -> std::io::Result<()> {
         options
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
-        options.open(path)?.sync_all()
+        options.open(_path)?.sync_all()
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "directory durability sync is unsupported on this platform",
@@ -1951,6 +1950,7 @@ where
 
 /// Write every part into a fresh, real staging directory, then read each part
 /// back. `Err` carries the first failure; the caller keeps the worktree.
+#[cfg(test)]
 fn write_verified_archive(
     repository: &GitRepo,
     checkout: &GitRepo,
