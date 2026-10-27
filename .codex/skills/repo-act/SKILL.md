@@ -90,6 +90,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   wall time, workload and binary identity, and raw samples. Do not equate an
   internal phase or coordinated-operation interval with end-to-end or network
   time. Use the existing non-gating performance workflow before adding builds.
+- For broker performance fixtures, command success is not enough: assert the
+  intended production profile with its recorded operation/profile witness and
+  verify the exact expected effects. A successful broad fallback is a
+  different scenario, not evidence for a narrow-path optimization. Validate
+  semantic results and source, binary, and fixture provenance before comparing
+  timings; unsupported or mismatched profiles, incomplete output, and missing
+  witnesses are unavailable samples, never eligible timings.
 - When investigating Git worktreeConfig migration, stage config.worktree files
   with explicit config --file paths before enabling the extension. Before enable,
   config --worktree can write shared local config in a single checkout; installed
