@@ -159,14 +159,6 @@ fn persisted_spawn_witness_count(broker: &mut Broker, session_id: i64) -> i64 {
     .unwrap()
 }
 
-#[cfg(unix)]
-fn unix_file_identity(path: &Path) -> (u64, u64) {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = std::fs::symlink_metadata(path).unwrap();
-    (metadata.dev(), metadata.ino())
-}
-
 /// Match repositories that explicitly keep pnpm's store inside each checkout.
 fn pnpm_store_fixture(ignored: bool) -> Fixture {
     let fx = fixture();
@@ -856,12 +848,27 @@ fn a_retained_spawn_record_does_not_own_a_same_repo_checkout_replacement() {
     assert_eq!(plan.selected_worktrees().len(), 1);
     let worktree_text = worktree.to_string_lossy().into_owned();
     let branch = broker.store().session(spawned_id).unwrap().branch;
-    let old_admin_dir = git_out(&worktree, &["rev-parse", "--absolute-git-dir"]);
-    let old_instance_parts = [
-        unix_file_identity(&worktree),
-        unix_file_identity(&worktree.join(".git")),
-        unix_file_identity(Path::new(&old_admin_dir)),
-    ];
+    let spawn_generation = {
+        let connection = rusqlite::Connection::open_with_flags(
+            broker.store().db_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let witness: String = connection
+            .query_row(
+                "SELECT witness_json FROM spawned_worktree_instances WHERE session_id = ?1",
+                [spawned_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&witness).unwrap();
+        value
+            .get("root_generation_sha256")
+            .and_then(serde_json::Value::as_str)
+            .expect("spawn must persist the root generation digest")
+            .to_owned()
+    };
+    assert_eq!(spawn_generation.len(), 64);
     git(&fx.repo, &["worktree", "remove", "--force", &worktree_text]);
     git(
         &fx.repo,
@@ -878,16 +885,6 @@ fn a_retained_spawn_record_does_not_own_a_same_repo_checkout_replacement() {
     );
     assert_eq!(main_common_dir, replacement_common_dir);
     assert_eq!(git_out(&worktree, &["branch", "--show-current"]), branch);
-    let new_admin_dir = git_out(&worktree, &["rev-parse", "--absolute-git-dir"]);
-    let new_instance_parts = [
-        unix_file_identity(&worktree),
-        unix_file_identity(&worktree.join(".git")),
-        unix_file_identity(Path::new(&new_admin_dir)),
-    ];
-    assert_ne!(
-        old_instance_parts, new_instance_parts,
-        "recreation changes a filesystem identity captured by the spawn witness"
-    );
 
     let report = broker.auto_cleanup_apply_now(plan).unwrap().unwrap();
 
