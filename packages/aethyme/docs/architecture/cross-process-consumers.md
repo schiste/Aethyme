@@ -125,7 +125,9 @@ old-side conflict spans per side/path are shown, with explicit truncation and
 whole-file markers; line 0 can represent an insertion before the first old line.
 `pull_request_basis` distinguishes a locally verified tracked-default merge base
 from `provider_diff`, whose exact base was not verified locally. Provider ranges
-are diagnostic and must not be assumed to share a coordinate basis.
+are diagnostic spans from each input diff. Provenance does not establish that
+the two diffs have identical base commits; do not assume a shared coordinate
+basis from the provenance label alone.
 
 `broker advanced leases plan --json` adds `shared_edit_owners` derived only from
 its existing conflict snapshot. `coordination_history.loaded: false` explicitly

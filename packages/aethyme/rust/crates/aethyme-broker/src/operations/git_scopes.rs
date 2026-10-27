@@ -553,6 +553,9 @@ pub(super) fn try_reconcile(
             remote = Some(oid.to_owned());
         }
         let completion = journal.completion.as_ref().expect("validated completion");
+        if completion.observed_at < operation.created_at || completion.observed_at > unix_now_ms() {
+            return Ok(None);
+        }
         let settled = if completion.success {
             local.is_some() && local == remote
         } else {

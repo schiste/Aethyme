@@ -168,6 +168,22 @@ blocked.
    its holder and when the holder last acted; a claim is refused only while
    its holder is working, and a quiet holder's claim is taken over.
 
+   For a shared source or generated policy change needed by several sessions,
+   agree on one session to land it. That session claims a short orchestration
+   name with `aethyme broker advanced ownership claim "shared edit <name>"
+   --session <owner> --reason "<shared change and dependent sessions>"` and
+   retains the normal file leases; the named claim does not replace them.
+   Use `broker advanced leases plan <paths...> --session <requester> --json`
+   to inspect current holders, then `broker advanced ownership list --json`
+   to check who agreed to drive the shared change. Do not infer an elected
+   owner from overlap counts or automatically take another session's files.
+   Once the shared commit is available, its owner sends each dependent session
+   `aethyme broker note send --session <owner> --to-session <dependent>
+   --message "Shared change available at <commit>; sync before continuing"`.
+   Dependents inspect their notes and sync their own sessions before editing
+   the shared paths. Release the named claim after the handoff is complete.
+   Lease-plan history marked `loaded: false` is deliberately absent, not empty.
+
 3. **Guard broad rewrite commands**. For formatters, code generators, or any
    command likely to touch many files, run through the broker guard:
 

@@ -273,14 +273,15 @@ impl BrokerStore {
             status,
             exit_code,
         );
+        let event_kind = if resolution.is_some() {
+            format!("operation.{}", status.as_str())
+        } else {
+            "operation.inspected".into()
+        };
         insert_event(
             &tx,
             now,
-            if resolution.is_some() {
-                "operation.fetch_reconciled"
-            } else {
-                "operation.inspected"
-            },
+            &event_kind,
             Some(expected.session_id),
             Some(&payload),
         )?;

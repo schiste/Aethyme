@@ -1621,14 +1621,14 @@ impl Broker {
         };
         let destination = format!("refs/remotes/{remote}/{branch}");
         let source = format!("refs/heads/{branch}");
-        let fetch_args = git_scopes::canonical_fetch_args(&remote, &branch)
+        let fetch_args = git_scopes::canonical_fetch_args(remote, branch)
             .filter(|args| {
                 self.store()
                     .session(session_id)
                     .ok()
                     .is_some_and(|session| {
                         git_scopes::validate_repository(
-                            &session.worktree_path,
+                            Path::new(&session.worktree_path),
                             args,
                             AdmissionDeadline::start(QueueWait::Seconds(5)),
                             repository,

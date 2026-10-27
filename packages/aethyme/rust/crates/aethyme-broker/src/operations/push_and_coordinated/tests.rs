@@ -2390,7 +2390,7 @@ fn completed_fetch_reconciles_only_with_actual_child_and_fresh_matching_refs() {
     let mut broker = Broker::open_with_options(root.path(), options).unwrap();
     let connection =
         rusqlite::Connection::open(crate::broker_db_path(root.path()).unwrap()).unwrap();
-    connection.execute_batch("INSERT INTO sessions (id, worktree_path, branch, origin, status, created_at, updated_at, last_activity_at) VALUES (37, '/repo/one', 'agent/one', 'adopted', 'active', 1, 1, 1);").unwrap();
+    connection.execute("INSERT INTO sessions (id, worktree_path, branch, origin, status, created_at, updated_at, last_activity_at) VALUES (37, ?1, 'main', 'adopted', 'active', 1, 1, 1)", [root.path().to_str().unwrap()]).unwrap();
     drop(connection);
     let push = Command::new("git")
         .current_dir(root.path())
@@ -2406,61 +2406,57 @@ fn completed_fetch_reconciles_only_with_actual_child_and_fresh_matching_refs() {
         .unwrap();
     assert!(delete.status.success());
     let args = git_scopes::canonical_fetch_args("origin", "main").unwrap();
-    let mut argv = vec!["git".to_owned()];
-    argv.extend(args.clone());
-    let operation = broker
-        .store()
-        .create_coordinated_operation(&crate::NewCoordinatedOperation {
-            session_id: 37,
-            provider: OperationProvider::Git,
-            repository: target.coordination_key.clone(),
-            scope: "fetch".into(),
-            effect: OperationEffect::Write,
-            authorization_reason: Some("test".into()),
-            command_json: serde_json::to_string(&argv).unwrap(),
-            pid: std::process::id() as i64,
-            host_operation_id: None,
-            identity_provenance: crate::OperationIdentityProvenance::VerifiedCanonical,
-        })
-        .unwrap();
     let deadline = AdmissionDeadline::start(QueueWait::Seconds(15));
-    let mut journal = git_scopes::FetchJournal::prepare(
-        operation.id,
-        root.path(),
-        &args,
-        deadline,
-        &target.coordination_key,
-    )
-    .unwrap()
-    .unwrap();
-    let mut command = provider_command(OperationProvider::Git);
-    remove_inherited_git_config_overrides(&mut command);
-    command.current_dir(root.path()).args(&args);
-    let output = output_within_observed(
-        command,
-        deadline,
-        &target.coordination_key,
-        "test fetch",
-        None,
-        MAX_COORDINATED_OUTPUT_BYTES,
-        Some(&mut |observation| journal.observe(observation)),
-    )
-    .unwrap();
-    assert!(output.status.success());
-    assert!(
-        journal.proves_provider_completion(),
-        "actual child generation and wait must be captured"
-    );
-    let details = json!({"fetch_reconciliation": journal});
-    broker
-        .store()
-        .transition_coordinated_operation(
-            operation.id,
-            OperationStatus::Running,
-            None,
-            Some(&details.to_string()),
+    let report = broker
+        .run_coordinated_operation_with_wait(
+            CoordinatedCommand {
+                session_id: 37,
+                provider: OperationProvider::Git,
+                repository: None,
+                resolved_target: Some(target.clone()),
+                scope: None,
+                declared_effect: None,
+                destructive_confirmed: false,
+                cross_session: None,
+                ref_write_acknowledged: false,
+                authorization_reason: Some("exercise real fetch journaling".into()),
+                args,
+            },
+            QueueWait::Seconds(15),
         )
         .unwrap();
+    assert!(report.ok());
+    let operation = report.operation;
+    let persisted: serde_json::Value =
+        serde_json::from_str(operation.details_json.as_deref().unwrap()).unwrap();
+    let journal: git_scopes::FetchJournal =
+        serde_json::from_value(persisted["fetch_reconciliation"].clone()).unwrap();
+    assert!(
+        journal.proves_provider_completion(),
+        "production path must persist actual child completion"
+    );
+    let host_id = operation
+        .host_operation_id
+        .as_ref()
+        .expect("production remote write has a host row");
+    let host_database = host.path().join("operations.db");
+    assert_eq!(
+        crate::host_operation(&host_database, host_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        OperationStatus::Succeeded
+    );
+    // Simulate loss of the terminal parent transitions in both ledgers. The
+    // generation/exit witness above came from the real production Child path.
+    let host_connection = rusqlite::Connection::open(&host_database).unwrap();
+    host_connection
+        .execute(
+            "UPDATE host_operations SET status='outcome_unknown' WHERE operation_id=?1",
+            [host_id],
+        )
+        .unwrap();
+    drop(host_connection);
     let unknown = broker
         .store()
         .transition_coordinated_operation(
@@ -2513,4 +2509,11 @@ fn completed_fetch_reconciles_only_with_actual_child_and_fresh_matching_refs() {
         "observed_fetch_completion"
     );
     assert_eq!(proof["reconciliation"]["remote_source"], oid);
+    assert_eq!(
+        crate::host_operation(&host_database, host_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        OperationStatus::ReconciledSucceeded
+    );
 }
