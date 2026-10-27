@@ -167,7 +167,7 @@ class PairedActionMatrixTests(unittest.TestCase):
         result = _compare_action(baseline, candidate, 'fetch_provable',
                                  {**self.paired, 'repetitions': 1})
         self.assertEqual(result['status'], 'unavailable')
-        self.assertIn('unsupported', result['reason'])
+        self.assertIn('baseline has no durable provider witness', result['reason'])
         self.assertNotIn('baseline_median_ms', result)
 
     @staticmethod
@@ -378,14 +378,16 @@ class PairedActionMatrixTests(unittest.TestCase):
             self.assertEqual(witness['schema_version'], 1)
             self.assertEqual(witness['provider_pid'], 2000)
 
+            valid_completion = copy.deepcopy(payload)
             payload['operation']['details_json'] = '{}'
             self.assertIsNone(_fetch_profile_witness(payload, expected))
-            payload['operation']['details_json'] = json.dumps({'fetch_reconciliation': {
-                'completion': {'pid': 2000, 'success': False, 'exit_code': 1,
-                               'observed_at': 4000},
-            }})
+            invalid_completion = valid_completion
+            invalid_journal = json.loads(invalid_completion['operation']['details_json'])
+            invalid_journal['fetch_reconciliation']['completion'].update(
+                {'success': False, 'exit_code': 1})
+            invalid_completion['operation']['details_json'] = json.dumps(invalid_journal)
             with self.assertRaisesRegex(RuntimeError, 'exact completed profile'):
-                _fetch_profile_witness(payload, expected)
+                _fetch_profile_witness(invalid_completion, expected)
 
     def test_missing_fetch_witness_is_only_an_unsupported_baseline_control(self):
         baseline = _missing_fetch_witness_semantic('baseline', 11, 12.5)
