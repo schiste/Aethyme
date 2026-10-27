@@ -6,6 +6,13 @@ broker. Other agents may be working in sibling worktrees right now. The
 check the paired runtime with `aethyme --version` and
 `aethyme-engine-cli --version`.
 
+Shared preparation-cache rotation uses a bounded no-follow inventory. If its
+time or entry cap is reached, the report marks the inventory incomplete and
+sets exact `bytes_before` to null; that limit can trigger whole-store rotation.
+Depth, read, mount, special-node and lease failures still refuse. The cache
+rotation remover independently refuses special nodes and leaves durable debt
+for recovery.
+
 For an existing-repository runtime upgrade, take consistent database backups
 before opening live state with the new binary. A schema migration does not
 adopt a legacy worktree root: if start requires a binding, review

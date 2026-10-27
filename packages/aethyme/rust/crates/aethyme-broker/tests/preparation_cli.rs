@@ -626,10 +626,17 @@ cache = "repository_shared"
         &["submit", "prepare", "--session", &session, "--json"],
     ));
     assert_eq!(rotated["state"], "current", "{rotated}");
+    assert_eq!(rotated["schema_version"], 2, "{rotated}");
     assert!(
         rotated["shared_cache_rotation"].is_object(),
         "the over-budget store must be reported as rotated: {rotated}"
     );
+    assert_eq!(rotated["shared_cache_rotation"]["inventory_complete"], true);
+    assert_eq!(
+        rotated["shared_cache_rotation"]["rotation_reason"],
+        "budget_exceeded"
+    );
+    assert!(rotated["shared_cache_rotation"]["bytes_before"].is_number());
     assert!(!store.join("old-artifact").exists());
     assert!(temp.path().join("node_modules").is_dir());
 }

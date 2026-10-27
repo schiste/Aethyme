@@ -430,6 +430,13 @@ broker. Other agents may be working in sibling worktrees right now. The
 `aethyme` router and its engine sibling are installed once for the user;
 check the paired runtime with `aethyme --version` and
 `aethyme-engine-cli --version`.
+
+Shared preparation-cache rotation uses a bounded no-follow inventory. If its
+time or entry cap is reached, the report marks the inventory incomplete and
+sets exact `bytes_before` to null; that limit can trigger whole-store rotation.
+Depth, read, mount, special-node and lease failures still refuse. The cache
+rotation remover independently refuses special nodes and leaves durable debt
+for recovery.
 When investigating retained worktrees, distinguish task identity from shared
 service uptime. A shared agent daemon can outlive many tasks; its PID alone
 proves neither that each task is active nor that its checkout is disposable.
@@ -1159,6 +1166,9 @@ mod tests {
             "that same command to completion before retrying",
             "session's reported repository",
             "worktree root match the repository you intended",
+            "Shared preparation-cache rotation uses a bounded no-follow inventory.",
+            "sets exact `bytes_before` to null; that limit can trigger whole-store rotation.",
+            "Depth, read, mount, special-node and lease failures still refuse.",
             "aethyme broker status --json",
             "--path <planned-path>",
             "aethyme broker start --adopt --task",
