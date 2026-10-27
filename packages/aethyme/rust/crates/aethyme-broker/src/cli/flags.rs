@@ -345,6 +345,10 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
         "exec",
         &["--session", "--non-interactive", "--timeout", "--"],
     ),
+    (
+        "commit",
+        &["--session", "--non-interactive", "--timeout", "--"],
+    ),
     ("exec-status", &["--session", "--receipt", "--limit"]),
     (
         "git",

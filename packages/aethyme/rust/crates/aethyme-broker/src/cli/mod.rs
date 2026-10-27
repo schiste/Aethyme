@@ -368,6 +368,11 @@ Usage:
       --timeout is refused in that mode. Combine it with --non-interactive
       only for a command that does not need terminal interaction.
       If the supervised helper cannot start, the child is not dispatched.
+  aethyme broker commit --session <id> [--non-interactive] [--timeout <1..86400 seconds>] [--json] -- <git-commit-args>
+      Run a local Git commit for the session's own checked-out branch. It
+      refuses inherited Git routing/config overrides, hook-bypass options,
+      incomplete path inventories, and paths outside current session ownership.
+      The command uses normal Git hooks and records a guarded-exec receipt.
   aethyme broker exec-status --session <id> [--receipt <32-hex-id> | --limit <1..100>] [--json]
       Read guarded-exec outcomes for this repository and session. A starting
       or running receipt is not process-liveness proof; this command never
@@ -2534,6 +2539,20 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
     // One declarative check replaces the per-flag guards that grew after #285:
     // a flag the subcommand never reads is refused rather than dropped.
     validate_flags(subcommand, &parsed)?;
+    if subcommand == "commit" {
+        if parsed.read_only_snapshot {
+            return Err(read_only_refusal(
+                &parsed,
+                "broker commit",
+                "run it from the live session worktree",
+            ));
+        }
+        if let Some(reason) = crate::git::session_commit_git_environment_refusal() {
+            return Err(UsageError::Message(reason.into()));
+        }
+        crate::broker::validate_session_commit_args(&parsed.exec_command)
+            .map_err(UsageError::Message)?;
+    }
     let reclaim_action = if subcommand == "reclaim" {
         Some(parse_reclaim_action(&parsed)?)
     } else {
@@ -2572,6 +2591,7 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         "leases" => run_leases(parsed)?,
         "ownership" => run_ownership(parsed)?,
         "exec" => run_exec(parsed)?,
+        "commit" => run_commit(parsed)?,
         "exec-status" => {
             let request = exec_status_request.ok_or_else(|| {
                 UsageError::Message("exec-status request validation was skipped".into())
@@ -2638,6 +2658,7 @@ const HOLDER_GUARDED: &[&str] = &[
     "close",
     "git",
     "gh",
+    "commit",
     "review-thread",
 ];
 

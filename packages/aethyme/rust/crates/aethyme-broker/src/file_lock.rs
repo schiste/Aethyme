@@ -87,6 +87,40 @@ pub(crate) fn acquire_pr_watch_tick_lock(main_root: &Path) -> io::Result<Exclusi
     Ok(lock)
 }
 
+/// Claim the cooperative commit lane for one session without serializing
+/// commits from other worktrees through the repository-wide Git write lock.
+/// The persistent lock file is never removed, so contenders always lock the
+/// same inode. A busy lane refuses immediately; it never queues behind a
+/// commit hook that may be waiting for another repository operation.
+pub(crate) fn try_acquire_session_commit_lock(
+    main_root: &Path,
+    session_id: i64,
+) -> io::Result<ExclusiveFileLock> {
+    if session_id <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session commit lock requires a positive session id",
+        ));
+    }
+    let name = format!("session-commit-{session_id}.lock");
+    let path = repository_runtime_lock_path(main_root, &name)?;
+    let file = open_lock_file_nofollow(&path)?;
+    let lock = ExclusiveFileLock::try_acquire(file)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("another broker commit is running for session {session_id}"),
+        )
+    })?;
+    if repository_runtime_lock_path(main_root, &name)? != path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "broker session commit lock path changed while it was acquired",
+        ));
+    }
+    verify_named_lock_file(&path, &lock.file)?;
+    Ok(lock)
+}
+
 fn acquire_repository_lifecycle_lock_with_wait(
     main_root: &Path,
     wait: Duration,
@@ -398,6 +432,19 @@ mod tests {
     #[test]
     fn cleanup_claim_blocks_adoption_claim() {
         lifecycle_claim_contends_in_order("cleanup", "adoption");
+    }
+
+    #[test]
+    fn session_commit_claims_are_exclusive_per_session_and_independent_between_sessions() {
+        let repository = tempfile::tempdir().unwrap();
+        let held = try_acquire_session_commit_lock(repository.path(), 42).unwrap();
+        let busy = try_acquire_session_commit_lock(repository.path(), 42).unwrap_err();
+        assert_eq!(busy.kind(), io::ErrorKind::WouldBlock);
+        let independent = try_acquire_session_commit_lock(repository.path(), 43).unwrap();
+
+        drop(held);
+        try_acquire_session_commit_lock(repository.path(), 42).unwrap();
+        drop(independent);
     }
 
     #[test]

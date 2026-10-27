@@ -1094,7 +1094,7 @@ fn enforce_protected_branch_session(
     Ok(Some(session.id))
 }
 
-fn protected_branches(checkout: &GitRepo) -> BTreeSet<String> {
+pub(crate) fn protected_branches(checkout: &GitRepo) -> BTreeSet<String> {
     let mut branches = BTreeSet::from(["aethyme/integration".to_string()]);
     if let Some(remote_head) = checkout.symbolic_ref("refs/remotes/origin/HEAD")
         && let Some(branch) = remote_head.strip_prefix("refs/remotes/origin/")

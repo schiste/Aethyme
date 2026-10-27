@@ -1,7 +1,6 @@
 //! `SessionStart` is where the broker tells an agent what it could not have
-//! known. Two things about the installation itself belong in that category:
-//! a router and engine built from different commits, a release newer than the
-//! one installed, and a stale Claude Code plugin cache.
+//! known. Installation diagnostics compare the running process with PATH and
+//! identify independent known install roots without executing their binaries.
 //!
 //! Both are reported, neither is acted on, and the hook has hard constraints
 //! that these exist to hold. Its stdout is parsed as an envelope, so a stray
@@ -19,8 +18,10 @@ struct Fixture {
     _temp: tempfile::TempDir,
     repo: PathBuf,
     path_dir: PathBuf,
+    home: PathBuf,
     cache: PathBuf,
     release: PathBuf,
+    unselected_root_marker: PathBuf,
 }
 
 impl Fixture {
@@ -28,10 +29,13 @@ impl Fixture {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
         let path_dir = temp.path().join("bin");
+        let home = temp.path().join("home");
         let cache = temp.path().join("cache");
         let release = temp.path().join("release");
+        let unselected_root_marker = temp.path().join("unselected-root-was-run");
         fs::create_dir_all(&repo).unwrap();
         fs::create_dir_all(&path_dir).unwrap();
+        fs::create_dir_all(&home).unwrap();
 
         git(&repo, &["init", "-q", "-b", "main"]);
         fs::write(repo.join("README.md"), "fixture\n").unwrap();
@@ -47,8 +51,10 @@ impl Fixture {
             _temp: temp,
             repo,
             path_dir,
+            home,
             cache,
             release,
+            unselected_root_marker,
         }
     }
 
@@ -76,6 +82,14 @@ impl Fixture {
             .args(["hook", "SessionStart"])
             .current_dir(&self.repo)
             .env("PATH", &self.path_dir)
+            .env("HOME", &self.home)
+            .env_remove("CARGO_HOME")
+            .env_remove("CARGO_INSTALL_ROOT")
+            .env_remove("AETHYME_UPDATE_CHECK")
+            .env(
+                "AETHYME_TEST_UNSELECTED_ROOT_MARKER",
+                &self.unselected_root_marker,
+            )
             // Point the release lookup at a directory that does not exist:
             // the hook must never reach a network, so the only correct
             // behaviour here is to say nothing about releases.
@@ -165,6 +179,79 @@ fn a_split_pair_is_reported_at_session_start() {
     );
 }
 
+#[test]
+fn a_running_build_mismatch_reports_independent_roots_without_running_them() {
+    let fixture = Fixture::new();
+    let path_identity = "0.0.1 (v0.0.1-6-gdeadbee)";
+    let path_router = fixture.path_dir.join("aethyme");
+    fs::remove_file(&path_router).unwrap();
+    fs::write(
+        &path_router,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'aethyme {path_identity}'; exit 0; fi\nexit 2\n"
+        ),
+    )
+    .unwrap();
+    make_executable(&path_router);
+    fs::write(
+        fixture.path_dir.join("aethyme-engine-cli"),
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'aethyme-engine-cli {path_identity}'; exit 0; fi\nexit 2\n"
+        ),
+    )
+    .unwrap();
+    make_executable(&fixture.path_dir.join("aethyme-engine-cli"));
+
+    let other_root = fixture.home.join(".local/bin");
+    fs::create_dir_all(&other_root).unwrap();
+    for binary in ["aethyme", "aethyme-engine-cli"] {
+        let path = other_root.join(binary);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf called >> \"$AETHYME_TEST_UNSELECTED_ROOT_MARKER\"\nif [ \"$1\" = --version ]; then echo '{binary} {path_identity}'; exit 0; fi\nexit 2\n"
+            ),
+        )
+        .unwrap();
+        make_executable(&path);
+    }
+
+    let context = context(&fixture.session_start())
+        .expect("the running build and PATH-selected build should differ");
+    let running_build = router_build();
+    let running_identity = running_build
+        .split_once(" build_date=")
+        .map_or(running_build.as_str(), |(identity, _)| identity);
+    assert!(
+        context.contains("running Aethyme process uses build"),
+        "the notice must identify the running process: {context}"
+    );
+    assert!(
+        context.contains(running_identity),
+        "the notice must report the actual process build: {context}"
+    );
+    assert!(
+        context.contains(path_identity),
+        "the notice must report the PATH-selected build: {context}"
+    );
+    assert!(
+        context.contains(&path_router.display().to_string()),
+        "the notice must identify the PATH-selected executable: {context}"
+    );
+    assert!(
+        context.contains(&other_root.display().to_string()),
+        "the notice must inventory the independent known root: {context}"
+    );
+    assert!(
+        context.contains("alternate binaries are not run"),
+        "the notice must state the inventory boundary: {context}"
+    );
+    assert!(
+        !fixture.unselected_root_marker.exists(),
+        "the alternate-root binaries must not be executed"
+    );
+}
+
 /// Reporting is the whole contract. A hook that repaired the installation on
 /// its own would be changing binaries out from under a running agent.
 #[test]
@@ -201,7 +288,9 @@ fn a_healthy_pair_adds_nothing_about_the_installation() {
     let fixture = Fixture::new().with_engine(&banner);
     let context = context(&fixture.session_start()).unwrap_or_default();
     assert!(
-        !context.contains("different builds") && !context.contains("not optional"),
+        !context.contains("different builds")
+            && !context.contains("not optional")
+            && !context.contains("running Aethyme process uses build"),
         "a matched pair must produce no installation notice: {context}"
     );
     assert!(
