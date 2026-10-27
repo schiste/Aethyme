@@ -13,16 +13,18 @@
 //! prints what would be preserved and a digest; confirming that digest writes
 //! a recovery archive (a bundle of the commits no delivery target holds, the
 //! staged and unstaged patches, a copy of the untracked files Git does not
-//! ignore, a manifest and restore steps), reads every part of it back, and only
+//! ignore, protected standalone ignored files and links, a manifest and restore
+//! steps), reads every part of it back, and only
 //! then asks cleanup to remove the worktree under its lifecycle claim. A failed
 //! verification leaves the worktree exactly where it was.
 //!
-//! Ignored paths are deliberately not archived. Cleanup policy must classify
-//! every ignored root as disposable before archive resolution may remove the
-//! worktree; protected paths or strict-policy leftovers leave it in place.
+//! Ignored directories remain opaque and follow the ordinary cleanup policy.
+//! Protected standalone ignored files and links are archived; strict-policy
+//! leftovers leave the worktree in place.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -32,7 +34,8 @@ use crate::git::GitRepo;
 use crate::types::SessionOrigin;
 use crate::{Broker, BrokerOpError, CleanupDisposition};
 
-pub const CLEANUP_RESOLVE_SCHEMA_VERSION: u32 = 1;
+pub const CLEANUP_RESOLVE_SCHEMA_VERSION: u32 = 2;
+const LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 1;
 
 /// Directory beneath the host state directory holding one subdirectory of
 /// archives per repository.
@@ -41,11 +44,34 @@ const BUNDLE_FILE: &str = "commits.bundle";
 const STAGED_PATCH_FILE: &str = "staged.patch";
 const UNSTAGED_PATCH_FILE: &str = "unstaged.patch";
 const UNTRACKED_DIRECTORY: &str = "untracked";
+const IGNORED_DIRECTORY: &str = "ignored";
 pub(crate) const MANIFEST_FILE: &str = "manifest.json";
 const README_FILE: &str = "README.md";
+const MAX_WORKTREE_SPECIAL_SCAN_ENTRIES: usize = 250_000;
+const MAX_WORKTREE_SPECIAL_SCAN_DEPTH: usize = 128;
+static ARCHIVE_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// One untracked path the archive preserves.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// One path from Git's collapsed ignored-root listing and the classification
+/// assigned by the current cleanup policy.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IgnoredPath {
+    pub path: String,
+    pub classification: IgnoredPathClassification,
+}
+
+/// The disposition of an ignored root in the reviewed cleanup plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IgnoredPathClassification {
+    DisposableDirectory,
+    DisposableOutput,
+    PreservedFile,
+}
+
+/// One untracked or protected ignored path the archive preserves.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArchivedFile {
     /// Relative to the worktree root.
     pub path: String,
@@ -54,14 +80,18 @@ pub struct ArchivedFile {
     pub sha256: String,
     /// A symbolic link is archived as the link, never as what it points at.
     pub symlink: bool,
+    /// Unix permission bits for a regular file. `None` for symlinks and on
+    /// platforms that cannot represent Unix file modes.
+    #[serde(default)]
+    pub mode: Option<u32>,
 }
 
 /// What a confirmed resolve would preserve, and the digest that authorizes it.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CleanupResolvePlan {
     pub schema_version: u32,
-    /// Binds the head, the delivery targets and the exact content of every
-    /// patch and untracked file, so any change after review refuses the apply.
+    /// Binds the head, delivery targets, patches, untracked files, ignored
+    /// root classifications, protected ignored files and cleanup policy.
     pub digest: String,
     pub session_id: i64,
     pub worktree_path: String,
@@ -82,6 +112,14 @@ pub struct CleanupResolvePlan {
     pub unstaged_patch_sha256: String,
     pub untracked_files: Vec<ArchivedFile>,
     pub untracked_bytes: u64,
+    /// Every Git ignored root and the policy classification used to decide
+    /// whether it is archived or discarded as generated output.
+    pub ignored_paths: Vec<IgnoredPath>,
+    /// Protected standalone ignored files and links, stored under `ignored/`.
+    pub ignored_files: Vec<ArchivedFile>,
+    pub ignored_bytes: u64,
+    /// Digest of the strict/regenerable policy inputs bound into `digest`.
+    pub ignored_policy_sha256: String,
     /// The directory the archive will be written beneath.
     pub archive_root: PathBuf,
     pub apply_command: String,
@@ -115,6 +153,15 @@ struct DigestInput<'a> {
     staged_patch_sha256: &'a str,
     unstaged_patch_sha256: &'a str,
     untracked_files: &'a [ArchivedFile],
+    ignored_paths: &'a [IgnoredPath],
+    ignored_files: &'a [ArchivedFile],
+    ignored_policy: &'a IgnoredPolicyProof<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct IgnoredPolicyProof<'a> {
+    strict: bool,
+    regenerable: &'a [String],
 }
 
 #[derive(serde::Serialize)]
@@ -129,6 +176,7 @@ struct PatchRecord<'a> {
 #[derive(serde::Serialize)]
 struct RecoveryManifest<'a> {
     schema_version: u32,
+    plan_digest: &'a str,
     created_at_ms: i64,
     aethyme_version: &'static str,
     repository: String,
@@ -148,10 +196,61 @@ struct RecoveryManifest<'a> {
     unstaged_patch: PatchRecord<'a>,
     untracked_directory: &'static str,
     untracked_files: &'a [ArchivedFile],
+    ignored_directory: &'static str,
+    ignored_paths: &'a [IgnoredPath],
+    ignored_files: &'a [ArchivedFile],
+    ignored_policy_sha256: &'a str,
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// The portable mode field is intentionally absent where Unix mode bits are
+/// unavailable. Never guess a mode on another platform.
+fn permission_mode(metadata: &std::fs::Metadata) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Some(metadata.permissions().mode() & 0o7777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+fn open_regular_file_no_follow(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open the reparse point itself so metadata below can reject it.
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path is not a regular file",
+        ));
+    }
+    Ok((file, metadata))
+}
+
+fn read_regular_file_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
+    let (mut file, _) = open_regular_file_no_follow(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn io_error(path: &Path, source: std::io::Error) -> BrokerOpError {
@@ -181,13 +280,15 @@ fn describe_untracked(full: &Path, relative: &str) -> std::io::Result<Option<Arc
             bytes: 0,
             sha256: sha256_hex(&hashed),
             symlink: true,
+            mode: None,
         }));
     }
     if !metadata.is_file() {
         return Ok(None);
     }
     let mut hasher = Sha256::new();
-    let mut file = std::fs::File::open(full)?;
+    let (mut file, opened_metadata) = open_regular_file_no_follow(full)?;
+    let mode = permission_mode(&opened_metadata);
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut bytes = 0_u64;
     loop {
@@ -198,17 +299,192 @@ fn describe_untracked(full: &Path, relative: &str) -> std::io::Result<Option<Arc
         bytes += read as u64;
         hasher.update(&buffer[..read]);
     }
+    let final_metadata = file.metadata()?;
+    if final_metadata.len() != bytes || permission_mode(&final_metadata) != mode {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file identity changed while it was read",
+        ));
+    }
     Ok(Some(ArchivedFile {
         path: relative.to_owned(),
         bytes,
         sha256: format!("{:x}", hasher.finalize()),
         symlink: false,
+        mode,
     }))
+}
+
+fn ignored_inventory(
+    checkout: &GitRepo,
+    worktree: &Path,
+    policy: &crate::AutoCleanupPolicy,
+    session_id: i64,
+) -> Result<(Vec<IgnoredPath>, Vec<ArchivedFile>), BrokerOpError> {
+    let refuse = |reason: String| BrokerOpError::CleanupResolveRefused {
+        id: session_id,
+        reason,
+    };
+    let mut roots = Vec::new();
+    let mut files = Vec::new();
+    for relative in checkout.ignored_paths_readonly()? {
+        let trimmed = relative.trim_end_matches('/');
+        if !is_contained_relative(trimmed) {
+            return Err(refuse(format!(
+                "Git reported an ignored path outside the worktree: {relative:?}"
+            )));
+        }
+        let full = worktree.join(trimmed);
+        let metadata = std::fs::symlink_metadata(&full).map_err(|error| io_error(&full, error))?;
+        let file_type = metadata.file_type();
+        if !metadata.is_dir() && !metadata.is_file() && !file_type.is_symlink() {
+            return Err(refuse(format!(
+                "ignored path {relative} is a special file, which an archive cannot preserve"
+            )));
+        }
+        if relative.ends_with('/') && (!metadata.is_dir() || file_type.is_symlink()) {
+            return Err(refuse(format!(
+                "Git listed ignored path {relative} as a directory, but it is not one"
+            )));
+        }
+        let classification = match crate::auto_cleanup::classify_ignored_for_recovery(
+            worktree, &relative, policy,
+        )
+        .map_err(refuse)?
+        {
+            crate::auto_cleanup::RecoveryIgnoredClassification::DisposableDirectory => {
+                if !metadata.is_dir() || file_type.is_symlink() {
+                    return Err(refuse(format!(
+                        "ignored path {relative} was classified as a directory but is not one"
+                    )));
+                }
+                IgnoredPathClassification::DisposableDirectory
+            }
+            crate::auto_cleanup::RecoveryIgnoredClassification::DisposableOutput => {
+                if metadata.is_dir() && !file_type.is_symlink() {
+                    IgnoredPathClassification::DisposableDirectory
+                } else {
+                    IgnoredPathClassification::DisposableOutput
+                }
+            }
+            crate::auto_cleanup::RecoveryIgnoredClassification::Preserve(_) => {
+                let Some(file) =
+                    describe_untracked(&full, &relative).map_err(|error| io_error(&full, error))?
+                else {
+                    return Err(refuse(format!(
+                        "ignored path {relative} is neither a regular file nor a symbolic link"
+                    )));
+                };
+                files.push(file);
+                IgnoredPathClassification::PreservedFile
+            }
+            crate::auto_cleanup::RecoveryIgnoredClassification::StrictRefusal => {
+                return Err(refuse(format!(
+                    "strict cleanup requires no ignored leftovers; remove {relative} manually or review an explicit discard"
+                )));
+            }
+        };
+        roots.push(IgnoredPath {
+            path: relative,
+            classification,
+        });
+    }
+    roots.sort_by(|left, right| left.path.cmp(&right.path));
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let opaque_directories = roots
+        .iter()
+        .filter(|root| root.classification == IgnoredPathClassification::DisposableDirectory)
+        .map(|root| root.path.trim_end_matches('/').to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    reject_unarchivable_special_nodes(worktree, &opaque_directories).map_err(refuse)?;
+    Ok((roots, files))
+}
+
+/// Git does not report every unsupported filesystem node (for example, an
+/// ignored FIFO). Walk only outside policy-approved opaque ignored directories
+/// and refuse if the bounded, no-follow scan cannot establish that the tree
+/// contains no special nodes.
+fn reject_unarchivable_special_nodes(
+    worktree: &Path,
+    opaque_directories: &std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    let root_metadata = std::fs::symlink_metadata(worktree)
+        .map_err(|error| format!("cannot inspect worktree root: {error}"))?;
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        return Err("worktree root is not a real directory".into());
+    }
+
+    let mut pending = vec![(PathBuf::new(), String::new(), 0_usize)];
+    let mut visited = 0_usize;
+    while let Some((relative_dir, relative_dir_string, depth)) = pending.pop() {
+        if depth > MAX_WORKTREE_SPECIAL_SCAN_DEPTH {
+            return Err(format!(
+                "worktree directory depth exceeds the special-file scan bound of {MAX_WORKTREE_SPECIAL_SCAN_DEPTH}"
+            ));
+        }
+        let directory = worktree.join(&relative_dir);
+        let metadata = std::fs::symlink_metadata(&directory)
+            .map_err(|error| format!("cannot inspect {}: {error}", directory.display()))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "worktree directory changed during the special-file scan: {}",
+                directory.display()
+            ));
+        }
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|error| format!("cannot read {}: {error}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "cannot read worktree entry under {}: {error}",
+                    directory.display()
+                )
+            })?;
+            visited += 1;
+            if visited > MAX_WORKTREE_SPECIAL_SCAN_ENTRIES {
+                return Err(format!(
+                    "worktree exceeds the special-file scan bound of {MAX_WORKTREE_SPECIAL_SCAN_ENTRIES} entries outside opaque ignored directories"
+                ));
+            }
+            let name = entry.file_name().into_string().map_err(|_| {
+                format!(
+                    "worktree contains a non-UTF-8 path under {}; cannot prove its filesystem inventory",
+                    directory.display()
+                )
+            })?;
+            let relative = if relative_dir_string.is_empty() {
+                name.clone()
+            } else {
+                format!("{relative_dir_string}/{name}")
+            };
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("cannot inspect {relative}: {error}"))?;
+            if file_type.is_dir() {
+                // A primary-checkout fixture may have a `.git` directory;
+                // linked worktrees have a `.git` file. Git metadata is outside
+                // the recoverable worktree payload.
+                if relative == ".git" || opaque_directories.contains(&relative) {
+                    continue;
+                }
+                pending.push((relative_dir.join(&name), relative, depth + 1));
+            } else if !file_type.is_file() && !file_type.is_symlink() {
+                return Err(format!(
+                    "worktree contains an unsupported special file: {relative}"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A relative path that stays inside the directory it is joined to.
 fn is_contained_relative(path: &str) -> bool {
     !path.is_empty()
+        && !path.contains('\0')
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
         && Path::new(path)
             .components()
             .all(|component| matches!(component, Component::Normal(_)))
@@ -296,9 +572,18 @@ impl Broker {
             ));
         }
         self.refuse_live_checkout(session_id, &worktree)?;
-        self.ensure_archive_ignored_content_is_discardable(session_id, &worktree)?;
-
         let checkout = GitRepo::discover(&worktree)?;
+        let tracked_submodules = checkout.tracked_submodule_paths()?;
+        if !tracked_submodules.is_empty() {
+            return Err(refuse(format!(
+                "the recovery archive does not include child Git repositories for tracked submodules {tracked_submodules:?}; preserve their commits and worktrees separately before archiving this session"
+            )));
+        }
+        if checkout.has_submodule_git_metadata()? {
+            return Err(refuse(
+                "the repository retains submodule Git metadata that the recovery archive cannot inspect or include; preserve child repositories separately before archiving this session".into(),
+            ));
+        }
         let head = checkout.head_commit()?;
         let delivery_targets = self.cleanup_delivery_targets()?;
         let unlanded_commits = checkout.commits_not_on_any(&head, &delivery_targets)?;
@@ -334,6 +619,19 @@ impl Broker {
         untracked_files.sort_by(|left, right| left.path.cmp(&right.path));
         let untracked_bytes = untracked_files.iter().map(|file| file.bytes).sum();
 
+        let ignored_policy = crate::AutoCleanupPolicy::load(self.main_root())
+            .map_err(|reason| refuse(format!("cannot read ignored cleanup policy: {reason}")))?;
+        let ignored_policy_proof = IgnoredPolicyProof {
+            strict: ignored_policy.strict,
+            regenerable: &ignored_policy.regenerable,
+        };
+        let (ignored_paths, ignored_files) =
+            ignored_inventory(&checkout, &worktree, &ignored_policy, session_id)?;
+        let ignored_bytes = ignored_files.iter().map(|file| file.bytes).sum();
+        let ignored_policy_bytes =
+            serde_json::to_vec(&ignored_policy_proof).map_err(|error| refuse(error.to_string()))?;
+        let ignored_policy_sha256 = sha256_hex(&ignored_policy_bytes);
+
         let staged_patch_sha256 = sha256_hex(&staged);
         let unstaged_patch_sha256 = sha256_hex(&unstaged);
         let digest_input = DigestInput {
@@ -347,9 +645,12 @@ impl Broker {
             staged_patch_sha256: &staged_patch_sha256,
             unstaged_patch_sha256: &unstaged_patch_sha256,
             untracked_files: &untracked_files,
+            ignored_paths: &ignored_paths,
+            ignored_files: &ignored_files,
+            ignored_policy: &ignored_policy_proof,
         };
         let mut hasher = Sha256::new();
-        hasher.update(b"aethyme-cleanup-resolve-v1\0");
+        hasher.update(b"aethyme-cleanup-resolve-v2\0");
         hasher
             .update(serde_json::to_vec(&digest_input).map_err(|error| refuse(error.to_string()))?);
         let digest = format!("{:x}", hasher.finalize());
@@ -375,6 +676,10 @@ impl Broker {
             unstaged_patch_bytes: unstaged.len() as u64,
             unstaged_patch_sha256,
             untracked_files,
+            ignored_paths,
+            ignored_files,
+            ignored_bytes,
+            ignored_policy_sha256,
             untracked_bytes,
             archive_root: self.recovery_archive_root()?,
         })
@@ -399,6 +704,25 @@ impl Broker {
     where
         F: FnOnce(),
     {
+        self.cleanup_resolve_apply_with_hooks(
+            session_id,
+            confirm,
+            after_archive_verified,
+            sync_archive_directory,
+        )
+    }
+
+    fn cleanup_resolve_apply_with_hooks<F, S>(
+        &mut self,
+        session_id: i64,
+        confirm: &str,
+        after_archive_verified: F,
+        sync_directory: S,
+    ) -> Result<CleanupResolveOutcome, BrokerOpError>
+    where
+        F: FnOnce(),
+        S: Fn(&Path) -> std::io::Result<()>,
+    {
         if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BrokerOpError::CleanupResolveConfirmationNotSha256);
         }
@@ -410,17 +734,37 @@ impl Broker {
             });
         }
         let session = self.store_ref().session(session_id)?;
-        let name = format!("{session_id}-{}-{}", &plan.head[..12], now_ms());
-        let archive = plan.archive_root.join(&name);
-        let partial = plan.archive_root.join(format!("{name}.partial"));
-        std::fs::create_dir_all(&partial).map_err(|error| io_error(&partial, error))?;
+        let archive_root = prepare_archive_root(&plan.archive_root).map_err(|reason| {
+            BrokerOpError::RecoveryArchiveUnverified {
+                id: session_id,
+                path: plan.archive_root.to_string_lossy().into_owned(),
+                reason,
+            }
+        })?;
+        let name = format!(
+            "{session_id}-{}-{}",
+            &plan.head[..12],
+            archive_staging_nonce()
+        );
+        let partial_name = format!("{name}.partial");
+        let partial_path = archive_root.join(&partial_name);
+        let partial =
+            create_exclusive_archive_directory(&archive_root, &partial_name).map_err(|reason| {
+                BrokerOpError::RecoveryArchiveUnverified {
+                    id: session_id,
+                    path: partial_path.to_string_lossy().into_owned(),
+                    reason,
+                }
+            })?;
+        let archive = archive_root.join(&name);
         let checkout = GitRepo::discover(Path::new(&plan.worktree_path))?;
-        if let Err(reason) = write_verified_archive(
+        if let Err(reason) = write_verified_archive_with_directory_sync(
             self.repo_handle(),
             &checkout,
             &plan,
             session.task.as_deref(),
             &partial,
+            &sync_directory,
         ) {
             return Err(BrokerOpError::RecoveryArchiveUnverified {
                 id: session_id,
@@ -428,13 +772,51 @@ impl Broker {
                 reason,
             });
         }
+        match std::fs::symlink_metadata(&archive) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(BrokerOpError::RecoveryArchiveUnverified {
+                    id: session_id,
+                    path: archive.to_string_lossy().into_owned(),
+                    reason: "archive destination already exists".into(),
+                });
+            }
+            Err(error) => return Err(io_error(&archive, error)),
+        }
         std::fs::rename(&partial, &archive).map_err(|error| io_error(&archive, error))?;
+        let archive_parent =
+            archive_root
+                .parent()
+                .ok_or_else(|| BrokerOpError::RecoveryArchiveUnverified {
+                    id: session_id,
+                    path: archive_root.to_string_lossy().into_owned(),
+                    reason: "archive root has no parent to sync".into(),
+                })?;
+        let archive_anchor =
+            archive_parent
+                .parent()
+                .ok_or_else(|| BrokerOpError::RecoveryArchiveUnverified {
+                    id: session_id,
+                    path: archive_parent.to_string_lossy().into_owned(),
+                    reason: "archive root has no storage anchor to sync".into(),
+                })?;
+        for (label, path) in [
+            ("archive root", archive_root.as_path()),
+            ("archive parent", archive_parent),
+            ("archive storage anchor", archive_anchor),
+        ] {
+            sync_directory(path).map_err(|error| BrokerOpError::RecoveryArchiveUnverified {
+                id: session_id,
+                path: path.to_string_lossy().into_owned(),
+                reason: format!("cannot sync {label} before worktree removal: {error}"),
+            })?;
+        }
         after_archive_verified();
 
-        // The archive is complete and verified. Cleanup rechecks protected
-        // ignored content under the lifecycle claim before removing the tree.
+        // The archive is complete and verified. Cleanup recomputes the full
+        // plan under the lifecycle claim immediately before removing the tree.
         let cleanup_error = self
-            .cleanup_after_recovery_archive(session_id)
+            .cleanup_after_recovery_archive(session_id, &plan.digest, &archive)
             .err()
             .map(|e| e.to_string());
         let worktree_removed = cleanup_error.is_none();
@@ -445,6 +827,7 @@ impl Broker {
             "disposition": plan.disposition.as_str(),
             "unlanded_commits": plan.unlanded_commits.len(),
             "untracked_files": plan.untracked_files.len(),
+            "ignored_files": plan.ignored_files.len(),
             "worktree_removed": worktree_removed,
         })
         .to_string();
@@ -462,26 +845,50 @@ impl Broker {
     }
 }
 
-/// The parts of a stored `manifest.json` expiry needs, read owned. An
-/// archive whose manifest does not parse into this is reported, never
-/// proposed: the broker cannot say whose work it holds.
+/// The complete manifest shape the broker has written. Unknown fields are
+/// refused so a newer archive cannot be treated as empty by an older reader.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredManifest {
     schema_version: u32,
     created_at_ms: i64,
+    aethyme_version: String,
     repository: String,
     session_id: i64,
+    task: Option<String>,
+    worktree_path: String,
     branch_ref: String,
+    disposition: String,
     head: String,
+    base: Option<String>,
+    delivery_targets: Vec<String>,
+    landing: serde_json::Value,
+    bundle: Option<String>,
+    unlanded_commits: Vec<String>,
     staged_patch: StoredPatch,
     unstaged_patch: StoredPatch,
+    untracked_directory: String,
+    untracked_files: Vec<ArchivedFile>,
+    /// Absent only in legacy schema v1. `None` in schema v2 is incomplete and
+    /// therefore cannot establish that an archive holds no ignored data.
     #[serde(default)]
-    untracked_files: Vec<serde_json::Value>,
+    ignored_directory: Option<String>,
+    #[serde(default)]
+    ignored_paths: Option<Vec<IgnoredPath>>,
+    #[serde(default)]
+    ignored_files: Option<Vec<ArchivedFile>>,
+    #[serde(default)]
+    ignored_policy_sha256: Option<String>,
+    #[serde(default)]
+    plan_digest: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredPatch {
+    file: String,
     bytes: u64,
+    sha256: String,
 }
 
 /// An archive the broker can vouch for: this repository wrote it, for a
@@ -491,8 +898,8 @@ pub(crate) struct OwnedRecoveryArchive {
     pub session_id: i64,
     pub head: String,
     pub created_at_ms: i64,
-    /// Staged, unstaged or untracked changes -- work no commit carries, so no
-    /// delivery target can ever hold it.
+    /// Staged, unstaged, untracked or protected ignored changes -- work no
+    /// commit carries, so no delivery target can ever hold it.
     pub holds_uncommitted: bool,
 }
 
@@ -510,6 +917,506 @@ fn same_path(left: &Path, right: &Path) -> bool {
     canonical(left) == canonical(right)
 }
 
+const MAX_RECOVERY_ARCHIVE_TREE_ENTRIES: usize = 250_000;
+const MAX_RECOVERY_ARCHIVE_TREE_DEPTH: usize = 128;
+const MAX_RECOVERY_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_git_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn read_recovery_manifest(path: &Path) -> Result<Vec<u8>, String> {
+    let (file, metadata) = open_regular_file_no_follow(path)
+        .map_err(|error| format!("cannot safely open manifest: {error}"))?;
+    if metadata.len() > MAX_RECOVERY_MANIFEST_BYTES {
+        return Err("manifest exceeds the ownership check byte bound".into());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_RECOVERY_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read manifest: {error}"))?;
+    if bytes.len() as u64 > MAX_RECOVERY_MANIFEST_BYTES {
+        return Err("manifest grew beyond the ownership check byte bound".into());
+    }
+    Ok(bytes)
+}
+
+fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
+    if manifest.session_id <= 0
+        || manifest.created_at_ms < 0
+        || manifest.aethyme_version.is_empty()
+        || manifest.worktree_path.is_empty()
+        || !Path::new(&manifest.worktree_path).is_absolute()
+        || manifest.branch_ref.is_empty()
+        || !matches!(
+            manifest.disposition.as_str(),
+            "dirty" | "pending_commits" | "unproven_provenance"
+        )
+        || !valid_git_object_id(&manifest.head)
+        || manifest
+            .base
+            .as_deref()
+            .is_some_and(|base| !valid_git_object_id(base))
+        || manifest
+            .task
+            .as_deref()
+            .is_some_and(|task| task.contains('\0'))
+        || manifest.landing.is_null()
+        || !manifest
+            .delivery_targets
+            .iter()
+            .all(|target| valid_git_object_id(target))
+        || !manifest
+            .unlanded_commits
+            .iter()
+            .all(|commit| valid_git_object_id(commit))
+        || manifest.bundle.is_some() == manifest.unlanded_commits.is_empty()
+    {
+        return Err("manifest has an incomplete or malformed archive identity".into());
+    }
+    Ok(())
+}
+
+fn validate_archived_files(label: &str, files: &[ArchivedFile]) -> Result<(), String> {
+    let mut previous: Option<&str> = None;
+    for file in files {
+        if !is_contained_relative(&file.path) {
+            return Err(format!(
+                "{label} path {:?} is not a contained relative path",
+                file.path
+            ));
+        }
+        if previous.is_some_and(|previous| previous >= file.path.as_str()) {
+            return Err(format!("{label} paths are not unique and sorted"));
+        }
+        if previous.is_some_and(|previous| {
+            file.path
+                .strip_prefix(previous)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        }) {
+            return Err(format!("{label} paths overlap as parent and child"));
+        }
+        if !valid_sha256(&file.sha256)
+            || (file.symlink && (file.bytes != 0 || file.mode.is_some()))
+            || file.mode.is_some_and(|mode| mode & !0o7777 != 0)
+        {
+            return Err(format!(
+                "{label} entry {:?} has an invalid identity",
+                file.path
+            ));
+        }
+        previous = Some(&file.path);
+    }
+    Ok(())
+}
+
+fn validate_archived_file_modes(
+    label: &str,
+    files: &[ArchivedFile],
+    schema_version: u32,
+) -> Result<(), String> {
+    match schema_version {
+        LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+            if files.iter().any(|file| file.mode.is_some()) {
+                return Err(format!(
+                    "legacy {label} entries unexpectedly contain file modes"
+                ));
+            }
+        }
+        CLEANUP_RESOLVE_SCHEMA_VERSION => {
+            #[cfg(unix)]
+            if files
+                .iter()
+                .any(|file| !file.symlink && file.mode.is_none())
+            {
+                return Err(format!(
+                    "schema v2 {label} entry is missing its Unix file mode"
+                ));
+            }
+            #[cfg(not(unix))]
+            if files.iter().any(|file| file.mode.is_some()) {
+                return Err(format!(
+                    "schema v2 {label} file modes cannot be verified on this platform"
+                ));
+            }
+        }
+        version => return Err(format!("manifest schema {version} is not supported")),
+    }
+    Ok(())
+}
+
+fn recovery_archive_expected_files(
+    manifest: &StoredManifest,
+) -> Result<std::collections::BTreeSet<PathBuf>, String> {
+    if manifest.untracked_directory != UNTRACKED_DIRECTORY
+        || manifest.staged_patch.file != STAGED_PATCH_FILE
+        || manifest.unstaged_patch.file != UNSTAGED_PATCH_FILE
+        || !valid_sha256(&manifest.staged_patch.sha256)
+        || !valid_sha256(&manifest.unstaged_patch.sha256)
+    {
+        return Err("manifest names an unexpected archive component".into());
+    }
+    if manifest
+        .bundle
+        .as_deref()
+        .is_some_and(|bundle| bundle != BUNDLE_FILE)
+    {
+        return Err("manifest names an unexpected commit bundle".into());
+    }
+    validate_archived_files("untracked", &manifest.untracked_files)?;
+
+    let ignored_files = match manifest.schema_version {
+        LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+            validate_archived_file_modes(
+                "untracked",
+                &manifest.untracked_files,
+                manifest.schema_version,
+            )?;
+            if manifest.ignored_directory.is_some()
+                || manifest.ignored_paths.is_some()
+                || manifest.ignored_files.is_some()
+                || manifest.ignored_policy_sha256.is_some()
+                || manifest.plan_digest.is_some()
+            {
+                return Err("legacy manifest unexpectedly contains ignored archive fields".into());
+            }
+            &[][..]
+        }
+        CLEANUP_RESOLVE_SCHEMA_VERSION => {
+            if manifest.ignored_directory.as_deref() != Some(IGNORED_DIRECTORY) {
+                return Err("schema v2 manifest is missing its ignored directory identity".into());
+            }
+            validate_archived_file_modes(
+                "untracked",
+                &manifest.untracked_files,
+                manifest.schema_version,
+            )?;
+            let files = manifest
+                .ignored_files
+                .as_deref()
+                .ok_or_else(|| "schema v2 manifest is missing ignored_files".to_string())?;
+            validate_archived_files("ignored", files)?;
+            validate_archived_file_modes("ignored", files, manifest.schema_version)?;
+            let ignored_paths = manifest
+                .ignored_paths
+                .as_deref()
+                .ok_or_else(|| "schema v2 manifest is missing ignored_paths".to_string())?;
+            if !manifest
+                .ignored_policy_sha256
+                .as_deref()
+                .is_some_and(valid_sha256)
+                || !manifest.plan_digest.as_deref().is_some_and(valid_sha256)
+            {
+                return Err(
+                    "schema v2 manifest has an invalid plan or ignored policy identity".into(),
+                );
+            }
+            let mut previous: Option<&str> = None;
+            let mut preserved = Vec::new();
+            for path in ignored_paths {
+                let trimmed = path.path.trim_end_matches('/');
+                if !is_contained_relative(trimmed)
+                    || previous.is_some_and(|previous| previous >= path.path.as_str())
+                {
+                    return Err("schema v2 ignored roots are invalid or unsorted".into());
+                }
+                if path.classification == IgnoredPathClassification::PreservedFile {
+                    if path.path.ends_with('/') {
+                        return Err("schema v2 preserved ignored path is a directory".into());
+                    }
+                    preserved.push(path.path.as_str());
+                }
+                previous = Some(&path.path);
+            }
+            if preserved.len() != files.len()
+                || preserved
+                    .iter()
+                    .zip(files)
+                    .any(|(path, file)| *path != file.path)
+            {
+                return Err("schema v2 ignored classifications do not match ignored_files".into());
+            }
+            files
+        }
+        version => return Err(format!("manifest schema {version} is not supported")),
+    };
+
+    let mut expected = std::collections::BTreeSet::from([
+        PathBuf::from(MANIFEST_FILE),
+        PathBuf::from(README_FILE),
+        PathBuf::from(STAGED_PATCH_FILE),
+        PathBuf::from(UNSTAGED_PATCH_FILE),
+    ]);
+    if manifest.bundle.is_some() {
+        expected.insert(PathBuf::from(BUNDLE_FILE));
+    }
+    expected.extend(
+        manifest
+            .untracked_files
+            .iter()
+            .map(|file| PathBuf::from(UNTRACKED_DIRECTORY).join(&file.path)),
+    );
+    expected.extend(
+        ignored_files
+            .iter()
+            .map(|file| PathBuf::from(IGNORED_DIRECTORY).join(&file.path)),
+    );
+    Ok(expected)
+}
+
+/// Enumerate archive files without following links. Incomplete or unexpectedly
+/// large trees stay unowned so retention never assumes their contents away.
+fn recovery_archive_file_set(root: &Path) -> Result<std::collections::BTreeSet<PathBuf>, String> {
+    let mut files = std::collections::BTreeSet::new();
+    let mut pending = vec![(PathBuf::new(), 0_usize)];
+    let mut visited = 0_usize;
+    while let Some((relative_dir, depth)) = pending.pop() {
+        if depth > MAX_RECOVERY_ARCHIVE_TREE_DEPTH {
+            return Err("archive directory depth exceeds the ownership check bound".into());
+        }
+        let directory = root.join(&relative_dir);
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|error| format!("cannot read {}: {error}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("cannot read archive entry: {error}"))?;
+            visited += 1;
+            if visited > MAX_RECOVERY_ARCHIVE_TREE_ENTRIES {
+                return Err("archive entry count exceeds the ownership check bound".into());
+            }
+            let name = entry.file_name();
+            let relative = relative_dir.join(name);
+            let metadata = std::fs::symlink_metadata(entry.path())
+                .map_err(|error| format!("cannot inspect {}: {error}", entry.path().display()))?;
+            if metadata.is_dir() {
+                pending.push((relative, depth + 1));
+            } else if metadata.is_file() || metadata.file_type().is_symlink() {
+                files.insert(relative);
+            } else {
+                return Err(format!(
+                    "archive contains a special file: {}",
+                    entry.path().display()
+                ));
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn verify_recovery_archive_tree(root: &Path, manifest: &StoredManifest) -> Result<(), String> {
+    let expected = recovery_archive_expected_files(manifest)?;
+    let actual = recovery_archive_file_set(root)?;
+    if actual != expected {
+        let unexpected = actual.difference(&expected).next();
+        let missing = expected.difference(&actual).next();
+        return Err(match (unexpected, missing) {
+            (Some(path), _) => format!("archive contains an unlisted file: {}", path.display()),
+            (_, Some(path)) => format!("archive is missing a listed file: {}", path.display()),
+            _ => "archive file inventory does not match its manifest".into(),
+        });
+    }
+    for path in [
+        MANIFEST_FILE,
+        README_FILE,
+        STAGED_PATCH_FILE,
+        UNSTAGED_PATCH_FILE,
+    ]
+    .into_iter()
+    .chain(manifest.bundle.as_deref())
+    {
+        let path = root.join(path);
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "archive component is not a regular file: {}",
+                path.display()
+            ));
+        }
+    }
+    for (name, expected_bytes) in [
+        (STAGED_PATCH_FILE, manifest.staged_patch.bytes),
+        (UNSTAGED_PATCH_FILE, manifest.unstaged_patch.bytes),
+    ] {
+        let path = root.join(name);
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        if metadata.len() != expected_bytes {
+            return Err(format!(
+                "{name} byte length does not match its manifest entry"
+            ));
+        }
+    }
+    for (directory, files) in [
+        (UNTRACKED_DIRECTORY, manifest.untracked_files.as_slice()),
+        (
+            IGNORED_DIRECTORY,
+            manifest.ignored_files.as_deref().unwrap_or_default(),
+        ),
+    ] {
+        for file in files {
+            let path = root.join(directory).join(&file.path);
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+            if metadata.file_type().is_symlink() != file.symlink
+                || (!file.symlink && !metadata.is_file())
+            {
+                return Err(format!(
+                    "archive entry {} has a different file type than its manifest",
+                    path.display()
+                ));
+            }
+            if !file.symlink && metadata.len() != file.bytes {
+                return Err(format!(
+                    "archive entry {} has a different byte length than its manifest",
+                    path.display()
+                ));
+            }
+            if !file.symlink
+                && manifest.schema_version == CLEANUP_RESOLVE_SCHEMA_VERSION
+                && permission_mode(&metadata) != file.mode
+            {
+                return Err(format!(
+                    "archive entry {} has a different file mode than its manifest",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Verify that the archive still contains the exact reviewed plan. Called
+/// after writing and again under the lifecycle claim immediately before the
+/// worktree is removed.
+pub(crate) fn verify_recovery_archive_for_plan(
+    repository: &GitRepo,
+    root: &Path,
+    plan: &CleanupResolvePlan,
+) -> Result<(), String> {
+    let root_metadata = std::fs::symlink_metadata(root)
+        .map_err(|error| format!("cannot inspect archive directory: {error}"))?;
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        return Err("archive path is not a real directory".into());
+    }
+    if root
+        .extension()
+        .is_some_and(|extension| extension == "partial")
+    {
+        return Err("archive is incomplete".into());
+    }
+    if !root
+        .parent()
+        .is_some_and(|parent| same_path(parent, &plan.archive_root))
+    {
+        return Err("archive is outside the reviewed archive root".into());
+    }
+    verify_recovery_archive_payload_for_plan(repository, root, plan)
+}
+
+/// Verify archive payload and manifest against a plan without imposing a
+/// final archive path. The writer uses this only for its owned `.partial`
+/// directory; the final removal path uses the stricter wrapper above.
+fn verify_recovery_archive_payload_for_plan(
+    repository: &GitRepo,
+    root: &Path,
+    plan: &CleanupResolvePlan,
+) -> Result<(), String> {
+    let bytes = read_recovery_manifest(&root.join(MANIFEST_FILE))?;
+    let manifest: StoredManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("unreadable {MANIFEST_FILE}: {error}"))?;
+    validate_manifest_identity(&manifest)?;
+    verify_recovery_archive_tree(root, &manifest)?;
+    let expected_landing = serde_json::to_value(&plan.landing)
+        .map_err(|error| format!("cannot encode reviewed landing verdict: {error}"))?;
+    if manifest.schema_version != CLEANUP_RESOLVE_SCHEMA_VERSION
+        || manifest.plan_digest.as_deref() != Some(plan.digest.as_str())
+        || manifest.session_id != plan.session_id
+        || !same_path(Path::new(&manifest.repository), repository.root())
+        || manifest.worktree_path != plan.worktree_path
+        || manifest.branch_ref != plan.branch_ref
+        || manifest.disposition != plan.disposition.as_str()
+        || manifest.head != plan.head
+        || manifest.delivery_targets != plan.delivery_targets
+        || manifest.unlanded_commits != plan.unlanded_commits
+        || manifest.landing != expected_landing
+        || manifest.staged_patch.bytes != plan.staged_patch_bytes
+        || manifest.staged_patch.sha256 != plan.staged_patch_sha256
+        || manifest.unstaged_patch.bytes != plan.unstaged_patch_bytes
+        || manifest.unstaged_patch.sha256 != plan.unstaged_patch_sha256
+        || manifest.untracked_files != plan.untracked_files
+        || manifest.ignored_paths.as_deref() != Some(plan.ignored_paths.as_slice())
+        || manifest.ignored_files.as_deref() != Some(plan.ignored_files.as_slice())
+        || manifest.ignored_policy_sha256.as_deref() != Some(plan.ignored_policy_sha256.as_str())
+    {
+        return Err("archive manifest does not match the reviewed resolve plan".into());
+    }
+
+    for (name, expected_bytes, expected_sha256) in [
+        (
+            STAGED_PATCH_FILE,
+            plan.staged_patch_bytes,
+            plan.staged_patch_sha256.as_str(),
+        ),
+        (
+            UNSTAGED_PATCH_FILE,
+            plan.unstaged_patch_bytes,
+            plan.unstaged_patch_sha256.as_str(),
+        ),
+    ] {
+        let path = root.join(name);
+        let actual = describe_untracked(&path, name)
+            .map_err(|error| format!("cannot verify {name}: {error}"))?
+            .ok_or_else(|| format!("{name} is not a regular file"))?;
+        if actual.bytes != expected_bytes || actual.sha256 != expected_sha256 {
+            return Err(format!("{name} differs from the reviewed plan"));
+        }
+    }
+    for (directory, files) in [
+        (UNTRACKED_DIRECTORY, plan.untracked_files.as_slice()),
+        (IGNORED_DIRECTORY, plan.ignored_files.as_slice()),
+    ] {
+        for expected in files {
+            let path = root.join(directory).join(&expected.path);
+            let actual = describe_untracked(&path, &expected.path)
+                .map_err(|error| format!("cannot verify {}: {error}", path.display()))?
+                .ok_or_else(|| format!("{} is not a regular file or symlink", path.display()))?;
+            if &actual != expected {
+                return Err(format!("{} differs from the reviewed plan", path.display()));
+            }
+        }
+    }
+    if manifest.bundle.is_some() {
+        let bundle = root.join(BUNDLE_FILE);
+        let heads = repository
+            .verify_bundle(&bundle)
+            .map_err(|error| format!("{BUNDLE_FILE} does not verify: {error}"))?;
+        if !heads.contains(&plan.head) {
+            return Err(format!("{BUNDLE_FILE} does not hold {}", plan.head));
+        }
+    }
+    let expected_readme = restore_readme(plan, manifest.bundle.is_some());
+    let readme_path = root.join(README_FILE);
+    let readme_metadata = std::fs::symlink_metadata(&readme_path)
+        .map_err(|error| format!("cannot inspect {README_FILE}: {error}"))?;
+    if readme_metadata.len() != expected_readme.len() as u64 {
+        return Err(format!(
+            "{README_FILE} differs from the reviewed restore steps"
+        ));
+    }
+    let readme = read_regular_file_no_follow(&readme_path)
+        .map_err(|error| format!("cannot safely read {README_FILE}: {error}"))?;
+    if readme != expected_readme.as_bytes() {
+        return Err(format!(
+            "{README_FILE} differs from the reviewed restore steps"
+        ));
+    }
+    Ok(())
+}
+
 impl Broker {
     /// Prove `dir` is a complete recovery archive this repository's broker
     /// wrote, or say why not. Used both to propose an archive and, again, to
@@ -518,9 +1425,12 @@ impl Broker {
         &self,
         dir: &Path,
     ) -> Result<OwnedRecoveryArchive, String> {
-        let root = self
+        let configured_root = self
             .recovery_archive_root()
             .map_err(|error| format!("no recovery archive root: {error}"))?;
+        let root = inspect_archive_root(&configured_root)
+            .map_err(|error| format!("unsafe recovery archive root: {}", error.reason))?
+            .ok_or_else(|| "recovery archive root is missing".to_string())?;
         let metadata =
             std::fs::symlink_metadata(dir).map_err(|error| format!("cannot read: {error}"))?;
         if !metadata.is_dir() {
@@ -536,21 +1446,21 @@ impl Broker {
             return Err(format!("not directly under {}", root.display()));
         }
         let manifest_path = dir.join(MANIFEST_FILE);
-        let manifest_metadata = std::fs::symlink_metadata(&manifest_path)
-            .map_err(|_| "no broker manifest; made outside the broker".to_string())?;
-        if !manifest_metadata.is_file() {
-            return Err("manifest is not a regular file".into());
-        }
-        let bytes = std::fs::read(&manifest_path)
-            .map_err(|error| format!("cannot read manifest: {error}"))?;
+        let bytes = read_recovery_manifest(&manifest_path)
+            .map_err(|reason| format!("no broker manifest; {reason}"))?;
         let manifest: StoredManifest = serde_json::from_slice(&bytes)
             .map_err(|error| format!("unreadable manifest: {error}"))?;
-        if manifest.schema_version != CLEANUP_RESOLVE_SCHEMA_VERSION {
+        if !matches!(
+            manifest.schema_version,
+            LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION | CLEANUP_RESOLVE_SCHEMA_VERSION
+        ) {
             return Err(format!(
-                "manifest schema {} is not {CLEANUP_RESOLVE_SCHEMA_VERSION}",
+                "manifest schema {} is not supported",
                 manifest.schema_version
             ));
         }
+        validate_manifest_identity(&manifest)?;
+        verify_recovery_archive_tree(dir, &manifest)?;
         if !same_path(Path::new(&manifest.repository), self.main_root()) {
             return Err(format!(
                 "manifest names another repository: {}",
@@ -575,7 +1485,11 @@ impl Broker {
             created_at_ms: manifest.created_at_ms,
             holds_uncommitted: manifest.staged_patch.bytes > 0
                 || manifest.unstaged_patch.bytes > 0
-                || !manifest.untracked_files.is_empty(),
+                || !manifest.untracked_files.is_empty()
+                || manifest
+                    .ignored_files
+                    .as_deref()
+                    .is_some_and(|files| !files.is_empty()),
         })
     }
 
@@ -606,23 +1520,63 @@ impl Broker {
     /// Every archive under this repository's recovery archive directory,
     /// split into the ones the broker can vouch for and the rest (with why).
     pub(crate) fn recovery_archives(&self) -> Result<RecoveryArchiveScan, BrokerOpError> {
-        let root = self.recovery_archive_root()?;
+        let configured_root = self.recovery_archive_root()?;
+        let root = match inspect_archive_root(&configured_root) {
+            Ok(Some(root)) => root,
+            Ok(None) => {
+                return Ok(RecoveryArchiveScan {
+                    root: configured_root,
+                    owned: Vec::new(),
+                    unowned: Vec::new(),
+                });
+            }
+            Err(error) => {
+                return Ok(RecoveryArchiveScan {
+                    root: configured_root.clone(),
+                    owned: Vec::new(),
+                    unowned: vec![(error.path, format!("unsafe archive root: {}", error.reason))],
+                });
+            }
+        };
         let mut owned = Vec::new();
         let mut unowned = Vec::new();
-        let Ok(entries) = std::fs::read_dir(&root) else {
-            return Ok(RecoveryArchiveScan {
-                root,
-                owned,
-                unowned,
-            });
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) => {
+                return Ok(RecoveryArchiveScan {
+                    root: configured_root,
+                    owned,
+                    unowned: vec![(root, format!("cannot read archive root: {error}"))],
+                });
+            }
         };
-        let mut paths = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                std::fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_file())
-            })
-            .collect::<Vec<_>>();
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    return Ok(RecoveryArchiveScan {
+                        root: configured_root.clone(),
+                        owned: Vec::new(),
+                        unowned: vec![(root, format!("cannot read archive entry: {error}"))],
+                    });
+                }
+            };
+            let path = entry.path();
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    return Ok(RecoveryArchiveScan {
+                        root: configured_root.clone(),
+                        owned: Vec::new(),
+                        unowned: vec![(root, format!("cannot inspect archive entry: {error}"))],
+                    });
+                }
+            };
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                paths.push(path);
+            }
+        }
         paths.sort();
         for path in paths {
             match self.owned_recovery_archive(&path) {
@@ -631,15 +1585,383 @@ impl Broker {
             }
         }
         Ok(RecoveryArchiveScan {
-            root,
+            root: configured_root,
             owned,
             unowned,
         })
     }
 }
 
-/// Write every part of the archive into `dir`, then read each part back.
-/// `Err` carries the first failure in words; the caller keeps the worktree.
+fn require_real_directory(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!("{} is not a real directory", path.display()));
+    }
+    Ok(())
+}
+
+/// Validate the configured archive path without following a symlink at the
+/// owned storage anchor, archive parent, or repository-specific root. The
+/// canonical paths must retain the exact expected parent chain.
+#[derive(Debug)]
+struct ArchiveRootError {
+    path: PathBuf,
+    reason: String,
+}
+
+fn inspect_archive_root(path: &Path) -> Result<Option<PathBuf>, ArchiveRootError> {
+    let parent = path.parent().ok_or_else(|| ArchiveRootError {
+        path: path.to_path_buf(),
+        reason: "archive root has no parent directory".into(),
+    })?;
+    let anchor = parent.parent().ok_or_else(|| ArchiveRootError {
+        path: path.to_path_buf(),
+        reason: "archive root has no owned storage anchor".into(),
+    })?;
+
+    for (label, component) in [
+        ("archive storage anchor", anchor),
+        ("archive parent", parent),
+        ("archive root", path),
+    ] {
+        match std::fs::symlink_metadata(component) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(ArchiveRootError {
+                    path: component.to_path_buf(),
+                    reason: format!("{label} is not a real directory"),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(ArchiveRootError {
+                    path: component.to_path_buf(),
+                    reason: format!("cannot inspect {label}: {error}"),
+                });
+            }
+        }
+    }
+
+    let canonical_anchor = std::fs::canonicalize(anchor).map_err(|error| ArchiveRootError {
+        path: anchor.to_path_buf(),
+        reason: format!("cannot resolve archive storage anchor: {error}"),
+    })?;
+    let canonical_parent = std::fs::canonicalize(parent).map_err(|error| ArchiveRootError {
+        path: parent.to_path_buf(),
+        reason: format!("cannot resolve archive parent: {error}"),
+    })?;
+    let canonical_root = std::fs::canonicalize(path).map_err(|error| ArchiveRootError {
+        path: path.to_path_buf(),
+        reason: format!("cannot resolve archive root: {error}"),
+    })?;
+    if canonical_parent.parent() != Some(canonical_anchor.as_path())
+        || canonical_root.parent() != Some(canonical_parent.as_path())
+    {
+        return Err(ArchiveRootError {
+            path: path.to_path_buf(),
+            reason: "archive root does not remain directly beneath its owned storage anchor".into(),
+        });
+    }
+    Ok(Some(canonical_root))
+}
+
+/// Resolve the configured archive root once and reject a symlink at the
+/// archive boundary before any payload write can follow it.
+fn prepare_archive_root(path: &Path) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "archive root has no parent directory".to_string())?;
+    let anchor = parent
+        .parent()
+        .ok_or_else(|| "archive root has no owned storage anchor".to_string())?;
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            require_real_directory(anchor)?;
+            require_real_directory(parent)?;
+            require_real_directory(path)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            require_real_directory(anchor)?;
+            match std::fs::symlink_metadata(parent) {
+                Ok(_) => require_real_directory(parent)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(parent)
+                        .map_err(|error| format!("cannot create archive parent: {error}"))?;
+                    require_real_directory(parent)?;
+                }
+                Err(error) => {
+                    return Err(format!("cannot inspect archive parent: {error}"));
+                }
+            }
+            match std::fs::create_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(format!("cannot create archive root: {error}"));
+                }
+            }
+            require_real_directory(path)?;
+        }
+        Err(error) => return Err(format!("cannot inspect archive root: {error}")),
+    }
+    inspect_archive_root(path)
+        .map_err(|error| error.reason)?
+        .ok_or_else(|| "archive root disappeared during setup".into())
+}
+
+fn create_exclusive_archive_directory(parent: &Path, name: &str) -> Result<PathBuf, String> {
+    require_real_directory(parent)?;
+    if !is_contained_relative(name) || name.contains('/') {
+        return Err("archive staging directory name is invalid".into());
+    }
+    let path = parent.join(name);
+    std::fs::create_dir(&path)
+        .map_err(|error| format!("cannot exclusively create {}: {error}", path.display()))?;
+    require_real_directory(&path)?;
+    Ok(path)
+}
+
+fn ensure_archive_directory(root: &Path, relative: &Path) -> Result<PathBuf, String> {
+    require_real_directory(root)?;
+    if relative.as_os_str().is_empty() {
+        return Ok(root.to_path_buf());
+    }
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(format!(
+            "archive directory path is not contained: {}",
+            relative.display()
+        ));
+    }
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err("archive directory path is not contained".into());
+        };
+        current.push(name);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    return Err(format!(
+                        "archive parent is not a real directory: {}",
+                        current.display()
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "cannot create archive directory {}: {error}",
+                            current.display()
+                        ));
+                    }
+                }
+                require_real_directory(&current)?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect archive directory {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(current)
+}
+
+fn create_new_archive_file(root: &Path, relative: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    if !is_contained_relative(relative) {
+        return Err(format!("archive file path is not contained: {relative:?}"));
+    }
+    let relative_path = Path::new(relative);
+    let parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
+    let parent = ensure_archive_directory(root, parent)?;
+    let name = relative_path
+        .file_name()
+        .ok_or_else(|| format!("archive file path has no name: {relative:?}"))?;
+    let path = parent.join(name);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|error| format!("cannot create archive file {}: {error}", path.display()))?;
+    file.write_all(bytes)
+        .map_err(|error| format!("cannot write archive file {}: {error}", path.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("cannot sync archive file {}: {error}", path.display()))?;
+    Ok(path)
+}
+
+fn copy_regular_archive_file(
+    source: &Path,
+    archive_root: &Path,
+    relative: &str,
+    expected: &ArchivedFile,
+) -> Result<(), String> {
+    let (mut source_file, source_metadata) =
+        open_regular_file_no_follow(source).map_err(|error| {
+            format!(
+                "cannot open {} without following links: {error}",
+                source.display()
+            )
+        })?;
+    let mode = permission_mode(&source_metadata);
+    if mode != expected.mode {
+        return Err(format!("{} changed mode after review", expected.path));
+    }
+    let relative_path = Path::new(relative);
+    let parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
+    let parent = ensure_archive_directory(archive_root, parent)?;
+    let name = relative_path
+        .file_name()
+        .ok_or_else(|| format!("archive file path has no name: {relative:?}"))?;
+    let target = parent.join(name);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut target_file = options
+        .open(&target)
+        .map_err(|error| format!("cannot create archive file {}: {error}", target.display()))?;
+    let copied = std::io::copy(&mut source_file, &mut target_file)
+        .map_err(|error| format!("cannot copy {}: {error}", expected.path))?;
+    let source_after = source_file
+        .metadata()
+        .map_err(|error| format!("cannot recheck {}: {error}", expected.path))?;
+    if copied != expected.bytes
+        || source_after.len() != expected.bytes
+        || permission_mode(&source_after) != expected.mode
+    {
+        return Err(format!("{} changed while it was archived", expected.path));
+    }
+    #[cfg(unix)]
+    if let Some(mode) = expected.mode {
+        use std::os::unix::fs::PermissionsExt;
+        target_file
+            .set_permissions(std::fs::Permissions::from_mode(mode))
+            .map_err(|error| format!("cannot preserve mode for {}: {error}", expected.path))?;
+    }
+    target_file
+        .sync_all()
+        .map_err(|error| format!("cannot sync {}: {error}", expected.path))?;
+    if permission_mode(
+        &target_file
+            .metadata()
+            .map_err(|error| format!("cannot verify mode for {}: {error}", expected.path))?,
+    ) != expected.mode
+    {
+        return Err(format!("{} mode did not copy intact", expected.path));
+    }
+    Ok(())
+}
+
+fn archive_staging_nonce() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = ARCHIVE_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}-{:x}-{sequence:x}", std::process::id())
+}
+
+fn sync_archive_directory(_path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+        options.open(_path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "directory durability sync is unsupported on this platform",
+        ))
+    }
+}
+
+fn sync_archive_directories_bottom_up<S>(root: &Path, sync_directory: &S) -> Result<(), String>
+where
+    S: Fn(&Path) -> std::io::Result<()>,
+{
+    let mut pending = vec![(root.to_path_buf(), 0_usize)];
+    let mut directories = Vec::new();
+    let mut visited = 0_usize;
+    while let Some((directory, depth)) = pending.pop() {
+        if depth > MAX_RECOVERY_ARCHIVE_TREE_DEPTH {
+            return Err("archive directory depth exceeds the durability bound".into());
+        }
+        let metadata = std::fs::symlink_metadata(&directory).map_err(|error| {
+            format!(
+                "cannot inspect archive directory {}: {error}",
+                directory.display()
+            )
+        })?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "archive component is not a real directory: {}",
+                directory.display()
+            ));
+        }
+        directories.push((depth, directory.clone()));
+        let entries = std::fs::read_dir(&directory).map_err(|error| {
+            format!(
+                "cannot read archive directory {}: {error}",
+                directory.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("cannot read archive entry: {error}"))?;
+            visited += 1;
+            if visited > MAX_RECOVERY_ARCHIVE_TREE_ENTRIES {
+                return Err("archive entry count exceeds the durability bound".into());
+            }
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                format!("cannot inspect archive entry {}: {error}", path.display())
+            })?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                pending.push((path, depth + 1));
+            } else if !metadata.is_file() && !metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "archive contains an unsupported filesystem node: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    directories.sort_by_key(|(depth, _)| std::cmp::Reverse(*depth));
+    for (_, directory) in directories {
+        sync_directory(&directory).map_err(|error| {
+            format!(
+                "cannot sync archive directory {}: {error}",
+                directory.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Write every part into a fresh, real staging directory, then read each part
+/// back. `Err` carries the first failure; the caller keeps the worktree.
+#[cfg(test)]
 fn write_verified_archive(
     repository: &GitRepo,
     checkout: &GitRepo,
@@ -647,11 +1969,32 @@ fn write_verified_archive(
     task: Option<&str>,
     dir: &Path,
 ) -> Result<(), String> {
-    let write = |name: &str, bytes: &[u8]| -> Result<PathBuf, String> {
-        let path = dir.join(name);
-        std::fs::write(&path, bytes).map_err(|error| format!("cannot write {name}: {error}"))?;
-        Ok(path)
-    };
+    write_verified_archive_with_directory_sync(
+        repository,
+        checkout,
+        plan,
+        task,
+        dir,
+        &sync_archive_directory,
+    )
+}
+
+fn write_verified_archive_with_directory_sync<S>(
+    repository: &GitRepo,
+    checkout: &GitRepo,
+    plan: &CleanupResolvePlan,
+    task: Option<&str>,
+    dir: &Path,
+    sync_directory: &S,
+) -> Result<(), String>
+where
+    S: Fn(&Path) -> std::io::Result<()>,
+{
+    require_real_directory(dir)?;
+    let dir = dir
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve archive staging directory: {error}"))?;
+    require_real_directory(&dir)?;
 
     // Patches are taken again rather than trusted from the plan: the digest
     // check just passed, and a patch that no longer hashes the same means the
@@ -664,9 +2007,9 @@ fn write_verified_archive(
         let bytes = checkout
             .recovery_patch(cached)
             .map_err(|error| format!("cannot take {file}: {error}"))?;
-        let path = write(file, &bytes)?;
-        let written =
-            std::fs::read(&path).map_err(|error| format!("cannot read {file}: {error}"))?;
+        let path = create_new_archive_file(&dir, file, &bytes)?;
+        let written = read_regular_file_no_follow(&path)
+            .map_err(|error| format!("cannot safely read {file}: {error}"))?;
         if sha256_hex(&written) != *expected {
             return Err(format!("{file} no longer matches the reviewed plan"));
         }
@@ -676,10 +2019,15 @@ fn write_verified_archive(
     let bundle = if plan.unlanded_commits.is_empty() {
         None
     } else {
-        let path = dir.join(BUNDLE_FILE);
+        let path = create_new_archive_file(&dir, BUNDLE_FILE, &[])?;
         checkout
             .create_recovery_bundle(&path, &plan.delivery_targets)
             .map_err(|error| format!("cannot write {BUNDLE_FILE}: {error}"))?;
+        let (bundle_file, _) = open_regular_file_no_follow(&path)
+            .map_err(|error| format!("cannot safely reopen {BUNDLE_FILE}: {error}"))?;
+        bundle_file
+            .sync_all()
+            .map_err(|error| format!("cannot sync {BUNDLE_FILE}: {error}"))?;
         let heads = repository
             .verify_bundle(&path)
             .map_err(|error| format!("{BUNDLE_FILE} does not verify: {error}"))?;
@@ -700,20 +2048,30 @@ fn write_verified_archive(
         .map_err(|error| format!("the patches do not apply to {}: {error}", plan.head))?;
 
     let worktree = Path::new(&plan.worktree_path);
-    let untracked_root = dir.join(UNTRACKED_DIRECTORY);
+    let untracked_root = create_exclusive_archive_directory(&dir, UNTRACKED_DIRECTORY)?;
     for file in &plan.untracked_files {
-        let source = worktree.join(&file.path);
-        let target = untracked_root.join(&file.path);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        if !is_contained_relative(&file.path) {
+            return Err(format!(
+                "untracked archive path is invalid: {:?}",
+                file.path
+            ));
         }
-        let copied = if file.symlink {
-            std::fs::read_link(&source).and_then(|link| std::os::unix::fs::symlink(link, &target))
+        let source = worktree.join(&file.path);
+        let relative_path = Path::new(&file.path);
+        let parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
+        let parent = ensure_archive_directory(&untracked_root, parent)?;
+        let target =
+            parent.join(relative_path.file_name().ok_or_else(|| {
+                format!("untracked archive path has no filename: {:?}", file.path)
+            })?);
+        if file.symlink {
+            let link = std::fs::read_link(&source)
+                .map_err(|error| format!("cannot read link {}: {error}", file.path))?;
+            std::os::unix::fs::symlink(link, &target)
+                .map_err(|error| format!("cannot preserve link {}: {error}", file.path))?;
         } else {
-            std::fs::copy(&source, &target).map(|_| ())
-        };
-        copied.map_err(|error| format!("cannot copy {}: {error}", file.path))?;
+            copy_regular_archive_file(&source, &untracked_root, &file.path, file)?;
+        }
         let archived = describe_untracked(&target, &file.path)
             .map_err(|error| format!("cannot read back {}: {error}", file.path))?;
         if archived.as_ref() != Some(file) {
@@ -724,8 +2082,41 @@ fn write_verified_archive(
         }
     }
 
+    let ignored_root = create_exclusive_archive_directory(&dir, IGNORED_DIRECTORY)?;
+    for file in &plan.ignored_files {
+        if !is_contained_relative(&file.path) {
+            return Err(format!("ignored archive path is invalid: {:?}", file.path));
+        }
+        let source = worktree.join(&file.path);
+        let relative_path = Path::new(&file.path);
+        let parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
+        let parent = ensure_archive_directory(&ignored_root, parent)?;
+        let target = parent.join(
+            relative_path
+                .file_name()
+                .ok_or_else(|| format!("ignored archive path has no filename: {:?}", file.path))?,
+        );
+        if file.symlink {
+            let link = std::fs::read_link(&source)
+                .map_err(|error| format!("cannot read ignored link {}: {error}", file.path))?;
+            std::os::unix::fs::symlink(link, &target)
+                .map_err(|error| format!("cannot preserve ignored link {}: {error}", file.path))?;
+        } else {
+            copy_regular_archive_file(&source, &ignored_root, &file.path, file)?;
+        }
+        let archived = describe_untracked(&target, &file.path)
+            .map_err(|error| format!("cannot read back ignored {}: {error}", file.path))?;
+        if archived.as_ref() != Some(file) {
+            return Err(format!(
+                "ignored {} changed while it was archived, or did not copy intact",
+                file.path
+            ));
+        }
+    }
+
     let manifest = RecoveryManifest {
         schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
+        plan_digest: &plan.digest,
         created_at_ms: now_ms(),
         aethyme_version: env!("CARGO_PKG_VERSION"),
         repository: repository.root().to_string_lossy().into_owned(),
@@ -755,14 +2146,21 @@ fn write_verified_archive(
         },
         untracked_directory: UNTRACKED_DIRECTORY,
         untracked_files: &plan.untracked_files,
+        ignored_directory: IGNORED_DIRECTORY,
+        ignored_paths: &plan.ignored_paths,
+        ignored_files: &plan.ignored_files,
+        ignored_policy_sha256: &plan.ignored_policy_sha256,
     };
     let manifest =
         serde_json::to_vec_pretty(&manifest).map_err(|error| format!("manifest: {error}"))?;
-    write(MANIFEST_FILE, &manifest)?;
-    write(
+    create_new_archive_file(&dir, MANIFEST_FILE, &manifest)?;
+    create_new_archive_file(
+        &dir,
         README_FILE,
         restore_readme(plan, bundle.is_some()).as_bytes(),
     )?;
+    verify_recovery_archive_payload_for_plan(repository, &dir, plan)?;
+    sync_archive_directories_bottom_up(&dir, sync_directory)?;
     Ok(())
 }
 
@@ -783,14 +2181,17 @@ fn restore_readme(plan: &CleanupResolvePlan, has_bundle: bool) -> String {
         "# Recovery archive for broker session {id}\n\n\
          Written by `aethyme broker finish cleanup resolve {id} --archive` before the worktree\n\
          `{path}` was removed. `{MANIFEST_FILE}` lists every part with its SHA-256.\n\
-         Ignored paths allowed by cleanup policy were not archived; reinstall dependencies if needed.\n\n\
+         Policy-approved ignored output was not archived; reinstall generated dependencies if needed.\n\
+         Protected standalone ignored paths are listed in `manifest.json` and stored in `{IGNORED_DIRECTORY}/`.\n\n\
          To restore into a NEW checkout of the same repository (never over a checkout in use):\n\n\
          1. Check out the session head:\n{checkout}\
          2. Re-apply the staged changes, then the unstaged ones (skip an empty patch):\n\
             git apply --index <this-archive>/{STAGED_PATCH_FILE}\n\
             git apply <this-archive>/{UNSTAGED_PATCH_FILE}\n\
-         3. Copy back the untracked files:\n\
-            cp -R <this-archive>/{UNTRACKED_DIRECTORY}/. .\n",
+         3. Copy back the untracked files and their permission bits:\n\
+            cp -pR <this-archive>/{UNTRACKED_DIRECTORY}/. .\n\
+         4. Copy back protected ignored files and links, if present:\n\
+            cp -pR <this-archive>/{IGNORED_DIRECTORY}/. .\n",
         id = plan.session_id,
         path = plan.worktree_path,
     )
@@ -833,7 +2234,7 @@ mod tests {
             .unwrap();
         let plan = CleanupResolvePlan {
             schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
-            digest: String::new(),
+            digest: sha256_hex(b"test reviewed plan"),
             session_id: 1,
             worktree_path: tmp.path().to_string_lossy().into_owned(),
             branch_ref: "refs/heads/main".into(),
@@ -852,6 +2253,10 @@ mod tests {
             unstaged_patch_sha256: sha256_hex(&unstaged),
             untracked_bytes: untracked.bytes,
             untracked_files: vec![untracked],
+            ignored_paths: Vec::new(),
+            ignored_files: Vec::new(),
+            ignored_bytes: 0,
+            ignored_policy_sha256: sha256_hex(b"{}"),
             archive_root: PathBuf::new(),
             apply_command: String::new(),
             discard_command: String::new(),
@@ -869,6 +2274,239 @@ mod tests {
             std::fs::read(dir.path().join("untracked/new.txt")).unwrap(),
             b"untracked\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_untracked_file_identity_includes_unix_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("tool.sh");
+        std::fs::write(&file, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o751)).unwrap();
+
+        let described = describe_untracked(&file, "tool.sh").unwrap().unwrap();
+        assert_eq!(described.mode, Some(0o751));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_staging_symlink_is_rejected_before_any_payload_write() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = root.path().join("archive.partial");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        let error = create_exclusive_archive_directory(root.path(), "archive.partial").unwrap_err();
+        assert!(error.contains("exclusively create"), "{error}");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_archive_root_is_rejected_before_staging() {
+        let parent = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = parent.path().join("archive-root");
+        std::os::unix::fs::symlink(outside.path(), &root).unwrap();
+
+        let error = prepare_archive_root(&root).unwrap_err();
+        assert!(error.contains("real directory"), "{error}");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_inventory_does_not_enumerate_a_replaced_symlink_root() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let broker = storage.open(&repository).unwrap();
+        let root = broker.recovery_archive_root().unwrap();
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("unrelated-archive")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &root).unwrap();
+
+        let scan = broker.recovery_archives().unwrap();
+        assert!(scan.owned.is_empty());
+        assert_eq!(scan.unowned.len(), 1);
+        assert_eq!(scan.unowned[0].0, root);
+        assert!(scan.unowned[0].1.contains("unsafe archive root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_inventory_rejects_a_symlink_in_the_owned_root_chain() {
+        let anchor = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let parent = anchor.path().join("recovery-archives");
+        std::os::unix::fs::symlink(outside.path(), &parent).unwrap();
+        let root = parent.join("repository-key");
+
+        let error = inspect_archive_root(&root).unwrap_err();
+        assert!(
+            error
+                .reason
+                .contains("archive parent is not a real directory"),
+            "{error:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_archive_file_symlink_is_not_followed_or_overwritten() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        std::fs::write(&sentinel, b"leave this alone").unwrap();
+        std::os::unix::fs::symlink(&sentinel, root.path().join("manifest.json")).unwrap();
+
+        let error =
+            create_new_archive_file(root.path(), MANIFEST_FILE, b"replacement").unwrap_err();
+        assert!(error.contains("cannot create archive file"), "{error}");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"leave this alone");
+    }
+
+    #[test]
+    fn archive_directories_are_synced_bottom_up() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("untracked/nested")).unwrap();
+        std::fs::create_dir(root.path().join("ignored")).unwrap();
+
+        let synced = std::cell::RefCell::new(Vec::new());
+        sync_archive_directories_bottom_up(root.path(), &|path| {
+            synced
+                .borrow_mut()
+                .push(path.strip_prefix(root.path()).unwrap().to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+
+        let synced = synced.into_inner();
+        let position = |path: &str| {
+            synced
+                .iter()
+                .position(|entry| entry == Path::new(path))
+                .unwrap()
+        };
+        assert!(position("untracked/nested") < position("untracked"));
+        assert!(position("untracked") < position(""));
+        assert!(position("ignored") < position(""));
+    }
+
+    #[test]
+    fn archive_ownership_rejects_unlisted_files_and_keeps_legacy_v1_readable() {
+        let (_tmp, repo, plan) = staged_checkout();
+        let dir = tempfile::tempdir().unwrap();
+        write_verified_archive(&repo, &repo, &plan, None, dir.path()).unwrap();
+        let manifest_path = dir.path().join(MANIFEST_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        #[cfg(unix)]
+        let valid_v2 = value.clone();
+        let mut malformed = value.clone();
+        malformed["ignored_policy_sha256"] = serde_json::json!("invalid");
+        let malformed: StoredManifest = serde_json::from_value(malformed).unwrap();
+        assert!(
+            recovery_archive_expected_files(&malformed)
+                .unwrap_err()
+                .contains("invalid plan or ignored policy identity")
+        );
+
+        value["schema_version"] = serde_json::json!(LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION);
+        for file in value["untracked_files"].as_array_mut().unwrap() {
+            file.as_object_mut().unwrap().remove("mode");
+        }
+        value.as_object_mut().unwrap().remove("ignored_directory");
+        value.as_object_mut().unwrap().remove("ignored_paths");
+        value.as_object_mut().unwrap().remove("ignored_files");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("ignored_policy_sha256");
+        value.as_object_mut().unwrap().remove("plan_digest");
+        std::fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let legacy: StoredManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        verify_recovery_archive_tree(dir.path(), &legacy).unwrap();
+
+        std::fs::write(dir.path().join("unlisted.bin"), b"work").unwrap();
+        let error = verify_recovery_archive_tree(dir.path(), &legacy).unwrap_err();
+        assert!(error.contains("unlisted file"), "{error}");
+
+        value["schema_version"] = serde_json::json!(CLEANUP_RESOLVE_SCHEMA_VERSION);
+        let missing_v2_field: StoredManifest = serde_json::from_value(value.clone()).unwrap();
+        assert!(
+            recovery_archive_expected_files(&missing_v2_field)
+                .unwrap_err()
+                .contains("missing its ignored directory identity")
+        );
+
+        #[cfg(unix)]
+        {
+            let mut missing_mode = valid_v2;
+            let untracked = missing_mode["untracked_files"].as_array_mut().unwrap();
+            untracked[0].as_object_mut().unwrap().remove("mode");
+            let missing_mode: StoredManifest = serde_json::from_value(missing_mode).unwrap();
+            assert!(
+                recovery_archive_expected_files(&missing_mode)
+                    .unwrap_err()
+                    .contains("missing its Unix file mode")
+            );
+        }
+
+        value["schema_version"] = serde_json::json!(CLEANUP_RESOLVE_SCHEMA_VERSION + 1);
+        let future: StoredManifest = serde_json::from_value(value).unwrap();
+        assert!(
+            recovery_archive_expected_files(&future)
+                .unwrap_err()
+                .contains("not supported")
+        );
+    }
+
+    #[test]
+    fn archive_ownership_rejects_patch_length_mismatch() {
+        let (_tmp, repo, plan) = staged_checkout();
+        let dir = tempfile::tempdir().unwrap();
+        write_verified_archive(&repo, &repo, &plan, None, dir.path()).unwrap();
+        let manifest_path = dir.path().join(MANIFEST_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert!(plan.staged_patch_bytes > 0);
+        value["staged_patch"]["bytes"] = serde_json::json!(0);
+        let forged: StoredManifest = serde_json::from_value(value).unwrap();
+
+        let error = verify_recovery_archive_tree(dir.path(), &forged).unwrap_err();
+        assert!(
+            error.contains("staged.patch byte length does not match"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_ownership_rejects_file_mode_mismatch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, repo, plan) = staged_checkout();
+        let dir = tempfile::tempdir().unwrap();
+        write_verified_archive(&repo, &repo, &plan, None, dir.path()).unwrap();
+        let path = dir.path().join("untracked/new.txt");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let manifest: StoredManifest =
+            serde_json::from_slice(&std::fs::read(dir.path().join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+
+        let error = verify_recovery_archive_tree(dir.path(), &manifest).unwrap_err();
+        assert!(error.contains("different file mode"), "{error}");
     }
 
     /// The patch written is re-hashed against the reviewed one, so a
@@ -968,9 +2606,12 @@ mod tests {
             .unwrap();
 
         assert!(!outcome.worktree_removed);
-        assert!(outcome.cleanup_error.as_deref().is_some_and(|error| {
-            error.contains("archive resolution refuses protected ignored content")
-        }));
+        assert!(
+            outcome
+                .cleanup_error
+                .as_deref()
+                .is_some_and(|error| { error.contains("changed after archive verification") })
+        );
         assert!(outcome.archive.join(MANIFEST_FILE).is_file());
         assert!(outcome.archive.join("untracked/new.txt").is_file());
         assert!(worktree.is_dir());
@@ -978,5 +2619,436 @@ mod tests {
             std::fs::read(worktree.join("private.txt")).unwrap(),
             b"preserve me\n"
         );
+    }
+
+    #[test]
+    fn archive_changed_after_initial_readback_keeps_the_worktree() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join(".gitignore"), "/private.txt\n").unwrap();
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("archive recheck fixture", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        std::fs::write(worktree.join("private.txt"), "reviewed data\n").unwrap();
+        broker.close(session.id).unwrap();
+
+        let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+        let archive_root = plan.archive_root.clone();
+        let outcome = broker
+            .cleanup_resolve_apply_with_post_archive_hook(session.id, &plan.digest, move || {
+                let archive = std::fs::read_dir(&archive_root)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                std::fs::write(archive.join("ignored/private.txt"), "altered data\n").unwrap();
+            })
+            .unwrap();
+
+        assert!(!outcome.worktree_removed);
+        assert!(
+            outcome
+                .cleanup_error
+                .as_deref()
+                .is_some_and(|error| { error.contains("archive changed before worktree removal") })
+        );
+        assert!(worktree.is_dir());
+        assert_eq!(
+            std::fs::read(worktree.join("private.txt")).unwrap(),
+            b"reviewed data\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_mode_change_after_initial_readback_keeps_the_worktree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join(".gitignore"), "/private.txt\n").unwrap();
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("archive mode recheck fixture", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        let protected = worktree.join("private.txt");
+        std::fs::write(&protected, "reviewed data\n").unwrap();
+        std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o640)).unwrap();
+        broker.close(session.id).unwrap();
+
+        let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+        let archive_root = plan.archive_root.clone();
+        let outcome = broker
+            .cleanup_resolve_apply_with_post_archive_hook(session.id, &plan.digest, move || {
+                let archive = std::fs::read_dir(&archive_root)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                std::fs::set_permissions(
+                    archive.join("ignored/private.txt"),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+            })
+            .unwrap();
+
+        assert!(!outcome.worktree_removed);
+        assert!(
+            outcome
+                .cleanup_error
+                .as_deref()
+                .is_some_and(|error| error.contains("archive changed before worktree removal"))
+        );
+        assert!(worktree.is_dir());
+        assert_eq!(
+            std::fs::metadata(protected).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_root_sync_failure_keeps_the_original_worktree() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join(".gitignore"), "/private.txt\n").unwrap();
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("archive sync failure fixture", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        let protected = worktree.join("private.txt");
+        std::fs::write(&protected, "keep until archive root is durable\n").unwrap();
+        broker.close(session.id).unwrap();
+
+        let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+        let expected_archive_root = plan.archive_root.clone();
+        let error = broker
+            .cleanup_resolve_apply_with_hooks(
+                session.id,
+                &plan.digest,
+                || {},
+                move |path| {
+                    if path == expected_archive_root.as_path() {
+                        Err(std::io::Error::other("injected archive root sync failure"))
+                    } else {
+                        sync_archive_directory(path)
+                    }
+                },
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("cannot sync archive root before worktree removal"),
+            "{error}"
+        );
+        assert!(worktree.is_dir());
+        assert_eq!(
+            std::fs::read(&protected).unwrap(),
+            b"keep until archive root is durable\n"
+        );
+        let archives = std::fs::read_dir(&plan.archive_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(archives.len(), 1);
+        let archived = broker.owned_recovery_archive(&archives[0]).unwrap();
+        assert!(archived.holds_uncommitted);
+    }
+
+    #[test]
+    fn archive_plan_refuses_tracked_submodules_and_preserves_the_checkout() {
+        for child_state in ["clean", "modified", "untracked", "pointer"] {
+            let owner = tempfile::tempdir().unwrap();
+            let repository = owner.path().join("repository");
+            let source = owner.path().join("submodule-source");
+            std::fs::create_dir(&repository).unwrap();
+            std::fs::create_dir(&source).unwrap();
+            git(&source, &["init", "-q", "-b", "main"]);
+            std::fs::write(source.join("tracked.txt"), "submodule source\n").unwrap();
+            git(&source, &["add", "tracked.txt"]);
+            git(&source, &["commit", "-qm", "submodule initial"]);
+
+            git(&repository, &["init", "-q", "-b", "main"]);
+            std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+            git(&repository, &["add", "README.md"]);
+            git(&repository, &["commit", "-qm", "superproject initial"]);
+            let source_path = source.to_str().unwrap();
+            git(
+                &repository,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    "--quiet",
+                    source_path,
+                    "sub",
+                ],
+            );
+            git(
+                &repository,
+                &["config", "-f", ".gitmodules", "submodule.sub.ignore", "all"],
+            );
+            git(&repository, &["add", "-A"]);
+            git(&repository, &["commit", "-qm", "add submodule"]);
+            git(&repository, &["config", "diff.ignoreSubmodules", "all"]);
+            git(&repository, &["config", "submodule.sub.ignore", "all"]);
+
+            let storage = crate::test_storage::TestStorage::new();
+            let mut broker = storage.open(&repository).unwrap();
+            let session = broker
+                .start_worktree("dirty submodule archive refusal", None)
+                .unwrap();
+            let worktree = PathBuf::from(&session.worktree_path);
+            git(
+                &worktree,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "update",
+                    "--init",
+                    "--quiet",
+                    "--",
+                    "sub",
+                ],
+            );
+            std::fs::write(worktree.join("outside.txt"), "archive-needed work\n").unwrap();
+            let child = worktree.join("sub");
+            match child_state {
+                "clean" => {}
+                "modified" => {
+                    std::fs::write(child.join("tracked.txt"), "modified child content\n").unwrap();
+                }
+                "untracked" => {
+                    std::fs::write(child.join("untracked.txt"), "untracked child content\n")
+                        .unwrap();
+                }
+                "pointer" => {
+                    std::fs::write(child.join("tracked.txt"), "second child commit\n").unwrap();
+                    git(&child, &["add", "tracked.txt"]);
+                    git(&child, &["commit", "-qm", "second child commit"]);
+                }
+                _ => unreachable!(),
+            }
+            broker.close(session.id).unwrap();
+
+            let error = broker
+                .cleanup_resolve_plan(session.id)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("does not include child Git repositories"),
+                "{error}"
+            );
+            assert!(worktree.is_dir());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_ignored_files_and_links_are_archived_and_block_gc_expiry() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        let newline_name = "private-line\nbreak";
+        std::fs::write(
+            repository.join(".gitignore"),
+            "/private.txt\n/private-link\n/private*break\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("archive protected ignored paths", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        std::fs::write(worktree.join("private.txt"), "preserve me\n").unwrap();
+        std::fs::write(worktree.join(newline_name), "preserve newline name\n").unwrap();
+        std::os::unix::fs::symlink("../outside-secret", worktree.join("private-link")).unwrap();
+        broker.close(session.id).unwrap();
+
+        let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+        assert_eq!(plan.ignored_files.len(), 3);
+        assert_eq!(
+            plan.ignored_bytes,
+            (b"preserve me\n".len() + b"preserve newline name\n".len()) as u64
+        );
+        assert_eq!(plan.ignored_paths.len(), 3);
+        assert!(
+            plan.ignored_paths
+                .iter()
+                .any(|path| path.path == newline_name)
+        );
+        assert!(
+            plan.ignored_paths
+                .iter()
+                .all(|path| path.classification == IgnoredPathClassification::PreservedFile)
+        );
+        let outcome = broker
+            .cleanup_resolve_apply(session.id, &plan.digest)
+            .unwrap();
+        assert!(outcome.worktree_removed);
+        assert_eq!(
+            std::fs::read(outcome.archive.join("ignored/private.txt")).unwrap(),
+            b"preserve me\n"
+        );
+        assert_eq!(
+            std::fs::read(outcome.archive.join("ignored").join(newline_name)).unwrap(),
+            b"preserve newline name\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(outcome.archive.join("ignored/private-link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let archived = broker.owned_recovery_archive(&outcome.archive).unwrap();
+        assert!(archived.holds_uncommitted);
+        assert!(!broker.recovery_archive_landed(&archived));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_archive_refuses_non_utf8_ignored_standalone_files() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join(".gitignore"), "/private-*\n").unwrap();
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("archive non-UTF-8 ignored file refusal", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        let mut filename = b"private-".to_vec();
+        filename.push(0xff);
+        let path = worktree.join(std::ffi::OsString::from_vec(filename));
+        std::fs::write(&path, "preserve or refuse\n").unwrap();
+        broker.close(session.id).unwrap();
+
+        let error = broker
+            .cleanup_resolve_plan(session.id)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("non-UTF-8"), "{error}");
+        assert!(worktree.is_dir());
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn ignored_directories_stay_collapsed_and_strict_policy_refuses_leftovers() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path();
+        git(repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            repository.join(".gitignore"),
+            "/opaque-cache/\n/private.txt\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(repository, &["add", "-A"]);
+        git(repository, &["commit", "-qm", "initial"]);
+        std::fs::create_dir_all(repository.join("opaque-cache/nested")).unwrap();
+        std::fs::write(repository.join("opaque-cache/nested/data"), "discardable").unwrap();
+        #[cfg(unix)]
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(repository.join("opaque-cache/nested/private.pipe"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(repository.join("private.txt"), "preserve").unwrap();
+
+        let checkout = GitRepo::discover(repository).unwrap();
+        let default_policy = crate::AutoCleanupPolicy::default();
+        let (roots, files) = ignored_inventory(&checkout, repository, &default_policy, 1).unwrap();
+        assert!(roots.iter().any(|root| {
+            root.path == "opaque-cache/"
+                && root.classification == IgnoredPathClassification::DisposableDirectory
+        }));
+        assert!(
+            !roots
+                .iter()
+                .any(|root| root.path.starts_with("opaque-cache/nested"))
+        );
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "private.txt");
+
+        let strict = crate::AutoCleanupPolicy {
+            strict: true,
+            ..Default::default()
+        };
+        assert!(ignored_inventory(&checkout, repository, &strict, 1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignored_special_files_fail_closed() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path();
+        git(repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join(".gitignore"), "/private.pipe\n").unwrap();
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(repository, &["add", "-A"]);
+        git(repository, &["commit", "-qm", "initial"]);
+        let status = std::process::Command::new("mkfifo")
+            .arg(repository.join("private.pipe"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let checkout = GitRepo::discover(repository).unwrap();
+        let error = ignored_inventory(
+            &checkout,
+            repository,
+            &crate::AutoCleanupPolicy::default(),
+            1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("special file"), "{error}");
     }
 }

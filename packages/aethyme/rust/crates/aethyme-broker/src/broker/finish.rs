@@ -334,7 +334,7 @@ impl Broker {
         // `git worktree remove` of a multi-gigabyte tree halfway leaves an
         // orphaned directory instead of a faster answer.
         match crate::git::without_git_deadline(|| {
-            self.cleanup_under_lifecycle_claim(&cleanup_session, false, false)
+            self.cleanup_under_lifecycle_claim(&cleanup_session, false, None)
         }) {
             Ok(()) => {
                 report.status = FinishStatus::Cleaned;

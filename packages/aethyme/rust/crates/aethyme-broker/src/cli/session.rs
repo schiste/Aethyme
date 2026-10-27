@@ -2093,15 +2093,20 @@ fn render_cleanup_resolve_plan(plan: &crate::CleanupResolvePlan) {
     };
     out!("  committed work: {landing}");
     out!(
-        "  archive would hold: {} unlanded commit(s) in a bundle; staged patch {}; unstaged patch {}; {} untracked file(s), {}",
+        "  archive would hold: {} unlanded commit(s) in a bundle; staged patch {}; unstaged patch {}; {} untracked file(s), {}; {} protected ignored file(s), {}",
         plan.unlanded_commits.len(),
         human_bytes(plan.staged_patch_bytes),
         human_bytes(plan.unstaged_patch_bytes),
         plan.untracked_files.len(),
         human_bytes(plan.untracked_bytes),
+        plan.ignored_files.len(),
+        human_bytes(plan.ignored_bytes),
     );
     out!("  archive root: {}", plan.archive_root.display());
-    out!("  ignored paths allowed by cleanup policy are not archived");
+    out!(
+        "  ignored roots: {}; policy-approved generated output may be discarded",
+        plan.ignored_paths.len()
+    );
     out!("  apply: {}", plan.apply_command);
     out!("  discard instead: {}", plan.discard_command);
 }

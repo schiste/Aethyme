@@ -374,19 +374,32 @@ fn enclosing_regenerable(
     })
 }
 
+/// Classification used by recovery archives, which preserve protected
+/// standalone ignored files while still discarding policy-approved output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryIgnoredClassification {
+    /// An ignored directory root. Its contents stay opaque and are disposable
+    /// under the existing cleanup policy.
+    DisposableDirectory,
+    /// A standalone path the current cleanup policy permits removing.
+    DisposableOutput,
+    /// A standalone path the policy protects and recovery must archive.
+    Preserve(&'static str),
+    /// Strict mode requires an explicit operator decision for every leftover.
+    StrictRefusal,
+}
+
 /// Classify an entry from Git's ignored listing. Directories are disposable
 /// opaque output by default, including local data and session records inside
 /// them. Standalone files need the existing metadata/artifact classification.
 /// Strict mode keeps every ignored leftover for explicit operator cleanup.
-pub(crate) fn classify_ignored(
+pub(crate) fn classify_ignored_for_recovery(
     worktree: &Path,
     relative: &str,
     policy: &AutoCleanupPolicy,
-) -> Result<(), String> {
+) -> Result<RecoveryIgnoredClassification, String> {
     if policy.strict {
-        return Err(format!(
-            "strict cleanup requires no ignored leftovers; remove {relative} manually or review an explicit discard"
-        ));
+        return Ok(RecoveryIgnoredClassification::StrictRefusal);
     }
     let trimmed = relative.trim_end_matches('/');
     if trimmed.is_empty()
@@ -400,7 +413,7 @@ pub(crate) fn classify_ignored(
     if (!relative.ends_with('/') && name == ".DS_Store")
         || crate::runtime_paths::is_broker_runtime_path(relative)
     {
-        return Ok(());
+        return Ok(RecoveryIgnoredClassification::DisposableOutput);
     }
     let metadata = std::fs::symlink_metadata(worktree.join(trimmed))
         .map_err(|error| format!("cannot stat ignored path {relative}: {error}"))?;
@@ -408,21 +421,42 @@ pub(crate) fn classify_ignored(
     // default regardless of its name, size or nested contents. Do not follow
     // symlinks to discover whether they happen to target a directory.
     if metadata.is_dir() {
-        return Ok(());
+        return Ok(RecoveryIgnoredClassification::DisposableDirectory);
     }
     let Some((_enclosing, cargo_target)) = enclosing_regenerable(worktree, trimmed, policy) else {
-        return Err(format!(
-            "ignored path {relative} is not inside a recognised build-output directory"
+        return Ok(RecoveryIgnoredClassification::Preserve(
+            "is not inside a recognised build-output directory",
         ));
     };
     if trimmed.split('/').any(|component| component == ".aethyme") && !cargo_target {
-        return Err(format!("{relative} holds Aethyme state"));
+        return Ok(RecoveryIgnoredClassification::Preserve(
+            "holds Aethyme state",
+        ));
     }
     // The policy declares this output disposable. Package fixtures routinely
     // contain keys, databases, dangling links and hundreds of thousands of files;
     // inspecting those contents both invents blockers and scales with the output.
     // Worktree removal unlinks symlinks; it never follows their targets.
-    Ok(())
+    Ok(RecoveryIgnoredClassification::DisposableOutput)
+}
+
+/// Cleanup's removal verdict remains conservative: only paths with an
+/// explicit disposable classification pass.
+pub(crate) fn classify_ignored(
+    worktree: &Path,
+    relative: &str,
+    policy: &AutoCleanupPolicy,
+) -> Result<(), String> {
+    match classify_ignored_for_recovery(worktree, relative, policy)? {
+        RecoveryIgnoredClassification::DisposableDirectory
+        | RecoveryIgnoredClassification::DisposableOutput => Ok(()),
+        RecoveryIgnoredClassification::Preserve(reason) => {
+            Err(format!("ignored path {relative} {reason}"))
+        }
+        RecoveryIgnoredClassification::StrictRefusal => Err(format!(
+            "strict cleanup requires no ignored leftovers; remove {relative} manually or review an explicit discard"
+        )),
+    }
 }
 
 /// One checkout auto-cleanup removed, with its proof.
