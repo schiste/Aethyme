@@ -167,6 +167,26 @@ struct DigestInputV2<'a> {
     ignored_policy: &'a IgnoredPolicyProof<'a>,
 }
 
+/// Frozen schema-3 digest serialization. Do not reorder or add fields.
+#[derive(serde::Serialize)]
+struct DigestInputV3<'a> {
+    schema_version: u32,
+    recovery_archive_schema_version: u32,
+    max_recovery_bundle_bytes: u64,
+    session_id: i64,
+    worktree_path: &'a str,
+    disposition: &'a str,
+    head: &'a str,
+    delivery_targets: &'a [String],
+    unlanded_commits: &'a [String],
+    staged_patch_sha256: &'a str,
+    unstaged_patch_sha256: &'a str,
+    untracked_files: &'a [ArchivedFile],
+    ignored_paths: &'a [IgnoredPath],
+    ignored_files: &'a [ArchivedFile],
+    ignored_policy: &'a IgnoredPolicyProof<'a>,
+}
+
 #[derive(serde::Serialize)]
 struct DigestInputV4<'a> {
     schema_version: u32,
@@ -290,10 +310,10 @@ fn legacy_v3_cleanup_resolve_digest(
     plan: &CleanupResolvePlan,
     ignored_policy: &IgnoredPolicyProof<'_>,
 ) -> Result<String, String> {
-    let input = DigestInputV4 {
+    let input = DigestInputV3 {
         schema_version: plan.schema_version,
-        recovery_archive_schema_version: RECOVERY_ARCHIVE_SCHEMA_VERSION,
-        max_recovery_bundle_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+        recovery_archive_schema_version: 3,
+        max_recovery_bundle_bytes: 1_073_741_824,
         session_id: plan.session_id,
         worktree_path: &plan.worktree_path,
         disposition: plan.disposition.as_str(),
@@ -3125,6 +3145,11 @@ mod tests {
         assert_eq!(
             legacy_v2_cleanup_resolve_digest(&plan, &policy).unwrap(),
             "31dec7c8b3dd9700062bd6332b0e2dab83d73767ec354fb4dc0ad318658a50c8"
+        );
+        // Independent Python JSON/SHA-256 vector using the pre-change v3 field order.
+        assert_eq!(
+            legacy_v3_cleanup_resolve_digest(&plan, &policy).unwrap(),
+            "89c341cd4c86f79e0c35e1652d3a4cd67b8c9471aca1402fe39a5b91ec2534a0"
         );
     }
 
