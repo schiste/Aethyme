@@ -461,8 +461,16 @@ blocked.
    unrecognized command. Destructive operations also require `--destructive`.
    Every coordinated write requires a concise `--reason` identifying the user
    request or documented workflow that authorized it.
-   If a crashed command leaves an unknown outcome, inspect external state and
-   use `aethyme broker advanced operations reconcile`; do not retry blindly.
+   If a command is blocked by an unknown outcome, first run
+   `aethyme broker advanced operations show <operation-id> --json` and identify
+   that original operation's command, provider, repository and owning session.
+   The blocking ID can belong to another request or session; checking the refs
+   targeted by your currently blocked command does not settle that operation.
+   Coordinate with its owner, inspect external state for the original command,
+   then use `aethyme broker advanced operations reconcile` only when the evidence
+   establishes its outcome. Do not retry blindly. Execution-tool session handles
+   and broker operation IDs are separate identifiers; use the broker's reported
+   operation ID for inspection and recovery.
 
    Direct Git is limited to read-only inspection and operations confined to
    the isolated session worktree and session branch that cannot affect other
