@@ -1064,6 +1064,23 @@ impl BrokerStore {
             .transpose()
     }
 
+    /// The newest queue entry for one exact session head, without loading
+    /// unrelated queue history.
+    pub fn latest_merge_queue_for_session_head(
+        &self,
+        session_id: i64,
+        head_commit: &str,
+    ) -> Result<Option<MergeQueueEntry>, BrokerError> {
+        self.conn
+            .query_row(
+                &format!("{MERGE_SELECT} WHERE session_id = ?1 AND head_commit = ?2 ORDER BY id DESC LIMIT 1"),
+                params![session_id, head_commit],
+                merge_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
     /// The latest queue entry per session, for all of `session_ids` at once.
     ///
     /// `broker status` needs this for every live session, and doing it with
@@ -1675,5 +1692,74 @@ impl BrokerStore {
         Ok(self
             .pr_watch_state(&state.target_branch, state.pr_number)?
             .expect("upserted pr_watch_state row should be readable"))
+    }
+}
+
+#[cfg(test)]
+mod finish_history_query_tests {
+    use super::*;
+
+    fn new_session(name: &str, root: &std::path::Path) -> NewSession {
+        NewSession {
+            worktree_path: root
+                .join(format!("{name}-worktree"))
+                .to_string_lossy()
+                .into_owned(),
+            branch: format!("agent/finish-history-{name}"),
+            origin: SessionOrigin::Spawned,
+            task: Some(name.to_owned()),
+            diff_base: None,
+            adoption_base: None,
+            adopted_head: None,
+            repository_contract: None,
+            pid: None,
+            command: None,
+            log_path: None,
+            agent_identity: None,
+        }
+    }
+
+    #[test]
+    fn latest_finish_queue_entries_ignore_unrelated_history_and_keep_id_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open(&temp.path().join("broker.db")).unwrap();
+        let target = store
+            .register_session(&new_session("target", temp.path()))
+            .unwrap();
+        let unrelated = store
+            .register_session(&new_session("unrelated", temp.path()))
+            .unwrap();
+
+        let old_target_head = store.submit(target.id, "target-old-head", "base").unwrap();
+        for index in 0..128 {
+            store
+                .submit(unrelated.id, &format!("unrelated-before-{index}"), "base")
+                .unwrap();
+        }
+        let current_target_head = store
+            .submit(target.id, "target-current-head", "base")
+            .unwrap();
+        for index in 128..256 {
+            store
+                .submit(unrelated.id, &format!("unrelated-after-{index}"), "base")
+                .unwrap();
+        }
+
+        let latest_for_session = store
+            .latest_merge_queue_for_session(target.id)
+            .unwrap()
+            .unwrap();
+        let latest_for_old_head = store
+            .latest_merge_queue_for_session_head(target.id, "target-old-head")
+            .unwrap()
+            .unwrap();
+        let latest_for_current_head = store
+            .latest_merge_queue_for_session_head(target.id, "target-current-head")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(latest_for_session.id, current_target_head.id);
+        assert_eq!(latest_for_old_head.id, old_target_head.id);
+        assert_eq!(latest_for_current_head.id, current_target_head.id);
     }
 }
