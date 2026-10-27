@@ -195,6 +195,53 @@ fn plan_exact_push(
     })
 }
 
+// Freeze the source objects before hooks run. A session-local commit may move
+// a named ref without taking the remote operation lane.
+fn pin_push_sources(args: &[String], plan: &ExactPushPlan) -> Option<Vec<String>> {
+    let command_index = git_subcommand_index(args)?;
+    let subcommand = args.get(command_index..)?;
+    if subcommand.first().map(String::as_str) != Some("push") {
+        return None;
+    }
+    let remote_positions = subcommand
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter_map(|(index, arg)| (arg == &plan.remote).then_some(index))
+        .collect::<Vec<_>>();
+    let [remote_index] = remote_positions.as_slice() else {
+        return None;
+    };
+    let first_refspec = command_index + *remote_index + 1;
+    if plan.destinations.is_empty()
+        || args.len().saturating_sub(first_refspec) != plan.destinations.len()
+    {
+        return None;
+    }
+    let mut pinned = args.to_vec();
+    for (index, destination) in plan.destinations.iter().enumerate() {
+        let force = args[first_refspec + index].starts_with('+');
+        pinned[first_refspec + index] = format!(
+            "{}{}:{}",
+            if force { "+" } else { "" },
+            destination.proposed_sha,
+            destination.destination_ref,
+        );
+    }
+    Some(pinned)
+}
+
+// Setting upstream relies on a named local source, so preserve Git's ordinary
+// hook execution and ref semantics instead of rewriting that source to an OID.
+fn push_sets_upstream(args: &[String]) -> bool {
+    git_subcommand_args(args).is_some_and(|args| {
+        args.iter().skip(1).any(|arg| {
+            arg == "--set-upstream"
+                || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('u'))
+        })
+    })
+}
+
 struct ExactPushObservation {
     classification: &'static str,
     outcome: Option<&'static str>,
@@ -2369,6 +2416,7 @@ impl Broker {
         let hooks_ran_outside_lock = effect != OperationEffect::Read
             && request.provider == OperationProvider::Git
             && is_push(&request.args)
+            && !push_sets_upstream(&request.args)
             && push_shape
                 .as_ref()
                 .is_none_or(|shape| shape.kind != PushKind::DeleteOnly)
@@ -2434,14 +2482,29 @@ impl Broker {
         // commits the real push will send, so the expensive part happens outside
         // the lock and the fleet no longer serialises on the slowest gate
         // (issues #138, #146).
+        let mut pinned_push_args = None;
         let prechecked_plan = if hooks_ran_outside_lock {
+            let plan = plan_exact_push(cwd, &request.args, resolved_target.as_ref());
+            let pinned = match &plan {
+                PushPlanning::Planned(exact) => pin_push_sources(&request.args, exact),
+                _ => None,
+            };
+            let Some(pinned) = pinned else {
+                self.resolve_unstarted_operation(
+                    queued_operation_id,
+                    "pre_push_sources_unavailable",
+                );
+                return Err(BrokerOpError::InvalidCoordinatedOperation {
+                    reason: "cannot bind the pre-push hook to exact source objects; use an explicit remote and refspec".into(),
+                });
+            };
             let mut dry_run = crate::git::git_command();
             remove_inherited_git_config_overrides(&mut dry_run);
             let command_index =
                 git_subcommand_index(&request.args).expect("push command was parsed");
-            dry_run.args(&request.args[..command_index]);
+            dry_run.args(&pinned[..command_index]);
             dry_run.arg("push").arg("--dry-run");
-            dry_run.args(&request.args[command_index + 1..]);
+            dry_run.args(&pinned[command_index + 1..]);
             dry_run.current_dir(cwd);
             export_push_shape(&mut dry_run, push_shape.as_ref());
             match output_within(
@@ -2490,11 +2553,8 @@ impl Broker {
                     return Err(error);
                 }
             }
-            Some(plan_exact_push(
-                cwd,
-                &request.args,
-                resolved_target.as_ref(),
-            ))
+            pinned_push_args = Some(pinned);
+            Some(plan)
         } else {
             None
         };
@@ -2903,7 +2963,7 @@ impl Broker {
         // it names is the whole point -- see `provider_command`.
         let executable = provider_executable(request.provider);
         let mut command = provider_command(request.provider);
-        command.args(&request.args);
+        command.args(pinned_push_args.as_deref().unwrap_or(&request.args));
         // Appended after the subcommand, where `git push` accepts it. The
         // repository opted in, the same hook already ran against these exact
         // commits in the dry run above, and the plan was re-proven unchanged

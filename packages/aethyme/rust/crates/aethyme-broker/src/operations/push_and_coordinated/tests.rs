@@ -2517,3 +2517,51 @@ fn completed_fetch_reconciles_only_with_actual_child_and_fresh_matching_refs() {
         OperationStatus::ReconciledSucceeded
     );
 }
+
+#[test]
+fn hook_push_sources_are_pinned_without_changing_force_or_destination_order() {
+    let first = "a".repeat(40);
+    let second = "b".repeat(40);
+    let plan = ExactPushPlan {
+        remote: "origin".into(),
+        destinations: vec![
+            ExactPushDestination {
+                destination_ref: "refs/heads/main".into(),
+                pre_push_sha: None,
+                proposed_sha: first.clone(),
+            },
+            ExactPushDestination {
+                destination_ref: "refs/heads/topic".into(),
+                pre_push_sha: None,
+                proposed_sha: second.clone(),
+            },
+        ],
+    };
+    let args = gh(&[
+        "push",
+        "--force-with-lease",
+        "origin",
+        "+main",
+        "HEAD:refs/heads/topic",
+    ]);
+    assert_eq!(
+        pin_push_sources(&args, &plan).unwrap(),
+        vec![
+            "push".to_string(),
+            "--force-with-lease".into(),
+            "origin".into(),
+            format!("+{first}:refs/heads/main"),
+            format!("{second}:refs/heads/topic"),
+        ]
+    );
+    assert!(pin_push_sources(&gh(&["push", "origin", "main"]), &plan).is_none());
+    assert!(push_sets_upstream(&gh(&["push", "-u", "origin", "main"])));
+    assert!(push_sets_upstream(&gh(&["push", "-qu", "origin", "main"])));
+    assert!(push_sets_upstream(&gh(&[
+        "push",
+        "--set-upstream",
+        "origin",
+        "main"
+    ])));
+    assert!(!push_sets_upstream(&args));
+}

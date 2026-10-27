@@ -114,6 +114,14 @@ old-runtime opens refuse schema 2. Deploy the matched router/engine to all local
 writers when activating this protocol. Broker operation details remain additive;
 this grants no new deletion rights.
 
+Opt-in push hooks outside the remote lock run against OID-pinned source
+refspecs; the real push uses the identical pinned sources. The original local
+refs are revalidated after waiting, but later movement cannot change the sent
+objects. Hooks must not assume that their `local_ref` column names the original
+branch; `local_sha` is the verified object. `AETHYME_PUSH_REFS` retains the caller's
+original refspecs. Pushes setting upstream retain ordinary Git hook execution
+and named-source semantics instead of the outside-lock optimization.
+
 Coordination wait details retain schema 1 and add `blocked_scope`,
 `safe_next_action` and `missing_evidence`. Matching running operations supply the
 holder identity and existing phase/progress timestamp. A resource wait does not
