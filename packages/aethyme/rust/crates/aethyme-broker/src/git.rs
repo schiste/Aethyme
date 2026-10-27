@@ -6317,8 +6317,8 @@ mod gitlink_census_tests {
         let mut tree = format!("160000 commit {oid}\tsub\nmodule\0").into_bytes();
         tree.extend_from_slice(format!("100644 blob {oid}\tregular.txt\0").as_bytes());
         assert_eq!(
-            parse_tree_gitlinks(&tree, &["ls-tree"]),
-            Ok(vec!["sub\nmodule".into()])
+            parse_tree_gitlinks(&tree, &["ls-tree"]).unwrap(),
+            vec!["sub\nmodule".into()]
         );
 
         let index = format!(
@@ -6328,12 +6328,12 @@ mod gitlink_census_tests {
              100644 {oid} 0\tregular.txt\0"
         );
         assert_eq!(
-            parse_index_gitlinks(index.as_bytes(), &["ls-files"]),
-            Ok(vec![
+            parse_index_gitlinks(index.as_bytes(), &["ls-files"]).unwrap(),
+            vec![
                 "conflicted-submodule".into(),
                 "conflicted-submodule".into(),
                 "conflicted-submodule".into()
-            ])
+            ]
         );
     }
 
