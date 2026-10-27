@@ -41,7 +41,7 @@ const PREPARATION_CACHE_HASH_BUFFER_BYTES: usize = 64 * 1024;
 // filesystem calls are not interruptible by this cooperative time limit.
 const SHARED_CACHE_SCAN_MAX_ENTRIES: usize = 100_000;
 const SHARED_CACHE_SCAN_MAX_DEPTH: usize = 64;
-const SHARED_CACHE_SCAN_MAX_ELAPSED: Duration = Duration::from_secs(5);
+const SHARED_CACHE_SCAN_MAX_ELAPSED: Duration = Duration::from_secs(30);
 const SHARED_CACHE_RECOVERY_MAX_ELAPSED: Duration = Duration::from_secs(5);
 
 /// Keep the recovery reserve observable while a preparation command is running.
@@ -815,7 +815,32 @@ impl Broker {
         // it has to be inside the same critical section that granted access.
         // It also runs before this run's directory is created, because it
         // moves the whole repository store away, that directory included.
+        let mut next_inventory_renewal = Instant::now();
         let rotation_result = if shared {
+            let mut progress = |force: bool| -> Result<(), PreparationError> {
+                if force || Instant::now() >= next_inventory_renewal {
+                    require_preparation_storage_with_cache_root(
+                        &storage_root,
+                        &storage_paths,
+                        cache_root_binding.as_ref(),
+                    )?;
+                    let (Some(coordinator), Some(grant)) = (coordinator.as_mut(), grant.as_mut())
+                    else {
+                        return Err(PreparationError::LivenessIncomplete {
+                            reason: "shared-cache lease is unavailable during inventory".into(),
+                        });
+                    };
+                    grant.lease = coordinator.renew(
+                        &grant.lease.lease_id,
+                        grant.lease.generation,
+                        &grant.ownership_token,
+                        PREPARATION_LEASE_TTL_SECONDS,
+                    )?;
+                    next_inventory_renewal =
+                        Instant::now() + Duration::from_secs(PREPARATION_LEASE_TTL_SECONDS / 3);
+                }
+                Ok(())
+            };
             shared_cache_budget(
                 config.shared_cache.as_ref(),
                 &digest,
@@ -823,6 +848,7 @@ impl Broker {
                 cache_root_binding
                     .as_ref()
                     .expect("shared cache has a binding"),
+                &mut progress,
             )
         } else {
             Ok(None)
@@ -2149,6 +2175,7 @@ fn shared_cache_budget(
     digest: &str,
     broker: &Broker,
     cache_root_binding: &crate::broker::PreparationCacheRootBinding,
+    progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
 ) -> Result<Option<SharedCacheRotation>, PreparationError> {
     let cache_root = cache_root_binding.path.clone();
     let resource_db_path = broker
@@ -2159,7 +2186,7 @@ fn shared_cache_budget(
             path: cache_root.clone(),
             reason: "the broker's captured host resource database path is unavailable".into(),
         })?;
-    shared_cache_budget_at_with_resource_db_and_identity_and_binding(
+    shared_cache_budget_at_with_guard(
         budget,
         &cache_root,
         resource_db_path,
@@ -2167,6 +2194,7 @@ fn shared_cache_budget(
         digest,
         cache_root_binding.identity.as_deref(),
         Some(cache_root_binding),
+        progress,
     )
 }
 
@@ -2269,6 +2297,7 @@ fn shared_cache_budget_at_with_resource_db_and_identity(
     )
 }
 
+#[cfg(test)]
 fn shared_cache_budget_at_with_resource_db_and_identity_and_binding(
     budget: Option<&SharedCacheBudget>,
     cache_root: &Path,
@@ -2278,6 +2307,30 @@ fn shared_cache_budget_at_with_resource_db_and_identity_and_binding(
     expected_root_identity: Option<&[u8]>,
     root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
 ) -> Result<Option<SharedCacheRotation>, PreparationError> {
+    shared_cache_budget_at_with_guard(
+        budget,
+        cache_root,
+        resource_db_path,
+        repository,
+        digest,
+        expected_root_identity,
+        root_binding,
+        &mut |_| Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shared_cache_budget_at_with_guard(
+    budget: Option<&SharedCacheBudget>,
+    cache_root: &Path,
+    resource_db_path: &Path,
+    repository: &str,
+    digest: &str,
+    expected_root_identity: Option<&[u8]>,
+    root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
+    progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
+) -> Result<Option<SharedCacheRotation>, PreparationError> {
+    progress(true)?;
     ensure_preparation_cache_root_binding(root_binding)?;
     ensure_preparation_cache_root_identity(cache_root, expected_root_identity)?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2288,12 +2341,15 @@ fn shared_cache_budget_at_with_resource_db_and_identity_and_binding(
         expected_root_identity,
         root_binding,
     )?;
+    progress(true)?;
 
     let Some(budget) = budget.filter(|budget| budget.max_bytes > 0) else {
         return Ok(None);
     };
     let store = cache_root.join(repository);
-    let Some(bytes) = directory_bytes(&store)? else {
+    let bytes = directory_bytes_with_progress(&store, SharedCacheScanLimits::default(), progress)?;
+    progress(true)?;
+    let Some(bytes) = bytes else {
         return Ok(None);
     };
     ensure_preparation_cache_root_identity(cache_root, expected_root_identity)?;
@@ -2355,6 +2411,7 @@ fn shared_cache_budget_at_with_resource_db_and_identity_and_binding(
         })?;
         ensure_preparation_cache_root_identity(cache_root, expected_root_identity)?;
         ensure_preparation_cache_root_binding(root_binding)?;
+        progress(true)?;
         rotation_journal::publish(
             resource_db_path,
             cache_root,
@@ -2368,6 +2425,7 @@ fn shared_cache_budget_at_with_resource_db_and_identity_and_binding(
         })?;
         ensure_preparation_cache_root_identity(cache_root, expected_root_identity)?;
         ensure_preparation_cache_root_binding(root_binding)?;
+        progress(true)?;
         rotation_debt::publish_with_root_guard(cache_root, debt, &mut || {
             validate_preparation_cache_binding_for_recovery(root_binding)
         })
@@ -2375,14 +2433,16 @@ fn shared_cache_budget_at_with_resource_db_and_identity_and_binding(
             path: store.clone(),
             reason: format!("cannot publish shared-cache rotation intent: {source}"),
         })?;
-        let progress = recover_rotation_debt(
+        progress(true)?;
+        let recovery = recover_rotation_debt(
             resource_db_path,
             cache_root,
             repository,
             expected_root_identity,
             root_binding,
         )?;
-        if !progress.found_debt || !progress.complete {
+        progress(true)?;
+        if !recovery.found_debt || !recovery.complete {
             return Err(PreparationError::StorageUnavailable {
                 path: store.clone(),
                 reason: "shared-cache rotation did not complete; retry after recovery".into(),
@@ -2663,6 +2723,7 @@ impl Default for SharedCacheScanLimits {
     }
 }
 
+#[cfg(test)]
 fn directory_bytes(path: &Path) -> Result<Option<u64>, PreparationError> {
     directory_bytes_with_limits(path, SharedCacheScanLimits::default())
 }
@@ -2677,13 +2738,22 @@ fn shared_cache_stat_device(device: libc::dev_t) -> Option<u64> {
     u64::try_from(device).ok()
 }
 
+#[cfg(test)]
 fn directory_bytes_with_limits(
     path: &Path,
+    limits: SharedCacheScanLimits,
+) -> Result<Option<u64>, PreparationError> {
+    directory_bytes_with_progress(path, limits, &mut |_| Ok(()))
+}
+
+fn directory_bytes_with_progress(
+    path: &Path,
     _limits: SharedCacheScanLimits,
+    _progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
 ) -> Result<Option<u64>, PreparationError> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        directory_bytes_fd_relative(path, _limits)
+        directory_bytes_fd_relative_with_progress(path, _limits, |_| {}, _progress)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -2785,19 +2855,24 @@ enum SharedCacheScanOpenTarget {
     Child,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn directory_bytes_fd_relative(
-    path: &Path,
-    limits: SharedCacheScanLimits,
-) -> Result<Option<u64>, PreparationError> {
-    directory_bytes_fd_relative_with_hook(path, limits, |_| {})
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn directory_bytes_fd_relative_with_hook<F>(
     path: &Path,
     limits: SharedCacheScanLimits,
+    before_open: F,
+) -> Result<Option<u64>, PreparationError>
+where
+    F: FnMut(SharedCacheScanOpenTarget),
+{
+    directory_bytes_fd_relative_with_progress(path, limits, before_open, &mut |_| Ok(()))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn directory_bytes_fd_relative_with_progress<F>(
+    path: &Path,
+    limits: SharedCacheScanLimits,
     mut before_open: F,
+    progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
 ) -> Result<Option<u64>, PreparationError>
 where
     F: FnMut(SharedCacheScanOpenTarget),
@@ -2876,6 +2951,7 @@ where
     let mut bytes = 0_u64;
 
     loop {
+        progress(false)?;
         check_shared_cache_scan_deadline(path, started, limits)?;
         let Some(frame) = pending.last_mut() else {
             break;
@@ -4410,6 +4486,82 @@ mod tests {
             "rotation report leaked a host path: {json}"
         );
         assert!(!json.contains("preparation-cache"), "{json}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn failed_inventory_progress_never_rotates_the_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("payload"), b"preserve").unwrap();
+        let mut checks = 0;
+        let result = shared_cache_budget_at_with_guard(
+            Some(&SharedCacheBudget {
+                max_bytes: 1,
+                ..SharedCacheBudget::default()
+            }),
+            &cache_root,
+            &tmp.path().join("resources.db"),
+            SHARED_CACHE_TEST_REPOSITORY,
+            "0123456789ab",
+            None,
+            None,
+            &mut |_| {
+                checks += 1;
+                if checks == 4 {
+                    return Err(PreparationError::LivenessIncomplete {
+                        reason: "lease lost".into(),
+                    });
+                }
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(PreparationError::LivenessIncomplete { .. })
+        ));
+        assert_eq!(checks, 4);
+        assert_eq!(fs::read(store.join("payload")).unwrap(), b"preserve");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn failed_post_inventory_lease_check_prevents_rotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("payload"), b"preserve").unwrap();
+        let mut scanned = false;
+        let result = shared_cache_budget_at_with_guard(
+            Some(&SharedCacheBudget {
+                max_bytes: 1,
+                ..SharedCacheBudget::default()
+            }),
+            &cache_root,
+            &tmp.path().join("resources.db"),
+            SHARED_CACHE_TEST_REPOSITORY,
+            "0123456789ab",
+            None,
+            None,
+            &mut |force| {
+                if force && scanned {
+                    return Err(PreparationError::LivenessIncomplete {
+                        reason: "lease lost after scan".into(),
+                    });
+                }
+                scanned |= !force;
+                Ok(())
+            },
+        );
+        assert!(scanned);
+        assert!(matches!(
+            result,
+            Err(PreparationError::LivenessIncomplete { .. })
+        ));
+        assert_eq!(fs::read(store.join("payload")).unwrap(), b"preserve");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
