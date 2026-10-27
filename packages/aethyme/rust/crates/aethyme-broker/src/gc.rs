@@ -6141,8 +6141,25 @@ impl Broker {
                 let deferrable =
                     artifact_witness_for_with_extras(&dir, &policy.artefact_directories)
                         .and_then(ArtifactWitness::deferrable_entry);
-                match remove_condemned_tree_with_progress(&dir, deferrable, Some(removal_deadline))
-                {
+                let removal_result = {
+                    let mut before_mutation = || {
+                        #[cfg(test)]
+                        {
+                            tests::before_gc_artifact_removal_mutation(&dir)
+                        }
+                        #[cfg(not(test))]
+                        {
+                            Ok(())
+                        }
+                    };
+                    remove_condemned_tree_with_progress_and_guard(
+                        &dir,
+                        deferrable,
+                        Some(removal_deadline),
+                        &mut before_mutation,
+                    )
+                };
+                match removal_result {
                     Ok((TreeRemoval::Complete, count)) => {
                         entries_reclaimed = entries_reclaimed.saturating_add(count);
                         let mut updated_paths = interrupted_paths.clone();
@@ -7064,6 +7081,53 @@ impl Broker {
 mod tests {
     use super::*;
     use crate::disk_headroom::SweepUrgency;
+    use std::cell::RefCell;
+
+    std::thread_local! {
+        static ARTIFACT_SWEEP_TEST_MUTATION_INTERRUPT: RefCell<Option<(PathBuf, usize)>> =
+            const { RefCell::new(None) };
+    }
+
+    struct ArtifactSweepTestMutationInterrupt {
+        previous: Option<(PathBuf, usize)>,
+    }
+
+    impl ArtifactSweepTestMutationInterrupt {
+        fn after_first_unlink(path: &Path) -> Self {
+            let previous = ARTIFACT_SWEEP_TEST_MUTATION_INTERRUPT
+                .with(|state| state.replace(Some((path.to_path_buf(), 0))));
+            Self { previous }
+        }
+    }
+
+    impl Drop for ArtifactSweepTestMutationInterrupt {
+        fn drop(&mut self) {
+            let previous = self.previous.take();
+            ARTIFACT_SWEEP_TEST_MUTATION_INTERRUPT.with(|state| {
+                state.replace(previous);
+            });
+        }
+    }
+
+    pub(super) fn before_gc_artifact_removal_mutation(path: &Path) -> std::io::Result<()> {
+        ARTIFACT_SWEEP_TEST_MUTATION_INTERRUPT.with(|state| {
+            let mut state = state.borrow_mut();
+            let Some((target, attempts)) = state.as_mut() else {
+                return Ok(());
+            };
+            if target.as_path() != path {
+                return Ok(());
+            }
+            *attempts += 1;
+            if *attempts >= 2 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "test hook stopped after the first cache unlink",
+                ));
+            }
+            Ok(())
+        })
+    }
 
     fn test_worker_retry_pending(broker: &mut Broker, now: i64) -> Result<bool, BrokerOpError> {
         let namespace = broker.ensure_artifact_sweep_namespace()?;
@@ -8703,10 +8767,14 @@ mod tests {
             "the managed producer's cache remains intact"
         );
         assert!(
-            broker
-                .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
-                .unwrap()
-                .is_none(),
+            decode_interrupted_paths(
+                broker
+                    .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                    .unwrap()
+                    .as_deref()
+            )
+            .unwrap()
+            .is_empty(),
             "admission must be acquired before publishing a new removal intent"
         );
 
@@ -8748,10 +8816,14 @@ mod tests {
             .expect("the unknown marker is recorded as a bounded blocker");
         assert!(blocked.contains("artifact_use_unknown_producer"));
         assert!(
-            broker
-                .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
-                .unwrap()
-                .is_none(),
+            decode_interrupted_paths(
+                broker
+                    .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                    .unwrap()
+                    .as_deref()
+            )
+            .unwrap()
+            .is_empty(),
             "an unknown marker must not publish a false removal intent"
         );
     }
@@ -9807,14 +9879,18 @@ mod tests {
         )
         .unwrap();
         let policy = load_retention_policy(root).unwrap();
-        let (partial, entries_reclaimed) = broker
-            .sweep_artifacts_autonomously_with_test_deadlines(
-                &policy,
-                ArtifactSweepScope::Inline,
-                Instant::now() + Duration::from_secs(30),
-                Instant::now(),
-            )
-            .unwrap();
+        let (partial, entries_reclaimed) = {
+            let _interrupt_after_first_unlink =
+                ArtifactSweepTestMutationInterrupt::after_first_unlink(&cache);
+            broker
+                .sweep_artifacts_autonomously_with_test_deadlines(
+                    &policy,
+                    ArtifactSweepScope::Inline,
+                    Instant::now() + Duration::from_secs(30),
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .unwrap()
+        };
         assert!(
             !partial.complete,
             "an interrupted removal is not a full lap"
@@ -9836,6 +9912,8 @@ mod tests {
         assert_ne!(partial_stamp, "0");
 
         let entries_after_partial = std::fs::read_dir(&cache).unwrap().count();
+        assert_eq!(entries_after_partial, 2);
+        assert!(cache.join("first").exists() || cache.join("second").exists());
         let (_, spaced_entries) = broker
             .sweep_artifacts_autonomously_with_test_deadlines(
                 &policy,
@@ -9859,8 +9937,8 @@ mod tests {
             "the partial path remains queued while the retry is spaced"
         );
 
-        // Advance only the persisted schedule marker; the test deadlines keep
-        // the filesystem transition deterministic without sleeping.
+        // Advance only the persisted schedule marker; the per-unlink hook
+        // forced the partial deletion deterministically without sleeping.
         broker
             .artifact_sweep_meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, "0")
             .unwrap();
@@ -10141,26 +10219,31 @@ mod tests {
                 assert!(broker.is_broker_owned_worktree(&session, &closed_worktree));
                 let policy = load_retention_policy(broker.main_root()).unwrap();
                 let mut entries_reclaimed: usize = 0;
-                broker
-                    .run_artifact_sweep_recovery_worker_loop(
-                        &policy,
-                        77,
-                        Some(1),
-                        None,
-                        |broker, policy, _remaining| {
-                            let result = broker.sweep_artifacts_autonomously_with_test_deadlines(
-                                policy,
-                                ArtifactSweepScope::AutomaticContinuation,
-                                Instant::now() + Duration::from_secs(5),
-                                Instant::now(),
-                            );
-                            if let Ok((_, count)) = &result {
-                                entries_reclaimed = *count;
-                            }
-                            result
-                        },
-                    )
-                    .unwrap();
+                {
+                    let _interrupt_after_first_unlink =
+                        ArtifactSweepTestMutationInterrupt::after_first_unlink(&cache);
+                    broker
+                        .run_artifact_sweep_recovery_worker_loop(
+                            &policy,
+                            77,
+                            Some(1),
+                            None,
+                            |broker, policy, _remaining| {
+                                let result = broker
+                                    .sweep_artifacts_autonomously_with_test_deadlines(
+                                        policy,
+                                        ArtifactSweepScope::AutomaticContinuation,
+                                        Instant::now() + Duration::from_secs(5),
+                                        Instant::now() + Duration::from_secs(30),
+                                    );
+                                if let Ok((_, count)) = &result {
+                                    entries_reclaimed = *count;
+                                }
+                                result
+                            },
+                        )
+                        .unwrap();
+                }
                 assert!(
                     entries_reclaimed > 0,
                     "the detached cache-only child must make filesystem progress"
@@ -10177,6 +10260,14 @@ mod tests {
                     cache.is_dir(),
                     "partial cache deletion must remain resumable"
                 );
+                let queued_after_partial = decode_interrupted_paths(
+                    broker
+                        .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                        .unwrap()
+                        .as_deref(),
+                )
+                .unwrap();
+                assert!(queued_after_partial.contains(&cache.to_string_lossy().into_owned()));
                 assert!(active_cache.is_dir(), "a live session cache is protected");
                 assert!(
                     idle_cache
