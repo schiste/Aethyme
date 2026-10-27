@@ -6421,7 +6421,10 @@ mod bounded_cleanup_status_tests {
             .args(args)
             .current_dir(root)
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
             .env("GIT_AUTHOR_NAME", "test")
             .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
             .env("GIT_COMMITTER_NAME", "test")
@@ -6435,8 +6438,9 @@ mod bounded_cleanup_status_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn bounded_status_preserves_literal_names_and_refuses_partial_results() {
+    fn bounded_status_preserves_unix_literal_names_and_refuses_partial_results() {
         let root = tempfile::tempdir().unwrap();
         git(root.path(), &["init", "-q", "-b", "main"]);
         std::fs::write(root.path().join("tracked.txt"), "base\n").unwrap();
@@ -6467,6 +6471,28 @@ mod bounded_cleanup_status_tests {
     }
 
     #[test]
+    fn bounded_status_refuses_partial_results_on_all_platforms() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(root.path().join("tracked.txt"), "base\n").unwrap();
+        git(root.path(), &["add", "tracked.txt"]);
+        git(root.path(), &["commit", "-qm", "initial"]);
+        std::fs::write(root.path().join("tracked.txt"), "changed\n").unwrap();
+        std::fs::write(root.path().join("untracked.txt"), "untracked").unwrap();
+
+        let repo = GitRepo::discover(root.path()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let byte_error = repo
+            .dirty_and_untracked_paths_until_with_limits(deadline, 1, 8)
+            .unwrap_err();
+        assert!(matches!(byte_error, GitError::UntrustedOutput { .. }));
+        let path_error = repo
+            .dirty_and_untracked_paths_until_with_limits(deadline, 4096, 1)
+            .unwrap_err();
+        assert!(matches!(path_error, GitError::UntrustedOutput { .. }));
+    }
+
+    #[test]
     fn bounded_finish_status_keeps_matching_ignored_paths_in_its_proof() {
         let root = tempfile::tempdir().unwrap();
         git(root.path(), &["init", "-q", "-b", "main"]);
@@ -6486,7 +6512,7 @@ mod bounded_cleanup_status_tests {
         let policy = crate::AutoCleanupPolicy::default();
         let deadline = Instant::now() + Duration::from_secs(15);
         assert!(
-            repo.has_only_unstaged_tracked_deletions_until_with_limits(&policy, deadline, 4096, 2)
+            repo.has_only_unstaged_tracked_deletions_until_with_limits(&policy, deadline, 4096, 8)
                 .unwrap()
         );
 
@@ -6498,7 +6524,7 @@ mod bounded_cleanup_status_tests {
         std::fs::write(root.path().join("private.dat"), "preserve").unwrap();
         assert!(
             !repo
-                .has_only_unstaged_tracked_deletions_until_with_limits(&policy, deadline, 4096, 4)
+                .has_only_unstaged_tracked_deletions_until_with_limits(&policy, deadline, 4096, 8)
                 .unwrap()
         );
     }
