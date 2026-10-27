@@ -3198,9 +3198,11 @@ where
         environment.load_avg_1m_end = load_average_1m();
         let status = match (status, release_error) {
             (Ok(mut outcome), release_error) => {
-                if outcome.resource_error.is_none() {
-                    outcome.resource_error = release_error;
-                }
+                outcome.resource_error = match (outcome.resource_error.take(), release_error) {
+                    (Some(existing), Some(release)) => Some(format!("{existing}; {release}")),
+                    (Some(existing), None) => Some(existing),
+                    (None, release) => release,
+                };
                 Ok(outcome)
             }
             // A failed spawn or wait is normally an environment error, but a
@@ -5706,7 +5708,14 @@ mod tests {
                 "live-writer bytes cannot be a settled measurement"
             );
             let log = std::fs::read_to_string(outcome.log_path.as_ref().unwrap()).unwrap();
-            assert!(log.contains("gate writer cleanup could not be confirmed"));
+            assert!(
+                log.contains("gate writer cleanup could not be confirmed"),
+                "quarantine reason was omitted from the gate log:\n{log}"
+            );
+            assert!(
+                log.contains("gate artifact-use settlement could not be confirmed"),
+                "artifact settlement reason was omitted from the gate log:\n{log}"
+            );
             let states: Vec<String> = rusqlite::Connection::open(&resource_db)
                 .unwrap()
                 .prepare("SELECT state FROM resource_leases ORDER BY generation")

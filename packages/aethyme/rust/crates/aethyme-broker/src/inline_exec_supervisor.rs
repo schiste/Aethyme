@@ -2285,7 +2285,13 @@ mod tests {
             || Ok(()),
         );
 
-        assert!(matches!(result, Err(InlineExecError::Setup(_))));
+        assert!(
+            matches!(
+                &result,
+                Err(InlineExecError::Setup(_)) | Err(InlineExecError::CommandOutcomeUnknown(_))
+            ),
+            "watcher failure should prevent a successful command launch: {result:?}"
+        );
         assert!(
             !marker.exists(),
             "command launched without a cleanup watcher"

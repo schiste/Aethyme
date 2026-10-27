@@ -1218,6 +1218,11 @@ mod tests {
         producer.finish_verified_quiescence(&mut child).unwrap();
         assert!(matches!(
             try_artifact_use_reclaimer(primary.path(), &first_checkout).unwrap(),
+            ArtifactUseReclaimTry::Blocked(ArtifactUseReclaimBlock::Contended)
+        ));
+        drop(producer);
+        assert!(matches!(
+            try_artifact_use_reclaimer(primary.path(), &first_checkout).unwrap(),
             ArtifactUseReclaimTry::Acquired(_)
         ));
     }
@@ -1228,6 +1233,11 @@ mod tests {
         let checkout = checkout(primary.path(), "checkout");
         let mut producer = begin(primary.path(), &checkout, 13, "exec:13:unavailable");
         producer.finish_not_started().unwrap();
+        assert!(matches!(
+            try_artifact_use_reclaimer(primary.path(), &checkout).unwrap(),
+            ArtifactUseReclaimTry::Blocked(ArtifactUseReclaimBlock::Contended)
+        ));
+        drop(producer);
         assert!(matches!(
             try_artifact_use_reclaimer(primary.path(), &checkout).unwrap(),
             ArtifactUseReclaimTry::Acquired(_)
@@ -1565,6 +1575,11 @@ mod tests {
         symlink(&target, &producer.marker_path).unwrap();
 
         assert!(producer.finish_not_started().is_err());
+        assert!(matches!(
+            try_artifact_use_reclaimer(primary.path(), &checkout).unwrap(),
+            ArtifactUseReclaimTry::Blocked(ArtifactUseReclaimBlock::Contended)
+        ));
+        drop(producer);
         assert_eq!(fs::read(&target).unwrap(), b"preserve");
         assert!(try_artifact_use_reclaimer(primary.path(), &checkout).is_err());
     }
