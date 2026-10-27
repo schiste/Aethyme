@@ -175,8 +175,8 @@ pub fn session_abandoned_unpushed_payload(
     .to_string()
 }
 
-/// Filesystem identity tuple captured from the GitRepo created by spawn.
-/// Missing or changed tuples cannot authorize unattended checkout removal.
+/// Filesystem identity tuple and root-generation digest captured by spawn.
+/// Missing or changed identity cannot authorize unattended checkout removal.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SpawnedWorktreeInstanceWitness {
@@ -192,6 +192,11 @@ pub(crate) struct SpawnedWorktreeInstanceWitness {
     pub(crate) git_common_path: String,
     pub(crate) git_common_device: u64,
     pub(crate) git_common_inode: u64,
+    /// Digest of the random root xattr written exclusively during broker
+    /// spawn. `None` is retained for legacy rows, which cannot authorize
+    /// automatic removal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) root_generation_sha256: Option<String>,
 }
 
 /// Immutable identity captured before `finish` begins physical cleanup. A
@@ -215,12 +220,45 @@ pub(crate) struct FinishCleanupRecoveryProof {
     pub(crate) branch_ref: String,
     pub(crate) head: String,
     pub(crate) branch_tip: String,
+    /// Spawn-time root marker digest. Legacy proofs deserialize as `None` and
+    /// cannot authorize resuming physical cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) root_generation_sha256: Option<String>,
     /// Ignored directory roots that cleanup classified as disposable before
     /// Git began removing this checkout. A later orphan retry may remove
     /// entries beneath these exact prefixes; it must preserve newly appeared
     /// ignored files and directories elsewhere.
     #[serde(default)]
     pub(crate) disposable_ignored_root_prefixes: Vec<String>,
+}
+
+impl FinishCleanupRecoveryProof {
+    /// A finish intent may use only the generation captured at spawn. The
+    /// current checkout's metadata and root marker alone cannot reconstruct
+    /// ownership after a path has been replaced.
+    pub(crate) fn matches_spawned_instance(
+        &self,
+        witness: &SpawnedWorktreeInstanceWitness,
+    ) -> bool {
+        self.schema_version == 3
+            && witness.schema_version == 2
+            && self.worktree_path == witness.worktree_path
+            && self.worktree_device == witness.worktree_device
+            && self.worktree_inode == witness.worktree_inode
+            && self.git_pointer_device == witness.git_pointer_device
+            && self.git_pointer_inode == witness.git_pointer_inode
+            && self.git_admin_path == witness.git_admin_path
+            && self.git_admin_device == witness.git_admin_device
+            && self.git_admin_inode == witness.git_admin_inode
+            && self.git_common_path == witness.git_common_path
+            && self.git_common_device == witness.git_common_device
+            && self.git_common_inode == witness.git_common_inode
+            && self
+                .root_generation_sha256
+                .as_deref()
+                .is_some_and(crate::root_generation::valid_digest)
+            && self.root_generation_sha256.as_deref() == witness.root_generation_sha256.as_deref()
+    }
 }
 
 /// Build the stable v1 payload for the start of finish cleanup.

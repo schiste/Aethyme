@@ -430,6 +430,18 @@ impl PinnedOrphanRoot {
         if !metadata.is_dir() || identity != (proof.worktree_device, proof.worktree_inode) {
             return Err("orphan root identity changed; preserved it for inspection".into());
         }
+        let generation = crate::root_generation::read_fd(root.as_raw_fd());
+        if !proof
+            .root_generation_sha256
+            .as_deref()
+            .is_some_and(crate::root_generation::valid_digest)
+            || generation.as_deref() != proof.root_generation_sha256.as_deref()
+        {
+            return Err(
+                "orphan root generation changed or is unavailable; preserved it for inspection"
+                    .into(),
+            );
+        }
         let root_filesystem_identity = filesystem_identity(root.as_raw_fd())
             .map_err(|error| format!("cannot inspect orphan root volume: {error}"))?;
         let root_mount_identity = mount_identity(root.as_raw_fd())
@@ -3287,11 +3299,12 @@ impl Broker {
             payload.get("recovery_proof")?.clone(),
         )
         .ok()?;
-        let schema_valid = match proof.schema_version {
-            1 => proof.disposable_ignored_root_prefixes.is_empty(),
-            2 => validate_disposable_prefixes(&proof.disposable_ignored_root_prefixes).is_ok(),
-            _ => false,
-        };
+        let schema_valid = proof.schema_version == 3
+            && validate_disposable_prefixes(&proof.disposable_ignored_root_prefixes).is_ok()
+            && proof
+                .root_generation_sha256
+                .as_deref()
+                .is_some_and(crate::root_generation::valid_digest);
         if !schema_valid
             || proof.branch_ref != format!("refs/heads/{}", current.branch)
             || proof.head != proof.branch_tip
@@ -3458,6 +3471,13 @@ impl Broker {
             || !path_metadata.is_dir()
             || path_metadata.dev() != proof.worktree_device
             || path_metadata.ino() != proof.worktree_inode
+        {
+            return None;
+        }
+        let (generation_device, generation_inode, generation_sha256) =
+            crate::root_generation::read_path_with_identity(worktree_path)?;
+        if (generation_device, generation_inode) != (proof.worktree_device, proof.worktree_inode)
+            || proof.root_generation_sha256.as_deref() != Some(generation_sha256.as_str())
         {
             return None;
         }
@@ -4478,7 +4498,7 @@ mod registered_removal_failure_tests {
         session: &crate::Session,
         worktree: &Path,
     ) -> crate::events::FinishCleanupRecoveryProof {
-        persist_finish_cleanup_intent_with_schema(broker, session, worktree, 2)
+        persist_finish_cleanup_intent_with_schema(broker, session, worktree, 3)
     }
 
     fn persist_finish_cleanup_intent_with_schema(
@@ -4493,7 +4513,10 @@ mod registered_removal_failure_tests {
             .finish_cleanup_recovery_proof(&branch_ref)
             .expect("the represented linked checkout must yield a durable recovery proof");
         proof.schema_version = schema_version;
-        if schema_version == 2 {
+        if schema_version < 3 {
+            proof.root_generation_sha256 = None;
+        }
+        if schema_version >= 2 {
             let policy = crate::AutoCleanupPolicy::load(broker.main_root()).unwrap();
             proof.disposable_ignored_root_prefixes =
                 crate::auto_cleanup::disposable_ignored_directory_prefixes(worktree, &policy)
@@ -5054,12 +5077,48 @@ mod registered_removal_failure_tests {
         let proof = persist_finish_cleanup_intent_with_schema(&mut broker, &session, &worktree, 1);
         std::fs::remove_file(worktree.join("README.md")).unwrap();
         remove_worktree_admin_directory(&worktree);
+        let closed = broker.store().session(session.id).unwrap();
+        assert!(
+            broker
+                .interrupted_finish_orphan_cleanup_proof(&closed)
+                .is_none()
+        );
 
         let error = broker.cleanup(session.id, false).unwrap_err();
-        assert!(
-            error.to_string().contains("unverified directory"),
-            "{error}"
+        assert!(error.to_string().contains("preserved"), "{error}");
+        assert_eq!(std::fs::read(&residue).unwrap(), b"saved session data");
+        assert_eq!(
+            broker.store().session(session.id).unwrap().cleanup_state,
+            SessionCleanupState::Closed
         );
+        assert!(broker.repo.resolve_ref(&proof.branch_ref).is_some());
+    }
+
+    #[test]
+    fn legacy_v2_orphan_proof_without_root_generation_cannot_authorize_residue() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "legacy v2 orphan proof");
+        let residue = worktree.join("local-dataset/saved-session.json");
+        std::fs::create_dir_all(residue.parent().unwrap()).unwrap();
+        std::fs::write(&residue, b"saved session data").unwrap();
+        let proof = persist_finish_cleanup_intent_with_schema(&mut broker, &session, &worktree, 2);
+        assert!(!proof.disposable_ignored_root_prefixes.is_empty());
+        assert!(proof.root_generation_sha256.is_none());
+        std::fs::remove_file(worktree.join("README.md")).unwrap();
+        remove_worktree_admin_directory(&worktree);
+        let closed = broker.store().session(session.id).unwrap();
+        assert!(
+            broker
+                .interrupted_finish_orphan_cleanup_proof(&closed)
+                .is_none()
+        );
+
+        let error = broker.cleanup(session.id, false).unwrap_err();
+        assert!(error.to_string().contains("preserved"), "{error}");
         assert_eq!(std::fs::read(&residue).unwrap(), b"saved session data");
         assert_eq!(
             broker.store().session(session.id).unwrap().cleanup_state,

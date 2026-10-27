@@ -2529,9 +2529,21 @@ impl GitRepo {
         if git_admin == git_common {
             return None;
         }
+        let (generation_device, generation_inode, root_generation_sha256) =
+            crate::root_generation::read_path_with_identity(&root)?;
+        if (generation_device, generation_inode) != (worktree_device, worktree_inode) {
+            return None;
+        }
+        let root_metadata = fs::symlink_metadata(&root).ok()?;
+        if root_metadata.file_type().is_symlink()
+            || !root_metadata.is_dir()
+            || (root_metadata.dev(), root_metadata.ino()) != (worktree_device, worktree_inode)
+        {
+            return None;
+        }
 
         Some(crate::events::SpawnedWorktreeInstanceWitness {
-            schema_version: 1,
+            schema_version: 2,
             worktree_path: root.to_str()?.to_string(),
             worktree_device,
             worktree_inode,
@@ -2543,6 +2555,7 @@ impl GitRepo {
             git_common_path: git_common.to_str()?.to_string(),
             git_common_device,
             git_common_inode,
+            root_generation_sha256: Some(root_generation_sha256),
         })
     }
 
@@ -2581,7 +2594,7 @@ impl GitRepo {
         let witness = self.spawned_worktree_instance_witness()?;
 
         Some(crate::events::FinishCleanupRecoveryProof {
-            schema_version: 1,
+            schema_version: 3,
             worktree_path: witness.worktree_path,
             worktree_device: witness.worktree_device,
             worktree_inode: witness.worktree_inode,
@@ -2596,6 +2609,7 @@ impl GitRepo {
             branch_ref: branch_ref.to_string(),
             head,
             branch_tip,
+            root_generation_sha256: witness.root_generation_sha256,
             disposable_ignored_root_prefixes: Vec::new(),
         })
     }

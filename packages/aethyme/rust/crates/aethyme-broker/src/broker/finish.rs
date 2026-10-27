@@ -303,6 +303,14 @@ impl Broker {
         ));
 
         if !recovery_retry {
+            let spawned_witness = if session.origin == SessionOrigin::Spawned {
+                self.store()
+                    .spawned_worktree_instance_witness(session.id)
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
             let recovery_proof =
                 if session.origin == SessionOrigin::Spawned && worktree_present && branch_present {
                     GitRepo::discover(&worktree_path)
@@ -314,6 +322,10 @@ impl Broker {
                             ))
                         })
                         .and_then(|mut proof| {
+                            let witness = spawned_witness.as_ref()?;
+                            if !proof.matches_spawned_instance(witness) {
+                                return None;
+                            }
                             if item.as_ref().and_then(|item| item.branch_tip.as_deref())
                                 != Some(proof.branch_tip.as_str())
                             {
@@ -326,7 +338,7 @@ impl Broker {
                                     &policy,
                                 )
                                 .ok()?;
-                            proof.schema_version = 2;
+                            proof.schema_version = 3;
                             Some(proof)
                         })
                 } else {
