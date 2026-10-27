@@ -4,6 +4,13 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.36] - 2026-10-27
+
+### Fixed
+
+- Cleanup discovers ignored directory roots through a bounded Git listing rather than recursively enumerating their contents. Oversized, incomplete or malformed listings retain the checkout.
+- Cleanup keeps worktrees with dirty tracked submodules even when local Git display settings hide their changes.
+
 ## [0.8.35] - 2026-10-26
 
 ### Fixed
