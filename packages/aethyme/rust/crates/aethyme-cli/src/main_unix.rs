@@ -405,7 +405,13 @@ fn main_with_args(args: &[String]) -> ExitCode {
         // The agent-surface hook entry point the Aethyme plugin shims
         // to. One stable spelling so an installed plugin never has to
         // match an installed CLI version.
-        "hook" => ExitCode::from(aethyme_broker::agent_hook::run(&args[1..])),
+        "hook" => {
+            let running_build_banner = build_banner();
+            ExitCode::from(aethyme_broker::agent_hook::run_with_build_banner(
+                &args[1..],
+                &running_build_banner,
+            ))
+        }
         // The other half of that stability: the binary that answers
         // `hook` is the one that registers the hooks, so a plugin
         // installed this way cannot be paired with a CLI too old to
@@ -464,23 +470,25 @@ fn main_with_args(args: &[String]) -> ExitCode {
     }
 }
 
-/// Crate version plus the source identity and build time captured by build.rs.
-fn print_version() {
+/// The stable banner identity captured by build.rs, excluding build time.
+fn build_banner() -> String {
     let revision = env!("AETHYME_GIT_REVISION");
     let commit = {
         let value = env!("AETHYME_GIT_COMMIT");
         if value.is_empty() { "unknown" } else { value }
     };
-    let build_date = env!("AETHYME_BUILD_DATE");
     let stable = if revision.is_empty() {
         format!("build_commit={commit}")
     } else {
         format!("build_revision={revision} build_commit={commit}")
     };
-    println!(
-        "aethyme {} ({stable}) build_date={build_date}",
-        env!("CARGO_PKG_VERSION")
-    );
+    format!("aethyme {} ({stable})", env!("CARGO_PKG_VERSION"))
+}
+
+/// Crate version plus the source identity and build time captured by build.rs.
+fn print_version() {
+    let build_date = env!("AETHYME_BUILD_DATE");
+    println!("{} build_date={build_date}", build_banner());
 }
 
 /// Map a typed engine front-end error onto a process exit code.

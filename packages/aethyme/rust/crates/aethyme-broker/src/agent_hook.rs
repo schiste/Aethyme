@@ -102,6 +102,17 @@ impl HookOutcome {
 /// no output, and the agent proceeds exactly as it would have without
 /// the plugin installed.
 pub fn run(args: &[String]) -> u8 {
+    run_with_optional_build_banner(args, None)
+}
+
+/// Run one event with the build banner captured by the CLI that launched this hook.
+///
+/// SessionStart uses it to compare this process with the router selected by PATH.
+pub fn run_with_build_banner(args: &[String], running_build_banner: &str) -> u8 {
+    run_with_optional_build_banner(args, Some(running_build_banner))
+}
+
+fn run_with_optional_build_banner(args: &[String], running_build_banner: Option<&str>) -> u8 {
     let Some(event) = args.first().map(String::as_str).and_then(HookEvent::parse) else {
         // Includes `--help` and every future event this binary predates.
         // An older CLI must stay silent in front of a newer plugin.
@@ -116,7 +127,7 @@ pub fn run(args: &[String]) -> u8 {
     let event_json: serde_json::Value =
         serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
 
-    match decide(event, repo.as_deref(), &event_json) {
+    match decide(event, repo.as_deref(), &event_json, running_build_banner) {
         Some(outcome) => {
             if let Some(envelope) = outcome.envelope(event) {
                 println!("{envelope}");
@@ -149,6 +160,7 @@ fn decide(
     event: HookEvent,
     repo: Option<&str>,
     event_json: &serde_json::Value,
+    running_build_banner: Option<&str>,
 ) -> Option<HookOutcome> {
     let cwd = match repo {
         Some(path) => std::path::PathBuf::from(path),
@@ -169,7 +181,9 @@ fn decide(
     // A broker that will not open is one of the things a mismatched router and
     // engine can produce, and that is the moment the notice is worth most.
     let installation_notice = match event {
-        HookEvent::SessionStart => crate::install_health::session_start_warnings(now_ms()),
+        HookEvent::SessionStart => {
+            crate::install_health::session_start_warnings_with_build(now_ms(), running_build_banner)
+        }
         _ => Vec::new(),
     };
 
@@ -204,11 +218,10 @@ fn decide(
 /// Append anything wrong with the local installation to a `SessionStart`
 /// outcome.
 ///
-/// This is the one event where it belongs. A session start is rare, it is
-/// already producing a paragraph, and the two things it reports — a router and
-/// engine from different builds, and a release newer than the one installed —
-/// are both things the agent is about to act on and cannot otherwise discover.
-/// On every other event it would be noise repeated per turn.
+/// This is the one event where they belong: session start is rare, it is already
+/// producing a paragraph, and the process/installation diagnostics concern the
+/// build the agent is about to use. On every other event it would be noise
+/// repeated per turn.
 ///
 /// Reporting only, and no network: see [`crate::install_health`]. A `Deny`
 /// outcome is returned untouched, because a refusal must not be diluted by

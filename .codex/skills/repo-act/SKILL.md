@@ -517,11 +517,22 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   rewrite telemetry history, exclude that plan's own metric even when output
   measurement is opted in.
 - For runtime rollout and dogfooding, resolve the executable actually selected
-  by PATH and compare its version with the repository runtime pointer. Pin the
-  verified executable for subsequent commands; the pointer alone does not prove
-  that the shell is using the deployed build. Pass the same absolute executable
-  and required sibling identity to delegated agents; selecting a repository
-  runtime does not rewrite their inherited PATH.
+  by the agent's inherited PATH and compare its version with the repository
+  runtime pointer. Pin the verified executable for later commands and pass the
+  same absolute executable plus sibling identity to delegated agents; selecting
+  a repository runtime does not rewrite their PATH. Separately verify the actual
+  running process image path/build and inspect only a fixed set of known roots
+  (CARGO_INSTALL_ROOT/bin, CARGO_HOME/bin, HOME/.cargo/bin, HOME/.local/bin)
+  plus the PATH-selected bin directory. Do not recursively scan roots or run
+  arbitrary binaries found in alternate roots. A selector change affects future
+  opens; a process already running keeps its loaded build. An explicit candidate
+  smoke proves that candidate runs; separately verify PATH and running-process
+  selection before calling rollout complete.
+- After a broker start call returns truncated or ambiguous output, inspect that
+  invocation before retrying. Wait on its original tool handle when available,
+  then query structured broker status by task or short name. An empty filtered
+  result or truncated response is not proof that no session was created; retry
+  only after a complete status confirms there is no registered session.
 - When resolving stacked merges, preserve the stronger assertions from both
   parents. Adapt tests to the merged API; do not replace explicit failure or
   completeness checks with weaker count-only assertions.
