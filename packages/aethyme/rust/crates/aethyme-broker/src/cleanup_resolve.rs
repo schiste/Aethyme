@@ -24,8 +24,9 @@
 
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -36,6 +37,11 @@ use crate::{Broker, BrokerOpError, CleanupDisposition};
 
 pub const CLEANUP_RESOLVE_SCHEMA_VERSION: u32 = 2;
 const LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 1;
+const PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 2;
+const RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 3;
+const MAX_RECOVERY_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_RECOVERY_BUNDLE_STDERR_BYTES: usize = 64 * 1024;
+const MAX_RECOVERY_BUNDLE_METADATA_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// Directory beneath the host state directory holding one subdirectory of
 /// archives per repository.
@@ -140,11 +146,30 @@ pub struct CleanupResolveOutcome {
     pub cleanup_error: Option<String>,
 }
 
-/// The part of a plan the digest covers. Sizes are derivable from the hashes;
-/// the archive root and commands are presentation.
+/// Schema v2's exact digest input is retained to validate archives written by
+/// v0.8.37. Do not add fields or reorder this serialization.
 #[derive(serde::Serialize)]
-struct DigestInput<'a> {
+struct DigestInputV2<'a> {
     schema_version: u32,
+    session_id: i64,
+    worktree_path: &'a str,
+    disposition: &'a str,
+    head: &'a str,
+    delivery_targets: &'a [String],
+    unlanded_commits: &'a [String],
+    staged_patch_sha256: &'a str,
+    unstaged_patch_sha256: &'a str,
+    untracked_files: &'a [ArchivedFile],
+    ignored_paths: &'a [IgnoredPath],
+    ignored_files: &'a [ArchivedFile],
+    ignored_policy: &'a IgnoredPolicyProof<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct DigestInputV3<'a> {
+    schema_version: u32,
+    recovery_archive_schema_version: u32,
+    max_recovery_bundle_bytes: u64,
     session_id: i64,
     worktree_path: &'a str,
     disposition: &'a str,
@@ -192,6 +217,10 @@ struct RecoveryManifest<'a> {
     delivery_targets: &'a [String],
     landing: &'a crate::LandingVerdict,
     bundle: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bundle_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bundle_sha256: Option<&'a str>,
     unlanded_commits: &'a [String],
     staged_patch: PatchRecord<'a>,
     unstaged_patch: PatchRecord<'a>,
@@ -203,8 +232,43 @@ struct RecoveryManifest<'a> {
     ignored_policy_sha256: &'a str,
 }
 
+struct RecoveryBundleIntegrity {
+    bytes: u64,
+    sha256: String,
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn legacy_v2_cleanup_resolve_digest(
+    plan: &CleanupResolvePlan,
+    ignored_policy: &IgnoredPolicyProof<'_>,
+) -> Result<String, String> {
+    if plan.schema_version != CLEANUP_RESOLVE_SCHEMA_VERSION {
+        return Err("cannot compare a legacy archive against an unsupported resolve plan".into());
+    }
+    let digest_input = DigestInputV2 {
+        schema_version: plan.schema_version,
+        session_id: plan.session_id,
+        worktree_path: &plan.worktree_path,
+        disposition: plan.disposition.as_str(),
+        head: &plan.head,
+        delivery_targets: &plan.delivery_targets,
+        unlanded_commits: &plan.unlanded_commits,
+        staged_patch_sha256: &plan.staged_patch_sha256,
+        unstaged_patch_sha256: &plan.unstaged_patch_sha256,
+        untracked_files: &plan.untracked_files,
+        ignored_paths: &plan.ignored_paths,
+        ignored_files: &plan.ignored_files,
+        ignored_policy,
+    };
+    let serialized = serde_json::to_vec(&digest_input)
+        .map_err(|error| format!("cannot encode legacy plan digest: {error}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"aethyme-cleanup-resolve-v2\0");
+    hasher.update(serialized);
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// The portable mode field is intentionally absent where Unix mode bits are
@@ -265,6 +329,43 @@ fn read_regular_file_no_follow(path: &Path, max_bytes: u64) -> std::io::Result<V
         ));
     }
     Ok(bytes)
+}
+
+fn hash_regular_file_no_follow(path: &Path, max_bytes: u64) -> std::io::Result<(u64, String)> {
+    let (mut file, metadata) = open_regular_file_no_follow(path)?;
+    if metadata.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "regular file exceeds its hash bound",
+        ));
+    }
+    let expected_len = metadata.len();
+    let mut hasher = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        bytes = bytes.checked_add(count as u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "file length overflow")
+        })?;
+        if bytes > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "regular file grew beyond its hash bound",
+            ));
+        }
+        hasher.update(&buffer[..count]);
+    }
+    if bytes != expected_len || file.metadata()?.len() != expected_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "regular file changed while it was hashed",
+        ));
+    }
+    Ok((bytes, format!("{:x}", hasher.finalize())))
 }
 
 fn io_error(path: &Path, source: std::io::Error) -> BrokerOpError {
@@ -697,8 +798,10 @@ impl Broker {
             serde_json::to_vec(&ignored_policy_proof).map_err(|error| refuse(error.to_string()))?;
         let ignored_policy_sha256 = sha256_hex(&ignored_policy_bytes);
 
-        let digest_input = DigestInput {
+        let digest_input = DigestInputV3 {
             schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
+            recovery_archive_schema_version: RECOVERY_ARCHIVE_SCHEMA_VERSION,
+            max_recovery_bundle_bytes: MAX_RECOVERY_BUNDLE_BYTES,
             session_id,
             worktree_path: &session.worktree_path,
             disposition: item.disposition.as_str(),
@@ -713,7 +816,7 @@ impl Broker {
             ignored_policy: &ignored_policy_proof,
         };
         let mut hasher = Sha256::new();
-        hasher.update(b"aethyme-cleanup-resolve-v2\0");
+        hasher.update(b"aethyme-cleanup-resolve-v3\0");
         hasher
             .update(serde_json::to_vec(&digest_input).map_err(|error| refuse(error.to_string()))?);
         let digest = format!("{:x}", hasher.finalize());
@@ -791,6 +894,34 @@ impl Broker {
         S: Fn(&Path) -> std::io::Result<()>,
         H: FnOnce(&Path, &Path) -> Option<crate::disk_headroom::DiskHeadroom>,
     {
+        self.cleanup_resolve_apply_with_bundle_writer(
+            session_id,
+            confirm,
+            after_archive_verified,
+            sync_directory,
+            headroom_for,
+            RecoveryBundleWriter {
+                max_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+                write_to: write_recovery_bundle_to_file,
+            },
+        )
+    }
+
+    fn cleanup_resolve_apply_with_bundle_writer<F, S, H, B>(
+        &mut self,
+        session_id: i64,
+        confirm: &str,
+        after_archive_verified: F,
+        sync_directory: S,
+        headroom_for: H,
+        bundle: RecoveryBundleWriter<B>,
+    ) -> Result<CleanupResolveOutcome, BrokerOpError>
+    where
+        F: FnOnce(),
+        S: Fn(&Path) -> std::io::Result<()>,
+        H: FnOnce(&Path, &Path) -> Option<crate::disk_headroom::DiskHeadroom>,
+        B: Fn(&GitRepo, &[String], u64, Instant, &mut std::fs::File) -> Result<u64, String>,
+    {
         if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BrokerOpError::CleanupResolveConfirmationNotSha256);
         }
@@ -841,12 +972,13 @@ impl Broker {
             })?;
         let archive = archive_root.join(&name);
         let checkout = GitRepo::discover(Path::new(&plan.worktree_path))?;
-        if let Err(reason) = write_verified_archive_with_directory_sync(
+        if let Err(reason) = write_verified_archive_with_bundle_writer(
             self.repo_handle(),
             &checkout,
             &plan,
             session.task.as_deref(),
             &partial,
+            &bundle,
             &sync_directory,
         ) {
             return Err(BrokerOpError::RecoveryArchiveUnverified {
@@ -947,12 +1079,16 @@ struct StoredManifest {
     delivery_targets: Vec<String>,
     landing: serde_json::Value,
     bundle: Option<String>,
+    #[serde(default)]
+    bundle_bytes: Option<u64>,
+    #[serde(default)]
+    bundle_sha256: Option<String>,
     unlanded_commits: Vec<String>,
     staged_patch: StoredPatch,
     unstaged_patch: StoredPatch,
     untracked_directory: String,
     untracked_files: Vec<ArchivedFile>,
-    /// Absent only in legacy schema v1. `None` in schema v2 is incomplete and
+    /// Absent only in legacy schema v1. `None` in schema v2/v3 is incomplete and
     /// therefore cannot establish that an archive holds no ignored data.
     #[serde(default)]
     ignored_directory: Option<String>,
@@ -1005,9 +1141,9 @@ const MAX_RECOVERY_ARCHIVE_TREE_DEPTH: usize = 128;
 const MAX_RECOVERY_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Check the known archive payload plus the configured reserve requirement
-/// against the destination volume. The optional commit bundle, filesystem
-/// allocation overhead, and concurrent writes are excluded, so this known-minimum
-/// admission check does not guarantee the reserve will remain available.
+/// against the destination volume. When needed, the bundle's enforced maximum
+/// is included; filesystem allocation overhead and concurrent writes are not,
+/// so this known-minimum admission check does not guarantee the reserve remains.
 fn require_recovery_archive_headroom(
     available_bytes: Option<u64>,
     known_payload_bytes: u64,
@@ -1021,7 +1157,7 @@ fn require_recovery_archive_headroom(
     })?;
     if available_bytes < required {
         return Err(format!(
-            "archive destination has {available_bytes} free bytes, below the {required} bytes required for the known payload plus the {}-byte reserve. This known-minimum check excludes bundle size, filesystem allocation overhead, and concurrent writes, so it does not guarantee the reserve will remain available; the worktree was left in place",
+            "archive destination has {available_bytes} free bytes, below the {required} bytes required for the known payload plus the {}-byte reserve. The bundle maximum is included when needed; filesystem allocation overhead and concurrent writes are not, so this known-minimum check does not guarantee the reserve will remain available; the worktree was left in place",
             crate::DEFAULT_GATE_HEADROOM_BYTES
         ));
     }
@@ -1039,6 +1175,9 @@ fn known_recovery_archive_payload_bytes(plan: &CleanupResolvePlan) -> Result<u64
     let mut total = 0_u64;
     add_archive_size(&mut total, plan.staged_patch_bytes, STAGED_PATCH_FILE)?;
     add_archive_size(&mut total, plan.unstaged_patch_bytes, UNSTAGED_PATCH_FILE)?;
+    if !plan.unlanded_commits.is_empty() {
+        add_archive_size(&mut total, MAX_RECOVERY_BUNDLE_BYTES, BUNDLE_FILE)?;
+    }
 
     let worktree = Path::new(&plan.worktree_path);
     for file in plan.untracked_files.iter().chain(&plan.ignored_files) {
@@ -1092,6 +1231,35 @@ fn read_recovery_manifest(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
+    match manifest.schema_version {
+        LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION | PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+            if manifest.bundle_bytes.is_some() || manifest.bundle_sha256.is_some() {
+                return Err("legacy manifest unexpectedly contains bundle integrity fields".into());
+            }
+        }
+        RECOVERY_ARCHIVE_SCHEMA_VERSION => match manifest.bundle.as_deref() {
+            Some(_) => {
+                let Some(bytes) = manifest.bundle_bytes else {
+                    return Err("schema v3 bundle is missing its byte length".into());
+                };
+                if bytes == 0 || bytes > MAX_RECOVERY_BUNDLE_BYTES {
+                    return Err("schema v3 bundle length is outside its supported bound".into());
+                }
+                if !manifest.bundle_sha256.as_deref().is_some_and(valid_sha256) {
+                    return Err("schema v3 bundle is missing a valid SHA-256".into());
+                }
+            }
+            None => {
+                if manifest.bundle_bytes.is_some() || manifest.bundle_sha256.is_some() {
+                    return Err(
+                        "schema v3 manifest has bundle integrity fields without a bundle".into(),
+                    );
+                }
+            }
+        },
+        version => return Err(format!("manifest schema {version} is not supported")),
+    }
+
     if manifest.session_id <= 0
         || manifest.created_at_ms < 0
         || manifest.aethyme_version.is_empty()
@@ -1173,20 +1341,20 @@ fn validate_archived_file_modes(
                 ));
             }
         }
-        CLEANUP_RESOLVE_SCHEMA_VERSION => {
+        PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION | RECOVERY_ARCHIVE_SCHEMA_VERSION => {
             #[cfg(unix)]
             if files
                 .iter()
                 .any(|file| !file.symlink && file.mode.is_none())
             {
                 return Err(format!(
-                    "schema v2 {label} entry is missing its Unix file mode"
+                    "schema v2/v3 {label} entry is missing its Unix file mode"
                 ));
             }
             #[cfg(not(unix))]
             if files.iter().any(|file| file.mode.is_some()) {
                 return Err(format!(
-                    "schema v2 {label} file modes cannot be verified on this platform"
+                    "schema v2/v3 {label} file modes cannot be verified on this platform"
                 ));
             }
         }
@@ -1232,9 +1400,11 @@ fn recovery_archive_expected_files(
             }
             &[][..]
         }
-        CLEANUP_RESOLVE_SCHEMA_VERSION => {
+        PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION | RECOVERY_ARCHIVE_SCHEMA_VERSION => {
             if manifest.ignored_directory.as_deref() != Some(IGNORED_DIRECTORY) {
-                return Err("schema v2 manifest is missing its ignored directory identity".into());
+                return Err(
+                    "schema v2/v3 manifest is missing its ignored directory identity".into(),
+                );
             }
             validate_archived_file_modes(
                 "untracked",
@@ -1244,13 +1414,13 @@ fn recovery_archive_expected_files(
             let files = manifest
                 .ignored_files
                 .as_deref()
-                .ok_or_else(|| "schema v2 manifest is missing ignored_files".to_string())?;
+                .ok_or_else(|| "schema v2/v3 manifest is missing ignored_files".to_string())?;
             validate_archived_files("ignored", files)?;
             validate_archived_file_modes("ignored", files, manifest.schema_version)?;
             let ignored_paths = manifest
                 .ignored_paths
                 .as_deref()
-                .ok_or_else(|| "schema v2 manifest is missing ignored_paths".to_string())?;
+                .ok_or_else(|| "schema v2/v3 manifest is missing ignored_paths".to_string())?;
             if !manifest
                 .ignored_policy_sha256
                 .as_deref()
@@ -1258,7 +1428,7 @@ fn recovery_archive_expected_files(
                 || !manifest.plan_digest.as_deref().is_some_and(valid_sha256)
             {
                 return Err(
-                    "schema v2 manifest has an invalid plan or ignored policy identity".into(),
+                    "schema v2/v3 manifest has an invalid plan or ignored policy identity".into(),
                 );
             }
             let mut previous: Option<&str> = None;
@@ -1268,11 +1438,11 @@ fn recovery_archive_expected_files(
                 if !is_contained_relative(trimmed)
                     || previous.is_some_and(|previous| previous >= path.path.as_str())
                 {
-                    return Err("schema v2 ignored roots are invalid or unsorted".into());
+                    return Err("schema v2/v3 ignored roots are invalid or unsorted".into());
                 }
                 if path.classification == IgnoredPathClassification::PreservedFile {
                     if path.path.ends_with('/') {
-                        return Err("schema v2 preserved ignored path is a directory".into());
+                        return Err("schema v2/v3 preserved ignored path is a directory".into());
                     }
                     preserved.push(path.path.as_str());
                 }
@@ -1284,7 +1454,9 @@ fn recovery_archive_expected_files(
                     .zip(files)
                     .any(|(path, file)| *path != file.path)
             {
-                return Err("schema v2 ignored classifications do not match ignored_files".into());
+                return Err(
+                    "schema v2/v3 ignored classifications do not match ignored_files".into(),
+                );
             }
             files
         }
@@ -1353,6 +1525,7 @@ fn recovery_archive_file_set(root: &Path) -> Result<std::collections::BTreeSet<P
 }
 
 fn verify_recovery_archive_tree(root: &Path, manifest: &StoredManifest) -> Result<(), String> {
+    validate_manifest_identity(manifest)?;
     let expected = recovery_archive_expected_files(manifest)?;
     let actual = recovery_archive_file_set(root)?;
     if actual != expected {
@@ -1422,7 +1595,10 @@ fn verify_recovery_archive_tree(root: &Path, manifest: &StoredManifest) -> Resul
                 ));
             }
             if !file.symlink
-                && manifest.schema_version == CLEANUP_RESOLVE_SCHEMA_VERSION
+                && matches!(
+                    manifest.schema_version,
+                    PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION | RECOVERY_ARCHIVE_SCHEMA_VERSION
+                )
                 && permission_mode(&metadata) != file.mode
             {
                 return Err(format!(
@@ -1430,6 +1606,20 @@ fn verify_recovery_archive_tree(root: &Path, manifest: &StoredManifest) -> Resul
                     path.display()
                 ));
             }
+        }
+    }
+    if manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
+        && let Some(bundle) = manifest.bundle.as_deref()
+    {
+        let path = root.join(bundle);
+        let (bytes, sha256) = hash_regular_file_no_follow(&path, MAX_RECOVERY_BUNDLE_BYTES)
+            .map_err(|error| format!("cannot verify {BUNDLE_FILE} integrity: {error}"))?;
+        if Some(bytes) != manifest.bundle_bytes
+            || Some(sha256.as_str()) != manifest.bundle_sha256.as_deref()
+        {
+            return Err(format!(
+                "{BUNDLE_FILE} differs from its manifest integrity record"
+            ));
         }
     }
     Ok(())
@@ -1476,10 +1666,30 @@ fn verify_recovery_archive_payload_for_plan(
         .map_err(|error| format!("unreadable {MANIFEST_FILE}: {error}"))?;
     validate_manifest_identity(&manifest)?;
     verify_recovery_archive_tree(root, &manifest)?;
+    let expected_plan_digest = match manifest.schema_version {
+        PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+            let policy = crate::AutoCleanupPolicy::load(repository.root()).map_err(|reason| {
+                format!("cannot verify legacy ignored cleanup policy: {reason}")
+            })?;
+            let proof = IgnoredPolicyProof {
+                strict: policy.strict,
+                regenerable: &policy.regenerable,
+            };
+            let proof_bytes = serde_json::to_vec(&proof)
+                .map_err(|error| format!("cannot encode legacy ignored policy: {error}"))?;
+            if sha256_hex(&proof_bytes) != plan.ignored_policy_sha256 {
+                return Err("legacy archive ignored policy differs from the current plan".into());
+            }
+            Some(legacy_v2_cleanup_resolve_digest(plan, &proof)?)
+        }
+        RECOVERY_ARCHIVE_SCHEMA_VERSION => Some(plan.digest.clone()),
+        _ => None,
+    };
     let expected_landing = serde_json::to_value(&plan.landing)
         .map_err(|error| format!("cannot encode reviewed landing verdict: {error}"))?;
-    if manifest.schema_version != CLEANUP_RESOLVE_SCHEMA_VERSION
-        || manifest.plan_digest.as_deref() != Some(plan.digest.as_str())
+    if expected_plan_digest
+        .as_deref()
+        .is_none_or(|expected| manifest.plan_digest.as_deref() != Some(expected))
         || manifest.session_id != plan.session_id
         || !same_path(Path::new(&manifest.repository), repository.root())
         || manifest.worktree_path != plan.worktree_path
@@ -1537,12 +1747,8 @@ fn verify_recovery_archive_payload_for_plan(
     }
     if manifest.bundle.is_some() {
         let bundle = root.join(BUNDLE_FILE);
-        let heads = repository
-            .verify_bundle(&bundle)
-            .map_err(|error| format!("{BUNDLE_FILE} does not verify: {error}"))?;
-        if !heads.contains(&plan.head) {
-            return Err(format!("{BUNDLE_FILE} does not hold {}", plan.head));
-        }
+        let deadline = recovery_bundle_deadline()?;
+        verify_recovery_bundle(repository, &bundle, &plan.head, deadline)?;
     }
     let expected_readme = restore_readme(plan, manifest.bundle.is_some());
     let readme_path = root.join(README_FILE);
@@ -1598,7 +1804,9 @@ impl Broker {
             .map_err(|error| format!("unreadable manifest: {error}"))?;
         if !matches!(
             manifest.schema_version,
-            LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION | CLEANUP_RESOLVE_SCHEMA_VERSION
+            LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION
+                | PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION
+                | RECOVERY_ARCHIVE_SCHEMA_VERSION
         ) {
             return Err(format!(
                 "manifest schema {} is not supported",
@@ -1922,6 +2130,18 @@ fn ensure_archive_directory(root: &Path, relative: &Path) -> Result<PathBuf, Str
 }
 
 fn create_new_archive_file(root: &Path, relative: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let (path, mut file) = create_new_archive_file_handle(root, relative)?;
+    file.write_all(bytes)
+        .map_err(|error| format!("cannot write archive file {}: {error}", path.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("cannot sync archive file {}: {error}", path.display()))?;
+    Ok(path)
+}
+
+fn create_new_archive_file_handle(
+    root: &Path,
+    relative: &str,
+) -> Result<(PathBuf, std::fs::File), String> {
     if !is_contained_relative(relative) {
         return Err(format!("archive file path is not contained: {relative:?}"));
     }
@@ -1939,14 +2159,172 @@ fn create_new_archive_file(root: &Path, relative: &str, bytes: &[u8]) -> Result<
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options
+    let file = options
         .open(&path)
         .map_err(|error| format!("cannot create archive file {}: {error}", path.display()))?;
-    file.write_all(bytes)
-        .map_err(|error| format!("cannot write archive file {}: {error}", path.display()))?;
-    file.sync_all()
-        .map_err(|error| format!("cannot sync archive file {}: {error}", path.display()))?;
-    Ok(path)
+    Ok((path, file))
+}
+
+fn recovery_bundle_deadline() -> Result<Instant, String> {
+    let requested = Instant::now()
+        .checked_add(crate::git::git_timeout())
+        .ok_or_else(|| "recovery bundle deadline overflow".to_owned())?;
+    Ok(crate::git::active_git_deadline().map_or(requested, |active| active.min(requested)))
+}
+
+fn recovery_git_budget(deadline: Instant) -> Result<(Instant, Duration), String> {
+    let effective_deadline =
+        crate::git::active_git_deadline().map_or(deadline, |active| active.min(deadline));
+    let remaining = effective_deadline
+        .saturating_duration_since(Instant::now())
+        .min(crate::git::git_timeout());
+    if remaining.is_zero() {
+        return Err("recovery bundle Git deadline expired".into());
+    }
+    Ok((effective_deadline, remaining))
+}
+
+fn stream_recovery_command_stdout(
+    command: &mut Command,
+    writer: &mut std::fs::File,
+    max_bundle_bytes: u64,
+    deadline: Instant,
+) -> Result<u64, String> {
+    let (effective_deadline, budget) = recovery_git_budget(deadline)?;
+    let output = crate::bounded_output::stream_stdout_to_writer_limited_in_owned_group(
+        command,
+        budget,
+        max_bundle_bytes,
+        MAX_RECOVERY_BUNDLE_STDERR_BYTES,
+        writer,
+    )
+    .map_err(|error| format!("cannot stream recovery bundle output: {error}"))?;
+    match output {
+        crate::bounded_output::LimitedStreamOutput::Completed {
+            status,
+            stdout_bytes,
+            stderr,
+        } => {
+            if Instant::now() >= effective_deadline {
+                return Err("recovery bundle Git deadline expired".into());
+            }
+            if !status.success() {
+                return Err(format!(
+                    "Git bundle command failed: {}",
+                    String::from_utf8_lossy(&stderr).trim()
+                ));
+            }
+            if stdout_bytes == 0 {
+                return Err("Git bundle command produced an empty bundle".into());
+            }
+            Ok(stdout_bytes)
+        }
+        crate::bounded_output::LimitedStreamOutput::Deadline => {
+            Err("Git bundle command exceeded its deadline; source checkout retained".into())
+        }
+        crate::bounded_output::LimitedStreamOutput::StdoutLimit => Err(format!(
+            "Git bundle exceeded its hard {max_bundle_bytes}-byte cap; source checkout retained and bounded partial archive kept"
+        )),
+        crate::bounded_output::LimitedStreamOutput::StderrLimit => Err(format!(
+            "Git bundle stderr exceeded its {MAX_RECOVERY_BUNDLE_STDERR_BYTES}-byte cap; source checkout retained"
+        )),
+    }
+}
+
+fn write_recovery_bundle_to_file(
+    checkout: &GitRepo,
+    excluded: &[String],
+    max_bundle_bytes: u64,
+    deadline: Instant,
+    file: &mut std::fs::File,
+) -> Result<u64, String> {
+    let mut command = crate::git::git_command();
+    command
+        .args(["bundle", "create", "-", "HEAD", "--not"])
+        .args(excluded.iter().map(String::as_str))
+        .current_dir(checkout.root())
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    stream_recovery_command_stdout(&mut command, file, max_bundle_bytes, deadline)
+}
+
+fn run_recovery_git_output_limited(
+    command: &mut Command,
+    deadline: Instant,
+    label: &str,
+) -> Result<std::process::Output, String> {
+    let (effective_deadline, budget) = recovery_git_budget(deadline)?;
+    let result = crate::bounded_output::output_limited_in_owned_group(
+        command,
+        budget,
+        MAX_RECOVERY_BUNDLE_METADATA_OUTPUT_BYTES,
+    )
+    .map_err(|error| format!("cannot run {label}: {error}"))?;
+    let output = match result {
+        crate::bounded_output::LimitedOutput::Completed(output) => output,
+        crate::bounded_output::LimitedOutput::Deadline => {
+            return Err(format!("{label} exceeded its Git deadline"));
+        }
+        crate::bounded_output::LimitedOutput::OutputLimit => {
+            return Err(format!(
+                "{label} output exceeded its {MAX_RECOVERY_BUNDLE_METADATA_OUTPUT_BYTES}-byte cap"
+            ));
+        }
+    };
+    if Instant::now() >= effective_deadline {
+        return Err(format!("{label} exceeded its Git deadline"));
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "{label} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output)
+}
+
+fn verify_recovery_bundle(
+    repository: &GitRepo,
+    bundle: &Path,
+    expected_head: &str,
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut verify = crate::git::git_command();
+    verify
+        .args(["bundle", "verify", "--quiet"])
+        .arg(bundle)
+        .current_dir(repository.root())
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    run_recovery_git_output_limited(&mut verify, deadline, "Git bundle verify")?;
+
+    let mut list_heads = crate::git::git_command();
+    list_heads
+        .args(["bundle", "list-heads"])
+        .arg(bundle)
+        .current_dir(repository.root())
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    let output =
+        run_recovery_git_output_limited(&mut list_heads, deadline, "Git bundle list-heads")?;
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "Git bundle list-heads returned non-UTF-8 output".to_owned())?;
+    let mut contains_head = false;
+    let mut saw_entry = false;
+    for line in text.lines() {
+        if line.is_empty() {
+            return Err("Git bundle list-heads returned an empty entry".into());
+        }
+        let mut fields = line.split_whitespace();
+        let object = fields.next().unwrap_or_default();
+        let name = fields.next().unwrap_or_default();
+        if !valid_git_object_id(object) || name.is_empty() || fields.next().is_some() {
+            return Err("Git bundle list-heads returned a malformed entry".into());
+        }
+        saw_entry = true;
+        contains_head |= object == expected_head;
+    }
+    if !saw_entry || !contains_head {
+        return Err(format!("{BUNDLE_FILE} does not hold {expected_head}"));
+    }
+    Ok(())
 }
 
 struct CappedArchiveBuffer {
@@ -2196,6 +2574,7 @@ fn write_verified_archive(
     )
 }
 
+#[cfg(test)]
 fn write_verified_archive_with_directory_sync<S>(
     repository: &GitRepo,
     checkout: &GitRepo,
@@ -2206,6 +2585,38 @@ fn write_verified_archive_with_directory_sync<S>(
 ) -> Result<(), String>
 where
     S: Fn(&Path) -> std::io::Result<()>,
+{
+    write_verified_archive_with_bundle_writer(
+        repository,
+        checkout,
+        plan,
+        task,
+        dir,
+        &RecoveryBundleWriter {
+            max_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+            write_to: write_recovery_bundle_to_file,
+        },
+        sync_directory,
+    )
+}
+
+struct RecoveryBundleWriter<B> {
+    max_bytes: u64,
+    write_to: B,
+}
+
+fn write_verified_archive_with_bundle_writer<S, B>(
+    repository: &GitRepo,
+    checkout: &GitRepo,
+    plan: &CleanupResolvePlan,
+    task: Option<&str>,
+    dir: &Path,
+    bundle: &RecoveryBundleWriter<B>,
+    sync_directory: &S,
+) -> Result<(), String>
+where
+    S: Fn(&Path) -> std::io::Result<()>,
+    B: Fn(&GitRepo, &[String], u64, Instant, &mut std::fs::File) -> Result<u64, String>,
 {
     require_real_directory(dir)?;
     let dir = dir
@@ -2234,26 +2645,41 @@ where
         patches.push((written.bytes != 0).then_some(path));
     }
 
-    let bundle = if plan.unlanded_commits.is_empty() {
+    let bundle_integrity = if plan.unlanded_commits.is_empty() {
         None
     } else {
-        let path = create_new_archive_file(&dir, BUNDLE_FILE, &[])?;
-        checkout
-            .create_recovery_bundle(&path, &plan.delivery_targets)
-            .map_err(|error| format!("cannot write {BUNDLE_FILE}: {error}"))?;
-        let (bundle_file, _) = open_regular_file_no_follow(&path)
-            .map_err(|error| format!("cannot safely reopen {BUNDLE_FILE}: {error}"))?;
+        let deadline = recovery_bundle_deadline()?;
+        let (path, mut bundle_file) = create_new_archive_file_handle(&dir, BUNDLE_FILE)?;
+        let streamed_bytes = match (bundle.write_to)(
+            checkout,
+            &plan.delivery_targets,
+            bundle.max_bytes,
+            deadline,
+            &mut bundle_file,
+        ) {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                if let Err(sync_error) = bundle_file.sync_all() {
+                    return Err(format!(
+                        "{reason}; cannot sync partial {BUNDLE_FILE}: {sync_error}"
+                    ));
+                }
+                return Err(reason);
+            }
+        };
         bundle_file
             .sync_all()
             .map_err(|error| format!("cannot sync {BUNDLE_FILE}: {error}"))?;
-        let heads = repository
-            .verify_bundle(&path)
-            .map_err(|error| format!("{BUNDLE_FILE} does not verify: {error}"))?;
-        if !heads.contains(&plan.head) {
-            return Err(format!("{BUNDLE_FILE} does not hold {}", plan.head));
+        drop(bundle_file);
+        let (bytes, sha256) = hash_regular_file_no_follow(&path, bundle.max_bytes)
+            .map_err(|error| format!("cannot read back {BUNDLE_FILE}: {error}"))?;
+        if bytes != streamed_bytes {
+            return Err(format!("{BUNDLE_FILE} byte count changed after streaming"));
         }
-        Some(BUNDLE_FILE)
+        verify_recovery_bundle(repository, &path, &plan.head, deadline)?;
+        Some(RecoveryBundleIntegrity { bytes, sha256 })
     };
+    let bundle = bundle_integrity.as_ref().map(|_| BUNDLE_FILE);
 
     let scratch = tempfile::tempdir().map_err(|error| format!("no scratch index: {error}"))?;
     repository
@@ -2333,7 +2759,7 @@ where
     }
 
     let manifest = RecoveryManifest {
-        schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
+        schema_version: RECOVERY_ARCHIVE_SCHEMA_VERSION,
         plan_digest: &plan.digest,
         created_at_ms: now_ms(),
         aethyme_version: env!("CARGO_PKG_VERSION"),
@@ -2351,6 +2777,10 @@ where
         delivery_targets: &plan.delivery_targets,
         landing: &plan.landing,
         bundle,
+        bundle_bytes: bundle_integrity.as_ref().map(|integrity| integrity.bytes),
+        bundle_sha256: bundle_integrity
+            .as_ref()
+            .map(|integrity| integrity.sha256.as_str()),
         unlanded_commits: &plan.unlanded_commits,
         staged_patch: PatchRecord {
             file: STAGED_PATCH_FILE,
@@ -2419,6 +2849,19 @@ fn restore_readme(plan: &CleanupResolvePlan, has_bundle: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn write_over_cap_bundle(
+        _checkout: &GitRepo,
+        _delivery_targets: &[String],
+        max_bytes: u64,
+        deadline: Instant,
+        file: &mut std::fs::File,
+    ) -> Result<u64, String> {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 123456789"]);
+        stream_recovery_command_stdout(&mut command, file, max_bytes, deadline)
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
@@ -2540,9 +2983,199 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_verified_archive(&repo, &repo, &plan, None, dir.path()).unwrap();
         assert!(dir.path().join(MANIFEST_FILE).is_file());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(manifest["schema_version"], RECOVERY_ARCHIVE_SCHEMA_VERSION);
+        assert!(manifest.get("bundle_bytes").is_none());
+        assert!(manifest.get("bundle_sha256").is_none());
         assert_eq!(
             std::fs::read(dir.path().join("untracked/new.txt")).unwrap(),
             b"untracked\n"
+        );
+    }
+
+    #[test]
+    fn legacy_v2_plan_digest_keeps_its_frozen_serialization() {
+        let plan = CleanupResolvePlan {
+            schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
+            digest: String::new(),
+            session_id: 9,
+            worktree_path: "/tmp/aethyme-v2".into(),
+            branch_ref: "refs/heads/main".into(),
+            disposition: CleanupDisposition::Dirty,
+            reason: String::new(),
+            head: "1".repeat(40),
+            delivery_targets: vec!["2".repeat(40)],
+            landing: crate::LandingVerdict::NotLanded {
+                examined: 1,
+                truncated: false,
+            },
+            unlanded_commits: vec!["3".repeat(40)],
+            staged_patch_bytes: 0,
+            staged_patch_sha256: "4".repeat(40),
+            unstaged_patch_bytes: 0,
+            unstaged_patch_sha256: "5".repeat(40),
+            untracked_files: vec![ArchivedFile {
+                path: "new.txt".into(),
+                bytes: 3,
+                sha256: "6".repeat(40),
+                symlink: false,
+                mode: None,
+            }],
+            untracked_bytes: 3,
+            ignored_paths: vec![IgnoredPath {
+                path: "cache/".into(),
+                classification: IgnoredPathClassification::DisposableDirectory,
+            }],
+            ignored_files: vec![ArchivedFile {
+                path: "private.txt".into(),
+                bytes: 7,
+                sha256: "7".repeat(40),
+                symlink: false,
+                mode: None,
+            }],
+            ignored_bytes: 7,
+            ignored_policy_sha256: String::new(),
+            archive_root: PathBuf::new(),
+            apply_command: String::new(),
+            discard_command: String::new(),
+        };
+        let regenerable = vec!["dist/".to_owned(), "target/".to_owned()];
+        let policy = IgnoredPolicyProof {
+            strict: true,
+            regenerable: &regenerable,
+        };
+
+        assert_eq!(
+            legacy_v2_cleanup_resolve_digest(&plan, &policy).unwrap(),
+            "31dec7c8b3dd9700062bd6332b0e2dab83d73767ec354fb4dc0ad318658a50c8"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schema_v3_bundle_manifest_hashes_the_streamed_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        git(tmp.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(tmp.path().join("base.txt"), "base\n").unwrap();
+        git(tmp.path(), &["add", "base.txt"]);
+        git(tmp.path(), &["commit", "-qm", "initial"]);
+        let repo = GitRepo::discover(tmp.path()).unwrap();
+        let delivered = repo.head_commit().unwrap();
+        std::fs::write(tmp.path().join("pending.txt"), "pending\n").unwrap();
+        git(tmp.path(), &["add", "pending.txt"]);
+        git(tmp.path(), &["commit", "-qm", "pending"]);
+        let head = repo.head_commit().unwrap();
+        let empty_patch = sha256_hex(b"");
+        let policy = crate::AutoCleanupPolicy::load(repo.root()).unwrap();
+        let proof = IgnoredPolicyProof {
+            strict: policy.strict,
+            regenerable: &policy.regenerable,
+        };
+        let plan = CleanupResolvePlan {
+            schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
+            digest: sha256_hex(b"v3 bundle fixture plan"),
+            session_id: 9,
+            worktree_path: tmp.path().to_string_lossy().into_owned(),
+            branch_ref: "refs/heads/main".into(),
+            disposition: CleanupDisposition::Dirty,
+            reason: "fixture".into(),
+            head: head.clone(),
+            delivery_targets: vec![delivered],
+            landing: crate::LandingVerdict::NotLanded {
+                examined: 1,
+                truncated: false,
+            },
+            unlanded_commits: vec![head],
+            staged_patch_bytes: 0,
+            staged_patch_sha256: empty_patch.clone(),
+            unstaged_patch_bytes: 0,
+            unstaged_patch_sha256: empty_patch,
+            untracked_files: Vec::new(),
+            untracked_bytes: 0,
+            ignored_paths: Vec::new(),
+            ignored_files: Vec::new(),
+            ignored_bytes: 0,
+            ignored_policy_sha256: sha256_hex(&serde_json::to_vec(&proof).unwrap()),
+            archive_root: PathBuf::new(),
+            apply_command: String::new(),
+            discard_command: String::new(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        write_verified_archive(&repo, &repo, &plan, None, dir.path()).unwrap();
+
+        let manifest_path = dir.path().join(MANIFEST_FILE);
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(value["schema_version"], RECOVERY_ARCHIVE_SCHEMA_VERSION);
+        assert_eq!(value["bundle"], BUNDLE_FILE);
+        assert!(
+            value["bundle_bytes"]
+                .as_u64()
+                .is_some_and(|bytes| { bytes > 0 && bytes <= MAX_RECOVERY_BUNDLE_BYTES })
+        );
+        assert!(value["bundle_sha256"].as_str().is_some_and(valid_sha256));
+        for (field, reason) in [
+            ("bundle_bytes", "missing its byte length"),
+            ("bundle_sha256", "missing a valid SHA-256"),
+        ] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            let missing: StoredManifest = serde_json::from_value(missing).unwrap();
+            assert!(
+                validate_manifest_identity(&missing)
+                    .unwrap_err()
+                    .contains(reason)
+            );
+        }
+        let mut fields_without_bundle = value.clone();
+        fields_without_bundle["bundle"] = serde_json::Value::Null;
+        let fields_without_bundle: StoredManifest =
+            serde_json::from_value(fields_without_bundle).unwrap();
+        assert!(
+            validate_manifest_identity(&fields_without_bundle)
+                .unwrap_err()
+                .contains("integrity fields without a bundle")
+        );
+
+        let mut oversized = value.clone();
+        oversized["bundle_bytes"] = serde_json::json!(MAX_RECOVERY_BUNDLE_BYTES + 1);
+        let oversized: StoredManifest = serde_json::from_value(oversized).unwrap();
+        assert!(
+            validate_manifest_identity(&oversized)
+                .unwrap_err()
+                .contains("outside its supported bound")
+        );
+
+        let manifest_v3: StoredManifest = serde_json::from_value(value.clone()).unwrap();
+        verify_recovery_archive_payload_for_plan(&repo, dir.path(), &plan).unwrap();
+
+        let legacy_digest = legacy_v2_cleanup_resolve_digest(&plan, &proof).unwrap();
+        let mut legacy_value = value.clone();
+        legacy_value["schema_version"] =
+            serde_json::json!(PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION);
+        legacy_value["plan_digest"] = serde_json::json!(legacy_digest);
+        legacy_value.as_object_mut().unwrap().remove("bundle_bytes");
+        legacy_value
+            .as_object_mut()
+            .unwrap()
+            .remove("bundle_sha256");
+        std::fs::write(&manifest_path, serde_json::to_vec(&legacy_value).unwrap()).unwrap();
+        verify_recovery_archive_payload_for_plan(&repo, dir.path(), &plan).unwrap();
+        std::fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let bundle_path = dir.path().join(BUNDLE_FILE);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&bundle_path)
+            .unwrap()
+            .write_all(b"tamper")
+            .unwrap();
+        assert!(
+            verify_recovery_archive_tree(dir.path(), &manifest_v3)
+                .unwrap_err()
+                .contains("differs from its manifest integrity record")
         );
     }
 
@@ -2681,7 +3314,7 @@ mod tests {
         let mut value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
         #[cfg(unix)]
-        let valid_v2 = value.clone();
+        let valid_v3 = value.clone();
         let mut malformed = value.clone();
         malformed["ignored_policy_sha256"] = serde_json::json!("invalid");
         let malformed: StoredManifest = serde_json::from_value(malformed).unwrap();
@@ -2722,7 +3355,7 @@ mod tests {
 
         #[cfg(unix)]
         {
-            let mut missing_mode = valid_v2;
+            let mut missing_mode = valid_v3;
             let untracked = missing_mode["untracked_files"].as_array_mut().unwrap();
             untracked[0].as_object_mut().unwrap().remove("mode");
             let missing_mode: StoredManifest = serde_json::from_value(missing_mode).unwrap();
@@ -2733,13 +3366,38 @@ mod tests {
             );
         }
 
-        value["schema_version"] = serde_json::json!(CLEANUP_RESOLVE_SCHEMA_VERSION + 1);
+        value["schema_version"] = serde_json::json!(RECOVERY_ARCHIVE_SCHEMA_VERSION + 1);
         let future: StoredManifest = serde_json::from_value(value).unwrap();
         assert!(
             recovery_archive_expected_files(&future)
                 .unwrap_err()
                 .contains("not supported")
         );
+    }
+
+    #[test]
+    fn schema_v2_archive_and_frozen_plan_digest_remain_readable() {
+        let (_tmp, repo, mut plan) = staged_checkout();
+        let policy = crate::AutoCleanupPolicy::load(repo.root()).unwrap();
+        let proof = IgnoredPolicyProof {
+            strict: policy.strict,
+            regenerable: &policy.regenerable,
+        };
+        plan.ignored_policy_sha256 = sha256_hex(&serde_json::to_vec(&proof).unwrap());
+        let legacy_digest = legacy_v2_cleanup_resolve_digest(&plan, &proof).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        write_verified_archive(&repo, &repo, &plan, None, dir.path()).unwrap();
+
+        let manifest_path = dir.path().join(MANIFEST_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        value["schema_version"] = serde_json::json!(PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION);
+        value["plan_digest"] = serde_json::json!(legacy_digest);
+        value.as_object_mut().unwrap().remove("bundle_bytes");
+        value.as_object_mut().unwrap().remove("bundle_sha256");
+        std::fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        verify_recovery_archive_payload_for_plan(&repo, dir.path(), &plan).unwrap();
     }
 
     #[test]
@@ -3070,6 +3728,69 @@ mod tests {
                 "{case}: no partial archive or payload should be written"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_limit_refusal_keeps_source_and_bounded_partial_archive() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("bundle cap refusal fixture", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        let committed = worktree.join("pending.txt");
+        std::fs::write(&committed, "pending commit data\n").unwrap();
+        git(&worktree, &["add", "pending.txt"]);
+        git(&worktree, &["commit", "-qm", "pending"]);
+        broker.close(session.id).unwrap();
+
+        let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+        assert!(!plan.unlanded_commits.is_empty());
+        let error = broker
+            .cleanup_resolve_apply_with_bundle_writer(
+                session.id,
+                &plan.digest,
+                || panic!("bundle refusal must happen before archive verification"),
+                sync_archive_directory,
+                |_, _| {
+                    Some(crate::disk_headroom::DiskHeadroom {
+                        bytes: u64::MAX,
+                        inodes: None,
+                    })
+                },
+                RecoveryBundleWriter {
+                    max_bytes: 8,
+                    write_to: write_over_cap_bundle,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("hard 8-byte cap"), "{error}");
+        assert!(worktree.is_dir());
+        assert_eq!(std::fs::read(&committed).unwrap(), b"pending commit data\n");
+        let entries = std::fs::read_dir(&plan.archive_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].extension().and_then(|ext| ext.to_str()),
+            Some("partial")
+        );
+        let partial_bundle = entries[0].join(BUNDLE_FILE);
+        assert_eq!(std::fs::metadata(&partial_bundle).unwrap().len(), 8);
+        assert_eq!(std::fs::read(partial_bundle).unwrap(), b"12345678");
+        assert!(!entries[0].join(MANIFEST_FILE).exists());
     }
 
     #[cfg(unix)]

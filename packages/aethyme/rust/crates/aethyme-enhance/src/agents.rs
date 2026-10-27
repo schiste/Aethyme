@@ -545,11 +545,13 @@ blocked.
    leases or in files that were untracked before your session began.
 
    For preservation archives, check free space on the actual destination
-   volume against checked known payload and metadata sizes plus the configured
-   reserve before staging. Treat this as known-minimum admission only: bundle
-   size, filesystem allocation overhead, and concurrent writes are excluded, so
-   the reserve is not guaranteed to remain available. Keep the source until the
-   archive is fully written and verified.
+   volume against checked payload and metadata sizes, plus the configured
+   reserve, before staging. If commits need a Git bundle, include its enforced
+   1 GiB output cap in this known minimum. The check excludes filesystem
+   allocation overhead and concurrent writes, so the reserve is not guaranteed
+   to remain available. A bundle cap refusal keeps the source and leaves the
+   bounded partial bundle for diagnosis. Keep the source until the archive is
+   fully written, verified and synced.
 
 4. **While working**: commit early and small. Only committed work can be
    verified and integrated. Never switch branches inside someone else's
@@ -1160,8 +1162,13 @@ mod tests {
             "aethyme broker advanced leases claim <path>",
             "aethyme broker advanced exec --session",
             "For preservation archives, check free space on the actual destination",
-            "Treat this as known-minimum admission only",
-            "reserve is not guaranteed to remain available",
+            "allocation overhead and concurrent writes",
+            "If commits need a Git bundle, include its enforced",
+            "1 GiB output cap in this known minimum",
+            "so the reserve is not guaranteed",
+            "A bundle cap refusal keeps the source and leaves the",
+            "bounded partial bundle for diagnosis",
+            "fully written, verified and synced",
             "AETHYME_TEST_DB_SUFFIX",
             "aethyme broker finish cleanup --all-cleaned --apply",
             "aethyme broker advanced operations reconcile",
