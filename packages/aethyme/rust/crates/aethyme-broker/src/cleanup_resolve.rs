@@ -284,6 +284,37 @@ fn legacy_v2_cleanup_resolve_digest(
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// V3 serialized the same fields as V4, but bound the complete ignored listing.
+/// Retain its exact domain and field order for archives from earlier runtimes.
+fn legacy_v3_cleanup_resolve_digest(
+    plan: &CleanupResolvePlan,
+    ignored_policy: &IgnoredPolicyProof<'_>,
+) -> Result<String, String> {
+    let input = DigestInputV4 {
+        schema_version: plan.schema_version,
+        recovery_archive_schema_version: RECOVERY_ARCHIVE_SCHEMA_VERSION,
+        max_recovery_bundle_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+        session_id: plan.session_id,
+        worktree_path: &plan.worktree_path,
+        disposition: plan.disposition.as_str(),
+        head: &plan.head,
+        delivery_targets: &plan.delivery_targets,
+        unlanded_commits: &plan.unlanded_commits,
+        staged_patch_sha256: &plan.staged_patch_sha256,
+        unstaged_patch_sha256: &plan.unstaged_patch_sha256,
+        untracked_files: &plan.untracked_files,
+        ignored_paths: &plan.ignored_paths,
+        ignored_files: &plan.ignored_files,
+        ignored_policy,
+    };
+    let serialized = serde_json::to_vec(&input)
+        .map_err(|error| format!("cannot encode legacy v3 plan digest: {error}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"aethyme-cleanup-resolve-v3\0");
+    hasher.update(serialized);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 /// The portable mode field is intentionally absent where Unix mode bits are
 /// unavailable. Never guess a mode on another platform.
 fn permission_mode(metadata: &std::fs::Metadata) -> Option<u32> {
@@ -1696,7 +1727,28 @@ fn verify_recovery_archive_payload_for_plan(
             }
             Some(legacy_v2_cleanup_resolve_digest(plan, &proof)?)
         }
-        RECOVERY_ARCHIVE_SCHEMA_VERSION => Some(plan.digest.clone()),
+        RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+            if manifest.plan_digest.as_deref() == Some(plan.digest.as_str()) {
+                Some(plan.digest.clone())
+            } else {
+                let policy =
+                    crate::AutoCleanupPolicy::load(repository.root()).map_err(|reason| {
+                        format!("cannot verify legacy ignored cleanup policy: {reason}")
+                    })?;
+                let proof = IgnoredPolicyProof {
+                    strict: policy.strict,
+                    regenerable: &policy.regenerable,
+                };
+                let bytes = serde_json::to_vec(&proof)
+                    .map_err(|error| format!("cannot encode legacy ignored policy: {error}"))?;
+                if sha256_hex(&bytes) != plan.ignored_policy_sha256 {
+                    return Err(
+                        "legacy archive ignored policy differs from the current plan".into(),
+                    );
+                }
+                Some(legacy_v3_cleanup_resolve_digest(plan, &proof)?)
+            }
+        }
         _ => None,
     };
     let expected_landing = serde_json::to_value(&plan.landing)
@@ -1719,7 +1771,9 @@ fn verify_recovery_archive_payload_for_plan(
         || manifest.unstaged_patch.sha256 != plan.unstaged_patch_sha256
         || manifest.untracked_files != plan.untracked_files
         || !manifest.ignored_paths.as_deref().is_some_and(|paths| {
-            if manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION {
+            if manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
+                && manifest.plan_digest.as_deref() == Some(plan.digest.as_str())
+            {
                 authorization_ignored_paths(paths)
                     == authorization_ignored_paths(&plan.ignored_paths)
             } else {
@@ -3419,6 +3473,30 @@ mod tests {
         std::fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
 
         verify_recovery_archive_payload_for_plan(&repo, dir.path(), &plan).unwrap();
+    }
+
+    #[test]
+    fn schema_v3_archive_with_previous_digest_remains_readable() {
+        let (_tmp, repo, plan) = staged_checkout();
+        let policy = crate::AutoCleanupPolicy::load(repo.root()).unwrap();
+        let proof = IgnoredPolicyProof {
+            strict: policy.strict,
+            regenerable: &policy.regenerable,
+        };
+        let digest = legacy_v3_cleanup_resolve_digest(&plan, &proof).unwrap();
+        assert_ne!(digest, plan.digest);
+        let dir = tempfile::tempdir().unwrap();
+        write_verified_archive(&repo, &repo, &plan, None, dir.path()).unwrap();
+        let path = dir.path().join(MANIFEST_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["plan_digest"] = serde_json::json!(digest);
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        verify_recovery_archive_payload_for_plan(&repo, dir.path(), &plan).unwrap();
+
+        let mut changed = plan.clone();
+        changed.delivery_targets.push("different-target".into());
+        assert!(verify_recovery_archive_payload_for_plan(&repo, dir.path(), &changed).is_err());
     }
 
     #[test]
