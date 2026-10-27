@@ -2949,6 +2949,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn schema_v3_bundle_manifest_hashes_the_streamed_bundle() {
         let tmp = tempfile::tempdir().unwrap();
