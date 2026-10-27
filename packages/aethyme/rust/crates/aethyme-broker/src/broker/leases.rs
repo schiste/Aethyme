@@ -328,6 +328,7 @@ struct GuardedExecOptions {
 pub(crate) struct GuardedExecCliReport {
     pub report: GuardedExecReport,
     pub receipt_id: String,
+    pub command_ran: Option<bool>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -341,6 +342,7 @@ pub(crate) struct GuardedCommitCliReport {
     pub post_commit_audit_error: Option<String>,
     pub post_commit_audit_complete: bool,
     pub ok: bool,
+    pub command_ran: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1989,20 +1991,25 @@ impl Broker {
         } else {
             std::process::Stdio::inherit()
         };
-        let (report, receipt_id) = self.guarded_exec_with_env_heartbeat_mode_and_output(
-            session_id,
-            command,
-            &[],
-            || Ok(()),
-            move || mode,
-            GuardedExecOptions {
-                stdout,
-                supervised_timeout,
-                record_receipt: true,
-            },
-        )?;
+        let (report, receipt_id, command_ran) = self
+            .guarded_exec_with_env_heartbeat_mode_and_output(
+                session_id,
+                command,
+                &[],
+                || Ok(()),
+                move || mode,
+                GuardedExecOptions {
+                    stdout,
+                    supervised_timeout,
+                    record_receipt: true,
+                },
+            )?;
         let receipt_id = receipt_id.expect("CLI guarded exec always records a receipt");
-        Ok(GuardedExecCliReport { report, receipt_id })
+        Ok(GuardedExecCliReport {
+            report,
+            receipt_id,
+            command_ran,
+        })
     }
 
     /// Run one local Git commit under the session-local cooperative lane.
@@ -2115,6 +2122,7 @@ impl Broker {
             json_mode,
             requested_timeout,
         )?;
+        let command_ran = execution.command_ran;
 
         let mut head_after = None;
         let mut committed_paths = None;
@@ -2213,6 +2221,7 @@ impl Broker {
             post_commit_audit_error,
             post_commit_audit_complete,
             ok,
+            command_ran,
         })
     }
 
@@ -2346,7 +2355,7 @@ impl Broker {
                 record_receipt: false,
             },
         )
-        .map(|(report, _)| report)
+        .map(|(report, _, _)| report)
     }
 
     fn guarded_exec_with_env_heartbeat_mode_and_output<F, M>(
@@ -2357,7 +2366,7 @@ impl Broker {
         mut heartbeat: F,
         select_mode: M,
         output: GuardedExecOptions,
-    ) -> Result<(GuardedExecReport, Option<String>), BrokerOpError>
+    ) -> Result<(GuardedExecReport, Option<String>, Option<bool>), BrokerOpError>
     where
         F: FnMut() -> Result<(), BrokerOpError>,
         M: FnOnce() -> crate::inline_exec_supervisor::GenericExecMode,
@@ -2633,7 +2642,7 @@ impl Broker {
                 })
             },
         )
-        .map(|(report, _)| report)
+        .map(|(report, _, _)| report)
     }
 
     fn guarded_exec_with_runner<F>(
@@ -2642,7 +2651,7 @@ impl Broker {
         command: &[String],
         record_receipt: bool,
         run: F,
-    ) -> Result<(GuardedExecReport, Option<String>), BrokerOpError>
+    ) -> Result<(GuardedExecReport, Option<String>, Option<bool>), BrokerOpError>
     where
         F: FnOnce(
             &crate::types::Session,
@@ -2907,7 +2916,7 @@ impl Broker {
                 )),
             )?;
         }
-        Ok((report, receipt_id))
+        Ok((report, receipt_id, status.command_started.then_some(true)))
     }
 }
 
@@ -3586,6 +3595,8 @@ mod generic_guarded_exec_tests {
                 .unwrap();
             let head_before = GitRepo::discover(&worktree).unwrap().head_commit().unwrap();
 
+            // SAFETY: this test re-executes only itself in a child process;
+            // no other test or concurrent environment reader runs there.
             unsafe { std::env::set_var("GIT_DIR", "/untrusted/git-dir") };
             let refusal = broker
                 .guarded_commit_for_cli(
@@ -3597,8 +3608,9 @@ mod generic_guarded_exec_tests {
                     None,
                 )
                 .unwrap_err();
+            // SAFETY: the same isolated test process is still the only code
+            // running here, and restoring precedes any later Git use.
             unsafe { std::env::remove_var("GIT_DIR") };
-
             assert!(
                 matches!(refusal, BrokerOpError::SessionCommitRefused { .. }),
                 "{refusal}"
@@ -4266,7 +4278,7 @@ mod generic_guarded_exec_tests {
         let session = broker
             .start_worktree("unconfirmed timeout receipt", None)
             .unwrap();
-        let (report, receipt_id) = broker
+        let (report, receipt_id, command_ran) = broker
             .guarded_exec_with_runner(
                 session.id,
                 &["/bin/sh".into(), "-c".into(), "exit 0".into()],
@@ -4284,6 +4296,7 @@ mod generic_guarded_exec_tests {
             .unwrap();
 
         assert!(report.command_timed_out);
+        assert_eq!(command_ran, None);
         let receipt = broker
             .store
             .guarded_exec_receipt(session.id, receipt_id.as_deref().unwrap())

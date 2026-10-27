@@ -886,8 +886,10 @@ post-commit audit is unknown. Only the broker's own preflight refusals above
 are guaranteed to happen before receipt creation. A supervisor/helper setup or
 launch failure after preflight can leave a `starting` receipt and no commit
 report; inspect `aethyme broker advanced exec-status` and treat an unresolved
-receipt as unknown. Every returned JSON report sets `command_ran` to true.
-Inspect the receipt and reported paths before retrying.
+receipt as unknown. `command_ran` is true only when the supervisor confirms
+command start; it is null when a timeout leaves dispatch unconfirmed. Null is
+unknown, not proof that the command did not run. Inspect the receipt and
+reported paths before retrying.
 
 ### Lease scope and guarded-execution reporting
 

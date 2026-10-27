@@ -732,7 +732,6 @@ pub(super) fn run_commit(parsed: Parsed) -> Result<(), UsageError> {
         let object = value
             .as_object_mut()
             .expect("guarded commit report is an object");
-        object.insert("command_ran".into(), serde_json::Value::Bool(true));
         object.insert(
             "outcome".into(),
             serde_json::Value::String(
@@ -768,7 +767,14 @@ pub(super) fn run_commit(parsed: Parsed) -> Result<(), UsageError> {
                 .map(|code| format!(" ({code})"))
                 .unwrap_or_default()
         );
-        out!("  command ran: yes");
+        out!(
+            "  command ran: {}",
+            match report.command_ran {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "unknown",
+            }
+        );
         out!("  execution receipt: {}", report.execution_receipt_id);
         out!(
             "  committed-path ownership audit: {}",
