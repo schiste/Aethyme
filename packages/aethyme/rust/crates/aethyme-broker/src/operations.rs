@@ -1093,6 +1093,19 @@ impl fmt::Display for UnknownOutcomeRecovery {
             self.canonical_repository
         )?;
         writeln!(formatter, "Operation ID: {}", self.operation_id)?;
+        writeln!(
+            formatter,
+            "First inspect the original operation's command and owning session:"
+        )?;
+        writeln!(
+            formatter,
+            "  aethyme broker advanced operations show {} --json",
+            self.operation_id
+        )?;
+        writeln!(
+            formatter,
+            "The blocking operation may belong to another request or session. Evidence about the currently blocked command does not establish the original operation's outcome; coordinate with its owner before reconciling."
+        )?;
         writeln!(formatter, "{}", self.inspection_instruction())?;
         writeln!(
             formatter,
