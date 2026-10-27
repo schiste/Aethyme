@@ -107,6 +107,7 @@ struct PinnedOrphanRoot {
     root: std::fs::File,
     name: std::ffi::CString,
     identity: (u64, u64),
+    root_generation_sha256: String,
     filesystem_identity: Vec<u8>,
     mount_identity: Vec<u8>,
 }
@@ -442,6 +443,9 @@ impl PinnedOrphanRoot {
                     .into(),
             );
         }
+        let root_generation_sha256 = proof.root_generation_sha256.clone().ok_or_else(|| {
+            "orphan root generation is unavailable; preserved it for inspection".to_string()
+        })?;
         let root_filesystem_identity = filesystem_identity(root.as_raw_fd())
             .map_err(|error| format!("cannot inspect orphan root volume: {error}"))?;
         let root_mount_identity = mount_identity(root.as_raw_fd())
@@ -461,6 +465,7 @@ impl PinnedOrphanRoot {
             root,
             name,
             identity,
+            root_generation_sha256,
             filesystem_identity: root_filesystem_identity,
             mount_identity: root_mount_identity,
         };
@@ -487,7 +492,16 @@ impl PinnedOrphanRoot {
                 && entry.inode == self.identity.1
                 && mode_has_type(entry.mode, libc::S_IFDIR)
         }) {
-            Ok(())
+            if crate::root_generation::read_fd(self.root.as_raw_fd()).as_deref()
+                == Some(self.root_generation_sha256.as_str())
+            {
+                Ok(())
+            } else {
+                Err(
+                    "orphan root generation changed or is unavailable; preserved it for inspection"
+                        .into(),
+                )
+            }
         } else {
             Err("orphan root binding changed; preserved it for inspection".into())
         }
