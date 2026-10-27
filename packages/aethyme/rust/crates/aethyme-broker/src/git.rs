@@ -164,19 +164,41 @@ pub(crate) fn suspend_git_deadline() -> GitDeadlineGuard {
 /// reported as not landed is merely kept.
 const PATCH_ID_ARGS: [&str; 2] = ["patch-id", "--verbatim"];
 
-// `git patch-id --verbatim` hashes full pre/post blob IDs for binary diffs
-// and skips their bodies. Keep those full IDs while avoiding binary patch
-// compression and base85 encoding in this streamed producer.
-const FIRST_PARENT_PATCH_ID_LOG_ARGS: [&str; 8] = [
-    "log",
-    "--no-walk=unsorted",
-    "--stdin",
+/// Diff formatting shared by recovery patches and patch-ID producers.
+const PINNED_DIFF_FORMAT_ARGS: [&str; 5] = [
     "--no-color",
-    "-p",
-    "--full-index",
-    "--diff-merges=first-parent",
-    "--format=commit %H",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
 ];
+
+/// Additional options that make every patch-ID producer compare the same
+/// complete, deterministic change set.
+const PATCH_ID_DIFF_ARGS: [&str; 6] = [
+    "--full-index",
+    "--ignore-submodules=none",
+    "--no-renames",
+    "--diff-algorithm=myers",
+    "--no-indent-heuristic",
+    "--unified=3",
+];
+
+const MAX_LITERAL_PATHSPEC_BATCH_BYTES: usize = 64 * 1024;
+const MAX_LITERAL_PATHSPEC_BATCH_COUNT: usize = 256;
+
+fn patch_id_diff_args() -> Vec<&'static str> {
+    let mut args = PINNED_DIFF_FORMAT_ARGS.to_vec();
+    args.extend(PATCH_ID_DIFF_ARGS);
+    args
+}
+
+fn first_parent_patch_id_log_args() -> Vec<&'static str> {
+    let mut args = vec!["log", "--no-walk=unsorted", "--stdin", "-p"];
+    args.extend(patch_id_diff_args());
+    args.extend(["--diff-merges=first-parent", "--format=commit %H"]);
+    args
+}
 
 /// Which side of a symmetric `left...right` range [`GitRepo::cherry_marked`]
 /// lists.
@@ -415,6 +437,36 @@ fn parse_nul_paths(out: &str) -> Vec<String> {
     out.split('\0')
         .filter(|chunk| !chunk.is_empty() && !chunk.contains('\n'))
         .map(str::to_string)
+        .collect()
+}
+
+/// Decode raw `-z` path output for cleanup-authority checks. Unlike the
+/// implicit-lease parser above, a newline is valid filename content here and
+/// must be preserved. Malformed framing and non-UTF-8 names refuse the check.
+fn parse_nul_paths_strict(out: &[u8], args: &[&str]) -> Result<Vec<String>, GitError> {
+    let invalid = || GitError::UntrustedOutput {
+        detail: format!(
+            "git {} emitted malformed or non-UTF-8 NUL-separated paths",
+            args.join(" ")
+        ),
+    };
+    if out.is_empty() {
+        return Ok(Vec::new());
+    }
+    if out.last() != Some(&0) {
+        return Err(invalid());
+    }
+
+    out[..out.len() - 1]
+        .split(|byte| *byte == 0)
+        .map(|path| {
+            if path.is_empty() {
+                return Err(invalid());
+            }
+            std::str::from_utf8(path)
+                .map(str::to_string)
+                .map_err(|_| invalid())
+        })
         .collect()
 }
 
@@ -3725,7 +3777,7 @@ impl GitRepo {
         if commits.is_empty() {
             return Ok(patch_ids);
         }
-        let log_args = FIRST_PARENT_PATCH_ID_LOG_ARGS;
+        let log_args = first_parent_patch_id_log_args();
         let pipeline_args = format!("{} | patch-id --verbatim", log_args.join(" "));
         let started = Instant::now();
         let deadline = effective_git_deadline(&pipeline_args, git_timeout(), started)?;
@@ -3733,7 +3785,7 @@ impl GitRepo {
             .map_err(|error| git_batch_input_error(&pipeline_args, started, deadline, error))?;
         let budget = remaining_git_budget(&pipeline_args, deadline)?;
         let mut log = git_command();
-        log.args(log_args).current_dir(&self.root);
+        log.args(&log_args).current_dir(&self.root);
         // The diff streams from one process into the other through a pipe,
         // so it is never held in memory however much history it covers.
         let mut patch_id = git_command();
@@ -3845,20 +3897,23 @@ impl GitRepo {
     }
 
     /// Verbatim patch id (`git patch-id --verbatim`) for the cumulative diff
-    /// `from..to`. Empty diffs
-    /// have no patch id and return `None`.
+    /// `from..to`, using the same pinned diff rendering as
+    /// [`Self::first_parent_patch_ids`]. Empty diffs have no patch id and
+    /// return `None`.
     pub fn patch_id_between(&self, from: &str, to: &str) -> Result<Option<String>, GitError> {
-        let diff = git_command()
-            .args(["diff", "--binary", from, to, "--"])
-            .current_dir(&self.root)
-            .output()
-            .map_err(|source| GitError::Spawn {
-                args: "diff --binary".into(),
-                source,
-            })?;
+        let mut diff_args = vec!["diff"];
+        diff_args.extend(patch_id_diff_args());
+        diff_args.extend([from, to, "--"]);
+        let diff_args_display = diff_args.join(" ");
+        let mut command = git_command();
+        command.args(&diff_args).current_dir(&self.root);
+        let diff = command.output().map_err(|source| GitError::Spawn {
+            args: diff_args_display.clone(),
+            source,
+        })?;
         if !diff.status.success() {
             return Err(GitError::Git {
-                args: "diff --binary".into(),
+                args: diff_args_display,
                 stderr: String::from_utf8_lossy(&diff.stderr).trim().to_string(),
             });
         }
@@ -3924,36 +3979,96 @@ impl GitRepo {
             return Ok(true);
         }
         require_trustworthy_porcelain()?;
-        let mut args: Vec<String> = vec![
-            "diff".into(),
-            "--name-only".into(),
-            "-z".into(),
-            left.into(),
-            right.into(),
-            "--".into(),
+        const DIFF_ARGS: &str = "diff --literal-pathspecs --name-only --no-renames";
+        const DIFF_COMMAND: &[&str] = &[
+            "--literal-pathspecs",
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=none",
+            "-z",
         ];
-        args.extend(paths.iter().cloned());
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = run_git(&self.root, &args)?;
-        if out.is_empty() {
-            return Ok(true);
+        let started = Instant::now();
+        let deadline = effective_git_deadline(DIFF_ARGS, git_timeout(), started)?;
+        let _deadline = limit_git_until(deadline);
+
+        let mut total_input_bytes = 0_usize;
+        for path in paths {
+            remaining_git_budget(DIFF_ARGS, deadline)?;
+            let Some(path_bytes) = path.len().checked_add(1) else {
+                return Err(GitError::Git {
+                    args: DIFF_ARGS.into(),
+                    stderr: "pathspec byte count overflowed".into(),
+                });
+            };
+            let Some(next_total) = total_input_bytes.checked_add(path_bytes) else {
+                return Err(GitError::Git {
+                    args: DIFF_ARGS.into(),
+                    stderr: "pathspec byte count overflowed".into(),
+                });
+            };
+            if paths.len() > MAX_GIT_BATCH_QUERY_COUNT || next_total > MAX_GIT_BATCH_INPUT_BYTES {
+                return Err(GitError::Git {
+                    args: DIFF_ARGS.into(),
+                    stderr: format!(
+                        "pathspec input exceeded {MAX_GIT_BATCH_QUERY_COUNT} paths or {MAX_GIT_BATCH_INPUT_BYTES} bytes"
+                    ),
+                });
+            }
+            total_input_bytes = next_total;
         }
-        if !parse_nul_paths(&out).is_empty() {
-            return Ok(false);
+
+        let mut start = 0;
+        while start < paths.len() {
+            remaining_git_budget(DIFF_ARGS, deadline)?;
+            let mut end = start;
+            let mut batch_bytes = 0_usize;
+            while end < paths.len() && end - start < MAX_LITERAL_PATHSPEC_BATCH_COUNT {
+                let path_bytes = paths[end].len().saturating_add(1);
+                if path_bytes > MAX_LITERAL_PATHSPEC_BATCH_BYTES {
+                    return Err(GitError::Git {
+                        args: DIFF_ARGS.into(),
+                        stderr: format!(
+                            "one pathspec exceeded {MAX_LITERAL_PATHSPEC_BATCH_BYTES} bytes"
+                        ),
+                    });
+                }
+                if batch_bytes.saturating_add(path_bytes) > MAX_LITERAL_PATHSPEC_BATCH_BYTES {
+                    break;
+                }
+                batch_bytes += path_bytes;
+                end += 1;
+            }
+            if end == start {
+                return Err(GitError::Git {
+                    args: DIFF_ARGS.into(),
+                    stderr: "could not make progress while batching pathspecs".into(),
+                });
+            }
+
+            let mut args = vec![
+                "--literal-pathspecs",
+                "diff",
+                "--name-only",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=none",
+                "-z",
+                left,
+                right,
+                "--",
+            ];
+            args.extend(paths[start..end].iter().map(String::as_str));
+            let out = run_git_bytes(&self.root, &args)?;
+            if !parse_nul_paths_strict(&out, DIFF_COMMAND)?.is_empty() {
+                return Ok(false);
+            }
+            start = end;
         }
-        // Bytes that are neither a path nor nothing. [`parse_nul_paths`] is
-        // conservative for dirtiness -- it drops a decoration rather than let
-        // it become a lease -- but dropping it here would answer "identical",
-        // and this predicate's wrong answer costs work rather than bytes.
-        // Decoration-only output is indistinguishable from a real path
-        // swallowed by a decoration glued to it, so refuse instead of guess.
-        Err(GitError::UntrustedOutput {
-            detail: format!(
-                "git diff --name-only emitted {} bytes holding no path while comparing \
-                 {left} and {right}; a PATH wrapper is rewriting git output",
-                out.len()
-            ),
-        })
+        Ok(true)
     }
 
     /// Simulate merging `head` onto `base` without touching any worktree
@@ -4086,13 +4201,44 @@ impl GitRepo {
         run_git(&self.root, &["show", "-s", "--format=%B", commit])
     }
 
-    /// Changed files between two commits (for affected-gate selection on
-    /// a simulated merged tree).
+    /// Changed paths between two commits with Git's rename-aware projection.
+    /// A rename is reported at its destination, preserving the lease and
+    /// changed-path behavior expected by existing callers.
     pub fn changed_between(&self, from: &str, to: &str) -> Result<Vec<String>, GitError> {
-        Ok(parse_nul_paths(&run_git(
-            &self.root,
-            &["diff", "--name-only", "-z", from, to],
-        )?))
+        self.changed_between_with_rename_policy(from, to, "--find-renames")
+    }
+
+    /// Complete changed-path census with rename collapsing disabled. This is
+    /// for content proofs that must account for both sides of a rename.
+    pub(crate) fn changed_between_all_paths(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<String>, GitError> {
+        self.changed_between_with_rename_policy(from, to, "--no-renames")
+    }
+
+    fn changed_between_with_rename_policy(
+        &self,
+        from: &str,
+        to: &str,
+        rename_policy: &str,
+    ) -> Result<Vec<String>, GitError> {
+        require_trustworthy_porcelain()?;
+        let args = [
+            "diff",
+            "--name-only",
+            rename_policy,
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=none",
+            "-z",
+            from,
+            to,
+            "--",
+        ];
+        let out = run_git_bytes(&self.root, &args)?;
+        parse_nul_paths_strict(&out, &args)
     }
 
     /// Changed files for gate trigger evaluation. Rename collapsing is
@@ -4563,15 +4709,9 @@ impl GitRepo {
             "-c",
             "diff.mnemonicPrefix=false",
             "diff",
-            "--binary",
-            "--full-index",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-renames",
-            "--src-prefix=a/",
-            "--dst-prefix=b/",
         ];
+        args.extend(PINNED_DIFF_FORMAT_ARGS);
+        args.extend(["--binary", "--full-index", "--no-renames"]);
         if cached {
             args.push("--cached");
         }
@@ -5417,6 +5557,31 @@ mod nul_path_tests {
     fn empty_output_yields_no_paths() {
         assert!(parse_nul_paths("").is_empty());
         assert!(parse_nul_paths("\0\0").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod strict_nul_path_tests {
+    use super::{GitError, parse_nul_paths_strict};
+
+    #[test]
+    fn strict_nul_paths_preserve_newlines_and_reject_malformed_or_non_utf8() {
+        let args = ["diff", "--name-only", "-z"];
+        assert_eq!(
+            parse_nul_paths_strict(b"tracked\nname\0plain.txt\0", &args).unwrap(),
+            vec!["tracked\nname", "plain.txt"]
+        );
+        assert!(matches!(
+            parse_nul_paths_strict(b"invalid-\xffname\0", &args),
+            Err(GitError::UntrustedOutput { .. })
+        ));
+        for malformed in [&b"unterminated"[..], &b"path\0\0"[..]] {
+            assert!(matches!(
+                parse_nul_paths_strict(malformed, &args),
+                Err(GitError::UntrustedOutput { .. })
+            ));
+        }
+        assert!(parse_nul_paths_strict(b"", &args).unwrap().is_empty());
     }
 }
 
@@ -6817,20 +6982,21 @@ mod batched_commit_tests {
             .first_parent_patch_ids(&with_parents)
             .expect("patch ids");
 
-        const LEGACY_BINARY_LOG_ARGS: [&str; 8] = [
-            "log",
-            "--no-walk=unsorted",
-            "--stdin",
-            "--no-color",
-            "-p",
+        // Keep the independent binary-patch oracle under the same pinned diff
+        // semantics; its only producer difference is `--binary` vs
+        // `--full-index`.
+        let mut legacy_binary_log_args = vec!["log", "--no-walk=unsorted", "--stdin", "-p"];
+        legacy_binary_log_args.extend(patch_id_diff_args());
+        legacy_binary_log_args.extend([
             "--binary",
             "--diff-merges=first-parent",
             "--format=commit %H",
-        ];
+        ]);
         let (legacy_patch_ids, legacy_log) =
-            patch_ids_for_log_args(root, &with_parents, &LEGACY_BINARY_LOG_ARGS);
+            patch_ids_for_log_args(root, &with_parents, &legacy_binary_log_args);
+        let production_log_args = first_parent_patch_id_log_args();
         let (full_index_patch_ids, full_index_log) =
-            patch_ids_for_log_args(root, &with_parents, &FIRST_PARENT_PATCH_ID_LOG_ARGS);
+            patch_ids_for_log_args(root, &with_parents, &production_log_args);
         assert_eq!(
             patch_ids, legacy_patch_ids,
             "optimized stream vs old --binary producer"
@@ -7037,6 +7203,273 @@ mod batched_commit_tests {
                 .expect("left-side exact comparison")
         );
         assert_eq!(exact_paired.right_only, marked("exact"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_id_producers_ignore_textconv_and_external_diff_configuration() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join(".gitattributes"), "*.txt diff=normalize\n")
+            .expect("write attributes");
+        std::fs::write(root.join("sample.txt"), "base raw\n").expect("write base");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "base"]);
+        let base = run(root, &["rev-parse", "HEAD"]);
+
+        run(root, &["switch", "-q", "-c", "session"]);
+        std::fs::write(root.join("sample.txt"), "session raw\n").expect("write session");
+        run(root, &["commit", "-qam", "session"]);
+        let session = run(root, &["rev-parse", "HEAD"]);
+
+        run(root, &["switch", "-q", "-c", "candidate-match", &base]);
+        std::fs::write(root.join("sample.txt"), "session raw\n").expect("write match");
+        run(root, &["commit", "-qam", "matching candidate"]);
+        let matching = run(root, &["rev-parse", "HEAD"]);
+
+        run(root, &["switch", "-q", "-c", "candidate-different", &base]);
+        std::fs::write(root.join("sample.txt"), "candidate raw\n").expect("write mismatch");
+        run(root, &["commit", "-qam", "different candidate"]);
+        let different = run(root, &["rev-parse", "HEAD"]);
+
+        let textconv = root.join("normalize.sh");
+        std::fs::write(
+            &textconv,
+            "#!/bin/sh\nif grep -q 'base raw' \"$1\"; then printf 'old normalized\\n'; else printf 'new normalized\\n'; fi\n",
+        )
+        .expect("write textconv");
+        std::fs::set_permissions(&textconv, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod textconv");
+        let external_diff = root.join("external-diff.sh");
+        std::fs::write(
+            &external_diff,
+            "#!/bin/sh\nprintf '%s\\n' 'diff --git a/sample.txt b/sample.txt' '--- a/sample.txt' '+++ b/sample.txt' '@@ -1 +1 @@' '-old normalized' '+new normalized'\n",
+        )
+        .expect("write external diff");
+        std::fs::set_permissions(&external_diff, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod external diff");
+        run(
+            root,
+            &[
+                "config",
+                "diff.normalize.textconv",
+                textconv.to_str().expect("utf-8 path"),
+            ],
+        );
+        run(
+            root,
+            &[
+                "config",
+                "diff.external",
+                external_diff.to_str().expect("utf-8 path"),
+            ],
+        );
+        run(root, &["config", "diff.noprefix", "true"]);
+        run(root, &["config", "color.ui", "always"]);
+
+        let repo = GitRepo::discover(root).expect("repo");
+        let session_patch = repo
+            .patch_id_between(&base, &session)
+            .expect("session patch")
+            .expect("non-empty patch");
+        let candidate_patches = repo
+            .first_parent_patch_ids(&[matching.clone(), different.clone()])
+            .expect("candidate patches");
+
+        assert_eq!(candidate_patches.get(&matching), Some(&session_patch));
+        assert_ne!(candidate_patches.get(&different), Some(&session_patch));
+    }
+
+    #[test]
+    fn patch_ids_and_path_census_include_gitlink_changes_despite_ignore_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("note.txt"), "base note\n").expect("write base");
+        run(root, &["add", "note.txt"]);
+        run(
+            root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000,1111111111111111111111111111111111111111,submodule",
+            ],
+        );
+        run(root, &["commit", "-qm", "base"]);
+        let base = run(root, &["rev-parse", "HEAD"]);
+
+        run(root, &["switch", "-q", "-c", "session"]);
+        std::fs::write(root.join("note.txt"), "shared note change\n").expect("write session");
+        run(root, &["add", "note.txt"]);
+        run(
+            root,
+            &[
+                "update-index",
+                "--cacheinfo",
+                "160000,2222222222222222222222222222222222222222,submodule",
+            ],
+        );
+        run(root, &["commit", "-qm", "session changes gitlink"]);
+        let session = run(root, &["rev-parse", "HEAD"]);
+
+        run(root, &["switch", "-q", "-c", "candidate", &base]);
+        std::fs::write(root.join("note.txt"), "shared note change\n").expect("write candidate");
+        run(root, &["commit", "-qam", "candidate changes text only"]);
+        let candidate = run(root, &["rev-parse", "HEAD"]);
+        run(root, &["config", "diff.ignoreSubmodules", "all"]);
+
+        let repo = GitRepo::discover(root).expect("repo");
+        let changed = repo
+            .changed_between(&base, &session)
+            .expect("changed paths");
+        assert!(
+            changed.iter().any(|path| path == "submodule"),
+            "{changed:?}"
+        );
+
+        let session_patch = repo
+            .patch_id_between(&base, &session)
+            .expect("session patch")
+            .expect("non-empty patch");
+        let candidate_patch = repo
+            .first_parent_patch_ids(std::slice::from_ref(&candidate))
+            .expect("candidate patches");
+        assert_ne!(candidate_patch.get(&candidate), Some(&session_patch));
+        assert!(
+            !repo
+                .paths_equal(&session, &candidate, &changed)
+                .expect("compare gitlink paths")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paths_equal_is_literal_and_bounded_across_mode_only_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("mode.sh"), "#!/bin/sh\nexit 0\n").expect("write mode file");
+        std::fs::write(root.join(":(exclude)literal.txt"), "before\n").expect("write literal path");
+        std::fs::write(root.join("stable.txt"), "stable\n").expect("write stable");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "base"]);
+        let base = run(root, &["rev-parse", "HEAD"]);
+
+        run(root, &["switch", "-q", "-c", "session"]);
+        std::fs::set_permissions(root.join("mode.sh"), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod mode file");
+        std::fs::write(root.join(":(exclude)literal.txt"), "after\n").expect("modify literal path");
+        run(root, &["commit", "-qam", "mode and literal path change"]);
+        let head = run(root, &["rev-parse", "HEAD"]);
+
+        let repo = GitRepo::discover(root).expect("repo");
+        let mut paths = vec!["stable.txt".to_string(); MAX_LITERAL_PATHSPEC_BATCH_COUNT + 1];
+        paths.push("mode.sh".to_string());
+        assert!(
+            !repo
+                .paths_equal(&base, &head, &paths)
+                .expect("mode compare")
+        );
+        assert!(
+            !repo
+                .paths_equal(&base, &head, &[":(exclude)literal.txt".to_string()])
+                .expect("literal path compare")
+        );
+    }
+
+    #[test]
+    fn changed_between_preserves_rename_projection_and_full_census_reports_both_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("before.txt"), "same content\n").expect("write before");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "base"]);
+        let base = run(root, &["rev-parse", "HEAD"]);
+
+        std::fs::rename(root.join("before.txt"), root.join("after.txt")).expect("rename");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "rename"]);
+        run(root, &["config", "diff.renames", "true"]);
+
+        let head = run(root, &["rev-parse", "HEAD"]);
+        let repo = GitRepo::discover(root).expect("repo");
+        let changed = repo.changed_between(&base, &head).expect("changed paths");
+        assert_eq!(changed, vec!["after.txt"]);
+
+        let complete = repo
+            .changed_between_all_paths(&base, &head)
+            .expect("complete changed-path census");
+        assert_eq!(complete.len(), 2, "{complete:?}");
+        assert!(
+            complete.iter().any(|path| path == "before.txt"),
+            "{complete:?}"
+        );
+        assert!(
+            complete.iter().any(|path| path == "after.txt"),
+            "{complete:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_path_evidence_preserves_newline_names_from_real_git() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        let path = "tracked\nname.txt";
+        std::fs::write(root.join(path), "before\n").expect("write base");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "base"]);
+        let base = run(root, &["rev-parse", "HEAD"]);
+
+        run(root, &["switch", "-q", "-c", "session"]);
+        std::fs::write(root.join(path), "after\n").expect("modify newline path");
+        run(root, &["commit", "-qam", "change newline path"]);
+        let head = run(root, &["rev-parse", "HEAD"]);
+
+        let repo = GitRepo::discover(root).expect("repo");
+        let changed = repo.changed_between(&base, &head).expect("changed paths");
+        assert_eq!(changed, vec![path]);
+        assert!(
+            !repo
+                .paths_equal(&base, &head, &changed)
+                .expect("path comparison")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_path_evidence_refuses_non_utf8_names_from_real_git() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").expect("write base");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "base"]);
+        let base = run(root, &["rev-parse", "HEAD"]);
+
+        run(root, &["switch", "-q", "-c", "session"]);
+        let path = OsString::from_vec(b"invalid-\xff-name.txt".to_vec());
+        std::fs::write(root.join(path), "tracked\n").expect("write invalid UTF-8 path");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "add non-UTF-8 path"]);
+        let head = run(root, &["rev-parse", "HEAD"]);
+
+        let repo = GitRepo::discover(root).expect("repo");
+        assert!(matches!(
+            repo.changed_between(&base, &head),
+            Err(GitError::UntrustedOutput { .. })
+        ));
     }
 }
 
