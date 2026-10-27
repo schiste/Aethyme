@@ -677,11 +677,7 @@ impl Broker {
                     .into(),
             ));
         };
-        let entry = self
-            .store
-            .merge_queue()?
-            .into_iter()
-            .find(|entry| entry.id == queue_entry_id);
+        let entry = self.store.merge_queue_entry_if_exists(queue_entry_id)?;
         let Some(entry) = entry else {
             if released_queue_entry_id == Some(queue_entry_id)
                 && self.repo.commit_tree_id(integration_commit).ok().as_deref()

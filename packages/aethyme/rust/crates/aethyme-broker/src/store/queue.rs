@@ -1011,6 +1011,25 @@ impl BrokerStore {
             .ok_or(BrokerError::SessionNotFound(entry_id))?
     }
 
+    /// Read one queue row when present, preserving typed decode errors.
+    ///
+    /// Cleanup provenance already knows the accepted entry id; decoding the
+    /// entire queue to find it makes an unrelated malformed historical row
+    /// block finishing this session.
+    pub(crate) fn merge_queue_entry_if_exists(
+        &self,
+        entry_id: i64,
+    ) -> Result<Option<MergeQueueEntry>, BrokerError> {
+        self.conn
+            .query_row(
+                &format!("{MERGE_SELECT} WHERE id = ?1"),
+                [entry_id],
+                merge_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
     pub fn current_merge_queue(&self) -> Result<Vec<MergeQueueEntry>, BrokerError> {
         let mut stmt = self.conn.prepare(&format!(
             "{MERGE_SELECT}
