@@ -65,7 +65,8 @@ fn coordination_history_drilldown(session_id: Option<i64>) -> CoordinationHistor
     CoordinationHistoryDrilldown {
         loaded: false,
         release_requests_command: "aethyme broker status --json",
-        notes_command: session_id.map(|id| format!("aethyme broker note list --session {id}")),
+        notes_command: session_id
+            .map(|id| format!("aethyme broker advanced note list --session {id}")),
     }
 }
 
@@ -155,7 +156,7 @@ pub(super) fn render_lease_plan(report: &crate::LeasePlan, json: bool) -> Result
             }
         }
         out!(
-            "  Coordination history was not loaded: inspect `aethyme broker status --json` for release requests and `aethyme broker note list --session <id>` for messages."
+            "  Coordination history was not loaded: inspect `aethyme broker status --json` for release requests and `aethyme broker advanced note list --session <id>` for messages."
         );
     }
     Ok(())
@@ -1229,7 +1230,7 @@ mod tests {
 
     #[test]
     fn lease_plan_groups_shared_owners_without_loading_history() {
-        let action = "aethyme broker note send --to-session 7 --message <reason>";
+        let action = "aethyme broker advanced note send --to-session 7 --message <reason>";
         let plan = crate::LeasePlan {
             session_id: Some(5),
             paths: vec![
@@ -1271,7 +1272,7 @@ mod tests {
         );
         assert_eq!(
             history["notes_command"],
-            "aethyme broker note list --session 5"
+            "aethyme broker advanced note list --session 5"
         );
     }
 }

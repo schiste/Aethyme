@@ -65,6 +65,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - For Rust compile review, trace the actual `mod` declarations, including
   `#[path]`, and item visibility from each use site; filenames alone do not
   establish module namespaces or sibling access.
+- Check newly emitted next-action commands against the public CLI resolver,
+  including product diagnostics, harness argv, and mirrored skills. Internal
+  broker help can contain legacy spellings that are rewritten at the public
+  boundary. Audit the whole changed batch after a spelling failure; fixing
+  the first reported caller does not establish that other scan groups pass.
 - Validate a command's complete action, arity, and required confirmation before
   opening broker state or scanning host or worktree inventories. Add a CLI
   regression that checks the structured refusal and confirms no repository or
