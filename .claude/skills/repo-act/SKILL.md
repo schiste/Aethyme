@@ -62,6 +62,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   before adding regressions. Integration tests cannot call crate-private APIs.
   Preserve optional-value types in assertions; a compile failure supplies no
   runtime test evidence and needlessly repeats the remote validation cycle.
+- For Rust compile review, trace the actual `mod` declarations, including
+  `#[path]`, and item visibility from each use site; filenames alone do not
+  establish module namespaces or sibling access.
 - Validate a command's complete action, arity, and required confirmation before
   opening broker state or scanning host or worktree inventories. Add a CLI
   regression that checks the structured refusal and confirms no repository or
