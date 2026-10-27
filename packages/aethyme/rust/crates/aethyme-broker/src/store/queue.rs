@@ -1093,7 +1093,11 @@ impl BrokerStore {
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![session_id, head_commit], merge_from_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row??);
+        }
+        Ok(entries)
     }
 
     /// The latest queue entry per session, for all of `session_ids` at once.
