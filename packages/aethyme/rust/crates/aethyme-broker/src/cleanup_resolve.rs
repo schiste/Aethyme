@@ -3502,12 +3502,13 @@ mod tests {
 
     #[test]
     fn schema_v3_archive_with_previous_digest_remains_readable() {
-        let (_tmp, repo, plan) = staged_checkout();
+        let (_tmp, repo, mut plan) = staged_checkout();
         let policy = crate::AutoCleanupPolicy::load(repo.root()).unwrap();
         let proof = IgnoredPolicyProof {
             strict: policy.strict,
             regenerable: &policy.regenerable,
         };
+        plan.ignored_policy_sha256 = sha256_hex(&serde_json::to_vec(&proof).unwrap());
         let digest = legacy_v3_cleanup_resolve_digest(&plan, &proof).unwrap();
         assert_ne!(digest, plan.digest);
         let dir = tempfile::tempdir().unwrap();
