@@ -368,7 +368,7 @@ pub(crate) struct InlineExecSupervisor {
     process_group: i32,
     terminalized: bool,
     observation: Option<crate::store::guarded_exec::HelperObservationTarget>,
-    artifact_use: Option<crate::file_lock::ArtifactUseProducer>,
+    artifact_use: Option<crate::file_lock::artifact_use::ArtifactUseProducer>,
 }
 
 #[cfg(not(unix))]
@@ -394,7 +394,7 @@ impl InlineExecSupervisor {
 
     pub(crate) fn with_artifact_use(
         self,
-        producer: Option<crate::file_lock::ArtifactUseProducer>,
+        producer: Option<crate::file_lock::artifact_use::ArtifactUseProducer>,
     ) -> Self {
         #[cfg(unix)]
         {
@@ -2033,7 +2033,7 @@ mod tests {
         let primary = tempfile::tempdir().unwrap();
         let checkout = primary.path().join("checkout");
         std::fs::create_dir(&checkout).unwrap();
-        let producer = match crate::file_lock::begin_artifact_use(
+        let producer = match crate::file_lock::artifact_use::begin_artifact_use(
             primary.path(),
             &checkout,
             41,
@@ -2041,8 +2041,8 @@ mod tests {
         )
         .unwrap()
         {
-            crate::file_lock::ArtifactUseAdmission::Admitted(producer) => producer,
-            crate::file_lock::ArtifactUseAdmission::ProtocolUnavailable => {
+            crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer) => producer,
+            crate::file_lock::artifact_use::ArtifactUseAdmission::ProtocolUnavailable => {
                 panic!("Unix test filesystem should support directory sync")
             }
         };
@@ -2060,8 +2060,9 @@ mod tests {
         assert!(result.succeeded);
         assert!(checkout.join("produced").exists());
         assert!(matches!(
-            crate::file_lock::try_artifact_use_reclaimer(primary.path(), &checkout).unwrap(),
-            crate::file_lock::ArtifactUseReclaimTry::Acquired(_)
+            crate::file_lock::artifact_use::try_artifact_use_reclaimer(primary.path(), &checkout)
+                .unwrap(),
+            crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(_)
         ));
     }
 

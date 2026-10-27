@@ -2953,14 +2953,16 @@ where
                 expires_at: runtime.grant.lease.expires_at,
                 allocations: runtime.grant.lease.allocations.clone(),
             });
-        let mut artifact_use = match crate::file_lock::begin_artifact_use(
+        let mut artifact_use = match crate::file_lock::artifact_use::begin_artifact_use(
             main_root,
             checkout.root(),
             session_id.unwrap_or(0),
-            &crate::file_lock::invocation_id("gate", session_id.unwrap_or(0)),
+            &crate::file_lock::artifact_use::invocation_id("gate", session_id.unwrap_or(0)),
         ) {
-            Ok(crate::file_lock::ArtifactUseAdmission::Admitted(producer)) => Some(producer),
-            Ok(crate::file_lock::ArtifactUseAdmission::ProtocolUnavailable) => None,
+            Ok(crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer)) => {
+                Some(producer)
+            }
+            Ok(crate::file_lock::artifact_use::ArtifactUseAdmission::ProtocolUnavailable) => None,
             Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
                 if let Some(runtime) = resource_runtime.as_mut() {
                     crate::warn_unrecorded(
@@ -4248,7 +4250,7 @@ fn remove_gate_pidfile_after_setup_failure(pidfile: &Path, reason: &str) {
 fn run_gate_command(
     command: &str,
     context: GateCommandContext<'_>,
-    mut artifact_use: Option<&mut crate::file_lock::ArtifactUseProducer>,
+    mut artifact_use: Option<&mut crate::file_lock::artifact_use::ArtifactUseProducer>,
 ) -> Result<GateCommandOutcome, std::io::Error> {
     let result = run_gate_command_inner(command, &context, &mut artifact_use);
     if result.is_err()
@@ -4272,7 +4274,7 @@ fn run_gate_command(
 fn run_gate_command_inner(
     command: &str,
     context: &GateCommandContext<'_>,
-    artifact_use: &mut Option<&mut crate::file_lock::ArtifactUseProducer>,
+    artifact_use: &mut Option<&mut crate::file_lock::artifact_use::ArtifactUseProducer>,
 ) -> Result<GateCommandOutcome, std::io::Error> {
     use std::os::unix::process::CommandExt;
 
@@ -4569,6 +4571,7 @@ fn run_gate_command_inner(
     let first_output = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
     let fatal_resource_error = std::sync::Arc::new(std::sync::Mutex::new(None));
     let resource_stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let command_started = context.started;
     let (status, timed_out, pipes_incomplete, stdout_result, stderr_result) =
         std::thread::scope(|scope| {
             let stdout_reader = scope.spawn({
@@ -4585,7 +4588,7 @@ fn run_gate_command_inner(
                         first_output,
                         drain_failed,
                         drain_error,
-                        context.started,
+                        command_started,
                     )
                 }
             });
@@ -4603,7 +4606,7 @@ fn run_gate_command_inner(
                         first_output,
                         drain_failed,
                         drain_error,
-                        context.started,
+                        command_started,
                     )
                 }
             });
@@ -5388,13 +5391,17 @@ mod tests {
         let checkout_root = owner.path().join("checkout");
         init_repo(&checkout_root);
         let database = owner.path().join("broker.db");
-        let reservation =
-            match crate::file_lock::try_artifact_use_reclaimer(&checkout_root, &checkout_root)
-                .unwrap()
-            {
-                crate::file_lock::ArtifactUseReclaimTry::Acquired(reservation) => reservation,
-                blocked => panic!("fresh checkout should admit the test reclaimer: {blocked:?}"),
-            };
+        let reservation = match crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+            &checkout_root,
+            &checkout_root,
+        )
+        .unwrap()
+        {
+            crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(reservation) => {
+                reservation
+            }
+            blocked => panic!("fresh checkout should admit the test reclaimer: {blocked:?}"),
+        };
 
         let conflict_sentinel = checkout_root.join(".artifact-conflict-started");
         let refused = run_test_gate_entrypoint(
@@ -5429,10 +5436,15 @@ mod tests {
         }
         let ready_seen = ready.exists();
         let producer_is_busy = matches!(
-            crate::file_lock::try_artifact_use_reclaimer(&checkout_root, &checkout_root),
-            Ok(crate::file_lock::ArtifactUseReclaimTry::Blocked(
-                crate::file_lock::ArtifactUseReclaimBlock::Contended
-            ))
+            crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                &checkout_root,
+                &checkout_root
+            ),
+            Ok(
+                crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(
+                    crate::file_lock::artifact_use::ArtifactUseReclaimBlock::Contended
+                )
+            )
         );
         let release_result = std::fs::write(&release, b"continue");
         let completed = running.join().unwrap();
@@ -5451,8 +5463,12 @@ mod tests {
         let _ = std::fs::remove_file(ready);
         let _ = std::fs::remove_file(release);
         assert!(matches!(
-            crate::file_lock::try_artifact_use_reclaimer(&checkout_root, &checkout_root).unwrap(),
-            crate::file_lock::ArtifactUseReclaimTry::Acquired(_)
+            crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                &checkout_root,
+                &checkout_root
+            )
+            .unwrap(),
+            crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(_)
         ));
     }
 
@@ -5758,7 +5774,7 @@ mod tests {
         let progress = Lines::default();
         let database = std::cell::OnceCell::new();
         let labels = crate::gate_debris::GateRunLabels::new("bounded-output", None, "synthetic");
-        let mut producer = match crate::file_lock::begin_artifact_use(
+        let mut producer = match crate::file_lock::artifact_use::begin_artifact_use(
             root.path(),
             root.path(),
             0,
@@ -5766,8 +5782,8 @@ mod tests {
         )
         .unwrap()
         {
-            crate::file_lock::ArtifactUseAdmission::Admitted(producer) => producer,
-            crate::file_lock::ArtifactUseAdmission::ProtocolUnavailable => {
+            crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer) => producer,
+            crate::file_lock::artifact_use::ArtifactUseAdmission::ProtocolUnavailable => {
                 panic!("Unix test filesystem should support directory sync")
             }
         };
@@ -5795,8 +5811,9 @@ mod tests {
         assert!(log.contains("stderr"));
         drop(producer);
         assert!(matches!(
-            crate::file_lock::try_artifact_use_reclaimer(root.path(), root.path()).unwrap(),
-            crate::file_lock::ArtifactUseReclaimTry::Acquired(_)
+            crate::file_lock::artifact_use::try_artifact_use_reclaimer(root.path(), root.path())
+                .unwrap(),
+            crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(_)
         ));
         assert!(
             std::fs::metadata(log_dir.join("gate.log")).unwrap().len()

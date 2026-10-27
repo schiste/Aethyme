@@ -675,9 +675,14 @@ impl Broker {
         // that outlives a crashed broker remains visible after this scope's
         // lock descriptor closes.
         let _artifact_use_scope =
-            match crate::file_lock::begin_artifact_use_scope(self.main_root(), &root) {
-                Ok(crate::file_lock::ArtifactUseScopeAdmission::Admitted(scope)) => Some(scope),
-                Ok(crate::file_lock::ArtifactUseScopeAdmission::ProtocolUnavailable) => None,
+            match crate::file_lock::artifact_use::begin_artifact_use_scope(self.main_root(), &root)
+            {
+                Ok(crate::file_lock::artifact_use::ArtifactUseScopeAdmission::Admitted(scope)) => {
+                    Some(scope)
+                }
+                Ok(
+                    crate::file_lock::artifact_use::ArtifactUseScopeAdmission::ProtocolUnavailable,
+                ) => None,
                 Err(source) => {
                     return Err(crate::BrokerError::Io {
                         path: root.clone(),
@@ -4985,15 +4990,19 @@ mod tests {
 
         #[cfg(unix)]
         {
-            let reservation =
-                match crate::file_lock::try_artifact_use_reclaimer(broker.main_root(), &worktree)
-                    .unwrap()
-                {
-                    crate::file_lock::ArtifactUseReclaimTry::Acquired(reservation) => reservation,
-                    blocked => {
-                        panic!("fresh checkout should admit the test reclaimer: {blocked:?}")
-                    }
-                };
+            let reservation = match crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                broker.main_root(),
+                &worktree,
+            )
+            .unwrap()
+            {
+                crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(reservation) => {
+                    reservation
+                }
+                blocked => {
+                    panic!("fresh checkout should admit the test reclaimer: {blocked:?}")
+                }
+            };
             let error = broker
                 .prepare_session(session.id, false, Duration::ZERO)
                 .expect_err("preparation must refuse while artifact reclamation is reserved");
@@ -5023,8 +5032,12 @@ mod tests {
 
         #[cfg(unix)]
         assert!(matches!(
-            crate::file_lock::try_artifact_use_reclaimer(broker.main_root(), &worktree,).unwrap(),
-            crate::file_lock::ArtifactUseReclaimTry::Acquired(_)
+            crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                broker.main_root(),
+                &worktree,
+            )
+            .unwrap(),
+            crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(_)
         ));
     }
 
