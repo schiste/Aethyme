@@ -376,6 +376,8 @@ fn mount_identity(fd: RawFd) -> std::io::Result<Vec<u8>> {
 
 #[cfg(target_os = "macos")]
 fn mount_identity(fd: RawFd) -> std::io::Result<Vec<u8>> {
+    // SAFETY: libc::statfs is a plain C output structure with integer and
+    // fixed array fields; all-zero is a valid initial buffer for fstatfs.
     let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: `fd` is a live directory descriptor and `stat` is writable.
     if unsafe { libc::fstatfs(fd, &mut stat) } != 0 {
