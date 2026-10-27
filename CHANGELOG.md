@@ -4,6 +4,17 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.38] - 2026-10-27
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0838).
+
+### Fixed
+
+- Cleanup inspects leases for its candidate sessions, including retained leases on closed sessions, and preserves unknown holders.
+- Recovery bundle capture streams into a bounded file with a hard 1 GiB cap. Manifest schema 3 verifies bundle length and SHA-256. Destination admission includes this enforced cap when a bundle is needed; allocation overhead and concurrent writes remain outside the estimate.
+- Closed-session artifact sweeps acquire an exclusive per-checkout guard before recording deletion intent or removing files. Busy or uncertain producers retain that candidate while unrelated candidates can progress. Open-session artifact reclamation remains disabled.
+- Cleanup status and archive untracked-path inventories have output and path-count caps. Cleanup proof rechecks share the inspection deadline; incomplete observations retain the checkout.
+
 ## [0.8.37] - 2026-10-27
 
 **Breaking:** see [UPGRADING.md](UPGRADING.md#v0837).

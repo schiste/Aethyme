@@ -16,12 +16,42 @@ version and the target, oldest first. Each schema migration runs on first open
 and is one-way, so rollback is limited to the oldest binary that still reads
 the newest schema you have opened.
 
-Breaking releases: [v0.8.37](#v0837), [v0.8.33](#v0833), [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
+Breaking releases: [v0.8.38](#v0838), [v0.8.37](#v0837), [v0.8.33](#v0833), [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
 [v0.7.25](#v0725), [v0.7.23](#v0723), [v0.7.22](#v0722), [v0.7.19](#v0719),
 [v0.7.18](#v0718), [v0.7.16](#v0716), [v0.7.9](#v079), [v0.7.8](#v078),
 [v0.7.4](#v074), [v0.7.2](#v072),
 [v0.7.1](#v071), [v0.5.0](#v050), [v0.3.0](#v030),
 [v0.2.2](#v022), [v0.2.0](#v020).
+
+## v0.8.38
+
+### Compatibility
+
+New recovery archives use manifest schema 3, which records bundle length and
+SHA-256 and requires bounded bundle capture. This runtime continues to read
+schema 1 and 2 archives. Earlier runtimes may classify schema 3 archives as
+unowned; preserve them and use a compatible reader for inventory and retention.
+No broker database migration or compatibility-floor change is added.
+
+Closed-session artifact cleanup now takes an exclusive per-checkout guard
+against participating managed producers. Busy or unknown producer state retains
+the candidate. This cooperative guard does not cover unmanaged external writers
+or authorize artifact reclamation from open sessions.
+
+### Migrate and verify
+
+Install the matching router and engine pair and verify that both report
+v0.8.38 and the same source commit. Existing archives need no manual conversion.
+Keep source checkouts when capture refuses its bounds, integrity checks or
+storage admission. The free-space estimate is not a total archive quota or a
+guarantee against concurrent disk writes.
+
+### Rollback
+
+Stop maintenance workers before rollback. Older runtimes do not implement the
+current cooperative artifact-removal guard and may not read schema 3 recovery
+archives. Keep those archives intact and return to a compatible newer reader
+to manage them. The earlier v0.8.37 and v0.8.31 compatibility limits still apply.
 
 ## v0.8.37
 
