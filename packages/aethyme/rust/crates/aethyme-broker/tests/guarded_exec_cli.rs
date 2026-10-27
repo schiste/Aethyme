@@ -367,7 +367,7 @@ fn guard_status_snapshots_match_existing_queries_for_renames_and_named_untracked
 }
 
 #[test]
-fn guarded_exec_refreshes_leases_without_speculative_merge_classification() {
+fn guarded_exec_does_not_refresh_diagnostics_or_implicit_leases() {
     let fixture = Fixture::new(Some("tracked.txt"));
     let mut broker = fixture.broker();
     let other = broker.start_worktree("overlapping owner", None).unwrap();
@@ -389,6 +389,19 @@ fn guarded_exec_refreshes_leases_without_speculative_merge_classification() {
         pairs[0].classified,
         "fixture must start with a cached diagnosis"
     );
+    let pairs_before = pairs;
+    let mut implicit_before = broker
+        .store()
+        .active_leases()
+        .unwrap()
+        .into_iter()
+        .filter(|lease| {
+            lease.session_id == fixture.session && lease.kind == aethyme_broker::LeaseKind::Implicit
+        })
+        .map(|lease| (lease.id, lease.path, lease.created_at, lease.expires_at))
+        .collect::<Vec<_>>();
+    implicit_before.sort();
+    let refreshed_at_before = broker.store().meta_get("leases.refreshed_at_ms").unwrap();
     drop(broker);
 
     let output = fixture.run("true", true);
@@ -396,22 +409,26 @@ fn guarded_exec_refreshes_leases_without_speculative_merge_classification() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["ownership_ok"], true);
     let mut broker = fixture.broker();
-    let pairs = broker.overlap_pairs_snapshot(&overlaps);
-    assert_eq!(pairs.len(), 1);
-    assert!(
-        !pairs[0].classified,
-        "deferred diagnostics must not appear current"
+    assert_eq!(broker.overlap_pairs_snapshot(&overlaps), pairs_before);
+    let mut implicit_after = broker
+        .store()
+        .active_leases()
+        .unwrap()
+        .into_iter()
+        .filter(|lease| {
+            lease.session_id == fixture.session && lease.kind == aethyme_broker::LeaseKind::Implicit
+        })
+        .map(|lease| (lease.id, lease.path, lease.created_at, lease.expires_at))
+        .collect::<Vec<_>>();
+    implicit_after.sort();
+    assert_eq!(implicit_after, implicit_before);
+    assert_eq!(
+        broker.store().meta_get("leases.refreshed_at_ms").unwrap(),
+        refreshed_at_before
     );
-    assert!(pairs[0].reason.contains("guarded exec deferred"));
-    // The performance change must retain the acting session's refreshed
-    // implicit lease, even though its dirty file was not changed by the child.
-    assert!(broker.store().active_leases().unwrap().iter().any(|lease| {
-        lease.session_id == fixture.session
-            && lease.path == "tracked.txt"
-            && lease.kind == aethyme_broker::LeaseKind::Implicit
-    }));
-    // Explicit refresh still performs the deferred diagnosis. This is also a
-    // positive control proving the fixture really has an analyzable overlap.
+
+    // An explicit refresh still updates the diagnostic snapshot. This is a
+    // positive control proving the fixture has an analyzable overlap.
     let overlaps = broker.refresh_leases().unwrap();
     assert!(broker.overlap_pairs_snapshot(&overlaps)[0].classified);
 }
