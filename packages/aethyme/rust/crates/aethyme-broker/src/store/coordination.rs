@@ -1403,7 +1403,7 @@ mod finish_lease_query_tests {
         assert_eq!(scoped.len(), 1, "unrelated lease history stays out");
         assert_eq!(scoped[0].session_id, target.id);
         assert_eq!(scoped[0].path, "unreleased-after-close");
-        let mut chunked_ids = (10_000..10_900).collect::<Vec<_>>();
+        let mut chunked_ids = (-900..0).collect::<Vec<_>>();
         chunked_ids.push(target.id);
         let chunked = store
             .unreleased_unexpired_leases_for_sessions_at(&chunked_ids, now)
