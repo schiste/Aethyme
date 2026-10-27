@@ -8,7 +8,7 @@
 //! in a follow-up.
 
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -25,6 +25,20 @@ pub(crate) enum LimitedOutput {
     Completed(Output),
     Deadline,
     OutputLimit,
+}
+
+/// Stream a child's stdout to a caller-owned sink without retaining the
+/// payload in memory. The byte probe past each cap is never written.
+#[derive(Debug)]
+pub(crate) enum LimitedStreamOutput {
+    Completed {
+        status: ExitStatus,
+        stdout_bytes: u64,
+        stderr: Vec<u8>,
+    },
+    Deadline,
+    StdoutLimit,
+    StderrLimit,
 }
 
 /// Bound memory and elapsed time even if a descendant holds a pipe open.
@@ -513,6 +527,220 @@ pub(crate) fn output_limited_in_owned_group(
             }));
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Stream stdout into `writer` while independently bounding stderr, the
+/// process-group lifetime and the bytes written to the sink. Deadline checks
+/// surround pipe reads and sink writes; a sink blocked in the operating system
+/// can still outlive the deadline while that write is in progress.
+#[cfg(unix)]
+pub(crate) fn stream_stdout_to_writer_limited_in_owned_group<W: Write>(
+    command: &mut Command,
+    budget: Duration,
+    max_stdout_bytes: u64,
+    max_stderr_bytes: usize,
+    writer: &mut W,
+) -> io::Result<LimitedStreamOutput> {
+    use std::os::unix::process::CommandExt;
+
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(budget)
+        .ok_or_else(|| io::Error::other("process deadline overflow"))?;
+    max_stdout_bytes
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("process stdout limit overflow"))?;
+    max_stderr_bytes
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("process stderr limit overflow"))?;
+    if Instant::now() >= deadline {
+        return Ok(LimitedStreamOutput::Deadline);
+    }
+
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()?;
+    let process_group = child.id() as i32;
+    let mut child = OwnedProbeChild::new(child, process_group);
+    let mut stdout_reader = child
+        .child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("missing stdout"))?;
+    let mut stderr_reader = child
+        .child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("missing stderr"))?;
+    set_probe_nonblocking(&stdout_reader)?;
+    set_probe_nonblocking(&stderr_reader)?;
+
+    let mut stdout_bytes = 0_u64;
+    let mut stderr = Vec::new();
+    let mut stdout_closed = false;
+    let mut stderr_closed = false;
+    loop {
+        if Instant::now() >= deadline {
+            child.terminate_and_reap()?;
+            return Ok(LimitedStreamOutput::Deadline);
+        }
+
+        if !stdout_closed {
+            match write_probe_stream(
+                &mut stdout_reader,
+                writer,
+                &mut stdout_bytes,
+                max_stdout_bytes,
+                deadline,
+            )? {
+                WriteProbeStreamRead::Open => {}
+                WriteProbeStreamRead::Closed => stdout_closed = true,
+                WriteProbeStreamRead::OutputLimit => {
+                    child.terminate_and_reap()?;
+                    return Ok(LimitedStreamOutput::StdoutLimit);
+                }
+            }
+        }
+        if !stderr_closed {
+            stderr_closed = matches!(
+                read_probe_stream(&mut stderr_reader, &mut stderr, max_stderr_bytes, deadline)?,
+                ProbeStreamRead::Closed
+            );
+            if stderr.len() > max_stderr_bytes {
+                child.terminate_and_reap()?;
+                return Ok(LimitedStreamOutput::StderrLimit);
+            }
+        }
+
+        if child.leader_exited_without_reaping()? {
+            // Keep the leader unreaped until the owned group is stopped. This
+            // prevents its PID/group identity from being reused before cleanup.
+            let status = child.terminate_and_reap()?;
+            let drain_deadline = Instant::now()
+                .checked_add(Duration::from_millis(250))
+                .ok_or_else(|| io::Error::other("pipe drain deadline overflow"))?;
+            while !stdout_closed || !stderr_closed {
+                if !stdout_closed {
+                    match write_probe_stream(
+                        &mut stdout_reader,
+                        writer,
+                        &mut stdout_bytes,
+                        max_stdout_bytes,
+                        drain_deadline,
+                    )? {
+                        WriteProbeStreamRead::Open => {}
+                        WriteProbeStreamRead::Closed => stdout_closed = true,
+                        WriteProbeStreamRead::OutputLimit => {
+                            return Ok(LimitedStreamOutput::StdoutLimit);
+                        }
+                    }
+                }
+                if !stderr_closed {
+                    stderr_closed = matches!(
+                        read_probe_stream(
+                            &mut stderr_reader,
+                            &mut stderr,
+                            max_stderr_bytes,
+                            drain_deadline,
+                        )?,
+                        ProbeStreamRead::Closed
+                    );
+                }
+                if stderr.len() > max_stderr_bytes {
+                    return Ok(LimitedStreamOutput::StderrLimit);
+                }
+                if stdout_closed && stderr_closed {
+                    if Instant::now() >= deadline {
+                        return Ok(LimitedStreamOutput::Deadline);
+                    }
+                    return Ok(LimitedStreamOutput::Completed {
+                        status,
+                        stdout_bytes,
+                        stderr,
+                    });
+                }
+                if Instant::now() >= drain_deadline {
+                    return Err(io::Error::other(
+                        "child output remained open after owned-group cleanup",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if Instant::now() >= deadline {
+                return Ok(LimitedStreamOutput::Deadline);
+            }
+            return Ok(LimitedStreamOutput::Completed {
+                status,
+                stdout_bytes,
+                stderr,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn stream_stdout_to_writer_limited_in_owned_group<W: Write>(
+    _command: &mut Command,
+    _budget: Duration,
+    _max_stdout_bytes: u64,
+    _max_stderr_bytes: usize,
+    _writer: &mut W,
+) -> io::Result<LimitedStreamOutput> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "owned process-group streaming is unavailable on this platform",
+    ))
+}
+
+#[cfg(unix)]
+enum WriteProbeStreamRead {
+    Open,
+    Closed,
+    OutputLimit,
+}
+
+#[cfg(unix)]
+fn write_probe_stream<R: Read, W: Write>(
+    stream: &mut R,
+    writer: &mut W,
+    written: &mut u64,
+    max_bytes: u64,
+    deadline: Instant,
+) -> io::Result<WriteProbeStreamRead> {
+    let mut chunk = [0_u8; 4096];
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(WriteProbeStreamRead::Open);
+        }
+        let remaining = max_bytes.saturating_sub(*written);
+        let read_len = usize::try_from(remaining.saturating_add(1).min(chunk.len() as u64))
+            .map_err(|_| io::Error::other("process stdout read bound overflow"))?;
+        match stream.read(&mut chunk[..read_len]) {
+            Ok(0) => return Ok(WriteProbeStreamRead::Closed),
+            Ok(count) => {
+                let allowed = usize::try_from(remaining.min(count as u64))
+                    .map_err(|_| io::Error::other("process stdout byte count overflow"))?;
+                if allowed > 0 {
+                    writer.write_all(&chunk[..allowed])?;
+                    *written = written
+                        .checked_add(allowed as u64)
+                        .ok_or_else(|| io::Error::other("process stdout byte count overflow"))?;
+                }
+                if count > allowed {
+                    return Ok(WriteProbeStreamRead::OutputLimit);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Ok(WriteProbeStreamRead::Open);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -1484,6 +1712,101 @@ mod tests {
                 _ => panic!("a finite leader exit should return its output"),
             },
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_group_stream_writes_exact_stdout_cap_and_collects_bounded_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("streamed");
+        let mut output_file = File::create(&output_path).unwrap();
+        let output = stream_stdout_to_writer_limited_in_owned_group(
+            Command::new("sh").args(["-c", "printf 12345678; printf note >&2"]),
+            Duration::from_secs(2),
+            8,
+            16,
+            &mut output_file,
+        )
+        .unwrap();
+
+        match output {
+            LimitedStreamOutput::Completed {
+                status,
+                stdout_bytes,
+                stderr,
+            } => {
+                assert!(status.success());
+                assert_eq!(stdout_bytes, 8);
+                assert_eq!(stderr, b"note");
+            }
+            other => panic!("exact-cap stream should complete, got {other:?}"),
+        }
+        drop(output_file);
+        assert_eq!(std::fs::read(output_path).unwrap(), b"12345678");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_group_stream_does_not_write_the_stdout_overflow_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("streamed");
+        let marker = dir.path().join("descendant-survived");
+        let mut output_file = File::create(&output_path).unwrap();
+        let output = stream_stdout_to_writer_limited_in_owned_group(
+            Command::new("sh")
+                .args([
+                    "-c",
+                    "(sleep 0.45; printf escaped > \"$PROFILE_PROBE_MARKER\") & printf 123456789; wait",
+                ])
+                .env("PROFILE_PROBE_MARKER", &marker),
+            Duration::from_secs(2),
+            8,
+            16,
+            &mut output_file,
+        )
+        .unwrap();
+        assert!(matches!(output, LimitedStreamOutput::StdoutLimit));
+        drop(output_file);
+        assert_eq!(std::fs::read(output_path).unwrap(), b"12345678");
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            !marker.exists(),
+            "overflow must stop the owned process group"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_group_stream_bounds_stderr_and_cleans_up_on_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("streamed");
+        let mut output_file = File::create(&output_path).unwrap();
+        let output = stream_stdout_to_writer_limited_in_owned_group(
+            Command::new("sh").args(["-c", "printf data; printf 12345 >&2"]),
+            Duration::from_secs(2),
+            16,
+            4,
+            &mut output_file,
+        )
+        .unwrap();
+        assert!(matches!(output, LimitedStreamOutput::StderrLimit));
+        drop(output_file);
+        assert_eq!(std::fs::read(&output_path).unwrap(), b"data");
+
+        let mut output_file = File::create(&output_path).unwrap();
+        let started = Instant::now();
+        let output = stream_stdout_to_writer_limited_in_owned_group(
+            Command::new("sh").args(["-c", "printf before; sleep 2"]),
+            Duration::from_millis(100),
+            64,
+            16,
+            &mut output_file,
+        )
+        .unwrap();
+        assert!(matches!(output, LimitedStreamOutput::Deadline));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(output_file);
+        assert_eq!(std::fs::read(output_path).unwrap(), b"before");
     }
 
     #[test]
