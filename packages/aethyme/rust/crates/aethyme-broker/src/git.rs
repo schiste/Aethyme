@@ -6318,7 +6318,7 @@ mod gitlink_census_tests {
         tree.extend_from_slice(format!("100644 blob {oid}\tregular.txt\0").as_bytes());
         assert_eq!(
             parse_tree_gitlinks(&tree, &["ls-tree"]).unwrap(),
-            vec!["sub\nmodule".into()]
+            vec!["sub\nmodule".to_owned()]
         );
 
         let index = format!(
@@ -6330,9 +6330,9 @@ mod gitlink_census_tests {
         assert_eq!(
             parse_index_gitlinks(index.as_bytes(), &["ls-files"]).unwrap(),
             vec![
-                "conflicted-submodule".into(),
-                "conflicted-submodule".into(),
-                "conflicted-submodule".into()
+                "conflicted-submodule".to_owned(),
+                "conflicted-submodule".to_owned(),
+                "conflicted-submodule".to_owned()
             ]
         );
     }
