@@ -6139,7 +6139,9 @@ mod tests {
                 git_common_dir: Some(invoking_repo.git_common_dir().unwrap()),
                 host_state_dir: self.resource_db_path.parent().map(Path::to_path_buf),
                 host_resource_db_path: Some(self.resource_db_path.clone()),
-                worktree_root_override: Some(self.storage_root.clone()),
+                // Exercise the public direct-root layout at the foreign
+                // placement itself, where its reserved cache child lives.
+                worktree_root_override: Some(self.placement_root.clone()),
                 host_state_dir_is_explicit: true,
                 ..crate::broker::BrokerStorageContext::default()
             }
@@ -6150,6 +6152,56 @@ mod tests {
     #[test]
     fn storage_plan_recognizes_but_never_reclaims_a_valid_foreign_cache_root() {
         let fixture = ForeignCacheRootFixture::new();
+
+        let layout = StorageRootLayout::KeyedContainer(fixture.storage_root.clone());
+        let roots = storage_root_entries(&fixture.storage_root, &layout).unwrap();
+        assert_eq!(roots, vec![fixture.placement_root.clone()]);
+        let invoking_repository = ThisRepository::observe(&fixture.invoking_root).unwrap();
+        let marker_root = normalise(&fixture.marker.repository_root);
+        let foreign_repository = GitRepo::discover(&fixture.marker.repository_root).unwrap();
+        let foreign_common_dir = foreign_repository.git_common_dir().unwrap();
+        let foreign_owner_root = foreign_common_dir.parent().unwrap();
+        let owner_root_matches = normalise(foreign_owner_root) == marker_root;
+        let repository_key_matches =
+            crate::host_state::repository_key(foreign_owner_root, Some(&foreign_common_dir))
+                == fixture.marker.repository_key;
+        let direct_binding_is_valid =
+            crate::broker::lifecycle::capture_worktree_volume_preparation_cache_root(
+                &fixture.placement_root,
+                &fixture.marker,
+                &fixture.resource_db_path,
+            )
+            .is_ok_and(|binding| binding.is_some());
+        assert!(
+            owner_root_matches,
+            "the foreign Git common-dir parent must match the marker root"
+        );
+        assert!(
+            repository_key_matches,
+            "the foreign Git common dir must reproduce the marker repository key"
+        );
+        assert!(
+            direct_binding_is_valid,
+            "the placement/cache marker pair must independently capture as a valid binding"
+        );
+        let discovered = discover_additional_worktree_cache_bindings(
+            &fixture.invoking_root,
+            &roots,
+            Some(&fixture.resource_db_path),
+            &[],
+            Some(&invoking_repository),
+        );
+        assert_eq!(
+            discovered.len(),
+            1,
+            "valid foreign cache discovery predicates: marker_root={marker_root:?}, foreign_owner_root={foreign_owner_root:?}, owner_root_matches={owner_root_matches}, repository_key_matches={repository_key_matches}, direct_binding_is_valid={direct_binding_is_valid}, storage_roots={roots:?}"
+        );
+        assert_eq!(
+            worktree_volume_cache_paths(&discovered),
+            BTreeSet::from([fixture
+                .placement_root
+                .join(crate::broker::lifecycle::WORKTREE_VOLUME_PREPARATION_CACHE_ROOT)])
+        );
 
         let plan = fixture.build_plan(false).unwrap();
 
@@ -6182,6 +6234,12 @@ mod tests {
         let fixture = ForeignCacheRootFixture::new();
         let context = fixture.invoking_storage_context();
         let plan = storage_plan_with_context(&fixture.invoking_root, &context).unwrap();
+        assert!(
+            plan.roots
+                .iter()
+                .any(|root| root.path == fixture.placement_root),
+            "the direct-root public plan must inventory the foreign placement"
+        );
         let placement = plan
             .roots
             .iter()
