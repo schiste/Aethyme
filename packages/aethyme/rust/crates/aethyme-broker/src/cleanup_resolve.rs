@@ -573,6 +573,17 @@ impl Broker {
         }
         self.refuse_live_checkout(session_id, &worktree)?;
         let checkout = GitRepo::discover(&worktree)?;
+        let tracked_submodules = checkout.tracked_submodule_paths()?;
+        if !tracked_submodules.is_empty() {
+            return Err(refuse(format!(
+                "the recovery archive does not include child Git repositories for tracked submodules {tracked_submodules:?}; preserve their commits and worktrees separately before archiving this session"
+            )));
+        }
+        if checkout.has_submodule_git_metadata()? {
+            return Err(refuse(
+                "the repository retains submodule Git metadata that the recovery archive cannot inspect or include; preserve child repositories separately before archiving this session".into(),
+            ));
+        }
         let head = checkout.head_commit()?;
         let delivery_targets = self.cleanup_delivery_targets()?;
         let unlanded_commits = checkout.commits_not_on_any(&head, &delivery_targets)?;
@@ -2773,6 +2784,96 @@ mod tests {
         assert!(archived.holds_uncommitted);
     }
 
+    #[test]
+    fn archive_plan_refuses_tracked_submodules_and_preserves_the_checkout() {
+        for child_state in ["clean", "modified", "untracked", "pointer"] {
+            let owner = tempfile::tempdir().unwrap();
+            let repository = owner.path().join("repository");
+            let source = owner.path().join("submodule-source");
+            std::fs::create_dir(&repository).unwrap();
+            std::fs::create_dir(&source).unwrap();
+            git(&source, &["init", "-q", "-b", "main"]);
+            std::fs::write(source.join("tracked.txt"), "submodule source\n").unwrap();
+            git(&source, &["add", "tracked.txt"]);
+            git(&source, &["commit", "-qm", "submodule initial"]);
+
+            git(&repository, &["init", "-q", "-b", "main"]);
+            std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+            git(&repository, &["add", "README.md"]);
+            git(&repository, &["commit", "-qm", "superproject initial"]);
+            let source_path = source.to_str().unwrap();
+            git(
+                &repository,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    "--quiet",
+                    source_path,
+                    "sub",
+                ],
+            );
+            git(
+                &repository,
+                &["config", "-f", ".gitmodules", "submodule.sub.ignore", "all"],
+            );
+            git(&repository, &["add", "-A"]);
+            git(&repository, &["commit", "-qm", "add submodule"]);
+            git(&repository, &["config", "diff.ignoreSubmodules", "all"]);
+            git(&repository, &["config", "submodule.sub.ignore", "all"]);
+
+            let storage = crate::test_storage::TestStorage::new();
+            let mut broker = storage.open(&repository).unwrap();
+            let session = broker
+                .start_worktree("dirty submodule archive refusal", None)
+                .unwrap();
+            let worktree = PathBuf::from(&session.worktree_path);
+            git(
+                &worktree,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "update",
+                    "--init",
+                    "--quiet",
+                    "--",
+                    "sub",
+                ],
+            );
+            std::fs::write(worktree.join("outside.txt"), "archive-needed work\n").unwrap();
+            let child = worktree.join("sub");
+            match child_state {
+                "clean" => {}
+                "modified" => {
+                    std::fs::write(child.join("tracked.txt"), "modified child content\n").unwrap();
+                }
+                "untracked" => {
+                    std::fs::write(child.join("untracked.txt"), "untracked child content\n")
+                        .unwrap();
+                }
+                "pointer" => {
+                    std::fs::write(child.join("tracked.txt"), "second child commit\n").unwrap();
+                    git(&child, &["add", "tracked.txt"]);
+                    git(&child, &["commit", "-qm", "second child commit"]);
+                }
+                _ => unreachable!(),
+            }
+            broker.close(session.id).unwrap();
+
+            let error = broker
+                .cleanup_resolve_plan(session.id)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("does not include child Git repositories"),
+                "{error}"
+            );
+            assert!(worktree.is_dir());
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn protected_ignored_files_and_links_are_archived_and_block_gc_expiry() {
@@ -2780,9 +2881,10 @@ mod tests {
         let repository = owner.path().join("repository");
         std::fs::create_dir(&repository).unwrap();
         git(&repository, &["init", "-q", "-b", "main"]);
+        let newline_name = "private-line\nbreak";
         std::fs::write(
             repository.join(".gitignore"),
-            "/private.txt\n/private-link\n",
+            "/private.txt\n/private-link\n/private*break\n",
         )
         .unwrap();
         std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
@@ -2796,13 +2898,22 @@ mod tests {
             .unwrap();
         let worktree = PathBuf::from(&session.worktree_path);
         std::fs::write(worktree.join("private.txt"), "preserve me\n").unwrap();
+        std::fs::write(worktree.join(newline_name), "preserve newline name\n").unwrap();
         std::os::unix::fs::symlink("../outside-secret", worktree.join("private-link")).unwrap();
         broker.close(session.id).unwrap();
 
         let plan = broker.cleanup_resolve_plan(session.id).unwrap();
-        assert_eq!(plan.ignored_files.len(), 2);
-        assert_eq!(plan.ignored_bytes, b"preserve me\n".len() as u64);
-        assert_eq!(plan.ignored_paths.len(), 2);
+        assert_eq!(plan.ignored_files.len(), 3);
+        assert_eq!(
+            plan.ignored_bytes,
+            (b"preserve me\n".len() + b"preserve newline name\n".len()) as u64
+        );
+        assert_eq!(plan.ignored_paths.len(), 3);
+        assert!(
+            plan.ignored_paths
+                .iter()
+                .any(|path| path.path == newline_name)
+        );
         assert!(
             plan.ignored_paths
                 .iter()
@@ -2816,6 +2927,10 @@ mod tests {
             std::fs::read(outcome.archive.join("ignored/private.txt")).unwrap(),
             b"preserve me\n"
         );
+        assert_eq!(
+            std::fs::read(outcome.archive.join("ignored").join(newline_name)).unwrap(),
+            b"preserve newline name\n"
+        );
         assert!(
             std::fs::symlink_metadata(outcome.archive.join("ignored/private-link"))
                 .unwrap()
@@ -2825,6 +2940,41 @@ mod tests {
         let archived = broker.owned_recovery_archive(&outcome.archive).unwrap();
         assert!(archived.holds_uncommitted);
         assert!(!broker.recovery_archive_landed(&archived));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_archive_refuses_non_utf8_ignored_standalone_files() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join(".gitignore"), "/private-*\n").unwrap();
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("archive non-UTF-8 ignored file refusal", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        let mut filename = b"private-".to_vec();
+        filename.push(0xff);
+        let path = worktree.join(std::ffi::OsString::from_vec(filename));
+        std::fs::write(&path, "preserve or refuse\n").unwrap();
+        broker.close(session.id).unwrap();
+
+        let error = broker
+            .cleanup_resolve_plan(session.id)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("non-UTF-8"), "{error}");
+        assert!(worktree.is_dir());
+        assert!(path.is_file());
     }
 
     #[test]

@@ -326,6 +326,101 @@ fn parse_porcelain_entries_z(out: &[u8]) -> Result<Vec<([u8; 2], String)>, GitEr
     Ok(entries)
 }
 
+fn git_listing_invalid(args: &[&str]) -> GitError {
+    GitError::UntrustedOutput {
+        detail: format!(
+            "git {} emitted malformed or non-UTF-8 NUL-separated entries",
+            args.join(" ")
+        ),
+    }
+}
+
+fn strict_git_listing_records<'a>(out: &'a [u8], args: &[&str]) -> Result<Vec<&'a [u8]>, GitError> {
+    let invalid = || git_listing_invalid(args);
+    if out.is_empty() {
+        return Ok(Vec::new());
+    }
+    if out.last() != Some(&0) {
+        return Err(invalid());
+    }
+    let records = out[..out.len() - 1]
+        .split(|byte| *byte == 0)
+        .collect::<Vec<_>>();
+    if records.iter().any(|record| record.is_empty()) {
+        return Err(invalid());
+    }
+    Ok(records)
+}
+
+fn valid_git_mode(field: &[u8]) -> bool {
+    field.len() == 6 && field.iter().all(|byte| (b'0'..=b'7').contains(byte))
+}
+
+fn valid_git_object_id(field: &[u8]) -> bool {
+    matches!(field.len(), 40 | 64) && field.iter().all(u8::is_ascii_hexdigit)
+}
+
+fn parse_tree_gitlinks(out: &[u8], args: &[&str]) -> Result<Vec<String>, GitError> {
+    let invalid = || git_listing_invalid(args);
+    let mut paths = Vec::new();
+    for record in strict_git_listing_records(out, args)? {
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(invalid)?;
+        let mut fields = record[..tab].split(|byte| *byte == b' ');
+        let mode = fields.next().ok_or_else(invalid)?;
+        let object_type = fields.next().ok_or_else(invalid)?;
+        let object_id = fields.next().ok_or_else(invalid)?;
+        if fields.next().is_some()
+            || !valid_git_mode(mode)
+            || !valid_git_object_id(object_id)
+            || !matches!(object_type, b"blob" | b"tree" | b"commit")
+            || ((mode == b"160000") != (object_type == b"commit"))
+        {
+            return Err(invalid());
+        }
+        let path = std::str::from_utf8(&record[tab + 1..]).map_err(|_| invalid())?;
+        if path.is_empty() {
+            return Err(invalid());
+        }
+        if mode == b"160000" {
+            paths.push(path.to_owned());
+        }
+    }
+    Ok(paths)
+}
+
+fn parse_index_gitlinks(out: &[u8], args: &[&str]) -> Result<Vec<String>, GitError> {
+    let invalid = || git_listing_invalid(args);
+    let mut paths = Vec::new();
+    for record in strict_git_listing_records(out, args)? {
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(invalid)?;
+        let mut fields = record[..tab].split(|byte| *byte == b' ');
+        let mode = fields.next().ok_or_else(invalid)?;
+        let object_id = fields.next().ok_or_else(invalid)?;
+        let stage = fields.next().ok_or_else(invalid)?;
+        if fields.next().is_some()
+            || !valid_git_mode(mode)
+            || !valid_git_object_id(object_id)
+            || !matches!(stage, b"0" | b"1" | b"2" | b"3")
+        {
+            return Err(invalid());
+        }
+        let path = std::str::from_utf8(&record[tab + 1..]).map_err(|_| invalid())?;
+        if path.is_empty() {
+            return Err(invalid());
+        }
+        if mode == b"160000" {
+            paths.push(path.to_owned());
+        }
+    }
+    Ok(paths)
+}
+
 fn only_unstaged_tracked_deletions(
     entries: &[([u8; 2], String)],
     safe_ignored: impl Fn(&str) -> bool,
@@ -4508,16 +4603,70 @@ impl GitRepo {
     /// Refuses outright when no trustworthy `git` was found: this answer
     /// decides whether a worktree may be removed and whether a push may
     /// proceed, and "clean" from a wrapper that swallowed a line is the one
-    /// wrong answer that costs work rather than disk.
+    /// wrong answer that costs work rather than disk. Submodule contents are
+    /// included explicitly so user ignore settings cannot make them appear clean.
     pub fn dirty_paths(&self) -> Result<Vec<String>, GitError> {
         require_trustworthy_porcelain()?;
         Ok(parse_porcelain_entries_z(&run_git_bytes(
             &self.root,
-            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
         )?)?
         .into_iter()
         .map(|(_, path)| path)
         .collect())
+    }
+
+    /// Gitlink paths in both the committed HEAD tree and every index stage.
+    /// The archive stores superproject commits and patches, not child Git
+    /// object stores, so cleanup must not treat a missing index entry as proof
+    /// that no submodule content belongs to this checkout.
+    pub(crate) fn tracked_submodule_paths(&self) -> Result<Vec<String>, GitError> {
+        require_trustworthy_porcelain()?;
+        const HEAD_ARGS: &[&str] = &["ls-tree", "-r", "--full-tree", "-z", "HEAD"];
+        const INDEX_ARGS: &[&str] = &["ls-files", "--stage", "--full-name", "-z"];
+        let mut paths = parse_tree_gitlinks(&run_git_bytes(&self.root, HEAD_ARGS)?, HEAD_ARGS)?;
+        paths.extend(parse_index_gitlinks(
+            &run_git_bytes(&self.root, INDEX_ARGS)?,
+            INDEX_ARGS,
+        )?);
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
+    /// Whether this checkout or its repository-wide Git directory retains a
+    /// submodule metadata root. Such metadata may hold child objects even if
+    /// the corresponding gitlink was removed from HEAD and the index.
+    pub(crate) fn has_submodule_git_metadata(&self) -> Result<bool, GitError> {
+        let worktree_git_dir =
+            worktree_git_dir(&self.root).ok_or_else(|| GitError::UntrustedOutput {
+                detail:
+                    "cannot establish the checkout Git directory for submodule metadata inspection"
+                        .into(),
+            })?;
+        let mut git_dirs = vec![worktree_git_dir, self.git_common_dir()?];
+        git_dirs.sort();
+        git_dirs.dedup();
+        for git_dir in git_dirs {
+            let modules = git_dir.join("modules");
+            match std::fs::symlink_metadata(&modules) {
+                Ok(_) => return Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(GitError::Spawn {
+                        args: format!("inspect {}", modules.display()),
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Dirty paths and their untracked subset from one trustworthy status snapshot.
@@ -4525,7 +4674,13 @@ impl GitRepo {
         require_trustworthy_porcelain()?;
         let entries = parse_porcelain_entries_z(&run_git_bytes(
             &self.root,
-            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
         )?)?;
         let mut dirty = Vec::with_capacity(entries.len());
         let mut untracked = Vec::new();
@@ -4556,6 +4711,7 @@ impl GitRepo {
                 "-z",
                 "--untracked-files=all",
                 "--ignored=matching",
+                "--ignore-submodules=none",
             ],
         )?)?;
         Ok(only_unstaged_tracked_deletions(&entries, |path| {
@@ -4689,7 +4845,13 @@ impl GitRepo {
         let mut summary = UncommittedSummary::default();
         for (xy, path) in parse_porcelain_entries_z(&run_git_bytes(
             &self.root,
-            &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=normal",
+                "--ignore-submodules=none",
+            ],
         )?)? {
             match xy {
                 [b'?', b'?'] => summary.untracked.push(path),
@@ -4703,7 +4865,13 @@ impl GitRepo {
     pub fn untracked_paths(&self) -> Result<Vec<String>, GitError> {
         Ok(parse_porcelain_entries_z(&run_git_bytes(
             &self.root,
-            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
         )?)?
         .into_iter()
         .filter(|(xy, _path)| *xy == [b'?', b'?'])
@@ -4717,7 +4885,8 @@ impl GitRepo {
     /// The prefixes, rename detection and diff drivers are pinned rather than
     /// inherited: a user's `diff.noprefix`, `diff.external` or textconv filter
     /// changes what `git diff` prints, and a recovery patch has to apply on a
-    /// machine that does not share that configuration.
+    /// machine that does not share that configuration. Submodule visibility is
+    /// pinned too, so a local ignore setting cannot hide a gitlink pointer change.
     pub fn recovery_patch(&self, cached: bool) -> Result<Vec<u8>, GitError> {
         let mut args = vec![
             "-c",
@@ -4727,7 +4896,12 @@ impl GitRepo {
             "diff",
         ];
         args.extend(PINNED_DIFF_FORMAT_ARGS);
-        args.extend(["--binary", "--full-index", "--no-renames"]);
+        args.extend([
+            "--binary",
+            "--full-index",
+            "--no-renames",
+            "--ignore-submodules=none",
+        ]);
         if cached {
             args.push("--cached");
         }
@@ -4809,7 +4983,13 @@ impl GitRepo {
     pub fn tracked_dirty_paths(&self) -> Result<Vec<String>, GitError> {
         Ok(parse_porcelain_entries_z(&run_git_bytes(
             &self.root,
-            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
         )?)?
         .into_iter()
         .filter(|(xy, _path)| *xy != [b'?', b'?'])
@@ -5542,6 +5722,249 @@ mod porcelain_tests {
         );
         assert!(parse_porcelain_entries_z(b"R  new\0").is_err());
         assert!(parse_porcelain_entries_z(b"R  new\0\0").is_err());
+    }
+}
+
+#[cfg(test)]
+mod gitlink_census_tests {
+    use super::{GitRepo, parse_index_gitlinks, parse_tree_gitlinks};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+            .output()
+            .expect("run git fixture command");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn init_repo(root: &Path) {
+        std::fs::create_dir_all(root).unwrap();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["config", "user.name", "test"]);
+        git(root, &["config", "user.email", "test@example.invalid"]);
+    }
+
+    fn submodule_fixture() -> (tempfile::TempDir, GitRepo, PathBuf) {
+        let owner = tempfile::tempdir().unwrap();
+        let source = owner.path().join("submodule-source");
+        let repository = owner.path().join("superproject");
+        init_repo(&source);
+        std::fs::write(source.join("tracked.txt"), "initial\n").unwrap();
+        git(&source, &["add", "tracked.txt"]);
+        git(&source, &["commit", "-qm", "submodule initial"]);
+
+        init_repo(&repository);
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "README.md"]);
+        git(&repository, &["commit", "-qm", "superproject initial"]);
+        let source_path = source.to_str().unwrap();
+        git(
+            &repository,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "--quiet",
+                source_path,
+                "sub",
+            ],
+        );
+        git(
+            &repository,
+            &["config", "-f", ".gitmodules", "submodule.sub.ignore", "all"],
+        );
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-qm", "add submodule"]);
+        git(&repository, &["config", "diff.ignoreSubmodules", "all"]);
+        git(&repository, &["config", "submodule.sub.ignore", "all"]);
+
+        let checkout = GitRepo::discover(&repository).unwrap();
+        (owner, checkout, repository.join("sub"))
+    }
+
+    #[test]
+    fn gitlink_census_parsers_are_strict_and_preserve_newline_paths_and_conflict_stages() {
+        let oid = "a".repeat(40);
+        let mut tree = format!("160000 commit {oid}\tsub\nmodule\0").into_bytes();
+        tree.extend_from_slice(format!("100644 blob {oid}\tregular.txt\0").as_bytes());
+        assert_eq!(
+            parse_tree_gitlinks(&tree, &["ls-tree"]),
+            Ok(vec!["sub\nmodule".into()])
+        );
+
+        let index = format!(
+            "160000 {oid} 1\tconflicted-submodule\0\
+             160000 {oid} 2\tconflicted-submodule\0\
+             160000 {oid} 3\tconflicted-submodule\0\
+             100644 {oid} 0\tregular.txt\0"
+        );
+        assert_eq!(
+            parse_index_gitlinks(index.as_bytes(), &["ls-files"]),
+            Ok(vec![
+                "conflicted-submodule".into(),
+                "conflicted-submodule".into(),
+                "conflicted-submodule".into()
+            ])
+        );
+    }
+
+    #[test]
+    fn malformed_gitlink_census_output_fails_closed() {
+        let oid = "a".repeat(40);
+        let mut invalid_tree_path = format!("160000 commit {oid}\tbad-").into_bytes();
+        invalid_tree_path.extend_from_slice(&[0xff, 0]);
+        for out in [
+            format!("160000 commit {oid}\tsub").into_bytes(),
+            format!("160000 blob {oid}\tsub\0").into_bytes(),
+            invalid_tree_path,
+        ] {
+            assert!(parse_tree_gitlinks(&out, &["ls-tree"]).is_err(), "{out:?}");
+        }
+        let mut invalid_index_path = format!("160000 {oid} 1\tbad-").into_bytes();
+        invalid_index_path.extend_from_slice(&[0xff, 0]);
+        for out in [
+            format!("160000 {oid} 4\tsub\0").into_bytes(),
+            format!("160000 {oid} 2\tsub").into_bytes(),
+            invalid_index_path,
+        ] {
+            assert!(
+                parse_index_gitlinks(&out, &["ls-files"]).is_err(),
+                "{out:?}"
+            );
+        }
+        assert!(parse_tree_gitlinks(b"", &["ls-tree"]).unwrap().is_empty());
+        assert!(parse_index_gitlinks(b"", &["ls-files"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn gitlink_census_covers_head_and_index_and_detects_retained_module_metadata() {
+        let (_owner, checkout, submodule) = submodule_fixture();
+        assert_eq!(checkout.tracked_submodule_paths().unwrap(), vec!["sub"]);
+        assert!(checkout.has_submodule_git_metadata().unwrap());
+
+        let oid = git(&submodule, &["rev-parse", "HEAD"]);
+        let cacheinfo = format!("160000,{oid},staged-submodule");
+        git(
+            checkout.root(),
+            &["update-index", "--add", "--cacheinfo", &cacheinfo],
+        );
+        assert_eq!(
+            checkout.tracked_submodule_paths().unwrap(),
+            vec!["staged-submodule", "sub"]
+        );
+        git(
+            checkout.root(),
+            &["update-index", "--force-remove", "staged-submodule"],
+        );
+
+        git(checkout.root(), &["rm", "-f", "--", "sub"]);
+        git(checkout.root(), &["commit", "-qm", "remove submodule"]);
+        assert!(checkout.tracked_submodule_paths().unwrap().is_empty());
+        assert!(checkout.has_submodule_git_metadata().unwrap());
+    }
+
+    #[test]
+    fn git_status_and_recovery_patch_include_gitlink_changes_under_ignore_all_config() {
+        let (_owner, checkout, submodule) = submodule_fixture();
+        let initial_oid = git(&submodule, &["rev-parse", "HEAD"]);
+        std::fs::write(submodule.join("tracked.txt"), "second commit\n").unwrap();
+        git(&submodule, &["add", "tracked.txt"]);
+        git(&submodule, &["commit", "-qm", "second submodule commit"]);
+        let changed_oid = git(&submodule, &["rev-parse", "HEAD"]);
+        assert!(
+            checkout
+                .dirty_paths()
+                .unwrap()
+                .iter()
+                .any(|path| path == "sub")
+        );
+        let pointer_patch = String::from_utf8(checkout.recovery_patch(false).unwrap()).unwrap();
+        assert!(
+            pointer_patch.contains(&format!("Subproject commit {initial_oid}")),
+            "{pointer_patch}"
+        );
+        assert!(
+            pointer_patch.contains(&format!("Subproject commit {changed_oid}")),
+            "{pointer_patch}"
+        );
+
+        git(&submodule, &["checkout", "--detach", &initial_oid]);
+        std::fs::write(submodule.join("tracked.txt"), "modified\n").unwrap();
+        assert!(
+            checkout
+                .dirty_paths()
+                .unwrap()
+                .iter()
+                .any(|path| path == "sub")
+        );
+        git(&submodule, &["checkout", "--", "tracked.txt"]);
+        std::fs::write(submodule.join("untracked.txt"), "untracked\n").unwrap();
+        assert!(
+            checkout
+                .dirty_paths()
+                .unwrap()
+                .iter()
+                .any(|path| path == "sub")
+        );
+    }
+
+    #[test]
+    fn staged_gitlink_patch_overrides_ignore_all_config() {
+        let owner = tempfile::tempdir().unwrap();
+        let source = owner.path().join("object-source");
+        let repository = owner.path().join("superproject");
+        init_repo(&source);
+        std::fs::write(source.join("commit.txt"), "object source\n").unwrap();
+        git(&source, &["add", "commit.txt"]);
+        git(&source, &["commit", "-qm", "object source"]);
+        let initial_oid = git(&source, &["rev-parse", "HEAD"]);
+        std::fs::write(source.join("commit.txt"), "second object source\n").unwrap();
+        git(&source, &["add", "commit.txt"]);
+        git(&source, &["commit", "-qm", "second object source"]);
+        let changed_oid = git(&source, &["rev-parse", "HEAD"]);
+
+        init_repo(&repository);
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "README.md"]);
+        git(&repository, &["commit", "-qm", "superproject initial"]);
+        let cacheinfo = format!("160000,{initial_oid},sub");
+        git(
+            &repository,
+            &["update-index", "--add", "--cacheinfo", &cacheinfo],
+        );
+        git(&repository, &["commit", "-qm", "initial gitlink"]);
+        git(&repository, &["config", "diff.ignoreSubmodules", "all"]);
+        let changed_cacheinfo = format!("160000,{changed_oid},sub");
+        git(
+            &repository,
+            &["update-index", "--cacheinfo", &changed_cacheinfo],
+        );
+
+        let checkout = GitRepo::discover(&repository).unwrap();
+        let patch = String::from_utf8(checkout.recovery_patch(true).unwrap()).unwrap();
+        assert!(
+            patch.contains(&format!("Subproject commit {initial_oid}")),
+            "{patch}"
+        );
+        assert!(
+            patch.contains(&format!("Subproject commit {changed_oid}")),
+            "{patch}"
+        );
     }
 }
 
