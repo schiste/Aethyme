@@ -16,12 +16,30 @@ version and the target, oldest first. Each schema migration runs on first open
 and is one-way, so rollback is limited to the oldest binary that still reads
 the newest schema you have opened.
 
-Breaking releases: [v0.8.40](#v0840), [v0.8.38](#v0838), [v0.8.37](#v0837), [v0.8.33](#v0833), [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
+Breaking releases: [v0.8.41](#v0841), [v0.8.40](#v0840), [v0.8.38](#v0838), [v0.8.37](#v0837), [v0.8.33](#v0833), [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
 [v0.7.25](#v0725), [v0.7.23](#v0723), [v0.7.22](#v0722), [v0.7.19](#v0719),
 [v0.7.18](#v0718), [v0.7.16](#v0716), [v0.7.9](#v079), [v0.7.8](#v078),
 [v0.7.4](#v074), [v0.7.2](#v072),
 [v0.7.1](#v071), [v0.5.0](#v050), [v0.3.0](#v030),
 [v0.2.2](#v022), [v0.2.0](#v020).
+
+## v0.8.41
+
+### Compatibility
+
+New broker-created worktrees record spawn witness schema 2, and new finish cleanup recovery proofs use schema 3. Both bind the checkout to a random generation marker created at spawn. Current maintenance reads legacy records but does not use records missing that marker to authorize unattended removal or finish-recovery resumption. For those unattended paths, missing, changed or unsupported generation evidence retains the checkout. Cleanup never backfills ownership onto an existing directory.
+
+Earlier strict readers can reject the new records. Use the matching current runtime for automatic maintenance of newly created worktrees. This release adds no broker database migration or compatibility-floor change; it does not make old running maintenance processes safe or update their behavior in place.
+
+The additive `broker commit` command uses a session-local lock while preserving hooks and before/after ownership checks. Existing `broker advanced git` commands retain their current coordination behavior. The new command's JSON field `command_ran` is true when launch is confirmed and null when launch cannot be confirmed; null must not be treated as proof that nothing ran.
+
+### Migrate and verify
+
+Install the matching router and engine pair and verify v0.8.41 and the same source commit at every active installation root. Restart maintenance workers on the updated pair before relying on generation-bound cleanup. Already-running old binaries remain old; switching an installation does not upgrade their mapped code. Preserve checkouts with legacy or incomplete generation evidence for reviewed recovery.
+
+### Rollback
+
+Stop maintenance workers before rollback. Earlier runtimes may reject new witness and recovery-proof records and do not implement the current generation checks. Preserve these records and their checkouts; return to a compatible current pair for automatic cleanup or recovery. Database rollback is not required by this release, and previous release compatibility limits still apply.
 
 ## v0.8.40
 
