@@ -2204,12 +2204,12 @@ impl Broker {
             return Err(BrokerOpError::MissingExecCommand);
         }
         let session = self.store.session(session_id)?;
-        // Guard ownership uses current explicit leases and holder policy, not
-        // speculative merge verdicts. Refresh lease records (including the
-        // acting session), but leave merge simulation and announcements to
-        // ordinary refresh/claim/submit. Keep both dirty-state snapshots and
-        // the post-command ownership audit below unchanged.
-        self.refresh_leases_including_with_claim_preparation(Some(session_id), None, false)?;
+        // Global implicit leases and overlap classification are diagnostic
+        // snapshots maintained by explicit refresh/claim/submit paths. Guarded
+        // authorization below reads current explicit leases, applies current
+        // holder policy, and checks the foreign-file snapshot directly. Avoid
+        // rescanning every live checkout here; leave the refresh timestamp
+        // unchanged so it continues to describe the diagnostic snapshot.
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
         let (mut before_dirty, before_untracked) = checkout.dirty_and_untracked_paths()?;
         before_dirty.sort();
@@ -2863,7 +2863,7 @@ impl PathAudit {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod generic_guarded_exec_tests {
     use super::*;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     fn git(root: &Path, args: &[&str]) {
@@ -2892,6 +2892,216 @@ mod generic_guarded_exec_tests {
         let storage = crate::test_storage::TestStorage::new();
         let broker = storage.open(repository.path()).unwrap();
         (repository, storage, broker)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_exec_does_not_probe_unrelated_live_worktrees() {
+        const CHILD_MODE: &str = "AETHYME_GUARDED_EXEC_TRACE_CHILD";
+        const TEST: &str = "broker::leases::generic_guarded_exec_tests::guarded_exec_does_not_probe_unrelated_live_worktrees";
+        if std::env::var_os(CHILD_MODE).is_some() {
+            let (_repository, _storage, mut broker) = fixture();
+            let actor = broker
+                .start_worktree("guarded exec trace actor", None)
+                .unwrap();
+            let peer = broker
+                .start_worktree("guarded exec trace peer", None)
+                .unwrap();
+            let actor_root = PathBuf::from(&actor.worktree_path).canonicalize().unwrap();
+            let peer_root = PathBuf::from(&peer.worktree_path).canonicalize().unwrap();
+            std::fs::write(peer_root.join("tracked.txt"), "peer edit\n").unwrap();
+            broker.claim_lease(actor.id, "tracked.txt", None).unwrap();
+            assert!(
+                broker
+                    .coordinating_session_ids()
+                    .unwrap()
+                    .contains(&peer.id),
+                "the peer must be a live coordinator so the old global refresh would scan it"
+            );
+            broker
+                .store
+                .meta_set("leases.refreshed_at_ms", "12345")
+                .unwrap();
+            let trace = PathBuf::from(
+                std::env::var_os("GIT_TRACE2_EVENT").expect("parent supplies a private trace path"),
+            );
+            std::fs::write(&trace, b"").unwrap();
+
+            let report = broker
+                .guarded_exec_with_env_heartbeat_and_mode(
+                    actor.id,
+                    &[
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "printf guarded > tracked.txt".into(),
+                    ],
+                    &[],
+                    || Ok(()),
+                    || crate::inline_exec_supervisor::GenericExecMode::Supervised,
+                )
+                .unwrap();
+            assert!(report.command_success);
+            assert!(report.ownership_ok);
+            assert_eq!(
+                broker
+                    .store
+                    .meta_get("leases.refreshed_at_ms")
+                    .unwrap()
+                    .as_deref(),
+                Some("12345"),
+                "guarded exec must not claim the global diagnostic snapshot was refreshed"
+            );
+
+            let worktrees: Vec<PathBuf> = std::fs::read_to_string(&trace)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|event| event["event"] == "def_repo")
+                .filter_map(|event| event["worktree"].as_str().map(PathBuf::from))
+                .map(|path| path.canonicalize().unwrap_or(path))
+                .collect();
+            assert!(
+                worktrees.iter().any(|path| path == &actor_root),
+                "the trace must observe Git in the guarded checkout: {worktrees:?}"
+            );
+            assert!(
+                !worktrees.iter().any(|path| path == &peer_root),
+                "guarded exec must not start Git in an unrelated live checkout: {worktrees:?}"
+            );
+            return;
+        }
+
+        let parent = tempfile::tempdir().unwrap();
+        let parent_path = parent.path().canonicalize().unwrap();
+        let trace = parent_path.join("git-trace.jsonl");
+        let home = parent_path.join("home");
+        std::fs::create_dir(&home).unwrap();
+        let global_config = parent_path.join("empty-git-config");
+        std::fs::write(&global_config, b"").unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", TEST, "--nocapture"]);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                child.env_remove(key);
+            }
+        }
+        let output = child
+            .env(CHILD_MODE, "1")
+            .env("HOME", &home)
+            .env("GIT_CONFIG_GLOBAL", &global_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TRACE2_EVENT", &trace)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn guarded_exec_preserves_out_of_lease_foreign_and_unknown_holder_checks() {
+        let (_repository, _storage, mut broker) = fixture();
+        let actor = broker
+            .start_worktree("guarded ownership actor", None)
+            .unwrap();
+        let holder = broker
+            .start_worktree("guarded ownership holder", None)
+            .unwrap();
+        broker
+            .store
+            .connection()
+            .execute(
+                "UPDATE sessions SET pid = NULL, status = 'active', last_activity_at = ?1 WHERE id = ?2",
+                rusqlite::params![crate::clock::epoch_ms(), holder.id],
+            )
+            .unwrap();
+        broker.claim_lease(holder.id, "tracked.txt", None).unwrap();
+        let holder_view = broker
+            .agents_snapshot(crate::clock::epoch_ms())
+            .unwrap()
+            .into_iter()
+            .find(|agent| agent.session.id == holder.id)
+            .unwrap();
+        assert_eq!(
+            holder_view.pid_alive, None,
+            "the holder has unknown process evidence"
+        );
+        assert_eq!(holder_view.derived_status, crate::SessionStatus::Active);
+
+        let guarded_write = |broker: &mut Broker, target: &str, value: &str| {
+            broker
+                .guarded_exec_with_env_heartbeat_and_mode(
+                    actor.id,
+                    &[
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "printf '%s' \"$VALUE\" > \"$TARGET\"".into(),
+                    ],
+                    &[
+                        ("TARGET".into(), target.into()),
+                        ("VALUE".into(), value.into()),
+                    ],
+                    || Ok(()),
+                    || crate::inline_exec_supervisor::GenericExecMode::Supervised,
+                )
+                .unwrap()
+        };
+
+        let outside = guarded_write(&mut broker, "tracked.txt", "unclaimed change\n");
+        assert!(!outside.ownership_ok);
+        assert!(
+            outside
+                .outside_lease_paths
+                .iter()
+                .any(|path| path == "tracked.txt")
+        );
+        assert!(
+            outside
+                .conflicting_leases
+                .iter()
+                .any(|lease| lease.session_id == holder.id && lease.path == "tracked.txt"),
+            "an explicit lease from an active holder with unknown PID remains a blocker"
+        );
+
+        let actor_root = PathBuf::from(&actor.worktree_path);
+        std::fs::write(actor_root.join("foreign.txt"), "before\n").unwrap();
+        broker
+            .store
+            .set_session_foreign_files(actor.id, &["foreign.txt".to_owned()])
+            .unwrap();
+        let foreign = guarded_write(&mut broker, "foreign.txt", "changed foreign content\n");
+        assert!(!foreign.ownership_ok);
+        assert!(
+            foreign
+                .foreign_paths
+                .iter()
+                .any(|path| path == "foreign.txt")
+        );
+        assert!(
+            foreign
+                .outside_lease_paths
+                .iter()
+                .any(|path| path == "foreign.txt")
+        );
+
+        broker.claim_lease(actor.id, "foreign.txt", None).unwrap();
+        let explicitly_owned = guarded_write(&mut broker, "foreign.txt", "claimed change\n");
+        assert!(explicitly_owned.ownership_ok);
+        assert!(
+            explicitly_owned
+                .outside_lease_paths
+                .iter()
+                .all(|path| path != "foreign.txt")
+        );
+        assert!(
+            explicitly_owned
+                .foreign_paths
+                .iter()
+                .all(|path| path != "foreign.txt")
+        );
     }
 
     #[test]
