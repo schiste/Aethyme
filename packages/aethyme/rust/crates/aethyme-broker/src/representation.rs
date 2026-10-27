@@ -67,7 +67,7 @@ pub const DEFAULT_SEARCH_CAP: usize = 2_000;
 const MAX_LANDING_SEARCH_BUDGET: Duration = Duration::from_secs(30);
 /// A large but finite complete commit listing for oldest-first search.
 const MAX_LANDING_CANDIDATE_LIST_BYTES: usize = 16 * 1024 * 1024;
-const LANDING_SEARCH_ALGORITHM_VERSION: u8 = 3;
+const LANDING_SEARCH_ALGORITHM_VERSION: u8 = 4;
 
 fn landing_query_count(candidate_count: usize, path_count: usize) -> Option<usize> {
     candidate_count
@@ -400,6 +400,16 @@ fn find_landing_with_limits(
         ));
     }
 
+    let query_budget = query_budget.min(crate::git::MAX_GIT_BATCH_QUERY_COUNT);
+    let query_limit_error = |needed| {
+        unavailable(format!(
+            "exact-content landing search needs {needed} candidate/path queries; the limit is {query_budget}"
+        ))
+    };
+    if content.paths.len() > query_budget {
+        return Err(query_limit_error(content.paths.len()));
+    }
+
     // Content already at the session's own base means the session changed
     // nothing the branch lacks. Naming a landing commit here would be a lie
     // about which commit carried the work.
@@ -424,21 +434,30 @@ fn find_landing_with_limits(
     let truncated = candidates.len() > cap;
     let window = &candidates[..candidates.len().min(cap)];
     let paths = content.paths.iter().collect::<Vec<_>>();
-    let query_count = landing_query_count(window.len(), paths.len())
-        .ok_or_else(|| unavailable("landing candidate/path query count overflowed".into()))?;
-    if query_count > query_budget || query_count > crate::git::MAX_GIT_BATCH_QUERY_COUNT {
-        return Err(unavailable(format!(
-            "exact-content landing search needs {query_count} candidate/path queries; the limit is {}",
-            query_budget.min(crate::git::MAX_GIT_BATCH_QUERY_COUNT)
-        )));
-    }
     let mut best: Option<(String, usize, String)> = None;
+    let mut examined = 0;
 
-    for (batch_index, batch) in window.chunks(CANDIDATE_BATCH).enumerate() {
+    // Charge only candidates actually read, including the base above. Reserving
+    // the entire possible window rejects early matches merely because unrelated
+    // history followed them. Shrink the final batch to the remaining budget;
+    // exhaustion is unavailable, never evidence that the work did not land.
+    while examined < window.len() {
+        let spent = landing_query_count(examined, paths.len())
+            .ok_or_else(|| unavailable("landing candidate/path query count overflowed".into()))?;
+        let batch_len = ((query_budget - spent) / paths.len())
+            .min(CANDIDATE_BATCH)
+            .min(window.len() - examined);
+        if batch_len == 0 {
+            let needed = spent.checked_add(paths.len()).ok_or_else(|| {
+                unavailable("landing candidate/path query count overflowed".into())
+            })?;
+            return Err(query_limit_error(needed));
+        }
+        let batch = &window[examined..examined + batch_len];
         if Instant::now() >= deadline {
             return Err(landing_search_budget_expired(format!(
                 "after {} of {} candidate commits",
-                batch_index * CANDIDATE_BATCH,
+                examined,
                 window.len()
             )));
         }
@@ -455,7 +474,7 @@ fn find_landing_with_limits(
             .map_err(|source| unavailable(format!("cannot read candidate content: {source}")))?;
         for (offset, (candidate, found)) in batch.iter().zip(blobs.chunks(paths.len())).enumerate()
         {
-            let position = batch_index * CANDIDATE_BATCH + offset;
+            let position = examined + offset;
             // Paths are compared in order and the first mismatch ends the
             // count, so "closest" means the longest matching prefix.
             let matched = paths
@@ -484,6 +503,7 @@ fn find_landing_with_limits(
                 best = Some((candidate.clone(), matched, paths[matched].0.clone()));
             }
         }
+        examined += batch.len();
     }
 
     // A truncated window says nothing about the history beyond it, and the
@@ -1702,6 +1722,69 @@ mod tests {
                 if reason.contains("needs 2 candidate/path queries")
                     && reason.contains("limit is 1")
         ));
+    }
+
+    #[test]
+    fn an_early_landing_does_not_reserve_queries_for_later_history() {
+        let (tmp, repo, base) = seeded();
+        git(tmp.path(), &["checkout", "-q", "-b", "session"]);
+        write(tmp.path(), "session.rs", "session change\n");
+        let head = commit(tmp.path(), "session change");
+        let content = session_content(&repo, &base, &head).unwrap();
+
+        git(tmp.path(), &["checkout", "-q", "main"]);
+        write(tmp.path(), "session.rs", "session change\n");
+        let landing = commit(tmp.path(), "squash session");
+        write(tmp.path(), "filler.txt", "unrelated later history\n");
+        let tip = commit(tmp.path(), "later unrelated work");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let _git_deadline = crate::git::limit_git_until(deadline);
+        let result = find_landing_with_limits(
+            &repo,
+            &content,
+            &tip,
+            DEFAULT_SEARCH_CAP,
+            deadline,
+            2, // One base path and one candidate path, not all future commits.
+            MAX_LANDING_CANDIDATE_LIST_BYTES,
+        )
+        .unwrap();
+        assert_eq!(result.examined, 1);
+        assert!(!result.truncated);
+        assert!(matches!(result.outcome, LandingOutcome::Landed(found)
+            if found.commit == landing && found.position == 0));
+    }
+
+    #[test]
+    fn exhausting_queries_after_a_partial_batch_is_not_a_negative() {
+        let (tmp, repo, base) = seeded();
+        git(tmp.path(), &["checkout", "-q", "-b", "session"]);
+        write(tmp.path(), "session.rs", "session change\n");
+        let head = commit(tmp.path(), "session change");
+        let content = session_content(&repo, &base, &head).unwrap();
+
+        git(tmp.path(), &["checkout", "-q", "main"]);
+        write(tmp.path(), "filler.txt", "before landing\n");
+        commit(tmp.path(), "unrelated work");
+        write(tmp.path(), "session.rs", "session change\n");
+        let tip = commit(tmp.path(), "squash session");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let _git_deadline = crate::git::limit_git_until(deadline);
+        let error = find_landing_with_limits(
+            &repo,
+            &content,
+            &tip,
+            DEFAULT_SEARCH_CAP,
+            deadline,
+            2,
+            MAX_LANDING_CANDIDATE_LIST_BYTES,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, BrokerOpError::RepresentationUnavailable { reason }
+            if reason.contains("needs 3 candidate/path queries")
+                && reason.contains("limit is 2"))
+        );
     }
 
     #[test]
