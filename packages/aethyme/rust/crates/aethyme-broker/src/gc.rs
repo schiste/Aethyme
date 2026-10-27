@@ -25,7 +25,7 @@ use crate::{
 mod tree_removal;
 pub(crate) use tree_removal::{
     PinnedTreeRemoval, TreeObjectIdentity, TreeRemoval, TreeRemovalError, remove_condemned_tree,
-    remove_condemned_tree_with_progress, remove_condemned_tree_with_progress_and_guard,
+    remove_condemned_tree_with_progress,
 };
 
 pub const GC_PLAN_SCHEMA_VERSION: u32 = 4;
@@ -318,6 +318,7 @@ impl ClosedSessionPages {
 enum InterruptedTreeState {
     Resume,
     Revoked(&'static str),
+    Blocked(&'static str),
     Unavailable(&'static str),
 }
 
@@ -430,10 +431,10 @@ fn interrupted_tree_state(root: &Path, path: &Path, extras: &[String]) -> Interr
     }
     let inspect_directory = |candidate: &Path| match std::fs::symlink_metadata(candidate) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            InterruptedTreeState::Revoked("symlink_component")
+            InterruptedTreeState::Blocked("symlink_component")
         }
         Ok(metadata) if metadata.is_dir() => InterruptedTreeState::Resume,
-        Ok(_) => InterruptedTreeState::Revoked("not_directory"),
+        Ok(_) => InterruptedTreeState::Blocked("not_directory"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             InterruptedTreeState::Revoked("path_missing")
         }
@@ -456,7 +457,7 @@ fn interrupted_tree_state(root: &Path, path: &Path, extras: &[String]) -> Interr
             if canonical_path != canonical_root && canonical_path.starts_with(&canonical_root) {
                 InterruptedTreeState::Resume
             } else {
-                InterruptedTreeState::Revoked("outside_worktree")
+                InterruptedTreeState::Blocked("outside_worktree")
             }
         }
         (Err(error), _) | (_, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -5792,10 +5793,39 @@ impl Broker {
             if sheltered {
                 continue;
             }
-            let root_is_directory = match std::fs::symlink_metadata(&root) {
-                Ok(metadata) if metadata.file_type().is_dir() => true,
-                Ok(_) => false,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            match std::fs::symlink_metadata(&root) {
+                Ok(metadata) if metadata.file_type().is_dir() => {}
+                Ok(_) => {
+                    // A present non-directory root may be a replacement or a
+                    // symlink. Keep interrupted intent and never follow it.
+                    blocked_interrupted_paths.push(BlockedInterruptedPath {
+                        path: Some(root.to_string_lossy().into_owned()),
+                        reason: "worktree_root_replaced",
+                    });
+                    scan_completed = false;
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // An absent worktree proves its queued descendants are
+                    // absent too. Retire only those intents; no replacement
+                    // path is opened or removed.
+                    let mut sweep_writer = ScopedArtifactSweepWriter {
+                        store: self.store(),
+                        namespace: &namespace,
+                    };
+                    if !revoke_interrupted_paths_under_root(
+                        &mut sweep_writer,
+                        &mut interrupted_paths,
+                        &mut interrupted_paths_valid,
+                        &root,
+                        "worktree_root_absent",
+                        &mut revoked_interrupted_paths,
+                        &mut blocked_interrupted_paths,
+                    )? {
+                        scan_completed = false;
+                    }
+                    continue;
+                }
                 Err(_) => {
                     blocked_interrupted_paths.push(BlockedInterruptedPath {
                         path: Some(root.to_string_lossy().into_owned()),
@@ -5804,24 +5834,6 @@ impl Broker {
                     scan_completed = false;
                     continue;
                 }
-            };
-            if !root_is_directory {
-                let mut sweep_writer = ScopedArtifactSweepWriter {
-                    store: self.store(),
-                    namespace: &namespace,
-                };
-                if !revoke_interrupted_paths_under_root(
-                    &mut sweep_writer,
-                    &mut interrupted_paths,
-                    &mut interrupted_paths_valid,
-                    &root,
-                    "worktree_root_revoked",
-                    &mut revoked_interrupted_paths,
-                    &mut blocked_interrupted_paths,
-                )? {
-                    scan_completed = false;
-                }
-                continue;
             }
             let ownership = {
                 let _git_deadline = crate::git::limit_git_until(discovery_deadline);
@@ -5912,6 +5924,13 @@ impl Broker {
                             session_scan_complete = false;
                         }
                     }
+                    InterruptedTreeState::Blocked(reason) => {
+                        blocked_interrupted_paths.push(BlockedInterruptedPath {
+                            path: Some(path.to_string_lossy().into_owned()),
+                            reason,
+                        });
+                        session_scan_complete = false;
+                    }
                     InterruptedTreeState::Unavailable(reason) => {
                         // Without a trustworthy queue write, or when the
                         // filesystem cannot be inspected, preserve the marker
@@ -5927,6 +5946,10 @@ impl Broker {
             let revoked_targets = revoked_in_worktree
                 .iter()
                 .filter_map(|revoked| revoked.canonical_path.clone())
+                .collect::<BTreeSet<_>>();
+            let revoked_paths = revoked_in_worktree
+                .iter()
+                .map(|revoked| PathBuf::from(&revoked.path))
                 .collect::<BTreeSet<_>>();
             if !revoked_in_worktree.is_empty() {
                 let revoked_paths = revoked_in_worktree
@@ -5950,6 +5973,7 @@ impl Broker {
                 }
             }
             found.retain(|dir| !pending_in_worktree.contains(dir));
+            found.retain(|dir| !revoked_paths.contains(dir));
             found.retain(|dir| {
                 std::fs::canonicalize(dir)
                     .ok()
@@ -6027,6 +6051,69 @@ impl Broker {
                     session_scan_complete = false;
                     continue;
                 }
+                // These earlier checks remain the cleanup authority. The
+                // reclaimer is an additional exclusion for cooperating B1
+                // producers; unknown markers and unsupported targets retain
+                // the cache. Check both sides of its bounded filesystem work
+                // so it cannot start deletion after the sweep budget expires.
+                if check_deadline(Some(removal_deadline)) {
+                    blocked_interrupted_paths.push(BlockedInterruptedPath {
+                        path: Some(dir_key),
+                        reason: "removal_budget_expired_before_admission",
+                    });
+                    session_scan_complete = false;
+                    continue;
+                }
+                let artifact_use_reclaimer =
+                    match crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                        &main_root, &root,
+                    ) {
+                        Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(
+                            reclaimer,
+                        )) => reclaimer,
+                        Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(
+                            block,
+                        )) => {
+                            let reason = match block {
+                            crate::file_lock::artifact_use::ArtifactUseReclaimBlock::Contended => {
+                                "artifact_use_contended"
+                            }
+                            crate::file_lock::artifact_use::ArtifactUseReclaimBlock::UnknownProducer {
+                                ..
+                            } => "artifact_use_unknown_producer",
+                            crate::file_lock::artifact_use::ArtifactUseReclaimBlock::ProtocolUnavailable => {
+                                "artifact_use_protocol_unavailable"
+                            }
+                        };
+                            blocked_interrupted_paths.push(BlockedInterruptedPath {
+                                path: Some(dir_key),
+                                reason,
+                            });
+                            session_scan_complete = false;
+                            continue;
+                        }
+                        Err(_) => {
+                            blocked_interrupted_paths.push(BlockedInterruptedPath {
+                                path: Some(dir_key),
+                                reason: "artifact_use_inventory_unavailable",
+                            });
+                            session_scan_complete = false;
+                            continue;
+                        }
+                    };
+                if check_deadline(Some(removal_deadline)) {
+                    blocked_interrupted_paths.push(BlockedInterruptedPath {
+                        path: Some(dir_key),
+                        reason: "removal_budget_expired_after_admission",
+                    });
+                    session_scan_complete = false;
+                    drop(artifact_use_reclaimer);
+                    continue;
+                }
+                // Keep the exclusive reservation alive through the durable
+                // interrupted-path update below, then release it before the
+                // next checkout key is considered.
+                let _artifact_use_reclaimer = artifact_use_reclaimer;
                 if !resuming {
                     let mut updated_paths = interrupted_paths.clone();
                     updated_paths.push(dir_key.clone());
@@ -8499,6 +8586,353 @@ mod tests {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn closed_artifact_sweep_fixture() -> (
+        tempfile::TempDir,
+        crate::test_storage::TestStorage,
+        Broker,
+        PathBuf,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
+        git(&root, &["add", "README.md", ".gitignore"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[cleanup]\nauto_remove = false\nstrict = false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 1\nclosed_worktree_grace_hours = 0\nauto_cleanup_worktrees_on_finish = false\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\nartifact_sweep_interval_hours = 1\n",
+        )
+        .unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let broker = storage.open(&root.canonicalize().unwrap()).unwrap();
+        (temporary, storage, broker, root.canonicalize().unwrap())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn closed_artifact_cache(broker: &mut Broker, name: &str) -> (i64, PathBuf, PathBuf) {
+        let session = broker.start_worktree(name, None).unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        broker
+            .close_abandoning_unpushed(session.id, "closed artifact sweep fixture")
+            .unwrap();
+        let cache = worktree.join("target");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
+        std::fs::write(cache.join("payload"), b"fixture cache").unwrap();
+        (session.id, worktree, cache)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn enable_closed_artifact_sweep(root: &Path) {
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 1\nclosed_worktree_grace_hours = 0\nauto_cleanup_worktrees_on_finish = false\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 1\n",
+        )
+        .unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn managed_test_artifact_producer(
+        primary_root: &Path,
+        checkout_root: &Path,
+        session_id: i64,
+        invocation: &str,
+    ) -> crate::file_lock::artifact_use::ArtifactUseProducer {
+        match crate::file_lock::artifact_use::begin_artifact_use(
+            primary_root,
+            checkout_root,
+            session_id,
+            invocation,
+        )
+        .unwrap()
+        {
+            crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer) => producer,
+            crate::file_lock::artifact_use::ArtifactUseAdmission::ProtocolUnavailable => {
+                panic!("Unix artifact-use admission should be available in this fixture")
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn run_closed_artifact_sweep(
+        broker: &mut Broker,
+        root: &Path,
+        session_id: i64,
+    ) -> (bool, usize) {
+        let policy = load_retention_policy(root).unwrap();
+        let (outcome, _) = broker
+            .sweep_artifacts_autonomously_with_deadlines(
+                &policy,
+                ArtifactSweepScope::ClosedSession(session_id),
+                None,
+                None,
+                None,
+                ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
+            )
+            .unwrap();
+        (outcome.complete, outcome.directories_reclaimed)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn closed_artifact_sweep_defers_while_managed_producer_is_admitted() {
+        let (_temporary, _storage, mut broker, root) = closed_artifact_sweep_fixture();
+        let (session_id, worktree, cache) = closed_artifact_cache(&mut broker, "producer busy");
+        enable_closed_artifact_sweep(&root);
+        let mut producer =
+            managed_test_artifact_producer(&root, &worktree, session_id, "gc-test:producer-busy");
+
+        let (complete_while_admitted, removed_while_admitted) =
+            run_closed_artifact_sweep(&mut broker, &root, session_id);
+        assert!(
+            !complete_while_admitted,
+            "a contended producer key is incomplete"
+        );
+        assert_eq!(removed_while_admitted, 0);
+        assert!(
+            cache.is_dir(),
+            "the managed producer's cache remains intact"
+        );
+        assert!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .unwrap()
+                .is_none(),
+            "admission must be acquired before publishing a new removal intent"
+        );
+
+        producer.finish_not_started().unwrap();
+        drop(producer);
+        let (complete_after_settlement, removed_after_settlement) =
+            run_closed_artifact_sweep(&mut broker, &root, session_id);
+        assert!(complete_after_settlement);
+        assert_eq!(removed_after_settlement, 1);
+        assert!(!cache.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn closed_artifact_sweep_retains_a_dropped_unknown_producer_marker() {
+        let (_temporary, _storage, mut broker, root) = closed_artifact_sweep_fixture();
+        let (session_id, worktree, cache) = closed_artifact_cache(&mut broker, "unknown producer");
+        enable_closed_artifact_sweep(&root);
+        let producer = managed_test_artifact_producer(
+            &root,
+            &worktree,
+            session_id,
+            "gc-test:unknown-producer",
+        );
+        // Simulate broker death: Drop releases the advisory lock but deliberately
+        // leaves the durable pre-dispatch marker unknown to future sweepers.
+        drop(producer);
+
+        let (complete, removed) = run_closed_artifact_sweep(&mut broker, &root, session_id);
+        assert!(
+            !complete,
+            "an unknown producer marker keeps the pass incomplete"
+        );
+        assert_eq!(removed, 0);
+        assert!(cache.is_dir());
+        let blocked = broker
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_BLOCKED_PATHS_KEY)
+            .unwrap()
+            .expect("the unknown marker is recorded as a bounded blocker");
+        assert!(blocked.contains("artifact_use_unknown_producer"));
+        assert!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .unwrap()
+                .is_none(),
+            "an unknown marker must not publish a false removal intent"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn closed_artifact_sweep_advances_to_an_unrelated_checkout_when_one_key_is_busy() {
+        let (_temporary, _storage, mut broker, root) = closed_artifact_sweep_fixture();
+        let (busy_id, busy_worktree, busy_cache) =
+            closed_artifact_cache(&mut broker, "busy closed checkout");
+        let (free_id, _free_worktree, free_cache) =
+            closed_artifact_cache(&mut broker, "free closed checkout");
+        enable_closed_artifact_sweep(&root);
+        let mut producer = managed_test_artifact_producer(
+            &root,
+            &busy_worktree,
+            busy_id,
+            "gc-test:unrelated-checkout",
+        );
+
+        let policy = load_retention_policy(&root).unwrap();
+        let (outcome, _) = broker
+            .sweep_artifacts_autonomously_with_deadlines(
+                &policy,
+                ArtifactSweepScope::Drain,
+                None,
+                None,
+                None,
+                ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
+            )
+            .unwrap();
+        assert!(!outcome.complete, "the busy checkout remains a blocker");
+        assert!(busy_cache.is_dir());
+        assert!(
+            !free_cache.exists(),
+            "the unrelated checkout still progresses"
+        );
+
+        producer.finish_not_started().unwrap();
+        drop(producer);
+        assert_eq!(
+            broker.store().session(free_id).unwrap().status,
+            crate::SessionStatus::Closed
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn closed_artifact_sweep_rechecks_admission_before_resuming_interrupted_removal() {
+        let (_temporary, _storage, mut broker, root) = closed_artifact_sweep_fixture();
+        let (session_id, worktree, cache) = closed_artifact_cache(&mut broker, "interrupted cache");
+        enable_closed_artifact_sweep(&root);
+        let cache_key = cache.canonicalize().unwrap().to_string_lossy().into_owned();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, &cache_key)
+            .unwrap();
+        let mut producer = managed_test_artifact_producer(
+            &root,
+            &worktree,
+            session_id,
+            "gc-test:interrupted-resume",
+        );
+
+        let (complete_while_admitted, removed_while_admitted) =
+            run_closed_artifact_sweep(&mut broker, &root, session_id);
+        assert!(!complete_while_admitted);
+        assert_eq!(removed_while_admitted, 0);
+        assert!(cache.is_dir());
+        assert_eq!(
+            decode_interrupted_paths(
+                broker
+                    .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                    .unwrap()
+                    .as_deref()
+            )
+            .unwrap(),
+            vec![cache_key.clone()],
+            "a busy resumed path keeps its durable removal intent"
+        );
+
+        producer.finish_not_started().unwrap();
+        drop(producer);
+        let (complete_after_settlement, removed_after_settlement) =
+            run_closed_artifact_sweep(&mut broker, &root, session_id);
+        assert!(complete_after_settlement);
+        assert_eq!(removed_after_settlement, 1);
+        assert!(!cache.exists());
+        assert!(
+            decode_interrupted_paths(
+                broker
+                    .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                    .unwrap()
+                    .as_deref()
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn closed_artifact_sweep_completes_missing_paths_but_retains_replaced_checkouts() {
+        let (temporary, _storage, mut broker, root) = closed_artifact_sweep_fixture();
+        let (missing_id, _missing_worktree, missing_cache) =
+            closed_artifact_cache(&mut broker, "missing cache candidate");
+        let (replaced_id, replaced_worktree, replaced_cache) =
+            closed_artifact_cache(&mut broker, "replaced checkout");
+        enable_closed_artifact_sweep(&root);
+
+        let missing_key = missing_cache
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let replaced_key = replaced_cache
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let queued =
+            encode_interrupted_paths(&[missing_key.clone(), replaced_key.clone()]).unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, &queued)
+            .unwrap();
+        std::fs::remove_dir_all(&missing_cache).unwrap();
+
+        let moved_checkout = temporary.path().join("moved-replaced-checkout");
+        std::fs::rename(&replaced_worktree, &moved_checkout).unwrap();
+        let replacement = temporary.path().join("replacement-checkout");
+        let replacement_cache = replacement.join("target");
+        std::fs::create_dir_all(&replacement_cache).unwrap();
+        std::fs::write(replacement_cache.join("payload"), b"preserve replacement").unwrap();
+        std::os::unix::fs::symlink(&replacement, &replaced_worktree).unwrap();
+
+        let policy = load_retention_policy(&root).unwrap();
+        let (outcome, _) = broker
+            .sweep_artifacts_autonomously_with_deadlines(
+                &policy,
+                ArtifactSweepScope::Drain,
+                None,
+                None,
+                None,
+                ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
+            )
+            .unwrap();
+        assert!(
+            !outcome.complete,
+            "a present replacement root remains blocked"
+        );
+        assert_eq!(
+            broker.store().session(missing_id).unwrap().status,
+            crate::SessionStatus::Closed
+        );
+        assert_eq!(
+            broker.store().session(replaced_id).unwrap().status,
+            crate::SessionStatus::Closed
+        );
+        assert!(replaced_worktree.is_symlink());
+        assert_eq!(
+            std::fs::read(replacement_cache.join("payload")).unwrap(),
+            b"preserve replacement"
+        );
+        assert_eq!(
+            decode_interrupted_paths(
+                broker
+                    .artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                    .unwrap()
+                    .as_deref()
+            )
+            .unwrap(),
+            vec![replaced_key],
+            "only the proven-absent candidate may be retired from the queue"
+        );
+        let blocked = broker
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_BLOCKED_PATHS_KEY)
+            .unwrap()
+            .expect("the replacement root is recorded as blocked");
+        assert!(blocked.contains("worktree_root_replaced"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn broker_open_keeps_published_rotation_debt_pending_when_sweep_is_disabled() {
         let tmp = tempfile::tempdir().unwrap();
@@ -10290,12 +10724,12 @@ mod tests {
         // Symlink guard only: the link resolves inside root.
         assert_eq!(
             interrupted_tree_state(root, &root.join("inner-link/node_modules"), &[]),
-            InterruptedTreeState::Revoked("symlink_component")
+            InterruptedTreeState::Blocked("symlink_component")
         );
         // A link leaving root.
         assert_eq!(
             interrupted_tree_state(root, &root.join("link/node_modules"), &[]),
-            InterruptedTreeState::Revoked("symlink_component")
+            InterruptedTreeState::Blocked("symlink_component")
         );
         // Not under root at all, and root itself.
         assert_eq!(
