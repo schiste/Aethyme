@@ -142,7 +142,7 @@ impl HostOperationGuard {
             .ok_or(HostOperationError::StateDirectoryUnavailable)?;
         create_private_directory(state_directory)?;
         let lock = HostRemoteLock::acquire_with_deadline(state_directory, remote_key, deadline)?;
-        let conn = open_database(database)?;
+        let conn = open_database_with_deadline(database, deadline)?;
         recover_or_block(&conn, remote_key)?;
         let operation_id = random_hex(&conn, 16)?;
         let now = now_ms();
@@ -255,7 +255,7 @@ pub(crate) fn reconcile_host_operation_with_deadline(
     succeeded: bool,
     deadline: Option<std::time::Instant>,
 ) -> Result<HostOperation, HostOperationError> {
-    let conn = open_database(database)?;
+    let conn = open_database_with_deadline(database, deadline)?;
     let operation = load_operation(&conn, operation_id)?
         .ok_or_else(|| HostOperationError::NotFound(operation_id.into()))?;
     let state_directory = database
@@ -263,6 +263,7 @@ pub(crate) fn reconcile_host_operation_with_deadline(
         .ok_or(HostOperationError::StateDirectoryUnavailable)?;
     let _lock =
         HostRemoteLock::acquire_with_deadline(state_directory, &operation.remote_key, deadline)?;
+    configure_database_wait(&conn, deadline)?;
     let operation = load_operation(&conn, operation_id)?
         .ok_or_else(|| HostOperationError::NotFound(operation_id.into()))?;
     let target = if succeeded {
@@ -362,14 +363,34 @@ impl HostRemoteLock {
     }
 }
 
+fn configure_database_wait(
+    conn: &Connection,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), HostOperationError> {
+    let maximum = std::time::Duration::from_secs(5);
+    let remaining = deadline
+        .map(|at| at.saturating_duration_since(std::time::Instant::now()))
+        .unwrap_or(maximum)
+        .min(maximum);
+    conn.busy_timeout(remaining)?;
+    Ok(())
+}
+
 fn open_database(path: &Path) -> Result<Connection, HostOperationError> {
+    open_database_with_deadline(path, None)
+}
+
+fn open_database_with_deadline(
+    path: &Path,
+    deadline: Option<std::time::Instant>,
+) -> Result<Connection, HostOperationError> {
     let parent = path
         .parent()
         .ok_or(HostOperationError::StateDirectoryUnavailable)?;
     create_private_directory(parent)?;
     let conn = Connection::open(path)?;
     protect(path, false)?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    configure_database_wait(&conn, deadline)?;
     conn.pragma_update(None, "journal_mode", "wal")?;
     conn.pragma_update(None, "synchronous", "FULL")?;
     conn.execute_batch(SCHEMA)?;
@@ -746,5 +767,19 @@ mod tests {
             host_operation(&database, "legacy").unwrap().unwrap().status,
             OperationStatus::OutcomeUnknown
         );
+    }
+    #[test]
+    fn host_sqlite_wait_does_not_receive_a_fresh_five_second_budget() {
+        let connection = Connection::open_in_memory().unwrap();
+        configure_database_wait(&connection, Some(std::time::Instant::now())).unwrap();
+        let milliseconds: i64 = connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(milliseconds, 0);
+        configure_database_wait(&connection, None).unwrap();
+        let milliseconds: i64 = connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(milliseconds, 5000);
     }
 }
