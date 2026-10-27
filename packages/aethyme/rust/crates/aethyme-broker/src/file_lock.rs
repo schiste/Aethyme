@@ -43,6 +43,10 @@ fn repository_lifecycle_lock_path(main_root: &Path) -> io::Result<std::path::Pat
 }
 
 fn repository_runtime_lock_path(main_root: &Path, name: &str) -> io::Result<std::path::PathBuf> {
+    Ok(repository_runtime_directory(main_root)?.join(name))
+}
+
+fn repository_runtime_directory(main_root: &Path) -> io::Result<std::path::PathBuf> {
     let root = main_root.canonicalize()?;
     let state_dir = root.join(".aethyme");
     ensure_real_directory(&state_dir)?;
@@ -59,7 +63,7 @@ fn repository_runtime_lock_path(main_root: &Path, name: &str) -> io::Result<std:
         ));
     }
 
-    Ok(canonical_run.join(name))
+    Ok(canonical_run)
 }
 
 /// Claim one complete CLI scheduling pass, including repository watches.
@@ -153,7 +157,6 @@ fn ensure_real_directory(path: &Path) -> io::Result<()> {
         Err(error) => Err(error),
     }
 }
-
 fn open_lock_file_nofollow(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true).truncate(false);
@@ -243,6 +246,32 @@ impl Drop for ExclusiveFileLock {
         let _ = self.file.unlock();
     }
 }
+
+/// A shared lock held on an open file until the guard drops.
+#[derive(Debug)]
+pub(crate) struct SharedFileLock {
+    file: File,
+}
+
+impl SharedFileLock {
+    /// Lock `file` shared without waiting; `None` when an exclusive user holds it.
+    pub(crate) fn try_acquire(file: File) -> io::Result<Option<Self>> {
+        match file.try_lock_shared() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+}
+
+impl Drop for SharedFileLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+#[path = "artifact_use.rs"]
+pub(crate) mod artifact_use;
 
 #[cfg(test)]
 mod tests {

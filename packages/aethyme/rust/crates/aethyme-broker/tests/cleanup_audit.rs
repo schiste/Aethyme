@@ -191,7 +191,7 @@ fn squash_landing_is_in_target_against_upstream_while_local_main_is_stale() {
 }
 
 #[test]
-fn rebased_delivery_is_recognised_by_patch_identity() {
+fn rebased_patch_candidate_with_different_tree_entries_is_retained() {
     let (_tmp, publisher, repo) = fixture();
     let mut broker = isolation::open(&repo);
     let session = broker.start_worktree("rebased work", None).unwrap();
@@ -204,8 +204,8 @@ fn rebased_delivery_is_recognised_by_patch_identity() {
     );
     broker.close(session.id).unwrap();
 
-    // The target edited another line of the same file first, so no target
-    // commit ever holds the session's exact blob: only the patch matches.
+    // The target edited another line of the same file first. Patch IDs match,
+    // but no target commit holds the session's exact changed-path tree entry.
     commit(
         &publisher,
         "shared.txt",
@@ -222,22 +222,28 @@ fn rebased_delivery_is_recognised_by_patch_identity() {
 
     let audit = broker.cleanup_audit().unwrap();
     let item = item_for(&audit, session.id);
-    assert_eq!(item.disposition, AuditDisposition::InTarget, "{item:#?}");
+    assert_eq!(
+        item.disposition,
+        AuditDisposition::WorktreeOnly,
+        "{item:#?}"
+    );
     assert!(matches!(
         item.committed,
-        Some(aethyme_broker::CommittedWork::InTarget {
-            evidence: LandingEvidence::PatchEquivalent,
-            ..
-        })
+        Some(aethyme_broker::CommittedWork::WorktreeOnly { .. })
     ));
+    assert!(!item.removable, "{item:#?}");
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("shared.txt")).unwrap(),
+        "one\ntwo\nthree\nfour\nFIVE\n",
+        "the rejected landing candidate must not make the source checkout disposable"
+    );
 }
 
-/// #408: the session commit was rebased onto a newer main and merged
-/// through a pull request's merge commit, so it reached main only via a
-/// second parent and with different blobs wherever the base had moved. The
-/// representation scan, the audit and the cleanup plan must give one verdict.
+/// The session commit was replayed onto a newer main and merged through a pull
+/// request's merge commit. The patch matches, but the same changed file has
+/// different tree content. The scan, audit and cleanup plan must all retain it.
 #[test]
-fn rebased_then_merged_work_gets_one_verdict_from_scan_audit_and_plan() {
+fn rebased_tree_mismatch_is_retained_by_scan_audit_and_plan() {
     let (_tmp, publisher, repo) = fixture();
     let mut broker = isolation::open(&repo);
     let session = broker.start_worktree("rebased then merged", None).unwrap();
@@ -270,7 +276,6 @@ fn rebased_then_merged_work_gets_one_verdict_from_scan_audit_and_plan() {
         &["fetch", "-q", repo.to_str().unwrap(), &session.branch],
     );
     git(&publisher, &["cherry-pick", &change]);
-    let copy = git_out(&publisher, &["rev-parse", "HEAD"]);
     git(&publisher, &["checkout", "-q", "main"]);
     git(
         &publisher,
@@ -289,21 +294,21 @@ fn rebased_then_merged_work_gets_one_verdict_from_scan_audit_and_plan() {
     git(&repo, &["merge", "-q", "--ff-only", "origin/main"]);
 
     let scan = broker.scan_session_representation(session.id).unwrap();
-    let landing = scan.search.landing().expect("the scan finds the landing");
-    assert_eq!(landing.evidence, LandingEvidence::PatchEquivalent);
-    assert_eq!(landing.commit, copy);
+    assert!(scan.search.landing().is_none(), "{scan:#?}");
+    assert!(!scan.search.truncated, "{scan:#?}");
 
     let audit = broker.cleanup_audit().unwrap();
     let item = item_for(&audit, session.id);
-    assert_eq!(item.disposition, AuditDisposition::InTarget, "{item:#?}");
+    assert_eq!(
+        item.disposition,
+        AuditDisposition::WorktreeOnly,
+        "{item:#?}"
+    );
     assert!(matches!(
         item.committed,
-        Some(aethyme_broker::CommittedWork::InTarget {
-            evidence: LandingEvidence::PatchEquivalent,
-            ..
-        })
+        Some(aethyme_broker::CommittedWork::WorktreeOnly { .. })
     ));
-    assert!(item.removable, "{item:#?}");
+    assert!(!item.removable, "{item:#?}");
 
     let plan = broker.cleanup_plan().unwrap();
     let planned = plan
@@ -311,13 +316,18 @@ fn rebased_then_merged_work_gets_one_verdict_from_scan_audit_and_plan() {
         .iter()
         .find(|planned| planned.session_id == session.id)
         .unwrap();
-    assert!(planned.eligible(), "{planned:#?}");
+    assert!(!planned.eligible(), "{planned:#?}");
     assert_eq!(
         planned
             .provenance
             .as_ref()
             .and_then(|provenance| provenance.represented_by_commit.as_deref()),
-        Some(copy.as_str())
+        None
+    );
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("shared.txt")).unwrap(),
+        "one\ntwo\nthree\nfour\nFIVE\n",
+        "the scan, audit, and plan must retain the source checkout"
     );
 }
 

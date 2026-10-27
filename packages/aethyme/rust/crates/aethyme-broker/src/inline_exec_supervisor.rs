@@ -368,6 +368,7 @@ pub(crate) struct InlineExecSupervisor {
     process_group: i32,
     terminalized: bool,
     observation: Option<crate::store::guarded_exec::HelperObservationTarget>,
+    artifact_use: Option<crate::file_lock::artifact_use::ArtifactUseProducer>,
 }
 
 #[cfg(not(unix))]
@@ -387,6 +388,23 @@ impl InlineExecSupervisor {
         #[cfg(not(unix))]
         {
             std::mem::drop(target);
+            self
+        }
+    }
+
+    pub(crate) fn with_artifact_use(
+        self,
+        producer: Option<crate::file_lock::artifact_use::ArtifactUseProducer>,
+    ) -> Self {
+        #[cfg(unix)]
+        {
+            let mut supervisor = self;
+            supervisor.artifact_use = producer;
+            supervisor
+        }
+        #[cfg(not(unix))]
+        {
+            std::mem::drop(producer);
             self
         }
     }
@@ -552,6 +570,7 @@ impl InlineExecSupervisor {
             process_group,
             terminalized: false,
             observation: None,
+            artifact_use: None,
         };
         let ready = read_frame_until(
             supervisor
@@ -648,8 +667,10 @@ impl InlineExecSupervisor {
         use std::time::{Duration, Instant};
 
         if command.is_empty() || command[0].is_empty() {
-            let cleanup = self.terminate_and_verify();
-            dispatch(CommandDispatchState::NotStarted);
+            let cleanup = self.terminate_not_started_and_verify();
+            if cleanup.is_ok() {
+                dispatch(CommandDispatchState::NotStarted);
+            }
             return match cleanup {
                 Ok(()) => Err(InlineExecError::Setup(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -659,16 +680,20 @@ impl InlineExecSupervisor {
             };
         }
         validate_environment(environment).map_err(|error| {
-            let cleanup = self.terminate_and_verify();
-            dispatch(CommandDispatchState::NotStarted);
+            let cleanup = self.terminate_not_started_and_verify();
+            if cleanup.is_ok() {
+                dispatch(CommandDispatchState::NotStarted);
+            }
             match cleanup {
                 Ok(()) => InlineExecError::Setup(error),
                 Err(reason) => InlineExecError::CleanupUnknown(reason),
             }
         })?;
         let cwd = cwd.canonicalize().map_err(|error| {
-            let cleanup = self.terminate_and_verify();
-            dispatch(CommandDispatchState::NotStarted);
+            let cleanup = self.terminate_not_started_and_verify();
+            if cleanup.is_ok() {
+                dispatch(CommandDispatchState::NotStarted);
+            }
             match cleanup {
                 Ok(()) => InlineExecError::Setup(error),
                 Err(reason) => InlineExecError::CleanupUnknown(reason),
@@ -680,15 +705,34 @@ impl InlineExecSupervisor {
             environment,
             observation: self.observation.as_ref(),
         };
+        if let Some(producer) = self.artifact_use.as_mut() {
+            let child = self.child.as_ref().ok_or_else(|| {
+                InlineExecError::CleanupUnknown(
+                    "helper child handle disappeared before command admission".into(),
+                )
+            })?;
+            if let Err(error) = producer.mark_process_started(child, self.process_group) {
+                let cleanup = self.terminate_and_verify();
+                return match cleanup {
+                    Ok(()) => Err(InlineExecError::Setup(error)),
+                    Err(reason) => Err(InlineExecError::CleanupUnknown(reason)),
+                };
+            }
+        }
         if let Err(error) = write_frame_until(
             self.control.as_mut().expect("control stream is present"),
             &request,
             Instant::now() + READY_TIMEOUT,
         ) {
+            // The helper may have received a complete request before the
+            // control channel failed. Preserve outcome-unknown semantics;
+            // terminate_and_verify settles the durable marker only after the
+            // owned helper exits and its original process group is absent.
             let cleanup = self.terminate_and_verify();
-            dispatch(CommandDispatchState::NotStarted);
             return match cleanup {
-                Ok(()) => Err(InlineExecError::Setup(error)),
+                Ok(()) => Err(InlineExecError::CommandOutcomeUnknown(format!(
+                    "command admission channel failed after dispatch may have occurred: {error}"
+                ))),
                 Err(reason) => Err(InlineExecError::CleanupUnknown(reason)),
             };
         }
@@ -812,7 +856,7 @@ impl InlineExecSupervisor {
                     }
                 }
                 HelperFrame::Failed { reason } => {
-                    self.terminate_and_verify()
+                    self.terminate_not_started_and_verify()
                         .map_err(InlineExecError::CleanupUnknown)?;
                     if command_started {
                         return Err(InlineExecError::CommandOutcomeUnknown(format!(
@@ -959,9 +1003,32 @@ impl InlineExecSupervisor {
                 Err(error) => return Err(format!("could not inspect owned helper: {error}")),
             }
         }
-        drop(self.child.take());
         wait_process_group_absent(self.process_group)?;
+        if let Some(producer) = self.artifact_use.as_mut()
+            && producer.is_unsettled_running()
+        {
+            let child = self.child.as_mut().ok_or_else(|| {
+                "helper child handle disappeared before artifact-use settlement".to_string()
+            })?;
+            producer
+                .finish_verified_quiescence(child)
+                .map_err(|error| format!("could not settle artifact-use marker: {error}"))?;
+        }
+        drop(self.child.take());
         self.terminalized = true;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn terminate_not_started_and_verify(&mut self) -> Result<(), String> {
+        self.terminate_and_verify()?;
+        if let Some(producer) = self.artifact_use.as_mut()
+            && producer.is_pre_dispatch()
+        {
+            producer.finish_not_started().map_err(|error| {
+                format!("could not clear pre-dispatch artifact-use marker: {error}")
+            })?;
+        }
         Ok(())
     }
 }
@@ -1962,6 +2029,44 @@ mod tests {
     }
 
     #[test]
+    fn artifact_use_marker_settles_after_owned_helper_group_quiescence() {
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = primary.path().join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let producer = match crate::file_lock::artifact_use::begin_artifact_use(
+            primary.path(),
+            &checkout,
+            41,
+            "supervised-test:41:child-settlement",
+        )
+        .unwrap()
+        {
+            crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer) => *producer,
+            crate::file_lock::artifact_use::ArtifactUseAdmission::ProtocolUnavailable => {
+                panic!("Unix test filesystem should support directory sync")
+            }
+        };
+
+        let result = start_helper()
+            .with_artifact_use(Some(producer))
+            .run(
+                &checkout,
+                &["/bin/sh".into(), "-c".into(), "touch produced".into()],
+                &[],
+                || Ok(()),
+            )
+            .unwrap();
+
+        assert!(result.succeeded);
+        assert!(checkout.join("produced").exists());
+        assert!(matches!(
+            crate::file_lock::artifact_use::try_artifact_use_reclaimer(primary.path(), &checkout)
+                .unwrap(),
+            crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(_)
+        ));
+    }
+
+    #[test]
     fn group_cleanup_retries_permission_denial_until_absence_is_observed() {
         let mut probes = 0;
         wait_process_group_absent_with_probe(std::time::Duration::from_secs(1), || {
@@ -2180,7 +2285,13 @@ mod tests {
             || Ok(()),
         );
 
-        assert!(matches!(result, Err(InlineExecError::Setup(_))));
+        assert!(
+            matches!(
+                &result,
+                Err(InlineExecError::Setup(_)) | Err(InlineExecError::CommandOutcomeUnknown(_))
+            ),
+            "watcher failure should prevent a successful command launch: {result:?}"
+        );
         assert!(
             !marker.exists(),
             "command launched without a cleanup watcher"
