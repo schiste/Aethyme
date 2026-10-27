@@ -4513,7 +4513,13 @@ impl GitRepo {
         require_trustworthy_porcelain()?;
         Ok(parse_porcelain_entries_z(&run_git_bytes(
             &self.root,
-            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
         )?)?
         .into_iter()
         .map(|(_, path)| path)
@@ -4525,7 +4531,13 @@ impl GitRepo {
         require_trustworthy_porcelain()?;
         let entries = parse_porcelain_entries_z(&run_git_bytes(
             &self.root,
-            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
         )?)?;
         let mut dirty = Vec::with_capacity(entries.len());
         let mut untracked = Vec::new();
@@ -4556,6 +4568,7 @@ impl GitRepo {
                 "-z",
                 "--untracked-files=all",
                 "--ignored=matching",
+                "--ignore-submodules=none",
             ],
         )?)?;
         Ok(only_unstaged_tracked_deletions(&entries, |path| {
@@ -4673,7 +4686,13 @@ impl GitRepo {
         let mut summary = UncommittedSummary::default();
         for (xy, path) in parse_porcelain_entries_z(&run_git_bytes(
             &self.root,
-            &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=normal",
+                "--ignore-submodules=none",
+            ],
         )?)? {
             match xy {
                 [b'?', b'?'] => summary.untracked.push(path),
@@ -4687,7 +4706,13 @@ impl GitRepo {
     pub fn untracked_paths(&self) -> Result<Vec<String>, GitError> {
         Ok(parse_porcelain_entries_z(&run_git_bytes(
             &self.root,
-            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
         )?)?
         .into_iter()
         .filter(|(xy, _path)| *xy == [b'?', b'?'])
@@ -4793,7 +4818,13 @@ impl GitRepo {
     pub fn tracked_dirty_paths(&self) -> Result<Vec<String>, GitError> {
         Ok(parse_porcelain_entries_z(&run_git_bytes(
             &self.root,
-            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
         )?)?
         .into_iter()
         .filter(|(xy, _path)| *xy != [b'?', b'?'])
