@@ -693,6 +693,25 @@ impl Broker {
     where
         F: FnOnce(),
     {
+        self.cleanup_resolve_apply_with_hooks(
+            session_id,
+            confirm,
+            after_archive_verified,
+            sync_archive_directory,
+        )
+    }
+
+    fn cleanup_resolve_apply_with_hooks<F, S>(
+        &mut self,
+        session_id: i64,
+        confirm: &str,
+        after_archive_verified: F,
+        sync_directory: S,
+    ) -> Result<CleanupResolveOutcome, BrokerOpError>
+    where
+        F: FnOnce(),
+        S: Fn(&Path) -> std::io::Result<()>,
+    {
         if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BrokerOpError::CleanupResolveConfirmationNotSha256);
         }
@@ -728,12 +747,13 @@ impl Broker {
             })?;
         let archive = archive_root.join(&name);
         let checkout = GitRepo::discover(Path::new(&plan.worktree_path))?;
-        if let Err(reason) = write_verified_archive(
+        if let Err(reason) = write_verified_archive_with_directory_sync(
             self.repo_handle(),
             &checkout,
             &plan,
             session.task.as_deref(),
             &partial,
+            &sync_directory,
         ) {
             return Err(BrokerOpError::RecoveryArchiveUnverified {
                 id: session_id,
@@ -753,6 +773,33 @@ impl Broker {
             Err(error) => return Err(io_error(&archive, error)),
         }
         std::fs::rename(&partial, &archive).map_err(|error| io_error(&archive, error))?;
+        let archive_parent =
+            archive_root
+                .parent()
+                .ok_or_else(|| BrokerOpError::RecoveryArchiveUnverified {
+                    id: session_id,
+                    path: archive_root.to_string_lossy().into_owned(),
+                    reason: "archive root has no parent to sync".into(),
+                })?;
+        let archive_anchor =
+            archive_parent
+                .parent()
+                .ok_or_else(|| BrokerOpError::RecoveryArchiveUnverified {
+                    id: session_id,
+                    path: archive_parent.to_string_lossy().into_owned(),
+                    reason: "archive root has no storage anchor to sync".into(),
+                })?;
+        for (label, path) in [
+            ("archive root", archive_root.as_path()),
+            ("archive parent", archive_parent),
+            ("archive storage anchor", archive_anchor),
+        ] {
+            sync_directory(path).map_err(|error| BrokerOpError::RecoveryArchiveUnverified {
+                id: session_id,
+                path: path.to_string_lossy().into_owned(),
+                reason: format!("cannot sync {label} before worktree removal: {error}"),
+            })?;
+        }
         after_archive_verified();
 
         // The archive is complete and verified. Cleanup recomputes the full
@@ -1820,6 +1867,88 @@ fn archive_staging_nonce() -> String {
     format!("{nanos:x}-{:x}-{sequence:x}", std::process::id())
 }
 
+fn sync_archive_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+        options.open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "directory durability sync is unsupported on this platform",
+        ))
+    }
+}
+
+fn sync_archive_directories_bottom_up<S>(root: &Path, sync_directory: &S) -> Result<(), String>
+where
+    S: Fn(&Path) -> std::io::Result<()>,
+{
+    let mut pending = vec![(root.to_path_buf(), 0_usize)];
+    let mut directories = Vec::new();
+    let mut visited = 0_usize;
+    while let Some((directory, depth)) = pending.pop() {
+        if depth > MAX_RECOVERY_ARCHIVE_TREE_DEPTH {
+            return Err("archive directory depth exceeds the durability bound".into());
+        }
+        let metadata = std::fs::symlink_metadata(&directory).map_err(|error| {
+            format!(
+                "cannot inspect archive directory {}: {error}",
+                directory.display()
+            )
+        })?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "archive component is not a real directory: {}",
+                directory.display()
+            ));
+        }
+        directories.push((depth, directory.clone()));
+        let entries = std::fs::read_dir(&directory).map_err(|error| {
+            format!(
+                "cannot read archive directory {}: {error}",
+                directory.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("cannot read archive entry: {error}"))?;
+            visited += 1;
+            if visited > MAX_RECOVERY_ARCHIVE_TREE_ENTRIES {
+                return Err("archive entry count exceeds the durability bound".into());
+            }
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                format!("cannot inspect archive entry {}: {error}", path.display())
+            })?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                pending.push((path, depth + 1));
+            } else if !metadata.is_file() && !metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "archive contains an unsupported filesystem node: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    directories.sort_by_key(|(depth, _)| std::cmp::Reverse(*depth));
+    for (_, directory) in directories {
+        sync_directory(&directory).map_err(|error| {
+            format!(
+                "cannot sync archive directory {}: {error}",
+                directory.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// Write every part into a fresh, real staging directory, then read each part
 /// back. `Err` carries the first failure; the caller keeps the worktree.
 fn write_verified_archive(
@@ -1829,6 +1958,27 @@ fn write_verified_archive(
     task: Option<&str>,
     dir: &Path,
 ) -> Result<(), String> {
+    write_verified_archive_with_directory_sync(
+        repository,
+        checkout,
+        plan,
+        task,
+        dir,
+        &sync_archive_directory,
+    )
+}
+
+fn write_verified_archive_with_directory_sync<S>(
+    repository: &GitRepo,
+    checkout: &GitRepo,
+    plan: &CleanupResolvePlan,
+    task: Option<&str>,
+    dir: &Path,
+    sync_directory: &S,
+) -> Result<(), String>
+where
+    S: Fn(&Path) -> std::io::Result<()>,
+{
     require_real_directory(dir)?;
     let dir = dir
         .canonicalize()
@@ -1999,6 +2149,7 @@ fn write_verified_archive(
         restore_readme(plan, bundle.is_some()).as_bytes(),
     )?;
     verify_recovery_archive_payload_for_plan(repository, &dir, plan)?;
+    sync_archive_directories_bottom_up(&dir, sync_directory)?;
     Ok(())
 }
 
@@ -2211,6 +2362,33 @@ mod tests {
             create_new_archive_file(root.path(), MANIFEST_FILE, b"replacement").unwrap_err();
         assert!(error.contains("cannot create archive file"), "{error}");
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"leave this alone");
+    }
+
+    #[test]
+    fn archive_directories_are_synced_bottom_up() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("untracked/nested")).unwrap();
+        std::fs::create_dir(root.path().join("ignored")).unwrap();
+
+        let synced = std::cell::RefCell::new(Vec::new());
+        sync_archive_directories_bottom_up(root.path(), &|path| {
+            synced
+                .borrow_mut()
+                .push(path.strip_prefix(root.path()).unwrap().to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+
+        let synced = synced.into_inner();
+        let position = |path: &str| {
+            synced
+                .iter()
+                .position(|entry| entry == Path::new(path))
+                .unwrap()
+        };
+        assert!(position("untracked/nested") < position("untracked"));
+        assert!(position("untracked") < position(""));
+        assert!(position("ignored") < position(""));
     }
 
     #[test]
@@ -2535,6 +2713,64 @@ mod tests {
             std::fs::metadata(protected).unwrap().permissions().mode() & 0o7777,
             0o640
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_root_sync_failure_keeps_the_original_worktree() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join(".gitignore"), "/private.txt\n").unwrap();
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("archive sync failure fixture", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        let protected = worktree.join("private.txt");
+        std::fs::write(&protected, "keep until archive root is durable\n").unwrap();
+        broker.close(session.id).unwrap();
+
+        let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+        let expected_archive_root = plan.archive_root.clone();
+        let error = broker
+            .cleanup_resolve_apply_with_hooks(
+                session.id,
+                &plan.digest,
+                || {},
+                move |path| {
+                    if path == expected_archive_root.as_path() {
+                        Err(std::io::Error::other("injected archive root sync failure"))
+                    } else {
+                        sync_archive_directory(path)
+                    }
+                },
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("cannot sync archive root before worktree removal"),
+            "{error}"
+        );
+        assert!(worktree.is_dir());
+        assert_eq!(
+            std::fs::read(&protected).unwrap(),
+            b"keep until archive root is durable\n"
+        );
+        let archives = std::fs::read_dir(&plan.archive_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(archives.len(), 1);
+        let archived = broker.owned_recovery_archive(&archives[0]).unwrap();
+        assert!(archived.holds_uncommitted);
     }
 
     #[cfg(unix)]
