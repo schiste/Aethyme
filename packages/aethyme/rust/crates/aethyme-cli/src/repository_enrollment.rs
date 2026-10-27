@@ -3,6 +3,7 @@
 //! Planning is observational: remote Git inspection and proposal generation
 //! happen in a disposable clone, never in the operator's checkout.
 
+use std::fmt::Write as FmtWrite;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -11,9 +12,12 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::repository_upgrade::{RepositoryTreeChange, RepositoryUpgradePlan};
+use crate::repository_upgrade::{
+    RepositoryPathOwnership, RepositoryTreeChange, RepositoryUpgradePlan,
+};
 
 const PLAN_SCHEMA_VERSION: u32 = 1;
+const DIFF_PREVIEW_LIMIT_BYTES: usize = 256 * 1024;
 const RUNTIME_EXCLUDE_BLOCK: &str = "# BEGIN Aethyme first-enrollment runtime\n/.aethyme/\n# END Aethyme first-enrollment runtime\n";
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -246,15 +250,17 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             if confirm.is_some() {
                 return Err("deploy plan does not accept --confirm".into());
             }
-            let plan = build_plan(&repo)?;
             if diff {
-                render_change_inventory(&plan);
+                let (plan, migration_diff) = build_plan_with_diff(&repo)?;
+                print!("{}", render_change_inventory(&plan, &migration_diff));
             } else if json {
+                let plan = build_plan(&repo)?;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&plan).map_err(|error| error.to_string())?
                 );
             } else {
+                let plan = build_plan(&repo)?;
                 render_plan(&plan);
             }
         }
@@ -298,6 +304,10 @@ fn run_inner(args: &[String]) -> Result<(), String> {
 }
 
 pub fn build_plan(repo_hint: &Path) -> Result<FirstEnrollmentPlan, String> {
+    build_plan_with_diff(repo_hint).map(|(plan, _)| plan)
+}
+
+fn build_plan_with_diff(repo_hint: &Path) -> Result<(FirstEnrollmentPlan, String), String> {
     let repo = aethyme_broker::GitRepo::discover(repo_hint).map_err(|error| error.to_string())?;
     let main_root = repo.main_root().map_err(|error| error.to_string())?;
     let remote = "origin";
@@ -315,8 +325,8 @@ pub fn build_plan(repo_hint: &Path) -> Result<FirstEnrollmentPlan, String> {
     let integration_sha = repo.resolve_ref(&integration_ref);
 
     let disposable = DisposableRemoteTree::new(&main_root, remote, &remote_default)?;
-    let generated_tree =
-        crate::repository_upgrade::initial_enrollment_plan(&disposable.root, None)?;
+    let (generated_tree, generated_diff) =
+        crate::repository_upgrade::initial_enrollment_plan_with_diff(&disposable.root, None)?;
     let planned_paths = generated_tree.planned_paths.clone();
     let generated_changes = generated_tree.changes.clone();
     let dirty_paths = repo.dirty_paths().map_err(|error| error.to_string())?;
@@ -481,7 +491,7 @@ pub fn build_plan(repo_hint: &Path) -> Result<FirstEnrollmentPlan, String> {
     } else {
         "resolve every blocker, then regenerate `aethyme deploy plan --repo .`".into()
     };
-    Ok(FirstEnrollmentPlan {
+    let plan = FirstEnrollmentPlan {
         schema_version: PLAN_SCHEMA_VERSION,
         remote_base,
         local_default,
@@ -509,7 +519,8 @@ pub fn build_plan(repo_hint: &Path) -> Result<FirstEnrollmentPlan, String> {
         warnings,
         plan_digest,
         next_action,
-    })
+    };
+    Ok((plan, generated_diff))
 }
 
 pub fn execute(repo_hint: &Path, confirmation: &str) -> Result<FirstEnrollmentExecution, String> {
@@ -1416,26 +1427,137 @@ fn render_plan(plan: &FirstEnrollmentPlan) {
     println!("Next: {}", plan.next_action);
 }
 
-fn render_change_inventory(plan: &FirstEnrollmentPlan) {
-    println!(
-        "First-enrollment change inventory for {}:",
-        plan.remote_base.exact_sha
+fn render_change_inventory(plan: &FirstEnrollmentPlan, migration_diff: &str) -> String {
+    let mut rendered = String::new();
+    let _ = writeln!(
+        rendered,
+        "First-enrollment generated output preview for {}:",
+        plan.remote_base.remote
     );
-    for change in &plan.generated_changes {
-        println!(
-            "  {:?} {} {} -> {} ({:?})",
-            change.action,
-            change.path,
-            change.before_sha256.as_deref().unwrap_or("missing"),
-            change.after_sha256.as_deref().unwrap_or("missing"),
-            change.ownership,
+    let _ = writeln!(
+        rendered,
+        "Canonical source: {}/{} @ {}",
+        plan.remote_base.remote, plan.remote_base.default_branch_ref, plan.remote_base.exact_sha
+    );
+    let _ = writeln!(
+        rendered,
+        "Generated outputs grouped by ownership; per-file generator-source mapping is unavailable."
+    );
+    for (ownership, title) in [
+        (
+            RepositoryPathOwnership::AethymeOwned,
+            "  Aethyme-owned outputs:",
+        ),
+        (
+            RepositoryPathOwnership::ManagedBlock,
+            "  Managed-block outputs:",
+        ),
+        (
+            RepositoryPathOwnership::RepositoryOwned,
+            "  Repository-owned policy/config outputs:",
+        ),
+    ] {
+        let _ = writeln!(rendered, "{title}");
+        let mut found = false;
+        for change in &plan.generated_changes {
+            if change.ownership != ownership {
+                continue;
+            }
+            found = true;
+            let _ = writeln!(
+                rendered,
+                "    {:?} {} {} -> {}",
+                change.action,
+                change.path,
+                change.before_sha256.as_deref().unwrap_or("missing"),
+                change.after_sha256.as_deref().unwrap_or("missing")
+            );
+        }
+        if !found {
+            let _ = writeln!(rendered, "    (none)");
+        }
+    }
+    let _ = writeln!(rendered, "Plan digest: {}", plan.plan_digest);
+    let _ = writeln!(
+        rendered,
+        "Full generated diff: {} bytes; SHA-256 {}",
+        migration_diff.len(),
+        plan.generated_tree.diff_sha256
+    );
+    rendered.push_str("Migration diff:\n");
+    if migration_diff.is_empty() {
+        rendered.push_str("(no changes)\n");
+        return rendered;
+    }
+
+    let (preview, truncated) = bounded_diff_preview(migration_diff, DIFF_PREVIEW_LIMIT_BYTES);
+    rendered.push_str(preview);
+    if !preview.ends_with('\n') {
+        rendered.push('\n');
+    }
+    if truncated {
+        let _ = writeln!(
+            rendered,
+            "[diff preview truncated: showing {} of {} bytes; SHA-256 covers the complete proposal]",
+            preview.len(),
+            migration_diff.len()
         );
     }
-    println!("Plan digest: {}", plan.plan_digest);
+    rendered
+}
+
+fn bounded_diff_preview(diff: &str, byte_limit: usize) -> (&str, bool) {
+    if diff.len() <= byte_limit {
+        return (diff, false);
+    }
+
+    let mut end = byte_limit.min(diff.len());
+    while !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    let Some(last_complete_line) = diff[..end].rfind('\n') else {
+        return ("", true);
+    };
+    end = last_complete_line + 1;
+    (&diff[..end], true)
 }
 
 fn print_usage() {
     println!("Usage:");
     println!("  aethyme deploy plan [--repo <path>] [--diff|--json]");
     println!("  aethyme deploy execute [--repo <path>] --confirm <plan-sha256> [--json]");
+}
+
+#[cfg(test)]
+mod diff_preview_tests {
+    use super::bounded_diff_preview;
+
+    #[test]
+    fn bounded_preview_keeps_utf8_complete_lines_and_reports_truncation() {
+        let diff = "header\nλ content beyond the limit\nnext\n";
+        let (preview, truncated) = bounded_diff_preview(diff, 10);
+
+        assert!(truncated);
+        assert_eq!(preview, "header\n");
+        assert!(preview.len() <= 10);
+        assert!(std::str::from_utf8(preview.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn bounded_preview_does_not_split_a_very_long_first_line() {
+        let diff = "λ".repeat(32);
+        let (preview, truncated) = bounded_diff_preview(&diff, 7);
+
+        assert!(truncated);
+        assert!(preview.is_empty());
+    }
+
+    #[test]
+    fn bounded_preview_keeps_complete_diff_when_within_limit() {
+        let diff = "diff --git a/file b/file\n";
+        let (preview, truncated) = bounded_diff_preview(diff, diff.len());
+
+        assert!(!truncated);
+        assert_eq!(preview, diff);
+    }
 }

@@ -3036,14 +3036,24 @@ pub fn initial_enrollment_plan(
     repo_hint: &Path,
     enrollment_session_id: Option<i64>,
 ) -> Result<RepositoryUpgradePlan, String> {
-    build_plan(
+    initial_enrollment_plan_with_diff(repo_hint, enrollment_session_id).map(|(report, _)| report)
+}
+
+/// Build the first-enrollment report and its exact generated-content diff from
+/// the same disposable proposal. Full diff text stays outside the report; the
+/// existing diff hash remains the plan-binding value.
+pub(crate) fn initial_enrollment_plan_with_diff(
+    repo_hint: &Path,
+    enrollment_session_id: Option<i64>,
+) -> Result<(RepositoryUpgradePlan, String), String> {
+    let built = build_plan(
         repo_hint,
         Some(RepositoryMode::Canonical),
         None,
         enrollment_session_id,
         RepositoryPlanIntent::SchemaUpgrade,
-    )
-    .map(|built| built.report)
+    )?;
+    Ok((built.report, built.migration_diff))
 }
 
 #[allow(dead_code)]
