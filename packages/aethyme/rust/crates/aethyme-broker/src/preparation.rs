@@ -4982,6 +4982,33 @@ mod tests {
 
         let sentinel = worktree.join("managed-storage-command-started");
         assert!(!sentinel.exists());
+
+        #[cfg(unix)]
+        {
+            let reservation = match crate::artifact_use::try_artifact_use_reclaimer(
+                broker.main_root(),
+                &worktree,
+            )
+            .unwrap()
+            {
+                crate::artifact_use::ArtifactUseReclaimTry::Acquired(reservation) => reservation,
+                blocked => panic!("fresh checkout should admit the test reclaimer: {blocked:?}"),
+            };
+            let error = broker
+                .prepare_session(session.id, false, Duration::ZERO)
+                .expect_err("preparation must refuse while artifact reclamation is reserved");
+            assert!(matches!(
+                error,
+                BrokerOpError::Store(crate::BrokerError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::WouldBlock
+            ));
+            assert!(
+                !sentinel.exists(),
+                "preparation must not dispatch after artifact admission refusal"
+            );
+            drop(reservation);
+        }
+
         let result = broker.prepare_session(session.id, false, Duration::ZERO);
         assert!(
             !sentinel.exists(),
@@ -4992,6 +5019,13 @@ mod tests {
             Err(BrokerOpError::Preparation(
                 PreparationError::ManagedStorageNotReady { paths: 1, steps: 1 }
             ))
+        ));
+
+        #[cfg(unix)]
+        assert!(matches!(
+            crate::artifact_use::try_artifact_use_reclaimer(broker.main_root(), &worktree,)
+                .unwrap(),
+            crate::artifact_use::ArtifactUseReclaimTry::Acquired(_)
         ));
     }
 

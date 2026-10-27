@@ -3085,6 +3085,81 @@ mod generic_guarded_exec_tests {
     }
 
     #[test]
+    fn real_guarded_exec_holds_artifact_admission_until_child_settlement() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker
+            .start_worktree("artifact admission guarded exec", None)
+            .unwrap();
+        let main_root = broker.main_root().to_path_buf();
+        let checkout = PathBuf::from(&session.worktree_path);
+        let rendezvous = tempfile::tempdir().unwrap();
+        let ready = rendezvous.path().join("ready");
+        let release = rendezvous.path().join("release");
+        let saw_ready = std::sync::Arc::new(AtomicBool::new(false));
+        let was_busy = std::sync::Arc::new(AtomicBool::new(false));
+        let heartbeat_ready = std::sync::Arc::clone(&saw_ready);
+        let heartbeat_busy = std::sync::Arc::clone(&was_busy);
+        let command = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "touch \"$READY_FILE\"; while [ ! -e \"$RELEASE_FILE\" ]; do /bin/sleep 0.01; done"
+                .into(),
+        ];
+        let environment = vec![
+            ("READY_FILE".into(), ready.to_string_lossy().into_owned()),
+            (
+                "RELEASE_FILE".into(),
+                release.to_string_lossy().into_owned(),
+            ),
+        ];
+        let report = broker
+            .guarded_exec_with_env_heartbeat_and_mode(
+                session.id,
+                &command,
+                &environment,
+                move || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !ready.exists() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let ready_seen = ready.exists();
+                    let busy = matches!(
+                        crate::artifact_use::try_artifact_use_reclaimer(&main_root, &checkout,),
+                        Ok(crate::artifact_use::ArtifactUseReclaimTry::Blocked(
+                            crate::artifact_use::ArtifactUseReclaimBlock::Contended
+                        ))
+                    );
+                    heartbeat_ready.store(ready_seen, Ordering::Release);
+                    heartbeat_busy.store(busy, Ordering::Release);
+                    std::fs::write(&release, b"continue").map_err(|source| {
+                        BrokerOpError::Spawn {
+                            command: "artifact admission test release signal".into(),
+                            source,
+                        }
+                    })?;
+                    Ok(())
+                },
+                || crate::inline_exec_supervisor::GenericExecMode::Supervised,
+            )
+            .unwrap();
+
+        assert!(report.command_success);
+        assert!(saw_ready.load(Ordering::Acquire));
+        assert!(was_busy.load(Ordering::Acquire));
+        assert!(matches!(
+            crate::artifact_use::try_artifact_use_reclaimer(
+                broker.main_root(),
+                Path::new(&session.worktree_path),
+            )
+            .unwrap(),
+            crate::artifact_use::ArtifactUseReclaimTry::Acquired(_)
+        ));
+    }
+
+    #[test]
     fn supervised_exec_timeout_keeps_the_post_command_ownership_audit() {
         use std::time::Duration;
 

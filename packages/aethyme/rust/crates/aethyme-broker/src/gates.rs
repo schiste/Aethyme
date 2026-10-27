@@ -5342,6 +5342,121 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn run_test_gate_entrypoint(
+        checkout_root: PathBuf,
+        database: PathBuf,
+        command: String,
+    ) -> std::thread::JoinHandle<Vec<GateRunOutcome>> {
+        std::thread::spawn(move || {
+            let mut store = BrokerStore::open(&database).unwrap();
+            let checkout = GitRepo::discover(&checkout_root).unwrap();
+            let mut gate = synthetic_gate("artifact-admission", false, &command);
+            gate.timeout_seconds = Some(10);
+            let progress = Lines::default();
+            let admission_host = SequencedAdmissionHost::new(vec![None]);
+            run_selections_with_admission(
+                &mut store,
+                &checkout_root,
+                &checkout,
+                vec![Selection {
+                    gate: &gate,
+                    triggered_by: None,
+                    owner_paths: Vec::new(),
+                }],
+                None,
+                CachePolicy::Bypass,
+                GateRuntimeContext {
+                    progress: &progress,
+                    admission_host: &admission_host,
+                    deadline: None,
+                    storage: GateStorageLocations::default(),
+                },
+                |_, _| None,
+                |_, _, _, _| None,
+            )
+            .unwrap()
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_gate_selection_refuses_busy_admission_and_holds_it_until_settlement() {
+        use std::time::{Duration, Instant};
+
+        let owner = tempfile::tempdir().unwrap();
+        let checkout_root = owner.path().join("checkout");
+        init_repo(&checkout_root);
+        let database = owner.path().join("broker.db");
+        let reservation =
+            match crate::artifact_use::try_artifact_use_reclaimer(&checkout_root, &checkout_root)
+                .unwrap()
+            {
+                crate::artifact_use::ArtifactUseReclaimTry::Acquired(reservation) => reservation,
+                blocked => panic!("fresh checkout should admit the test reclaimer: {blocked:?}"),
+            };
+
+        let conflict_sentinel = checkout_root.join(".artifact-conflict-started");
+        let refused = run_test_gate_entrypoint(
+            checkout_root.clone(),
+            database.clone(),
+            "touch .artifact-conflict-started".into(),
+        )
+        .join()
+        .unwrap();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(
+            refused[0].failure_class,
+            Some(GateFailureClass::ResourceContention)
+        );
+        assert!(
+            !conflict_sentinel.exists(),
+            "the real gate entrypoint must not dispatch after artifact admission refusal"
+        );
+        drop(reservation);
+
+        let ready = checkout_root.join(".artifact-ready");
+        let release = checkout_root.join(".artifact-release");
+        let running = run_test_gate_entrypoint(
+            checkout_root.clone(),
+            database,
+            "touch .artifact-ready; while [ ! -e .artifact-release ]; do /bin/sleep 0.01; done"
+                .into(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ready_seen = ready.exists();
+        let producer_is_busy = matches!(
+            crate::artifact_use::try_artifact_use_reclaimer(&checkout_root, &checkout_root),
+            Ok(crate::artifact_use::ArtifactUseReclaimTry::Blocked(
+                crate::artifact_use::ArtifactUseReclaimBlock::Contended
+            ))
+        );
+        let release_result = std::fs::write(&release, b"continue");
+        let completed = running.join().unwrap();
+
+        assert!(release_result.is_ok(), "could not release controlled gate");
+        assert!(
+            ready_seen,
+            "controlled gate did not reach its running sentinel"
+        );
+        assert!(
+            producer_is_busy,
+            "the actual gate entrypoint was not admitted"
+        );
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].status, GateStatus::Pass);
+        let _ = std::fs::remove_file(ready);
+        let _ = std::fs::remove_file(release);
+        assert!(matches!(
+            crate::artifact_use::try_artifact_use_reclaimer(&checkout_root, &checkout_root)
+                .unwrap(),
+            crate::artifact_use::ArtifactUseReclaimTry::Acquired(_)
+        ));
+    }
+
     #[test]
     fn bounded_command_refuses_expired_dispatch_and_late_success() {
         let root = tempfile::tempdir().unwrap();
