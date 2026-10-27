@@ -20,65 +20,63 @@ const XATTR_NAME: &std::ffi::CStr = c"com.aethyme.root-generation";
 /// Create a fresh marker once on a newly spawned worktree root and return its
 /// digest for durable witnesses. Any unsupported filesystem or ambiguous
 /// state disables unattended cleanup for this checkout.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn initialize(path: &Path) -> Option<String> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        use std::io::Read;
-        use std::os::fd::AsRawFd;
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
 
-        let directory = open_directory(path)?;
-        let mut token = [0_u8; TOKEN_BYTES];
-        std::fs::File::open("/dev/urandom")
-            .ok()?
-            .read_exact(&mut token)
-            .ok()?;
+    let directory = open_directory(path)?;
+    let mut token = [0_u8; TOKEN_BYTES];
+    std::fs::File::open("/dev/urandom")
+        .ok()?
+        .read_exact(&mut token)
+        .ok()?;
 
-        #[cfg(target_os = "linux")]
-        // SAFETY: the descriptor is an open directory, the xattr name is a
-        // static NUL-terminated string, and the token buffer remains live for
-        // the duration of the call. XATTR_CREATE refuses to replace a marker.
-        let result = unsafe {
-            libc::fsetxattr(
-                directory.as_raw_fd(),
-                XATTR_NAME.as_ptr(),
-                token.as_ptr().cast(),
-                token.len(),
-                libc::XATTR_CREATE,
-            )
-        };
+    #[cfg(target_os = "linux")]
+    // SAFETY: the descriptor is an open directory, the xattr name is a
+    // static NUL-terminated string, and the token buffer remains live for
+    // the duration of the call. XATTR_CREATE refuses to replace a marker.
+    let result = unsafe {
+        libc::fsetxattr(
+            directory.as_raw_fd(),
+            XATTR_NAME.as_ptr(),
+            token.as_ptr().cast(),
+            token.len(),
+            libc::XATTR_CREATE,
+        )
+    };
 
-        #[cfg(target_os = "macos")]
-        // SAFETY: the descriptor is an open directory, the xattr name is a
-        // static NUL-terminated string, and the token buffer remains live for
-        // the duration of the call. XATTR_CREATE refuses to replace a marker.
-        let result = unsafe {
-            libc::fsetxattr(
-                directory.as_raw_fd(),
-                XATTR_NAME.as_ptr(),
-                token.as_ptr().cast(),
-                token.len(),
-                0,
-                libc::XATTR_CREATE,
-            )
-        };
-        if result != 0 {
-            return None;
-        }
-
-        // SAFETY: `directory` owns a live descriptor for the root whose xattr
-        // was just created. Sync it before its digest can be committed to the
-        // broker event stream.
-        if unsafe { libc::fsync(directory.as_raw_fd()) } != 0 {
-            return None;
-        }
-        let digest = sha256(&token);
-        (read_fd(directory.as_raw_fd()).as_deref() == Some(digest.as_str())).then_some(digest)
+    #[cfg(target_os = "macos")]
+    // SAFETY: the descriptor is an open directory, the xattr name is a
+    // static NUL-terminated string, and the token buffer remains live for
+    // the duration of the call. XATTR_CREATE refuses to replace a marker.
+    let result = unsafe {
+        libc::fsetxattr(
+            directory.as_raw_fd(),
+            XATTR_NAME.as_ptr(),
+            token.as_ptr().cast(),
+            token.len(),
+            0,
+            libc::XATTR_CREATE,
+        )
+    };
+    if result != 0 {
+        return None;
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = path;
-        None
+
+    // SAFETY: `directory` owns a live descriptor for the root whose xattr
+    // was just created. Sync it before its digest can be committed to the
+    // broker event stream.
+    if unsafe { libc::fsync(directory.as_raw_fd()) } != 0 {
+        return None;
     }
+    let digest = sha256(&token);
+    (read_fd(directory.as_raw_fd()).as_deref() == Some(digest.as_str())).then_some(digest)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn initialize(_path: &Path) -> Option<String> {
+    None
 }
 
 /// Read the recorded generation from an already pinned root directory.
