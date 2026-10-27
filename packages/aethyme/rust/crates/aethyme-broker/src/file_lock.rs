@@ -43,6 +43,10 @@ fn repository_lifecycle_lock_path(main_root: &Path) -> io::Result<std::path::Pat
 }
 
 fn repository_runtime_lock_path(main_root: &Path, name: &str) -> io::Result<std::path::PathBuf> {
+    Ok(repository_runtime_directory(main_root)?.join(name))
+}
+
+fn repository_runtime_directory(main_root: &Path) -> io::Result<std::path::PathBuf> {
     let root = main_root.canonicalize()?;
     let state_dir = root.join(".aethyme");
     ensure_real_directory(&state_dir)?;
@@ -59,7 +63,7 @@ fn repository_runtime_lock_path(main_root: &Path, name: &str) -> io::Result<std:
         ));
     }
 
-    Ok(canonical_run.join(name))
+    Ok(canonical_run)
 }
 
 /// Claim one complete CLI scheduling pass, including repository watches.
@@ -243,6 +247,34 @@ impl Drop for ExclusiveFileLock {
         let _ = self.file.unlock();
     }
 }
+
+/// A shared lock held on an open file until the guard drops.
+#[derive(Debug)]
+pub(crate) struct SharedFileLock {
+    file: File,
+}
+
+impl SharedFileLock {
+    /// Block until `file` is locked shared.
+    pub(crate) fn acquire(file: File) -> io::Result<Self> {
+        file.lock_shared()?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for SharedFileLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+#[path = "artifact_use.rs"]
+mod artifact_use;
+
+pub(crate) use artifact_use::{
+    ArtifactUseMarker, ArtifactUseProducer, ArtifactUseReclaimBlock, ArtifactUseReclaimTry,
+    ArtifactUseReclaimer, ProcessStartIdentity, begin_artifact_use, try_artifact_use_reclaimer,
+};
 
 #[cfg(test)]
 mod tests {
