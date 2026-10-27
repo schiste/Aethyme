@@ -981,6 +981,12 @@ same rule, and so do planned leases at `start --path` and the guarded-exec
 check. The rule is shared with `submit`, which additionally requires the two
 sessions' edits to conflict.
 
+Implicit warnings use the last recorded diagnostic snapshot. Claims do not
+scan other worktrees for new edits; changes made since the last lease refresh
+may be absent from the warnings. Refresh diagnostics explicitly when a fresh
+implicit-edit inventory is needed. Explicit-holder enforcement still uses
+the current lease records and holder policy.
+
 A plan is a point-in-time read. Another session can claim a path after the plan
 returns, so the claim remains authoritative:
 

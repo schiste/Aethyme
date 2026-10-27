@@ -197,6 +197,9 @@ fn an_implicit_lease_never_refuses_an_explicit_claim() {
         .adopt(&add_worktree(tmp.path(), "claimer"), None)
         .unwrap();
     std::fs::write(wt_editor.join("src/auth.py"), "edited elsewhere\n").unwrap();
+    // Implicit edit warnings come from the explicit diagnostic refresh;
+    // granting an explicit path must not scan unrelated working checkouts.
+    broker.refresh_leases().unwrap();
 
     let report = broker.claim_lease(claimer.id, "src/", None).unwrap();
 
