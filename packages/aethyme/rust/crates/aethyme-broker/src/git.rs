@@ -2201,7 +2201,10 @@ pub(crate) struct GitIgnoredPathEntry {
     pub(crate) relative: String,
     /// Whether Git marked the record as a collapsed directory.
     pub(crate) directory_marker: bool,
-    /// A conservative path shape classification; never a deletion verdict.
+    /// A conservative path shape classification for a future in-place
+    /// artifact lane; whole-checkout cleanup intentionally keeps its existing
+    /// classifier. This is never a deletion verdict.
+    #[allow(dead_code)]
     pub(crate) kind: GitIgnoredPathKind,
 }
 
@@ -5262,10 +5265,15 @@ impl GitRepo {
 
         let deadline = active_git_deadline().map_or(deadline, |active| active.min(deadline));
         ensure_ignored_listing_before(deadline, ARGS)?;
+        if std::env::vars_os().any(|(key, _)| unsafe_graph_git_environment_key(&key)) {
+            return Err(GitError::UntrustedOutput {
+                detail: "inherited Git routing overrides make ignored paths unknown".into(),
+            });
+        }
         require_trustworthy_porcelain()?;
         ensure_ignored_listing_before(deadline, ARGS)?;
         let mut command = ignored_paths_git_command(&self.root, ARGS);
-        let output = run_bounded_ignored_listing_command(
+        let output = run_git_process_output_limited(
             &mut command,
             ARGS,
             deadline,
@@ -5278,16 +5286,9 @@ impl GitRepo {
             });
         }
 
-        let raw_paths = parse_nul_paths_strict(&output.stdout, ARGS)?;
+        let raw_paths =
+            parse_ignored_paths_with_cap(&output.stdout, ARGS, MAX_IGNORED_PATHS_ENTRIES)?;
         ensure_ignored_listing_before(deadline, ARGS)?;
-        if raw_paths.len() > MAX_IGNORED_PATHS_ENTRIES {
-            return Err(GitError::UntrustedOutput {
-                detail: format!(
-                    "git {} returned more than {MAX_IGNORED_PATHS_ENTRIES} ignored paths",
-                    ARGS.join(" ")
-                ),
-            });
-        }
 
         let mut entries = Vec::with_capacity(raw_paths.len());
         for mut raw in raw_paths {
@@ -5355,7 +5356,31 @@ fn ensure_ignored_listing_before(deadline: Instant, args: &[&str]) -> Result<(),
     }
 }
 
-fn run_bounded_ignored_listing_command(
+fn parse_ignored_paths_with_cap(
+    output: &[u8],
+    args: &[&str],
+    max_entries: usize,
+) -> Result<Vec<String>, GitError> {
+    let terminators = output
+        .iter()
+        .filter(|byte| **byte == 0)
+        .take(max_entries.saturating_add(1))
+        .count();
+    if terminators > max_entries {
+        return Err(GitError::UntrustedOutput {
+            detail: format!(
+                "git {} returned more than {max_entries} ignored paths",
+                args.join(" ")
+            ),
+        });
+    }
+    parse_nul_paths_strict(output, args)
+}
+
+/// Run a prepared Git command with an absolute deadline and per-stream output
+/// cap. Nonzero status and stderr are returned to the caller; deadline or cap
+/// failures never expose partial stdout.
+pub(crate) fn run_git_process_output_limited(
     command: &mut Command,
     args: &[&str],
     deadline: Instant,
@@ -5397,8 +5422,8 @@ fn run_bounded_ignored_listing_command(
         }
         crate::bounded_output::LimitedOutput::OutputLimit => Err(GitError::UntrustedOutput {
             detail: format!(
-                "git {} exceeded the bounded ignored-path listing output limit",
-                args.join(" ")
+                "git {} exceeded the {max_output_bytes}-byte per-stream output limit",
+                args.join(" "),
             ),
         }),
     }
@@ -5485,7 +5510,7 @@ fn ignored_directory_is_real(
 mod ignored_path_listing_tests {
     use super::{
         GitError, GitIgnoredPathKind, GitRepo, is_broker_protected_ignored_path,
-        run_bounded_ignored_listing_command,
+        parse_ignored_paths_with_cap, run_git_process_output_limited,
     };
     use std::process::Command;
     use std::time::Instant;
@@ -5537,6 +5562,25 @@ mod ignored_path_listing_tests {
         assert_eq!(find("newline\nname").kind, GitIgnoredPathKind::Other);
         assert_eq!(find(".aethyme").kind, GitIgnoredPathKind::Protected);
         assert!(find(".aethyme").directory_marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_git_filename_makes_the_complete_listing_unknown() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = repository();
+        std::fs::write(root.path().join(".gitignore"), "bad-*\n").unwrap();
+        git(root.path(), &["add", ".gitignore"]);
+        git(root.path(), &["commit", "-qm", "ignore malformed filename"]);
+        let invalid_name = std::ffi::OsStr::from_bytes(b"bad-\xff");
+        std::fs::write(root.path().join(invalid_name), b"ignored").unwrap();
+
+        let repo = GitRepo::discover(root.path()).unwrap();
+        assert!(matches!(
+            repo.ignored_paths_readonly_until(Instant::now() + std::time::Duration::from_secs(5)),
+            Err(GitError::UntrustedOutput { .. })
+        ));
     }
 
     #[test]
@@ -5596,6 +5640,26 @@ mod ignored_path_listing_tests {
         assert!(!is_broker_protected_ignored_path("cache/output"));
     }
 
+    #[test]
+    fn ignored_path_count_cap_is_checked_before_decoding_paths() {
+        let mut output = Vec::new();
+        for _ in 0..=super::MAX_IGNORED_PATHS_ENTRIES {
+            output.extend_from_slice(b"x\0");
+        }
+        output.extend_from_slice(b"invalid-\xff\0");
+
+        let error = parse_ignored_paths_with_cap(
+            &output,
+            &["ls-files", "--ignored", "-z"],
+            super::MAX_IGNORED_PATHS_ENTRIES,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, GitError::UntrustedOutput { ref detail } if detail.contains("more than")),
+            "{error}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn expired_listing_deadline_fails_before_spawning_and_output_cap_is_unknown() {
@@ -5604,12 +5668,7 @@ mod ignored_path_listing_tests {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "touch \"$1\"", "test"]).arg(&marker);
         assert!(matches!(
-            run_bounded_ignored_listing_command(
-                &mut command,
-                &["test deadline"],
-                Instant::now(),
-                8,
-            ),
+            run_git_process_output_limited(&mut command, &["test deadline"], Instant::now(), 8,),
             Err(GitError::TimedOut { .. })
         ));
         assert!(!marker.exists());
@@ -5617,7 +5676,7 @@ mod ignored_path_listing_tests {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "printf 1234567890"]);
         assert!(matches!(
-            run_bounded_ignored_listing_command(
+            run_git_process_output_limited(
                 &mut command,
                 &["test output cap"],
                 Instant::now() + std::time::Duration::from_secs(2),

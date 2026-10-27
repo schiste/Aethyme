@@ -886,11 +886,9 @@ pub(crate) fn ignored_content_reason(
     worktree: &Path,
     policy: &AutoCleanupPolicy,
 ) -> Result<Option<String>, String> {
-    if crate::git::graph_verification_environment_refusal().is_some() {
-        return Err("inherited Git routing overrides make ignored paths unknown".into());
-    }
     let deadline = Instant::now() + IGNORED_PATH_LISTING_BUDGET;
-    let ignored = crate::git::with_git_deadline(IGNORED_PATH_LISTING_BUDGET, || {
+    crate::git::with_git_deadline(IGNORED_PATH_LISTING_BUDGET, || {
+        ensure_ignored_content_before(deadline)?;
         let expected_root = worktree
             .canonicalize()
             .map_err(|error| format!("cannot resolve cleanup checkout root: {error}"))?;
@@ -902,29 +900,40 @@ pub(crate) fn ignored_content_reason(
         if discovered_root != expected_root {
             return Err("Git resolved a different root than the cleanup checkout".into());
         }
-        repo.ignored_paths_readonly_until(deadline)
-            .map_err(|error| error.to_string())
-    })?;
-    // Git supplies ignored roots; never recursively walk their contents.
-    // Keep every listed entry in the existing whole-checkout classifier:
-    // typed protection here is only for future in-place artifact discovery.
-    for entry in ignored {
-        let _discovery_kind = entry.kind;
-        if Instant::now() >= deadline {
-            return Err("ignored-path classification exceeded its time budget".into());
+        let ignored = repo
+            .ignored_paths_readonly_until(deadline)
+            .map_err(|error| error.to_string())?;
+        // Git supplies ignored roots; never recursively walk their contents.
+        // Keep every listed entry in the existing whole-checkout classifier:
+        // typed protection here is only for future in-place artifact discovery.
+        for entry in ignored {
+            ensure_ignored_content_before(deadline)?;
+            let relative = if entry.directory_marker {
+                format!("{}/", entry.relative)
+            } else {
+                entry.relative
+            };
+            let classification = classify_ignored(worktree, &relative, policy);
+            ensure_ignored_content_before(deadline)?;
+            if let Err(reason) = classification {
+                return Ok(Some(format!(
+                    "ignored content requires explicit cleanup: {reason}"
+                )));
+            }
         }
-        let relative = if entry.directory_marker {
-            format!("{}/", entry.relative)
-        } else {
-            entry.relative
-        };
-        if let Err(reason) = classify_ignored(worktree, &relative, policy) {
-            return Ok(Some(format!(
-                "ignored content requires explicit cleanup: {reason}"
-            )));
-        }
+        ensure_ignored_content_before(deadline)?;
+        Ok(None)
+    })
+}
+
+fn ensure_ignored_content_before(deadline: Instant) -> Result<(), String> {
+    let deadline =
+        crate::git::active_git_deadline().map_or(deadline, |active| active.min(deadline));
+    if Instant::now() >= deadline {
+        Err("ignored-path classification exceeded its time budget".into())
+    } else {
+        Ok(())
     }
-    Ok(None)
 }
 
 /// Proof 4: every commit at `head` is in `upstream_tip`.
