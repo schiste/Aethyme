@@ -4528,6 +4528,44 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
+    fn failed_post_inventory_lease_check_prevents_rotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = tmp.path().join("cache");
+        let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("payload"), b"preserve").unwrap();
+        let mut scanned = false;
+        let result = shared_cache_budget_at_with_guard(
+            Some(&SharedCacheBudget {
+                max_bytes: 1,
+                ..SharedCacheBudget::default()
+            }),
+            &cache_root,
+            &tmp.path().join("resources.db"),
+            SHARED_CACHE_TEST_REPOSITORY,
+            "0123456789ab",
+            None,
+            None,
+            &mut |force| {
+                if force && scanned {
+                    return Err(PreparationError::LivenessIncomplete {
+                        reason: "lease lost after scan".into(),
+                    });
+                }
+                scanned |= !force;
+                Ok(())
+            },
+        );
+        assert!(scanned);
+        assert!(matches!(
+            result,
+            Err(PreparationError::LivenessIncomplete { .. })
+        ));
+        assert_eq!(fs::read(store.join("payload")).unwrap(), b"preserve");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
     fn shared_cache_inventory_counts_links_without_following_targets_or_cycles() {
         use std::os::unix::fs::symlink;
 
