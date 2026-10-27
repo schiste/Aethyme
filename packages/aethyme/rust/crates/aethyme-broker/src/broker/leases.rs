@@ -3387,14 +3387,34 @@ mod generic_guarded_exec_tests {
 
         let bare = tempfile::tempdir().unwrap();
         git(bare.path(), &["init", "--bare", "-q"]);
-        let remote_url = "https://github.com/example/repo.git";
+        let bare_path = bare.path().to_string_lossy().into_owned();
+        git(repository.path(), &["push", &bare_path, "main"]);
+
+        let ssh_proxy = tempfile::tempdir().unwrap();
+        let ssh_proxy_path = ssh_proxy.path().join("ssh-proxy");
+        let quoted_bare_path = crate::broker::shell_quote(&bare_path);
+        std::fs::write(
+            &ssh_proxy_path,
+            format!("#!/bin/sh\nexec git upload-pack {quoted_bare_path}\n"),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = std::fs::metadata(&ssh_proxy_path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&ssh_proxy_path, permissions).unwrap();
+        }
+        let ssh_proxy_command = crate::broker::shell_quote(&ssh_proxy_path.to_string_lossy());
         git(
             repository.path(),
-            &["config", "remote.origin.url", remote_url],
+            &["config", "core.sshCommand", &ssh_proxy_command],
         );
-        let local_remote = format!("url.file://{}.insteadOf", bare.path().to_string_lossy());
-        git(repository.path(), &["config", &local_remote, remote_url]);
-        git(repository.path(), &["push", "origin", "main"]);
+        git(repository.path(), &["config", "ssh.variant", "ssh"]);
+        git(
+            repository.path(),
+            &["remote", "add", "origin", "git@github.com:example/repo.git"],
+        );
 
         let hooks = tempfile::tempdir().unwrap();
         let entered = hooks.path().join("pre-commit-entered");
