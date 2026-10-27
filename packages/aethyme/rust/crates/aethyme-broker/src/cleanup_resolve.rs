@@ -866,8 +866,10 @@ impl Broker {
             after_archive_verified,
             sync_directory,
             headroom_for,
-            MAX_RECOVERY_BUNDLE_BYTES,
-            write_recovery_bundle_to_file,
+            RecoveryBundleWriter {
+                max_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+                write_to: write_recovery_bundle_to_file,
+            },
         )
     }
 
@@ -878,8 +880,7 @@ impl Broker {
         after_archive_verified: F,
         sync_directory: S,
         headroom_for: H,
-        bundle_max_bytes: u64,
-        bundle_writer: B,
+        bundle: RecoveryBundleWriter<B>,
     ) -> Result<CleanupResolveOutcome, BrokerOpError>
     where
         F: FnOnce(),
@@ -943,8 +944,7 @@ impl Broker {
             &plan,
             session.task.as_deref(),
             &partial,
-            bundle_max_bytes,
-            &bundle_writer,
+            &bundle,
             &sync_directory,
         ) {
             return Err(BrokerOpError::RecoveryArchiveUnverified {
@@ -1574,18 +1574,18 @@ fn verify_recovery_archive_tree(root: &Path, manifest: &StoredManifest) -> Resul
             }
         }
     }
-    if manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION {
-        if let Some(bundle) = manifest.bundle.as_deref() {
-            let path = root.join(bundle);
-            let (bytes, sha256) = hash_regular_file_no_follow(&path, MAX_RECOVERY_BUNDLE_BYTES)
-                .map_err(|error| format!("cannot verify {BUNDLE_FILE} integrity: {error}"))?;
-            if Some(bytes) != manifest.bundle_bytes
-                || Some(sha256.as_str()) != manifest.bundle_sha256.as_deref()
-            {
-                return Err(format!(
-                    "{BUNDLE_FILE} differs from its manifest integrity record"
-                ));
-            }
+    if manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
+        && let Some(bundle) = manifest.bundle.as_deref()
+    {
+        let path = root.join(bundle);
+        let (bytes, sha256) = hash_regular_file_no_follow(&path, MAX_RECOVERY_BUNDLE_BYTES)
+            .map_err(|error| format!("cannot verify {BUNDLE_FILE} integrity: {error}"))?;
+        if Some(bytes) != manifest.bundle_bytes
+            || Some(sha256.as_str()) != manifest.bundle_sha256.as_deref()
+        {
+            return Err(format!(
+                "{BUNDLE_FILE} differs from its manifest integrity record"
+            ));
         }
     }
     Ok(())
@@ -2558,10 +2558,17 @@ where
         plan,
         task,
         dir,
-        MAX_RECOVERY_BUNDLE_BYTES,
-        &write_recovery_bundle_to_file,
+        &RecoveryBundleWriter {
+            max_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+            write_to: write_recovery_bundle_to_file,
+        },
         sync_directory,
     )
+}
+
+struct RecoveryBundleWriter<B> {
+    max_bytes: u64,
+    write_to: B,
 }
 
 fn write_verified_archive_with_bundle_writer<S, B>(
@@ -2570,8 +2577,7 @@ fn write_verified_archive_with_bundle_writer<S, B>(
     plan: &CleanupResolvePlan,
     task: Option<&str>,
     dir: &Path,
-    bundle_max_bytes: u64,
-    bundle_writer: &B,
+    bundle: &RecoveryBundleWriter<B>,
     sync_directory: &S,
 ) -> Result<(), String>
 where
@@ -2610,10 +2616,10 @@ where
     } else {
         let deadline = recovery_bundle_deadline()?;
         let (path, mut bundle_file) = create_new_archive_file_handle(&dir, BUNDLE_FILE)?;
-        let streamed_bytes = match bundle_writer(
+        let streamed_bytes = match (bundle.write_to)(
             checkout,
             &plan.delivery_targets,
-            bundle_max_bytes,
+            bundle.max_bytes,
             deadline,
             &mut bundle_file,
         ) {
@@ -2631,7 +2637,7 @@ where
             .sync_all()
             .map_err(|error| format!("cannot sync {BUNDLE_FILE}: {error}"))?;
         drop(bundle_file);
-        let (bytes, sha256) = hash_regular_file_no_follow(&path, bundle_max_bytes)
+        let (bytes, sha256) = hash_regular_file_no_follow(&path, bundle.max_bytes)
             .map_err(|error| format!("cannot read back {BUNDLE_FILE}: {error}"))?;
         if bytes != streamed_bytes {
             return Err(format!("{BUNDLE_FILE} byte count changed after streaming"));
@@ -3663,11 +3669,13 @@ mod tests {
                         inodes: None,
                     })
                 },
-                8,
-                |_, _, max_bytes, deadline, file| {
-                    let mut command = Command::new("sh");
-                    command.args(["-c", "printf 123456789"]);
-                    stream_recovery_command_stdout(&mut command, file, max_bytes, deadline)
+                RecoveryBundleWriter {
+                    max_bytes: 8,
+                    write_to: |_, _, max_bytes, deadline, file| {
+                        let mut command = Command::new("sh");
+                        command.args(["-c", "printf 123456789"]);
+                        stream_recovery_command_stdout(&mut command, file, max_bytes, deadline)
+                    },
                 },
             )
             .unwrap_err()
