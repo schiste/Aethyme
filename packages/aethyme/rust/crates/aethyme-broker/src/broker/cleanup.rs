@@ -4375,7 +4375,7 @@ mod registered_removal_failure_tests {
         tracked_tree_contains_directory,
     };
     use crate::{SessionCleanupState, git::with_git_deadline};
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::ffi::CString;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::os::fd::AsRawFd;
