@@ -1336,6 +1336,25 @@ fn unsafe_graph_git_environment_key(key: &std::ffi::OsStr) -> bool {
     )
 }
 
+fn unsafe_session_commit_git_environment_key(key: &std::ffi::OsStr) -> bool {
+    let normalized = key.to_string_lossy().to_ascii_uppercase();
+    unsafe_graph_git_environment_key(std::ffi::OsStr::new(&normalized))
+        || normalized == "GIT_EXEC_PATH"
+        || normalized == "GIT_CONFIG"
+        || normalized.starts_with("GIT_CONFIG_")
+}
+
+/// Refuse commit commands when inherited Git environment can redirect
+/// repository discovery, history, the index, or Git configuration. This is
+/// checked before CLI broker discovery as well as immediately before commit.
+pub(crate) fn session_commit_git_environment_refusal() -> Option<&'static str> {
+    std::env::vars_os()
+        .any(|(key, _)| unsafe_session_commit_git_environment_key(&key))
+        .then_some(
+            "broker commit refuses inherited Git routing or configuration overrides; unset them before retrying",
+        )
+}
+
 fn graph_snapshot_error(message: &str) -> GitError {
     GitError::Spawn {
         args: "isolate exact graph source".into(),
@@ -3461,6 +3480,73 @@ impl GitRepo {
             .collect())
     }
 
+    pub(crate) fn commit_parents_until_with_limit(
+        &self,
+        commit: &str,
+        deadline: Instant,
+        max_output_bytes: usize,
+    ) -> Result<Vec<String>, GitError> {
+        let args = [
+            "--no-replace-objects",
+            "rev-list",
+            "--parents",
+            "-n",
+            "1",
+            commit,
+        ];
+        let deadline = active_git_deadline().map_or(deadline, |active| active.min(deadline));
+        ensure_bounded_git_listing_before(deadline, &args)?;
+        if std::env::vars_os().any(|(key, _)| unsafe_session_commit_git_environment_key(&key)) {
+            return Err(GitError::UntrustedOutput {
+                detail:
+                    "inherited Git routing or configuration overrides make commit ancestry unknown"
+                        .into(),
+            });
+        }
+        let mut command = git_command();
+        command.args(args).current_dir(&self.root);
+        let output =
+            run_git_process_output_limited(&mut command, &args, deadline, max_output_bytes)?;
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        ensure_bounded_git_listing_before(deadline, &args)?;
+        if output.stdout.last() != Some(&b'\n')
+            || output.stdout[..output.stdout.len().saturating_sub(1)].contains(&b'\n')
+        {
+            return Err(GitError::UntrustedOutput {
+                detail: "git returned an incomplete commit ancestry record".into(),
+            });
+        }
+        let mut fields =
+            output.stdout[..output.stdout.len() - 1].split(|byte| byte.is_ascii_whitespace());
+        let object = fields.next().ok_or_else(|| GitError::UntrustedOutput {
+            detail: "git returned an empty commit ancestry record".into(),
+        })?;
+        if !valid_git_object_id(object) || object != commit.as_bytes() {
+            return Err(GitError::UntrustedOutput {
+                detail: "git returned a malformed commit object id".into(),
+            });
+        }
+        let mut parents = Vec::new();
+        for parent in fields.filter(|field| !field.is_empty()) {
+            if !valid_git_object_id(parent) {
+                return Err(GitError::UntrustedOutput {
+                    detail: "git returned a malformed parent object id".into(),
+                });
+            }
+            parents.push(String::from_utf8(parent.to_vec()).map_err(|_| {
+                GitError::UntrustedOutput {
+                    detail: "git returned a non-UTF-8 parent object id".into(),
+                }
+            })?);
+        }
+        Ok(parents)
+    }
+
     /// Tree object referenced by a commit.
     /// `(status, path)` for every path a commit changed, against its first
     /// parent. Status is git's name-status letter: `A`, `M`, `D`, and so on.
@@ -4381,6 +4467,62 @@ impl GitRepo {
         to: &str,
     ) -> Result<Vec<String>, GitError> {
         self.changed_between_with_rename_policy(from, to, "--no-renames")
+    }
+
+    /// A bounded complete path census for a local commit delta. Unlike the
+    /// compatibility API above, this refuses when either the byte or path
+    /// count cap is reached so a commit guard never treats a partial listing
+    /// as an ownership proof.
+    pub(crate) fn changed_between_until_with_limits(
+        &self,
+        from: &str,
+        to: &str,
+        deadline: Instant,
+        max_output_bytes: usize,
+        max_path_fields: usize,
+    ) -> Result<Vec<String>, GitError> {
+        require_trustworthy_porcelain()?;
+        let args = [
+            "--no-replace-objects",
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=none",
+            "-z",
+            from,
+            to,
+            "--",
+        ];
+        let deadline = active_git_deadline().map_or(deadline, |active| active.min(deadline));
+        ensure_bounded_git_listing_before(deadline, &args)?;
+        if std::env::vars_os().any(|(key, _)| unsafe_session_commit_git_environment_key(&key)) {
+            return Err(GitError::UntrustedOutput {
+                detail: "inherited Git routing or configuration overrides make the commit path census unknown".into(),
+            });
+        }
+        let mut command = git_command();
+        command.args(args).current_dir(&self.root);
+        let output =
+            run_git_process_output_limited(&mut command, &args, deadline, max_output_bytes)?;
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        let paths = parse_nul_paths_strict(&output.stdout, &args)?;
+        if paths.len() > max_path_fields {
+            return Err(GitError::UntrustedOutput {
+                detail: format!(
+                    "git {} returned more than {max_path_fields} changed paths",
+                    args.join(" ")
+                ),
+            });
+        }
+        ensure_bounded_git_listing_before(deadline, &args)?;
+        Ok(paths)
     }
 
     fn changed_between_with_rename_policy(
@@ -8848,6 +8990,50 @@ mod graph_snapshot_tests {
             "GIT_CONFIG_COUNT"
         )));
         assert!(!is_git_environment_key(std::ffi::OsStr::new("PATH")));
+    }
+
+    #[test]
+    fn session_commit_environment_preflight_refuses_routing_and_config_overrides() {
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+            "GIT_PREFIX",
+            "GIT_CONFIG",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_EXEC_PATH",
+        ] {
+            assert!(
+                unsafe_session_commit_git_environment_key(std::ffi::OsStr::new(key)),
+                "{key}"
+            );
+        }
+        for key in [
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+            "GIT_EDITOR",
+            "GIT_PAGER",
+            "GIT_TRACE2_EVENT",
+            "HOME",
+            "PATH",
+        ] {
+            assert!(
+                !unsafe_session_commit_git_environment_key(std::ffi::OsStr::new(key)),
+                "{key}"
+            );
+        }
     }
 
     #[test]

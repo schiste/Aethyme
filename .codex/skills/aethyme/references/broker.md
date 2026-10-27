@@ -189,6 +189,14 @@ blocked.
    verified and integrated. Never switch branches inside someone else's
    worktree; never edit files outside your own worktree.
 
+   For a local commit in your own active session, use
+   \`aethyme broker commit --session <your-session-id> -- <git-commit-args>\`.
+   It checks the registered worktree and branch, audits complete bounded path
+   inventories before and after the commit, and runs the repository's normal
+   Git hooks. Hook-bypass options and inherited Git routing/config overrides
+   are refused. If post-commit ownership verification is unknown, inspect the
+   worktree and execution receipt before trying another commit.
+
    **If `.aethyme/config.toml`, as committed on the default branch, sets
    `[delivery] push_session_branches = true`, push your session branch as you
    go.** Work that exists only in a worktree
