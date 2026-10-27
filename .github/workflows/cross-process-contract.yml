@@ -39,6 +39,8 @@ jobs:
           # the PR's contract diff when the branch is behind.
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
+          # Avoid transient credential includes forcing conservative build identity.
+          persist-credentials: false
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
