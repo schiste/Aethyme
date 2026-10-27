@@ -182,7 +182,7 @@ impl PinnedTreeRemoval {
         _witness_name: &str,
         _deadline: Option<Instant>,
         _validate: F,
-        _before_mutation: M,
+        mut _before_mutation: M,
     ) -> Result<(TreeRemoval, usize), TreeRemovalError>
     where
         F: FnOnce(&[u8]) -> io::Result<()>,
@@ -216,7 +216,7 @@ impl PinnedTreeRemoval {
         _witness_name: &str,
         _deadline: Option<Instant>,
         _validate: F,
-        mut _before_mutation: M,
+        _before_mutation: M,
     ) -> Result<(TreeRemoval, usize), TreeRemovalError>
     where
         F: FnOnce(&[u8]) -> io::Result<()>,
