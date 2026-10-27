@@ -518,6 +518,9 @@ blocked.
    the consumer cannot represent.
    Treat the proof as a complete literal Git path census plus committed file
    type and mode evidence; diff-rendering settings are not source identity.
+   Before deleting a source checkout after archiving, sync archive files and
+   directories bottom-up; after publishing the final archive, sync its
+   directory, parent and storage anchor. Keep the source if any sync fails.
 
    Orchestration with no path -- a release, a merge chain -- is claimed by
    name instead: `aethyme broker advanced ownership claim "release v1.2.0"
