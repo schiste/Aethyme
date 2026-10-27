@@ -240,14 +240,19 @@ real saving there comes from migrating to pnpm, not from the flag.
 
 The shared store is keyed by preparation digest, so a repository whose lockfile
 differs between branches accumulates one store directory per distinct input set.
-When set, `shared_cache.max_bytes` caps that, and the store is rotated when it
-exceeds the budget. Rotation happens inside the exclusive lease, never after it,
+`shared_cache.max_bytes` defaults to 8 GiB and is a pre-run rotation threshold,
+not a write quota. Rotation happens inside the exclusive lease, never after it,
 because it removes a store other worktrees may be reading. Declaring a budget
 without a `repository_shared` step is refused rather than ignored.
 
-By default the broker places this store beside its captured host resource
-database. A repository may select the worktree placement filesystem when its
-package manager can hardlink its content-addressable store into each worktree:
+An unspecified `shared_cache.root` keeps the historical Host placement for
+existing configurations. A new pnpm draft from `aethyme init` selects the
+worktree placement filesystem and passes its broker-managed store path with
+`--store-dir`, so pnpm can hardlink package content when its import mode allows
+it. Worktree outputs such as `node_modules/` remain per-worktree. A
+worktree-relative `store-dir` in `.npmrc` creates a private store for
+installs that do not pass an explicit store path; remove it to avoid that
+per-checkout cache:
 
 ```toml
 [shared_cache]
@@ -258,6 +263,7 @@ The broker derives a repository-owned cache root under the selected worktree
 placement root and verifies its ownership marker and filesystem before use.
 An explicit `AETHYME_PREPARATION_CACHE_ROOT` operator setting keeps precedence;
 the broker refuses that setting for this mode if it is on another filesystem.
+Set `root = "host"` when a new configuration needs the historical placement.
 Changing the selected placement does not migrate or remove an old cache root.
 Only the package-manager store can share physical data this way; declared
 worktree outputs such as Python virtual environments remain per-worktree.
