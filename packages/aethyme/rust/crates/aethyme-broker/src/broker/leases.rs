@@ -3347,9 +3347,8 @@ mod generic_guarded_exec_tests {
 
     #[test]
     fn local_commit_hook_does_not_hold_the_repository_lock_needed_by_fetch() {
-        use crate::operations::{
-            CoordinatedCommand, OperationEffect, OperationProvider, QueueWait,
-        };
+        use crate::operations::{CoordinatedCommand, QueueWait};
+        use crate::types::{OperationEffect, OperationProvider};
 
         let (repository, storage, mut commit_broker) = fixture();
         git(repository.path(), &["config", "user.name", "Fixture"]);
