@@ -265,6 +265,9 @@ const MAX_GIT_BATCH_INPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_IGNORED_PATHS_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IGNORED_PATHS_ENTRIES: usize = 16_384;
 const MAX_IGNORED_PATH_BYTES: usize = 4_096;
+/// Refuse recovery patches larger than this rather than buffering an
+/// unbounded diff in memory. The archive source remains untouched on refusal.
+const MAX_RECOVERY_PATCH_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 /// A single exact-tree landing search may ask for at most this many objects.
 /// The same ceiling is enforced by `objects_at_many` before it allocates input.
 pub(crate) const MAX_GIT_BATCH_QUERY_COUNT: usize = 100_000;
@@ -4952,7 +4955,17 @@ impl GitRepo {
     /// changes what `git diff` prints, and a recovery patch has to apply on a
     /// machine that does not share that configuration. Submodule visibility is
     /// pinned too, so a local ignore setting cannot hide a gitlink pointer change.
+    /// Each capture is capped at 64 MiB; larger patches fail closed without
+    /// returning truncated output.
     pub fn recovery_patch(&self, cached: bool) -> Result<Vec<u8>, GitError> {
+        self.recovery_patch_with_output_limit(cached, MAX_RECOVERY_PATCH_OUTPUT_BYTES)
+    }
+
+    fn recovery_patch_with_output_limit(
+        &self,
+        cached: bool,
+        max_output_bytes: usize,
+    ) -> Result<Vec<u8>, GitError> {
         let mut args = vec![
             "-c",
             "diff.noprefix=false",
@@ -4970,7 +4983,26 @@ impl GitRepo {
         if cached {
             args.push("--cached");
         }
-        run_git_bytes(&self.root, &args)
+        let mut command = git_command();
+        command
+            .args(&args)
+            .current_dir(&self.root)
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        let output = run_git_process_output_limited(
+            &mut command,
+            &args,
+            Instant::now()
+                .checked_add(git_timeout())
+                .unwrap_or_else(Instant::now),
+            max_output_bytes,
+        )?;
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        Ok(output.stdout)
     }
 
     /// Commits reachable from `head` that none of `excluded` holds, newest
@@ -6241,7 +6273,7 @@ mod porcelain_tests {
 
 #[cfg(test)]
 mod gitlink_census_tests {
-    use super::{GitRepo, parse_index_gitlinks, parse_tree_gitlinks};
+    use super::{GitError, GitRepo, parse_index_gitlinks, parse_tree_gitlinks};
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -6482,6 +6514,36 @@ mod gitlink_census_tests {
             patch.contains(&format!("Subproject commit {changed_oid}")),
             "{patch}"
         );
+    }
+
+    #[test]
+    fn recovery_patch_output_limit_accepts_boundary_and_refuses_truncation() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        init_repo(&repository);
+        std::fs::write(repository.join("tracked.txt"), "initial\n").unwrap();
+        git(&repository, &["add", "tracked.txt"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+        std::fs::write(repository.join("tracked.txt"), "changed\n").unwrap();
+
+        let checkout = GitRepo::discover(&repository).unwrap();
+        let patch = checkout.recovery_patch(false).unwrap();
+        assert!(!patch.is_empty());
+        assert_eq!(
+            checkout
+                .recovery_patch_with_output_limit(false, patch.len())
+                .unwrap(),
+            patch
+        );
+
+        let error = checkout
+            .recovery_patch_with_output_limit(false, patch.len() - 1)
+            .unwrap_err();
+        assert!(
+            matches!(&error, GitError::UntrustedOutput { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("output limit"), "{error}");
     }
 }
 

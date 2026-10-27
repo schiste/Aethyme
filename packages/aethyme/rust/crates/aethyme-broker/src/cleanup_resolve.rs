@@ -47,6 +47,7 @@ const UNTRACKED_DIRECTORY: &str = "untracked";
 const IGNORED_DIRECTORY: &str = "ignored";
 pub(crate) const MANIFEST_FILE: &str = "manifest.json";
 const README_FILE: &str = "README.md";
+const MAX_RECOVERY_README_BYTES: u64 = 64 * 1024;
 const MAX_WORKTREE_SPECIAL_SCAN_ENTRIES: usize = 250_000;
 const MAX_WORKTREE_SPECIAL_SCAN_DEPTH: usize = 128;
 static ARCHIVE_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -246,10 +247,23 @@ fn open_regular_file_no_follow(path: &Path) -> std::io::Result<(std::fs::File, s
     Ok((file, metadata))
 }
 
-fn read_regular_file_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
-    let (mut file, _) = open_regular_file_no_follow(path)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+fn read_regular_file_no_follow(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let (file, metadata) = open_regular_file_no_follow(path)?;
+    if metadata.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "regular file exceeds its read bound",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len().min(max_bytes) as usize);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "regular file grew beyond its read bound",
+        ));
+    }
     Ok(bytes)
 }
 
@@ -296,7 +310,12 @@ fn describe_untracked(full: &Path, relative: &str) -> std::io::Result<Option<Arc
         if read == 0 {
             break;
         }
-        bytes += read as u64;
+        bytes = bytes.checked_add(read as u64).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file size overflows u64 while it was read",
+            )
+        })?;
         hasher.update(&buffer[..read]);
     }
     let final_metadata = file.metadata()?;
@@ -589,8 +608,18 @@ impl Broker {
         let unlanded_commits = checkout.commits_not_on_any(&head, &delivery_targets)?;
         let primary = self.repo_handle().head_commit()?;
         let landing = crate::work_landed(self.repo_handle(), &head, &primary)?;
-        let staged = checkout.recovery_patch(true)?;
-        let unstaged = checkout.recovery_patch(false)?;
+        let (staged_patch_bytes, staged_patch_sha256) = {
+            let staged = checkout.recovery_patch(true)?;
+            let bytes = u64::try_from(staged.len())
+                .map_err(|_| refuse("staged recovery patch is too large to measure".into()))?;
+            (bytes, sha256_hex(&staged))
+        };
+        let (unstaged_patch_bytes, unstaged_patch_sha256) = {
+            let unstaged = checkout.recovery_patch(false)?;
+            let bytes = u64::try_from(unstaged.len())
+                .map_err(|_| refuse("unstaged recovery patch is too large to measure".into()))?;
+            (bytes, sha256_hex(&unstaged))
+        };
 
         let mut untracked_files = Vec::new();
         for relative in checkout.untracked_paths()? {
@@ -617,7 +646,8 @@ impl Broker {
             }
         }
         untracked_files.sort_by(|left, right| left.path.cmp(&right.path));
-        let untracked_bytes = untracked_files.iter().map(|file| file.bytes).sum();
+        let untracked_bytes = checked_archived_file_bytes(&untracked_files)
+            .ok_or_else(|| refuse("the total untracked archive size overflows u64".into()))?;
 
         let ignored_policy = crate::AutoCleanupPolicy::load(self.main_root())
             .map_err(|reason| refuse(format!("cannot read ignored cleanup policy: {reason}")))?;
@@ -627,13 +657,12 @@ impl Broker {
         };
         let (ignored_paths, ignored_files) =
             ignored_inventory(&checkout, &worktree, &ignored_policy, session_id)?;
-        let ignored_bytes = ignored_files.iter().map(|file| file.bytes).sum();
+        let ignored_bytes = checked_archived_file_bytes(&ignored_files)
+            .ok_or_else(|| refuse("the total ignored archive size overflows u64".into()))?;
         let ignored_policy_bytes =
             serde_json::to_vec(&ignored_policy_proof).map_err(|error| refuse(error.to_string()))?;
         let ignored_policy_sha256 = sha256_hex(&ignored_policy_bytes);
 
-        let staged_patch_sha256 = sha256_hex(&staged);
-        let unstaged_patch_sha256 = sha256_hex(&unstaged);
         let digest_input = DigestInput {
             schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
             session_id,
@@ -671,9 +700,9 @@ impl Broker {
             delivery_targets,
             landing,
             unlanded_commits,
-            staged_patch_bytes: staged.len() as u64,
+            staged_patch_bytes,
             staged_patch_sha256,
-            unstaged_patch_bytes: unstaged.len() as u64,
+            unstaged_patch_bytes,
             unstaged_patch_sha256,
             untracked_files,
             ignored_paths,
@@ -709,19 +738,24 @@ impl Broker {
             confirm,
             after_archive_verified,
             sync_archive_directory,
+            |main_root, archive_root| {
+                crate::disk_headroom::available_headroom_at_or_above_for(main_root, archive_root)
+            },
         )
     }
 
-    fn cleanup_resolve_apply_with_hooks<F, S>(
+    fn cleanup_resolve_apply_with_hooks<F, S, H>(
         &mut self,
         session_id: i64,
         confirm: &str,
         after_archive_verified: F,
         sync_directory: S,
+        headroom_for: H,
     ) -> Result<CleanupResolveOutcome, BrokerOpError>
     where
         F: FnOnce(),
         S: Fn(&Path) -> std::io::Result<()>,
+        H: FnOnce(&Path, &Path) -> Option<crate::disk_headroom::DiskHeadroom>,
     {
         if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BrokerOpError::CleanupResolveConfirmationNotSha256);
@@ -741,6 +775,21 @@ impl Broker {
                 reason,
             }
         })?;
+        let known_payload_bytes =
+            known_recovery_archive_payload_bytes(&plan).map_err(|reason| {
+                BrokerOpError::CleanupResolveRefused {
+                    id: session_id,
+                    reason: format!("archive capacity preflight failed: {reason}"),
+                }
+            })?;
+        let destination_headroom =
+            headroom_for(self.main_root(), &archive_root).map(|headroom| headroom.bytes);
+        require_recovery_archive_headroom(destination_headroom, known_payload_bytes).map_err(
+            |reason| BrokerOpError::CleanupResolveRefused {
+                id: session_id,
+                reason: format!("archive capacity preflight failed: {reason}"),
+            },
+        )?;
         let name = format!(
             "{session_id}-{}-{}",
             &plan.head[..12],
@@ -920,6 +969,69 @@ fn same_path(left: &Path, right: &Path) -> bool {
 const MAX_RECOVERY_ARCHIVE_TREE_ENTRIES: usize = 250_000;
 const MAX_RECOVERY_ARCHIVE_TREE_DEPTH: usize = 128;
 const MAX_RECOVERY_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Check the known archive payload plus the configured reserve requirement
+/// against the destination volume. The optional commit bundle, filesystem
+/// allocation overhead, and concurrent writes are excluded, so this known-minimum
+/// admission check does not guarantee the reserve will remain available.
+fn require_recovery_archive_headroom(
+    available_bytes: Option<u64>,
+    known_payload_bytes: u64,
+) -> Result<(), String> {
+    let required = known_payload_bytes
+        .checked_add(crate::DEFAULT_GATE_HEADROOM_BYTES)
+        .ok_or_else(|| "known archive size plus the storage reserve overflows u64".to_owned())?;
+    let available_bytes = available_bytes.ok_or_else(|| {
+        "cannot measure free space on the archive destination volume; the worktree was left in place"
+            .to_owned()
+    })?;
+    if available_bytes < required {
+        return Err(format!(
+            "archive destination has {available_bytes} free bytes, below the {required} bytes required for the known payload plus the {}-byte reserve. This known-minimum check excludes bundle size, filesystem allocation overhead, and concurrent writes, so it does not guarantee the reserve will remain available; the worktree was left in place",
+            crate::DEFAULT_GATE_HEADROOM_BYTES
+        ));
+    }
+    Ok(())
+}
+
+fn add_archive_size(total: &mut u64, bytes: u64, label: &str) -> Result<(), String> {
+    *total = total.checked_add(bytes).ok_or_else(|| {
+        format!("known recovery archive size overflows u64 while counting {label}")
+    })?;
+    Ok(())
+}
+
+fn known_recovery_archive_payload_bytes(plan: &CleanupResolvePlan) -> Result<u64, String> {
+    let mut total = 0_u64;
+    add_archive_size(&mut total, plan.staged_patch_bytes, STAGED_PATCH_FILE)?;
+    add_archive_size(&mut total, plan.unstaged_patch_bytes, UNSTAGED_PATCH_FILE)?;
+
+    let worktree = Path::new(&plan.worktree_path);
+    for file in plan.untracked_files.iter().chain(&plan.ignored_files) {
+        let bytes = if file.symlink {
+            let path = worktree.join(&file.path);
+            let target = std::fs::read_link(&path)
+                .map_err(|error| format!("cannot measure archived link {}: {error}", file.path))?;
+            u64::try_from(target.as_os_str().as_encoded_bytes().len())
+                .map_err(|_| format!("archived link target is too large: {}", file.path))?
+        } else {
+            file.bytes
+        };
+        add_archive_size(&mut total, bytes, &file.path)?;
+    }
+
+    // The manifest reader's limit is the conservative upper bound reserved
+    // for its encoded contents. The generated README has a smaller fixed cap.
+    add_archive_size(&mut total, MAX_RECOVERY_MANIFEST_BYTES, MANIFEST_FILE)?;
+    add_archive_size(&mut total, MAX_RECOVERY_README_BYTES, README_FILE)?;
+    Ok(total)
+}
+
+fn checked_archived_file_bytes(files: &[ArchivedFile]) -> Option<u64> {
+    files
+        .iter()
+        .try_fold(0_u64, |total, file| total.checked_add(file.bytes))
+}
 
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -1407,7 +1519,7 @@ fn verify_recovery_archive_payload_for_plan(
             "{README_FILE} differs from the reviewed restore steps"
         ));
     }
-    let readme = read_regular_file_no_follow(&readme_path)
+    let readme = read_regular_file_no_follow(&readme_path, MAX_RECOVERY_README_BYTES)
         .map_err(|error| format!("cannot safely read {README_FILE}: {error}"))?;
     if readme != expected_readme.as_bytes() {
         return Err(format!(
@@ -1803,6 +1915,76 @@ fn create_new_archive_file(root: &Path, relative: &str, bytes: &[u8]) -> Result<
     Ok(path)
 }
 
+struct CappedArchiveBuffer {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+}
+
+impl Write for CappedArchiveBuffer {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if buffer.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "serialized recovery manifest exceeds its size bound",
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_recovery_manifest(
+    manifest: &impl serde::Serialize,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let mut buffer = CappedArchiveBuffer {
+        bytes: Vec::new(),
+        max_bytes,
+    };
+    serde_json::to_writer_pretty(&mut buffer, manifest).map_err(|error| {
+        format!("cannot serialize recovery manifest within its size bound: {error}")
+    })?;
+    Ok(buffer.bytes)
+}
+
+/// Copy at most the byte length captured by the reviewed plan, then read one
+/// extra byte to detect growth without writing beyond that plan.
+fn copy_expected_bytes_with_probe<R: Read, W: Write>(
+    source: &mut R,
+    target: &mut W,
+    expected_bytes: u64,
+) -> std::io::Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut remaining = expected_bytes;
+    while remaining > 0 {
+        let limit = remaining.min(buffer.len() as u64) as usize;
+        let read = source.read(&mut buffer[..limit])?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "source is shorter than its reviewed byte length",
+            ));
+        }
+        target.write_all(&buffer[..read])?;
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+
+    let mut probe = [0_u8; 1];
+    if source.read(&mut probe)? != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "source grew beyond its reviewed byte length",
+        ));
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn copy_regular_archive_file(
     source: &Path,
     archive_root: &Path,
@@ -1837,14 +2019,15 @@ fn copy_regular_archive_file(
     let mut target_file = options
         .open(&target)
         .map_err(|error| format!("cannot create archive file {}: {error}", target.display()))?;
-    let copied = std::io::copy(&mut source_file, &mut target_file)
-        .map_err(|error| format!("cannot copy {}: {error}", expected.path))?;
+    let copied_sha256 =
+        copy_expected_bytes_with_probe(&mut source_file, &mut target_file, expected.bytes)
+            .map_err(|error| format!("cannot copy {}: {error}", expected.path))?;
     let source_after = source_file
         .metadata()
         .map_err(|error| format!("cannot recheck {}: {error}", expected.path))?;
-    if copied != expected.bytes
-        || source_after.len() != expected.bytes
+    if source_after.len() != expected.bytes
         || permission_mode(&source_after) != expected.mode
+        || copied_sha256 != expected.sha256
     {
         return Err(format!("{} changed while it was archived", expected.path));
     }
@@ -2008,12 +2191,13 @@ where
             .recovery_patch(cached)
             .map_err(|error| format!("cannot take {file}: {error}"))?;
         let path = create_new_archive_file(&dir, file, &bytes)?;
-        let written = read_regular_file_no_follow(&path)
-            .map_err(|error| format!("cannot safely read {file}: {error}"))?;
-        if sha256_hex(&written) != *expected {
+        let written = describe_untracked(&path, file)
+            .map_err(|error| format!("cannot safely read {file}: {error}"))?
+            .ok_or_else(|| format!("{file} is not a regular file"))?;
+        if written.bytes != bytes.len() as u64 || written.sha256 != *expected {
             return Err(format!("{file} no longer matches the reviewed plan"));
         }
-        patches.push((!written.is_empty()).then_some(path));
+        patches.push((written.bytes != 0).then_some(path));
     }
 
     let bundle = if plan.unlanded_commits.is_empty() {
@@ -2151,14 +2335,15 @@ where
         ignored_files: &plan.ignored_files,
         ignored_policy_sha256: &plan.ignored_policy_sha256,
     };
-    let manifest =
-        serde_json::to_vec_pretty(&manifest).map_err(|error| format!("manifest: {error}"))?;
+    let manifest = serialize_recovery_manifest(&manifest, MAX_RECOVERY_MANIFEST_BYTES as usize)?;
     create_new_archive_file(&dir, MANIFEST_FILE, &manifest)?;
-    create_new_archive_file(
-        &dir,
-        README_FILE,
-        restore_readme(plan, bundle.is_some()).as_bytes(),
-    )?;
+    let readme = restore_readme(plan, bundle.is_some());
+    if readme.len() as u64 > MAX_RECOVERY_README_BYTES {
+        return Err(format!(
+            "restore README exceeds the {MAX_RECOVERY_README_BYTES}-byte archive size bound"
+        ));
+    }
+    create_new_archive_file(&dir, README_FILE, readme.as_bytes())?;
     verify_recovery_archive_payload_for_plan(repository, &dir, plan)?;
     sync_archive_directories_bottom_up(&dir, sync_directory)?;
     Ok(())
@@ -2726,6 +2911,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn archive_capacity_refusal_queries_configured_destination_before_staging() {
+        for (case, headroom) in [
+            (
+                "insufficient",
+                Some(crate::disk_headroom::DiskHeadroom {
+                    bytes: 0,
+                    inodes: None,
+                }),
+            ),
+            ("unknown", None),
+        ] {
+            let owner = tempfile::tempdir().unwrap();
+            let repository = owner.path().join("repository");
+            std::fs::create_dir(&repository).unwrap();
+            git(&repository, &["init", "-q", "-b", "main"]);
+            std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+            git(&repository, &["add", "-A"]);
+            git(&repository, &["commit", "-qm", "initial"]);
+
+            let storage = crate::test_storage::TestStorage::new();
+            let mut broker = storage.open(&repository).unwrap();
+            let session = broker
+                .start_worktree("archive capacity refusal fixture", None)
+                .unwrap();
+            let worktree = PathBuf::from(&session.worktree_path);
+            let committed = worktree.join("committed.txt");
+            std::fs::write(&committed, "pending commit\n").unwrap();
+            git(&worktree, &["add", "committed.txt"]);
+            git(&worktree, &["commit", "-qm", "pending"]);
+            let source = worktree.join("preserve.txt");
+            std::fs::write(&source, "retain before archive staging\n").unwrap();
+            broker.close(session.id).unwrap();
+
+            let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+            assert!(
+                !plan.unlanded_commits.is_empty(),
+                "fixture must require a commit bundle"
+            );
+            assert!(plan.archive_root.starts_with(storage.host_state_dir()));
+            assert!(!plan.archive_root.starts_with(&repository));
+            let expected_repository = broker.main_root().to_path_buf();
+            let expected_archive_root = plan.archive_root.clone();
+            let error = broker
+                .cleanup_resolve_apply_with_hooks(
+                    session.id,
+                    &plan.digest,
+                    || panic!("capacity refusal must happen before archive verification"),
+                    sync_archive_directory,
+                    move |repository_root, destination| {
+                        assert_eq!(repository_root, expected_repository);
+                        assert_eq!(destination, expected_archive_root);
+                        headroom
+                    },
+                )
+                .unwrap_err()
+                .to_string();
+
+            assert!(
+                error.contains("archive capacity preflight failed"),
+                "{case}: {error}"
+            );
+            assert!(worktree.is_dir(), "{case}");
+            assert_eq!(
+                std::fs::read(&source).unwrap(),
+                b"retain before archive staging\n",
+                "{case}"
+            );
+            assert_eq!(
+                std::fs::read_dir(&plan.archive_root).unwrap().count(),
+                0,
+                "{case}: no partial archive or payload should be written"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn archive_root_sync_failure_keeps_the_original_worktree() {
@@ -2761,6 +3022,12 @@ mod tests {
                     } else {
                         sync_archive_directory(path)
                     }
+                },
+                |_, _| {
+                    Some(crate::disk_headroom::DiskHeadroom {
+                        bytes: u64::MAX,
+                        inodes: None,
+                    })
                 },
             )
             .unwrap_err()
@@ -3050,5 +3317,90 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("special file"), "{error}");
+    }
+
+    #[test]
+    fn archive_copy_accepts_exact_size_and_never_writes_growth_probe() {
+        use std::io::Cursor;
+
+        let mut exact_source = Cursor::new(b"archive".to_vec());
+        let mut exact_target = Vec::new();
+        let digest =
+            copy_expected_bytes_with_probe(&mut exact_source, &mut exact_target, 7).unwrap();
+        assert_eq!(exact_target, b"archive");
+        assert_eq!(digest, sha256_hex(b"archive"));
+
+        let mut growing_source = Cursor::new(b"archive grew".to_vec());
+        let mut growing_target = Vec::new();
+        let error = copy_expected_bytes_with_probe(&mut growing_source, &mut growing_target, 7)
+            .unwrap_err();
+        assert!(error.to_string().contains("grew beyond"), "{error}");
+        assert_eq!(growing_target, b"archive");
+    }
+
+    #[test]
+    fn archive_capacity_keeps_the_storage_reserve_at_the_known_size_boundary() {
+        let known = MAX_RECOVERY_MANIFEST_BYTES + MAX_RECOVERY_README_BYTES + 7;
+        let required = known + crate::DEFAULT_GATE_HEADROOM_BYTES;
+        assert!(require_recovery_archive_headroom(Some(required), known).is_ok());
+        assert!(require_recovery_archive_headroom(Some(required - 1), known).is_err());
+        assert!(require_recovery_archive_headroom(None, known).is_err());
+        assert!(require_recovery_archive_headroom(Some(u64::MAX), u64::MAX).is_err());
+
+        let mut total = u64::MAX;
+        assert!(add_archive_size(&mut total, 1, "fixture").is_err());
+        assert_eq!(total, u64::MAX);
+        let overflowing_files = [
+            ArchivedFile {
+                path: "large".into(),
+                bytes: u64::MAX,
+                sha256: String::new(),
+                symlink: false,
+                mode: None,
+            },
+            ArchivedFile {
+                path: "extra".into(),
+                bytes: 1,
+                sha256: String::new(),
+                symlink: false,
+                mode: None,
+            },
+        ];
+        assert!(checked_archived_file_bytes(&overflowing_files).is_none());
+    }
+
+    #[test]
+    fn recovery_manifest_serializer_refuses_past_its_fixture_limit() {
+        let value = "archive manifest";
+        let expected = serde_json::to_vec_pretty(&value).unwrap();
+        assert_eq!(
+            serialize_recovery_manifest(&value, expected.len()).unwrap(),
+            expected
+        );
+        assert!(serialize_recovery_manifest(&value, expected.len() - 1).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_capacity_counts_symlink_target_bytes_and_metadata_allowances() {
+        let (owner, _checkout, mut plan) = staged_checkout();
+        let target = "relative-target";
+        let link_path = owner.path().join("archive-link");
+        std::os::unix::fs::symlink(target, &link_path).unwrap();
+        let link = describe_untracked(&link_path, "archive-link")
+            .unwrap()
+            .unwrap();
+        plan.untracked_files.push(link);
+
+        let expected = plan.staged_patch_bytes
+            + plan.unstaged_patch_bytes
+            + plan.untracked_bytes
+            + target.len() as u64
+            + MAX_RECOVERY_MANIFEST_BYTES
+            + MAX_RECOVERY_README_BYTES;
+        assert_eq!(
+            known_recovery_archive_payload_bytes(&plan).unwrap(),
+            expected
+        );
     }
 }
