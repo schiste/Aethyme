@@ -3565,6 +3565,159 @@ mod registered_removal_failure_tests {
 }
 
 #[cfg(test)]
+mod tracked_submodule_cleanup_tests {
+    use super::CleanupDisposition;
+    use crate::git::GitRepo;
+    use crate::test_storage::TestStorage;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(root: &Path, args: &[&str]) {
+        let mut command = Command::new("git");
+        let git_keys = std::env::vars_os()
+            .map(|(key, _)| key)
+            .chain(command.get_envs().map(|(key, _)| key.to_os_string()))
+            .filter(|key| key.to_string_lossy().starts_with("GIT_"))
+            .collect::<Vec<_>>();
+        for key in git_keys {
+            command.env_remove(key);
+        }
+        let status = command
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "submodule cleanup test")
+            .env("GIT_AUTHOR_EMAIL", "submodule-cleanup@example.invalid")
+            .env("GIT_COMMITTER_NAME", "submodule cleanup test")
+            .env("GIT_COMMITTER_EMAIL", "submodule-cleanup@example.invalid")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn cleanup_retains_dirty_submodule_files_under_ignore_all_configuration() {
+        for child_state in ["modified", "untracked"] {
+            let owner = tempfile::tempdir().unwrap();
+            let repository = owner.path().join("repository");
+            let source = owner.path().join("submodule-source");
+            std::fs::create_dir(&repository).unwrap();
+            std::fs::create_dir(&source).unwrap();
+            git(&source, &["init", "-q", "-b", "main"]);
+            git(&source, &["config", "user.name", "submodule cleanup test"]);
+            git(
+                &source,
+                &["config", "user.email", "submodule-cleanup@example.invalid"],
+            );
+            std::fs::write(source.join("tracked.txt"), "initial child content\n").unwrap();
+            git(&source, &["add", "tracked.txt"]);
+            git(&source, &["commit", "-qm", "initial child commit"]);
+
+            git(&repository, &["init", "-q", "-b", "main"]);
+            git(
+                &repository,
+                &["config", "user.name", "submodule cleanup test"],
+            );
+            git(
+                &repository,
+                &["config", "user.email", "submodule-cleanup@example.invalid"],
+            );
+            std::fs::write(repository.join("README.md"), "base\n").unwrap();
+            git(&repository, &["add", "README.md"]);
+            git(&repository, &["commit", "-qm", "superproject base"]);
+            let source_path = source.to_str().unwrap();
+            git(
+                &repository,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    "--quiet",
+                    source_path,
+                    "sub",
+                ],
+            );
+            git(
+                &repository,
+                &["config", "-f", ".gitmodules", "submodule.sub.ignore", "all"],
+            );
+            git(&repository, &["add", "-A"]);
+            git(&repository, &["commit", "-qm", "add child submodule"]);
+            git(&repository, &["config", "diff.ignoreSubmodules", "all"]);
+            git(&repository, &["config", "submodule.sub.ignore", "all"]);
+
+            let storage = TestStorage::new();
+            let mut broker = storage.open(&repository).unwrap();
+            let session = broker
+                .start_worktree("dirty child submodule", None)
+                .unwrap();
+            let worktree = Path::new(&session.worktree_path);
+            assert_eq!(
+                GitRepo::discover(worktree).unwrap().head_commit().unwrap(),
+                GitRepo::discover(&repository)
+                    .unwrap()
+                    .head_commit()
+                    .unwrap(),
+                "the superproject commit is already the parent checkout HEAD"
+            );
+            git(
+                worktree,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "update",
+                    "--init",
+                    "--quiet",
+                    "--",
+                    "sub",
+                ],
+            );
+            let child = worktree.join("sub");
+            let dirty_path = match child_state {
+                "modified" => {
+                    let path = child.join("tracked.txt");
+                    std::fs::write(&path, "changed child content\n").unwrap();
+                    path
+                }
+                "untracked" => {
+                    let path = child.join("new.txt");
+                    std::fs::write(&path, "new child content\n").unwrap();
+                    path
+                }
+                _ => unreachable!(),
+            };
+            broker.close(session.id).unwrap();
+
+            let closed_session = broker.store().session(session.id).unwrap();
+            let item = broker
+                .cleanup_item(&closed_session)
+                .unwrap()
+                .expect("the closed broker worktree remains in cleanup planning");
+            assert_eq!(item.disposition, CleanupDisposition::Dirty, "{child_state}");
+            assert!(
+                item.reason
+                    .contains("worktree has uncommitted or untracked changes"),
+                "{child_state}: {}",
+                item.reason
+            );
+            let error = broker.cleanup(session.id, false).unwrap_err().to_string();
+            assert!(
+                error.contains("uncommitted or untracked changes"),
+                "{error}"
+            );
+            assert!(
+                worktree.is_dir(),
+                "{child_state} submodule worktree was removed"
+            );
+            assert!(dirty_path.is_file(), "{child_state} child data was removed");
+        }
+    }
+}
+
+#[cfg(test)]
 mod cleanup_target_snapshot_tests {
     use super::CleanupDisposition;
     use crate::test_storage::TestStorage;
