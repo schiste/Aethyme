@@ -4572,6 +4572,8 @@ fn run_gate_command_inner(
     let fatal_resource_error = std::sync::Arc::new(std::sync::Mutex::new(None));
     let resource_stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let command_started = context.started;
+    let progress = context.progress;
+    let gate_name = context.gate_name;
     let (status, timed_out, pipes_incomplete, stdout_result, stderr_result) =
         std::thread::scope(|scope| {
             let stdout_reader = scope.spawn({
@@ -4673,10 +4675,10 @@ fn run_gate_command_inner(
                                     }
                                 }
                                 if last_progress.elapsed() >= progress_interval {
-                                    context.progress.report(&format!(
+                                    progress.report(&format!(
                                         "gate {} running... {}s",
-                                        context.gate_name,
-                                        context.started.elapsed().as_secs()
+                                        gate_name,
+                                        command_started.elapsed().as_secs()
                                     ));
                                     last_progress = Instant::now();
                                 }
