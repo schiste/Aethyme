@@ -264,24 +264,35 @@ impl BrokerStore {
                 finished_at
             ],
         )?;
-        let payload = crate::events::operation_payload(
-            expected.id,
-            expected.provider,
-            &expected.repository,
-            &expected.scope,
-            expected.effect,
-            status,
-            exit_code,
-        );
-        let event_kind = if resolution.is_some() {
-            format!("operation.{}", status.as_str())
+        let payload = if resolution.is_some() {
+            crate::events::fetch_reconciled_payload(
+                expected.id,
+                &expected.repository,
+                &expected.scope,
+                expected.effect,
+                status,
+                exit_code,
+            )
         } else {
-            "operation.inspected".into()
+            crate::events::operation_payload(
+                expected.id,
+                expected.provider,
+                &expected.repository,
+                &expected.scope,
+                expected.effect,
+                status,
+                exit_code,
+            )
+        };
+        let event_kind = if resolution.is_some() {
+            crate::events::OPERATION_FETCH_RECONCILED
+        } else {
+            crate::events::OPERATION_INSPECTED
         };
         insert_event(
             &tx,
             now,
-            &event_kind,
+            event_kind,
             Some(expected.session_id),
             Some(&payload),
         )?;
