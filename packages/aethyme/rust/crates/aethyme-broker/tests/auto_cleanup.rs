@@ -583,6 +583,49 @@ fn closing_releases_leases_so_none_can_hold_a_closed_checkout() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn retained_unknown_lease_on_closed_candidate_is_kept_amid_unrelated_leases() {
+    let fx = fixture();
+    let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
+    let (session_id, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let unrelated = broker
+        .start_worktree("unrelated lease history", None)
+        .unwrap();
+
+    // Simulate a retained post-close row and remove its holder binding
+    // so liveness must classify it as unknown, which keeps the checkout.
+    let db_path = broker.store().db_path().to_path_buf();
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "DELETE FROM events WHERE session_id = ?1 AND kind = ?2",
+            rusqlite::params![session_id, "session.holder_bound"],
+        )
+        .unwrap();
+    broker
+        .store()
+        .claim_lease(session_id, "feature.txt", None)
+        .unwrap();
+
+    // Unrelated active rows must not hide or replace the candidate's lease
+    // evidence when cleanup scopes its query to the closed checkout cohort.
+    for index in 0..128 {
+        broker
+            .store()
+            .claim_lease(unrelated.id, &format!("unrelated-{index}"), None)
+            .unwrap();
+    }
+
+    let report = run(&mut broker);
+
+    assert!(
+        kept_reason(&report, &worktree).contains("lease on feature.txt is unknown and still holds"),
+        "{report:#?}"
+    );
+    assert!(worktree.exists());
+}
+
 #[test]
 fn a_live_session_that_adopted_the_closed_checkout_keeps_it() {
     let fx = fixture();
