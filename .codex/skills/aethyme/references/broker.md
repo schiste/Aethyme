@@ -119,6 +119,8 @@ blocked.
 
    Use a trailing `/` for directory leases. Implicit leases refresh from
    changed files, but explicit leases are clearer for planned shared edits.
+   `leases release` removes an explicit claim; implicit rows describe the
+   current diff and remain until that diff is refreshed or cleared.
    A claim is refused only by another explicit lease whose holder is actively
    working, and never in a `verify-only` repository; every other overlap comes
    back as a warning naming the holder, with the `note send` command to
@@ -195,7 +197,7 @@ blocked.
    no-side-effect help coverage in sync as well.
 
    For a local commit in your own active session, use
-   \`aethyme broker commit --session <your-session-id> -- <git-commit-args>\`.
+   `aethyme broker commit --session <your-session-id> -- <git-commit-args>`.
    It checks the registered worktree and branch, audits complete bounded path
    inventories before and after the commit, and runs the repository's normal
    Git hooks. Hook-bypass options and inherited Git routing/config overrides
@@ -227,6 +229,10 @@ blocked.
    default pull-request template on the fetched base branch. Prepare the
    reviewed body from the repository template, preserving its required
    contract decision and justification fields.
+   Finalize those fields before qualification. Keep validation tied to the
+   exact source head and use the PR checks for its current verdict; avoid
+   status-only body edits that retrigger required checks. After a necessary
+   body edit, verify the newly triggered checks before merging.
    Put any justification on a plain-text line starting exactly
    `Contract justification: ` with at least 24 characters after the prefix.
    For a `none` choice, avoid comment-only bodies containing tracked terms
