@@ -946,11 +946,12 @@ impl Broker {
         let path = normalize_lease_path(path)?;
         preparation.check()?;
         let _git_deadline = crate::git::limit_git_until(preparation.deadline);
-        self.refresh_leases_including_with_claim_preparation(
-            Some(session_id),
-            Some(&preparation),
-            true,
-        )?;
+        // Explicit leases are authoritative records, not inferred Git edits.
+        // The current holder policy and overlapping records below decide this
+        // claim; refreshing every working checkout and classifying unrelated
+        // overlaps is diagnostic work, not a prerequisite for authorization.
+        // Keep implicit warnings at their recorded snapshot and do not advance
+        // the global refresh timestamp here.
         preparation.check()?;
         let policy = self.lease_refusal_policy()?;
         preparation.check()?;
@@ -2205,7 +2206,7 @@ impl Broker {
         }
         let session = self.store.session(session_id)?;
         // Global implicit leases and overlap classification are diagnostic
-        // snapshots maintained by explicit refresh/claim/submit paths. Guarded
+        // snapshots maintained by explicit refresh/submit paths. Guarded
         // authorization below reads current explicit leases, applies current
         // holder policy, and checks the foreign-file snapshot directly. Avoid
         // rescanning every live checkout here; leave the refresh timestamp
@@ -2896,9 +2897,9 @@ mod generic_guarded_exec_tests {
 
     #[cfg(unix)]
     #[test]
-    fn guarded_exec_does_not_probe_unrelated_live_worktrees() {
+    fn guarded_exec_and_claim_do_not_probe_unrelated_live_worktrees() {
         const CHILD_MODE: &str = "AETHYME_GUARDED_EXEC_TRACE_CHILD";
-        const TEST: &str = "broker::leases::generic_guarded_exec_tests::guarded_exec_does_not_probe_unrelated_live_worktrees";
+        const TEST: &str = "broker::leases::generic_guarded_exec_tests::guarded_exec_and_claim_do_not_probe_unrelated_live_worktrees";
         if std::env::var_os(CHILD_MODE).is_some() {
             let (_repository, _storage, mut broker) = fixture();
             let actor = broker
@@ -2926,6 +2927,18 @@ mod generic_guarded_exec_tests {
                 std::env::var_os("GIT_TRACE2_EVENT").expect("parent supplies a private trace path"),
             );
             std::fs::write(&trace, b"").unwrap();
+
+            let claim = broker.claim_lease(actor.id, "tracked.txt", None).unwrap();
+            assert!(claim.accepted);
+            assert_eq!(
+                broker
+                    .store
+                    .meta_get("leases.refreshed_at_ms")
+                    .unwrap()
+                    .as_deref(),
+                Some("12345"),
+                "an explicit claim must not refresh the global diagnostic snapshot"
+            );
 
             let report = broker
                 .guarded_exec_with_env_heartbeat_and_mode(
@@ -2966,7 +2979,7 @@ mod generic_guarded_exec_tests {
             );
             assert!(
                 !worktrees.iter().any(|path| path == &peer_root),
-                "guarded exec must not start Git in an unrelated live checkout: {worktrees:?}"
+                "claim and guarded exec must not start Git in an unrelated live checkout: {worktrees:?}"
             );
             println!("AETHYME_GUARDED_EXEC_TRACE_ASSERTIONS_OK");
             return;
