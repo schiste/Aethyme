@@ -4201,14 +4201,34 @@ impl GitRepo {
         run_git(&self.root, &["show", "-s", "--format=%B", commit])
     }
 
-    /// Changed files between two commits (for affected-gate selection on
-    /// a simulated merged tree).
+    /// Changed paths between two commits with Git's rename-aware projection.
+    /// A rename is reported at its destination, preserving the lease and
+    /// changed-path behavior expected by existing callers.
     pub fn changed_between(&self, from: &str, to: &str) -> Result<Vec<String>, GitError> {
+        self.changed_between_with_rename_policy(from, to, "--find-renames")
+    }
+
+    /// Complete changed-path census with rename collapsing disabled. This is
+    /// for content proofs that must account for both sides of a rename.
+    pub(crate) fn changed_between_all_paths(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<String>, GitError> {
+        self.changed_between_with_rename_policy(from, to, "--no-renames")
+    }
+
+    fn changed_between_with_rename_policy(
+        &self,
+        from: &str,
+        to: &str,
+        rename_policy: &str,
+    ) -> Result<Vec<String>, GitError> {
         require_trustworthy_porcelain()?;
         let args = [
             "diff",
             "--name-only",
-            "--no-renames",
+            rename_policy,
             "--no-ext-diff",
             "--no-textconv",
             "--ignore-submodules=none",
@@ -7364,7 +7384,7 @@ mod batched_commit_tests {
     }
 
     #[test]
-    fn changed_between_keeps_both_paths_of_a_rename() {
+    fn changed_between_preserves_rename_projection_and_full_census_reports_both_paths() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         run(root, &["init", "-q", "-b", "main"]);
@@ -7381,13 +7401,19 @@ mod batched_commit_tests {
         let head = run(root, &["rev-parse", "HEAD"]);
         let repo = GitRepo::discover(root).expect("repo");
         let changed = repo.changed_between(&base, &head).expect("changed paths");
+        assert_eq!(changed, vec!["after.txt"]);
+
+        let complete = repo
+            .changed_between_all_paths(&base, &head)
+            .expect("complete changed-path census");
+        assert_eq!(complete.len(), 2, "{complete:?}");
         assert!(
-            changed.iter().any(|path| path == "before.txt"),
-            "{changed:?}"
+            complete.iter().any(|path| path == "before.txt"),
+            "{complete:?}"
         );
         assert!(
-            changed.iter().any(|path| path == "after.txt"),
-            "{changed:?}"
+            complete.iter().any(|path| path == "after.txt"),
+            "{complete:?}"
         );
     }
 
