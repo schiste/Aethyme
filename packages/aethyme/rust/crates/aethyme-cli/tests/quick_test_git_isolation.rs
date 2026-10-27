@@ -348,9 +348,15 @@ fn quick_test_cli_keeps_host_git_context_out_of_its_disposable_repository() {
     let objects = git_dir.join("objects");
     let mut positive_control = Command::new("git");
     clear_git_environment(&mut positive_control);
+    // Keep this control commit from leaving Git's own maintenance writer
+    // racing the exact before/after sentinel snapshot below.
     positive_control
         .current_dir(&sentinel)
         .args([
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
             "-c",
             "user.name=Quick Test Sentinel",
             "-c",
