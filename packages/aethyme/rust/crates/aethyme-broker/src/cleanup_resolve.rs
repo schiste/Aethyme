@@ -2963,6 +2963,11 @@ mod tests {
         git(tmp.path(), &["commit", "-qm", "pending"]);
         let head = repo.head_commit().unwrap();
         let empty_patch = sha256_hex(b"");
+        let policy = crate::AutoCleanupPolicy::load(repo.root()).unwrap();
+        let proof = IgnoredPolicyProof {
+            strict: policy.strict,
+            regenerable: &policy.regenerable,
+        };
         let plan = CleanupResolvePlan {
             schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
             digest: sha256_hex(b"v3 bundle fixture plan"),
@@ -2987,7 +2992,7 @@ mod tests {
             ignored_paths: Vec::new(),
             ignored_files: Vec::new(),
             ignored_bytes: 0,
-            ignored_policy_sha256: sha256_hex(b"{}"),
+            ignored_policy_sha256: sha256_hex(&serde_json::to_vec(&proof).unwrap()),
             archive_root: PathBuf::new(),
             apply_command: String::new(),
             discard_command: String::new(),
@@ -3019,8 +3024,41 @@ mod tests {
                     .contains(reason)
             );
         }
-        let manifest: StoredManifest = serde_json::from_value(value).unwrap();
+        let mut fields_without_bundle = value.clone();
+        fields_without_bundle["bundle"] = serde_json::Value::Null;
+        let fields_without_bundle: StoredManifest =
+            serde_json::from_value(fields_without_bundle).unwrap();
+        assert!(
+            validate_manifest_identity(&fields_without_bundle)
+                .unwrap_err()
+                .contains("integrity fields without a bundle")
+        );
+
+        let mut oversized = value.clone();
+        oversized["bundle_bytes"] = serde_json::json!(MAX_RECOVERY_BUNDLE_BYTES + 1);
+        let oversized: StoredManifest = serde_json::from_value(oversized).unwrap();
+        assert!(
+            validate_manifest_identity(&oversized)
+                .unwrap_err()
+                .contains("outside its supported bound")
+        );
+
+        let manifest_v3: StoredManifest = serde_json::from_value(value.clone()).unwrap();
         verify_recovery_archive_payload_for_plan(&repo, dir.path(), &plan).unwrap();
+
+        let legacy_digest = legacy_v2_cleanup_resolve_digest(&plan, &proof).unwrap();
+        let mut legacy_value = value.clone();
+        legacy_value["schema_version"] =
+            serde_json::json!(PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION);
+        legacy_value["plan_digest"] = serde_json::json!(legacy_digest);
+        legacy_value.as_object_mut().unwrap().remove("bundle_bytes");
+        legacy_value
+            .as_object_mut()
+            .unwrap()
+            .remove("bundle_sha256");
+        std::fs::write(&manifest_path, serde_json::to_vec(&legacy_value).unwrap()).unwrap();
+        verify_recovery_archive_payload_for_plan(&repo, dir.path(), &plan).unwrap();
+        std::fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
 
         let bundle_path = dir.path().join(BUNDLE_FILE);
         std::fs::OpenOptions::new()
@@ -3030,7 +3068,7 @@ mod tests {
             .write_all(b"tamper")
             .unwrap();
         assert!(
-            verify_recovery_archive_tree(dir.path(), &manifest)
+            verify_recovery_archive_tree(dir.path(), &manifest_v3)
                 .unwrap_err()
                 .contains("differs from its manifest integrity record")
         );
