@@ -948,23 +948,29 @@ fn tracked_tree_contains_directory(
     prefix.push_str(directory);
     prefix.push('/');
     Ok(files
-        .range::<str, _>(prefix.as_str()..)
+        .range::<str, _>((
+            std::ops::Bound::Included(prefix.as_str()),
+            std::ops::Bound::Unbounded,
+        ))
         .next()
         .is_some_and(|(path, _)| path.starts_with(&prefix)))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn mode_has_type(mode: u32, expected: libc::mode_t) -> bool {
-    mode & u32::from(libc::S_IFMT) == u32::from(expected)
+    u64::from(mode) & u64::from(libc::S_IFMT) == u64::from(expected)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn orphan_kind(mode: u32) -> OrphanResidueKind {
-    match mode & u32::from(libc::S_IFMT) {
-        mode if mode == u32::from(libc::S_IFDIR) => OrphanResidueKind::Directory,
-        mode if mode == u32::from(libc::S_IFREG) => OrphanResidueKind::RegularFile,
-        mode if mode == u32::from(libc::S_IFLNK) => OrphanResidueKind::Symlink,
-        _ => OrphanResidueKind::Special,
+    if mode_has_type(mode, libc::S_IFDIR) {
+        OrphanResidueKind::Directory
+    } else if mode_has_type(mode, libc::S_IFREG) {
+        OrphanResidueKind::RegularFile
+    } else if mode_has_type(mode, libc::S_IFLNK) {
+        OrphanResidueKind::Symlink
+    } else {
+        OrphanResidueKind::Special
     }
 }
 
