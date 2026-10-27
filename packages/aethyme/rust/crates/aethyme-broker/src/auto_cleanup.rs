@@ -482,6 +482,61 @@ pub(crate) fn classify_ignored(
     }
 }
 
+/// Snapshot the ignored directory roots that passed the same cleanup
+/// classifier before finish starts removal. The resulting prefixes are part
+/// of its durable recovery proof; an orphan retry may discard contents only
+/// beneath these roots after Git metadata has gone.
+pub(crate) fn disposable_ignored_directory_prefixes(
+    worktree: &Path,
+    policy: &AutoCleanupPolicy,
+) -> Result<Vec<String>, String> {
+    let deadline = Instant::now() + IGNORED_PATH_LISTING_BUDGET;
+    let expected_root = worktree
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve cleanup checkout root: {error}"))?;
+    let checkout = GitRepo::discover(worktree).map_err(|error| error.to_string())?;
+    let discovered_root = checkout
+        .root()
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve discovered Git root: {error}"))?;
+    if discovered_root != expected_root {
+        return Err("Git resolved a different root than the cleanup checkout".into());
+    }
+
+    let ignored = checkout
+        .ignored_paths_readonly_until(deadline)
+        .map_err(|error| error.to_string())?;
+    let mut prefixes = Vec::new();
+    for entry in ignored {
+        let relative = if entry.directory_marker {
+            format!("{}/", entry.relative)
+        } else {
+            entry.relative.clone()
+        };
+        match classify_ignored_for_recovery(worktree, &relative, policy)? {
+            RecoveryIgnoredClassification::DisposableDirectory if entry.directory_marker => {
+                prefixes.push(format!("{}/", entry.relative));
+            }
+            RecoveryIgnoredClassification::DisposableOutput if !entry.directory_marker => {}
+            RecoveryIgnoredClassification::DisposableDirectory => {
+                return Err(format!(
+                    "ignored path {relative} changed shape while finish cleanup was being proved"
+                ));
+            }
+            // These entries receive no discard prefix. Keeping the identity
+            // proof lets registered recovery re-run the active policy after
+            // an operator resolves them; orphan recovery will reject any
+            // surviving path that the proof did not authorize.
+            RecoveryIgnoredClassification::Preserve(_)
+            | RecoveryIgnoredClassification::StrictRefusal
+            | RecoveryIgnoredClassification::DisposableOutput => {}
+        }
+    }
+    prefixes.sort();
+    prefixes.dedup();
+    Ok(prefixes)
+}
+
 /// One checkout auto-cleanup removed, with its proof.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AutoRemovedCheckout {
