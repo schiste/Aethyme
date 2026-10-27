@@ -28,8 +28,9 @@
 //! - **content**: the earliest commit on the branch holding every blob the
 //!   session produced (a squash or a cherry-pick of the net diff);
 //! - **patch equivalence**: every session commit has a patch-identical commit
-//!   on the branch, and one branch commit has all of them in its history (a
-//!   rebase before merge, which changes every blob the base touched, #408).
+//!   on the branch, one branch commit has all of them in its history, and that
+//!   commit has the exact tree entries for every changed path. Patch IDs only
+//!   nominate candidates; the fixed tree comparison is still required.
 //!
 //! [`work_landed`] is the one entry point for "did this work land": the
 //! representation scan, the cleanup audit and the cleanup plan all ask it, so
@@ -66,7 +67,7 @@ pub const DEFAULT_SEARCH_CAP: usize = 2_000;
 const MAX_LANDING_SEARCH_BUDGET: Duration = Duration::from_secs(30);
 /// A large but finite complete commit listing for oldest-first search.
 const MAX_LANDING_CANDIDATE_LIST_BYTES: usize = 16 * 1024 * 1024;
-const LANDING_SEARCH_ALGORITHM_VERSION: u8 = 2;
+const LANDING_SEARCH_ALGORITHM_VERSION: u8 = 3;
 
 fn landing_query_count(candidate_count: usize, path_count: usize) -> Option<usize> {
     candidate_count
@@ -144,8 +145,8 @@ pub enum LandingEvidence {
     Ancestry,
     /// A commit on the branch carries the net content (squash delivery).
     Content,
-    /// Every session commit's patch is on the branch under another SHA
-    /// (rebase or cherry-pick delivery).
+    /// Every session commit's patch is on the branch under another SHA, and
+    /// the candidate's complete changed-path tree entries match.
     PatchEquivalent,
     /// The head changes nothing the branch does not already hold.
     NoNetChange,
@@ -166,13 +167,13 @@ impl LandingEvidence {
 pub struct Landing {
     /// The commit that carried the work: the earliest holding the content, or,
     /// for patch equivalence, the earliest whose history holds every
-    /// equivalent patch.
+    /// equivalent patch and whose changed-path tree entries match.
     pub commit: String,
     pub subject: String,
     /// Candidates examined before this one; 0 means the oldest candidate.
     pub position: usize,
     pub paths: usize,
-    /// Content, or patch equivalence when no single commit holds the content.
+    /// Content or fully verified patch-equivalence evidence.
     pub evidence: LandingEvidence,
 }
 
@@ -328,9 +329,9 @@ const CANDIDATE_BATCH: usize = 64;
 ///
 /// Content is tried first; the *earliest* match is taken rather than the latest
 /// because that is the commit that carried the work, and every later commit
-/// merely inherits it. When no commit holds the content -- the work was rebased
-/// onto a newer base before it merged, so the base's files differ -- patch
-/// equivalence is tried (see [`patch_landing`]).
+/// merely inherits it. Patch equivalence is also checked as a candidate source
+/// when no commit holds the content (see [`patch_landing`]), but never replaces
+/// the exact changed-path tree-entry comparison.
 pub fn find_landing(
     repo: &GitRepo,
     content: &SessionContent,
@@ -490,17 +491,21 @@ fn find_landing_with_limits(
     if !truncated
         && let Some((commit, position)) = patch_landing(repo, content, branch_tip, window)?
     {
-        return Ok(LandingSearch {
-            outcome: LandingOutcome::Landed(Landing {
-                subject: subject(repo, &commit),
-                commit,
-                position,
-                paths: paths.len(),
-                evidence: LandingEvidence::PatchEquivalent,
-            }),
-            examined: window.len(),
-            truncated: false,
-        });
+        // Patch IDs nominate a candidate; only exact entries on every changed
+        // path can establish that the fixed commit carries this session's work.
+        if tree_entries_equal(repo, content, &commit)? {
+            return Ok(LandingSearch {
+                outcome: LandingOutcome::Landed(Landing {
+                    subject: subject(repo, &commit),
+                    commit,
+                    position,
+                    paths: paths.len(),
+                    evidence: LandingEvidence::PatchEquivalent,
+                }),
+                examined: window.len(),
+                truncated: false,
+            });
+        }
     }
 
     Ok(LandingSearch {
@@ -520,12 +525,14 @@ fn find_landing_with_limits(
 }
 
 /// The earliest candidate whose history holds a patch-identical copy of every
-/// session commit, if there is one.
+/// session commit, if there is one. The caller still verifies exact changed-
+/// path tree entries before treating the candidate as landed.
 ///
 /// This is the rebase-then-merge case (#408): the same patches applied to a
-/// newer base produce different blobs wherever the base differs, so no commit
-/// holds the session's exact content, yet `git patch-id --verbatim` agrees for
-/// every commit. Three conditions keep the verdict sound rather than likely:
+/// newer base can produce different blobs, so no commit holds the session's
+/// exact content, yet `git patch-id --verbatim` agrees for every commit. These
+/// conditions make the patch result a complete candidate rather than a likely
+/// match; the caller's exact tree-entry check remains required:
 ///
 /// - **every** session commit after the base must be accounted for, either by
 ///   an equivalent on the branch or by being on the branch itself -- one
@@ -534,11 +541,11 @@ fn find_landing_with_limits(
 ///   resolution no patch describes, so it counts only if that merge itself is
 ///   on the branch;
 /// - a single branch commit must have all of them in its history, so the
-///   verdict names one fixed commit that carried the work, as a recorded
-///   representation requires.
+///   candidate names one fixed commit that could have carried the work.
 ///
-/// [`GitRepo::cherry_marked`] compares the session side against the branch commits since
-/// the two diverged, including those reached through a merge's second parent.
+/// [`GitRepo::cherry_marked`] compares the session side against the branch
+/// commits since the two diverged, including those reached through a merge's
+/// second parent.
 fn patch_landing(
     repo: &GitRepo,
     content: &SessionContent,
@@ -961,6 +968,10 @@ mod tests {
                 .outcome,
             LandingOutcome::NotFound { .. }
         ));
+        assert!(matches!(
+            work_landed(&repo, &head, &target).unwrap(),
+            LandingVerdict::NotLanded { truncated: false, .. }
+        ));
         git(tmp.path(), &["cherry-pick", &head]);
         let landed = git(tmp.path(), &["rev-parse", "HEAD"]);
         assert!(content_at(&repo, &content, &landed).unwrap().is_present());
@@ -969,6 +980,13 @@ mod tests {
                 .unwrap()
                 .represented()
         );
+        assert!(matches!(
+            work_landed(&repo, &head, &landed).unwrap(),
+            LandingVerdict::Landed {
+                evidence: LandingEvidence::Content,
+                ..
+            }
+        ));
     }
 
     #[cfg(unix)]
@@ -994,6 +1012,10 @@ mod tests {
                 .outcome,
             LandingOutcome::NotFound { .. }
         ));
+        assert!(matches!(
+            work_landed(&repo, &head, &target).unwrap(),
+            LandingVerdict::NotLanded { truncated: false, .. }
+        ));
         git(tmp.path(), &["cherry-pick", &head]);
         let landed = git(tmp.path(), &["rev-parse", "HEAD"]);
         assert!(content_at(&repo, &content, &landed).unwrap().is_present());
@@ -1002,6 +1024,13 @@ mod tests {
                 .unwrap()
                 .represented()
         );
+        assert!(matches!(
+            work_landed(&repo, &head, &landed).unwrap(),
+            LandingVerdict::Landed {
+                evidence: LandingEvidence::Content,
+                ..
+            }
+        ));
     }
 
     fn cached_landing_fixture() -> (tempfile::TempDir, GitRepo, String, String, String) {
@@ -1753,25 +1782,20 @@ mod tests {
     }
 
     #[test]
-    fn rebased_then_merged_work_is_found_by_patch_equivalence() {
+    fn patch_equivalence_candidate_requires_matching_tree_entries_before_landed() {
         const ROOT_ENV: &str = "AETHYME_REPRESENTATION_TRACE_ROOT";
         const HEAD_ENV: &str = "AETHYME_REPRESENTATION_TRACE_HEAD";
         const TIP_ENV: &str = "AETHYME_REPRESENTATION_TRACE_TIP";
-        const COPY_ENV: &str = "AETHYME_REPRESENTATION_TRACE_COPY";
         const TEST: &str =
-            "representation::tests::rebased_then_merged_work_is_found_by_patch_equivalence";
+            "representation::tests::patch_equivalence_candidate_requires_matching_tree_entries_before_landed";
         if let Some(root) = std::env::var_os(ROOT_ENV) {
             let repo = GitRepo::discover(Path::new(&root)).unwrap();
             let head = std::env::var(HEAD_ENV).unwrap();
             let tip = std::env::var(TIP_ENV).unwrap();
-            let copy = std::env::var(COPY_ENV).unwrap();
-            assert_eq!(
+            assert!(matches!(
                 work_landed(&repo, &head, &tip).unwrap(),
-                LandingVerdict::Landed {
-                    evidence: LandingEvidence::PatchEquivalent,
-                    landed_by: Some(copy),
-                }
-            );
+                LandingVerdict::NotLanded { truncated: false, .. }
+            ));
             return;
         }
 
@@ -1784,16 +1808,28 @@ mod tests {
         );
 
         let content = session_content(&repo, &base, &head).unwrap();
-        let search = find_landing(&repo, &content, tip, DEFAULT_SEARCH_CAP).unwrap();
-        let landing = search.landing().expect("rebased work landed");
-        assert_eq!(landing.evidence, LandingEvidence::PatchEquivalent);
-        assert_eq!(landing.commit, copy, "the copy carried it, not the merge");
+        let candidates = repo
+            .commits_between_oldest(&base, tip)
+            .expect("complete candidate list");
+        assert_eq!(
+            patch_landing(&repo, &content, tip, &candidates)
+                .unwrap()
+                .map(|(commit, _)| commit),
+            Some(copy.to_string()),
+            "patch identity should nominate the rebased copy"
+        );
+        assert!(matches!(
+            find_landing(&repo, &content, tip, DEFAULT_SEARCH_CAP)
+                .unwrap()
+                .outcome,
+            LandingOutcome::NotFound { .. }
+        ));
 
         assert_eq!(
             work_landed(&repo, &head, tip).unwrap(),
-            LandingVerdict::Landed {
-                evidence: LandingEvidence::PatchEquivalent,
-                landed_by: Some(copy.to_string()),
+            LandingVerdict::NotLanded {
+                examined: candidates.len(),
+                truncated: false,
             }
         );
 
@@ -1810,7 +1846,6 @@ mod tests {
             .env(ROOT_ENV, _tmp.path())
             .env(HEAD_ENV, &head)
             .env(TIP_ENV, tip)
-            .env(COPY_ENV, copy)
             .env("GIT_TRACE2_EVENT", &trace)
             .output()
             .unwrap();
