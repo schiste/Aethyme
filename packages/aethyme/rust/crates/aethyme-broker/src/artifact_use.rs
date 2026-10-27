@@ -12,7 +12,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,6 +21,8 @@ use sha2::{Digest, Sha256};
 const MARKER_SCHEMA_VERSION: u32 = 1;
 const MAX_MARKERS_PER_CHECKOUT: usize = 256;
 const MAX_MARKER_BYTES: u64 = 16 * 1024;
+const ARTIFACT_LAYOUT_LOCK_WAIT: Duration = Duration::from_secs(1);
+const ARTIFACT_LAYOUT_LOCK_POLL: Duration = Duration::from_millis(10);
 static NEXT_MARKER_NONCE: AtomicU64 = AtomicU64::new(1);
 
 /// Immutable process identity captured after a command starts. The start token
@@ -45,7 +48,8 @@ impl ProcessStartIdentity {
                 ),
             ));
         }
-        let (start_time, start_time_clock) = process_start_token(pid)?;
+        let (start_time, start_time_clock) =
+            process_start_token(pid).unwrap_or((None, "unavailable"));
         Ok(Self {
             pid,
             process_group,
@@ -110,6 +114,7 @@ struct ArtifactUseLocations {
     checkout_identity: DirectoryIdentity,
     checkout_key: String,
     runtime_dir: PathBuf,
+    layout_lock_path: PathBuf,
     lock_path: PathBuf,
     marker_dir: PathBuf,
 }
@@ -141,6 +146,7 @@ impl ArtifactUseLocations {
             primary_identity,
             checkout_root,
             checkout_identity,
+            layout_lock_path: runtime_dir.join(format!("{checkout_key}.init.lock")),
             lock_path: runtime_dir.join(format!("{checkout_key}.lock")),
             marker_dir: runtime_dir.join(format!("{checkout_key}.markers")),
             checkout_key,
@@ -157,6 +163,48 @@ impl ArtifactUseLocations {
             ));
         }
         Ok(())
+    }
+
+    /// Initialize the persistent lock and marker layout under a short
+    /// per-checkout exclusive lock. Marker storage is created and synced
+    /// before the producer lock appears; a pre-existing producer lock with a
+    /// missing marker directory is retained as unknown evidence.
+    fn initialize_layout(&self, wait: Duration) -> io::Result<bool> {
+        let deadline = Instant::now() + wait;
+        let layout_lock = loop {
+            let file = super::open_lock_file_nofollow(&self.layout_lock_path)?;
+            super::verify_named_lock_file(&self.layout_lock_path, &file)?;
+            match super::ExclusiveFileLock::try_acquire(file)? {
+                Some(lock) => break lock,
+                None if Instant::now() >= deadline => return Ok(false),
+                None => thread::sleep(
+                    ARTIFACT_LAYOUT_LOCK_POLL
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                ),
+            }
+        };
+        super::verify_named_lock_file(&self.layout_lock_path, &layout_lock.file)?;
+
+        self.require_unchanged()?;
+        let lock_preexisted = path_exists(&self.lock_path)?;
+        self.ensure_marker_dir_for_producer(lock_preexisted)?;
+        let file = super::open_lock_file_nofollow(&self.lock_path)?;
+        super::verify_named_lock_file(&self.lock_path, &file)?;
+        self.sync_runtime_directory_chain()?;
+        self.require_unchanged()?;
+        drop(layout_lock);
+        Ok(true)
+    }
+
+    /// Persist the complete runtime-directory path and its entries before a
+    /// producer marker can authorize any managed writes.
+    fn sync_runtime_directory_chain(&self) -> io::Result<()> {
+        let state_dir = self.primary_root.join(".aethyme");
+        let run_dir = state_dir.join("run");
+        sync_directory(&self.runtime_dir)?;
+        sync_directory(&run_dir)?;
+        sync_directory(&state_dir)?;
+        sync_directory(&self.primary_root)
     }
 
     fn ensure_marker_dir(&self) -> io::Result<()> {
@@ -192,10 +240,6 @@ impl ArtifactUseLocations {
         }
     }
 
-    fn ensure_marker_dir_for_reclaimer(&self, lock_preexisted: bool) -> io::Result<()> {
-        self.ensure_marker_dir_for_producer(lock_preexisted)
-    }
-
     fn marker_for(&self, marker: &ArtifactUseMarker) -> io::Result<()> {
         if marker.schema_version != MARKER_SCHEMA_VERSION
             || marker.primary_root != path_text(&self.primary_root)?
@@ -227,6 +271,7 @@ pub(crate) struct ArtifactUseProducer {
     marker_file: File,
     marker_path: PathBuf,
     marker: ArtifactUseMarker,
+    marker_removed: bool,
     locations: ArtifactUseLocations,
 }
 
@@ -235,23 +280,34 @@ impl ArtifactUseProducer {
         &self.marker
     }
 
-    /// Record the real command process after dispatch. `start_time` may be
-    /// absent on platforms that cannot distinguish PID reuse; such a marker
-    /// remains unknown to automated cleanup until stronger evidence exists.
-    pub(crate) fn mark_process_started(&mut self, process: ProcessStartIdentity) -> io::Result<()> {
-        if process.pid <= 1 || process.process_group <= 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "artifact producer process identity has a reserved PID or process group",
-            ));
-        }
+    /// Record the actual supervised command child after dispatch. The child
+    /// handle binds the marker PID to this invocation; `process_group` must be
+    /// the group assigned to that child by its existing process supervisor.
+    /// If the start token cannot be read, the durable marker remains unknown
+    /// to reconciliation after supervisor death.
+    pub(crate) fn mark_process_started(
+        &mut self,
+        child: &std::process::Child,
+        process_group: i32,
+    ) -> io::Result<()> {
         self.marker.phase = ArtifactUsePhase::Running;
-        self.marker.process = Some(process);
+        self.marker.process = None;
+        let pid = match i32::try_from(child.id()) {
+            Ok(pid) if pid > 1 && process_group > 1 => pid,
+            _ => {
+                self.persist_marker()?;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "artifact producer child or process group has an invalid identity",
+                ));
+            }
+        };
+        self.marker.process = Some(ProcessStartIdentity::capture(pid, process_group)?);
         self.persist_marker()
     }
 
     /// Clear a marker only when dispatch is known not to have occurred.
-    pub(crate) fn finish_not_started(self) -> io::Result<()> {
+    pub(crate) fn finish_not_started(&mut self) -> io::Result<()> {
         if self.marker.phase != ArtifactUsePhase::PreDispatch || self.marker.process.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -261,10 +317,49 @@ impl ArtifactUseProducer {
         self.remove_marker()
     }
 
-    /// Clear a marker only after the caller has independently verified process
-    /// tree quiescence. This method is intentionally explicit; `Drop` is not
-    /// evidence that a child or descendant stopped.
-    pub(crate) fn finish_verified_quiescence(self) -> io::Result<()> {
+    /// Clear a running marker only after this owned child has exited and its
+    /// recorded process group is observed absent. The group observation is
+    /// performed here so callers cannot clear with a boolean attestation.
+    pub(crate) fn finish_verified_quiescence(
+        &mut self,
+        child: &mut std::process::Child,
+    ) -> io::Result<()> {
+        if self.marker.phase != ArtifactUsePhase::Running || self.marker_removed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "artifact-use marker is not an unsettled running producer",
+            ));
+        }
+        let process = self.marker.process.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "artifact-use marker has no process identity; retain it as unknown",
+            )
+        })?;
+        let child_pid = i32::try_from(child.id()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "supervised child PID cannot be represented in the artifact-use marker",
+            )
+        })?;
+        if child_pid != process.pid {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "artifact-use marker PID does not match the owned child",
+            ));
+        }
+        if child.try_wait()?.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "artifact-use command child is still running",
+            ));
+        }
+        if !crate::gates::gate_process_group_absent(process.process_group) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "artifact-use process group is present or could not be confirmed absent",
+            ));
+        }
         self.remove_marker()
     }
 
@@ -286,10 +381,17 @@ impl ArtifactUseProducer {
         sync_directory(&self.locations.marker_dir)
     }
 
-    fn remove_marker(self) -> io::Result<()> {
+    fn remove_marker(&mut self) -> io::Result<()> {
+        if self.marker_removed {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "artifact-use marker was already removed",
+            ));
+        }
         self.locations.require_unchanged()?;
         super::verify_named_lock_file(&self.marker_path, &self.marker_file)?;
         fs::remove_file(&self.marker_path)?;
+        self.marker_removed = true;
         sync_directory(&self.locations.marker_dir)
     }
 }
@@ -318,19 +420,21 @@ pub(crate) fn begin_artifact_use(
         ));
     }
     let locations = ArtifactUseLocations::resolve(primary_root, checkout_root)?;
-    let lock_preexisted = match fs::symlink_metadata(&locations.lock_path) {
-        Ok(_) => true,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        Err(error) => return Err(error),
-    };
+    if !locations.initialize_layout(ARTIFACT_LAYOUT_LOCK_WAIT)? {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "artifact-use layout is being initialized; retry producer admission",
+        ));
+    }
     let file = super::open_lock_file_nofollow(&locations.lock_path)?;
-    let lock = super::SharedFileLock::acquire(file)?;
+    let lock = super::SharedFileLock::try_acquire(file)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "checkout artifact use is reserved; retry producer admission",
+        )
+    })?;
     locations.require_unchanged()?;
     super::verify_named_lock_file(&locations.lock_path, &lock.file)?;
-    if !lock_preexisted {
-        sync_directory(&locations.runtime_dir)?;
-    }
-    locations.ensure_marker_dir_for_producer(lock_preexisted)?;
 
     let nonce = next_nonce();
     let marker_path = locations.marker_dir.join(format!("{nonce}.json"));
@@ -380,6 +484,7 @@ pub(crate) fn begin_artifact_use(
         marker_file,
         marker_path,
         marker,
+        marker_removed: false,
         locations,
     })
 }
@@ -392,11 +497,11 @@ pub(crate) fn try_artifact_use_reclaimer(
     checkout_root: &Path,
 ) -> io::Result<ArtifactUseReclaimTry> {
     let locations = ArtifactUseLocations::resolve(primary_root, checkout_root)?;
-    let lock_preexisted = match fs::symlink_metadata(&locations.lock_path) {
-        Ok(_) => true,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        Err(error) => return Err(error),
-    };
+    if !locations.initialize_layout(Duration::ZERO)? {
+        return Ok(ArtifactUseReclaimTry::Blocked(
+            ArtifactUseReclaimBlock::Contended,
+        ));
+    }
     let file = super::open_lock_file_nofollow(&locations.lock_path)?;
     let Some(lock) = super::ExclusiveFileLock::try_acquire(file)? else {
         return Ok(ArtifactUseReclaimTry::Blocked(
@@ -405,11 +510,6 @@ pub(crate) fn try_artifact_use_reclaimer(
     };
     locations.require_unchanged()?;
     super::verify_named_lock_file(&locations.lock_path, &lock.file)?;
-    if !lock_preexisted {
-        sync_directory(&locations.runtime_dir)?;
-    }
-
-    locations.ensure_marker_dir_for_reclaimer(lock_preexisted)?;
     let markers = read_marker_inventory(&locations)?;
     locations.require_unchanged()?;
     if markers.is_empty() {
@@ -574,6 +674,14 @@ fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
+fn path_exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn path_text(path: &Path) -> io::Result<String> {
     path.to_str().map(str::to_owned).ok_or_else(|| {
         io::Error::new(
@@ -720,7 +828,6 @@ fn process_start_token(pid: i32) -> io::Result<(Option<u64>, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
     fn checkout(primary: &Path, name: &str) -> PathBuf {
@@ -788,6 +895,53 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn concurrent_first_producers_serialize_layout_initialization() {
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = checkout(primary.path(), "checkout");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let workers = (21..23)
+            .map(|session_id| {
+                let primary_root = primary.path().to_path_buf();
+                let checkout_root = checkout.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let mut producer = begin_artifact_use(
+                        &primary_root,
+                        &checkout_root,
+                        session_id,
+                        &format!("test:{session_id}:layout-race"),
+                    )
+                    .unwrap();
+                    producer.finish_not_started().unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn producer_admission_defers_while_exclusive_reclaimer_reservation_is_held() {
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = checkout(primary.path(), "checkout");
+        let reservation = match try_artifact_use_reclaimer(primary.path(), &checkout).unwrap() {
+            ArtifactUseReclaimTry::Acquired(reservation) => reservation,
+            blocked => {
+                panic!("empty checkout should reserve after complete inventory: {blocked:?}")
+            }
+        };
+        let error = begin(primary.path(), &checkout, 23, "test:23:contended").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        drop(reservation);
+
+        let mut producer = begin(primary.path(), &checkout, 24, "test:24:resumed");
+        producer.finish_not_started().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn checkout_aliases_resolve_to_the_same_artifact_use_key() {
@@ -798,32 +952,38 @@ mod tests {
         let alias = primary.path().join("checkout-alias");
         symlink(&checkout, &alias).unwrap();
 
-        let first = begin(primary.path(), &checkout, 18, "test:18:canonical");
-        let second = begin(primary.path(), &alias, 19, "test:19:alias");
+        let mut first = begin(primary.path(), &checkout, 18, "test:18:canonical");
+        let mut second = begin(primary.path(), &alias, 19, "test:19:alias");
         assert_eq!(first.marker().checkout_key, second.marker().checkout_key);
         assert_eq!(first.marker().checkout_root, second.marker().checkout_root);
         first.finish_not_started().unwrap();
         second.finish_not_started().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
-    fn different_checkout_does_not_wait_and_verified_settlement_clears_its_marker() {
+    fn different_checkout_does_not_wait_and_unbound_fast_exit_clears_with_owned_child_proof() {
         let primary = tempfile::tempdir().unwrap();
         let first_checkout = checkout(primary.path(), "first");
         let second_checkout = checkout(primary.path(), "second");
         let mut producer = begin(primary.path(), &first_checkout, 12, "prepare:12:deps");
+        use std::os::unix::process::CommandExt;
+        let mut command = Command::new("/bin/true");
+        command.process_group(0);
+        let mut child = command.spawn().unwrap();
+        let process_group = i32::try_from(child.id()).unwrap();
         producer
-            .mark_process_started(ProcessStartIdentity {
-                pid: 1234,
-                process_group: 1234,
-                start_time: Some(5678),
-                start_time_clock: "test_clock".into(),
-            })
+            .mark_process_started(&child, process_group)
             .unwrap();
+        let process = producer.marker.process.as_mut().unwrap();
+        process.start_time = None;
+        process.start_time_clock = "unavailable".into();
+        producer.persist_marker().unwrap();
         let unrelated = try_artifact_use_reclaimer(primary.path(), &second_checkout).unwrap();
         assert!(matches!(unrelated, ArtifactUseReclaimTry::Acquired(_)));
 
-        producer.finish_verified_quiescence().unwrap();
+        child.wait().unwrap();
+        producer.finish_verified_quiescence(&mut child).unwrap();
         assert!(matches!(
             try_artifact_use_reclaimer(primary.path(), &first_checkout).unwrap(),
             ArtifactUseReclaimTry::Acquired(_)
@@ -834,12 +994,198 @@ mod tests {
     fn confirmed_not_started_removes_the_marker_without_poisoning_future_admission() {
         let primary = tempfile::tempdir().unwrap();
         let checkout = checkout(primary.path(), "checkout");
-        let producer = begin(primary.path(), &checkout, 13, "exec:13:unavailable");
+        let mut producer = begin(primary.path(), &checkout, 13, "exec:13:unavailable");
         producer.finish_not_started().unwrap();
         assert!(matches!(
             try_artifact_use_reclaimer(primary.path(), &checkout).unwrap(),
             ArtifactUseReclaimTry::Acquired(_)
         ));
+    }
+
+    #[cfg(unix)]
+    struct TestProcessGroupChild {
+        child: std::process::Child,
+        process_group: i32,
+        member: Option<ProcessStartIdentity>,
+        leader_reaped: bool,
+    }
+
+    #[cfg(unix)]
+    impl TestProcessGroupChild {
+        fn new(child: std::process::Child, process_group: i32) -> Self {
+            Self {
+                child,
+                process_group,
+                member: None,
+                leader_reaped: false,
+            }
+        }
+
+        fn wait_for_ready_member(&mut self, timeout: Duration) -> io::Result<ProcessStartIdentity> {
+            let line = read_test_child_handshake(
+                self.child.stdout.as_mut().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "test child has no stdout pipe")
+                })?,
+                timeout,
+            )?;
+            let identity = parse_test_child_identity(&line)?;
+            if identity.process_group != self.process_group {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "producer child handshake named a different process group",
+                ));
+            }
+            if identity.start_time.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "test child process start identity could not be bound",
+                ));
+            }
+            self.member = Some(identity.clone());
+            Ok(identity)
+        }
+
+        fn kill_leader(&mut self) -> io::Result<std::process::ExitStatus> {
+            self.child.kill()?;
+            let status = wait_for_test_child(&mut self.child, Duration::from_secs(2))?;
+            self.leader_reaped = true;
+            Ok(status)
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_test_child_handshake(
+        stdout: &mut std::process::ChildStdout,
+        timeout: Duration,
+    ) -> io::Result<String> {
+        use std::os::fd::AsRawFd;
+
+        let deadline = Instant::now() + timeout;
+        let mut buffered = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "producer child ready handshake timed out",
+                ));
+            }
+            let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+            let mut descriptor = libc::pollfd {
+                fd: stdout.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll reads one valid descriptor and writes readiness into
+            // the local `descriptor`; it does not signal or modify the child.
+            let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+            if ready == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "producer child ready handshake timed out",
+                ));
+            }
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(error);
+            }
+
+            let mut chunk = [0_u8; 256];
+            match stdout.read(&mut chunk) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "producer child exited before its ready handshake",
+                    ));
+                }
+                Ok(read) => {
+                    buffered.extend_from_slice(&chunk[..read]);
+                    while let Some(end) = buffered.iter().position(|byte| *byte == b'\n') {
+                        let line = String::from_utf8_lossy(&buffered[..end]).trim().to_owned();
+                        buffered.drain(..=end);
+                        if line.starts_with("artifact-use-ready:") {
+                            return Ok(line);
+                        }
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn parse_test_child_identity(line: &str) -> io::Result<ProcessStartIdentity> {
+        let payload = line.strip_prefix("artifact-use-ready:").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid producer child handshake",
+            )
+        })?;
+        let mut parts = payload.split(':');
+        let pid = parts
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing child PID"))?
+            .parse::<i32>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let process_group = parts
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing process group"))?
+            .parse::<i32>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if parts.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected fields in producer child handshake",
+            ));
+        }
+        ProcessStartIdentity::capture(pid, process_group)
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestProcessGroupChild {
+        fn drop(&mut self) {
+            if !self.leader_reaped {
+                // SAFETY: the child is still unreaped, so its process-group ID
+                // cannot have been released and reused.
+                let _ = unsafe { libc::killpg(self.process_group, libc::SIGKILL) };
+                let _ = self.child.kill();
+                let _ = wait_for_test_child(&mut self.child, Duration::from_secs(2));
+            } else if let Some(member) = self.member.as_ref() {
+                let still_same_member =
+                    ProcessStartIdentity::capture(member.pid, member.process_group)
+                        .is_ok_and(|current| current == *member);
+                if still_same_member {
+                    // SAFETY: the captured start token still identifies the
+                    // test-owned group member, so this group ID cannot name a
+                    // replacement group yet.
+                    let _ = unsafe { libc::killpg(self.process_group, libc::SIGKILL) };
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_test_child(
+        child: &mut std::process::Child,
+        timeout: Duration,
+    ) -> io::Result<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "test child did not exit within its bounded cleanup window",
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[cfg(unix)]
@@ -853,14 +1199,20 @@ mod tests {
                 PathBuf::from(std::env::var_os("AETHYME_ARTIFACT_USE_TEST_CHECKOUT").unwrap());
             let mut producer =
                 begin_artifact_use(&primary, &checkout, 15, "test:15:process-death").unwrap();
-            use std::os::unix::process::CommandExt;
             let mut command = Command::new("/bin/sleep");
-            command.arg("60").process_group(0);
-            let _command_child = command.spawn().unwrap();
-            let command_pid = _command_child.id() as i32;
-            let process = ProcessStartIdentity::capture(command_pid, command_pid).unwrap();
-            producer.mark_process_started(process).unwrap();
-            println!("artifact-use-ready");
+            command.arg("30");
+            let command_child = command.spawn().unwrap();
+            // SAFETY: getpgrp takes no pointers and reads this process's group ID.
+            let process_group = unsafe { libc::getpgrp() };
+            let process =
+                ProcessStartIdentity::capture(command_child.id() as i32, process_group).unwrap();
+            producer
+                .mark_process_started(&command_child, process_group)
+                .unwrap();
+            println!(
+                "artifact-use-ready:{}:{}",
+                process.pid, process.process_group
+            );
             io::stdout().flush().unwrap();
             let mut byte = [0_u8; 1];
             let _ = io::stdin().read(&mut byte);
@@ -881,23 +1233,13 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .process_group(0);
-        let mut child = command.spawn().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let mut output = BufReader::new(stdout);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            assert_ne!(
-                output.read_line(&mut line).unwrap(),
-                0,
-                "producer child exited before publishing its ready handshake"
-            );
-            if line.trim() == "artifact-use-ready" {
-                break;
-            }
-        }
-        child.kill().unwrap();
-        let status = child.wait().unwrap();
+        let child = command.spawn().unwrap();
+        let process_group = i32::try_from(child.id()).unwrap();
+        let mut guarded = TestProcessGroupChild::new(child, process_group);
+        let child_member = guarded
+            .wait_for_ready_member(Duration::from_secs(5))
+            .unwrap();
+        let status = guarded.kill_leader().unwrap();
         assert!(!status.success(), "the producer process should be killed");
 
         let markers = match try_artifact_use_reclaimer(primary.path(), &checkout).unwrap() {
@@ -911,16 +1253,11 @@ mod tests {
         let process = markers[0].process.as_ref().unwrap();
         assert_ne!(process.pid as u32, std::process::id());
         assert!(process.start_time.is_some());
+        assert_eq!(process, &child_member);
         assert_eq!(
-            ProcessStartIdentity::capture(process.pid, process.process_group)
-                .unwrap()
-                .start_time,
-            process.start_time
+            ProcessStartIdentity::capture(process.pid, process.process_group).unwrap(),
+            child_member
         );
-        // SAFETY: the marker recorded this process group and its start token
-        // still matches, so the group belongs to this test's command child.
-        let killed = unsafe { libc::kill(-process.process_group, libc::SIGKILL) };
-        assert!(killed == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH));
     }
 
     #[test]
@@ -984,14 +1321,14 @@ mod tests {
 
         let primary = tempfile::tempdir().unwrap();
         let checkout = checkout(primary.path(), "checkout");
-        let producer = begin(primary.path(), &checkout, 17, "exec:17:replacement");
+        let mut producer = begin(primary.path(), &checkout, 17, "exec:17:replacement");
         let target = primary.path().join("marker-target");
         fs::write(&target, b"preserve").unwrap();
         let displaced = producer.marker_path.with_extension("displaced");
         fs::rename(&producer.marker_path, &displaced).unwrap();
         symlink(&target, &producer.marker_path).unwrap();
 
-        assert!(producer.finish_verified_quiescence().is_err());
+        assert!(producer.finish_not_started().is_err());
         assert_eq!(fs::read(&target).unwrap(), b"preserve");
         assert!(try_artifact_use_reclaimer(primary.path(), &checkout).is_err());
     }

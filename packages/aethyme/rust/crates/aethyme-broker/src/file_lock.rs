@@ -126,15 +126,17 @@ fn acquire_repository_lifecycle_lock_with_wait(
 }
 
 fn ensure_real_directory(path: &Path) -> io::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
-        Ok(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "broker runtime path is not a real directory: {}",
-                path.display()
-            ),
-        )),
+    let parent_needs_sync = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => false,
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "broker runtime path is not a real directory: {}",
+                    path.display()
+                ),
+            ));
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             match std::fs::create_dir(path) {
                 Ok(()) => {}
@@ -142,20 +144,37 @@ fn ensure_real_directory(path: &Path) -> io::Result<()> {
                 Err(error) => return Err(error),
             }
             let metadata = std::fs::symlink_metadata(path)?;
-            if metadata.file_type().is_dir() {
-                Ok(())
-            } else {
-                Err(io::Error::new(
+            if !metadata.file_type().is_dir() {
+                return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
                         "broker runtime path changed while it was created: {}",
                         path.display()
                     ),
-                ))
+                ));
             }
+            true
         }
-        Err(error) => Err(error),
+        Err(error) => return Err(error),
+    };
+    if parent_needs_sync {
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "broker runtime path has no parent directory: {}",
+                    path.display()
+                ),
+            )
+        })?;
+        sync_directory(parent)
+    } else {
+        Ok(())
     }
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
 }
 
 fn open_lock_file_nofollow(path: &Path) -> io::Result<File> {
@@ -255,10 +274,13 @@ pub(crate) struct SharedFileLock {
 }
 
 impl SharedFileLock {
-    /// Block until `file` is locked shared.
-    pub(crate) fn acquire(file: File) -> io::Result<Self> {
-        file.lock_shared()?;
-        Ok(Self { file })
+    /// Lock `file` shared without waiting; `None` when an exclusive user holds it.
+    pub(crate) fn try_acquire(file: File) -> io::Result<Option<Self>> {
+        match file.try_lock_shared() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 # Broker worktree storage lifecycle
 
-Last Updated: 2026-10-18
+Last Updated: 2026-10-27
 
 The broker must account for worktree storage after its repository or placement
 configuration disappears. A placement rule alone is insufficient: temporary
@@ -141,6 +141,15 @@ contract.
 Cache writers and preparation-cache reclamation use the
 same root resolver and lease key. These controls reduce avoidable allocation
 and protect data during cleanup.
+
+B1 adds internal per-checkout shared/exclusive admission locks and durable
+per-invocation producer markers under the primary repository runtime directory.
+This source foundation is not yet wired into managed preparation, gates, or
+guarded execution; no cleanup path consumes it and it grants no deletion
+authority. A dropped producer guard leaves its marker for conservative review.
+Clients predating this protocol do not honor these locks and remain unknown.
+B2 must establish compatibility with those clients before cleanup can treat
+artifact-use admission as deletion evidence.
 
 The opt-in `managed_storage` profile currently describes intended preparation
 growth but does not enforce a bound. A minimal worktree-local declaration is:
