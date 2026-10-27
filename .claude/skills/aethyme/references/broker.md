@@ -154,11 +154,12 @@ blocked.
    The guard fails if the command leaves dirty paths outside your explicit
    leases or in files that were untracked before your session began.
 
-   For preservation archives, measure free space on the actual destination
-   volume and add checked known payload and metadata sizes to the existing
-   reserve before staging. If a component has no known size, describe this as
-   known-minimum admission; keep the source until the archive is fully written
-   and verified.
+   For preservation archives, check free space on the actual destination
+   volume against checked known payload and metadata sizes plus the configured
+   reserve before staging. Treat this as known-minimum admission only: bundle
+   size, filesystem allocation overhead, and concurrent writes are excluded, so
+   the reserve is not guaranteed to remain available. Keep the source until the
+   archive is fully written and verified.
 
 4. **While working**: commit early and small. Only committed work can be
    verified and integrated. Never switch branches inside someone else's
