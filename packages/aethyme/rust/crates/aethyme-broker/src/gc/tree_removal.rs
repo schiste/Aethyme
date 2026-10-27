@@ -182,7 +182,7 @@ impl PinnedTreeRemoval {
         _witness_name: &str,
         _deadline: Option<Instant>,
         _validate: F,
-        mut _before_mutation: M,
+        _before_mutation: M,
     ) -> Result<(TreeRemoval, usize), TreeRemovalError>
     where
         F: FnOnce(&[u8]) -> io::Result<()>,
@@ -196,6 +196,42 @@ impl PinnedTreeRemoval {
                 _validate,
                 &mut _before_mutation,
             )
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _self = self;
+            Err(TreeRemovalError {
+                source: unsupported_platform(),
+                entries_reclaimed: 0,
+            })
+        }
+    }
+
+    /// As above, but refuses non-directory entries that are neither regular
+    /// files nor symlinks. Preparation-cache rotation uses this narrower
+    /// policy because an incomplete size inventory cannot establish that
+    /// special filesystem nodes are disposable.
+    pub(crate) fn remove_verified_witness_with_progress_and_guard_refusing_special_nodes<F, M>(
+        self,
+        _witness_name: &str,
+        _deadline: Option<Instant>,
+        _validate: F,
+        mut _before_mutation: M,
+    ) -> Result<(TreeRemoval, usize), TreeRemovalError>
+    where
+        F: FnOnce(&[u8]) -> io::Result<()>,
+        M: FnMut() -> io::Result<()>,
+    {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let mut before_mutation = _before_mutation;
+            self.0
+                .remove_verified_witness_with_progress_and_guard_refusing_special_nodes(
+                    _witness_name,
+                    _deadline,
+                    _validate,
+                    &mut before_mutation,
+                )
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -301,6 +337,7 @@ mod unix {
         pub(super) object_identity: TreeObjectIdentity,
         pub(super) filesystem_identity: Vec<u8>,
         mount_identity: Vec<u8>,
+        refuse_special_nodes: bool,
     }
 
     impl PinnedTreeRemoval {
@@ -363,6 +400,7 @@ mod unix {
                 object_identity,
                 filesystem_identity: root_filesystem_identity,
                 mount_identity: root_mount_identity,
+                refuse_special_nodes: false,
             }))
         }
 
@@ -431,6 +469,29 @@ mod unix {
             F: FnOnce(&[u8]) -> io::Result<()>,
             M: FnMut() -> io::Result<()>,
         {
+            self.remove_with_hooks_and_progress(
+                Some(witness_name),
+                deadline,
+                &mut || Ok(()),
+                &mut || Ok(()),
+                before_mutation,
+                validate,
+            )
+            .map(|(outcome, entries, _bytes)| (outcome, entries))
+        }
+
+        pub(super) fn remove_verified_witness_with_progress_and_guard_refusing_special_nodes<F, M>(
+            mut self,
+            witness_name: &str,
+            deadline: Option<Instant>,
+            validate: F,
+            before_mutation: &mut M,
+        ) -> Result<(TreeRemoval, usize), super::TreeRemovalError>
+        where
+            F: FnOnce(&[u8]) -> io::Result<()>,
+            M: FnMut() -> io::Result<()>,
+        {
+            self.refuse_special_nodes = true;
             self.remove_with_hooks_and_progress(
                 Some(witness_name),
                 deadline,
@@ -771,6 +832,12 @@ mod unix {
                     entries,
                 });
             } else {
+                if pinned.refuse_special_nodes && !observed.is_regular && !observed.is_symlink {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "refusing to remove a special cache entry",
+                    ));
+                }
                 before_mutation()?;
                 ensure_bindings(pinned, &bindings)?;
                 ensure_named_entry(directory_fd, &c_name, observed.identity)?;
@@ -979,6 +1046,7 @@ mod unix {
         identity: TreeObjectIdentity,
         is_directory: bool,
         is_regular: bool,
+        is_symlink: bool,
         logical_bytes: u64,
     }
 
@@ -1020,6 +1088,7 @@ mod unix {
             },
             is_directory: mode & libc::S_IFMT == libc::S_IFDIR,
             is_regular: mode & libc::S_IFMT == libc::S_IFREG,
+            is_symlink: mode & libc::S_IFMT == libc::S_IFLNK,
             logical_bytes: u64::try_from(stat.st_size).unwrap_or(0),
         }))
     }

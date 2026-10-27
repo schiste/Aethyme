@@ -4,6 +4,18 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [Unreleased]
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0840).
+
+### Changed
+
+- `aethyme broker submit prepare --json` advances its report schema to 2.
+  A time- or entry-limited cache inventory can trigger whole-store rotation;
+  its report exposes a nullable exact `bytes_before`, inventory completeness,
+  a lower bound and typed reason. Configuration and preparation-state schemas
+  remain version 1.
+
 ## [0.8.39] - 2026-10-27
 
 ### Changed

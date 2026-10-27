@@ -33,6 +33,7 @@ pub(crate) mod rotation_journal;
 
 pub const PREPARATION_CONFIG_RELPATH: &str = ".aethyme/prepare.toml";
 pub const PREPARATION_SCHEMA_VERSION: u32 = 1;
+pub const PREPARATION_REPORT_SCHEMA_VERSION: u32 = 2;
 const PREPARATION_LEASE_TTL_SECONDS: u64 = 30;
 const PREPARATION_STORAGE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const PREPARATION_CACHE_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
@@ -346,7 +347,8 @@ pub struct PreparationReport {
     pub state: PreparationState,
     pub offline: bool,
     pub shared_cache_coordinated: bool,
-    /// Set when the shared store exceeded its declared budget and was rotated.
+    /// Set when a complete over-budget measurement or a bounded inventory
+    /// limit triggers a completed shared-store rotation.
     /// Additive and `None` in the overwhelmingly common case.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_cache_rotation: Option<SharedCacheRotation>,
@@ -631,7 +633,7 @@ impl Broker {
         let status = self.preparation_status(session_id)?;
         if status.state == PreparationState::Current {
             return Ok(PreparationReport {
-                schema_version: PREPARATION_SCHEMA_VERSION,
+                schema_version: PREPARATION_REPORT_SCHEMA_VERSION,
                 session_id,
                 digest,
                 state: PreparationState::Current,
@@ -1113,7 +1115,7 @@ impl Broker {
             },
         )?;
         Ok(PreparationReport {
-            schema_version: PREPARATION_SCHEMA_VERSION,
+            schema_version: PREPARATION_REPORT_SCHEMA_VERSION,
             session_id,
             digest,
             state: PreparationState::Current,
@@ -2159,13 +2161,15 @@ pub(crate) fn current_cache_key_before(
     Ok(Some(digest[..12.min(digest.len())].to_string()))
 }
 
-/// Rotate the shared store when it exceeds its declared budget.
+/// Rotate the shared store when it exceeds its declared budget or the bounded
+/// size inventory reaches its time or entry limit.
 ///
 /// Rotation is whole-store rather than per-entry because the budget exists to
 /// bound a *rate* of growth, and evicting the oldest entries is a policy the
 /// package managers inside the store already own. It is reported rather than
 /// silent, because a customer watching a cache reset mid-day deserves to know
-/// which command did it.
+/// which command did it. An incomplete inventory is reported with no exact
+/// pre-rotation byte count and an explicit reason.
 ///
 /// Recovers any prior rotation before applying the optional budget. A missing
 /// budget still avoids a size measurement, but cannot leave a published
@@ -2330,6 +2334,45 @@ fn shared_cache_budget_at_with_guard(
     root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
     progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
 ) -> Result<Option<SharedCacheRotation>, PreparationError> {
+    shared_cache_budget_at_with_scan_limits(
+        SharedCacheBudgetRequest {
+            budget,
+            cache_root,
+            resource_db_path,
+            repository,
+            digest,
+            expected_root_identity,
+            root_binding,
+        },
+        progress,
+        SharedCacheScanLimits::default(),
+    )
+}
+
+struct SharedCacheBudgetRequest<'a> {
+    budget: Option<&'a SharedCacheBudget>,
+    cache_root: &'a Path,
+    resource_db_path: &'a Path,
+    repository: &'a str,
+    digest: &'a str,
+    expected_root_identity: Option<&'a [u8]>,
+    root_binding: Option<&'a crate::broker::PreparationCacheRootBinding>,
+}
+
+fn shared_cache_budget_at_with_scan_limits(
+    request: SharedCacheBudgetRequest<'_>,
+    progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
+    scan_limits: SharedCacheScanLimits,
+) -> Result<Option<SharedCacheRotation>, PreparationError> {
+    let SharedCacheBudgetRequest {
+        budget,
+        cache_root,
+        resource_db_path,
+        repository,
+        digest,
+        expected_root_identity,
+        root_binding,
+    } = request;
     progress(true)?;
     ensure_preparation_cache_root_binding(root_binding)?;
     ensure_preparation_cache_root_identity(cache_root, expected_root_identity)?;
@@ -2347,16 +2390,39 @@ fn shared_cache_budget_at_with_guard(
         return Ok(None);
     };
     let store = cache_root.join(repository);
-    let bytes = directory_bytes_with_progress(&store, SharedCacheScanLimits::default(), progress)?;
+    let inventory = directory_inventory_with_progress(&store, scan_limits, progress)?;
     progress(true)?;
-    let Some(bytes) = bytes else {
-        return Ok(None);
-    };
+    let (bytes_before, observed_bytes_lower_bound, inventory_complete, rotation_reason) =
+        match inventory {
+            SharedCacheInventory::Absent => return Ok(None),
+            SharedCacheInventory::Complete { bytes } if bytes <= budget.max_bytes => {
+                return Ok(None);
+            }
+            SharedCacheInventory::Complete { bytes } => (
+                Some(bytes),
+                bytes,
+                true,
+                SharedCacheRotationReason::BudgetExceeded,
+            ),
+            SharedCacheInventory::BoundedIncomplete {
+                observed_bytes_lower_bound,
+                limit,
+            } => (
+                None,
+                observed_bytes_lower_bound,
+                false,
+                match limit {
+                    SharedCacheInventoryLimit::Time => {
+                        SharedCacheRotationReason::InventoryTimeLimit
+                    }
+                    SharedCacheInventoryLimit::Entries => {
+                        SharedCacheRotationReason::InventoryEntryLimit
+                    }
+                },
+            ),
+        };
     ensure_preparation_cache_root_identity(cache_root, expected_root_identity)?;
     ensure_preparation_cache_root_binding(root_binding)?;
-    if bytes <= budget.max_bytes {
-        return Ok(None);
-    }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     return Err(PreparationError::StorageUnavailable {
@@ -2454,9 +2520,12 @@ fn shared_cache_budget_at_with_guard(
         // the store lives on this machine.
         key: digest[..12.min(digest.len())].to_string(),
         budget_bytes: budget.max_bytes,
-        bytes_before: bytes,
+        bytes_before,
+        observed_bytes_lower_bound,
         bytes_after: 0,
         removed: true,
+        inventory_complete,
+        rotation_reason,
     }))
 }
 
@@ -2669,11 +2738,29 @@ fn validate_preparation_cache_binding_for_recovery(
 pub struct SharedCacheRotation {
     pub key: String,
     pub budget_bytes: u64,
-    pub bytes_before: u64,
+    /// Exact logical size of the old store when its inventory completed.
+    /// Null means the scan stopped at a reported time or entry limit.
+    pub bytes_before: Option<u64>,
+    /// Logical bytes observed so far; equals bytes_before for a complete scan.
+    pub observed_bytes_lower_bound: u64,
     pub bytes_after: u64,
     /// True after the old store is fully removed. Incomplete recovery returns
     /// a storage refusal and leaves the durable debt for the next sweep.
     pub removed: bool,
+    /// Whether the pre-rotation logical-size inventory completed.
+    pub inventory_complete: bool,
+    pub rotation_reason: SharedCacheRotationReason,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedCacheRotationReason {
+    /// A complete inventory found more logical bytes than the configured budget.
+    BudgetExceeded,
+    /// The bounded inventory elapsed-time limit was reached.
+    InventoryTimeLimit,
+    /// The bounded inventory entry-count limit was reached.
+    InventoryEntryLimit,
 }
 
 fn preparation_cache_root_binding_for_broker(
@@ -2713,6 +2800,24 @@ struct SharedCacheScanLimits {
     max_elapsed: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedCacheInventoryLimit {
+    Time,
+    Entries,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedCacheInventory {
+    Absent,
+    Complete {
+        bytes: u64,
+    },
+    BoundedIncomplete {
+        observed_bytes_lower_bound: u64,
+        limit: SharedCacheInventoryLimit,
+    },
+}
+
 impl Default for SharedCacheScanLimits {
     fn default() -> Self {
         Self {
@@ -2746,14 +2851,29 @@ fn directory_bytes_with_limits(
     directory_bytes_with_progress(path, limits, &mut |_| Ok(()))
 }
 
+#[cfg(test)]
 fn directory_bytes_with_progress(
     path: &Path,
-    _limits: SharedCacheScanLimits,
-    _progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
+    limits: SharedCacheScanLimits,
+    progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
 ) -> Result<Option<u64>, PreparationError> {
+    match directory_inventory_with_progress(path, limits, progress)? {
+        SharedCacheInventory::Absent => Ok(None),
+        SharedCacheInventory::Complete { bytes } => Ok(Some(bytes)),
+        SharedCacheInventory::BoundedIncomplete { limit, .. } => {
+            Err(shared_cache_inventory_limit_refusal(path, limit))
+        }
+    }
+}
+
+fn directory_inventory_with_progress(
+    path: &Path,
+    limits: SharedCacheScanLimits,
+    progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
+) -> Result<SharedCacheInventory, PreparationError> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        directory_bytes_fd_relative_with_progress(path, _limits, |_| {}, _progress)
+        directory_inventory_fd_relative_with_progress(path, limits, |_| {}, progress)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -2762,6 +2882,18 @@ fn directory_bytes_with_progress(
             "bounded no-follow inventory is unsupported on this platform",
         ))
     }
+}
+
+#[cfg(test)]
+fn shared_cache_inventory_limit_refusal(
+    path: &Path,
+    limit: SharedCacheInventoryLimit,
+) -> PreparationError {
+    let reason = match limit {
+        SharedCacheInventoryLimit::Time => "cache inventory time limit was exceeded",
+        SharedCacheInventoryLimit::Entries => "cache inventory entry limit was exceeded",
+    };
+    shared_cache_scan_refusal(path, reason)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2864,16 +2996,23 @@ fn directory_bytes_fd_relative_with_hook<F>(
 where
     F: FnMut(SharedCacheScanOpenTarget),
 {
-    directory_bytes_fd_relative_with_progress(path, limits, before_open, &mut |_| Ok(()))
+    match directory_inventory_fd_relative_with_progress(path, limits, before_open, &mut |_| Ok(()))?
+    {
+        SharedCacheInventory::Absent => Ok(None),
+        SharedCacheInventory::Complete { bytes } => Ok(Some(bytes)),
+        SharedCacheInventory::BoundedIncomplete { limit, .. } => {
+            Err(shared_cache_inventory_limit_refusal(path, limit))
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn directory_bytes_fd_relative_with_progress<F>(
+fn directory_inventory_fd_relative_with_progress<F>(
     path: &Path,
     limits: SharedCacheScanLimits,
     mut before_open: F,
     progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
-) -> Result<Option<u64>, PreparationError>
+) -> Result<SharedCacheInventory, PreparationError>
 where
     F: FnMut(SharedCacheScanOpenTarget),
 {
@@ -2882,7 +3021,9 @@ where
     let started = Instant::now();
     let root_metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SharedCacheInventory::Absent);
+        }
         Err(source) => return Err(shared_cache_scan_io_refusal(path, &source)),
     };
     if root_metadata.file_type().is_symlink() {
@@ -2897,13 +3038,24 @@ where
             "cache store root is not a directory",
         ));
     }
-    if limits.max_entries == 0 || limits.max_depth == 0 {
+    if limits.max_depth == 0 {
         return Err(shared_cache_scan_refusal(
             path,
-            "cache inventory limit was exceeded",
+            "cache inventory directory depth limit was exceeded",
         ));
     }
-    check_shared_cache_scan_deadline(path, started, limits)?;
+    if shared_cache_scan_deadline_exceeded(started, limits) {
+        return Ok(SharedCacheInventory::BoundedIncomplete {
+            observed_bytes_lower_bound: 0,
+            limit: SharedCacheInventoryLimit::Time,
+        });
+    }
+    if limits.max_entries == 0 {
+        return Ok(SharedCacheInventory::BoundedIncomplete {
+            observed_bytes_lower_bound: 0,
+            limit: SharedCacheInventoryLimit::Entries,
+        });
+    }
 
     let path_c = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| shared_cache_scan_refusal(path, "cache store path is invalid"))?;
@@ -2916,7 +3068,7 @@ where
     if root_fd < 0 {
         let source = std::io::Error::last_os_error();
         if source.kind() == std::io::ErrorKind::NotFound {
-            return Ok(None);
+            return Ok(SharedCacheInventory::Absent);
         }
         return Err(shared_cache_scan_io_refusal(path, &source));
     }
@@ -2952,12 +3104,22 @@ where
 
     loop {
         progress(false)?;
-        check_shared_cache_scan_deadline(path, started, limits)?;
+        if shared_cache_scan_deadline_exceeded(started, limits) {
+            return Ok(SharedCacheInventory::BoundedIncomplete {
+                observed_bytes_lower_bound: bytes,
+                limit: SharedCacheInventoryLimit::Time,
+            });
+        }
         let Some(frame) = pending.last_mut() else {
             break;
         };
         let name = frame.stream.next_name(path)?;
-        check_shared_cache_scan_deadline(path, started, limits)?;
+        if shared_cache_scan_deadline_exceeded(started, limits) {
+            return Ok(SharedCacheInventory::BoundedIncomplete {
+                observed_bytes_lower_bound: bytes,
+                limit: SharedCacheInventoryLimit::Time,
+            });
+        }
         let Some(name) = name else {
             pending.pop();
             continue;
@@ -2969,10 +3131,10 @@ where
             shared_cache_scan_refusal(path, "cache inventory entry count overflowed")
         })?;
         if visited_entries > limits.max_entries {
-            return Err(shared_cache_scan_refusal(
-                path,
-                "cache inventory entry limit was exceeded",
-            ));
+            return Ok(SharedCacheInventory::BoundedIncomplete {
+                observed_bytes_lower_bound: bytes,
+                limit: SharedCacheInventoryLimit::Entries,
+            });
         }
 
         let parent_fd = pending
@@ -2980,7 +3142,12 @@ where
             .expect("nonempty directory stack")
             .stream
             .fd(path)?;
-        check_shared_cache_scan_deadline(path, started, limits)?;
+        if shared_cache_scan_deadline_exceeded(started, limits) {
+            return Ok(SharedCacheInventory::BoundedIncomplete {
+                observed_bytes_lower_bound: bytes,
+                limit: SharedCacheInventoryLimit::Time,
+            });
+        }
         let mut entry_stat = MaybeUninit::<libc::stat>::uninit();
         // SAFETY: parent_fd is owned by the live stream, name is NUL-terminated,
         // and entry_stat is writable storage. AT_SYMLINK_NOFOLLOW classifies
@@ -2999,7 +3166,12 @@ where
                 &std::io::Error::last_os_error(),
             ));
         }
-        check_shared_cache_scan_deadline(path, started, limits)?;
+        if shared_cache_scan_deadline_exceeded(started, limits) {
+            return Ok(SharedCacheInventory::BoundedIncomplete {
+                observed_bytes_lower_bound: bytes,
+                limit: SharedCacheInventoryLimit::Time,
+            });
+        }
         // SAFETY: successful fstatat initialized the structure.
         let entry_stat = unsafe { entry_stat.assume_init() };
         if entry_stat.st_dev != root_device {
@@ -3017,7 +3189,12 @@ where
                         "cache inventory directory depth limit was exceeded",
                     ));
                 }
-                check_shared_cache_scan_deadline(path, started, limits)?;
+                if shared_cache_scan_deadline_exceeded(started, limits) {
+                    return Ok(SharedCacheInventory::BoundedIncomplete {
+                        observed_bytes_lower_bound: bytes,
+                        limit: SharedCacheInventoryLimit::Time,
+                    });
+                }
                 before_open(SharedCacheScanOpenTarget::Child);
                 // SAFETY: name is NUL-terminated and parent_fd remains live.
                 let child_fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
@@ -3052,7 +3229,12 @@ where
                     ));
                 }
                 let child = SharedCacheDirectoryStream::from_owned_fd(child_fd, path)?;
-                check_shared_cache_scan_deadline(path, started, limits)?;
+                if shared_cache_scan_deadline_exceeded(started, limits) {
+                    return Ok(SharedCacheInventory::BoundedIncomplete {
+                        observed_bytes_lower_bound: bytes,
+                        limit: SharedCacheInventoryLimit::Time,
+                    });
+                }
                 pending.push(SharedCacheDirectoryFrame { stream: child });
             }
             libc::S_IFREG | libc::S_IFLNK => {
@@ -3072,22 +3254,12 @@ where
         }
     }
 
-    Ok(Some(bytes))
+    Ok(SharedCacheInventory::Complete { bytes })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn check_shared_cache_scan_deadline(
-    path: &Path,
-    started: Instant,
-    limits: SharedCacheScanLimits,
-) -> Result<(), PreparationError> {
-    if started.elapsed() >= limits.max_elapsed {
-        return Err(shared_cache_scan_refusal(
-            path,
-            "cache inventory time limit was exceeded",
-        ));
-    }
-    Ok(())
+fn shared_cache_scan_deadline_exceeded(started: Instant, limits: SharedCacheScanLimits) -> bool {
+    started.elapsed() >= limits.max_elapsed
 }
 
 fn shared_cache_scan_refusal(path: &Path, reason: &str) -> PreparationError {
@@ -4382,10 +4554,16 @@ mod tests {
         )
         .expect("rotation is reported")
         .expect("over budget");
-        assert_eq!(rotation.bytes_before, bytes);
+        assert_eq!(rotation.bytes_before, Some(bytes));
+        assert_eq!(rotation.observed_bytes_lower_bound, bytes);
         assert_eq!(rotation.budget_bytes, budget.max_bytes);
         assert_eq!(rotation.key, "abcdef123456");
         assert!(rotation.removed, "the retired tree is reclaimed");
+        assert!(rotation.inventory_complete);
+        assert_eq!(
+            rotation.rotation_reason,
+            SharedCacheRotationReason::BudgetExceeded
+        );
         assert!(
             store.is_dir() && std::fs::read_dir(&store).unwrap().next().is_none(),
             "rotation must leave an empty, usable store"
@@ -4404,6 +4582,95 @@ mod tests {
             .is_none()
         );
         assert!(store.join("payload").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn bounded_inventory_rotates_and_reports_unknown_exact_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture_root = tmp.path().canonicalize().unwrap();
+        let cache_root = fixture_root.join("preparation-cache");
+        let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("payload"), b"bounded inventory").unwrap();
+        let scan_limits = SharedCacheScanLimits {
+            max_entries: 0,
+            max_depth: SHARED_CACHE_SCAN_MAX_DEPTH,
+            max_elapsed: Duration::from_secs(5),
+        };
+
+        let rotation = shared_cache_budget_at_with_scan_limits(
+            SharedCacheBudgetRequest {
+                budget: Some(&SharedCacheBudget {
+                    max_bytes: 1,
+                    ..SharedCacheBudget::default()
+                }),
+                cache_root: &cache_root,
+                resource_db_path: &fixture_root.join(".aethyme-test-host-resources.sqlite3"),
+                repository: SHARED_CACHE_TEST_REPOSITORY,
+                digest: "0123456789ab",
+                expected_root_identity: None,
+                root_binding: None,
+            },
+            &mut |_| Ok(()),
+            scan_limits,
+        )
+        .unwrap()
+        .expect("entry-limited inventory should rotate the disposable cache");
+
+        assert!(rotation.removed);
+        assert_eq!(rotation.bytes_before, None);
+        assert_eq!(rotation.observed_bytes_lower_bound, 0);
+        assert!(!rotation.inventory_complete);
+        assert_eq!(
+            rotation.rotation_reason,
+            SharedCacheRotationReason::InventoryEntryLimit
+        );
+        assert!(store.is_dir());
+        assert_eq!(fs::read_dir(&store).unwrap().count(), 0);
+        assert!(
+            rotation_debt::read(&cache_root, SHARED_CACHE_TEST_REPOSITORY)
+                .unwrap()
+                .is_none()
+        );
+        let json = serde_json::to_value(rotation).unwrap();
+        assert_eq!(json["bytes_before"], serde_json::Value::Null);
+        assert_eq!(json["inventory_complete"], false);
+        assert_eq!(json["rotation_reason"], "inventory_entry_limit");
+        assert_eq!(json["observed_bytes_lower_bound"], 0);
+
+        fs::write(store.join("payload"), b"time-limited inventory").unwrap();
+        let timed_rotation = shared_cache_budget_at_with_scan_limits(
+            SharedCacheBudgetRequest {
+                budget: Some(&SharedCacheBudget {
+                    max_bytes: 1,
+                    ..SharedCacheBudget::default()
+                }),
+                cache_root: &cache_root,
+                resource_db_path: &fixture_root.join(".aethyme-test-host-resources.sqlite3"),
+                repository: SHARED_CACHE_TEST_REPOSITORY,
+                digest: "0123456789ab",
+                expected_root_identity: None,
+                root_binding: None,
+            },
+            &mut |_| Ok(()),
+            SharedCacheScanLimits {
+                max_entries: SHARED_CACHE_SCAN_MAX_ENTRIES,
+                max_depth: SHARED_CACHE_SCAN_MAX_DEPTH,
+                max_elapsed: Duration::ZERO,
+            },
+        )
+        .unwrap()
+        .expect("time-limited inventory should rotate the disposable cache");
+        assert_eq!(timed_rotation.bytes_before, None);
+        assert_eq!(timed_rotation.observed_bytes_lower_bound, 0);
+        assert!(!timed_rotation.inventory_complete);
+        assert_eq!(
+            timed_rotation.rotation_reason,
+            SharedCacheRotationReason::InventoryTimeLimit
+        );
+        assert!(store.is_dir());
+        assert_eq!(fs::read_dir(&store).unwrap().count(), 0);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -4534,18 +4801,21 @@ mod tests {
         let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
         fs::create_dir_all(&store).unwrap();
         fs::write(store.join("payload"), b"preserve").unwrap();
+        fs::write(store.join("second"), b"preserve too").unwrap();
         let mut scanned = false;
-        let result = shared_cache_budget_at_with_guard(
-            Some(&SharedCacheBudget {
-                max_bytes: 1,
-                ..SharedCacheBudget::default()
-            }),
-            &cache_root,
-            &tmp.path().join("resources.db"),
-            SHARED_CACHE_TEST_REPOSITORY,
-            "0123456789ab",
-            None,
-            None,
+        let result = shared_cache_budget_at_with_scan_limits(
+            SharedCacheBudgetRequest {
+                budget: Some(&SharedCacheBudget {
+                    max_bytes: 1,
+                    ..SharedCacheBudget::default()
+                }),
+                cache_root: &cache_root,
+                resource_db_path: &tmp.path().join("resources.db"),
+                repository: SHARED_CACHE_TEST_REPOSITORY,
+                digest: "0123456789ab",
+                expected_root_identity: None,
+                root_binding: None,
+            },
             &mut |force| {
                 if force && scanned {
                     return Err(PreparationError::LivenessIncomplete {
@@ -4555,6 +4825,11 @@ mod tests {
                 scanned |= !force;
                 Ok(())
             },
+            SharedCacheScanLimits {
+                max_entries: 1,
+                max_depth: SHARED_CACHE_SCAN_MAX_DEPTH,
+                max_elapsed: Duration::from_secs(5),
+            },
         );
         assert!(scanned);
         assert!(matches!(
@@ -4562,6 +4837,12 @@ mod tests {
             Err(PreparationError::LivenessIncomplete { .. })
         ));
         assert_eq!(fs::read(store.join("payload")).unwrap(), b"preserve");
+        assert_eq!(fs::read(store.join("second")).unwrap(), b"preserve too");
+        assert!(
+            rotation_debt::read(&cache_root, SHARED_CACHE_TEST_REPOSITORY)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -4719,6 +5000,48 @@ mod tests {
             time_limited,
             Err(PreparationError::StorageUnavailable { .. })
         ));
+
+        assert!(matches!(
+            directory_inventory_with_progress(
+                &store,
+                SharedCacheScanLimits {
+                    max_entries: 2,
+                    ..base
+                },
+                &mut |_| Ok(()),
+            )
+            .unwrap(),
+            SharedCacheInventory::BoundedIncomplete {
+                limit: SharedCacheInventoryLimit::Entries,
+                ..
+            }
+        ));
+        assert!(matches!(
+            directory_inventory_with_progress(
+                &store,
+                SharedCacheScanLimits {
+                    max_elapsed: Duration::ZERO,
+                    ..base
+                },
+                &mut |_| Ok(()),
+            )
+            .unwrap(),
+            SharedCacheInventory::BoundedIncomplete {
+                limit: SharedCacheInventoryLimit::Time,
+                ..
+            }
+        ));
+        assert!(matches!(
+            directory_inventory_with_progress(
+                &store,
+                SharedCacheScanLimits {
+                    max_depth: 1,
+                    ..base
+                },
+                &mut |_| Ok(()),
+            ),
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -4777,6 +5100,89 @@ mod tests {
         ));
         assert_eq!(fs::read(store.join("keep")).unwrap(), b"preserve me");
         assert!(fifo.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn incomplete_rotation_refuses_fifo_and_recovers_debt_after_removal() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture_root = tmp.path().canonicalize().unwrap();
+        let cache_root = fixture_root.join("preparation-cache");
+        let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("keep"), b"preserved until rotation").unwrap();
+        let fifo = store.join("blocked-pipe");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_c is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        let refusal = shared_cache_budget_at_with_scan_limits(
+            SharedCacheBudgetRequest {
+                budget: Some(&SharedCacheBudget {
+                    max_bytes: 1,
+                    ..SharedCacheBudget::default()
+                }),
+                cache_root: &cache_root,
+                resource_db_path: &fixture_root.join(".aethyme-test-host-resources.sqlite3"),
+                repository: SHARED_CACHE_TEST_REPOSITORY,
+                digest: "0123456789ab",
+                expected_root_identity: None,
+                root_binding: None,
+            },
+            &mut |_| Ok(()),
+            SharedCacheScanLimits {
+                max_entries: 0,
+                max_depth: SHARED_CACHE_SCAN_MAX_DEPTH,
+                max_elapsed: Duration::from_secs(5),
+            },
+        )
+        .expect_err("the rotation remover must refuse the FIFO");
+        assert!(
+            refusal.to_string().contains("special cache entry"),
+            "unexpected refusal: {refusal}"
+        );
+
+        let retained = rotation_debt::read(&cache_root, SHARED_CACHE_TEST_REPOSITORY)
+            .unwrap()
+            .expect("an interrupted rotation must retain durable debt");
+        let retired = cache_root.join(retained.debt.retired_component());
+        let retired_fifo = retired.join("blocked-pipe");
+        assert!(
+            fs::symlink_metadata(&retired_fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "the special node must remain intact under the retired tree"
+        );
+        assert!(
+            !store.exists(),
+            "the original store has been durably retired"
+        );
+
+        fs::remove_file(&retired_fifo).unwrap();
+        assert!(
+            shared_cache_budget_at(
+                None,
+                &cache_root,
+                SHARED_CACHE_TEST_REPOSITORY,
+                "0123456789ab",
+            )
+            .unwrap()
+            .is_none(),
+            "retrying must finish prior debt without requiring a budget"
+        );
+        assert!(store.is_dir());
+        assert_eq!(fs::read_dir(&store).unwrap().count(), 0);
+        assert!(
+            rotation_debt::read(&cache_root, SHARED_CACHE_TEST_REPOSITORY)
+                .unwrap()
+                .is_none(),
+            "completed recovery must clear its durable debt"
+        );
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
