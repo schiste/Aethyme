@@ -99,11 +99,38 @@ jobs:
           cargo build --release --locked --target "${{ matrix.target }}" \
             -p aethyme-cli --bin aethyme -p aethyme-engine --bin aethyme-engine-cli
 
+      - name: Build release manifest helpers
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          cargo build --release --locked --target "${{ matrix.target }}" \
+            -p aethyme-broker --example release_manifest --example homebrew_formula
+          helper_stage_dir="$RUNNER_TEMP/aethyme-release-helpers"
+          mkdir -p "$helper_stage_dir"
+          cp "target/${{ matrix.target }}/release/examples/release_manifest" "$helper_stage_dir/"
+          cp "target/${{ matrix.target }}/release/examples/homebrew_formula" "$helper_stage_dir/"
+          printf '%s\n' "$GITHUB_SHA" > "$helper_stage_dir/source.sha"
+          (
+            cd "$helper_stage_dir"
+            sha256sum release_manifest homebrew_formula > SHA256SUMS
+          )
+          tar -czf "target/${{ matrix.target }}/release-helpers.tar.gz" -C "$helper_stage_dir" \
+            release_manifest homebrew_formula source.sha SHA256SUMS
+
       - name: Verify release version contract
+        if: matrix.target != 'x86_64-unknown-linux-gnu'
         env:
           AETHYME_RELEASE_TAG: ${{ github.ref_name }}
           AETHYME_RELEASE_COMMIT: ${{ github.sha }}
           AETHYME_RELEASE_BINARY_DIR: ${{ github.workspace }}/packages/aethyme/rust/target/${{ matrix.target }}/release
+        run: cargo test --locked -p aethyme-testkit --test release_contract
+
+      - name: Verify release helper contract
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          AETHYME_RELEASE_TAG: ${{ github.ref_name }}
+          AETHYME_RELEASE_COMMIT: ${{ github.sha }}
+          AETHYME_RELEASE_BINARY_DIR: ${{ github.workspace }}/packages/aethyme/rust/target/${{ matrix.target }}/release
+          AETHYME_RELEASE_HELPER_BINARY_DIR: ${{ github.workspace }}/packages/aethyme/rust/target/${{ matrix.target }}/release/examples
         run: cargo test --locked -p aethyme-testkit --test release_contract
 
       - name: Verify embedded release versions
@@ -154,6 +181,14 @@ jobs:
         with:
           name: aethyme-${{ matrix.target }}
           path: packages/aethyme/rust/aethyme-*-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+      - name: Upload release helper artifact
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-helpers-${{ github.sha }}
+          path: packages/aethyme/rust/target/${{ matrix.target }}/release-helpers.tar.gz
           if-no-files-found: error
 
   build-windows:
@@ -220,7 +255,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --dir dist
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'aethyme-*' --dir dist
           find dist -mindepth 2 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} dist/ \;
           find dist -mindepth 1 -type d -empty -delete
           tar_count="$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d ' ')"
@@ -228,10 +263,34 @@ jobs:
           # Five Unix archives plus the native Windows x64 zip.
           test "$tar_count" = "5"
           test "$windows_count" = "1"
+          test -z "$(find dist -type f \( -name 'release_manifest' -o -name 'homebrew_formula' -o -name 'release-helpers.tar.gz' \) -print -quit)"
+
+      - name: Download release helper artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          helper_artifact_dir="$RUNNER_TEMP/release-helper-artifact"
+          helper_dir="$RUNNER_TEMP/aethyme-release-helpers"
+          mkdir -p "$helper_artifact_dir" "$helper_dir"
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "release-helpers-${GITHUB_SHA}" --dir "$helper_artifact_dir"
+          helper_archive="$(find "$helper_artifact_dir" -type f -name 'release-helpers.tar.gz' -print -quit)"
+          test -n "$helper_archive"
+          test "$(find "$helper_artifact_dir" -type f -name 'release-helpers.tar.gz' | wc -l | tr -d ' ')" = "1"
+          tar -xzf "$helper_archive" -C "$helper_dir"
+          helper_source_sha="$(cat "$helper_dir/source.sha")"
+          test "$helper_source_sha" = "$GITHUB_SHA"
+          (cd "$helper_dir" && sha256sum --check SHA256SUMS)
+          test -x "$helper_dir/release_manifest"
+          test -x "$helper_dir/homebrew_formula"
+          test ! -e dist/release_manifest
+          test ! -e dist/homebrew_formula
 
       - name: Build release manifest and checksums
         env:
           REF_NAME: ${{ github.ref_name }}
+          AETHYME_RELEASE_HELPER_DIR: ${{ runner.temp }}/aethyme-release-helpers
         run: |
           source_sha="$(git rev-parse HEAD)"
           test "$source_sha" = "$GITHUB_SHA"
@@ -240,16 +299,14 @@ jobs:
             *) release_channel=stable ;;
           esac
           cp install.sh dist/install.sh
-          cargo run --locked --manifest-path packages/aethyme/rust/Cargo.toml \
-            -p aethyme-broker --example release_manifest -- \
+          "$AETHYME_RELEASE_HELPER_DIR/release_manifest" \
             --dist "$GITHUB_WORKSPACE/dist" \
             --tag "$REF_NAME" \
             --source-sha "$source_sha" \
             --channel "$release_channel" \
             --output "$GITHUB_WORKSPACE/dist/release-manifest.json"
           if [ "$release_channel" = stable ]; then
-            cargo run --locked --manifest-path packages/aethyme/rust/Cargo.toml \
-              -p aethyme-broker --example homebrew_formula -- \
+            "$AETHYME_RELEASE_HELPER_DIR/homebrew_formula" \
               --manifest "$GITHUB_WORKSPACE/dist/release-manifest.json" \
               --tag "$REF_NAME" \
               --source-sha "$source_sha" \
