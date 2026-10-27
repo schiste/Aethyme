@@ -214,11 +214,11 @@ pub fn session_content(
     base: &str,
     head: &str,
 ) -> Result<SessionContent, BrokerOpError> {
-    let changed = repo.changed_between(base, head).map_err(|source| {
-        BrokerOpError::RepresentationUnavailable {
+    let changed = repo
+        .changed_between_all_paths(base, head)
+        .map_err(|source| BrokerOpError::RepresentationUnavailable {
             reason: format!("cannot diff {} to {}: {source}", short(base), short(head)),
-        }
-    })?;
+        })?;
 
     // One `cat-file` for the whole diff, not one `rev-parse` per path. The
     // cleanup plan behind `broker status` builds this map for every retained
