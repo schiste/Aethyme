@@ -1,7 +1,5 @@
 use super::*;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use sha1::Digest as _;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::{CStr, CString, OsString};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::fs::File;
@@ -231,6 +229,8 @@ struct OrphanFsMetadata {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn stat_at(parent_fd: RawFd, name: &CString) -> std::io::Result<Option<OrphanFsMetadata>> {
+    // SAFETY: libc::stat is a plain C output structure with integer and fixed
+    // array fields; all-zero is a valid initial buffer for fstatat.
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `parent_fd` is held open by the caller and `name` is one
     // NUL-terminated component. `AT_SYMLINK_NOFOLLOW` inspects the leaf itself.
@@ -328,6 +328,8 @@ fn open_directory_chain(path: &Path) -> std::io::Result<(Vec<File>, Vec<OrphanDi
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn filesystem_identity(fd: RawFd) -> std::io::Result<Vec<u8>> {
+    // SAFETY: libc::statfs is a plain C output structure with integer and
+    // fixed array fields; all-zero is a valid initial buffer for fstatfs.
     let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: `fd` is a live directory descriptor and `stat` is writable.
     if unsafe { libc::fstatfs(fd, &mut stat) } != 0 {
@@ -346,6 +348,8 @@ fn filesystem_identity(fd: RawFd) -> std::io::Result<Vec<u8>> {
 #[cfg(target_os = "linux")]
 fn mount_identity(fd: RawFd) -> std::io::Result<Vec<u8>> {
     let empty_path = CString::new("").expect("empty path has no NUL");
+    // SAFETY: libc::statx is a plain C output structure with integer and
+    // fixed array fields; all-zero is a valid initial buffer for statx.
     let mut stat: libc::statx = unsafe { std::mem::zeroed() };
     // SAFETY: `fd` is live and `AT_EMPTY_PATH` requests its mount identity.
     let result = unsafe {
@@ -467,7 +471,7 @@ impl PinnedOrphanRoot {
         if named.is_some_and(|entry| {
             entry.device == self.identity.0
                 && entry.inode == self.identity.1
-                && entry.mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32
+                && mode_has_type(entry.mode, libc::S_IFDIR)
         }) {
             Ok(())
         } else {
@@ -844,7 +848,7 @@ fn hash_symlink_at(
         .map_err(|error| format!("cannot recheck tracked symlink: {error}"))?
         .ok_or_else(|| "tracked symlink disappeared during inspection".to_string())?;
     if (after.device, after.inode) != (expected.device, expected.inode)
-        || after.mode & libc::S_IFMT as u32 != libc::S_IFLNK as u32
+        || !mode_has_type(after.mode, libc::S_IFLNK)
         || after.device != root.identity.0
     {
         return Err("tracked symlink changed during inspection; preserved it".into());
@@ -887,7 +891,7 @@ fn read_bounded_regular_file_at(
     if bytes.len() as u64 > max_bytes
         || (after.device, after.inode) != (expected.device, expected.inode)
         || after.size != metadata.len()
-        || after.mode & libc::S_IFMT as u32 != libc::S_IFREG as u32
+        || !mode_has_type(after.mode, libc::S_IFREG)
     {
         return Err("cleanup witness changed during inspection".into());
     }
@@ -932,33 +936,34 @@ fn validate_disposable_prefixes(prefixes: &[String]) -> Result<(), String> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn worktree_tracked_directories(
+fn tracked_tree_contains_directory(
     files: &std::collections::BTreeMap<String, crate::git::GitTreeFile>,
-) -> std::collections::BTreeSet<String> {
-    let mut directories = std::collections::BTreeSet::new();
-    for path in files.keys() {
-        let mut current = String::new();
-        let mut components = path.split('/').peekable();
-        while let Some(component) = components.next() {
-            if components.peek().is_none() {
-                break;
-            }
-            if !current.is_empty() {
-                current.push('/');
-            }
-            current.push_str(component);
-            directories.insert(current.clone());
-        }
+    directory: &str,
+    deadline: std::time::Instant,
+) -> Result<bool, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("tracked tree directory lookup exceeded its time budget".into());
     }
-    directories
+    let mut prefix = String::with_capacity(directory.len().saturating_add(1));
+    prefix.push_str(directory);
+    prefix.push('/');
+    Ok(files
+        .range::<str, _>(prefix.as_str()..)
+        .next()
+        .is_some_and(|(path, _)| path.starts_with(&prefix)))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn mode_has_type(mode: u32, expected: libc::mode_t) -> bool {
+    mode & u32::from(libc::S_IFMT) == u32::from(expected)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn orphan_kind(mode: u32) -> OrphanResidueKind {
-    match mode & libc::S_IFMT as u32 {
-        mode if mode == libc::S_IFDIR as u32 => OrphanResidueKind::Directory,
-        mode if mode == libc::S_IFREG as u32 => OrphanResidueKind::RegularFile,
-        mode if mode == libc::S_IFLNK as u32 => OrphanResidueKind::Symlink,
+    match mode & u32::from(libc::S_IFMT) {
+        mode if mode == u32::from(libc::S_IFDIR) => OrphanResidueKind::Directory,
+        mode if mode == u32::from(libc::S_IFREG) => OrphanResidueKind::RegularFile,
+        mode if mode == u32::from(libc::S_IFLNK) => OrphanResidueKind::Symlink,
         _ => OrphanResidueKind::Special,
     }
 }
@@ -1011,7 +1016,6 @@ fn collect_orphan_residue(
     relative_directory: &str,
     proof: &crate::events::FinishCleanupRecoveryProof,
     tracked_files: &std::collections::BTreeMap<String, crate::git::GitTreeFile>,
-    tracked_directories: &std::collections::BTreeSet<String>,
     budget: &mut OrphanResidueBudget,
     entries: &mut std::collections::BTreeMap<String, OrphanResidueEntry>,
 ) -> Result<(), String> {
@@ -1065,7 +1069,9 @@ fn collect_orphan_residue(
         };
         match kind {
             OrphanResidueKind::Directory => {
-                if !under_ignored_prefix && !tracked_directories.contains(&relative) {
+                if !under_ignored_prefix
+                    && !tracked_tree_contains_directory(tracked_files, &relative, budget.deadline)?
+                {
                     return Err(format!(
                         "unverified directory {relative} remains; preserved it for inspection"
                     ));
@@ -1093,7 +1099,6 @@ fn collect_orphan_residue(
                     &relative,
                     proof,
                     tracked_files,
-                    tracked_directories,
                     budget,
                     entries,
                 )?;
@@ -1334,12 +1339,12 @@ fn remove_orphan_directory_contents(
                 match entry.kind {
                     OrphanResidueKind::RegularFile => {
                         if let Some(expected) = entry.tracked_object_id.as_deref() {
-                            if let Some(expected_executable) = entry.tracked_executable {
-                                if (current.mode & 0o111 != 0) != expected_executable {
-                                    return Err(format!(
-                                        "tracked path {relative} changed executable mode during removal; preserved it"
-                                    ));
-                                }
+                            if let Some(expected_executable) = entry.tracked_executable
+                                && (current.mode & 0o111 != 0) != expected_executable
+                            {
+                                return Err(format!(
+                                    "tracked path {relative} changed executable mode during removal; preserved it"
+                                ));
                             }
                             if hash_regular_file_at(
                                 root,
@@ -1379,19 +1384,18 @@ fn remove_orphan_directory_contents(
                         }
                     }
                     OrphanResidueKind::Symlink => {
-                        if let Some(expected) = entry.tracked_object_id.as_deref() {
-                            if hash_symlink_at(
+                        if let Some(expected) = entry.tracked_object_id.as_deref()
+                            && hash_symlink_at(
                                 root,
                                 directory.as_raw_fd(),
                                 &entry.name,
                                 current,
                                 expected.len(),
                             )? != expected
-                            {
-                                return Err(format!(
-                                    "tracked symlink {relative} changed during removal; preserved it"
-                                ));
-                            }
+                        {
+                            return Err(format!(
+                                "tracked symlink {relative} changed during removal; preserved it"
+                            ));
                         }
                     }
                     OrphanResidueKind::Directory | OrphanResidueKind::Special => {
@@ -1470,7 +1474,6 @@ fn remove_authorized_orphan_tree(
             .into_iter()
             .map(|entry| (entry.path.clone(), entry))
             .collect::<std::collections::BTreeMap<_, _>>();
-        let tracked_directories = worktree_tracked_directories(&tracked_files);
         let mut entries = std::collections::BTreeMap::new();
         budget.begin_inventory();
         collect_orphan_residue(
@@ -1479,7 +1482,6 @@ fn remove_authorized_orphan_tree(
             "",
             proof,
             &tracked_files,
-            &tracked_directories,
             &mut budget,
             &mut entries,
         )?;
@@ -4365,7 +4367,18 @@ mod ownership_witness_tests {
 #[cfg(test)]
 mod registered_removal_failure_tests {
     use super::CleanupStatusLimits;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use super::{
+        MAX_ORPHAN_RESIDUE_ENUMERATED_ENTRIES, MAX_ORPHAN_RESIDUE_ENUMERATED_NAME_BYTES,
+        ORPHAN_RESIDUE_SCAN_BUDGET, OrphanRemovePass, OrphanResidueBudget, PinnedOrphanRoot,
+        collect_orphan_residue, open_directory_at, remove_orphan_residue_pass,
+        tracked_tree_contains_directory,
+    };
     use crate::{SessionCleanupState, git::with_git_deadline};
+    #[cfg(unix)]
+    use std::ffi::CString;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::os::fd::AsRawFd;
     use std::path::Path;
     use std::process::Command;
     use std::time::Duration;
@@ -5065,7 +5078,6 @@ mod registered_removal_failure_tests {
         let mut budget = OrphanResidueBudget::new(deadline);
         let mut entries = std::collections::BTreeMap::new();
         let tracked = std::collections::BTreeMap::new();
-        let tracked_directories = std::collections::BTreeSet::new();
         let mut root = PinnedOrphanRoot::open(&worktree, &proof).unwrap().unwrap();
         root.identity.0 = expected_device;
 
@@ -5075,7 +5087,6 @@ mod registered_removal_failure_tests {
             "",
             &proof,
             &tracked,
-            &tracked_directories,
             &mut budget,
             &mut entries,
         )
@@ -5109,7 +5120,6 @@ mod registered_removal_failure_tests {
             .into_iter()
             .map(|entry| (entry.path.clone(), entry))
             .collect::<std::collections::BTreeMap<_, _>>();
-        let tracked_directories = worktree_tracked_directories(&tracked);
         let mut entries = std::collections::BTreeMap::new();
         let mut budget = OrphanResidueBudget::new(deadline);
         collect_orphan_residue(
@@ -5118,7 +5128,6 @@ mod registered_removal_failure_tests {
             "",
             &proof,
             &tracked,
-            &tracked_directories,
             &mut budget,
             &mut entries,
         )
@@ -5155,7 +5164,6 @@ mod registered_removal_failure_tests {
             .into_iter()
             .map(|entry| (entry.path.clone(), entry))
             .collect::<std::collections::BTreeMap<_, _>>();
-        let tracked_directories = worktree_tracked_directories(&tracked);
         let mut entries = std::collections::BTreeMap::new();
         let mut budget = OrphanResidueBudget::new(deadline);
         collect_orphan_residue(
@@ -5164,7 +5172,6 @@ mod registered_removal_failure_tests {
             "",
             &proof,
             &tracked,
-            &tracked_directories,
             &mut budget,
             &mut entries,
         )
@@ -5199,7 +5206,6 @@ mod registered_removal_failure_tests {
         let mut budget = OrphanResidueBudget::with_limits(deadline, 2, 1024, 1024);
         let mut entries = std::collections::BTreeMap::new();
         let tracked = std::collections::BTreeMap::new();
-        let tracked_directories = std::collections::BTreeSet::new();
         let nested_directory = open_directory_at(
             root.root.as_raw_fd(),
             &CString::new("local-dataset").unwrap(),
@@ -5212,7 +5218,6 @@ mod registered_removal_failure_tests {
             "local-dataset",
             &proof,
             &tracked,
-            &tracked_directories,
             &mut budget,
             &mut entries,
         )
@@ -5228,7 +5233,6 @@ mod registered_removal_failure_tests {
             "local-dataset",
             &proof,
             &tracked,
-            &tracked_directories,
             &mut name_budget,
             &mut name_entries,
         )
@@ -5256,7 +5260,6 @@ mod registered_removal_failure_tests {
         );
         let mut entries = std::collections::BTreeMap::new();
         let tracked = std::collections::BTreeMap::new();
-        let tracked_directories = std::collections::BTreeSet::new();
 
         let error = collect_orphan_residue(
             &root,
@@ -5264,12 +5267,32 @@ mod registered_removal_failure_tests {
             "",
             &proof,
             &tracked,
-            &tracked_directories,
             &mut budget,
             &mut entries,
         )
         .unwrap_err();
         assert!(error.contains("retained path safety limit"), "{error}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn tracked_tree_directory_lookup_matches_complete_path_components() {
+        fn file(path: &str) -> crate::git::GitTreeFile {
+            crate::git::GitTreeFile {
+                path: path.to_owned(),
+                mode: "100644".into(),
+                object_id: "0".repeat(40),
+            }
+        }
+
+        let files = [file("nested/tracked.txt"), file("nestedish/other.txt")]
+            .into_iter()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        assert!(tracked_tree_contains_directory(&files, "nested", deadline).unwrap());
+        assert!(!tracked_tree_contains_directory(&files, "nestedi", deadline).unwrap());
+        assert!(!tracked_tree_contains_directory(&files, "nestedish/other.txt", deadline).unwrap());
     }
 
     #[test]
