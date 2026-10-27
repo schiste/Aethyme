@@ -826,7 +826,13 @@ pub(crate) fn unclean_reason(
 ) -> Result<Option<String>, String> {
     let status = git(
         worktree,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
     )?;
     let changed = status
         .split('\0')
@@ -1787,6 +1793,8 @@ mod tests {
         decode_auto_cleanup_cursor, first_live_worktree_overlap, group_closed_checkout_sessions,
         resolve_worktree_paths_until,
     };
+    #[cfg(unix)]
+    use crate::git::GitRepo;
     use std::path::Path;
     #[cfg(unix)]
     use std::path::PathBuf;
@@ -1951,6 +1959,132 @@ mod tests {
             .unwrap();
         std::fs::write(worktree.join("cursor-dirty.txt"), "retain this checkout\n").unwrap();
         (session.id, worktree)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_cleanup_retains_dirty_submodule_files_under_ignore_all_configuration() {
+        for untracked in [false, true] {
+            let case = if untracked { "untracked" } else { "modified" };
+            let owner = tempfile::tempdir().unwrap();
+            let root = owner.path().join("repository");
+            let source = owner.path().join("submodule-source");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::create_dir_all(&source).unwrap();
+
+            git(&source, &["init", "-q", "-b", "main"]);
+            git(&source, &["config", "user.name", "Auto cleanup test"]);
+            git(
+                &source,
+                &["config", "user.email", "auto-cleanup@example.invalid"],
+            );
+            std::fs::write(source.join("tracked.txt"), "initial child content\n").unwrap();
+            git(&source, &["add", "tracked.txt"]);
+            git(&source, &["commit", "-qm", "initial child commit"]);
+
+            git(&root, &["init", "-q", "-b", "main"]);
+            git(&root, &["config", "user.name", "Auto cleanup test"]);
+            git(
+                &root,
+                &["config", "user.email", "auto-cleanup@example.invalid"],
+            );
+            std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
+            std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+            git(&root, &["add", ".gitignore", "README.md"]);
+            git(&root, &["commit", "-qm", "superproject base"]);
+            let source_path = source.to_str().unwrap();
+            git(
+                &root,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    "--quiet",
+                    source_path,
+                    "sub",
+                ],
+            );
+            git(
+                &root,
+                &["config", "-f", ".gitmodules", "submodule.sub.ignore", "all"],
+            );
+            git(&root, &["add", "-A"]);
+            git(&root, &["commit", "-qm", "add child submodule"]);
+            git(&root, &["config", "diff.ignoreSubmodules", "all"]);
+            git(&root, &["config", "submodule.sub.ignore", "all"]);
+            git(&root, &["remote", "add", "origin", "."]);
+            git(
+                &root,
+                &["fetch", "-q", "origin", "main:refs/remotes/origin/main"],
+            );
+            git(&root, &["remote", "set-head", "origin", "main"]);
+
+            std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+            std::fs::write(
+                root.join(".aethyme/config.toml"),
+                "[cleanup]\nauto_remove = true\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.join(".aethyme/broker.toml"),
+                "[retention]\nclosed_worktrees_days = 1\nclosed_worktree_grace_hours = 0\nauto_cleanup_worktrees_on_finish = false\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\nartifact_sweep_interval_hours = 1\n",
+            )
+            .unwrap();
+
+            let storage = crate::test_storage::TestStorage::new();
+            let mut broker = storage.open(&root).unwrap();
+            let session = broker
+                .start_worktree("dirty child submodule", None)
+                .unwrap();
+            let worktree = Path::new(&session.worktree_path);
+            assert_eq!(
+                GitRepo::discover(worktree).unwrap().head_commit().unwrap(),
+                GitRepo::discover(&root).unwrap().head_commit().unwrap(),
+                "the superproject commit is already the parent checkout HEAD"
+            );
+            git(
+                worktree,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "update",
+                    "--init",
+                    "--quiet",
+                    "--",
+                    "sub",
+                ],
+            );
+            broker
+                .close_abandoning_unpushed(session.id, "automatic cleanup regression")
+                .unwrap();
+
+            let child = worktree.join("sub");
+            let dirty_path = if untracked {
+                let path = child.join("new.txt");
+                std::fs::write(&path, "new child content\n").unwrap();
+                path
+            } else {
+                let path = child.join("tracked.txt");
+                std::fs::write(&path, "changed child content\n").unwrap();
+                path
+            };
+
+            let expected_path = worktree.to_string_lossy().into_owned();
+            let report = broker.auto_remove_disposable_checkouts(None).unwrap();
+            assert!(report.removed.is_empty(), "{case}");
+            assert!(
+                report.kept.iter().any(|kept| {
+                    kept.worktree == expected_path
+                        && kept.reason.contains("uncommitted or untracked path(s)")
+                }),
+                "{case}: {:?}",
+                report.kept
+            );
+            assert!(worktree.is_dir(), "{case} worktree was removed");
+            assert!(dirty_path.is_file(), "{case} child data was removed");
+        }
     }
 
     #[cfg(unix)]
