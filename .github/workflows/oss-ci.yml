@@ -308,6 +308,22 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: bash .github/scripts/validate-performance-fast-lane.sh
 
+      - name: Run broker performance controls in the full lane
+        if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}
+        working-directory: ${{ github.workspace }}
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 -m unittest discover \
+            -s packages/aethyme-eval/benchmarks/performance \
+            -p 'test_broker_latency.py' -v
+          python3 -m unittest discover \
+            -s packages/aethyme-eval/benchmarks/performance \
+            -p 'test_broker_concurrent_submit.py' -v
+          python3 -m unittest discover \
+            -s packages/aethyme-eval/benchmarks/performance \
+            -p 'test_git_worktree_config.py' -v
+
       - name: Install cargo-nextest
         if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}
         uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
