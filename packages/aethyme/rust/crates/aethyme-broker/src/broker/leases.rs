@@ -3105,8 +3105,7 @@ mod generic_guarded_exec_tests {
         let command = vec![
             "/bin/sh".into(),
             "-c".into(),
-            "touch \"$READY_FILE\"; while [ ! -e \"$RELEASE_FILE\" ]; do /bin/sleep 0.01; done"
-                .into(),
+            "touch \"$READY_FILE\"; i=0; while [ ! -e \"$RELEASE_FILE\" ] && [ \"$i\" -lt 1000 ]; do i=$((i + 1)); /bin/sleep 0.01; done; [ -e \"$RELEASE_FILE\" ]".into(),
         ];
         let environment = vec![
             ("READY_FILE".into(), ready.to_string_lossy().into_owned()),
