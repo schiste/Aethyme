@@ -62,16 +62,16 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
         .collect::<Vec<_>>();
     assert_eq!(
         rust_conditions.len(),
-        10,
-        "the Rust job has one PR guard, seven full-suite guards, one shared parity guard and one performance validation guard"
+        11,
+        "the Rust job has one PR guard, eight full-lane guards, one shared parity guard and one performance validation guard"
     );
     assert_eq!(
         rust_conditions
             .iter()
             .filter(|line| **line == "if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}")
             .count(),
-        7,
-        "all expensive Rust steps must run when classification fails or selects the full suite"
+        8,
+        "seven Rust steps and the Python controls must run when classification fails or selects the full suite"
     );
     assert_eq!(
         rust_conditions
@@ -84,6 +84,45 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
 
     assert!(rust_conditions.contains(&"if: ${{ needs.classify_changes.result == 'success' && needs.classify_changes.outputs.performance_fast == 'true' }}"));
     assert!(rust.contains(&"        run: bash .github/scripts/validate-performance-fast-lane.sh"));
+
+    // The added lightweight coverage belongs to the full lane too. Pin its
+    // condition and exact suites, rather than only accepting another guard.
+    let rust_body = rust.join("\n");
+    let controls = block(
+        &rust_body,
+        "      - name: Run broker performance controls in the full lane",
+    );
+    assert_eq!(controls.iter().filter(|line| line.trim() == "if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}").count(), 1);
+    assert_eq!(
+        controls
+            .iter()
+            .filter(|line| line.trim() == "-s packages/aethyme-eval/benchmarks/performance \\")
+            .count(),
+        3
+    );
+    assert_eq!(
+        controls
+            .iter()
+            .filter(|line| line.trim().starts_with("python3 -m unittest discover"))
+            .count(),
+        3
+    );
+    assert_eq!(
+        controls
+            .iter()
+            .filter_map(|line| line.trim().strip_prefix("-p "))
+            .collect::<Vec<_>>(),
+        [
+            "'test_broker_latency.py' -v",
+            "'test_broker_concurrent_submit.py' -v",
+            "'test_git_worktree_config.py' -v",
+        ]
+    );
+    assert!(
+        !controls
+            .iter()
+            .any(|line| line.contains("cargo") || line.contains("go run"))
+    );
 
     // The cache warm-up compiles on pushes and never runs tests, so main
     // keeps exactly one automatic full-workspace owner: Aethyme Gates.
