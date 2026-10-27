@@ -2859,7 +2859,11 @@ mod unix {
 
         #[test]
         fn sidecar_metadata_diagnostics_identify_each_refusal_predicate() {
-            let regular_mode = libc::S_IFREG as u32 | 0o600;
+            let regular_file_type = u32::try_from(u64::from(libc::S_IFREG))
+                .expect("regular file type fits in ProbeMetadata");
+            let symlink_file_type = u32::try_from(u64::from(libc::S_IFLNK))
+                .expect("symlink file type fits in ProbeMetadata");
+            let regular_mode = regular_file_type | 0o600;
             let baseline = ProbeMetadata {
                 device: 1,
                 inode: 2,
@@ -2871,7 +2875,7 @@ mod unix {
             let cases = [
                 (
                     ProbeMetadata {
-                        mode: libc::S_IFLNK as u32 | 0o600,
+                        mode: symlink_file_type | 0o600,
                         ..baseline
                     },
                     SidecarMetadataViolation::NotRegularFile,
