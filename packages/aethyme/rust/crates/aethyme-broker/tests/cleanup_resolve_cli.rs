@@ -4,6 +4,7 @@
 #[path = "common/isolation.rs"]
 mod isolation;
 
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -304,6 +305,59 @@ fn pending_commits_are_carried_by_a_verified_bundle() {
 }
 
 #[test]
+fn untracked_newline_path_is_archived_without_truncating_the_inventory() {
+    let tmp = repo();
+    let (id, worktree) = closed_session(tmp.path(), "newline path fixture");
+    let relative = "untracked-line\nbreak.txt";
+    std::fs::write(worktree.join(relative), b"preserve newline path\n").unwrap();
+
+    let reviewed = plan(tmp.path(), &id);
+    assert_eq!(reviewed["untracked_files"].as_array().unwrap().len(), 1);
+    assert_eq!(reviewed["untracked_files"][0]["path"], relative);
+    let outcome = json(&apply(
+        tmp.path(),
+        &id,
+        reviewed["digest"].as_str().unwrap(),
+    ));
+    assert_eq!(outcome["worktree_removed"], true);
+    let archive = PathBuf::from(outcome["archive"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read(archive.join("untracked").join(relative)).unwrap(),
+        b"preserve newline path\n"
+    );
+}
+
+#[test]
+fn non_utf8_untracked_path_refuses_archive_resolution_before_cleanup() {
+    let tmp = repo();
+    let (id, worktree) = closed_session(tmp.path(), "non-utf8 path fixture");
+    let name = std::ffi::OsString::from_vec(b"untracked-\xff.txt".to_vec());
+    let path = worktree.join(name);
+    std::fs::write(&path, b"must remain").unwrap();
+
+    let error = refused_plan(tmp.path(), &id);
+    assert!(
+        error.contains("non-UTF-8 NUL-separated porcelain status"),
+        "{error}"
+    );
+    assert!(
+        path.is_file(),
+        "the unrepresentable file remains in the worktree"
+    );
+    let archive_root = tmp
+        .path()
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join("host-state/recovery-archives");
+    assert!(
+        archive_entries(&archive_root).is_empty(),
+        "no archive was created"
+    );
+}
+
+#[test]
 fn a_stale_digest_is_refused_and_nothing_moves() {
     let tmp = repo();
     let (id, worktree) = dirty_closed_session(tmp.path());
@@ -321,47 +375,128 @@ fn a_stale_digest_is_refused_and_nothing_moves() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn protected_ignored_file_alone_refuses_archive_resolution() {
+fn a_permission_mode_change_after_review_invalidates_the_plan() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = repo();
+    let (id, worktree) = closed_session(tmp.path(), "mode-change fixture");
+    let executable = worktree.join("tool.sh");
+    std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o751)).unwrap();
+
+    let reviewed = plan(tmp.path(), &id);
+    assert_eq!(reviewed["untracked_files"][0]["mode"], 0o751);
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let refused = apply(tmp.path(), &id, reviewed["digest"].as_str().unwrap());
+    assert!(!refused.status.success());
+    assert!(json_error::message(&refused).contains("digest"));
+    assert!(worktree.is_dir());
+    assert!(executable.is_file());
+    assert!(archive_entries(&archive_root(tmp.path(), &reviewed)).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_untracked_executable_mode_survives_archive_and_documented_restore() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = repo();
+    let (id, worktree) = closed_session(tmp.path(), "executable restore fixture");
+    let executable = worktree.join("tool.sh");
+    std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o751)).unwrap();
+    let reviewed = plan(tmp.path(), &id);
+    let outcome = json(&apply(
+        tmp.path(),
+        &id,
+        reviewed["digest"].as_str().unwrap(),
+    ));
+    let archive = PathBuf::from(outcome["archive"].as_str().unwrap());
+    assert_eq!(
+        std::fs::metadata(archive.join("untracked/tool.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o751
+    );
+
+    let restored = tempfile::tempdir().unwrap();
+    git(
+        restored.path(),
+        &["clone", "-q", &tmp.path().to_string_lossy(), "."],
+    );
+    let copied = Command::new("cp")
+        .args(["-pR"])
+        .arg(archive.join("untracked/."))
+        .arg(".")
+        .current_dir(restored.path())
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    assert_eq!(
+        std::fs::metadata(restored.path().join("tool.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o751
+    );
+}
+
+#[test]
+fn protected_ignored_file_alone_is_archived_before_removal() {
     let tmp = repo();
     let (id, worktree) = closed_session(tmp.path(), "ignored-only fixture");
     let protected = worktree.join("private.txt");
     std::fs::write(&protected, "keep this file\n").unwrap();
 
-    let error = refused_plan(tmp.path(), &id);
-    assert!(
-        error.contains("archive resolution refuses protected ignored content"),
-        "{error}"
+    let reviewed = plan(tmp.path(), &id);
+    assert_eq!(reviewed["ignored_files"].as_array().unwrap().len(), 1);
+    assert_eq!(reviewed["ignored_files"][0]["path"], "private.txt");
+    assert_eq!(reviewed["ignored_bytes"], b"keep this file\n".len() as u64);
+    let outcome = json(&apply(
+        tmp.path(),
+        &id,
+        reviewed["digest"].as_str().unwrap(),
+    ));
+    assert_eq!(outcome["worktree_removed"], true);
+    assert!(!worktree.exists());
+    let archive = PathBuf::from(outcome["archive"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read(archive.join("ignored/private.txt")).unwrap(),
+        b"keep this file\n"
     );
-    assert!(error.contains("private.txt"), "{error}");
-    assert_eq!(std::fs::read(&protected).unwrap(), b"keep this file\n");
-    assert!(worktree.is_dir());
 }
 
 #[test]
-fn protected_ignored_file_with_dirty_work_refuses_archive_resolution() {
+fn protected_ignored_file_is_archived_alongside_dirty_work() {
     let tmp = repo();
     let (id, worktree) = dirty_closed_session(tmp.path());
     let protected = worktree.join("private.txt");
     std::fs::write(&protected, "keep alongside the patch\n").unwrap();
 
-    let error = refused_plan(tmp.path(), &id);
-    assert!(
-        error.contains("archive resolution refuses protected ignored content"),
-        "{error}"
-    );
-    assert!(error.contains("private.txt"), "{error}");
-    assert!(worktree.join("README.md").is_file());
-    assert!(worktree.join("notes/todo.txt").is_file());
+    let reviewed = plan(tmp.path(), &id);
+    assert_eq!(reviewed["ignored_files"].as_array().unwrap().len(), 1);
+    let outcome = json(&apply(
+        tmp.path(),
+        &id,
+        reviewed["digest"].as_str().unwrap(),
+    ));
+    assert_eq!(outcome["worktree_removed"], true);
+    let archive = PathBuf::from(outcome["archive"].as_str().unwrap());
     assert_eq!(
-        std::fs::read(&protected).unwrap(),
+        std::fs::read(archive.join("ignored/private.txt")).unwrap(),
         b"keep alongside the patch\n"
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn protected_ignored_symlink_refuses_without_following_its_target() {
+fn protected_ignored_symlink_is_archived_without_following_its_target() {
     let tmp = repo();
     let (id, worktree) = closed_session(tmp.path(), "ignored symlink fixture");
     let outside = tempfile::tempdir().unwrap();
@@ -370,17 +505,18 @@ fn protected_ignored_symlink_refuses_without_following_its_target() {
     let link = worktree.join("private-link");
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
-    let error = refused_plan(tmp.path(), &id);
-    assert!(
-        error.contains("archive resolution refuses protected ignored content"),
-        "{error}"
-    );
-    assert!(error.contains("private-link"), "{error}");
-    assert!(
-        std::fs::symlink_metadata(&link)
-            .unwrap()
-            .file_type()
-            .is_symlink()
+    let reviewed = plan(tmp.path(), &id);
+    assert_eq!(reviewed["ignored_files"].as_array().unwrap().len(), 1);
+    let outcome = json(&apply(
+        tmp.path(),
+        &id,
+        reviewed["digest"].as_str().unwrap(),
+    ));
+    assert_eq!(outcome["worktree_removed"], true);
+    let archive = PathBuf::from(outcome["archive"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read_link(archive.join("ignored/private-link")).unwrap(),
+        target
     );
     assert_eq!(std::fs::read(&target).unwrap(), b"outside data\n");
 }
@@ -400,10 +536,6 @@ fn strict_cleanup_policy_refuses_ignored_directory_during_archive_resolution() {
     std::fs::write(ignored.join("private.bin"), b"retain under strict policy").unwrap();
 
     let error = refused_plan(tmp.path(), &id);
-    assert!(
-        error.contains("archive resolution refuses protected ignored content"),
-        "{error}"
-    );
     assert!(
         error.contains("strict cleanup requires no ignored leftovers"),
         "{error}"

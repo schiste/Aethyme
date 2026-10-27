@@ -128,6 +128,16 @@ blocked.
    dependency state; use the read-only lease plan to recheck scope before a
    later retry.
 
+   Cleanup and archive inventories are deletion proofs: path enumeration must
+   preserve every path or fail closed. Do not use a parser that silently drops
+   newline or non-UTF-8 paths; use lossless NUL-delimited bytes and reject paths
+   the consumer cannot represent.
+   Treat the proof as a complete literal Git path census plus committed file
+   type and mode evidence; diff-rendering settings are not source identity.
+   Before deleting a source checkout after archiving, sync archive files and
+   directories bottom-up; after publishing the final archive, sync its
+   directory, parent and storage anchor. Keep the source if any sync fails.
+
    Orchestration with no path -- a release, a merge chain -- is claimed by
    name instead: `aethyme broker advanced ownership claim "release v1.2.0"
    --session <your-session-id> --reason "<why>"`. `status` shows every claim,
