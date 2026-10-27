@@ -1464,4 +1464,24 @@ mod finish_lease_query_tests {
                 .is_empty()
         );
     }
+
+    #[test]
+    fn generic_path_release_still_releases_explicit_and_implicit_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open(&temp.path().join("broker.db")).unwrap();
+        let session = store
+            .register_session(&new_session("path-wide-release", temp.path()))
+            .unwrap();
+        let path = "src/shared.rs";
+
+        store.claim_lease(session.id, path, None).unwrap();
+        store
+            .set_implicit_leases(session.id, &[path.to_owned()])
+            .unwrap();
+        store.release_lease(session.id, path).unwrap();
+
+        let leases = store.session_leases(session.id).unwrap();
+        assert_eq!(leases.len(), 2);
+        assert!(leases.iter().all(|lease| lease.released_at.is_some()));
+    }
 }

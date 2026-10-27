@@ -197,6 +197,56 @@ fn a_verified_finish_releases_every_lease_with_its_generation_on_record() {
 }
 
 #[test]
+fn explicit_cli_release_preserves_a_same_path_implicit_lease() {
+    let fx = fixture();
+    let session = fx.session_claiming("release explicit only", &[PATH]);
+    {
+        let mut store = BrokerStore::open_in_repo(&fx.repo).unwrap();
+        store
+            .set_implicit_leases(session, &[PATH.to_owned()])
+            .unwrap();
+    }
+
+    let session_id = session.to_string();
+    let output = fx.run(&[
+        "advanced",
+        "leases",
+        "release",
+        PATH,
+        "--session",
+        &session_id,
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "leases release: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["released"], PATH);
+
+    let store = BrokerStore::open_in_repo(&fx.repo).unwrap();
+    let leases = store.session_leases(session).unwrap();
+    assert_eq!(leases.len(), 2);
+    let explicit = leases
+        .iter()
+        .find(|lease| lease.kind.as_str() == "explicit")
+        .unwrap();
+    let implicit = leases
+        .iter()
+        .find(|lease| lease.kind.as_str() == "implicit")
+        .unwrap();
+    assert!(
+        explicit.released_at.is_some(),
+        "explicit claim should release"
+    );
+    assert!(
+        implicit.released_at.is_none(),
+        "implicit row should remain active"
+    );
+}
+
+#[test]
 fn a_refused_finish_keeps_every_lease() {
     let fx = fixture();
     let session = fx.session_claiming("unfinished", &[PATH]);

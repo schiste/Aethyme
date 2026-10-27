@@ -416,7 +416,7 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
             let session = parsed.session.ok_or(UsageError::Message(
                 "release requires --session <id>".into(),
             ))?;
-            broker.store().release_lease(session, path)?;
+            broker.store().release_explicit_lease(session, path)?;
             if parsed.json {
                 out!("{{\"released\":{}}}", serde_json::to_string(path)?);
             } else {
