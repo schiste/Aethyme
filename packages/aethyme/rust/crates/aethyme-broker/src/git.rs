@@ -5341,7 +5341,8 @@ fn ignored_paths_git_command(root: &Path, args: &[&str]) -> Command {
     command
         .args(args)
         .current_dir(root)
-        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    command
 }
 
 fn ensure_ignored_listing_before(deadline: Instant, args: &[&str]) -> Result<(), GitError> {
