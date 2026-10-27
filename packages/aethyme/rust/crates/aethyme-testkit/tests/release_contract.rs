@@ -5,6 +5,7 @@ use aethyme_testkit::bins::{aethyme_bin, engine_bin};
 use aethyme_testkit::paths::rust_workspace_root;
 
 const RELEASE_BINARY_DIR_ENV: &str = "AETHYME_RELEASE_BINARY_DIR";
+const RELEASE_HELPER_BINARY_DIR_ENV: &str = "AETHYME_RELEASE_HELPER_BINARY_DIR";
 
 const PRODUCTION_CRATES: &[&str] = &[
     "aethyme-broker",
@@ -105,6 +106,27 @@ fn version_binary(
     Ok(path)
 }
 
+fn release_helper_binary(
+    name: &str,
+    release_helper_binary_dir: Option<PathBuf>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(release_helper_binary_dir) = release_helper_binary_dir else {
+        return Ok(None);
+    };
+    if release_helper_binary_dir.as_os_str().is_empty() {
+        return Err(format!("{RELEASE_HELPER_BINARY_DIR_ENV} is set but empty"));
+    }
+
+    let path = release_helper_binary_dir.join(release_binary_filename(name));
+    if !path.is_file() {
+        return Err(format!(
+            "{RELEASE_HELPER_BINARY_DIR_ENV} is set but the release helper is missing: {}",
+            path.display()
+        ));
+    }
+    Ok(Some(path))
+}
+
 #[test]
 fn release_binary_override_selects_existing_artifact_without_fallback() {
     let directory = tempfile::tempdir().unwrap();
@@ -139,6 +161,30 @@ fn release_binary_override_refuses_missing_artifact_without_fallback() {
     assert!(error.contains(RELEASE_BINARY_DIR_ENV));
     assert!(error.contains("aethyme-engine-cli"));
     assert!(!fallback_called);
+}
+
+#[test]
+fn release_helper_binary_override_selects_the_existing_artifact() {
+    let directory = tempfile::tempdir().unwrap();
+    let expected = directory
+        .path()
+        .join(release_binary_filename("release_manifest"));
+    std::fs::write(&expected, b"fixture helper binary").unwrap();
+
+    let actual =
+        release_helper_binary("release_manifest", Some(directory.path().to_path_buf())).unwrap();
+
+    assert_eq!(actual, Some(expected));
+}
+
+#[test]
+fn release_helper_binary_override_refuses_a_missing_artifact() {
+    let directory = tempfile::tempdir().unwrap();
+    let error = release_helper_binary("homebrew_formula", Some(directory.path().to_path_buf()))
+        .unwrap_err();
+
+    assert!(error.contains(RELEASE_HELPER_BINARY_DIR_ENV));
+    assert!(error.contains("homebrew_formula"));
 }
 
 fn is_full_git_sha(value: &str) -> bool {
@@ -252,6 +298,19 @@ fn production_crates_and_binaries_share_the_release_version() {
             }
         }
         _ => panic!("AETHYME_RELEASE_TAG and AETHYME_RELEASE_COMMIT must be set together"),
+    }
+}
+
+#[test]
+fn configured_release_helper_directory_contains_both_helpers() {
+    let Some(directory) = std::env::var_os(RELEASE_HELPER_BINARY_DIR_ENV).map(PathBuf::from) else {
+        return;
+    };
+
+    for helper in ["release_manifest", "homebrew_formula"] {
+        release_helper_binary(helper, Some(directory.clone()))
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|| panic!("{RELEASE_HELPER_BINARY_DIR_ENV} unexpectedly unset"));
     }
 }
 
@@ -403,26 +462,45 @@ fn release_workflow_uses_ephemeral_checkouts_and_source_sha_contract() {
         );
     }
 
-    let contract_step = workflow
-        .split("- name: Verify release version contract")
-        .nth(1)
-        .and_then(|tail| tail.split("\n      - ").next())
-        .expect("release workflow must run the release version contract");
+    let contract_step = workflow_step_block(workflow, "Verify release version contract");
+    assert!(contract_step.contains("if: matrix.target != 'x86_64-unknown-linux-gnu'"));
     assert!(contract_step.contains("AETHYME_RELEASE_TAG: ${{ github.ref_name }}"));
     assert!(contract_step.contains("AETHYME_RELEASE_COMMIT: ${{ github.sha }}"));
     assert!(contract_step.contains(
         "AETHYME_RELEASE_BINARY_DIR: ${{ github.workspace }}/packages/aethyme/rust/target/${{ matrix.target }}/release"
     ));
 
+    let helper_contract_step = workflow_step_block(workflow, "Verify release helper contract");
+    assert!(helper_contract_step.contains("if: matrix.target == 'x86_64-unknown-linux-gnu'"));
+    assert!(helper_contract_step.contains("AETHYME_RELEASE_TAG: ${{ github.ref_name }}"));
+    assert!(helper_contract_step.contains("AETHYME_RELEASE_COMMIT: ${{ github.sha }}"));
+    assert!(helper_contract_step.contains(
+        "AETHYME_RELEASE_BINARY_DIR: ${{ github.workspace }}/packages/aethyme/rust/target/${{ matrix.target }}/release"
+    ));
+    assert!(helper_contract_step.contains(
+        "AETHYME_RELEASE_HELPER_BINARY_DIR: ${{ github.workspace }}/packages/aethyme/rust/target/${{ matrix.target }}/release/examples"
+    ));
+    assert!(
+        workflow_step_block(workflow, "Build release manifest helpers")
+            .contains("if: matrix.target == 'x86_64-unknown-linux-gnu'")
+    );
+
     let matrix_release_build = workflow
         .find("cargo build --release --locked --target \"${{ matrix.target }}\"")
         .expect("release binaries must be built for the matrix target");
-    let contract_step_position = workflow
-        .find("- name: Verify release version contract")
-        .expect("release version contract step must be present");
+    let helper_build_step_position = workflow
+        .find("- name: Build release manifest helpers")
+        .expect("release helpers must be built in the native Linux release job");
+    let helper_contract_step_position = workflow
+        .find("- name: Verify release helper contract")
+        .expect("release helper binaries must be checked before upload");
     assert!(
-        matrix_release_build < contract_step_position,
-        "the release contract must inspect binaries after they are built"
+        matrix_release_build < helper_build_step_position,
+        "release helper binaries must be built after the shipped broker pair"
+    );
+    assert!(
+        helper_build_step_position < helper_contract_step_position,
+        "the release helper contract must inspect binaries after they are built"
     );
 }
 
@@ -432,10 +510,54 @@ fn release_workflow_renders_the_homebrew_formula_from_the_manifest() {
         aethyme_testkit::paths::repo_root().join(".github/workflows/release.yml"),
     )
     .unwrap();
-    let manifest_position = workflow.find("--example release_manifest").unwrap();
-    let formula_position = workflow.find("--example homebrew_formula").unwrap();
+    let helper_build = workflow_step_script(workflow, "Build release manifest helpers");
+    assert!(
+        workflow_step_block(workflow, "Build release manifest helpers")
+            .contains("if: matrix.target == 'x86_64-unknown-linux-gnu'")
+    );
+    assert!(
+        helper_build
+            .contains("-p aethyme-broker --example release_manifest --example homebrew_formula")
+    );
+    assert!(
+        helper_build.contains("printf '%s\\n' \"$GITHUB_SHA\" > \"$helper_stage_dir/source.sha\"")
+    );
+    assert!(helper_build.contains("sha256sum release_manifest homebrew_formula > SHA256SUMS"));
+
+    let download_products = workflow_step_script(workflow, "Download artifacts");
+    assert!(download_products.contains("--pattern 'aethyme-*' --dir dist"));
+    assert!(download_products.contains("test \"$tar_count\" = \"5\""));
+    assert!(download_products.contains("test \"$windows_count\" = \"1\""));
+
+    let download_helpers = workflow_step_script(workflow, "Download release helper artifact");
+    assert!(download_helpers.contains("--name \"release-helpers-${GITHUB_SHA}\""));
+    assert!(download_helpers.contains("--dir \"$helper_artifact_dir\""));
+    assert!(download_helpers.contains("test \"$helper_source_sha\" = \"$GITHUB_SHA\""));
+    assert!(download_helpers.contains("sha256sum --check SHA256SUMS"));
+    assert!(download_helpers.contains("test ! -e dist/release_manifest"));
+    assert!(download_helpers.contains("test ! -e dist/homebrew_formula"));
+
+    let upload_helpers = workflow_step_block(workflow, "Upload release helper artifact");
+    assert!(upload_helpers.contains("if: matrix.target == 'x86_64-unknown-linux-gnu'"));
+    assert!(upload_helpers.contains("name: release-helpers-${{ github.sha }}"));
+    assert!(upload_helpers.contains(
+        "path: packages/aethyme/rust/target/${{ matrix.target }}/release-helpers.tar.gz"
+    ));
+    assert!(!upload_helpers.contains("name: aethyme-release-helpers-"));
+
+    let build_manifest = workflow_step_script(workflow, "Build release manifest and checksums");
+    let manifest_position = build_manifest
+        .find("\"$AETHYME_RELEASE_HELPER_DIR/release_manifest\"")
+        .unwrap();
+    let formula_position = build_manifest
+        .find("\"$AETHYME_RELEASE_HELPER_DIR/homebrew_formula\"")
+        .unwrap();
 
     assert!(manifest_position < formula_position);
+    assert!(workflow.contains("name: release-helpers-${{ github.sha }}"));
+    assert!(!workflow.contains("name: aethyme-release-helpers-"));
+    assert!(workflow.contains("files: dist/*"));
+    assert!(!build_manifest.contains("cargo run"));
     assert!(workflow.contains("*-*) release_channel=preview"));
     assert!(workflow.contains("--channel \"$release_channel\""));
     assert!(workflow.contains("if [ \"$release_channel\" = stable ]; then"));
