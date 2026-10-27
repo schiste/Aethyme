@@ -19,6 +19,7 @@ from broker_concurrent_submit import (
     BoundedCommandRunner,
     MAX_BINARY_BYTES,
     MAX_OUTPUT_BYTES,
+    MAX_STDERR_BYTES,
     MAX_STDOUT_BYTES,
     ReceiptLog,
     canonical_json_bytes,
@@ -49,6 +50,12 @@ MAX_TREE_PATH_BYTES = 8 * 1024 * 1024
 MAX_TREE_DEPTH = 64
 WORKTREE_REPO = 'playground/latency'
 REMOTE_URL = 'git@github.com:playground/latency.git'
+FETCH_REMOTE = 'perf-local'
+FETCH_SOURCE_REF = 'refs/heads/perf-proven'
+FETCH_DESTINATION_REF = f'refs/remotes/{FETCH_REMOTE}/perf-proven'
+BASELINE_UNSUPPORTED_FETCH_OPTIONS = (
+    '--no-auto-maintenance', '--no-write-commit-graph', '--no-prune', '--no-prune-tags',
+)
 UNPROVABLE_FETCH_REASON = (
     'A safe public-CLI injection cannot yet prove that the provider ran while '
     'withholding its exit witness; no command or synthetic journal was created.'
@@ -255,13 +262,13 @@ def load_v41_context(path, baseline_identity):
                 or not isinstance(engine.get('sha256'), str)
                 or not re.fullmatch(r'[0-9a-f]{64}', cli.get('sha256', ''))
                 or not re.fullmatch(r'[0-9a-f]{64}', engine.get('sha256', ''))):
-            raise ValueError('v0.8.41 live reference has malformed signed pair hashes')
+            raise ValueError('v0.8.41 live reference has malformed binary-pair hashes')
         observed_pairs.add((cli['sha256'], engine['sha256']))
     if len(observed_pairs) != 1:
         raise ValueError('v0.8.41 live reference roots do not agree on one binary pair')
     pair = next(iter(observed_pairs))
     if pair != (baseline_identity['cli_sha256'], baseline_identity['engine_sha256']):
-        raise ValueError('baseline executable pair does not match the v0.8.41 signed receipt')
+        raise ValueError('baseline executable pair does not match the retained v0.8.41 reference')
     rollout = {}
     real_commit = report.get('real_commit')
     if isinstance(real_commit, dict):
@@ -389,6 +396,8 @@ def action_playground(name, binary, git, sample_output, command_timeout_seconds)
         seed_tree = run_git(runner, git, repo, f'{name}:seed-tree', 'rev-parse',
                             f'{baseline}^{{tree}}').strip()
         run_git(runner, git, repo, f'{name}:add-origin', 'remote', 'add', 'origin', REMOTE_URL)
+        run_git(runner, git, repo, f'{name}:add-local-fetch-remote', 'remote', 'add',
+                FETCH_REMOTE, str(remote))
         run_git(runner, git, repo, f'{name}:publish-main', 'push', '-q', 'origin', 'main')
         run_git(runner, git, repo, f'{name}:publish-provable-fetch-ref', 'push', '-q', 'origin',
                 'main:refs/heads/perf-proven')
@@ -524,7 +533,7 @@ def _run_slow_hook_commits(playground, sessions, timings, semantic, hold_ms):
     }
 
 
-def _operation_json(row):
+def _operation_report(row):
     payload = _json(row, 'coordinated Git operation')
     operation = payload.get('operation') if isinstance(payload, dict) else None
     if not isinstance(operation, dict):
@@ -532,7 +541,7 @@ def _operation_json(row):
     operation_id = operation.get('id')
     if isinstance(operation_id, bool) or not isinstance(operation_id, int) or operation_id <= 0:
         raise RuntimeError('coordinated Git result has an invalid operation id')
-    return operation
+    return payload, operation
 
 
 FETCH_FLAGS = [
@@ -542,60 +551,361 @@ FETCH_FLAGS = [
 ]
 
 
-def _run_provable_fetch(playground, sessions, timings, semantic):
+def _fetch_profile_witness(payload, expected):
+    operation = payload.get('operation') if isinstance(payload, dict) else None
+    target = payload.get('resolved_target') if isinstance(payload, dict) else None
+    if not isinstance(operation, dict) or not isinstance(target, dict):
+        raise RuntimeError('fetch omitted its operation or resolved-remote identity')
+    operation_id = operation.get('id')
+    session_id = operation.get('session_id')
+    if (isinstance(operation_id, bool) or not isinstance(operation_id, int)
+            or operation_id <= 0
+            or isinstance(session_id, bool) or not isinstance(session_id, int)
+            or operation.get('provider') != 'git'
+            or operation.get('session_id') != expected['session_id']
+            or operation.get('status') != 'succeeded'
+            or operation.get('repository') != expected['repository']):
+        raise RuntimeError('fetch operation identity or successful status did not match')
+    try:
+        command = json.loads(operation['command_json'])
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError('fetch operation omitted its recorded Git argv') from error
+    if command != ['git', *expected['expected_args']]:
+        raise RuntimeError('fetch operation did not record the exact bounded argv profile')
+    evidence = target.get('evidence')
+    fetch_evidence = evidence.get('fetch') if isinstance(evidence, dict) else None
+    push_evidence = evidence.get('push') if isinstance(evidence, dict) else None
+    if (target.get('remote_name') != expected['remote_name']
+            or target.get('normalized_host') != 'local'
+            or target.get('repository_path') != expected['remote_path']
+            or target.get('coordination_key') != expected['repository']
+            or target.get('caller_assertion') is not None
+            or not isinstance(evidence, dict)
+            or evidence.get('caller_assertion') != 'not_supplied'
+            or evidence.get('identity') != 'fetch_and_push_matched'
+            or not isinstance(fetch_evidence, dict)
+            or fetch_evidence.get('syntax') != 'local_path'
+            or not isinstance(push_evidence, dict)
+            or push_evidence.get('syntax') != 'local_path'):
+        raise RuntimeError('fetch operation did not bind the expected local-path identity')
+
+    details_raw = operation.get('details_json')
+    if details_raw is None:
+        return None
+    if not isinstance(details_raw, str):
+        raise RuntimeError('fetch operation details were not serialized JSON')
+    try:
+        details = json.loads(details_raw)
+    except json.JSONDecodeError as error:
+        raise RuntimeError('fetch operation details were malformed') from error
+    journal = details.get('fetch_reconciliation') if isinstance(details, dict) else None
+    if journal is None:
+        return None
+    if not isinstance(journal, dict):
+        raise RuntimeError('fetch reconciliation proof was not an object')
+    footprint = journal.get('footprint')
+    expected_footprint = {
+        'remote': expected['remote_name'],
+        'source_ref': expected['source_ref'],
+        'destination_ref': expected['destination_ref'],
+    }
+    common_raw = journal.get('common_directory')
+    if not isinstance(common_raw, str) or not Path(common_raw).is_absolute():
+        raise RuntimeError('fetch proof common-directory path was not absolute')
+    try:
+        common_directory = Path(common_raw).resolve(strict=True)
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        raise RuntimeError('fetch proof common-directory identity was unavailable') from error
+    provider = journal.get('provider')
+    completion = journal.get('completion')
+    if not isinstance(provider, dict) or not isinstance(completion, dict):
+        raise RuntimeError('fetch proof omitted its actual provider completion witness')
+    provider_pid = provider.get('pid')
+    provider_group = provider.get('process_group')
+    provider_start = provider.get('start_time')
+    completion_pid = completion.get('pid')
+    completion_exit = completion.get('exit_code')
+    schema_version = journal.get('schema_version')
+    common_device = journal.get('common_device')
+    common_inode = journal.get('common_inode')
+    if (isinstance(schema_version, bool) or schema_version != 1
+            or isinstance(journal.get('operation_id'), bool)
+            or not isinstance(journal.get('operation_id'), int)
+            or journal.get('operation_id') != operation_id
+            or journal.get('repository') != expected['repository']
+            or footprint != expected_footprint
+            or not common_directory.is_absolute()
+            or common_directory != expected['common_directory']
+            or isinstance(common_device, bool) or not isinstance(common_device, int)
+            or common_device != expected['common_device']
+            or isinstance(common_inode, bool) or not isinstance(common_inode, int)
+            or common_inode != expected['common_inode']
+            or journal.get('pre_destination') is not None
+            or isinstance(provider_pid, bool) or not isinstance(provider_pid, int)
+            or provider_pid <= 1
+            or isinstance(provider_group, bool) or not isinstance(provider_group, int)
+            or provider_group <= 1
+            or isinstance(provider_start, bool) or not isinstance(provider_start, int)
+            or provider_start <= 0
+            or not isinstance(provider.get('start_time_clock'), str)
+            or not provider['start_time_clock']
+            or isinstance(completion_pid, bool) or not isinstance(completion_pid, int)
+            or completion_pid != provider_pid
+            or completion.get('success') is not True
+            or isinstance(completion_exit, bool) or not isinstance(completion_exit, int)
+            or completion_exit != 0
+            or isinstance(completion.get('observed_at'), bool)
+            or not isinstance(completion.get('observed_at'), int)
+            or completion['observed_at'] <= 0):
+        raise RuntimeError('fetch reconciliation proof did not match the exact completed profile')
+    return {
+        'schema_version': 1,
+        'provider_pid': provider_pid,
+        'provider_start_time': provider_start,
+        'completion_observed_at': completion['observed_at'],
+    }
+
+
+def _missing_fetch_witness_semantic(role, operation_id, duration_ms):
+    if role == 'candidate':
+        raise RuntimeError('candidate omitted durable strict-fetch completion evidence')
+    if role != 'baseline':
+        raise RuntimeError(f'unknown strict-fetch measurement role: {role}')
+    return {
+        'status': 'unsupported',
+        'reason': 'baseline completed the fetch but did not persist fetch_reconciliation schema 1',
+        'operation_id': operation_id,
+        'observed_command_duration_ms': duration_ms,
+        'comparison_eligible': False,
+    }
+
+
+def _baseline_unsupported_fetch_option(role, receipt, expected_argv):
+    if role != 'baseline' or not isinstance(receipt, dict):
+        return None
+    exit_code = receipt.get('exit_code')
+    if (receipt.get('label') != 'action:fetch_provable'
+            or receipt.get('argv') != expected_argv
+            or isinstance(exit_code, bool) or not isinstance(exit_code, int)
+            or exit_code <= 0
+            or receipt.get('failure') != f'command exited with status {exit_code}'
+            or receipt.get('stdout_complete') is not False
+            or receipt.get('stdout_utf8_valid') is not True
+            or not isinstance(receipt.get('stdout'), str)
+            or not isinstance(receipt.get('stderr'), str)):
+        return None
+    for field, limit in (('stdout_bytes', MAX_STDOUT_BYTES),
+                         ('stderr_bytes', MAX_STDERR_BYTES)):
+        size = receipt.get(field)
+        if (isinstance(size, bool) or not isinstance(size, int)
+                or size < 0 or size > limit):
+            return None
+    duration = receipt.get('duration_ms')
+    if (isinstance(duration, bool) or not isinstance(duration, (int, float))
+            or not math.isfinite(duration) or duration < 0):
+        return None
+    for field in ('stdout_sha256', 'stderr_sha256'):
+        digest = receipt.get(field)
+        if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
+            return None
+    output = f"{receipt['stdout']}\n{receipt['stderr']}"
+    for option in BASELINE_UNSUPPORTED_FETCH_OPTIONS:
+        refusal = (
+            f'unsupported fetch option "{option}" prevents deterministic remote resolution')
+        if refusal in output:
+            return option
+    return None
+
+
+def _run_provable_fetch(playground, sessions, timings, semantic, role):
     _validate_fixture_git_environment(playground['runner'].env)
     session = sessions['fetch_provable']
+    repo = Path(playground['repo'])
+    worktree = Path(session['worktree'])
+    remote_path = Path(playground['remote']).resolve(strict=True)
+    expected_repository_path = remote_path.as_posix().removesuffix('.git').rstrip('/')
+    expected_repository = f'local:{expected_repository_path}'
+    expected_ref = FETCH_DESTINATION_REF
+    before_ref = run_git(
+        playground['runner'], playground['git'], worktree,
+        'fetch-proven:pre-ref', 'for-each-ref', '--count=2',
+        '--format=%(refname) %(objectname)', '--', expected_ref).strip()
+    if before_ref:
+        raise RuntimeError('strict-fetch destination unexpectedly existed before the sample')
+    common_raw = run_git(playground['runner'], playground['git'], worktree,
+                         'fetch-proven:common-directory', 'rev-parse',
+                         '--git-common-dir').strip()
+    common_directory = Path(common_raw)
+    if not common_directory.is_absolute():
+        common_directory = worktree / common_directory
+    common_directory = common_directory.resolve(strict=True)
+    common_metadata = common_directory.stat()
+    source_ref = FETCH_SOURCE_REF
+    refspec = f'{source_ref}:{expected_ref}'
     args = [
         'broker', 'advanced', 'git', '--session', str(session['id']),
-        '--repo', WORKTREE_REPO, '--effect', 'write', '--scope', 'fetch',
+        '--effect', 'write', '--scope', 'fetch',
         '--reason', 'synthetic paired action measurement', '--json', '--',
-        'fetch', *FETCH_FLAGS, 'origin',
-        'refs/heads/perf-proven:refs/remotes/origin/perf-proven',
+        'fetch', *FETCH_FLAGS, '--', FETCH_REMOTE, refspec,
     ]
-    row = _cli(playground, args, session['worktree'], 'action:fetch_provable')
-    operation = _operation_json(row)
+    ssh_command = run_git(playground['runner'], playground['git'], repo,
+                           'fetch-proven:read-fixture-ssh-command',
+                           'config', '--get', 'core.sshCommand').strip()
+    if not ssh_command:
+        raise RuntimeError('the fixture SSH shim was not configured before strict fetch')
+    run_git(playground['runner'], playground['git'], repo,
+            'fetch-proven:disable-ssh-override', 'config', '--unset', 'core.sshCommand')
+    try:
+        expected_argv = [str(playground['binary']), *args]
+        try:
+            row = _cli(playground, args, worktree, 'action:fetch_provable')
+        except RuntimeError:
+            receipt = playground['runner'].receipts.rows[-1] \
+                if playground['runner'].receipts.rows else None
+            unsupported_option = _baseline_unsupported_fetch_option(
+                role, receipt, expected_argv)
+            if unsupported_option is None:
+                raise
+            refusal_reason = (
+                f'baseline CLI refused strict-fetch option {unsupported_option} before '
+                'deterministic remote resolution; no fetch operation was created')
+            semantic['fetch_provable'] = {
+                'status': 'unsupported',
+                'reason': refusal_reason,
+                'unsupported_option': unsupported_option,
+                'observed_command_duration_ms': receipt['duration_ms'],
+                'comparison_eligible': False,
+            }
+            semantic['fetch_recovery_show'] = {
+                'status': 'unsupported',
+                'reason': refusal_reason + '; operation readback was not attempted',
+                'comparison_eligible': False,
+            }
+            return
+    finally:
+        run_git(playground['runner'], playground['git'], repo,
+                'fetch-proven:restore-ssh-override', 'config', 'core.sshCommand', ssh_command)
+    payload, operation = _operation_report(row)
     if operation.get('status') != 'succeeded':
         raise RuntimeError('provable fetch did not have a succeeded operation status')
     actual_ref = run_git(playground['runner'], playground['git'],
-                         Path(session['worktree']), 'fetch-proven:verify-ref',
-                         'rev-parse', '--verify', 'refs/remotes/origin/perf-proven').strip()
+                         worktree, 'fetch-proven:verify-ref',
+                         'rev-parse', '--verify', expected_ref).strip()
     if actual_ref != playground['baseline_commit']:
         raise RuntimeError('fetch did not update exactly the pinned remote-tracking ref')
-    _record(timings, 'fetch_provable', row)
+    witness = _fetch_profile_witness(payload, {
+        'session_id': session['id'],
+        'repository': expected_repository,
+        'remote_path': expected_repository_path,
+        'remote_name': FETCH_REMOTE,
+        'source_ref': source_ref,
+        'destination_ref': expected_ref,
+        'common_directory': common_directory,
+        'common_device': common_metadata.st_dev,
+        'common_inode': common_metadata.st_ino,
+        'expected_args': ['fetch', *FETCH_FLAGS, '--', FETCH_REMOTE, refspec],
+    })
+    if witness is None:
+        semantic['fetch_provable'] = _missing_fetch_witness_semantic(
+            role, operation['id'], row['duration_ms'])
+    else:
+        _record(timings, 'fetch_provable', row)
+        semantic['fetch_provable'] = {
+            'status': 'verified',
+            'comparison_eligible': True,
+            'operation_id': operation['id'],
+            'operation_status': operation['status'],
+            'expected_remote_ref': expected_ref,
+            'expected_commit': playground['baseline_commit'],
+            'observed_commit': actual_ref,
+            'fetch_reconciliation_schema_version': witness['schema_version'],
+            'provider_pid': witness['provider_pid'],
+            'provider_start_time': witness['provider_start_time'],
+            'completion_observed_at': witness['completion_observed_at'],
+            'canonical_repository': expected_repository,
+            'remote_name': FETCH_REMOTE,
+            'git_environment': (
+                'fixture allowlist; inherited Git routing/configuration/SSH selectors absent; '
+                'local-path remote with no custom core.sshCommand during fetch'),
+        }
     show = _cli(playground,
                 ['broker', 'advanced', 'operations', 'show', str(operation['id']), '--json'],
                 playground['repo'], 'action:fetch_recovery_show')
     shown = _json(show, 'fetch recovery operation show')
     recovered = shown.get('operation') if isinstance(shown, dict) else None
     if (not isinstance(recovered, dict) or recovered.get('id') != operation['id']
-            or recovered.get('status') != 'succeeded'):
+            or recovered.get('status') != 'succeeded'
+            or recovered.get('details_json') != operation.get('details_json')):
         raise RuntimeError('fetch recovery readback did not preserve the exact success witness')
     _record(timings, 'fetch_recovery_show', show)
-    semantic['fetch_provable'] = {
+    semantic['fetch_recovery_show'] = {
         'status': 'verified',
         'operation_id': operation['id'],
         'operation_status': recovered['status'],
-        'expected_remote_ref': 'refs/remotes/origin/perf-proven',
-        'expected_commit': playground['baseline_commit'],
-        'observed_commit': actual_ref,
-        'git_environment': (
-            'fixture allowlist; inherited Git routing/configuration/SSH selectors absent; '
-            'repository-local fixture SSH shim'),
+        'same_details_json': recovered.get('details_json') == operation.get('details_json'),
     }
 
 
 def _parse_deploy_preview(text, expected_source):
-    source = re.search(r'Canonical source: origin/refs/heads/main @ ([0-9a-f]{40,64})', text)
+    source = re.search(
+        r'Configured origin/default ref: origin/refs/heads/main @ ([0-9a-f]{40,64})', text)
     digest = re.search(r'Plan digest: ([0-9a-f]{64})', text)
-    full_diff = re.search(r'Full generated diff: ([0-9]+) bytes; SHA-256 ([0-9a-f]{64})', text)
-    sections = ('Aethyme-owned outputs', 'Managed-block outputs',
-                'Repository-owned policy/config outputs')
+    full_diff = re.search(
+        r'Raw generated diff: ([0-9]+) bytes; SHA-256 \(raw\) ([0-9a-f]{64})', text)
+    migration_heading = re.search(r'(?m)^Migration diff:\r?\n', text)
+    diff_truncation = re.search(
+        r'(?m)^\[terminal-safe diff preview truncated at a complete line boundary: '
+        r'showing ([0-9]+) escaped bytes from ([0-9]+) raw diff bytes; '
+        r'raw SHA-256 covers the complete proposal\][ \t]*\r?$', text)
+    output_truncation = re.search(
+        r'(?m)^\[rendered preview truncated at a complete line boundary; '
+        r'output byte limit reached\][ \t]*\r?$', text)
+    output_truncated = output_truncation is not None
+    sections = ('Aethyme-owned outputs:', 'Managed-block outputs:',
+                'Repository-owned policy/config outputs:')
     present_sections = [name for name in sections if name in text]
     generated_bytes = int(full_diff.group(1)) if full_diff else None
+    preview_escaped_bytes = int(diff_truncation.group(1)) if diff_truncation else None
+    preview_raw_bytes = int(diff_truncation.group(2)) if diff_truncation else None
     source_matches_seed = bool(source and source.group(1) == expected_source)
+    ownership_grouping = (
+        'Generated outputs grouped by ownership; per-file generator-source mapping is unavailable.'
+        in text)
     inventory_supported = bool(
-        source and digest and len(present_sections) == len(sections)
-        and 'Migration diff:' in text)
+        source and digest and ownership_grouping and len(present_sections) == len(sections)
+        and migration_heading)
+    migration_body = text[migration_heading.end():] if migration_heading else ''
+    for marker in (
+            diff_truncation.group(0) if diff_truncation else None,
+            output_truncation.group(0) if output_truncation else None):
+        if marker:
+            migration_body = migration_body.split(marker, maxsplit=1)[0]
+    migration_body_size = len(migration_body.encode('utf-8'))
+    migration_body_content = migration_body.strip()
+    empty_diff_sha256 = hashlib.sha256(b'').hexdigest()
+    truncation_evidence_matches = bool(
+        not diff_truncation
+        or (preview_raw_bytes == generated_bytes
+            and preview_escaped_bytes in {
+                migration_body_size, max(0, migration_body_size - 1)}))
+    complete_diff_body = bool(
+        full_diff and migration_heading and not diff_truncation and not output_truncated
+        and ((generated_bytes == 0 and full_diff.group(2) == empty_diff_sha256
+              and migration_body_content == '(no changes)')
+             or (generated_bytes is not None and generated_bytes > 0
+                 and bool(migration_body_content))))
+    generated_content_available = complete_diff_body
+    preview_truncated = bool(diff_truncation or output_truncated)
+    content_identity = None
+    if inventory_supported and generated_content_available:
+        content_identity = {
+            'contract': 'first_enrollment_generated_diff_preview_v1',
+            'source_commit': source.group(1),
+            'raw_diff_bytes': generated_bytes,
+            'raw_diff_sha256': full_diff.group(2),
+            'rendered_diff_preview_sha256': hashlib.sha256(
+                migration_body.encode('utf-8')).hexdigest(),
+        }
     return {
         'source_commit': source.group(1) if source else None,
         'source_matches_seed': source_matches_seed,
@@ -603,13 +913,44 @@ def _parse_deploy_preview(text, expected_source):
         'full_generated_diff_bytes': generated_bytes,
         'full_generated_diff_sha256': full_diff.group(2) if full_diff else None,
         'ownership_sections_present': present_sections,
+        'ownership_grouping_present': ownership_grouping,
+        'migration_preview_escaped_bytes': preview_escaped_bytes,
+        'migration_preview_raw_bytes': preview_raw_bytes,
+        'migration_preview_raw_sha256': None,
+        'truncation_evidence_matches': truncation_evidence_matches,
         'migration_diff_present': 'Migration diff:' in text,
-        'truncation_explicit': bool(re.search(r'\btruncat(?:ed|ion)\b', text, re.IGNORECASE)),
+        'truncation_explicit': preview_truncated,
         'inventory_supported': inventory_supported,
-        'generated_content_available': bool(full_diff),
+        'generated_content_available': generated_content_available,
+        'content_contract': (content_identity['contract']
+                             if content_identity is not None else None),
+        'content_identity': content_identity,
         'preview_bytes': len(text.encode('utf-8')),
         'preview_sha256': hashlib.sha256(text.encode('utf-8')).hexdigest(),
     }
+
+
+def _classify_deploy_preview(text, row, expected_source):
+    preview = _parse_deploy_preview(text, expected_source)
+    preview['utf8_complete'] = (
+        row.get('stdout_complete') is True
+        and row.get('stdout_utf8_valid') is True)
+    if not preview['inventory_supported']:
+        preview['status'] = 'output_incomplete'
+    elif not preview['source_matches_seed']:
+        preview['status'] = 'source_identity_mismatch'
+    elif not preview['utf8_complete']:
+        preview['status'] = 'output_incomplete'
+    elif preview['generated_content_available']:
+        preview['status'] = 'supported_content_available'
+    else:
+        preview['status'] = 'supported_inventory_content_missing'
+    preview['comparison_eligible'] = preview['status'] == 'supported_content_available'
+    if not preview['comparison_eligible']:
+        preview['comparison_ineligibility_reason'] = (
+            'preview is incomplete, has the wrong source identity, or lacks '
+            'matching raw-diff content evidence')
+    return preview
 
 
 def _tree_fingerprint(root):
@@ -702,7 +1043,8 @@ def _bounded_output_control(playground):
     }
 
 
-def _measure_profile(role, repetition, identity, git, output, contracts):
+def _measure_profile(role, repetition, identity, git, output, contracts,
+                     baseline_source_commit=None):
     sample_name = f'r{repetition + 1:02d}-{role}'
     sample_output = output / 'samples' / sample_name
     sample_output.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -737,9 +1079,13 @@ def _measure_profile(role, repetition, identity, git, output, contracts):
             engine_version_text = engine_row['stdout'].strip()
             if not version_text or not engine_version_text:
                 raise RuntimeError('binary pair did not report both version identities')
+            build_commit = _build_commit(version_text)
+            if role == 'baseline' and build_commit != baseline_source_commit:
+                raise RuntimeError(
+                    'baseline CLI build_commit does not match the retained v0.8.41 source commit')
             sample['binary_version'] = {
                 'aethyme': version_text,
-                'aethyme_build_commit': _build_commit(version_text),
+                'aethyme_build_commit': build_commit,
                 'engine_cli': engine_version_text,
                 'engine_build_commit': _build_commit(engine_version_text),
             }
@@ -850,7 +1196,8 @@ def _measure_profile(role, repetition, identity, git, output, contracts):
                 playground, sessions, sample['timings_ms'], sample['semantic'],
                 contracts['matrix']['runner']['slow_hook_minimum_hold_ms'])
 
-            _run_provable_fetch(playground, sessions, sample['timings_ms'], sample['semantic'])
+            _run_provable_fetch(playground, sessions, sample['timings_ms'], sample['semantic'],
+                                role)
 
             deploy_args = ['deploy', 'plan', '--repo', str(playground['repo']), '--diff']
             try:
@@ -870,19 +1217,8 @@ def _measure_profile(role, repetition, identity, git, output, contracts):
             else:
                 _record(sample['timings_ms'], 'deploy_plan_diff', deploy_row)
                 preview_text = deploy_row['stdout']
-                preview = _parse_deploy_preview(preview_text, playground['baseline_commit'])
-                preview['utf8_complete'] = (
-                    deploy_row.get('stdout_complete') is True
-                    and deploy_row.get('stdout_utf8_valid') is True)
-                if not preview['inventory_supported']:
-                    preview['status'] = 'output_incomplete'
-                elif not preview['source_matches_seed']:
-                    preview['status'] = 'source_identity_mismatch'
-                elif preview['generated_content_available']:
-                    preview['status'] = 'supported_content_available'
-                else:
-                    preview['status'] = 'supported_inventory_content_missing'
-                preview['comparison_eligible'] = True
+                preview = _classify_deploy_preview(
+                    preview_text, deploy_row, playground['baseline_commit'])
                 sample['semantic']['deploy_plan_diff'] = preview
 
             def history_command(argv, cwd, label, redact_values=()):
@@ -985,24 +1321,52 @@ def _timed_scenarios(contracts):
 
 
 def _compare_action(baseline_samples, candidate_samples, action, paired):
+    all_samples = [('baseline', sample) for sample in baseline_samples]
+    all_samples.extend(('candidate', sample) for sample in candidate_samples)
+    ineligible = []
+    if (len(baseline_samples) != paired['repetitions']
+            or len(candidate_samples) != paired['repetitions']):
+        ineligible.append('one or more paired samples are missing')
+    for role, sample in all_samples:
+        if sample.get('status') != 'complete':
+            ineligible.append(f'{role}: sample {sample.get("repetition")} incomplete')
+            continue
+        semantic = sample.get('semantic', {}).get(action)
+        if isinstance(semantic, dict):
+            if semantic.get('status') == 'unsupported':
+                ineligible.append(f'{role}: {semantic.get("reason", "unsupported")}')
+            elif semantic.get('comparison_eligible') is False:
+                ineligible.append(
+                    f'{role}: {semantic.get("comparison_ineligibility_reason", "semantic check failed")}')
+            elif action == 'deploy_plan_diff':
+                if (semantic.get('status') != 'supported_content_available'
+                        or semantic.get('comparison_eligible') is not True
+                        or not isinstance(semantic.get('content_identity'), dict)):
+                    ineligible.append(
+                        f'{role}: complete generated-preview content is unavailable')
+        elif action == 'deploy_plan_diff':
+            ineligible.append(f'{role}: generated-preview semantics are missing')
     baseline = [sample.get('timings_ms', {}).get(action) for sample in baseline_samples]
     candidate = [sample.get('timings_ms', {}).get(action) for sample in candidate_samples]
     if (len(baseline) != paired['repetitions']
             or len(candidate) != paired['repetitions']
             or any(value is None for value in baseline + candidate)):
-        reasons = []
-        for role, samples in (('baseline', baseline_samples), ('candidate', candidate_samples)):
-            for sample in samples:
-                semantic = sample.get('semantic', {}).get(action)
-                if isinstance(semantic, dict) and semantic.get('status') == 'unsupported':
-                    reasons.append(f'{role}: {semantic.get("reason", "unsupported")}' )
-                elif sample.get('status') != 'complete':
-                    reasons.append(f'{role}: sample {sample.get("repetition")} incomplete')
+        ineligible.append('one or more paired timing samples are missing')
+    if ineligible:
         return {
             'status': 'unavailable',
-            'reason': '; '.join(reasons) if reasons else 'one or more paired samples are missing',
+            'reason': '; '.join(ineligible),
             'enforcement': 'warning',
         }
+    if action == 'deploy_plan_diff':
+        identities = [sample['semantic'][action]['content_identity']
+                      for _, sample in all_samples]
+        if any(identity != identities[0] for identity in identities[1:]):
+            return {
+                'status': 'unavailable',
+                'reason': 'baseline and candidate generated-preview content contracts differ',
+                'enforcement': 'warning',
+            }
     return {'status': 'compared', **compare_samples(baseline, candidate, paired)}
 
 
@@ -1126,8 +1490,9 @@ def _run_matrix(args):
             for role in paired_order(repetition):
                 identity = baseline_identity if role == 'baseline' else candidate_identity
                 try:
-                    sample = _measure_profile(role, repetition, identity, str(git_path), output,
-                                               contracts)
+                    sample = _measure_profile(
+                        role, repetition, identity, str(git_path), output, contracts,
+                        v41_context['source_commit'])
                 except Exception as error:
                     sample_path = (output / 'samples' / f'r{repetition + 1:02d}-{role}'
                                    / 'sample.json')
@@ -1246,7 +1611,7 @@ def _write_markdown_summary(path, report):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--baseline-cli', type=Path, required=True,
-                        help='CLI executable from the signed v0.8.41 pair')
+                        help='CLI executable from the retained v0.8.41 binary pair')
     parser.add_argument('--candidate-cli', type=Path, required=True,
                         help='candidate CLI executable; its engine sibling is required')
     parser.add_argument('--v41-live-reference', type=Path, required=True,
