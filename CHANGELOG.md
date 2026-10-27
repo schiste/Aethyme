@@ -4,6 +4,17 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.39] - 2026-10-27
+
+### Changed
+
+- Guarded execution no longer refreshes implicit leases and overlap diagnostics across every live checkout before each command. Before/after dirty snapshots, artifact-use admission, and the post-command ownership audit remain; that audit still uses explicit leases, current holder policy, and the foreign-file snapshot. The global overlap-diagnostic timestamp remains tied to the last actual refresh.
+- SQLite sidecar guard failures now identify the first failed metadata predicate at each existing guard stage. Existing refusal conditions and error prefixes remain unchanged; this improves diagnosis without changing race-handling behavior.
+
+### Tests
+
+- The process-handoff test fixture writes watcher output to a temporary sibling and renames it after the copy completes, so observers see complete output rather than a partial file.
+
 ## [0.8.38] - 2026-10-27
 
 **Breaking:** see [UPGRADING.md](UPGRADING.md#v0838).
