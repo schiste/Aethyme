@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "enforcement": "diagnostic_only",
+  "fixture": {
+    "synthetic": true,
+    "profile": "single_repository_multi_session",
+    "transport": "local_bare_remote_via_strict_ssh_shim",
+    "network_sandbox": false,
+    "seed_commit_date": "2020-01-02T03:04:05+00:00"
+  },
+  "scenarios": [
+    {"id": "start", "kind": "timing", "command": "broker start"},
+    {"id": "status_summary", "kind": "timing", "command": "broker status --summary --json", "expectation": "one_live_session_to_match_v1_routine_status_budget", "absolute_budget": "routine_status"},
+    {"id": "lease_plan", "kind": "timing", "command": "broker leases plan"},
+    {"id": "lease_claim", "kind": "timing", "command": "broker leases claim"},
+    {"id": "lease_release", "kind": "timing", "command": "broker leases release"},
+    {"id": "overlap_detail", "kind": "semantic_timing", "command": "broker leases plan", "expectation": "one_exact_conflicting_owner"},
+    {"id": "broker_commit_slow_hook", "kind": "semantic_timing", "command": "broker commit", "expectation": "slow_hooked_session_commit_completes_after_hook_release"},
+    {"id": "broker_commit_independent", "kind": "semantic_timing", "command": "broker commit", "expectation": "independent_session_commit_completes_before_slow_hook_release"},
+    {"id": "fetch_provable", "kind": "semantic_timing", "command": "broker advanced git fetch", "expectation": "exact_remote_tracking_ref_matches_pinned_remote_commit"},
+    {"id": "fetch_recovery_show", "kind": "semantic_timing", "command": "broker advanced operations show", "expectation": "read_only_exact_operation_status_is_succeeded"},
+    {"id": "fetch_unprovable", "kind": "semantic_control", "command": "broker advanced git fetch", "expectation": "unresolved_operation_remains_unresolved_after_provider_exit_is_unobserved"},
+    {"id": "deploy_plan_diff", "kind": "semantic_timing", "command": "deploy plan --repo --diff", "expectation": "bounded_preview_and_plan_identity"},
+    {"id": "status_aged_history", "kind": "timing", "command": "broker status --summary --json", "history_rows": 1000},
+    {"id": "finish", "kind": "semantic_timing", "command": "broker finish", "expectation": "session_closed"},
+    {"id": "bounded_output_control", "kind": "harness_control", "command": "bounded stdout producer", "expectation": "typed_output_limit_refusal_and_fixture_unchanged"}
+  ]
+}

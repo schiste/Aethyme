@@ -1,0 +1,22 @@
+{
+  "schema_version": 2,
+  "enforcement": "warning",
+  "statistic": "median",
+  "unit": "milliseconds",
+  "absolute_budget_reference": {
+    "path": "broker-budgets.json",
+    "schema_version": 1
+  },
+  "paired_comparison": {
+    "repetitions": 5,
+    "order": "alternating",
+    "max_regression_percent": 10,
+    "absolute_jitter_floor_ms": 100,
+    "enforcement": "warning"
+  },
+  "runner": {
+    "command_timeout_seconds": 60,
+    "history_rows": 1000,
+    "slow_hook_minimum_hold_ms": 250
+  }
+}

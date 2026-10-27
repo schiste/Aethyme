@@ -17,6 +17,14 @@ from broker_latency import (
     validate_session_count,
     validate_resource_inventory,
 )
+from broker_action_matrix import (
+    _compare_action,
+    _parse_deploy_preview,
+    compare_samples,
+    load_contracts,
+    load_v41_context,
+    paired_order,
+)
 
 
 class PlaygroundSetupTests(unittest.TestCase):
@@ -90,6 +98,122 @@ class BudgetPolicyTests(unittest.TestCase):
                              ('statistic', 'minimum'), ('unit', 'seconds')):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 assess({**self.budgets, field: value}, self.samples)
+
+
+class PairedActionMatrixTests(unittest.TestCase):
+    def setUp(self):
+        self.contracts = load_contracts()
+        self.paired = dict(self.contracts['matrix']['paired_comparison'])
+
+    def test_action_contract_references_v1_budgets_without_changing_them(self):
+        self.assertEqual(self.contracts['absolute_budgets']['schema_version'], 1)
+        self.assertEqual(
+            self.contracts['matrix']['absolute_budget_reference'],
+            {'path': 'broker-budgets.json', 'schema_version': 1})
+        scenarios = {row['id']: row for row in self.contracts['scenario_manifest']['scenarios']}
+        self.assertEqual(scenarios['status_aged_history']['history_rows'],
+                         self.contracts['matrix']['runner']['history_rows'])
+        self.assertEqual(scenarios['fetch_unprovable']['kind'], 'semantic_control')
+
+    def test_malformed_action_contract_types_fail_with_value_error(self):
+        for field, value in (('kind', []), ('absolute_budget', [])):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                matrix_path = directory / 'broker-action-matrix-v2.json'
+                scenarios_path = directory / 'broker-action-scenarios-v1.json'
+                absolute_path = directory / 'broker-budgets.json'
+                matrix_path.write_bytes(self.contracts['matrix_bytes'])
+                absolute_path.write_bytes(self.contracts['absolute_bytes'])
+                manifest = copy.deepcopy(self.contracts['scenario_manifest'])
+                target = next(row for row in manifest['scenarios']
+                              if row['id'] == 'status_summary')
+                target[field] = value
+                scenarios_path.write_text(json.dumps(manifest), encoding='utf-8')
+                with self.assertRaises(ValueError):
+                    load_contracts(matrix_path, scenarios_path, absolute_path)
+
+    def test_pair_order_alternates_and_rejects_invalid_indices(self):
+        self.assertEqual(paired_order(0), ('baseline', 'candidate'))
+        self.assertEqual(paired_order(1), ('candidate', 'baseline'))
+        self.assertEqual(paired_order(2), ('baseline', 'candidate'))
+        for value in (-1, True, 1.5):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                paired_order(value)
+
+    def test_comparison_warns_only_above_percent_or_jitter_floor(self):
+        values = {'repetitions': 5, 'max_regression_percent': 10,
+                  'absolute_jitter_floor_ms': 100}
+        at_threshold = compare_samples([1_000] * 5, [1_100] * 5, values)
+        above_threshold = compare_samples([1_000] * 5, [1_101] * 5, values)
+        zero_baseline = compare_samples([0] * 5, [100] * 5, values)
+        self.assertEqual(at_threshold['verdict'], 'within_warning_band')
+        self.assertEqual(above_threshold['verdict'], 'warning')
+        self.assertEqual(zero_baseline['verdict'], 'within_warning_band')
+        self.assertEqual(above_threshold['enforcement'], 'warning')
+        self.assertEqual(above_threshold['sample_count'], 5)
+
+    def test_missing_unprovable_fetch_is_not_a_zero_timing(self):
+        baseline = [{'status': 'complete', 'semantic': {
+            'fetch_unprovable': {'status': 'unsupported', 'command_dispatched': False}}}]
+        candidate = [{'status': 'complete', 'timings_ms': {'fetch_unprovable': 0.0}}]
+        result = _compare_action(baseline, candidate, 'fetch_unprovable', self.paired)
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertIn('unsupported', result['reason'])
+        self.assertNotIn('baseline_median_ms', result)
+
+    def test_generator_inventory_can_be_supported_without_generated_content(self):
+        preview = '\n'.join((
+            'Canonical source: origin/refs/heads/main @ ' + 'a' * 40,
+            'Aethyme-owned outputs',
+            'Managed-block outputs',
+            'Repository-owned policy/config outputs',
+            'Plan digest: ' + 'b' * 64,
+            'Migration diff:',
+        ))
+        result = _parse_deploy_preview(preview, 'a' * 40)
+        self.assertTrue(result['inventory_supported'])
+        self.assertFalse(result['generated_content_available'])
+        self.assertTrue(result['source_matches_seed'])
+
+    def test_zero_byte_generated_diff_is_still_available_content(self):
+        preview = '\n'.join((
+            'Canonical source: origin/refs/heads/main @ ' + 'a' * 40,
+            'Aethyme-owned outputs',
+            'Managed-block outputs',
+            'Repository-owned policy/config outputs',
+            'Plan digest: ' + 'b' * 64,
+            'Full generated diff: 0 bytes; SHA-256 ' + 'c' * 64,
+            'Migration diff:',
+        ))
+        result = _parse_deploy_preview(preview, 'a' * 40)
+        self.assertTrue(result['inventory_supported'])
+        self.assertTrue(result['generated_content_available'])
+
+    def test_v41_live_receipt_is_context_only_and_pins_both_executables(self):
+        cli_hash = 'a' * 64
+        engine_hash = 'b' * 64
+        receipt = {
+            'version': '0.8.41',
+            'source_commit': 'c' * 40,
+            'release': 'https://example.invalid/releases/tag/v0.8.41',
+            'hosted_workspace_passed': 1,
+            'local_native_builds_or_tests': False,
+            'roots': {'install-root': {
+                'aethyme': {'sha256': cli_hash},
+                'aethyme-engine-cli': {'sha256': engine_hash},
+            }},
+            'repos': {'mockup': {'seconds': {'start': 2.5}}},
+        }
+        identity = {'cli_sha256': cli_hash, 'engine_sha256': engine_hash}
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'v41.json'
+            path.write_text(json.dumps(receipt))
+            context = load_v41_context(path, identity)
+            self.assertFalse(context['comparison_eligible'])
+            self.assertEqual(context['uncontrolled_real_rollout_seconds']['mockup']['start'],
+                             2.5)
+            with self.assertRaisesRegex(ValueError, 'does not match'):
+                load_v41_context(path, {**identity, 'engine_sha256': 'd' * 64})
 
 
 class AgedHistoryTests(unittest.TestCase):
