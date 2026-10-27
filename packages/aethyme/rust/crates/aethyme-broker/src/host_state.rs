@@ -172,8 +172,8 @@ pub(crate) fn describe_host_state_sqlite(error: &rusqlite::Error) -> String {
          not a missing or outdated installation. For shared work, grant this process access \
          to the same host-state directory used by the other Aethyme sessions. Set \
          AETHYME_HOST_STATE_DIR to a writable directory only for intentionally isolated work; \
-         it creates a private coordination domain that will not see leases, sessions or host \
-         resources held by anything else."
+         it creates a private coordination domain and does not share host resource leases or \
+         capacity with sessions using the shared directory."
     )
 }
 
@@ -265,7 +265,11 @@ mod tests {
         );
         assert!(text.contains("private coordination domain"), "{text}");
         assert!(
-            text.contains("will not see leases, sessions or host resources"),
+            text.contains("does not share host resource leases or capacity"),
+            "{text}"
+        );
+        assert!(
+            text.contains("sessions using the shared directory"),
             "{text}"
         );
 
