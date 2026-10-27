@@ -6029,7 +6029,7 @@ mod tests {
             let _foreign_broker = foreign_storage.open(&foreign_root).unwrap();
 
             let resource_db_path = test_host_resource_db(temporary.path());
-            let storage_root = temporary.path().join("worktree-container");
+            let storage_root = resource_db_path.parent().unwrap().join("worktrees");
             std::fs::create_dir_all(&storage_root).unwrap();
             let storage_root = storage_root.canonicalize().unwrap();
             let placement_root = storage_root.join("foreign-placement");
@@ -6064,7 +6064,7 @@ mod tests {
             .unwrap();
             let unplaced_cache_binding =
                 initialized_storage_cache_root_binding(&cache_root, &resource_db_path);
-            let _placed_cache_binding =
+            let placed_cache_binding =
                 crate::broker::lifecycle::capture_worktree_volume_preparation_cache_root(
                     &placement_root,
                     &marker,
@@ -6073,7 +6073,8 @@ mod tests {
                 .unwrap()
                 .expect("the initialized foreign cache root has a valid placement binding");
 
-            let foreign_cache_entry = cache_root
+            let foreign_cache_entry = placed_cache_binding
+                .path
                 .join(TEST_PREPARATION_REPOSITORY)
                 .join("ffffffffffff");
             std::fs::create_dir_all(&foreign_cache_entry).unwrap();
@@ -6139,9 +6140,6 @@ mod tests {
                 git_common_dir: Some(invoking_repo.git_common_dir().unwrap()),
                 host_state_dir: self.resource_db_path.parent().map(Path::to_path_buf),
                 host_resource_db_path: Some(self.resource_db_path.clone()),
-                // Exercise the public direct-root layout at the foreign
-                // placement itself, where its reserved cache child lives.
-                worktree_root_override: Some(self.placement_root.clone()),
                 host_state_dir_is_explicit: true,
                 ..crate::broker::BrokerStorageContext::default()
             }
