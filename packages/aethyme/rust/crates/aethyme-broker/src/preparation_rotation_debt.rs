@@ -2296,7 +2296,7 @@ fn recover_inner_with_root_guard(
                     .to_owned();
                 validate_root().map_err(|source| recovery_error(progress, source))?;
                 let root_guard = std::cell::RefCell::new(&mut *validate_root);
-                match pinned.remove_verified_witness_with_progress_and_guard(
+                match pinned.remove_verified_witness_with_progress_and_guard_refusing_special_nodes(
                     &witness_name,
                     Some(deadline),
                     |bytes| {

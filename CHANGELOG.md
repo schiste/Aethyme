@@ -4,6 +4,30 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.40] - 2026-10-27
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0840).
+
+### Changed
+
+- `aethyme broker submit prepare --json` advances its report schema to 2.
+  A time- or entry-limited cache inventory can trigger whole-store rotation;
+  its report exposes a nullable exact `bytes_before`, inventory completeness,
+  a lower bound and typed reason. Configuration and preparation-state schemas
+  remain version 1.
+
+### Fixed
+
+- Explicit lease claims no longer refresh implicit leases and overlap diagnostics
+  across every live checkout before checking the requested path.
+- Cleanup budgets landing-proof work by actual query batches, so an early exact
+  proof can complete without requiring the full candidate/path window to fit;
+  exhausted evidence still refuses cleanup.
+- Shared-cache inventory renews its host resource lease and rechecks storage
+  during a bounded 30-second traversal. Time- or entry-limited inventories can
+  rotate eligible owned caches; other incomplete inventories or failed lease
+  checks still refuse.
+
 ## [0.8.39] - 2026-10-27
 
 ### Changed

@@ -455,9 +455,10 @@ pub use pr_watch::{
     PullRequestWatchRequest, PullRequestWatchStatus,
 };
 pub use preparation::{
-    PREPARATION_CONFIG_RELPATH, PREPARATION_SCHEMA_VERSION, PreparationCachePolicy,
-    PreparationConfig, PreparationError, PreparationReport, PreparationState, PreparationStatus,
-    PreparationStep, PreparationStepResult, RuntimeProbe,
+    PREPARATION_CONFIG_RELPATH, PREPARATION_REPORT_SCHEMA_VERSION, PREPARATION_SCHEMA_VERSION,
+    PreparationCachePolicy, PreparationConfig, PreparationError, PreparationReport,
+    PreparationState, PreparationStatus, PreparationStep, PreparationStepResult, RuntimeProbe,
+    SharedCacheRotation, SharedCacheRotationReason,
 };
 pub use promotion_record::{
     PROMOTION_RECORD_PLAN_SCHEMA_VERSION, PromotionRecordApplyReport, PromotionRecordPlan,
