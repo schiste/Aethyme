@@ -27,7 +27,7 @@
 //! remote.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::types::{Session, SessionCleanupState, SessionOrigin};
 use crate::{Broker, BrokerOpError, GitRepo};
@@ -91,6 +91,9 @@ const GLOB_PROBES: &[&str] = &[
 pub(crate) const AUTO_CLEANUP_LAST_REPORT_KEY: &str = "auto_cleanup.last_report";
 const AUTO_CLEANUP_CURSOR_KEY: &str = "auto_cleanup.cursor";
 const AUTO_CLEANUP_CURSOR_VERSION: u32 = 1;
+/// Bound discovery of ignored roots before whole-checkout cleanup considers
+/// their existing policy classifications.
+const IGNORED_PATH_LISTING_BUDGET: Duration = Duration::from_secs(15);
 
 /// Durable scheduling state for closed-checkout cleanup. It grants no
 /// authority to remove a checkout; every candidate still passes the regular
@@ -883,20 +886,39 @@ pub(crate) fn ignored_content_reason(
     worktree: &Path,
     policy: &AutoCleanupPolicy,
 ) -> Result<Option<String>, String> {
-    let ignored = git(
-        worktree,
-        &[
-            "ls-files",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "--directory",
-            "-z",
-        ],
-    )?;
+    if crate::git::graph_verification_environment_refusal().is_some() {
+        return Err("inherited Git routing overrides make ignored paths unknown".into());
+    }
+    let deadline = Instant::now() + IGNORED_PATH_LISTING_BUDGET;
+    let ignored = crate::git::with_git_deadline(IGNORED_PATH_LISTING_BUDGET, || {
+        let expected_root = worktree
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve cleanup checkout root: {error}"))?;
+        let repo = GitRepo::discover(worktree).map_err(|error| error.to_string())?;
+        let discovered_root = repo
+            .root()
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve discovered Git root: {error}"))?;
+        if discovered_root != expected_root {
+            return Err("Git resolved a different root than the cleanup checkout".into());
+        }
+        repo.ignored_paths_readonly_until(deadline)
+            .map_err(|error| error.to_string())
+    })?;
     // Git supplies ignored roots; never recursively walk their contents.
-    for relative in ignored.split('\0').filter(|path| !path.is_empty()) {
-        if let Err(reason) = classify_ignored(worktree, relative, policy) {
+    // Keep every listed entry in the existing whole-checkout classifier:
+    // typed protection here is only for future in-place artifact discovery.
+    for entry in ignored {
+        let _discovery_kind = entry.kind;
+        if Instant::now() >= deadline {
+            return Err("ignored-path classification exceeded its time budget".into());
+        }
+        let relative = if entry.directory_marker {
+            format!("{}/", entry.relative)
+        } else {
+            entry.relative
+        };
+        if let Err(reason) = classify_ignored(worktree, &relative, policy) {
             return Ok(Some(format!(
                 "ignored content requires explicit cleanup: {reason}"
             )));
@@ -1785,7 +1807,7 @@ mod tests {
         AUTO_CLEANUP_CURSOR_KEY, AutoCleanupCursor, AutoCleanupGroupInspection, AutoCleanupPolicy,
         LiveOverlapEvidence, ResolvedWorktreePath, auto_cleanup_lap_range, classify_ignored,
         decode_auto_cleanup_cursor, first_live_worktree_overlap, group_closed_checkout_sessions,
-        resolve_worktree_paths_until,
+        ignored_content_reason, resolve_worktree_paths_until,
     };
     use std::path::Path;
     #[cfg(unix)]
@@ -1940,6 +1962,35 @@ mod tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_ignored_listing_keeps_existing_whole_checkout_policy() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["config", "user.name", "Auto cleanup test"]);
+        git(
+            root,
+            &["config", "user.email", "auto-cleanup@example.invalid"],
+        );
+        std::fs::write(
+            root.join(".gitignore"),
+            ".aethyme/\nopaque/\nprivate.sqlite\n",
+        )
+        .unwrap();
+        git(root, &["add", ".gitignore"]);
+        git(root, &["commit", "-qm", "ignore disposable output"]);
+        touch(root, "opaque/nested/user-data.json");
+        touch(root, ".aethyme/run/worker.json");
+
+        let policy = AutoCleanupPolicy::default();
+        assert_eq!(ignored_content_reason(root, &policy), Ok(None));
+
+        touch(root, "private.sqlite");
+        let reason = ignored_content_reason(root, &policy).unwrap().unwrap();
+        assert!(reason.contains("private.sqlite"), "{reason}");
     }
 
     #[cfg(unix)]

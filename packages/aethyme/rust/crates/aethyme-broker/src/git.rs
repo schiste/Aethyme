@@ -260,6 +260,11 @@ const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// large repository. Patch bodies themselves are streamed between Git.
 const MAX_GIT_BATCH_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_GIT_BATCH_INPUT_BYTES: usize = 16 * 1024 * 1024;
+/// A complete ignored-path census stays finite. Hitting any cap makes the
+/// listing unknown; callers must not treat it as an empty or partial result.
+const MAX_IGNORED_PATHS_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_IGNORED_PATHS_ENTRIES: usize = 16_384;
+const MAX_IGNORED_PATH_BYTES: usize = 4_096;
 /// A single exact-tree landing search may ask for at most this many objects.
 /// The same ceiling is enforced by `objects_at_many` before it allocates input.
 pub(crate) const MAX_GIT_BATCH_QUERY_COUNT: usize = 100_000;
@@ -2174,6 +2179,30 @@ pub const BROKER_WORKTREE_LOCK_REASON: &str =
 pub struct GitRepo {
     /// Top level of *this* checkout.
     root: PathBuf,
+}
+
+/// The shape of one entry in a complete Git ignored-path listing.
+///
+/// `DirectoryRoot` only proves that Git returned a collapsed, real directory
+/// root outside broker-owned paths. It is a discovery result, not an
+/// authorization to remove the directory; liveness, ownership, and fresh
+/// resource checks remain separate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GitIgnoredPathKind {
+    DirectoryRoot,
+    Protected,
+    Other,
+}
+
+/// One path from `ls-files --others --ignored --directory -z`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitIgnoredPathEntry {
+    /// Relative path without Git's trailing slash marker.
+    pub(crate) relative: String,
+    /// Whether Git marked the record as a collapsed directory.
+    pub(crate) directory_marker: bool,
+    /// A conservative path shape classification; never a deletion verdict.
+    pub(crate) kind: GitIgnoredPathKind,
 }
 
 /// One entry from Git's authoritative worktree list output. Optional lock and
@@ -5204,6 +5233,398 @@ impl GitRepo {
     pub fn worktree_inventory(&self) -> Result<Vec<GitWorktreeInfo>, GitError> {
         let listing = run_git_bytes(&self.root, &["worktree", "list", "--porcelain", "-z"])?;
         parse_worktree_porcelain_z(&listing)
+    }
+
+    /// Return a complete, bounded listing of Git-ignored paths in this
+    /// discovered working-tree checkout. Any timeout, malformed path, output
+    /// cap, or failed directory verification is an error rather than a partial
+    /// listing.
+    ///
+    /// This method only identifies collapsed directory roots. A caller that
+    /// later reclaims artifacts must perform its own fresh ownership, liveness,
+    /// and resource checks under the corresponding admission protocol.
+    pub(crate) fn ignored_paths_readonly_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<Vec<GitIgnoredPathEntry>, GitError> {
+        const ARGS: &[&str] = &[
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ];
+
+        let deadline = active_git_deadline().map_or(deadline, |active| active.min(deadline));
+        ensure_ignored_listing_before(deadline, ARGS)?;
+        require_trustworthy_porcelain()?;
+        ensure_ignored_listing_before(deadline, ARGS)?;
+        let mut command = ignored_paths_git_command(&self.root, ARGS);
+        let output = run_bounded_ignored_listing_command(
+            &mut command,
+            ARGS,
+            deadline,
+            MAX_IGNORED_PATHS_OUTPUT_BYTES,
+        )?;
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: ARGS.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+
+        let raw_paths = parse_nul_paths_strict(&output.stdout, ARGS)?;
+        ensure_ignored_listing_before(deadline, ARGS)?;
+        if raw_paths.len() > MAX_IGNORED_PATHS_ENTRIES {
+            return Err(GitError::UntrustedOutput {
+                detail: format!(
+                    "git {} returned more than {MAX_IGNORED_PATHS_ENTRIES} ignored paths",
+                    ARGS.join(" ")
+                ),
+            });
+        }
+
+        let mut entries = Vec::with_capacity(raw_paths.len());
+        for mut raw in raw_paths {
+            ensure_ignored_listing_before(deadline, ARGS)?;
+
+            let directory_marker = raw.ends_with('/');
+            if directory_marker {
+                raw.pop();
+            }
+            validate_relative_git_path(&raw, ARGS)?;
+            if raw.len() > MAX_IGNORED_PATH_BYTES {
+                return Err(GitError::UntrustedOutput {
+                    detail: format!(
+                        "git {} returned an ignored path longer than {MAX_IGNORED_PATH_BYTES} bytes",
+                        ARGS.join(" ")
+                    ),
+                });
+            }
+
+            let kind = if is_broker_protected_ignored_path(&raw) {
+                GitIgnoredPathKind::Protected
+            } else if directory_marker
+                && ignored_directory_is_real(&self.root, &raw, ARGS, deadline)?
+            {
+                GitIgnoredPathKind::DirectoryRoot
+            } else {
+                GitIgnoredPathKind::Other
+            };
+            entries.push(GitIgnoredPathEntry {
+                relative: raw,
+                directory_marker,
+                kind,
+            });
+        }
+
+        ensure_ignored_listing_before(deadline, ARGS)?;
+        Ok(entries)
+    }
+}
+
+/// Preserve the checkout's normal exclude configuration while preventing
+/// inherited Git directory/index selectors from redirecting this read.
+fn ignored_paths_git_command(root: &Path, args: &[&str]) -> Command {
+    let mut command = git_command();
+    for (key, _) in std::env::vars_os() {
+        if unsafe_graph_git_environment_key(&key) {
+            command.env_remove(key);
+        }
+    }
+    command
+        .args(args)
+        .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+}
+
+fn ensure_ignored_listing_before(deadline: Instant, args: &[&str]) -> Result<(), GitError> {
+    if Instant::now() >= deadline {
+        note_git_timeout();
+        Err(GitError::TimedOut {
+            args: args.join(" "),
+            seconds: 1,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn run_bounded_ignored_listing_command(
+    command: &mut Command,
+    args: &[&str],
+    deadline: Instant,
+    max_output_bytes: usize,
+) -> Result<std::process::Output, GitError> {
+    let effective_deadline = active_git_deadline().map_or(deadline, |active| active.min(deadline));
+    let remaining = effective_deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        note_git_timeout();
+        return Err(GitError::TimedOut {
+            args: args.join(" "),
+            seconds: 1,
+        });
+    }
+    let budget = remaining.min(git_timeout());
+    match crate::bounded_output::output_limited(command, budget, max_output_bytes).map_err(
+        |source| GitError::Spawn {
+            args: args.join(" "),
+            source,
+        },
+    )? {
+        crate::bounded_output::LimitedOutput::Completed(output) => {
+            if Instant::now() >= effective_deadline {
+                note_git_timeout();
+                Err(GitError::TimedOut {
+                    args: args.join(" "),
+                    seconds: 1,
+                })
+            } else {
+                Ok(output)
+            }
+        }
+        crate::bounded_output::LimitedOutput::Deadline => {
+            note_git_timeout();
+            Err(GitError::TimedOut {
+                args: args.join(" "),
+                seconds: budget.as_secs().max(1),
+            })
+        }
+        crate::bounded_output::LimitedOutput::OutputLimit => Err(GitError::UntrustedOutput {
+            detail: format!(
+                "git {} exceeded the bounded ignored-path listing output limit",
+                args.join(" ")
+            ),
+        }),
+    }
+}
+
+fn validate_relative_git_path(path: &str, args: &[&str]) -> Result<(), GitError> {
+    let invalid = || GitError::UntrustedOutput {
+        detail: format!(
+            "git {} returned an invalid relative ignored path",
+            args.join(" ")
+        ),
+    };
+    if path.is_empty()
+        || path.starts_with('/')
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || Path::new(path)
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn is_broker_protected_ignored_path(relative: &str) -> bool {
+    if relative
+        .split('/')
+        .any(|component| component == ".git" || component == ".aethyme")
+    {
+        return true;
+    }
+
+    crate::runtime_paths::broker_runtime_ignore_patterns().any(|pattern| {
+        let pattern = pattern.trim_end_matches('*').trim_end_matches('/');
+        relative == pattern
+            || relative
+                .strip_prefix(pattern)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+            || pattern
+                .strip_prefix(relative)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    })
+}
+
+/// Check only a Git-collapsed directory root. `symlink_metadata` is used for
+/// every component so an ignored symlink or a symlinked parent is never
+/// promoted to a directory candidate.
+fn ignored_directory_is_real(
+    root: &Path,
+    relative: &str,
+    args: &[&str],
+    deadline: Instant,
+) -> Result<bool, GitError> {
+    let components = relative.split('/').collect::<Vec<_>>();
+    let mut path = root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        ensure_ignored_listing_before(deadline, args)?;
+        path.push(component);
+        let metadata = fs::symlink_metadata(&path).map_err(|source| GitError::UntrustedOutput {
+            detail: format!(
+                "could not verify an ignored directory from git {}: {source}",
+                args.join(" ")
+            ),
+        })?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            return Ok(false);
+        }
+        if index + 1 < components.len() && !file_type.is_dir() {
+            return Err(GitError::UntrustedOutput {
+                detail: format!("ignored directory changed during git {}", args.join(" ")),
+            });
+        }
+        if index + 1 == components.len() {
+            return Ok(file_type.is_dir());
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod ignored_path_listing_tests {
+    use super::{
+        GitError, GitIgnoredPathKind, GitRepo, is_broker_protected_ignored_path,
+        run_bounded_ignored_listing_command,
+    };
+    use std::process::Command;
+    use std::time::Instant;
+
+    fn git(root: &std::path::Path, args: &[&str]) {
+        super::run_isolated_graph_git(root, args)
+            .unwrap_or_else(|error| panic!("git {}: {error}", args.join(" ")));
+    }
+
+    fn repository() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q", "--template=", "-b", "main"]);
+        git(root.path(), &["config", "user.name", "Ignored path test"]);
+        git(
+            root.path(),
+            &["config", "user.email", "ignored-path@example.invalid"],
+        );
+        git(root.path(), &["commit", "--allow-empty", "-qm", "initial"]);
+        root
+    }
+
+    fn touch(root: &std::path::Path, relative: &str) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"ignored test data").unwrap();
+    }
+
+    #[test]
+    fn complete_listing_types_collapsed_directories_and_preserves_files() {
+        let root = repository();
+        std::fs::write(root.path().join(".gitignore"), "*\n").unwrap();
+        git(root.path(), &["add", "-f", ".gitignore"]);
+        git(root.path(), &["commit", "-qm", "ignore outputs"]);
+        touch(root.path(), "opaque/nested/file.txt");
+        touch(root.path(), "standalone");
+        touch(root.path(), "newline\nname");
+        touch(root.path(), ".aethyme/run/worker.json");
+
+        let repo = GitRepo::discover(root.path()).unwrap();
+        let entries = repo
+            .ignored_paths_readonly_until(Instant::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        let find = |path: &str| entries.iter().find(|entry| entry.relative == path).unwrap();
+
+        assert_eq!(find("opaque").kind, GitIgnoredPathKind::DirectoryRoot);
+        assert!(find("opaque").directory_marker);
+        assert_eq!(find("standalone").kind, GitIgnoredPathKind::Other);
+        assert!(!find("standalone").directory_marker);
+        assert_eq!(find("newline\nname").kind, GitIgnoredPathKind::Other);
+        assert_eq!(find(".aethyme").kind, GitIgnoredPathKind::Protected);
+        assert!(find(".aethyme").directory_marker);
+    }
+
+    #[test]
+    fn directory_with_a_tracked_child_is_not_a_collapsed_candidate() {
+        let root = repository();
+        std::fs::write(root.path().join(".gitignore"), "mixed/*\n").unwrap();
+        git(root.path(), &["add", ".gitignore"]);
+        git(root.path(), &["commit", "-qm", "ignore mixed output"]);
+        std::fs::create_dir_all(root.path().join("mixed")).unwrap();
+        touch(root.path(), "mixed/tracked.txt");
+        touch(root.path(), "mixed/ignored.txt");
+        git(root.path(), &["add", "-f", "mixed/tracked.txt"]);
+        git(root.path(), &["commit", "-qm", "tracked child"]);
+
+        let repo = GitRepo::discover(root.path()).unwrap();
+        let entries = repo
+            .ignored_paths_readonly_until(Instant::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(!entries.iter().any(|entry| {
+            entry.relative == "mixed" && entry.kind == GitIgnoredPathKind::DirectoryRoot
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_listing_is_never_a_directory_candidate() {
+        let root = repository();
+        std::fs::write(root.path().join(".gitignore"), "linked\n").unwrap();
+        std::os::unix::fs::symlink(
+            root.path().join("missing-target"),
+            root.path().join("linked"),
+        )
+        .unwrap();
+        let repo = GitRepo::discover(root.path()).unwrap();
+        let entries = repo
+            .ignored_paths_readonly_until(Instant::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        let linked = entries
+            .iter()
+            .find(|entry| entry.relative == "linked")
+            .unwrap();
+        assert_eq!(linked.kind, GitIgnoredPathKind::Other);
+        assert!(!linked.directory_marker);
+    }
+
+    #[test]
+    fn broker_roots_and_their_runtime_ancestors_are_protected() {
+        for path in [
+            ".git",
+            ".git/worktrees/session",
+            ".aethyme",
+            ".aethyme/run/worker.json",
+            ".aethyme/locks/cleanup.lock",
+        ] {
+            assert!(is_broker_protected_ignored_path(path), "{path}");
+        }
+        assert!(!is_broker_protected_ignored_path("cache/output"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_listing_deadline_fails_before_spawning_and_output_cap_is_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("should-not-run");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "touch \"$1\"", "test"]).arg(&marker);
+        assert!(matches!(
+            run_bounded_ignored_listing_command(
+                &mut command,
+                &["test deadline"],
+                Instant::now(),
+                8,
+            ),
+            Err(GitError::TimedOut { .. })
+        ));
+        assert!(!marker.exists());
+
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 1234567890"]);
+        assert!(matches!(
+            run_bounded_ignored_listing_command(
+                &mut command,
+                &["test output cap"],
+                Instant::now() + std::time::Duration::from_secs(2),
+                4,
+            ),
+            Err(GitError::UntrustedOutput { .. })
+        ));
     }
 }
 
