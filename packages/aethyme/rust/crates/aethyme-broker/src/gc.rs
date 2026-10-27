@@ -272,6 +272,8 @@ struct OpenSessionArtifactPass {
     uninspected_scopes: usize,
     replay_limited_scopes: usize,
     depth_limited_scopes: usize,
+    new_entries_examined: usize,
+    replay_entries_examined: usize,
     pending_frontiers: usize,
     frontier_state_unavailable: usize,
     frontier_state_write_limited: usize,
@@ -5812,10 +5814,11 @@ impl Broker {
                         continue;
                     }
                 }
-                match {
+                let ownership = {
                     let _git_deadline = crate::git::limit_git_until(deadline);
                     self.is_broker_owned_worktree_checked(&session, &root)
-                } {
+                };
+                match ownership {
                     Ok(true) => {}
                     Ok(false) => {
                         frontier_set
@@ -5872,6 +5875,12 @@ impl Broker {
                     pass.depth_limited_scopes = pass.depth_limited_scopes.saturating_add(1);
                 }
                 pass.worktrees_scanned = pass.worktrees_scanned.saturating_add(1);
+                pass.new_entries_examined = pass
+                    .new_entries_examined
+                    .saturating_add(scan.new_entries_examined);
+                pass.replay_entries_examined = pass
+                    .replay_entries_examined
+                    .saturating_add(scan.replay_entries_examined);
                 pass.recommendations = pass.recommendations.saturating_add(
                     scan.candidates
                         .iter()
@@ -6985,6 +6994,8 @@ impl Broker {
         let mut open_pass_uninspected_scopes = 0usize;
         let mut open_pass_replay_limited_scopes = 0usize;
         let mut open_pass_depth_limited_scopes = 0usize;
+        let mut open_pass_new_entries_examined = 0usize;
+        let mut open_pass_replay_entries_examined = 0usize;
         let mut open_pass_pending_frontiers = 0usize;
         let mut open_pass_frontier_state_unavailable = 0usize;
         let mut open_pass_frontier_state_write_limited = 0usize;
@@ -6997,6 +7008,8 @@ impl Broker {
             open_pass_uninspected_scopes = open_pass.uninspected_scopes;
             open_pass_replay_limited_scopes = open_pass.replay_limited_scopes;
             open_pass_depth_limited_scopes = open_pass.depth_limited_scopes;
+            open_pass_new_entries_examined = open_pass.new_entries_examined;
+            open_pass_replay_entries_examined = open_pass.replay_entries_examined;
             open_pass_pending_frontiers = open_pass.pending_frontiers;
             open_pass_frontier_state_unavailable = open_pass.frontier_state_unavailable;
             open_pass_frontier_state_write_limited = open_pass.frontier_state_write_limited;
@@ -7009,12 +7022,14 @@ impl Broker {
         }
         let open_session_result_state = open_session_scan_ran.then(|| {
             format!(
-                "{}:{}:{}:{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
                 idle_open_session_recommendations,
                 u8::from(open_session_scan_complete),
                 open_pass_uninspected_scopes,
                 open_pass_replay_limited_scopes,
                 open_pass_depth_limited_scopes,
+                open_pass_new_entries_examined,
+                open_pass_replay_entries_examined,
                 open_pass_pending_frontiers,
                 open_pass_frontier_state_unavailable,
                 open_pass_frontier_state_write_limited
@@ -7095,6 +7110,8 @@ impl Broker {
                 "idle_open_session_uninspected_scopes": open_pass_uninspected_scopes,
                 "idle_open_session_replay_limited_scopes": open_pass_replay_limited_scopes,
                 "idle_open_session_depth_limited_scopes": open_pass_depth_limited_scopes,
+                "idle_open_session_new_entries_examined": open_pass_new_entries_examined,
+                "idle_open_session_replay_entries_examined": open_pass_replay_entries_examined,
                 "idle_open_session_pending_frontiers": open_pass_pending_frontiers,
                 "idle_open_session_frontier_state_unavailable": open_pass_frontier_state_unavailable,
                 "idle_open_session_frontier_state_write_limited": open_pass_frontier_state_write_limited,

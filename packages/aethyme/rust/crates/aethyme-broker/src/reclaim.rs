@@ -29,6 +29,7 @@ pub(crate) const BOUNDED_RECLAIM_SCAN_ENTRY_BUDGET: usize = 16_384;
 const RESUMABLE_RECLAIM_SCAN_MAX_DEPTH: usize = 64;
 const RESUMABLE_RECLAIM_FRONTIER_MAX_FRAMES: usize = RESUMABLE_RECLAIM_SCAN_MAX_DEPTH + 1;
 const RESUMABLE_RECLAIM_SCAN_REPLAY_ENTRY_BUDGET_PER_DIRECTORY: usize = 16_384;
+#[cfg(test)]
 const RESUMABLE_RECLAIM_SCAN_MAX_REPLAY_ENTRIES: usize =
     RESUMABLE_RECLAIM_SCAN_REPLAY_ENTRY_BUDGET_PER_DIRECTORY
         * RESUMABLE_RECLAIM_FRONTIER_MAX_FRAMES;
@@ -37,7 +38,9 @@ const RESUMABLE_RECLAIM_FRONTIER_MAX_PATH_BYTES: usize = 4_096;
 #[derive(Debug)]
 pub(crate) struct BoundedReclaimScan {
     pub candidates: Vec<ReclaimCandidate>,
+    #[cfg(test)]
     pub complete: bool,
+    #[cfg(test)]
     pub entries_examined: usize,
 }
 
@@ -324,6 +327,7 @@ pub(crate) struct ResumableReclaimScan {
     pub candidates: Vec<ReclaimCandidate>,
     pub complete: bool,
     /// All directory entries consumed in this pass, including cursor replay.
+    #[cfg(test)]
     pub entries_examined: usize,
     /// Newly inspected entries, excluding cursor replay.
     pub new_entries_examined: usize,
@@ -1189,6 +1193,7 @@ pub fn scan_worktree(
 /// Candidates found before a limit expires still carry their own Git and
 /// worktree eligibility evidence; callers must keep the worktree cursor pending
 /// while `complete` is false.
+#[cfg(test)]
 pub(crate) fn scan_worktree_bounded(
     worktree: &Path,
     active: &[PathBuf],
@@ -1435,7 +1440,7 @@ pub(crate) fn scan_worktree_resumable(
                 incomplete.mark("entry_unavailable", &frame.relative);
                 continue;
             };
-            if {
+            let should_descend = {
                 let mut walk = Walk {
                     worktree,
                     checkout: checkout.as_ref(),
@@ -1445,7 +1450,8 @@ pub(crate) fn scan_worktree_resumable(
                     budget: &mut budget,
                 };
                 walk.inspect_directory(path, &mut found)
-            } {
+            };
+            if should_descend {
                 let relative = match path.strip_prefix(worktree).ok().and_then(Path::to_str) {
                     Some(relative) => relative.to_owned(),
                     None => {
@@ -1500,6 +1506,7 @@ pub(crate) fn scan_worktree_resumable(
     ResumableReclaimScan {
         candidates: found,
         complete: budget.complete && frames.is_empty(),
+        #[cfg(test)]
         entries_examined: budget.entries_examined + replay_entries_examined,
         new_entries_examined: budget.entries_examined,
         replay_entries_examined,
@@ -1604,7 +1611,9 @@ fn scan_worktree_with_limits(
     found.sort_by_key(|candidate| std::cmp::Reverse(candidate.bytes));
     BoundedReclaimScan {
         candidates: found,
+        #[cfg(test)]
         complete: budget.complete,
+        #[cfg(test)]
         entries_examined: budget.entries_examined,
     }
 }
