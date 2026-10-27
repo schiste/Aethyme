@@ -528,6 +528,10 @@ blocked.
    directories bottom-up; after publishing the final archive, sync its
    directory, parent and storage anchor. Keep the source if any sync fails.
 
+   Compound filesystem guards should name the failed predicate (file type,
+   owner, zero/multiple links, group/world write, or identity change) without
+   logging raw metadata values; keep a refusal regression for each category.
+
    Orchestration with no path -- a release, a merge chain -- is claimed by
    name instead: `aethyme broker advanced ownership claim "release v1.2.0"
    --session <your-session-id> --reason "<why>"`. `status` shows every claim,
@@ -1169,6 +1173,7 @@ mod tests {
             "A bundle cap refusal keeps the source and leaves the",
             "bounded partial bundle for diagnosis",
             "fully written, verified and synced",
+            "Compound filesystem guards should name the failed predicate",
             "AETHYME_TEST_DB_SUFFIX",
             "aethyme broker finish cleanup --all-cleaned --apply",
             "aethyme broker advanced operations reconcile",
