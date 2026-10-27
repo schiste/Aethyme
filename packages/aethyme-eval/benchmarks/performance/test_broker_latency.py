@@ -18,6 +18,7 @@ from broker_latency import (
     validate_resource_inventory,
 )
 from broker_action_matrix import (
+    _baseline_unsupported_fetch_option,
     FETCH_FLAGS,
     _classify_deploy_preview,
     _compare_action,
@@ -393,6 +394,47 @@ class PairedActionMatrixTests(unittest.TestCase):
         self.assertEqual(baseline['observed_command_duration_ms'], 12.5)
         with self.assertRaisesRegex(RuntimeError, 'candidate omitted durable'):
             _missing_fetch_witness_semantic('candidate', 11, 12.5)
+
+    def test_baseline_fetch_downgrade_requires_exact_complete_refusal_receipt(self):
+        expected_argv = ['/fixture/aethyme', 'broker', 'advanced', 'git', '--session',
+                         '7', '--effect', 'write', '--scope', 'fetch', '--reason',
+                         'synthetic paired action measurement', '--json', '--', 'fetch',
+                         *FETCH_FLAGS, '--', 'perf-local',
+                         'refs/heads/perf-proven:refs/remotes/perf-local/perf-proven']
+        message = (
+            'Error: unsupported fetch option "--no-auto-maintenance" prevents '
+            'deterministic remote resolution')
+        receipt = {
+            'label': 'action:fetch_provable',
+            'argv': expected_argv,
+            'exit_code': 2,
+            'failure': 'command exited with status 2',
+            'stdout_complete': False,
+            'stdout_utf8_valid': True,
+            'stdout': message,
+            'stderr': '',
+            'stdout_bytes': len(message.encode()),
+            'stderr_bytes': 0,
+            'stdout_sha256': 'a' * 64,
+            'stderr_sha256': 'b' * 64,
+            'duration_ms': 12.5,
+        }
+        self.assertEqual(
+            _baseline_unsupported_fetch_option('baseline', receipt, expected_argv),
+            '--no-auto-maintenance')
+        self.assertIsNone(
+            _baseline_unsupported_fetch_option('candidate', receipt, expected_argv))
+
+        for changed in (
+                {'failure': 'command exceeded 60 seconds'},
+                {'failure': 'command exited with status 2', 'exit_code': 0},
+                {'stdout': 'Error: fetch network connection failed'},
+                {'argv': expected_argv[:-1]},
+                {'stdout_complete': True},
+                {'stderr_sha256': None}):
+            with self.subTest(changed=changed):
+                self.assertIsNone(_baseline_unsupported_fetch_option(
+                    'baseline', {**receipt, **changed}, expected_argv))
 
     def test_v41_live_receipt_is_context_only_and_pins_both_executables(self):
         cli_hash = 'a' * 64

@@ -19,6 +19,7 @@ from broker_concurrent_submit import (
     BoundedCommandRunner,
     MAX_BINARY_BYTES,
     MAX_OUTPUT_BYTES,
+    MAX_STDERR_BYTES,
     MAX_STDOUT_BYTES,
     ReceiptLog,
     canonical_json_bytes,
@@ -52,6 +53,9 @@ REMOTE_URL = 'git@github.com:playground/latency.git'
 FETCH_REMOTE = 'perf-local'
 FETCH_SOURCE_REF = 'refs/heads/perf-proven'
 FETCH_DESTINATION_REF = f'refs/remotes/{FETCH_REMOTE}/perf-proven'
+BASELINE_UNSUPPORTED_FETCH_OPTIONS = (
+    '--no-auto-maintenance', '--no-write-commit-graph', '--no-prune', '--no-prune-tags',
+)
 UNPROVABLE_FETCH_REASON = (
     'A safe public-CLI injection cannot yet prove that the provider ran while '
     'withholding its exit witness; no command or synthetic journal was created.'
@@ -676,6 +680,43 @@ def _missing_fetch_witness_semantic(role, operation_id, duration_ms):
     }
 
 
+def _baseline_unsupported_fetch_option(role, receipt, expected_argv):
+    if role != 'baseline' or not isinstance(receipt, dict):
+        return None
+    exit_code = receipt.get('exit_code')
+    if (receipt.get('label') != 'action:fetch_provable'
+            or receipt.get('argv') != expected_argv
+            or isinstance(exit_code, bool) or not isinstance(exit_code, int)
+            or exit_code <= 0
+            or receipt.get('failure') != f'command exited with status {exit_code}'
+            or receipt.get('stdout_complete') is not False
+            or receipt.get('stdout_utf8_valid') is not True
+            or not isinstance(receipt.get('stdout'), str)
+            or not isinstance(receipt.get('stderr'), str)):
+        return None
+    for field, limit in (('stdout_bytes', MAX_STDOUT_BYTES),
+                         ('stderr_bytes', MAX_STDERR_BYTES)):
+        size = receipt.get(field)
+        if (isinstance(size, bool) or not isinstance(size, int)
+                or size < 0 or size > limit):
+            return None
+    duration = receipt.get('duration_ms')
+    if (isinstance(duration, bool) or not isinstance(duration, (int, float))
+            or not math.isfinite(duration) or duration < 0):
+        return None
+    for field in ('stdout_sha256', 'stderr_sha256'):
+        digest = receipt.get(field)
+        if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
+            return None
+    output = f"{receipt['stdout']}\n{receipt['stderr']}"
+    for option in BASELINE_UNSUPPORTED_FETCH_OPTIONS:
+        refusal = (
+            f'unsupported fetch option "{option}" prevents deterministic remote resolution')
+        if refusal in output:
+            return option
+    return None
+
+
 def _run_provable_fetch(playground, sessions, timings, semantic, role):
     _validate_fixture_git_environment(playground['runner'].env)
     session = sessions['fetch_provable']
@@ -715,7 +756,32 @@ def _run_provable_fetch(playground, sessions, timings, semantic, role):
     run_git(playground['runner'], playground['git'], repo,
             'fetch-proven:disable-ssh-override', 'config', '--unset', 'core.sshCommand')
     try:
-        row = _cli(playground, args, worktree, 'action:fetch_provable')
+        expected_argv = [str(playground['binary']), *args]
+        try:
+            row = _cli(playground, args, worktree, 'action:fetch_provable')
+        except RuntimeError:
+            receipt = playground['runner'].receipts.rows[-1] \
+                if playground['runner'].receipts.rows else None
+            unsupported_option = _baseline_unsupported_fetch_option(
+                role, receipt, expected_argv)
+            if unsupported_option is None:
+                raise
+            refusal_reason = (
+                f'baseline CLI refused strict-fetch option {unsupported_option} before '
+                'deterministic remote resolution; no fetch operation was created')
+            semantic['fetch_provable'] = {
+                'status': 'unsupported',
+                'reason': refusal_reason,
+                'unsupported_option': unsupported_option,
+                'observed_command_duration_ms': receipt['duration_ms'],
+                'comparison_eligible': False,
+            }
+            semantic['fetch_recovery_show'] = {
+                'status': 'unsupported',
+                'reason': refusal_reason + '; operation readback was not attempted',
+                'comparison_eligible': False,
+            }
+            return
     finally:
         run_git(playground['runner'], playground['git'], repo,
                 'fetch-proven:restore-ssh-override', 'config', 'core.sshCommand', ssh_command)
