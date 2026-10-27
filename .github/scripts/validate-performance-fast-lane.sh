@@ -8,7 +8,12 @@ workflow="$repo_root/.github/workflows/product-performance.yml"
 
 for path in \
   "$benchmark_dir/broker_latency.py" \
+  "$benchmark_dir/broker_concurrent_submit.py" \
+  "$benchmark_dir/broker_action_matrix.py" \
+  "$benchmark_dir/broker-action-matrix-v2.json" \
+  "$benchmark_dir/broker-action-scenarios-v1.json" \
   "$benchmark_dir/test_broker_latency.py" \
+  "$benchmark_dir/test_broker_concurrent_submit.py" \
   "$benchmark_dir/git_worktree_config.py" \
   "$benchmark_dir/test_git_worktree_config.py" \
   "$benchmark_dir/git_worktree_options.py" \
@@ -35,7 +40,10 @@ benchmark_dir = Path(sys.argv[1])
 allowed_stdlib = sys.stdlib_module_names
 sources = {
     "broker_latency.py": set(),
-    "test_broker_latency.py": {"broker_latency"},
+    "broker_concurrent_submit.py": {"broker_latency"},
+    "broker_action_matrix.py": {"broker_concurrent_submit", "broker_latency"},
+    "test_broker_latency.py": {"broker_latency", "broker_action_matrix"},
+    "test_broker_concurrent_submit.py": {"broker_concurrent_submit"},
     "git_worktree_config.py": {"git_worktree_options"},
     "test_git_worktree_config.py": {"git_worktree_config"},
     "git_worktree_options.py": set(),
@@ -49,6 +57,9 @@ required_tests = {
     "test_missing_or_unknown_action_is_invalid",
     "test_overruns_are_warnings_and_keep_raw_samples",
     "test_unknown_schema_or_hard_enforcement_is_rejected",
+    "test_missing_strict_fetch_witness_is_not_a_timing_sample",
+    "test_fetch_comparison_requires_schema_one_provider_completion_witness",
+    "test_runner_marks_invalid_utf8_from_original_stdout_bytes",
     "test_normal_primary_refuses_unknown_extension_and_rolls_back",
     "test_explicit_core_worktree_preserves_existing_checkouts",
     "test_bare_primary_preserves_existing_checkouts",
@@ -73,10 +84,19 @@ for filename, allowed_local in sources.items():
                 raise SystemExit(f"{path}: non-stdlib import is not allowed: {module}")
 
 sys.path.insert(0, str(benchmark_dir))
+from broker_action_matrix import load_contracts
+
+# Check the matrix and scenario files with the production contract loader.
+load_contracts()
+
 suite = unittest.TestSuite(
     unittest.defaultTestLoader.discover(str(benchmark_dir), pattern=pattern,
                                        top_level_dir=str(benchmark_dir))
-    for pattern in ("test_broker_latency.py", "test_git_worktree_config.py")
+    for pattern in (
+        "test_broker_latency.py",
+        "test_broker_concurrent_submit.py",
+        "test_git_worktree_config.py",
+    )
 )
 
 def iter_test_cases(test_suite):
@@ -119,6 +139,9 @@ PY
 
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
   -s "$benchmark_dir" -p 'test_broker_latency.py' -v
+
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
+  -s "$benchmark_dir" -p 'test_broker_concurrent_submit.py' -v
 
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
   -s "$benchmark_dir" -p 'test_git_worktree_config.py' -v

@@ -98,6 +98,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   wall time, workload and binary identity, and raw samples. Do not equate an
   internal phase or coordinated-operation interval with end-to-end or network
   time. Use the existing non-gating performance workflow before adding builds.
+- When adding non-Rust controls to a fast lane, verify that mixed and full
+  changes also execute them. Test positive fast-lane and negative/full-lane
+  classification cases; a green Rust suite does not establish that the
+  non-Rust controls ran. Keep the lane conditions exclusive so the full path
+  does not repeat the fast validator and its extra tooling. When changing CI
+  workflow steps, inspect the Rust CI-contract tests alongside the shell
+  classifier tests and keep both aligned.
 - For broker performance fixtures, command success is not enough: assert the
   intended production profile with its recorded operation/profile witness and
   verify the exact expected effects. A successful broad fallback is a
