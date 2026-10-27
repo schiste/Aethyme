@@ -27,6 +27,11 @@ irreplaceable evidence outside disposable checkouts before closing them, or set
 `[cleanup] strict = true` in the primary checkout to retain ignored leftovers and
 pause automatic artifact sweeps. `auto_remove = false` only disables whole-checkout
 removal. Never use `--force` merely to clear a capacity refusal.
+For `finish cleanup resolve --archive --json`, exit status zero can mean the
+archive succeeded while checkout removal failed. Check `worktree_removed` and
+`cleanup_error`, verify the checkout is absent, and retain the archive before
+reporting reclaimed storage. A partial removal needs inspection, not a blind
+retry or forced deletion.
 
 When investigating retained worktrees, distinguish task identity from shared
 service uptime. A shared agent daemon can outlive many tasks; its PID alone
