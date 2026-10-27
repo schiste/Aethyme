@@ -1,8 +1,40 @@
 use super::*;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::{CStr, CString, OsString};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::fs::File;
 use std::io::Read;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::fs::MetadataExt;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::path::Component;
 
 const WORKTREE_OWNERSHIP_WITNESS_MAX_BYTES: u64 = 8 * 1024;
 const CLEANUP_TARGET_SNAPSHOT_UNAVAILABLE: &str = "the cleanup plan could not resolve primary HEAD, so session eligibility was not checked against a target bound to the plan";
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_ORPHAN_RESIDUE_ENTRIES: usize = 100_000;
+// A full retry can enumerate once for inventory and once for removal, up to
+// three times. Keep one total cap across those traversals and any refill retry.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_ORPHAN_RESIDUE_ENUMERATED_ENTRIES: usize = MAX_ORPHAN_RESIDUE_ENTRIES * 8;
+// This also bounds the temporary per-directory name vectors while the full
+// inventory and removal walks share one operation budget.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_ORPHAN_RESIDUE_ENUMERATED_NAME_BYTES: usize = 32 * 1024 * 1024;
+// Includes each retained relative map key and its duplicated leaf name.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_ORPHAN_RESIDUE_SNAPSHOT_PATH_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_ORPHAN_RESIDUE_DEPTH: usize = 128;
+const MAX_ORPHAN_DISPOSABLE_PREFIXES: usize = 16_384;
+const MAX_ORPHAN_DISPOSABLE_PREFIX_BYTES: usize = 4_097;
+const MAX_ORPHAN_DISPOSABLE_PREFIX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const ORPHAN_RESIDUE_SCAN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
 enum CleanupDeliveryTargets<'a> {
@@ -44,6 +76,40 @@ struct CleanupInspectionContext<'a> {
     delivery_targets: CleanupDeliveryTargets<'a>,
     landing_cache: &'a mut crate::representation::LandingVerdictCache,
     status_limits: CleanupStatusLimits,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrphanResidueKind {
+    Directory,
+    RegularFile,
+    Symlink,
+    Special,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone)]
+struct OrphanResidueEntry {
+    name: std::ffi::CString,
+    kind: OrphanResidueKind,
+    device: u64,
+    inode: u64,
+    tracked_object_id: Option<String>,
+    tracked_executable: Option<bool>,
+    pointer_sha256: Option<String>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct PinnedOrphanRoot {
+    _ancestors: Vec<std::fs::File>,
+    ancestry_bindings: Vec<OrphanDirectoryBinding>,
+    parent: std::fs::File,
+    root: std::fs::File,
+    name: std::ffi::CString,
+    identity: (u64, u64),
+    root_generation_sha256: String,
+    filesystem_identity: Vec<u8>,
+    mount_identity: Vec<u8>,
 }
 
 /// Read the two small files used as ownership witnesses without following a
@@ -106,6 +172,1369 @@ fn ownership_inspection_error(path: &Path, action: &str, error: std::io::Error) 
             path.display()
         ),
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+enum OrphanBlobHasher {
+    Sha1(sha1::Sha1),
+    Sha256(sha2::Sha256),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl OrphanBlobHasher {
+    fn new(object_id_len: usize, size: u64) -> Result<Self, String> {
+        let header = format!("blob {size}\0");
+        match object_id_len {
+            40 => {
+                let mut hasher = sha1::Sha1::new();
+                hasher.update(header.as_bytes());
+                Ok(Self::Sha1(hasher))
+            }
+            64 => {
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(header.as_bytes());
+                Ok(Self::Sha256(hasher))
+            }
+            _ => Err("the pinned commit has an unsupported object ID format".into()),
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Sha1(hasher) => hasher.update(bytes),
+            Self::Sha256(hasher) => hasher.update(bytes),
+        }
+    }
+
+    fn finish(self) -> String {
+        match self {
+            Self::Sha1(hasher) => format!("{:x}", hasher.finalize()),
+            Self::Sha256(hasher) => format!("{:x}", hasher.finalize()),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn unix_file_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy)]
+struct OrphanFsMetadata {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    size: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stat_at(parent_fd: RawFd, name: &CString) -> std::io::Result<Option<OrphanFsMetadata>> {
+    // SAFETY: libc::stat is a plain C output structure with integer and fixed
+    // array fields; all-zero is a valid initial buffer for fstatat.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `parent_fd` is held open by the caller and `name` is one
+    // NUL-terminated component. `AT_SYMLINK_NOFOLLOW` inspects the leaf itself.
+    if unsafe {
+        libc::fstatat(
+            parent_fd,
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    #[cfg(target_os = "linux")]
+    let device = stat.st_dev as u64;
+    #[cfg(target_os = "macos")]
+    let device = u64::try_from(stat.st_dev).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "negative device number")
+    })?;
+    Ok(Some(OrphanFsMetadata {
+        device,
+        inode: stat.st_ino as u64,
+        mode: stat.st_mode as u32,
+        size: u64::try_from(stat.st_size).unwrap_or(0),
+    }))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn c_name(name: &std::ffi::OsStr) -> std::io::Result<CString> {
+    CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL path component"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_root_directory() -> std::io::Result<File> {
+    let path = CString::new("/").expect("static root path has no NUL");
+    let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+    // SAFETY: `path` is NUL-terminated and the returned descriptor is owned below.
+    let fd = unsafe { libc::open(path.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `open` returned a fresh owned descriptor.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_directory_at(parent_fd: RawFd, name: &CString) -> std::io::Result<File> {
+    let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+    // SAFETY: `parent_fd` is held open and `name` is one component. No symlink
+    // is followed at the directory entry being opened.
+    let fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a fresh owned descriptor.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_directory_chain(path: &Path) -> std::io::Result<(Vec<File>, Vec<OrphanDirectoryBinding>)> {
+    let mut directories = vec![open_root_directory()?];
+    let mut bindings = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                let parent = directories.last().expect("root descriptor is present");
+                let name = c_name(name)?;
+                let child = open_directory_at(parent.as_raw_fd(), &name)?;
+                let metadata = child.metadata()?;
+                bindings.push(OrphanDirectoryBinding {
+                    parent_fd: parent.as_raw_fd(),
+                    name,
+                    identity: unix_file_identity(&metadata),
+                });
+                directories.push(child);
+            }
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "directory chain is not a normalized absolute path",
+                ));
+            }
+        }
+    }
+    Ok((directories, bindings))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn filesystem_identity(fd: RawFd) -> std::io::Result<Vec<u8>> {
+    // SAFETY: libc::statfs is a plain C output structure with integer and
+    // fixed array fields; all-zero is a valid initial buffer for fstatfs.
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is a live directory descriptor and `stat` is writable.
+    if unsafe { libc::fstatfs(fd, &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful `fstatfs` initialized the fixed-size `f_fsid` field.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            std::ptr::addr_of!(stat.f_fsid).cast::<u8>(),
+            std::mem::size_of_val(&stat.f_fsid),
+        )
+    };
+    Ok(bytes.to_vec())
+}
+
+#[cfg(target_os = "linux")]
+fn mount_identity(fd: RawFd) -> std::io::Result<Vec<u8>> {
+    let empty_path = CString::new("").expect("empty path has no NUL");
+    // SAFETY: libc::statx is a plain C output structure with integer and
+    // fixed array fields; all-zero is a valid initial buffer for statx.
+    let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is live and `AT_EMPTY_PATH` requests its mount identity.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            fd,
+            empty_path.as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_MNT_ID,
+            &mut stat,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if stat.stx_mask & libc::STATX_MNT_ID == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "kernel did not provide a mount identity",
+        ));
+    }
+    Ok(stat.stx_mnt_id.to_ne_bytes().to_vec())
+}
+
+#[cfg(target_os = "macos")]
+fn mount_identity(fd: RawFd) -> std::io::Result<Vec<u8>> {
+    // SAFETY: libc::statfs is a plain C output structure with integer and
+    // fixed array fields; all-zero is a valid initial buffer for fstatfs.
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is a live directory descriptor and `stat` is writable.
+    if unsafe { libc::fstatfs(fd, &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fstatfs` fills `f_mntonname` as a NUL-terminated field.
+    let mountpoint = unsafe { CStr::from_ptr(stat.f_mntonname.as_ptr()) }.to_bytes();
+    if mountpoint.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "filesystem did not provide a mountpoint identity",
+        ));
+    }
+    Ok(mountpoint.to_vec())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl PinnedOrphanRoot {
+    fn open(
+        path: &Path,
+        proof: &crate::events::FinishCleanupRecoveryProof,
+    ) -> Result<Option<Self>, String> {
+        let canonical = path
+            .canonicalize()
+            .map_err(|error| format!("cannot resolve orphan root: {error}"))?;
+        if canonical.to_str() != Some(proof.worktree_path.as_str()) {
+            return Err("orphan root path changed; preserved it for inspection".into());
+        }
+        let parent_path = canonical
+            .parent()
+            .ok_or_else(|| "orphan root has no parent directory".to_string())?;
+        let leaf = canonical
+            .file_name()
+            .ok_or_else(|| "orphan root has no final path component".to_string())?;
+        let (mut ancestors, ancestry_bindings) = open_directory_chain(parent_path)
+            .map_err(|error| format!("cannot pin orphan root parent: {error}"))?;
+        let parent = ancestors
+            .pop()
+            .ok_or_else(|| "orphan root parent chain is empty".to_string())?;
+        let name = c_name(leaf).map_err(|error| format!("invalid orphan root name: {error}"))?;
+        let root = match open_directory_at(parent.as_raw_fd(), &name) {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("cannot pin orphan root: {error}")),
+        };
+        let metadata = root
+            .metadata()
+            .map_err(|error| format!("cannot inspect pinned orphan root: {error}"))?;
+        let identity = unix_file_identity(&metadata);
+        if !metadata.is_dir() || identity != (proof.worktree_device, proof.worktree_inode) {
+            return Err("orphan root identity changed; preserved it for inspection".into());
+        }
+        let generation = crate::root_generation::read_fd(root.as_raw_fd());
+        if !proof
+            .root_generation_sha256
+            .as_deref()
+            .is_some_and(crate::root_generation::valid_digest)
+            || generation.as_deref() != proof.root_generation_sha256.as_deref()
+        {
+            return Err(
+                "orphan root generation changed or is unavailable; preserved it for inspection"
+                    .into(),
+            );
+        }
+        let root_generation_sha256 = proof.root_generation_sha256.clone().ok_or_else(|| {
+            "orphan root generation is unavailable; preserved it for inspection".to_string()
+        })?;
+        let root_filesystem_identity = filesystem_identity(root.as_raw_fd())
+            .map_err(|error| format!("cannot inspect orphan root volume: {error}"))?;
+        let root_mount_identity = mount_identity(root.as_raw_fd())
+            .map_err(|error| format!("cannot inspect orphan root mount: {error}"))?;
+        if metadata.dev() != parent.metadata().map_err(|error| error.to_string())?.dev()
+            || filesystem_identity(parent.as_raw_fd()).map_err(|error| error.to_string())?
+                != root_filesystem_identity
+            || mount_identity(parent.as_raw_fd()).map_err(|error| error.to_string())?
+                != root_mount_identity
+        {
+            return Err("orphan root is a mount point; preserved it for inspection".into());
+        }
+        let pinned = Self {
+            _ancestors: ancestors,
+            ancestry_bindings,
+            parent,
+            root,
+            name,
+            identity,
+            root_generation_sha256,
+            filesystem_identity: root_filesystem_identity,
+            mount_identity: root_mount_identity,
+        };
+        pinned.ensure_binding()?;
+        Ok(Some(pinned))
+    }
+
+    fn ensure_binding(&self) -> Result<(), String> {
+        for binding in &self.ancestry_bindings {
+            let named = stat_at(binding.parent_fd, &binding.name)
+                .map_err(|error| format!("cannot recheck orphan parent binding: {error}"))?;
+            if !named.is_some_and(|entry| {
+                entry.device == binding.identity.0
+                    && entry.inode == binding.identity.1
+                    && orphan_kind(entry.mode) == OrphanResidueKind::Directory
+            }) {
+                return Err("orphan parent path changed; preserved it for inspection".into());
+            }
+        }
+        let named = stat_at(self.parent.as_raw_fd(), &self.name)
+            .map_err(|error| format!("cannot recheck orphan root binding: {error}"))?;
+        if named.is_some_and(|entry| {
+            entry.device == self.identity.0
+                && entry.inode == self.identity.1
+                && mode_has_type(entry.mode, libc::S_IFDIR)
+        }) {
+            if crate::root_generation::read_fd(self.root.as_raw_fd()).as_deref()
+                == Some(self.root_generation_sha256.as_str())
+            {
+                Ok(())
+            } else {
+                Err(
+                    "orphan root generation changed or is unavailable; preserved it for inspection"
+                        .into(),
+                )
+            }
+        } else {
+            Err("orphan root binding changed; preserved it for inspection".into())
+        }
+    }
+
+    fn remove_empty(&self) -> Result<OrphanRemovePass, String> {
+        self.ensure_binding()?;
+        // SAFETY: the pinned parent descriptor is live and the leaf name is
+        // the recorded root binding. The kernel removes it only if it is empty.
+        let result = unsafe {
+            libc::unlinkat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        };
+        if result == 0 {
+            return Ok(OrphanRemovePass::Complete);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::DirectoryNotEmpty {
+            Ok(OrphanRemovePass::Retry)
+        } else if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(OrphanRemovePass::Complete)
+        } else {
+            Err(format!("cannot remove the verified orphan root: {error}"))
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrphanRemovePass {
+    Complete,
+    Retry,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone)]
+struct OrphanDirectoryBinding {
+    parent_fd: RawFd,
+    name: CString,
+    identity: (u64, u64),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct OrphanResidueBudget {
+    deadline: std::time::Instant,
+    enumerated_entries: usize,
+    enumerated_name_bytes: usize,
+    traversal_entries: usize,
+    snapshot_path_bytes: usize,
+    max_enumerated_entries: usize,
+    max_enumerated_name_bytes: usize,
+    max_snapshot_path_bytes: usize,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl OrphanResidueBudget {
+    fn new(deadline: std::time::Instant) -> Self {
+        Self::with_limits(
+            deadline,
+            MAX_ORPHAN_RESIDUE_ENUMERATED_ENTRIES,
+            MAX_ORPHAN_RESIDUE_ENUMERATED_NAME_BYTES,
+            MAX_ORPHAN_RESIDUE_SNAPSHOT_PATH_BYTES,
+        )
+    }
+
+    fn with_limits(
+        deadline: std::time::Instant,
+        max_enumerated_entries: usize,
+        max_enumerated_name_bytes: usize,
+        max_snapshot_path_bytes: usize,
+    ) -> Self {
+        Self {
+            deadline,
+            enumerated_entries: 0,
+            enumerated_name_bytes: 0,
+            traversal_entries: 0,
+            snapshot_path_bytes: 0,
+            max_enumerated_entries,
+            max_enumerated_name_bytes,
+            max_snapshot_path_bytes,
+        }
+    }
+
+    fn check_deadline(&self) -> Result<(), String> {
+        if std::time::Instant::now() >= self.deadline {
+            Err("orphan residue processing exceeded its time budget".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn record_name(&mut self, name_bytes: usize) -> Result<(), String> {
+        self.check_deadline()?;
+        self.traversal_entries = self.traversal_entries.saturating_add(1);
+        if self.traversal_entries > MAX_ORPHAN_RESIDUE_ENTRIES {
+            return Err(format!(
+                "orphan residue exceeds the {}-entry safety limit",
+                MAX_ORPHAN_RESIDUE_ENTRIES
+            ));
+        }
+        self.enumerated_entries = self.enumerated_entries.saturating_add(1);
+        if self.enumerated_entries > self.max_enumerated_entries {
+            return Err("orphan residue exceeds its total enumeration safety limit".into());
+        }
+        self.enumerated_name_bytes = self.enumerated_name_bytes.saturating_add(name_bytes);
+        if self.enumerated_name_bytes > self.max_enumerated_name_bytes {
+            return Err("orphan residue exceeds its total name-byte safety limit".into());
+        }
+        Ok(())
+    }
+
+    fn retain_path(&mut self, parent: &str, name: &str) -> Result<(), String> {
+        let relative_bytes = parent
+            .len()
+            .checked_add(if parent.is_empty() { 0 } else { 1 })
+            .and_then(|bytes| bytes.checked_add(name.len()))
+            .ok_or_else(|| "orphan residue path size overflow".to_string())?;
+        let retained_bytes = relative_bytes
+            .checked_add(name.len())
+            .ok_or_else(|| "orphan residue path size overflow".to_string())?;
+        self.snapshot_path_bytes = self.snapshot_path_bytes.saturating_add(retained_bytes);
+        if self.snapshot_path_bytes > self.max_snapshot_path_bytes {
+            return Err("orphan residue exceeds its retained path safety limit".into());
+        }
+        Ok(())
+    }
+
+    fn begin_inventory(&mut self) {
+        self.traversal_entries = 0;
+        self.snapshot_path_bytes = 0;
+    }
+
+    fn begin_removal_pass(&mut self) {
+        self.traversal_entries = 0;
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct OrphanDirectoryEntries(*mut libc::DIR);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl OrphanDirectoryEntries {
+    fn open(fd: RawFd) -> std::io::Result<Self> {
+        let dot = CString::new(".").expect("dot has no NUL");
+        // SAFETY: `fd` is a live directory descriptor and opening `.` creates
+        // an independent directory offset without following a path component.
+        let duplicate = unsafe {
+            libc::openat(
+                fd,
+                dot.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            )
+        };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `duplicate` is a fresh descriptor whose ownership transfers
+        // to `fdopendir` on success.
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        if stream.is_null() {
+            let error = std::io::Error::last_os_error();
+            // SAFETY: `fdopendir` did not take ownership when it failed.
+            unsafe { libc::close(duplicate) };
+            return Err(error);
+        }
+        Ok(Self(stream))
+    }
+
+    fn next_name(&mut self) -> std::io::Result<Option<OsString>> {
+        reset_errno();
+        // SAFETY: `self.0` is a live DIR stream owned by this value.
+        let entry = unsafe { libc::readdir(self.0) };
+        if entry.is_null() {
+            let errno = current_errno();
+            return if errno == 0 {
+                Ok(None)
+            } else {
+                Err(std::io::Error::from_raw_os_error(errno))
+            };
+        }
+        // SAFETY: `d_name` is NUL-terminated and remains valid until the next
+        // `readdir`; copy its bytes before returning.
+        let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }
+            .to_bytes()
+            .to_vec();
+        Ok(Some(OsString::from_vec(bytes)))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for OrphanDirectoryEntries {
+    fn drop(&mut self) {
+        // SAFETY: this value owns the DIR stream returned by fdopendir.
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn reset_errno() {
+    // SAFETY: the platform errno pointer is thread-local and valid.
+    unsafe { *errno_location() = 0 };
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn current_errno() -> libc::c_int {
+    // SAFETY: the platform errno pointer is thread-local and valid.
+    unsafe { *errno_location() }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn errno_location() -> *mut libc::c_int {
+    // SAFETY: this is libc's calling-thread errno pointer.
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn errno_location() -> *mut libc::c_int {
+    // SAFETY: this is libc's calling-thread errno pointer.
+    unsafe { libc::__error() }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_orphan_directory_names(
+    fd: RawFd,
+    budget: &mut OrphanResidueBudget,
+) -> Result<Vec<String>, String> {
+    let mut stream = OrphanDirectoryEntries::open(fd)
+        .map_err(|error| format!("cannot list pinned residue directory: {error}"))?;
+    let mut names = Vec::new();
+    loop {
+        budget.check_deadline()?;
+        let Some(name) = stream
+            .next_name()
+            .map_err(|error| format!("cannot read pinned residue directory: {error}"))?
+        else {
+            break;
+        };
+        if name == "." || name == ".." {
+            continue;
+        }
+        budget.record_name(name.as_bytes().len())?;
+        let name = name.into_string().map_err(|_| {
+            "orphan residue contains a non-UTF-8 path; preserved it for inspection".to_string()
+        })?;
+        if name.is_empty() || name.contains('/') {
+            return Err("orphan residue contains an invalid path component".into());
+        }
+        names.push(name);
+    }
+    names.sort();
+    Ok(names)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_regular_file_at(parent_fd: RawFd, name: &CString) -> std::io::Result<File> {
+    let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    // SAFETY: `parent_fd` is live and `name` is a single component; the final
+    // component cannot redirect through a symlink.
+    let fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a fresh owned descriptor.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn unlink_orphan_entry(parent_fd: RawFd, name: &CString, directory: bool) -> std::io::Result<()> {
+    let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
+    // SAFETY: the parent descriptor is pinned and the final component is one
+    // NUL-terminated name. `unlinkat` never follows a symlink leaf.
+    if unsafe { libc::unlinkat(parent_fd, name.as_ptr(), flags) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn hash_regular_file_at(
+    root: &PinnedOrphanRoot,
+    parent_fd: RawFd,
+    name: &CString,
+    expected: OrphanFsMetadata,
+    object_id_len: usize,
+    deadline: std::time::Instant,
+) -> Result<String, String> {
+    let mut file = open_regular_file_at(parent_fd, name)
+        .map_err(|error| format!("cannot safely open tracked residue: {error}"))?;
+    let before = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect opened tracked residue: {error}"))?;
+    if !before.is_file()
+        || unix_file_identity(&before) != (expected.device, expected.inode)
+        || before.len() != expected.size
+        || before.mode() as u32 != expected.mode
+        || filesystem_identity(file.as_raw_fd()).map_err(|error| error.to_string())?
+            != root.filesystem_identity
+        || mount_identity(file.as_raw_fd()).map_err(|error| error.to_string())?
+            != root.mount_identity
+    {
+        return Err("tracked residue changed while it was opened; preserved it".into());
+    }
+    let mut hasher = OrphanBlobHasher::new(object_id_len, expected.size)?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err("orphan residue inventory exceeded its time budget".into());
+        }
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot read tracked residue: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let after = file
+        .metadata()
+        .map_err(|error| format!("cannot recheck tracked residue: {error}"))?;
+    if unix_file_identity(&after) != (expected.device, expected.inode)
+        || after.len() != expected.size
+        || after.mode() as u32 != expected.mode
+    {
+        return Err("tracked residue changed during inspection; preserved it".into());
+    }
+    let named = stat_at(parent_fd, name)
+        .map_err(|error| format!("cannot recheck tracked residue binding: {error}"))?;
+    if !named.is_some_and(|entry| {
+        (entry.device, entry.inode) == (expected.device, expected.inode)
+            && entry.mode == expected.mode
+            && entry.size == expected.size
+    }) {
+        return Err("tracked residue binding changed during inspection; preserved it".into());
+    }
+    Ok(hasher.finish())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn hash_symlink_at(
+    root: &PinnedOrphanRoot,
+    parent_fd: RawFd,
+    name: &CString,
+    expected: OrphanFsMetadata,
+    object_id_len: usize,
+) -> Result<String, String> {
+    let mut target = vec![0_u8; 16 * 1024];
+    // SAFETY: the parent descriptor is pinned, the component is NUL-terminated,
+    // and readlinkat reads the target bytes without following them.
+    let length = unsafe {
+        libc::readlinkat(
+            parent_fd,
+            name.as_ptr(),
+            target.as_mut_ptr().cast(),
+            target.len(),
+        )
+    };
+    if length < 0 {
+        return Err(format!(
+            "cannot read tracked symlink: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let length = length as usize;
+    if length == target.len() {
+        return Err("tracked symlink target exceeds the inspection bound".into());
+    }
+    let after = stat_at(parent_fd, name)
+        .map_err(|error| format!("cannot recheck tracked symlink: {error}"))?
+        .ok_or_else(|| "tracked symlink disappeared during inspection".to_string())?;
+    if (after.device, after.inode) != (expected.device, expected.inode)
+        || !mode_has_type(after.mode, libc::S_IFLNK)
+        || after.device != root.identity.0
+    {
+        return Err("tracked symlink changed during inspection; preserved it".into());
+    }
+    let mut hasher = OrphanBlobHasher::new(object_id_len, length as u64)?;
+    hasher.update(&target[..length]);
+    Ok(hasher.finish())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_bounded_regular_file_at(
+    root: &PinnedOrphanRoot,
+    parent_fd: RawFd,
+    name: &CString,
+    expected: OrphanFsMetadata,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    let file = open_regular_file_at(parent_fd, name)
+        .map_err(|error| format!("cannot safely open cleanup witness: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect cleanup witness: {error}"))?;
+    if !metadata.is_file()
+        || unix_file_identity(&metadata) != (expected.device, expected.inode)
+        || metadata.len() > max_bytes
+        || filesystem_identity(file.as_raw_fd()).map_err(|error| error.to_string())?
+            != root.filesystem_identity
+        || mount_identity(file.as_raw_fd()).map_err(|error| error.to_string())?
+            != root.mount_identity
+    {
+        return Err("cleanup witness is not the expected bounded regular file".into());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read cleanup witness: {error}"))?;
+    let after = stat_at(parent_fd, name)
+        .map_err(|error| format!("cannot recheck cleanup witness: {error}"))?
+        .ok_or_else(|| "cleanup witness disappeared during inspection".to_string())?;
+    if bytes.len() as u64 > max_bytes
+        || (after.device, after.inode) != (expected.device, expected.inode)
+        || after.size != metadata.len()
+        || !mode_has_type(after.mode, libc::S_IFREG)
+    {
+        return Err("cleanup witness changed during inspection".into());
+    }
+    Ok(bytes)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn path_is_under_disposable_prefix(path: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|prefix| {
+        prefix
+            .strip_suffix('/')
+            .is_some_and(|root| path == root || path.starts_with(prefix))
+    })
+}
+
+fn valid_disposable_ignored_prefix(prefix: &str) -> bool {
+    let Some(path) = prefix.strip_suffix('/') else {
+        return false;
+    };
+    !path.is_empty()
+        && !path.starts_with('/')
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+fn validate_disposable_prefixes(prefixes: &[String]) -> Result<(), String> {
+    let prefix_bytes = prefixes
+        .iter()
+        .try_fold(0_usize, |total, prefix| total.checked_add(prefix.len()));
+    if prefixes.len() > MAX_ORPHAN_DISPOSABLE_PREFIXES
+        || prefixes.iter().any(|prefix| {
+            prefix.len() > MAX_ORPHAN_DISPOSABLE_PREFIX_BYTES
+                || !valid_disposable_ignored_prefix(prefix)
+        })
+        || prefix_bytes.is_none_or(|bytes| bytes > MAX_ORPHAN_DISPOSABLE_PREFIX_TOTAL_BYTES)
+        || prefixes.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err("the durable cleanup proof has invalid ignored directory prefixes".into());
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn tracked_tree_contains_directory(
+    files: &std::collections::BTreeMap<String, crate::git::GitTreeFile>,
+    directory: &str,
+    deadline: std::time::Instant,
+) -> Result<bool, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("tracked tree directory lookup exceeded its time budget".into());
+    }
+    let mut prefix = String::with_capacity(directory.len().saturating_add(1));
+    prefix.push_str(directory);
+    prefix.push('/');
+    Ok(files
+        .range::<str, _>((
+            std::ops::Bound::Included(prefix.as_str()),
+            std::ops::Bound::Unbounded,
+        ))
+        .next()
+        .is_some_and(|(path, _)| path.starts_with(&prefix)))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn mode_has_type(mode: u32, expected: libc::mode_t) -> bool {
+    u64::from(mode) & u64::from(libc::S_IFMT) == u64::from(expected)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn orphan_kind(mode: u32) -> OrphanResidueKind {
+    if mode_has_type(mode, libc::S_IFDIR) {
+        OrphanResidueKind::Directory
+    } else if mode_has_type(mode, libc::S_IFREG) {
+        OrphanResidueKind::RegularFile
+    } else if mode_has_type(mode, libc::S_IFLNK) {
+        OrphanResidueKind::Symlink
+    } else {
+        OrphanResidueKind::Special
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn relative_orphan_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn git_pointer_matches_proof(
+    bytes: &[u8],
+    proof: &crate::events::FinishCleanupRecoveryProof,
+) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let Some(pointed) = text
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))
+        .map(str::trim)
+    else {
+        return false;
+    };
+    let pointed = PathBuf::from(pointed);
+    let pointed = if pointed.is_absolute() {
+        pointed
+    } else {
+        Path::new(&proof.worktree_path).join(pointed)
+    };
+    let Some(parent) = pointed
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+    else {
+        return false;
+    };
+    pointed
+        .file_name()
+        .is_some_and(|name| parent.join(name) == Path::new(&proof.git_admin_path))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn collect_orphan_residue(
+    root: &PinnedOrphanRoot,
+    directory: &File,
+    relative_directory: &str,
+    proof: &crate::events::FinishCleanupRecoveryProof,
+    tracked_files: &std::collections::BTreeMap<String, crate::git::GitTreeFile>,
+    budget: &mut OrphanResidueBudget,
+    entries: &mut std::collections::BTreeMap<String, OrphanResidueEntry>,
+) -> Result<(), String> {
+    budget.check_deadline()?;
+    let directory_metadata = directory
+        .metadata()
+        .map_err(|error| format!("cannot inspect pinned residue directory: {error}"))?;
+    if !directory_metadata.is_dir()
+        || directory_metadata.dev() != root.identity.0
+        || filesystem_identity(directory.as_raw_fd()).map_err(|error| error.to_string())?
+            != root.filesystem_identity
+        || mount_identity(directory.as_raw_fd()).map_err(|error| error.to_string())?
+            != root.mount_identity
+    {
+        return Err("residue directory crosses a volume or mount; preserved it".into());
+    }
+    let names = read_orphan_directory_names(directory.as_raw_fd(), budget)?;
+    for name in names {
+        budget.check_deadline()?;
+        budget.retain_path(relative_directory, &name)?;
+        let relative = relative_orphan_path(relative_directory, &name);
+        let depth = relative.bytes().filter(|byte| *byte == b'/').count() + 1;
+        if depth > MAX_ORPHAN_RESIDUE_DEPTH {
+            return Err(format!(
+                "orphan residue exceeds the {MAX_ORPHAN_RESIDUE_DEPTH}-level safety limit"
+            ));
+        }
+        let name_c = c_name(std::ffi::OsStr::new(&name))
+            .map_err(|error| format!("invalid residue path component: {error}"))?;
+        let Some(metadata) = stat_at(directory.as_raw_fd(), &name_c)
+            .map_err(|error| format!("cannot inspect residue entry {relative}: {error}"))?
+        else {
+            continue;
+        };
+        if metadata.device != root.identity.0 {
+            return Err(format!(
+                "residue path {relative} crosses onto another volume"
+            ));
+        }
+        let under_ignored_prefix =
+            path_is_under_disposable_prefix(&relative, &proof.disposable_ignored_root_prefixes);
+        let kind = orphan_kind(metadata.mode);
+        let mut entry = OrphanResidueEntry {
+            name: name_c.clone(),
+            kind,
+            device: metadata.device,
+            inode: metadata.inode,
+            tracked_object_id: None,
+            tracked_executable: None,
+            pointer_sha256: None,
+        };
+        match kind {
+            OrphanResidueKind::Directory => {
+                if !under_ignored_prefix
+                    && !tracked_tree_contains_directory(tracked_files, &relative, budget.deadline)?
+                {
+                    return Err(format!(
+                        "unverified directory {relative} remains; preserved it for inspection"
+                    ));
+                }
+                let child = open_directory_at(directory.as_raw_fd(), &name_c).map_err(|error| {
+                    format!("cannot safely open residue directory {relative}: {error}")
+                })?;
+                let opened = child.metadata().map_err(|error| {
+                    format!("cannot inspect opened residue directory {relative}: {error}")
+                })?;
+                if unix_file_identity(&opened) != (metadata.device, metadata.inode)
+                    || filesystem_identity(child.as_raw_fd()).map_err(|error| error.to_string())?
+                        != root.filesystem_identity
+                    || mount_identity(child.as_raw_fd()).map_err(|error| error.to_string())?
+                        != root.mount_identity
+                {
+                    return Err(format!(
+                        "residue directory {relative} changed identity or crossed a mount; preserved it"
+                    ));
+                }
+                entries.insert(relative.clone(), entry);
+                collect_orphan_residue(
+                    root,
+                    &child,
+                    &relative,
+                    proof,
+                    tracked_files,
+                    budget,
+                    entries,
+                )?;
+            }
+            OrphanResidueKind::Special => {
+                return Err(format!(
+                    "special path {relative} remains; preserved it for inspection"
+                ));
+            }
+            OrphanResidueKind::RegularFile if relative == ".git" => {
+                let bytes = read_bounded_regular_file_at(
+                    root,
+                    directory.as_raw_fd(),
+                    &name_c,
+                    metadata,
+                    WORKTREE_OWNERSHIP_WITNESS_MAX_BYTES,
+                )?;
+                if (metadata.device, metadata.inode)
+                    != (proof.git_pointer_device, proof.git_pointer_inode)
+                    || !git_pointer_matches_proof(&bytes, proof)
+                {
+                    return Err(
+                        "the remaining .git pointer no longer matches the cleanup proof".into(),
+                    );
+                }
+                entry.pointer_sha256 = Some(format!("{:x}", sha2::Sha256::digest(&bytes)));
+                entries.insert(relative, entry);
+            }
+            OrphanResidueKind::RegularFile | OrphanResidueKind::Symlink => {
+                if let Some(tracked) = tracked_files.get(&relative) {
+                    let expected_symlink = tracked.mode == "120000";
+                    if (kind == OrphanResidueKind::Symlink) != expected_symlink {
+                        return Err(format!(
+                            "tracked path {relative} changed type; preserved it for inspection"
+                        ));
+                    }
+                    let actual = if expected_symlink {
+                        hash_symlink_at(
+                            root,
+                            directory.as_raw_fd(),
+                            &name_c,
+                            metadata,
+                            tracked.object_id.len(),
+                        )?
+                    } else {
+                        let expected_executable = tracked.mode == "100755";
+                        let actual_executable = metadata.mode & 0o111 != 0;
+                        if expected_executable != actual_executable {
+                            return Err(format!(
+                                "tracked path {relative} changed executable mode; preserved it for inspection"
+                            ));
+                        }
+                        entry.tracked_executable = Some(expected_executable);
+                        hash_regular_file_at(
+                            root,
+                            directory.as_raw_fd(),
+                            &name_c,
+                            metadata,
+                            tracked.object_id.len(),
+                            budget.deadline,
+                        )?
+                    };
+                    if actual != tracked.object_id {
+                        return Err(format!(
+                            "tracked path {relative} changed after cleanup was authorized; preserved it for inspection"
+                        ));
+                    }
+                    entry.tracked_object_id = Some(tracked.object_id.clone());
+                } else if under_ignored_prefix {
+                    if kind == OrphanResidueKind::RegularFile {
+                        verify_regular_file_mount(root, directory.as_raw_fd(), &name_c, metadata)?;
+                    }
+                } else {
+                    return Err(format!(
+                        "unverified path {relative} remains; preserved it for inspection"
+                    ));
+                }
+                entries.insert(relative, entry);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_regular_file_mount(
+    root: &PinnedOrphanRoot,
+    parent_fd: RawFd,
+    name: &CString,
+    expected: OrphanFsMetadata,
+) -> Result<(), String> {
+    let file = open_regular_file_at(parent_fd, name)
+        .map_err(|error| format!("cannot safely inspect disposable file: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect disposable file: {error}"))?;
+    if !metadata.is_file()
+        || unix_file_identity(&metadata) != (expected.device, expected.inode)
+        || filesystem_identity(file.as_raw_fd()).map_err(|error| error.to_string())?
+            != root.filesystem_identity
+        || mount_identity(file.as_raw_fd()).map_err(|error| error.to_string())?
+            != root.mount_identity
+    {
+        return Err("disposable file changed identity or crossed a mount; preserved it".into());
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn ensure_orphan_directory_bindings(
+    root: &PinnedOrphanRoot,
+    bindings: &[OrphanDirectoryBinding],
+) -> Result<(), String> {
+    root.ensure_binding()?;
+    for binding in bindings {
+        let named = stat_at(binding.parent_fd, &binding.name)
+            .map_err(|error| format!("cannot recheck residue directory binding: {error}"))?;
+        if !named.is_some_and(|entry| {
+            entry.device == binding.identity.0
+                && entry.inode == binding.identity.1
+                && orphan_kind(entry.mode) == OrphanResidueKind::Directory
+        }) {
+            return Err("residue directory binding changed; preserved the remainder".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn remove_orphan_directory_contents(
+    root: &PinnedOrphanRoot,
+    directory: &File,
+    relative_directory: &str,
+    bindings: &mut Vec<OrphanDirectoryBinding>,
+    entries: &std::collections::BTreeMap<String, OrphanResidueEntry>,
+    proof: &crate::events::FinishCleanupRecoveryProof,
+    budget: &mut OrphanResidueBudget,
+) -> Result<OrphanRemovePass, String> {
+    if budget.check_deadline().is_err() {
+        return Err(
+            "orphan residue removal exceeded its time budget; preserved the remainder".into(),
+        );
+    }
+    ensure_orphan_directory_bindings(root, bindings)?;
+    let names = read_orphan_directory_names(directory.as_raw_fd(), budget)?;
+    for name in &names {
+        let relative = relative_orphan_path(relative_directory, name);
+        if !entries.contains_key(&relative) {
+            return Ok(OrphanRemovePass::Retry);
+        }
+    }
+
+    for directories_first in [true, false] {
+        for name in &names {
+            if budget.check_deadline().is_err() {
+                return Err(
+                    "orphan residue removal exceeded its time budget; preserved the remainder"
+                        .into(),
+                );
+            }
+            let relative = relative_orphan_path(relative_directory, name);
+            let entry = entries
+                .get(&relative)
+                .expect("directory listing was checked against the snapshot");
+            let is_directory = entry.kind == OrphanResidueKind::Directory;
+            if is_directory != directories_first {
+                continue;
+            }
+            ensure_orphan_directory_bindings(root, bindings)?;
+            let current = stat_at(directory.as_raw_fd(), &entry.name)
+                .map_err(|error| format!("cannot recheck residue path {relative}: {error}"))?;
+            let Some(current) = current else {
+                continue;
+            };
+            if (current.device, current.inode) != (entry.device, entry.inode)
+                || orphan_kind(current.mode) != entry.kind
+                || current.device != root.identity.0
+            {
+                return Err(format!(
+                    "residue path {relative} changed after verification; preserved it"
+                ));
+            }
+            if is_directory {
+                let child =
+                    open_directory_at(directory.as_raw_fd(), &entry.name).map_err(|error| {
+                        format!("cannot safely reopen residue directory {relative}: {error}")
+                    })?;
+                let child_metadata = child.metadata().map_err(|error| {
+                    format!("cannot inspect reopened residue directory {relative}: {error}")
+                })?;
+                if unix_file_identity(&child_metadata) != (entry.device, entry.inode)
+                    || filesystem_identity(child.as_raw_fd()).map_err(|error| error.to_string())?
+                        != root.filesystem_identity
+                    || mount_identity(child.as_raw_fd()).map_err(|error| error.to_string())?
+                        != root.mount_identity
+                {
+                    return Err(format!(
+                        "residue directory {relative} changed identity or crossed a mount; preserved it"
+                    ));
+                }
+                bindings.push(OrphanDirectoryBinding {
+                    parent_fd: directory.as_raw_fd(),
+                    name: entry.name.clone(),
+                    identity: (entry.device, entry.inode),
+                });
+                let outcome = remove_orphan_directory_contents(
+                    root, &child, &relative, bindings, entries, proof, budget,
+                );
+                bindings.pop();
+                if outcome? == OrphanRemovePass::Retry {
+                    return Ok(OrphanRemovePass::Retry);
+                }
+                ensure_orphan_directory_bindings(root, bindings)?;
+                let current = stat_at(directory.as_raw_fd(), &entry.name).map_err(|error| {
+                    format!("cannot recheck residue directory {relative}: {error}")
+                })?;
+                if current.is_some_and(|current| {
+                    (current.device, current.inode) != (entry.device, entry.inode)
+                        || orphan_kind(current.mode) != OrphanResidueKind::Directory
+                }) {
+                    return Err(format!(
+                        "residue directory {relative} changed before unlink; preserved it"
+                    ));
+                }
+                match unlink_orphan_entry(directory.as_raw_fd(), &entry.name, true) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                        return Ok(OrphanRemovePass::Retry);
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "cannot remove verified residue directory {relative}: {error}"
+                        ));
+                    }
+                }
+            } else {
+                match entry.kind {
+                    OrphanResidueKind::RegularFile => {
+                        if let Some(expected) = entry.tracked_object_id.as_deref() {
+                            if let Some(expected_executable) = entry.tracked_executable
+                                && (current.mode & 0o111 != 0) != expected_executable
+                            {
+                                return Err(format!(
+                                    "tracked path {relative} changed executable mode during removal; preserved it"
+                                ));
+                            }
+                            if hash_regular_file_at(
+                                root,
+                                directory.as_raw_fd(),
+                                &entry.name,
+                                current,
+                                expected.len(),
+                                budget.deadline,
+                            )? != expected
+                            {
+                                return Err(format!(
+                                    "tracked path {relative} changed during removal; preserved it"
+                                ));
+                            }
+                        } else if let Some(expected) = entry.pointer_sha256.as_deref() {
+                            let bytes = read_bounded_regular_file_at(
+                                root,
+                                directory.as_raw_fd(),
+                                &entry.name,
+                                current,
+                                WORKTREE_OWNERSHIP_WITNESS_MAX_BYTES,
+                            )?;
+                            if format!("{:x}", sha2::Sha256::digest(&bytes)) != expected
+                                || !git_pointer_matches_proof(&bytes, proof)
+                            {
+                                return Err(
+                                    "the .git pointer changed during removal; preserved it".into(),
+                                );
+                            }
+                        } else {
+                            verify_regular_file_mount(
+                                root,
+                                directory.as_raw_fd(),
+                                &entry.name,
+                                current,
+                            )?;
+                        }
+                    }
+                    OrphanResidueKind::Symlink => {
+                        if let Some(expected) = entry.tracked_object_id.as_deref()
+                            && hash_symlink_at(
+                                root,
+                                directory.as_raw_fd(),
+                                &entry.name,
+                                current,
+                                expected.len(),
+                            )? != expected
+                        {
+                            return Err(format!(
+                                "tracked symlink {relative} changed during removal; preserved it"
+                            ));
+                        }
+                    }
+                    OrphanResidueKind::Directory | OrphanResidueKind::Special => {
+                        return Err(format!(
+                            "unsafe residue type at {relative}; preserved it for inspection"
+                        ));
+                    }
+                }
+                ensure_orphan_directory_bindings(root, bindings)?;
+                match unlink_orphan_entry(directory.as_raw_fd(), &entry.name, false) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "cannot remove verified residue {relative}: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(OrphanRemovePass::Complete)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn remove_orphan_residue_pass(
+    root: &PinnedOrphanRoot,
+    entries: &std::collections::BTreeMap<String, OrphanResidueEntry>,
+    proof: &crate::events::FinishCleanupRecoveryProof,
+    budget: &mut OrphanResidueBudget,
+) -> Result<OrphanRemovePass, String> {
+    budget.begin_removal_pass();
+    root.ensure_binding()?;
+    let outcome = remove_orphan_directory_contents(
+        root,
+        &root.root,
+        "",
+        &mut Vec::new(),
+        entries,
+        proof,
+        budget,
+    )?;
+    if outcome == OrphanRemovePass::Retry {
+        return Ok(outcome);
+    }
+    root.remove_empty()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn remove_authorized_orphan_tree(
+    repository: &crate::git::GitRepo,
+    root_path: &Path,
+    proof: &crate::events::FinishCleanupRecoveryProof,
+) -> Result<(), String> {
+    validate_disposable_prefixes(&proof.disposable_ignored_root_prefixes)?;
+    let deadline = std::time::Instant::now() + ORPHAN_RESIDUE_SCAN_BUDGET;
+    let mut budget = OrphanResidueBudget::new(deadline);
+    let Some(root) = PinnedOrphanRoot::open(root_path, proof)? else {
+        return Ok(());
+    };
+    for attempt in 1..=3 {
+        if std::time::Instant::now() >= deadline {
+            return Err(
+                "orphan residue processing exceeded its time budget; preserved the remainder"
+                    .into(),
+            );
+        }
+        root.ensure_binding()?;
+        let tracked = repository
+            .tracked_tree_files_at(&proof.head, deadline)
+            .map_err(|error| format!("cannot inspect the pinned tracked tree: {error}"))?;
+        if tracked.iter().any(|entry| entry.mode == "160000") {
+            return Err("the pinned checkout contains a submodule; preserved orphan residue for manual inspection".into());
+        }
+        let tracked_files = tracked
+            .into_iter()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut entries = std::collections::BTreeMap::new();
+        budget.begin_inventory();
+        collect_orphan_residue(
+            &root,
+            &root.root,
+            "",
+            proof,
+            &tracked_files,
+            &mut budget,
+            &mut entries,
+        )?;
+        match remove_orphan_residue_pass(&root, &entries, proof, &mut budget)? {
+            OrphanRemovePass::Complete => return Ok(()),
+            OrphanRemovePass::Retry if attempt < 3 => {}
+            OrphanRemovePass::Retry => break,
+        }
+    }
+    Err("new residue kept the orphan directory non-empty after three bounded passes".into())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn remove_authorized_orphan_tree(
+    _repository: &crate::git::GitRepo,
+    _root: &Path,
+    _proof: &crate::events::FinishCleanupRecoveryProof,
+) -> Result<(), String> {
+    Err("safe orphan residue removal is unavailable on this platform".into())
 }
 
 fn worktree_size_estimate(
@@ -1884,7 +3313,13 @@ impl Broker {
             payload.get("recovery_proof")?.clone(),
         )
         .ok()?;
-        if proof.schema_version != 1
+        let schema_valid = proof.schema_version == 3
+            && validate_disposable_prefixes(&proof.disposable_ignored_root_prefixes).is_ok()
+            && proof
+                .root_generation_sha256
+                .as_deref()
+                .is_some_and(crate::root_generation::valid_digest);
+        if !schema_valid
             || proof.branch_ref != format!("refs/heads/{}", current.branch)
             || proof.head != proof.branch_tip
         {
@@ -1932,8 +3367,14 @@ impl Broker {
             return None;
         }
         let checkout = GitRepo::discover(&canonical_path).ok()?;
+        let mut checkout_proof = checkout.finish_cleanup_recovery_proof(&proof.branch_ref)?;
+        // Git can reconstruct the checkout identity while its metadata still
+        // exists, but only the event carries the captured disposable roots.
+        checkout_proof.schema_version = proof.schema_version;
+        checkout_proof.disposable_ignored_root_prefixes =
+            proof.disposable_ignored_root_prefixes.clone();
         if checkout.root() != canonical_path
-            || checkout.finish_cleanup_recovery_proof(&proof.branch_ref)? != proof
+            || checkout_proof != proof
             || self.repo.resolve_ref(&proof.branch_ref).as_deref()
                 != Some(proof.branch_tip.as_str())
         {
@@ -2044,6 +3485,13 @@ impl Broker {
             || !path_metadata.is_dir()
             || path_metadata.dev() != proof.worktree_device
             || path_metadata.ino() != proof.worktree_inode
+        {
+            return None;
+        }
+        let (generation_device, generation_inode, generation_sha256) =
+            crate::root_generation::read_path_with_identity(worktree_path)?;
+        if (generation_device, generation_inode) != (proof.worktree_device, proof.worktree_inode)
+            || proof.root_generation_sha256.as_deref() != Some(generation_sha256.as_str())
         {
             return None;
         }
@@ -2269,14 +3717,13 @@ impl Broker {
             });
         }
 
-        let outcome = crate::removal::remove_tree(&worktree_path);
-        if !outcome.removed {
+        if let Err(reason) =
+            remove_authorized_orphan_tree(&self.repo, &worktree_path, expected_proof)
+        {
             return Err(BrokerOpError::DirtyWorktree {
                 id: session.id,
                 reason: format!(
-                    "interrupted orphan removal stopped after {} attempt(s); preserved the branch and session for retry: {}",
-                    outcome.attempts,
-                    outcome.error.as_deref().unwrap_or("the path remains")
+                    "interrupted orphan removal preserved unverified residue and retained the branch and session for retry: {reason}"
                 ),
             });
         }
@@ -2970,7 +4417,18 @@ mod ownership_witness_tests {
 #[cfg(test)]
 mod registered_removal_failure_tests {
     use super::CleanupStatusLimits;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use super::{
+        MAX_ORPHAN_RESIDUE_ENUMERATED_ENTRIES, MAX_ORPHAN_RESIDUE_ENUMERATED_NAME_BYTES,
+        ORPHAN_RESIDUE_SCAN_BUDGET, OrphanRemovePass, OrphanResidueBudget, PinnedOrphanRoot,
+        collect_orphan_residue, open_directory_at, remove_orphan_residue_pass,
+        tracked_tree_contains_directory,
+    };
     use crate::{SessionCleanupState, git::with_git_deadline};
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::ffi::CString;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::os::fd::AsRawFd;
     use std::path::Path;
     use std::process::Command;
     use std::time::Duration;
@@ -3062,11 +4520,30 @@ mod registered_removal_failure_tests {
         session: &crate::Session,
         worktree: &Path,
     ) -> crate::events::FinishCleanupRecoveryProof {
+        persist_finish_cleanup_intent_with_schema(broker, session, worktree, 3)
+    }
+
+    fn persist_finish_cleanup_intent_with_schema(
+        broker: &mut crate::Broker,
+        session: &crate::Session,
+        worktree: &Path,
+        schema_version: u8,
+    ) -> crate::events::FinishCleanupRecoveryProof {
         let branch_ref = format!("refs/heads/{}", session.branch);
         let checkout = crate::git::GitRepo::discover(worktree).unwrap();
-        let proof = checkout
+        let mut proof = checkout
             .finish_cleanup_recovery_proof(&branch_ref)
             .expect("the represented linked checkout must yield a durable recovery proof");
+        proof.schema_version = schema_version;
+        if schema_version < 3 {
+            proof.root_generation_sha256 = None;
+        }
+        if schema_version >= 2 {
+            let policy = crate::AutoCleanupPolicy::load(broker.main_root()).unwrap();
+            proof.disposable_ignored_root_prefixes =
+                crate::auto_cleanup::disposable_ignored_directory_prefixes(worktree, &policy)
+                    .unwrap();
+        }
         let payload = crate::events::session_finish_cleanup_started_payload_with_proof(
             true,
             true,
@@ -3478,6 +4955,482 @@ mod registered_removal_failure_tests {
         broker.cleanup(session.id, false).unwrap();
         assert!(!worktree.exists());
         assert!(broker.repo.resolve_ref(&proof.branch_ref).is_none());
+    }
+
+    #[test]
+    fn orphan_finish_recovery_preserves_a_new_standalone_file() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "orphan recovery late file");
+        let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        std::fs::remove_file(worktree.join("README.md")).unwrap();
+        remove_worktree_admin_directory(&worktree);
+
+        let late_file = worktree.join("late-after-git-removal.txt");
+        std::fs::write(&late_file, b"preserve this file").unwrap();
+        let closed = broker.store().session(session.id).unwrap();
+        assert_eq!(
+            broker.interrupted_finish_orphan_cleanup_proof(&closed),
+            Some(proof.clone())
+        );
+
+        let error = broker.cleanup(session.id, false).unwrap_err();
+        assert!(error.to_string().contains("unverified path"), "{error}");
+        assert_eq!(std::fs::read(&late_file).unwrap(), b"preserve this file");
+        assert_eq!(
+            broker.store().session(session.id).unwrap().cleanup_state,
+            SessionCleanupState::Closed
+        );
+        assert!(broker.repo.resolve_ref(&proof.branch_ref).is_some());
+    }
+
+    #[test]
+    fn orphan_finish_recovery_preserves_tracked_content_changed_after_verification() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "orphan recovery changed tracked");
+        let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        std::fs::remove_file(worktree.join("README.md")).unwrap();
+        remove_worktree_admin_directory(&worktree);
+
+        let changed = worktree.join("README.md");
+        std::fs::write(&changed, b"new content after authorization").unwrap();
+        let error = broker.cleanup(session.id, false).unwrap_err();
+        assert!(
+            error.to_string().contains("changed after cleanup"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&changed).unwrap(),
+            b"new content after authorization"
+        );
+        assert_eq!(
+            broker.store().session(session.id).unwrap().cleanup_state,
+            SessionCleanupState::Closed
+        );
+        assert!(broker.repo.resolve_ref(&proof.branch_ref).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphan_finish_recovery_preserves_tracked_executable_mode_changes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "orphan recovery changed mode");
+        let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        std::fs::remove_file(worktree.join("README.md")).unwrap();
+        remove_worktree_admin_directory(&worktree);
+
+        let changed = worktree.join("README.md");
+        std::fs::write(&changed, b"tracked fixture\n").unwrap();
+        std::fs::set_permissions(&changed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = broker.cleanup(session.id, false).unwrap_err();
+        assert!(
+            error.to_string().contains("changed executable mode"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&changed).unwrap(), b"tracked fixture\n");
+        assert_eq!(
+            std::fs::metadata(&changed).unwrap().permissions().mode() & 0o111,
+            0o111
+        );
+        assert_eq!(
+            broker.store().session(session.id).unwrap().cleanup_state,
+            SessionCleanupState::Closed
+        );
+        assert!(broker.repo.resolve_ref(&proof.branch_ref).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphan_finish_recovery_preserves_a_symlink_replacing_tracked_content() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "orphan recovery symlink");
+        let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        std::fs::remove_file(worktree.join("README.md")).unwrap();
+        remove_worktree_admin_directory(&worktree);
+
+        let outside = owner.path().join("outside.txt");
+        std::fs::write(&outside, b"outside content").unwrap();
+        let tracked_path = worktree.join("README.md");
+        std::os::unix::fs::symlink(&outside, &tracked_path).unwrap();
+        let error = broker.cleanup(session.id, false).unwrap_err();
+        assert!(error.to_string().contains("changed type"), "{error}");
+        assert!(
+            std::fs::symlink_metadata(&tracked_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside content");
+        assert_eq!(
+            broker.store().session(session.id).unwrap().cleanup_state,
+            SessionCleanupState::Closed
+        );
+        assert!(broker.repo.resolve_ref(&proof.branch_ref).is_some());
+    }
+
+    #[test]
+    fn legacy_orphan_proof_cannot_authorize_an_ignored_directory() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "legacy orphan proof");
+        let residue = worktree.join("local-dataset/saved-session.json");
+        std::fs::create_dir_all(residue.parent().unwrap()).unwrap();
+        std::fs::write(&residue, b"saved session data").unwrap();
+        let proof = persist_finish_cleanup_intent_with_schema(&mut broker, &session, &worktree, 1);
+        std::fs::remove_file(worktree.join("README.md")).unwrap();
+        remove_worktree_admin_directory(&worktree);
+        let closed = broker.store().session(session.id).unwrap();
+        assert!(
+            broker
+                .interrupted_finish_orphan_cleanup_proof(&closed)
+                .is_none()
+        );
+
+        let error = broker.cleanup(session.id, false).unwrap_err();
+        assert!(error.to_string().contains("preserved"), "{error}");
+        assert_eq!(std::fs::read(&residue).unwrap(), b"saved session data");
+        assert_eq!(
+            broker.store().session(session.id).unwrap().cleanup_state,
+            SessionCleanupState::Closed
+        );
+        assert!(broker.repo.resolve_ref(&proof.branch_ref).is_some());
+    }
+
+    #[test]
+    fn legacy_v2_orphan_proof_without_root_generation_cannot_authorize_residue() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "legacy v2 orphan proof");
+        let residue = worktree.join("local-dataset/saved-session.json");
+        std::fs::create_dir_all(residue.parent().unwrap()).unwrap();
+        std::fs::write(&residue, b"saved session data").unwrap();
+        let proof = persist_finish_cleanup_intent_with_schema(&mut broker, &session, &worktree, 2);
+        assert!(!proof.disposable_ignored_root_prefixes.is_empty());
+        assert!(proof.root_generation_sha256.is_none());
+        std::fs::remove_file(worktree.join("README.md")).unwrap();
+        remove_worktree_admin_directory(&worktree);
+        let closed = broker.store().session(session.id).unwrap();
+        assert!(
+            broker
+                .interrupted_finish_orphan_cleanup_proof(&closed)
+                .is_none()
+        );
+
+        let error = broker.cleanup(session.id, false).unwrap_err();
+        assert!(error.to_string().contains("preserved"), "{error}");
+        assert_eq!(std::fs::read(&residue).unwrap(), b"saved session data");
+        assert_eq!(
+            broker.store().session(session.id).unwrap().cleanup_state,
+            SessionCleanupState::Closed
+        );
+        assert!(broker.repo.resolve_ref(&proof.branch_ref).is_some());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn orphan_residue_inventory_refuses_a_volume_identity_mismatch() {
+        use std::os::unix::fs::MetadataExt;
+
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "orphan recovery volume check");
+        let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        let metadata = std::fs::symlink_metadata(&worktree).unwrap();
+        let expected_device = metadata.dev().saturating_add(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut budget = OrphanResidueBudget::new(deadline);
+        let mut entries = std::collections::BTreeMap::new();
+        let tracked = std::collections::BTreeMap::new();
+        let mut root = PinnedOrphanRoot::open(&worktree, &proof).unwrap().unwrap();
+        root.identity.0 = expected_device;
+
+        let error = collect_orphan_residue(
+            &root,
+            &root.root,
+            "",
+            &proof,
+            &tracked,
+            &mut budget,
+            &mut entries,
+        )
+        .unwrap_err();
+        assert!(error.contains("crosses a volume or mount"), "{error}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn pinned_orphan_root_rechecks_its_generation_before_each_removal_pass() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "orphan root generation recheck");
+        let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        let root = PinnedOrphanRoot::open(&worktree, &proof).unwrap().unwrap();
+        let replacement = [0x5a_u8; 32];
+
+        #[cfg(target_os = "linux")]
+        let name = c"user.aethyme.root-generation";
+        #[cfg(target_os = "macos")]
+        let name = c"com.aethyme.root-generation";
+
+        #[cfg(target_os = "linux")]
+        // SAFETY: the descriptor is the pinned root directory and the xattr
+        // name/value buffers remain live for the duration of the call.
+        let result = unsafe {
+            libc::fsetxattr(
+                root.root.as_raw_fd(),
+                name.as_ptr(),
+                replacement.as_ptr().cast(),
+                replacement.len(),
+                libc::XATTR_REPLACE,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        // SAFETY: the descriptor is the pinned root directory and the xattr
+        // name/value buffers remain live for the duration of the call.
+        let result = unsafe {
+            libc::fsetxattr(
+                root.root.as_raw_fd(),
+                name.as_ptr(),
+                replacement.as_ptr().cast(),
+                replacement.len(),
+                0,
+                libc::XATTR_REPLACE,
+            )
+        };
+        assert_eq!(result, 0);
+
+        let error = root.ensure_binding().unwrap_err();
+        assert!(error.contains("generation changed"), "{error}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn orphan_removal_does_not_follow_a_directory_replaced_by_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        std::fs::create_dir_all(repository.join("nested")).unwrap();
+        std::fs::write(repository.join("nested/tracked.txt"), b"tracked data").unwrap();
+        git(&repository, &["add", "nested/tracked.txt"]);
+        git(&repository, &["commit", "-qm", "nested tracked fixture"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "orphan ancestor swap protection");
+        let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        let deadline = std::time::Instant::now() + ORPHAN_RESIDUE_SCAN_BUDGET;
+        let root = PinnedOrphanRoot::open(&worktree, &proof).unwrap().unwrap();
+        let tracked = crate::git::GitRepo::discover(&repository)
+            .unwrap()
+            .tracked_tree_files_at(&proof.head, deadline)
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut entries = std::collections::BTreeMap::new();
+        let mut budget = OrphanResidueBudget::new(deadline);
+        collect_orphan_residue(
+            &root,
+            &root.root,
+            "",
+            &proof,
+            &tracked,
+            &mut budget,
+            &mut entries,
+        )
+        .unwrap();
+
+        let outside = owner.path().join("moved-nested");
+        std::fs::rename(worktree.join("nested"), &outside).unwrap();
+        symlink(&outside, worktree.join("nested")).unwrap();
+
+        let error = remove_orphan_residue_pass(&root, &entries, &proof, &mut budget).unwrap_err();
+        assert!(error.contains("changed after verification"), "{error}");
+        assert_eq!(
+            std::fs::read(outside.join("tracked.txt")).unwrap(),
+            b"tracked data"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn orphan_removal_preserves_a_new_path_added_after_inventory() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "orphan late path protection");
+        let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        let deadline = std::time::Instant::now() + ORPHAN_RESIDUE_SCAN_BUDGET;
+        let root = PinnedOrphanRoot::open(&worktree, &proof).unwrap().unwrap();
+        let tracked = crate::git::GitRepo::discover(&repository)
+            .unwrap()
+            .tracked_tree_files_at(&proof.head, deadline)
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut entries = std::collections::BTreeMap::new();
+        let mut budget = OrphanResidueBudget::new(deadline);
+        collect_orphan_residue(
+            &root,
+            &root.root,
+            "",
+            &proof,
+            &tracked,
+            &mut budget,
+            &mut entries,
+        )
+        .unwrap();
+
+        let late_path = worktree.join("added-after-inventory.txt");
+        std::fs::write(&late_path, b"preserve late path").unwrap();
+        assert_eq!(
+            remove_orphan_residue_pass(&root, &entries, &proof, &mut budget).unwrap(),
+            OrphanRemovePass::Retry
+        );
+        assert_eq!(std::fs::read(&late_path).unwrap(), b"preserve late path");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn orphan_residue_inventory_enforces_a_seeded_enumeration_limit() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "orphan recovery inventory cap");
+        let nested = worktree.join("local-dataset/outer");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("one"), b"1").unwrap();
+        std::fs::write(nested.join("two"), b"2").unwrap();
+        std::fs::write(nested.join("three"), b"3").unwrap();
+        let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        let root = PinnedOrphanRoot::open(&worktree, &proof).unwrap().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut budget = OrphanResidueBudget::with_limits(deadline, 2, 1024, 1024);
+        let mut entries = std::collections::BTreeMap::new();
+        let tracked = std::collections::BTreeMap::new();
+        let nested_directory = open_directory_at(
+            root.root.as_raw_fd(),
+            &CString::new("local-dataset").unwrap(),
+        )
+        .unwrap();
+
+        let error = collect_orphan_residue(
+            &root,
+            &nested_directory,
+            "local-dataset",
+            &proof,
+            &tracked,
+            &mut budget,
+            &mut entries,
+        )
+        .unwrap_err();
+        assert!(error.contains("total enumeration safety limit"), "{error}");
+        assert!(nested.join("one").is_file());
+
+        let mut name_budget = OrphanResidueBudget::with_limits(deadline, 10, 1, 1024);
+        let mut name_entries = std::collections::BTreeMap::new();
+        let error = collect_orphan_residue(
+            &root,
+            &nested_directory,
+            "local-dataset",
+            &proof,
+            &tracked,
+            &mut name_budget,
+            &mut name_entries,
+        )
+        .unwrap_err();
+        assert!(error.contains("total name-byte safety limit"), "{error}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn orphan_residue_inventory_enforces_a_seeded_retained_path_limit() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "orphan recovery path byte cap");
+        let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        let root = PinnedOrphanRoot::open(&worktree, &proof).unwrap().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut budget = OrphanResidueBudget::with_limits(
+            deadline,
+            MAX_ORPHAN_RESIDUE_ENUMERATED_ENTRIES,
+            MAX_ORPHAN_RESIDUE_ENUMERATED_NAME_BYTES,
+            1,
+        );
+        let mut entries = std::collections::BTreeMap::new();
+        let tracked = std::collections::BTreeMap::new();
+
+        let error = collect_orphan_residue(
+            &root,
+            &root.root,
+            "",
+            &proof,
+            &tracked,
+            &mut budget,
+            &mut entries,
+        )
+        .unwrap_err();
+        assert!(error.contains("retained path safety limit"), "{error}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn tracked_tree_directory_lookup_matches_complete_path_components() {
+        fn file(path: &str) -> crate::git::GitTreeFile {
+            crate::git::GitTreeFile {
+                path: path.to_owned(),
+                mode: "100644".into(),
+                object_id: "0".repeat(40),
+            }
+        }
+
+        let files = [file("nested/tracked.txt"), file("nestedish/other.txt")]
+            .into_iter()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        assert!(tracked_tree_contains_directory(&files, "nested", deadline).unwrap());
+        assert!(!tracked_tree_contains_directory(&files, "nestedi", deadline).unwrap());
+        assert!(!tracked_tree_contains_directory(&files, "nestedish/other.txt", deadline).unwrap());
     }
 
     #[test]

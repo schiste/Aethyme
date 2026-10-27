@@ -52,6 +52,7 @@ mod disk_headroom;
 mod duplicate_work;
 pub mod exit_status;
 mod resource_pressure;
+mod root_generation;
 // The T03 mapping adapter is compiled for the experimental contract tests but is not activated by a provider.
 #[allow(dead_code)]
 pub mod experimental_symbol_mapping;
@@ -126,6 +127,7 @@ pub mod local_target;
 pub mod local_wave;
 mod main_drift;
 pub mod main_reconcile;
+pub mod managed_services;
 mod measurement;
 mod merge;
 mod merge_chain;

@@ -26,6 +26,18 @@ struct CreatedSessionWorktree {
     _lifecycle_claim: crate::file_lock::ExclusiveFileLock,
 }
 
+fn capture_spawned_worktree_instance_witness(
+    worktree: &crate::git::GitRepo,
+) -> Option<crate::events::SpawnedWorktreeInstanceWitness> {
+    // Initialization returns only after the marker is synced and read back.
+    // If the filesystem cannot persist it, leave this session ineligible for
+    // unattended cleanup while allowing normal worktree use and finish.
+    let initialized_generation = crate::root_generation::initialize(worktree.root())?;
+    let witness = worktree.spawned_worktree_instance_witness()?;
+    (witness.root_generation_sha256.as_deref() == Some(initialized_generation.as_str()))
+        .then_some(witness)
+}
+
 #[derive(Clone)]
 struct ReusePrefetchedDefaultBranch {
     session_id: i64,
@@ -7150,7 +7162,7 @@ impl Broker {
             &start_base,
             selected_promote_branch,
         );
-        let worktree_instance_witness = worktree.spawned_worktree_instance_witness();
+        let worktree_instance_witness = capture_spawned_worktree_instance_witness(&worktree);
         let repository_contract = self.capture_repository_contract(worktree.root(), false)?;
         let new_session = NewSession {
             worktree_path: worktree.root().to_string_lossy().into_owned(),
@@ -7282,7 +7294,7 @@ impl Broker {
             selected_promote_branch,
         );
         let worktree_path = worktree.root().to_path_buf();
-        let worktree_instance_witness = worktree.spawned_worktree_instance_witness();
+        let worktree_instance_witness = capture_spawned_worktree_instance_witness(&worktree);
         let repository_contract = match self.capture_repository_contract(&worktree_path, false) {
             Ok(contract) => contract,
             Err(error) => {

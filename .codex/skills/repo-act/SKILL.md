@@ -373,6 +373,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   producer encodings, and bind the exact observed bytes across plan/apply when
   an operator confirmation spans invocations; test re-encoding drift and
   rollback after the write-side recheck.
+- For recovery code that returns private control material, distinguish request
+  identity from caller authority. Keep recovery internal until a durable journal
+  and recovery lock bind ownership; public inventory must not confer token
+  recovery authority. Read grant identity, state, allocations and retaining holds
+  from one database snapshot.
 - For recovery fixtures, exercise the production entry point that persists the
   recovery intent, assert that the intent exists, and only then simulate the
   interruption. An option that skips cleanup or a hand-seeded event does not

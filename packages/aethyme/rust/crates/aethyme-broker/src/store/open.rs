@@ -456,10 +456,15 @@ impl BrokerStore {
             ));
         }
         if let Some(witness) = witness
-            && (witness.schema_version != 1 || witness.worktree_path != new.worktree_path)
+            && (witness.schema_version != 2
+                || witness.worktree_path != new.worktree_path
+                || !witness
+                    .root_generation_sha256
+                    .as_deref()
+                    .is_some_and(crate::root_generation::valid_digest))
         {
             return Err(BrokerError::InvalidSpawnedWorktreeInstanceWitness(
-                "captured identity does not match the spawned worktree path".into(),
+                "captured identity does not match the spawned worktree path or lacks a valid root-generation marker".into(),
             ));
         }
         self.register_session_with_optional_spawn_witness(
