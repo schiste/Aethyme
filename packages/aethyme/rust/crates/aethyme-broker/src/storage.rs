@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -28,6 +28,9 @@ pub const STORAGE_PLAN_SCHEMA_VERSION: u32 = 3;
 pub const STORAGE_RECONCILIATION_SCHEMA_VERSION: u32 = 1;
 
 const DAY_MS: i64 = 86_400_000;
+const STORAGE_ROOT_MAX_ENTRIES: usize = 4096;
+const WORKTREE_ROOT_MARKER_MAX_BYTES: u64 = 64 * 1024;
+const WORKTREE_CACHE_ROOT_DISCOVERY_BUDGET: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const PREPARATION_SWEEP_MAX_DISCOVERY_PATHS: usize = 4096;
 #[cfg(test)]
@@ -586,6 +589,7 @@ pub(crate) fn storage_plan_with_context(
         .as_ref()
         .and_then(|binding| binding.instance_nonce.as_deref());
     let mut enumerate_children = preparation_live_root_children;
+    let mut additional_worktree_volume_cache_bindings = Vec::new();
     let plan = build_plan(
         &main_root,
         &storage_layout,
@@ -597,6 +601,8 @@ pub(crate) fn storage_plan_with_context(
         crate::SizeScan::Recorded,
         &mut records,
         &worktree_volume_cache_bindings,
+        context.host_resource_db_path.as_deref(),
+        &mut additional_worktree_volume_cache_bindings,
         &mut enumerate_children,
     )?;
     if let Some(binding) = preparation_cache_root_binding.as_ref() {
@@ -694,6 +700,7 @@ pub(crate) fn storage_apply_with_context(
         .as_ref()
         .map(|binding| binding.path.clone());
     let mut enumerate_children = preparation_live_root_children;
+    let mut additional_worktree_volume_cache_bindings = Vec::new();
     let plan = build_apply_plan(
         &main_root,
         &storage_layout,
@@ -708,6 +715,8 @@ pub(crate) fn storage_apply_with_context(
         warnings,
         &mut records,
         &worktree_volume_cache_bindings,
+        context.host_resource_db_path.as_deref(),
+        &mut additional_worktree_volume_cache_bindings,
         &mut enumerate_children,
     )?;
     if let Some(binding) = preparation_cache_root_binding.as_ref() {
@@ -727,13 +736,28 @@ pub(crate) fn storage_apply_with_context(
         .into_iter()
         .collect::<Vec<_>>();
     cache_bindings.extend(worktree_volume_cache_bindings);
-    let worktree_volume_cache_paths = worktree_volume_cache_paths(&cache_bindings);
+    let mut verified_worktree_cache_paths = worktree_volume_cache_paths(&cache_bindings);
+    verified_worktree_cache_paths.extend(worktree_volume_cache_paths(
+        &additional_worktree_volume_cache_bindings,
+    ));
     let live_roots = preparation_live_roots(
         &main_root,
         &plan.primary_checkouts,
         &plan.roots,
-        &worktree_volume_cache_paths,
+        &verified_worktree_cache_paths,
     )?;
+    // Additional roots only make their reserved child safe to recognize while
+    // resolving liveness. They never enter `cache_bindings`, which is the set
+    // that authorizes preparation-cache candidates for deletion.
+    for binding in &additional_worktree_volume_cache_bindings {
+        binding
+            .validate()
+            .map_err(|error| StorageError::Unavailable {
+                reason: format!(
+                    "additional worktree-volume preparation-cache root changed during apply: {error}"
+                ),
+            })?;
+    }
 
     let mut applied = Vec::new();
     let mut failures = Vec::new();
@@ -834,6 +858,8 @@ fn build_apply_plan<F>(
     warnings: Vec<String>,
     records: &mut crate::measurement::SizeRecords,
     worktree_volume_cache_bindings: &[crate::broker::PreparationCacheRootBinding],
+    host_resource_db_path: Option<&Path>,
+    additional_worktree_volume_cache_bindings: &mut Vec<crate::broker::PreparationCacheRootBinding>,
     enumerate_children: &mut F,
 ) -> Result<StoragePlan, StorageError>
 where
@@ -850,6 +876,8 @@ where
         crate::SizeScan::Recorded,
         records,
         worktree_volume_cache_bindings,
+        host_resource_db_path,
+        additional_worktree_volume_cache_bindings,
         enumerate_children,
     )
 }
@@ -868,6 +896,8 @@ fn build_plan<F>(
     scan: crate::SizeScan,
     records: &mut crate::measurement::SizeRecords,
     worktree_volume_cache_bindings: &[crate::broker::PreparationCacheRootBinding],
+    host_resource_db_path: Option<&Path>,
+    additional_worktree_volume_cache_bindings: &mut Vec<crate::broker::PreparationCacheRootBinding>,
     enumerate_children: &mut F,
 ) -> Result<StoragePlan, StorageError>
 where
@@ -876,13 +906,22 @@ where
     let storage_root = normalise(&absolute_path(main_root, storage_layout.path()));
     let evaluated_at = now_ms();
     let paths = storage_root_entries(&storage_root, storage_layout)?;
-    let worktree_volume_cache_paths = worktree_volume_cache_paths(worktree_volume_cache_bindings);
+    let this_repository = ThisRepository::observe(main_root).ok();
+    let additional_cache_bindings = discover_additional_worktree_cache_bindings(
+        main_root,
+        &paths,
+        host_resource_db_path,
+        worktree_volume_cache_bindings,
+        this_repository.as_ref(),
+    );
+    let mut verified_worktree_cache_paths =
+        worktree_volume_cache_paths(worktree_volume_cache_bindings);
+    verified_worktree_cache_paths.extend(worktree_volume_cache_paths(&additional_cache_bindings));
 
     let mut roots = Vec::with_capacity(paths.len());
     let mut candidates = Vec::new();
     // Read-only: a root with no marker is only told whether this repository
     // can prove it owns it, and how to record that (#257).
-    let this_repository = ThisRepository::observe(main_root).ok();
     for path in paths {
         let mut root = inspect_root(
             &path,
@@ -890,7 +929,7 @@ where
             orphan_worktree_roots_days,
             scan,
             records,
-            &worktree_volume_cache_paths,
+            &verified_worktree_cache_paths,
         );
         if root.marker_status == StorageMarkerStatus::Missing
             && let Some(this_repository) = &this_repository
@@ -921,7 +960,7 @@ where
         main_root,
         &primary_checkouts,
         &roots,
-        &worktree_volume_cache_paths,
+        &verified_worktree_cache_paths,
         enumerate_children,
     )?;
     let mut preparation_entries = Vec::new();
@@ -955,6 +994,7 @@ where
             preparation_cache_root_identity,
             preparation_cache_root_nonce,
             worktree_volume_cache_bindings,
+            additional_worktree_volume_cache_bindings: &additional_cache_bindings,
         },
         orphan_worktree_roots_days,
         &candidates,
@@ -970,6 +1010,7 @@ where
         &preparation_candidates,
     );
     let recovery_archives = inspect_recovery_archives(&storage_root, scan, records);
+    *additional_worktree_volume_cache_bindings = additional_cache_bindings;
     Ok(StoragePlan {
         schema_version: STORAGE_PLAN_SCHEMA_VERSION,
         evaluated_at,
@@ -3487,6 +3528,115 @@ fn preparation_live_root_children(root: &Path) -> Result<Vec<PathBuf>, StorageEr
     Ok(paths)
 }
 
+fn discover_additional_worktree_cache_bindings(
+    main_root: &Path,
+    placement_roots: &[PathBuf],
+    host_resource_db_path: Option<&Path>,
+    existing_bindings: &[crate::broker::PreparationCacheRootBinding],
+    this_repository: Option<&ThisRepository>,
+) -> Vec<crate::broker::PreparationCacheRootBinding> {
+    let Some(resource_db_path) = host_resource_db_path else {
+        return Vec::new();
+    };
+    let existing_paths = worktree_volume_cache_paths(existing_bindings);
+    let main_root = normalise(main_root);
+    let discovery_started = Instant::now();
+
+    crate::git::with_git_deadline(WORKTREE_CACHE_ROOT_DISCOVERY_BUDGET, || {
+        let mut bindings = Vec::new();
+        for placement_root in placement_roots {
+            if discovery_started.elapsed() >= WORKTREE_CACHE_ROOT_DISCOVERY_BUDGET {
+                break;
+            }
+            let placement_metadata = match std::fs::symlink_metadata(placement_root) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            if placement_metadata.file_type().is_symlink() || !placement_metadata.is_dir() {
+                continue;
+            }
+            let cache_root = placement_root
+                .join(crate::broker::lifecycle::WORKTREE_VOLUME_PREPARATION_CACHE_ROOT);
+            if existing_paths.contains(&cache_root) {
+                continue;
+            }
+            let cache_metadata = match std::fs::symlink_metadata(&cache_root) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            if cache_metadata.file_type().is_symlink() || !cache_metadata.is_dir() {
+                continue;
+            }
+
+            let marker_path = placement_root.join(WORKTREE_ROOT_MARKER);
+            let marker_bytes = match crate::preparation::read_bounded_regular_file_for_liveness(
+                &marker_path,
+                WORKTREE_ROOT_MARKER_MAX_BYTES,
+                discovery_started + WORKTREE_CACHE_ROOT_DISCOVERY_BUDGET,
+            ) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) | Err(_) => continue,
+            };
+            let marker = match serde_json::from_slice::<WorktreeRootMarker>(&marker_bytes) {
+                Ok(marker)
+                    if marker.schema_version == WORKTREE_ROOT_SCHEMA_VERSION
+                        && !marker.repository_key.is_empty() =>
+                {
+                    marker
+                }
+                Ok(_) | Err(_) => continue,
+            };
+            let marker_root = normalise(&marker.repository_root);
+            let repository_key_matches = if marker_root == main_root {
+                this_repository.is_some_and(|repository| {
+                    repository.main_root == main_root && repository.key == marker.repository_key
+                })
+            } else {
+                let Ok(repository) = GitRepo::discover(&marker.repository_root) else {
+                    continue;
+                };
+                let Ok(common_dir) = repository.git_common_dir() else {
+                    continue;
+                };
+                let Some(owner_root) = common_dir.parent() else {
+                    continue;
+                };
+                normalise(owner_root) == marker_root
+                    && crate::host_state::repository_key(owner_root, Some(&common_dir))
+                        == marker.repository_key
+            };
+            if !repository_key_matches
+                || discovery_started.elapsed() >= WORKTREE_CACHE_ROOT_DISCOVERY_BUDGET
+            {
+                continue;
+            }
+
+            let binding =
+                match crate::broker::lifecycle::capture_worktree_volume_preparation_cache_root(
+                    placement_root,
+                    &marker,
+                    resource_db_path,
+                ) {
+                    Ok(Some(binding)) => binding,
+                    Ok(None) | Err(_) => continue,
+                };
+            if binding.validate().is_err()
+                || binding
+                    .root_guard
+                    .as_ref()
+                    .and_then(|guard| guard.placement_root.as_ref())
+                    .is_none()
+            {
+                continue;
+            }
+            bindings.push(binding);
+        }
+        bindings.sort_by(|left, right| left.path.cmp(&right.path));
+        bindings.dedup_by(|left, right| left.path == right.path);
+        bindings
+    })
+}
+
 fn worktree_volume_cache_paths(
     bindings: &[crate::broker::PreparationCacheRootBinding],
 ) -> BTreeSet<PathBuf> {
@@ -5050,8 +5200,19 @@ fn storage_root_entries(
     storage_root: &Path,
     layout: &StorageRootLayout,
 ) -> Result<Vec<PathBuf>, StorageError> {
+    storage_root_entries_with_limit(storage_root, layout, STORAGE_ROOT_MAX_ENTRIES)
+}
+
+fn storage_root_entries_with_limit(
+    storage_root: &Path,
+    layout: &StorageRootLayout,
+    max_entries: usize,
+) -> Result<Vec<PathBuf>, StorageError> {
     match std::fs::symlink_metadata(storage_root) {
         Ok(metadata) if metadata.is_dir() => {
+            if layout.is_direct() {
+                return Ok(vec![storage_root.to_path_buf()]);
+            }
             let entries = std::fs::read_dir(storage_root).map_err(|source| StorageError::Io {
                 path: storage_root.to_path_buf(),
                 source,
@@ -5062,12 +5223,12 @@ fn storage_root_entries(
                     path: storage_root.to_path_buf(),
                     source,
                 })?;
-                if !layout.is_direct() {
-                    paths.push(entry.path());
+                if paths.len() >= max_entries {
+                    return Err(StorageError::Unavailable {
+                        reason: "storage-root inventory exceeded its entry bound".into(),
+                    });
                 }
-            }
-            if layout.is_direct() {
-                return Ok(vec![storage_root.to_path_buf()]);
+                paths.push(entry.path());
             }
             paths.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
             Ok(paths)
@@ -5439,6 +5600,7 @@ struct DecisionRootMetadata<'a> {
     preparation_cache_root_identity: Option<&'a [u8]>,
     preparation_cache_root_nonce: Option<&'a str>,
     worktree_volume_cache_bindings: &'a [crate::broker::PreparationCacheRootBinding],
+    additional_worktree_volume_cache_bindings: &'a [crate::broker::PreparationCacheRootBinding],
 }
 
 fn decision_digest(
@@ -5503,6 +5665,11 @@ fn decision_digest(
     let worktree_volume_cache_roots = root_metadata
         .worktree_volume_cache_bindings
         .iter()
+        .chain(
+            root_metadata
+                .additional_worktree_volume_cache_bindings
+                .iter(),
+        )
         .filter_map(|binding| {
             let guard = binding.root_guard.as_ref()?;
             let placement = guard.placement_root.as_ref()?;
@@ -5796,6 +5963,7 @@ mod tests {
             F: FnMut(&Path) -> Result<Vec<PathBuf>, StorageError>,
         {
             let mut records = crate::measurement::SizeRecords::default();
+            let mut additional_worktree_volume_cache_bindings = Vec::new();
             if apply {
                 build_apply_plan(
                     &self.main_root,
@@ -5807,6 +5975,8 @@ mod tests {
                     Vec::new(),
                     &mut records,
                     &self.bindings,
+                    None,
+                    &mut additional_worktree_volume_cache_bindings,
                     enumerate_children,
                 )
             } else {
@@ -5821,10 +5991,385 @@ mod tests {
                     crate::SizeScan::Recorded,
                     &mut records,
                     &self.bindings,
+                    None,
+                    &mut additional_worktree_volume_cache_bindings,
                     enumerate_children,
                 )
             }
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct ForeignCacheRootFixture {
+        _temporary: tempfile::TempDir,
+        _foreign_storage: crate::test_storage::TestStorage,
+        invoking_root: PathBuf,
+        foreign_common_dir: PathBuf,
+        storage_root: PathBuf,
+        placement_root: PathBuf,
+        resource_db_path: PathBuf,
+        marker: WorktreeRootMarker,
+        unplaced_cache_binding: crate::broker::PreparationCacheRootBinding,
+        foreign_cache_entry: PathBuf,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl ForeignCacheRootFixture {
+        fn new() -> Self {
+            let temporary = tempfile::tempdir().unwrap();
+            let invoking_root = temporary.path().join("invoking-repository");
+            let invoking_repo = init_storage_root_test_repository(&invoking_root);
+            let invoking_root = invoking_repo.main_root().unwrap();
+
+            let foreign_root = temporary.path().join("foreign-repository");
+            let foreign_repo = init_storage_root_test_repository(&foreign_root);
+            let foreign_root = foreign_repo.main_root().unwrap();
+            let foreign_common_dir = foreign_repo.git_common_dir().unwrap();
+            let foreign_storage = crate::test_storage::TestStorage::new();
+            let _foreign_broker = foreign_storage.open(&foreign_root).unwrap();
+
+            let resource_db_path = test_host_resource_db(temporary.path());
+            let storage_root = resource_db_path.parent().unwrap().join("worktrees");
+            std::fs::create_dir_all(&storage_root).unwrap();
+            let storage_root = storage_root.canonicalize().unwrap();
+            let placement_root = storage_root.join("foreign-placement");
+            std::fs::create_dir_all(&placement_root).unwrap();
+            let placement_root = placement_root.canonicalize().unwrap();
+            let marker = WorktreeRootMarker {
+                schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+                repository_key: crate::host_state::repository_key(
+                    &foreign_root,
+                    Some(&foreign_common_dir),
+                ),
+                repository_root: foreign_root,
+            };
+            std::fs::write(
+                placement_root.join(WORKTREE_ROOT_MARKER),
+                serde_json::to_vec(&marker).unwrap(),
+            )
+            .unwrap();
+
+            let cache_root = placement_root
+                .join(crate::broker::lifecycle::WORKTREE_VOLUME_PREPARATION_CACHE_ROOT);
+            let placement_identity =
+                crate::preparation::rotation_debt::DirectoryIdentity::capture(&placement_root)
+                    .unwrap()
+                    .encode()
+                    .unwrap();
+            crate::preparation::rotation_debt::ensure_preparation_cache_root_child(
+                &placement_root,
+                crate::broker::lifecycle::WORKTREE_VOLUME_PREPARATION_CACHE_ROOT,
+                &placement_identity,
+            )
+            .unwrap();
+            let unplaced_cache_binding =
+                initialized_storage_cache_root_binding(&cache_root, &resource_db_path);
+            let placed_cache_binding =
+                crate::broker::lifecycle::capture_worktree_volume_preparation_cache_root(
+                    &placement_root,
+                    &marker,
+                    &resource_db_path,
+                )
+                .unwrap()
+                .expect("the initialized foreign cache root has a valid placement binding");
+
+            let foreign_cache_entry = placed_cache_binding
+                .path
+                .join(TEST_PREPARATION_REPOSITORY)
+                .join("ffffffffffff");
+            std::fs::create_dir_all(&foreign_cache_entry).unwrap();
+            std::fs::write(foreign_cache_entry.join("payload.bin"), b"foreign cache").unwrap();
+
+            Self {
+                _temporary: temporary,
+                _foreign_storage: foreign_storage,
+                invoking_root,
+                foreign_common_dir,
+                storage_root,
+                placement_root,
+                resource_db_path,
+                marker,
+                unplaced_cache_binding,
+                foreign_cache_entry,
+            }
+        }
+
+        fn build_plan(&self, apply: bool) -> Result<StoragePlan, StorageError> {
+            let mut records = crate::measurement::SizeRecords::default();
+            let mut enumerate_children = preparation_live_root_children;
+            let mut additional_worktree_volume_cache_bindings = Vec::new();
+            let layout = StorageRootLayout::KeyedContainer(self.storage_root.clone());
+            if apply {
+                build_apply_plan(
+                    &self.invoking_root,
+                    &layout,
+                    None,
+                    None,
+                    None,
+                    7,
+                    Vec::new(),
+                    &mut records,
+                    &[],
+                    Some(&self.resource_db_path),
+                    &mut additional_worktree_volume_cache_bindings,
+                    &mut enumerate_children,
+                )
+            } else {
+                build_plan(
+                    &self.invoking_root,
+                    &layout,
+                    None,
+                    None,
+                    None,
+                    7,
+                    Vec::new(),
+                    crate::SizeScan::Recorded,
+                    &mut records,
+                    &[],
+                    Some(&self.resource_db_path),
+                    &mut additional_worktree_volume_cache_bindings,
+                    &mut enumerate_children,
+                )
+            }
+        }
+
+        fn invoking_storage_context(&self) -> crate::broker::BrokerStorageContext {
+            let invoking_repo = GitRepo::discover(&self.invoking_root).unwrap();
+            crate::broker::BrokerStorageContext {
+                repository_root: Some(self.invoking_root.clone()),
+                git_common_dir: Some(invoking_repo.git_common_dir().unwrap()),
+                host_state_dir: self.resource_db_path.parent().map(Path::to_path_buf),
+                host_resource_db_path: Some(self.resource_db_path.clone()),
+                host_state_dir_is_explicit: true,
+                ..crate::broker::BrokerStorageContext::default()
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn storage_plan_recognizes_but_never_reclaims_a_valid_foreign_cache_root() {
+        let fixture = ForeignCacheRootFixture::new();
+
+        let layout = StorageRootLayout::KeyedContainer(fixture.storage_root.clone());
+        let roots = storage_root_entries(&fixture.storage_root, &layout).unwrap();
+        assert_eq!(roots, vec![fixture.placement_root.clone()]);
+        let bounded_marker_bytes = crate::preparation::read_bounded_regular_file_for_liveness(
+            &fixture.placement_root.join(WORKTREE_ROOT_MARKER),
+            WORKTREE_ROOT_MARKER_MAX_BYTES,
+            Instant::now() + WORKTREE_CACHE_ROOT_DISCOVERY_BUDGET,
+        )
+        .unwrap()
+        .expect("the fixture has a readable bounded placement marker");
+        let bounded_marker: WorktreeRootMarker =
+            serde_json::from_slice(&bounded_marker_bytes).unwrap();
+        assert_eq!(bounded_marker, fixture.marker);
+        assert_eq!(bounded_marker.schema_version, WORKTREE_ROOT_SCHEMA_VERSION);
+        assert!(!bounded_marker.repository_key.is_empty());
+        let invoking_repository = ThisRepository::observe(&fixture.invoking_root).unwrap();
+        let marker_root = normalise(&fixture.marker.repository_root);
+        let foreign_repository = GitRepo::discover(&fixture.marker.repository_root).unwrap();
+        let foreign_common_dir = foreign_repository.git_common_dir().unwrap();
+        let foreign_owner_root = foreign_common_dir.parent().unwrap();
+        let owner_root_matches = normalise(foreign_owner_root) == marker_root;
+        let repository_key_matches =
+            crate::host_state::repository_key(foreign_owner_root, Some(&foreign_common_dir))
+                == fixture.marker.repository_key;
+        let direct_binding_is_valid =
+            crate::broker::lifecycle::capture_worktree_volume_preparation_cache_root(
+                &fixture.placement_root,
+                &fixture.marker,
+                &fixture.resource_db_path,
+            )
+            .is_ok_and(|binding| binding.is_some());
+        assert!(
+            owner_root_matches,
+            "the foreign Git common-dir parent must match the marker root"
+        );
+        assert!(
+            repository_key_matches,
+            "the foreign Git common dir must reproduce the marker repository key"
+        );
+        assert!(
+            direct_binding_is_valid,
+            "the placement/cache marker pair must independently capture as a valid binding"
+        );
+        let discovered = discover_additional_worktree_cache_bindings(
+            &fixture.invoking_root,
+            &roots,
+            Some(&fixture.resource_db_path),
+            &[],
+            Some(&invoking_repository),
+        );
+        assert_eq!(
+            discovered.len(),
+            1,
+            "valid foreign cache discovery predicates: marker_root={marker_root:?}, foreign_owner_root={foreign_owner_root:?}, owner_root_matches={owner_root_matches}, repository_key_matches={repository_key_matches}, direct_binding_is_valid={direct_binding_is_valid}, storage_roots={roots:?}"
+        );
+        assert_eq!(
+            worktree_volume_cache_paths(&discovered),
+            BTreeSet::from([fixture
+                .placement_root
+                .join(crate::broker::lifecycle::WORKTREE_VOLUME_PREPARATION_CACHE_ROOT)])
+        );
+
+        let plan = fixture.build_plan(false).unwrap();
+
+        assert!(
+            plan.roots
+                .iter()
+                .any(|root| root.path == fixture.placement_root),
+            "the foreign placement root remains in the host inventory"
+        );
+        assert!(
+            plan.roots
+                .iter()
+                .all(|root| !root.blockers.iter().any(|reason| {
+                    reason.contains("reserved worktree-volume preparation-cache root")
+                })),
+            "the independently validated placement/cache markers resolve the reserved child"
+        );
+        assert!(
+            plan.preparation_candidates
+                .iter()
+                .all(|candidate| candidate.path != fixture.foreign_cache_entry),
+            "foreign cache entries are not inspected or granted deletion authority"
+        );
+        assert!(fixture.foreign_cache_entry.join("payload.bin").is_file());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn storage_apply_recognizes_foreign_cache_root_without_reclaiming_its_entries() {
+        let fixture = ForeignCacheRootFixture::new();
+        let context = fixture.invoking_storage_context();
+        let plan = storage_plan_with_context(&fixture.invoking_root, &context).unwrap();
+        assert!(
+            plan.roots
+                .iter()
+                .any(|root| root.path == fixture.placement_root),
+            "the direct-root public plan must inventory the foreign placement"
+        );
+        let placement = plan
+            .roots
+            .iter()
+            .find(|root| root.path == fixture.placement_root)
+            .expect("the reviewed plan must include the foreign placement root");
+        assert!(
+            placement.blockers.iter().all(|reason| {
+                !reason.contains("reserved worktree-volume preparation-cache root")
+            }),
+            "planning must recognize the validated reserved cache child"
+        );
+        assert!(
+            plan.candidates
+                .iter()
+                .all(|candidate| !candidate.path.starts_with(&fixture.placement_root)),
+            "the foreign placement root must remain outside the storage candidate set"
+        );
+        assert!(
+            plan.primary_candidates
+                .iter()
+                .all(|candidate| !candidate.path.starts_with(&fixture.placement_root)),
+            "the foreign placement root must remain outside the primary artifact set"
+        );
+        assert!(
+            plan.preparation_candidates
+                .iter()
+                .all(|candidate| candidate.path != fixture.foreign_cache_entry),
+            "foreign cache entries must remain outside the reviewed candidate set"
+        );
+
+        let report =
+            storage_apply_with_context(&fixture.invoking_root, &plan.digest, &context).unwrap();
+
+        assert!(report.complete, "apply report: {:?}", report.failures);
+        assert!(
+            report.applied.iter().all(|item| {
+                !item.path.starts_with(&fixture.placement_root)
+                    && !item.path.starts_with(&fixture.foreign_cache_entry)
+            }),
+            "the foreign placement and cache paths are not apply candidates"
+        );
+        assert_eq!(
+            std::fs::read(fixture.foreign_cache_entry.join("payload.bin")).unwrap(),
+            b"foreign cache",
+            "apply recognizes the reserved cache child but retains foreign cache data"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn storage_apply_refuses_changed_foreign_cache_markers() {
+        let fixture = ForeignCacheRootFixture::new();
+        let _reviewed_plan = fixture.build_plan(false).unwrap();
+
+        let marker_path = fixture.placement_root.join(WORKTREE_ROOT_MARKER);
+        let original_marker = std::fs::read(&marker_path).unwrap();
+        let mut wrong_owner = fixture.marker.clone();
+        wrong_owner.repository_key.push_str("-wrong");
+        std::fs::write(&marker_path, serde_json::to_vec(&wrong_owner).unwrap()).unwrap();
+
+        let changed_placement = fixture.build_plan(true).unwrap_err();
+        assert!(
+            matches!(&changed_placement, StorageError::Unavailable { reason }
+                if reason.contains("unverified reserved preparation-cache child")),
+            "a changed parent marker makes the reserved child unverified: {changed_placement:?}"
+        );
+
+        std::fs::write(&marker_path, original_marker).unwrap();
+        let detached_common_dir = fixture
+            ._temporary
+            .path()
+            .join("detached-foreign-git-common");
+        std::fs::rename(&fixture.foreign_common_dir, &detached_common_dir).unwrap();
+        let changed_git_common = fixture.build_plan(true).unwrap_err();
+        assert!(
+            matches!(&changed_git_common, StorageError::Unavailable { reason }
+                if reason.contains("unverified reserved preparation-cache child")),
+            "a missing Git common directory keeps the reserved cache unknown: {changed_git_common:?}"
+        );
+        std::fs::rename(&detached_common_dir, &fixture.foreign_common_dir).unwrap();
+
+        change_cache_root_coordinator(&fixture.unplaced_cache_binding);
+        let changed_cache_marker = fixture.build_plan(true).unwrap_err();
+        assert!(
+            matches!(&changed_cache_marker, StorageError::Unavailable { reason }
+                if reason.contains("unverified reserved preparation-cache child")),
+            "a changed cache-root marker is retained: {changed_cache_marker:?}"
+        );
+        assert!(fixture.foreign_cache_entry.join("payload.bin").is_file());
+    }
+
+    #[test]
+    fn storage_root_entry_inventory_is_bounded_and_direct_roots_are_not_enumerated() {
+        let temporary = tempfile::tempdir().unwrap();
+        let storage_root = temporary.path().join("container");
+        std::fs::create_dir_all(storage_root.join("one")).unwrap();
+        std::fs::create_dir_all(storage_root.join("two")).unwrap();
+
+        let bounded = storage_root_entries_with_limit(
+            &storage_root,
+            &StorageRootLayout::KeyedContainer(storage_root.clone()),
+            1,
+        );
+        assert!(
+            matches!(
+                bounded.as_ref(),
+                Err(StorageError::Unavailable { reason }) if reason.contains("entry bound")
+            ),
+            "an incomplete keyed-root inventory must fail closed: {bounded:?}"
+        );
+        assert_eq!(
+            storage_root_entries_with_limit(
+                &storage_root,
+                &StorageRootLayout::DirectRoot(storage_root.clone()),
+                0,
+            )
+            .unwrap(),
+            vec![storage_root],
+            "a direct root is one item and does not enumerate its descendants"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -8372,6 +8917,7 @@ mod tests {
         let mut records = crate::measurement::SizeRecords::default();
         records.record_usage(&root_key, 0, Some(1), 1);
         let mut enumerate_children = preparation_live_root_children;
+        let mut additional_worktree_volume_cache_bindings = Vec::new();
         let plan = build_apply_plan(
             repository.root(),
             &StorageRootLayout::DirectRoot(storage_root.clone()),
@@ -8382,6 +8928,8 @@ mod tests {
             Vec::new(),
             &mut records,
             &[],
+            None,
+            &mut additional_worktree_volume_cache_bindings,
             &mut enumerate_children,
         )
         .unwrap();

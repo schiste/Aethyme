@@ -262,7 +262,7 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   inspect its exact captured body and `Looked in` output before diagnosing a
   formatting problem.
   Prepare the exact body file. When local validation is allowed, run the pinned
-  CLI's `broker advanced check-contract --base <exact-base> --pr-body <file>`
+  CLI's `broker check-contract --base <exact-base> --pr-body <file>`
   from that PR's worktree. Resolve `<exact-base>` with `git merge-base` between
   the verified target-branch SHA and the reviewed PR HEAD, matching the contract
   workflow. A two-dot comparison with the latest target tree can misclassify
