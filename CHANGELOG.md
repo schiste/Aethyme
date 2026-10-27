@@ -4,6 +4,21 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.37] - 2026-10-27
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0837).
+
+### Fixed
+
+- Session finish reads the relevant submission records and lease state instead of decoding unrelated queue history.
+- Recovery archives preserve protected standalone ignored files, links and Unix file modes, and verify the complete durable archive before removing the source checkout.
+- Recovery patch capture, manifest serialization and file copying have explicit bounds. Archive admission checks free space on the destination volume against known payload sizes plus the storage reserve; bundle size, filesystem allocation overhead and concurrent writes remain outside that estimate.
+- Cleanup requires exact changed-path tree entries before accepting patch-equivalence evidence as proof that work landed.
+
+### Added
+
+- Managed preparation, gates and guarded commands record durable artifact use. Unknown producers remain protected; this does not enable automatic artifact deletion from open worktrees.
+
 ## [0.8.36] - 2026-10-27
 
 ### Fixed

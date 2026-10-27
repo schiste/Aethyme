@@ -16,12 +16,53 @@ version and the target, oldest first. Each schema migration runs on first open
 and is one-way, so rollback is limited to the oldest binary that still reads
 the newest schema you have opened.
 
-Breaking releases: [v0.8.33](#v0833), [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
+Breaking releases: [v0.8.37](#v0837), [v0.8.33](#v0833), [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
 [v0.7.25](#v0725), [v0.7.23](#v0723), [v0.7.22](#v0722), [v0.7.19](#v0719),
 [v0.7.18](#v0718), [v0.7.16](#v0716), [v0.7.9](#v079), [v0.7.8](#v078),
 [v0.7.4](#v074), [v0.7.2](#v072),
 [v0.7.1](#v071), [v0.5.0](#v050), [v0.3.0](#v030),
 [v0.2.2](#v022), [v0.2.0](#v020).
+
+## v0.8.37
+
+### Compatibility
+
+New recovery archives use manifest schema 2, which preserves protected ignored
+files and binds them to the reviewed cleanup plan and policy. This runtime reads
+complete schema 1 and 2 archives. Earlier runtimes, including v0.8.36, reject
+schema 2 archives as unowned and cannot manage their inventory or retention.
+This release adds no broker database migration or compatibility-floor change.
+
+Cleanup now retains a checkout when patch-equivalent commits do not also carry
+its exact changed-path contents, modes and types. Recovery capture refuses
+oversized patches or unknown or insufficient destination capacity and leaves
+the source checkout in place. Its capacity check is a known-minimum estimate,
+not a total archive quota or a guarantee that the reserve remains available.
+
+### Migrate and verify
+
+Install the matching router and engine pair, then verify that both report
+v0.8.37 and the same source commit. Preserve existing recovery archives; no
+manual conversion is needed. Use the new runtime for archive inventory and
+retention after it has created a schema 2 archive.
+
+Managed Unix preparation, gates and guarded execution require durable
+artifact-use records on the repository filesystem. An I/O or directory-sync
+failure refuses admission rather than silently disabling that protection.
+These records do not authorize automatic cleanup of an open checkout or prove
+that direct external commands have stopped writing.
+On non-Unix targets, this protocol reports admission unavailable; ordinary
+commands continue without participating, and that result grants no artifact
+cleanup authority.
+
+### Rollback
+
+A schema-compatible older pair can still read the broker database, subject to
+the earlier v0.8.31 limits. Keep schema 2 archives intact: an older runtime's
+unowned classification does not make them disposable. Return to v0.8.37 or a
+compatible newer reader to manage them. Stop maintenance workers before
+rollback; older clients do not implement the new artifact-use tracking or
+stronger landing-proof checks. Do not delete unknown markers to force cleanup.
 
 ## v0.8.33
 
