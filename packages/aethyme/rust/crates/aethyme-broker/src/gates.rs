@@ -2953,6 +2953,52 @@ where
                 expires_at: runtime.grant.lease.expires_at,
                 allocations: runtime.grant.lease.allocations.clone(),
             });
+        let mut artifact_use = match crate::artifact_use::begin_artifact_use(
+            main_root,
+            checkout.root(),
+            session_id.unwrap_or(0),
+            &crate::artifact_use::invocation_id("gate", session_id.unwrap_or(0)),
+        ) {
+            Ok(crate::artifact_use::ArtifactUseAdmission::Admitted(producer)) => Some(producer),
+            Ok(crate::artifact_use::ArtifactUseAdmission::ProtocolUnavailable) => None,
+            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                if let Some(runtime) = resource_runtime.as_mut() {
+                    crate::warn_unrecorded(
+                        "release a gate host resource lease after artifact admission refusal",
+                        runtime.release(),
+                    );
+                }
+                drop(owner_locks);
+                let diagnostic = format!("managed artifact admission is busy: {source}");
+                outcomes.push(record_gate_preflight_resource_failure(
+                    store,
+                    GatePreflightResourceFailure {
+                        gate,
+                        tree: &tree,
+                        session_id,
+                        wait_duration_ms: wait_started.elapsed().as_millis() as i64,
+                        log_path: &log_path,
+                        diagnostic: &diagnostic,
+                        progress,
+                    },
+                )?);
+                break;
+            }
+            Err(source) => {
+                if let Some(runtime) = resource_runtime.as_mut() {
+                    crate::warn_unrecorded(
+                        "release a gate host resource lease after artifact admission failure",
+                        runtime.release(),
+                    );
+                }
+                drop(owner_locks);
+                return Err(crate::BrokerError::Io {
+                    path: checkout.root().to_path_buf(),
+                    source,
+                }
+                .into());
+            }
+        };
         let repository = git_origin_fingerprint(checkout);
         let mut managed_cache_runtime = match prepare_managed_gate_cache(
             gate.managed_cache.as_ref(),
@@ -2965,6 +3011,18 @@ where
             Ok(runtime) => runtime,
             Err(error) => {
                 let message = format!("managed cache preparation failed: {error}");
+                let message = if let Some(producer) = artifact_use.as_mut()
+                    && producer.is_pre_dispatch()
+                {
+                    match producer.finish_not_started() {
+                        Ok(()) => message,
+                        Err(settlement_error) => format!(
+                            "{message}; pre-dispatch artifact-use marker remains unknown: {settlement_error}"
+                        ),
+                    }
+                } else {
+                    message
+                };
                 let _ = std::fs::write(&log_path, format!("aethyme {message}\n"));
                 progress.report(&format!("gate {} environment error: {message}", gate.name));
                 if let Some(runtime) = resource_runtime.as_mut() {
@@ -3053,6 +3111,20 @@ where
                         resource.release(),
                     );
                 }
+                let diagnostic = if let Some(producer) = artifact_use.as_mut()
+                    && producer.is_pre_dispatch()
+                {
+                    match producer.finish_not_started() {
+                        Ok(()) => {
+                            "native gate allowance exhausted before command dispatch".to_owned()
+                        }
+                        Err(error) => format!(
+                            "native gate allowance exhausted before command dispatch; artifact-use marker remains unknown: {error}"
+                        ),
+                    }
+                } else {
+                    "native gate allowance exhausted before command dispatch".to_owned()
+                };
                 outcomes.push(record_gate_preflight_resource_failure(
                     store,
                     GatePreflightResourceFailure {
@@ -3061,7 +3133,7 @@ where
                         session_id,
                         wait_duration_ms: wait_started.elapsed().as_millis() as i64,
                         log_path: &log_path,
-                        diagnostic: "native gate allowance exhausted before command dispatch",
+                        diagnostic: &diagnostic,
                         progress,
                     },
                 )?);
@@ -3100,6 +3172,7 @@ where
                 command_process_group: Some(&command_process_group),
                 run_labels: &run_labels,
             },
+            artifact_use.as_mut(),
         );
         let writers_quiescent = gate_process_group_absent(
             command_process_group.load(std::sync::atomic::Ordering::Acquire),
@@ -4175,6 +4248,31 @@ fn remove_gate_pidfile_after_setup_failure(pidfile: &Path, reason: &str) {
 fn run_gate_command(
     command: &str,
     context: GateCommandContext<'_>,
+    mut artifact_use: Option<&mut crate::artifact_use::ArtifactUseProducer>,
+) -> Result<GateCommandOutcome, std::io::Error> {
+    let result = run_gate_command_inner(command, &context, &mut artifact_use);
+    if result.is_err()
+        && let Some(producer) = artifact_use.as_deref_mut()
+        && producer.is_pre_dispatch()
+        && let Err(settlement_error) = producer.finish_not_started()
+    {
+        return match result {
+            Err(source) => Err(std::io::Error::new(
+                source.kind(),
+                format!(
+                    "{source}; pre-dispatch artifact-use marker remains unknown: {settlement_error}"
+                ),
+            )),
+            Ok(_) => unreachable!("only an error result enters pre-dispatch settlement"),
+        };
+    }
+    result
+}
+
+fn run_gate_command_inner(
+    command: &str,
+    context: &GateCommandContext<'_>,
+    artifact_use: &mut Option<&mut crate::artifact_use::ArtifactUseProducer>,
 ) -> Result<GateCommandOutcome, std::io::Error> {
     use std::os::unix::process::CommandExt;
 
@@ -4336,6 +4434,43 @@ fn run_gate_command(
     let mut child = spawn_gate_command(&mut process, context.absolute_deadline)?;
     if let Some(slot) = context.command_process_group {
         slot.store(child.id() as i32, std::sync::atomic::Ordering::Release);
+    }
+    let process_group = child.id() as i32;
+    if let Some(producer) = artifact_use.as_deref_mut()
+        && let Err(error) = producer.mark_process_started(&child, process_group)
+    {
+        // The leader is still our unreaped child, so this assigned group id
+        // cannot have been recycled. Keep the marker if either the child or
+        // original group cannot be confirmed settled.
+        // SAFETY: killpg receives the assigned process-group id and a signal.
+        unsafe {
+            libc::killpg(process_group, libc::SIGKILL);
+        }
+        let wait_error = child.wait().err();
+        let settlement = if gate_process_group_absent(process_group) {
+            artifact_use
+                .as_deref_mut()
+                .expect("producer was present")
+                .finish_verified_quiescence(&mut child)
+                .err()
+        } else {
+            Some(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "gate process group remained present after marker failure",
+            ))
+        };
+        let details = [
+            Some(format!(
+                "could not persist gate artifact-use process identity: {error}"
+            )),
+            wait_error.map(|error| format!("could not reap gate after marker failure: {error}")),
+            settlement.map(|error| format!("artifact-use settlement failed: {error}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("; ");
+        return Err(std::io::Error::other(details));
     }
 
     let pidfile = context.session_id.map(|sid| {
@@ -4604,6 +4739,16 @@ fn run_gate_command(
     if let Some(pidfile) = &pidfile {
         let _ = std::fs::remove_file(pidfile);
     }
+    let artifact_use_error = if let Some(producer) = artifact_use.as_deref_mut()
+        && producer.is_unsettled_running()
+    {
+        producer
+            .finish_verified_quiescence(&mut child)
+            .err()
+            .map(|error| format!("gate artifact-use settlement could not be confirmed: {error}"))
+    } else {
+        None
+    };
     let capture_error = if pipes_incomplete {
         Some(format!(
             "gate output capture incomplete: stdout/stderr pipes stayed open after {}s; remaining output was discarded",
@@ -4645,6 +4790,11 @@ fn run_gate_command(
                 .write_error()
                 .map(|error| format!("gate log capture failed: {error}"))
         });
+    let resource_error = match (resource_error, artifact_use_error) {
+        (Some(resource), Some(artifact)) => Some(format!("{resource}; {artifact}")),
+        (Some(resource), None) => Some(resource),
+        (None, artifact) => artifact,
+    };
     // Killed-by-signal surfaces as no exit code; absent a resource error,
     // `None` remains a non-conclusive cancellation.
     let observed_first_output = first_output.load(std::sync::atomic::Ordering::Acquire);
@@ -5225,7 +5375,7 @@ mod tests {
             command_process_group: None,
             run_labels: &labels,
         };
-        let result = run_gate_command("touch dispatched", context());
+        let result = run_gate_command("touch dispatched", context(), None);
         assert_eq!(result.err().unwrap().kind(), std::io::ErrorKind::TimedOut);
         assert!(!root.path().join("dispatched").exists());
         let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
@@ -5494,6 +5644,19 @@ mod tests {
         let progress = Lines::default();
         let database = std::cell::OnceCell::new();
         let labels = crate::gate_debris::GateRunLabels::new("bounded-output", None, "synthetic");
+        let mut producer = match crate::artifact_use::begin_artifact_use(
+            root.path(),
+            root.path(),
+            0,
+            "gate-test:0:child-settlement",
+        )
+        .unwrap()
+        {
+            crate::artifact_use::ArtifactUseAdmission::Admitted(producer) => producer,
+            crate::artifact_use::ArtifactUseAdmission::ProtocolUnavailable => {
+                panic!("Unix test filesystem should support directory sync")
+            }
+        };
         let status = run_gate_command(
             "printf stdout; printf stderr >&2",
             command_context(
@@ -5505,6 +5668,7 @@ mod tests {
                 &database,
                 &labels,
             ),
+            Some(&mut producer),
         )
         .unwrap();
 
@@ -5515,6 +5679,11 @@ mod tests {
         let log = std::fs::read_to_string(log_path).unwrap();
         assert!(log.contains("stdout"));
         assert!(log.contains("stderr"));
+        drop(producer);
+        assert!(matches!(
+            crate::artifact_use::try_artifact_use_reclaimer(root.path(), root.path()).unwrap(),
+            crate::artifact_use::ArtifactUseReclaimTry::Acquired(_)
+        ));
         assert!(
             std::fs::metadata(log_dir.join("gate.log")).unwrap().len()
                 <= bounded_log::MAX_LOG_BYTES
@@ -5547,6 +5716,7 @@ mod tests {
                 &database,
                 &labels,
             ),
+            None,
         )
         .unwrap();
 
@@ -5583,6 +5753,7 @@ mod tests {
                 &database,
                 &labels,
             ),
+            None,
         )
         .unwrap();
         let (status, class, exit) = classify_gate_result("sh -c gate", &log_path, Ok(outcome));

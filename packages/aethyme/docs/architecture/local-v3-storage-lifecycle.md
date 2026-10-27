@@ -142,21 +142,37 @@ Cache writers and preparation-cache reclamation use the
 same root resolver and lease key. These controls reduce avoidable allocation
 and protect data during cleanup.
 
-B1 adds internal per-checkout shared/exclusive admission locks and durable
+B1 wires internal per-checkout shared/exclusive admission locks and durable
 per-invocation producer markers under the primary repository runtime directory.
-This source foundation is not yet wired into managed preparation, gates, or
-guarded execution; no cleanup path consumes it and it grants no deletion
-authority. A dropped producer guard leaves its marker for conservative review.
+Managed preparation holds one shared scope lock from before cache-root
+initialization through synchronous cache and record writes, every supervised
+step, postprocessing, and the existing host-resource settlement. Each
+dispatched preparation step has its own durable marker. Gates create a marker
+before managed-cache preparation and hold its shared lock through command
+quiescence and gate-result recording. Guarded execution also admits before
+dispatch; supervised commands retain their marker through the owned helper's
+exit and original process-group absence. Legacy unsupervised guarded execution
+is deliberately left as an unknown producer.
+
+Clearing a running marker requires both the owned child to have exited and its
+original process group to be observed absent. This proves quiescence only for
+that group; descendants that escape it are outside the proof. Preparation's
+outer scope lock protects its synchronous writes while the broker is alive,
+while per-step markers protect any supervised child that outlives a crashed
+broker. A dropped or unsettled producer guard leaves its marker for conservative
+review. No cleanup path consumes these locks or markers and B1 grants no
+deletion authority.
+
 Clients predating this protocol do not honor these locks and remain unknown.
 The admission protocol currently supports Unix targets with directory sync;
 non-Unix targets return `ProtocolUnavailable` and their reclaimer remains
 blocked regardless of inventory, keeping automatic artifact cleanup disabled.
 Unix filesystem sync errors fail admission and leave cleanup unknown; callers
 must not dispatch after an admission error. Process start tokens are currently
-available on macOS and Linux;
-markers without a token remain unknown after supervisor death. B2 must establish
-compatibility with older and unavailable clients before cleanup can treat
-artifact-use admission as deletion evidence.
+available on macOS and Linux; markers without a token remain unknown after
+supervisor death. B2 must establish compatibility with older and unavailable
+clients and verify complete process use before cleanup can treat artifact-use
+admission as deletion evidence; an empty marker inventory alone is not enough.
 
 The opt-in `managed_storage` profile currently describes intended preparation
 growth but does not enforce a bound. A minimal worktree-local declaration is:

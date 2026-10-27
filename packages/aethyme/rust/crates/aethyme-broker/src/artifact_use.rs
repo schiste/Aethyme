@@ -7,6 +7,8 @@
 //! crashed producer may have left descendants running after its lock descriptor
 //! was closed. Old clients that do not use this protocol remain unknown; this
 //! module does not grant deletion authority.
+//! Synchronous preparation also holds a shared scope lock; each child it
+//! dispatches acquires its own durable producer marker before dispatch.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -25,8 +27,9 @@ const ARTIFACT_LAYOUT_LOCK_WAIT: Duration = Duration::from_secs(1);
 const ARTIFACT_LAYOUT_LOCK_POLL: Duration = Duration::from_millis(10);
 static NEXT_MARKER_NONCE: AtomicU64 = AtomicU64::new(1);
 
-/// Immutable process identity captured after a command starts. The start token
-/// is opaque and comparable only on the host that created the marker.
+/// Immutable owned-process identity captured at the dispatch boundary. The
+/// start token is opaque and comparable only on the host that created the
+/// marker.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ProcessStartIdentity {
     pub(crate) pid: i32,
@@ -106,6 +109,14 @@ pub(crate) enum ArtifactUseReclaimTry {
 /// remains disabled for every checkout on this unsupported target.
 pub(crate) enum ArtifactUseAdmission {
     Admitted(ArtifactUseProducer),
+    ProtocolUnavailable,
+}
+
+/// A shared checkout reservation for synchronous managed work that does not
+/// dispatch a child. Child processes still need their own durable producer
+/// markers, because this lock is released if the broker process exits.
+pub(crate) enum ArtifactUseScopeAdmission {
+    Admitted(ArtifactUseScope),
     ProtocolUnavailable,
 }
 
@@ -259,7 +270,7 @@ impl ArtifactUseLocations {
             || marker.checkout_inode != self.checkout_identity.inode
             || marker.checkout_key != self.checkout_key
             || marker.nonce.is_empty()
-            || marker.session_id <= 0
+            || marker.session_id < 0
             || marker.invocation_id.is_empty()
         {
             return Err(io::Error::new(
@@ -284,16 +295,33 @@ pub(crate) struct ArtifactUseProducer {
     locations: ArtifactUseLocations,
 }
 
+/// Shared checkout reservation for one synchronous managed-work scope.
+#[derive(Debug)]
+pub(crate) struct ArtifactUseScope {
+    _lock: super::SharedFileLock,
+}
+
 impl ArtifactUseProducer {
     pub(crate) fn marker(&self) -> &ArtifactUseMarker {
         &self.marker
     }
 
-    /// Record the actual supervised command child after dispatch. The child
-    /// handle binds the marker PID to this invocation; `process_group` must be
-    /// the group assigned to that child by its existing process supervisor.
-    /// If the start token cannot be read, the durable marker remains unknown
-    /// to reconciliation after supervisor death.
+    pub(crate) fn is_pre_dispatch(&self) -> bool {
+        !self.marker_removed
+            && self.marker.phase == ArtifactUsePhase::PreDispatch
+            && self.marker.process.is_none()
+    }
+
+    pub(crate) fn is_unsettled_running(&self) -> bool {
+        !self.marker_removed && self.marker.phase == ArtifactUsePhase::Running
+    }
+
+    /// Bind this invocation to the owned child and assigned group immediately
+    /// before the supervisor dispatches its command. For inline execution,
+    /// the child is the helper whose assigned group the command inherits; a
+    /// gate uses the command child directly. If the start token cannot be
+    /// read, the durable marker remains unknown to reconciliation after
+    /// supervisor death.
     pub(crate) fn mark_process_started(
         &mut self,
         child: &std::process::Child,
@@ -447,10 +475,10 @@ pub(crate) fn begin_artifact_use(
     session_id: i64,
     invocation_id: &str,
 ) -> io::Result<ArtifactUseAdmission> {
-    if session_id <= 0 || invocation_id.is_empty() || invocation_id.len() > 256 {
+    if session_id < 0 || invocation_id.is_empty() || invocation_id.len() > 256 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "artifact-use admission requires a positive session ID and a bounded invocation ID",
+            "artifact-use admission requires a nonnegative session ID and a bounded invocation ID",
         ));
     }
     if !cfg!(unix) {
@@ -523,6 +551,46 @@ pub(crate) fn begin_artifact_use(
         marker,
         marker_removed: false,
         locations,
+    }))
+}
+
+/// Build a unique bounded identifier for one caller invocation. Session zero
+/// represents a gate run without a broker session; it does not affect the
+/// canonical-checkout lock key.
+pub(crate) fn invocation_id(kind: &str, session_id: i64) -> String {
+    format!("{kind}:{session_id}:{}", next_nonce())
+}
+
+/// Reserve a canonical checkout while the current broker process performs
+/// synchronous managed work. Any dispatched child must use
+/// `begin_artifact_use` separately so its durable marker survives broker
+/// process death. The nonblocking shared-lock attempt keeps foreground work
+/// bounded when a future reclaimer is active.
+pub(crate) fn begin_artifact_use_scope(
+    primary_root: &Path,
+    checkout_root: &Path,
+) -> io::Result<ArtifactUseScopeAdmission> {
+    if !cfg!(unix) {
+        return Ok(ArtifactUseScopeAdmission::ProtocolUnavailable);
+    }
+    let locations = ArtifactUseLocations::resolve(primary_root, checkout_root)?;
+    if !locations.initialize_layout(ARTIFACT_LAYOUT_LOCK_WAIT)? {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "artifact-use layout is being initialized; retry producer admission",
+        ));
+    }
+    let file = super::open_lock_file_nofollow(&locations.lock_path)?;
+    let lock = super::SharedFileLock::try_acquire(file)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "checkout artifact use is reserved; retry producer admission",
+        )
+    })?;
+    locations.require_unchanged()?;
+    super::verify_named_lock_file(&locations.lock_path, &lock.file)?;
+    Ok(ArtifactUseScopeAdmission::Admitted(ArtifactUseScope {
+        _lock: lock,
     }))
 }
 
@@ -1000,6 +1068,31 @@ mod tests {
 
         let mut producer = begin(primary.path(), &checkout, 24, "test:24:resumed");
         producer.finish_not_started().unwrap();
+    }
+
+    #[test]
+    fn synchronous_scope_holds_checkout_admission_across_child_markers() {
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = checkout(primary.path(), "checkout");
+        let scope = match begin_artifact_use_scope(primary.path(), &checkout).unwrap() {
+            ArtifactUseScopeAdmission::Admitted(scope) => scope,
+            ArtifactUseScopeAdmission::ProtocolUnavailable => {
+                panic!("Unix test filesystem should support directory sync")
+            }
+        };
+        let mut child = begin(primary.path(), &checkout, 29, "prepare-step:29:nested");
+        child.finish_not_started().unwrap();
+        drop(child);
+
+        assert!(matches!(
+            try_artifact_use_reclaimer(primary.path(), &checkout).unwrap(),
+            ArtifactUseReclaimTry::Blocked(ArtifactUseReclaimBlock::Contended)
+        ));
+        drop(scope);
+        assert!(matches!(
+            try_artifact_use_reclaimer(primary.path(), &checkout).unwrap(),
+            ArtifactUseReclaimTry::Acquired(_)
+        ));
     }
 
     #[test]
@@ -1489,6 +1582,10 @@ mod unsupported_tests {
         assert!(matches!(
             begin_artifact_use(primary.path(), &checkout, 31, "test:31:unsupported").unwrap(),
             ArtifactUseAdmission::ProtocolUnavailable
+        ));
+        assert!(matches!(
+            begin_artifact_use_scope(primary.path(), &checkout).unwrap(),
+            ArtifactUseScopeAdmission::ProtocolUnavailable
         ));
         assert!(matches!(
             try_artifact_use_reclaimer(primary.path(), &checkout).unwrap(),

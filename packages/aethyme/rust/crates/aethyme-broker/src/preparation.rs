@@ -668,6 +668,24 @@ impl Broker {
             .steps
             .iter()
             .any(|step| step.cache == PreparationCachePolicy::RepositoryShared);
+        // Keep the checkout shared lock from before cache-root initialization
+        // through every synchronous write, child step, record update, and
+        // existing host-resource settlement. Each dispatched child also gets
+        // its own durable marker through the process supervisor, so a child
+        // that outlives a crashed broker remains visible after this scope's
+        // lock descriptor closes.
+        let _artifact_use_scope =
+            match crate::artifact_use::begin_artifact_use_scope(self.main_root(), &root) {
+                Ok(crate::artifact_use::ArtifactUseScopeAdmission::Admitted(scope)) => Some(scope),
+                Ok(crate::artifact_use::ArtifactUseScopeAdmission::ProtocolUnavailable) => None,
+                Err(source) => {
+                    return Err(crate::BrokerError::Io {
+                        path: root.clone(),
+                        source,
+                    }
+                    .into());
+                }
+            };
         let cache_root_binding = if shared {
             let binding = match config
                 .shared_cache
