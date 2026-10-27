@@ -2968,6 +2968,7 @@ mod generic_guarded_exec_tests {
                 !worktrees.iter().any(|path| path == &peer_root),
                 "guarded exec must not start Git in an unrelated live checkout: {worktrees:?}"
             );
+            println!("AETHYME_GUARDED_EXEC_TRACE_ASSERTIONS_OK");
             return;
         }
 
@@ -2977,7 +2978,11 @@ mod generic_guarded_exec_tests {
         let home = parent_path.join("home");
         std::fs::create_dir(&home).unwrap();
         let global_config = parent_path.join("empty-git-config");
-        std::fs::write(&global_config, b"").unwrap();
+        std::fs::write(
+            &global_config,
+            b"[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n",
+        )
+        .unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap());
         child.args(["--exact", TEST, "--nocapture"]);
         for (key, _) in std::env::vars_os() {
@@ -2999,10 +3004,16 @@ mod generic_guarded_exec_tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("AETHYME_GUARDED_EXEC_TRACE_ASSERTIONS_OK"),
+            "the child must execute the assertions, not only exit successfully:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 
     #[test]
-    fn guarded_exec_preserves_out_of_lease_foreign_and_unknown_holder_checks() {
+    fn guarded_exec_preserves_out_of_lease_foreign_and_holder_policy_checks() {
         let (_repository, _storage, mut broker) = fixture();
         let actor = broker
             .start_worktree("guarded ownership actor", None)
@@ -3030,6 +3041,7 @@ mod generic_guarded_exec_tests {
             "the holder has unknown process evidence"
         );
         assert_eq!(holder_view.derived_status, crate::SessionStatus::Active);
+        let expected_holder_block = !broker.lease_refusal_policy().unwrap().is_verify_only();
 
         let guarded_write = |broker: &mut Broker, target: &str, value: &str| {
             broker
@@ -3058,12 +3070,13 @@ mod generic_guarded_exec_tests {
                 .iter()
                 .any(|path| path == "tracked.txt")
         );
-        assert!(
+        assert_eq!(
             outside
                 .conflicting_leases
                 .iter()
                 .any(|lease| lease.session_id == holder.id && lease.path == "tracked.txt"),
-            "an explicit lease from an active holder with unknown PID remains a blocker"
+            expected_holder_block,
+            "the holder has unknown PID evidence but remains active; conflict reporting follows the current repository policy"
         );
 
         let actor_root = PathBuf::from(&actor.worktree_path);
