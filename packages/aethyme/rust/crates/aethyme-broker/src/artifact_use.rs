@@ -21,6 +21,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const MARKER_SCHEMA_VERSION: u32 = 1;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "B1 ships the fail-closed reclaimer surface before a production cleanup caller exists."
+    )
+)]
 const MAX_MARKERS_PER_CHECKOUT: usize = 256;
 const MAX_MARKER_BYTES: u64 = 16 * 1024;
 const ARTIFACT_LAYOUT_LOCK_WAIT: Duration = Duration::from_secs(1);
@@ -88,6 +95,13 @@ pub(crate) enum ArtifactUsePhase {
 }
 
 /// Why a future artifact reclamation attempt could not prove the checkout idle.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "B1 ships the fail-closed reclaimer surface before a production cleanup caller exists."
+    )
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ArtifactUseReclaimBlock {
     /// A producer or another exclusive user currently holds the inode lock.
@@ -99,6 +113,13 @@ pub(crate) enum ArtifactUseReclaimBlock {
 }
 
 /// Result of a bounded, nonblocking attempt to reserve a checkout for cleanup.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "B1 ships the fail-closed reclaimer surface before a production cleanup caller exists."
+    )
+)]
 #[derive(Debug)]
 pub(crate) enum ArtifactUseReclaimTry {
     Acquired(ArtifactUseReclaimer),
@@ -108,7 +129,7 @@ pub(crate) enum ArtifactUseReclaimTry {
 /// A caller may continue ordinary work without admission only when cleanup
 /// remains disabled for every checkout on this unsupported target.
 pub(crate) enum ArtifactUseAdmission {
-    Admitted(ArtifactUseProducer),
+    Admitted(Box<ArtifactUseProducer>),
     ProtocolUnavailable,
 }
 
@@ -302,10 +323,6 @@ pub(crate) struct ArtifactUseScope {
 }
 
 impl ArtifactUseProducer {
-    pub(crate) fn marker(&self) -> &ArtifactUseMarker {
-        &self.marker
-    }
-
     pub(crate) fn is_pre_dispatch(&self) -> bool {
         !self.marker_removed
             && self.marker.phase == ArtifactUsePhase::PreDispatch
@@ -456,6 +473,13 @@ impl ArtifactUseProducer {
 /// An exclusive reservation returned only when the full durable marker
 /// inventory was readable and empty. It is a synchronization primitive, not
 /// cleanup authority.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "B1 ships the fail-closed reclaimer surface before a production cleanup caller exists."
+    )
+)]
 #[derive(Debug)]
 pub(crate) struct ArtifactUseReclaimer {
     _lock: super::ExclusiveFileLock,
@@ -544,14 +568,16 @@ pub(crate) fn begin_artifact_use(
             )),
         };
     }
-    Ok(ArtifactUseAdmission::Admitted(ArtifactUseProducer {
-        _lock: lock,
-        marker_file,
-        marker_path,
-        marker,
-        marker_removed: false,
-        locations,
-    }))
+    Ok(ArtifactUseAdmission::Admitted(Box::new(
+        ArtifactUseProducer {
+            _lock: lock,
+            marker_file,
+            marker_path,
+            marker,
+            marker_removed: false,
+            locations,
+        },
+    )))
 }
 
 /// Build a unique bounded identifier for one caller invocation. Session zero
@@ -598,6 +624,13 @@ pub(crate) fn begin_artifact_use_scope(
 /// marker, malformed entry, cap overflow, or I/O error must retain the
 /// checkout; this function never deletes or repairs markers. Non-Unix
 /// targets return `ProtocolUnavailable` permanently, regardless of inventory.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "B1 ships the fail-closed reclaimer surface before a production cleanup caller exists."
+    )
+)]
 pub(crate) fn try_artifact_use_reclaimer(
     primary_root: &Path,
     checkout_root: &Path,
@@ -634,6 +667,13 @@ pub(crate) fn try_artifact_use_reclaimer(
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "B1 ships the fail-closed reclaimer surface before a production cleanup caller exists."
+    )
+)]
 fn read_marker_inventory(locations: &ArtifactUseLocations) -> io::Result<Vec<ArtifactUseMarker>> {
     let directory_metadata = match fs::symlink_metadata(&locations.marker_dir) {
         Ok(metadata) => metadata,
@@ -697,6 +737,13 @@ fn read_marker_inventory(locations: &ArtifactUseLocations) -> io::Result<Vec<Art
     Ok(markers)
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "B1 ships the fail-closed reclaimer surface before a production cleanup caller exists."
+    )
+)]
 fn read_marker_file(path: &Path) -> io::Result<ArtifactUseMarker> {
     let mut file = open_existing_nofollow(path)?;
     super::verify_named_lock_file(path, &file)?;
@@ -732,6 +779,13 @@ fn create_marker_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "B1 ships the fail-closed reclaimer surface before a production cleanup caller exists."
+    )
+)]
 fn open_existing_nofollow(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -965,7 +1019,7 @@ mod tests {
         invocation: &str,
     ) -> ArtifactUseProducer {
         match begin_artifact_use(primary, checkout, session, invocation).unwrap() {
-            ArtifactUseAdmission::Admitted(producer) => producer,
+            ArtifactUseAdmission::Admitted(producer) => *producer,
             ArtifactUseAdmission::ProtocolUnavailable => {
                 panic!("Unix test filesystem should support directory sync")
             }
@@ -1002,8 +1056,8 @@ mod tests {
         assert_eq!(marker.session_id, 11);
         assert_eq!(marker.invocation_id, "gate:11:test");
         assert_eq!(
-            producer.marker().checkout_key,
-            second_session.marker().checkout_key
+            producer.marker.checkout_key,
+            second_session.marker.checkout_key
         );
         assert_eq!(
             marker.checkout_root,
@@ -1178,8 +1232,8 @@ mod tests {
 
         let mut first = begin(primary.path(), &checkout, 18, "test:18:canonical");
         let mut second = begin(primary.path(), &alias, 19, "test:19:alias");
-        assert_eq!(first.marker().checkout_key, second.marker().checkout_key);
-        assert_eq!(first.marker().checkout_root, second.marker().checkout_root);
+        assert_eq!(first.marker.checkout_key, second.marker.checkout_key);
+        assert_eq!(first.marker.checkout_root, second.marker.checkout_root);
         first.finish_not_started().unwrap();
         second.finish_not_started().unwrap();
     }
@@ -1414,6 +1468,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[expect(
+        clippy::zombie_processes,
+        reason = "the bounded nested child intentionally outlives its killed producer; the parent verifies its marker and kills the owned group"
+    )]
     fn process_death_leaves_the_durable_marker_for_reconciliation() {
         const CHILD: &str = "AETHYME_ARTIFACT_USE_TEST_CHILD";
         if std::env::var_os(CHILD).is_some() {

@@ -2960,7 +2960,7 @@ where
             &crate::file_lock::artifact_use::invocation_id("gate", session_id.unwrap_or(0)),
         ) {
             Ok(crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer)) => {
-                Some(producer)
+                Some(*producer)
             }
             Ok(crate::file_lock::artifact_use::ArtifactUseAdmission::ProtocolUnavailable) => None,
             Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
@@ -4254,7 +4254,7 @@ fn run_gate_command(
 ) -> Result<GateCommandOutcome, std::io::Error> {
     let result = run_gate_command_inner(command, &context, &mut artifact_use);
     if result.is_err()
-        && let Some(producer) = artifact_use.as_deref_mut()
+        && let Some(producer) = artifact_use
         && producer.is_pre_dispatch()
         && let Err(settlement_error) = producer.finish_not_started()
     {
@@ -4697,7 +4697,7 @@ fn run_gate_command_inner(
             let process_group = child.id() as i32;
             let (status, timed_out) = wait_gate_child(
                 &mut child,
-                &context,
+                context,
                 process_group,
                 &collector,
                 &drain_failed,
@@ -5784,7 +5784,7 @@ mod tests {
         )
         .unwrap()
         {
-            crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer) => producer,
+            crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer) => *producer,
             crate::file_lock::artifact_use::ArtifactUseAdmission::ProtocolUnavailable => {
                 panic!("Unix test filesystem should support directory sync")
             }

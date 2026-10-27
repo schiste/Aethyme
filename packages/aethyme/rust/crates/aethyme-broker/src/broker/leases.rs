@@ -2236,7 +2236,7 @@ impl Broker {
             &crate::file_lock::artifact_use::invocation_id("guarded-exec", session_id),
         ) {
             Ok(crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer)) => {
-                Some(producer)
+                Some(*producer)
             }
             Ok(crate::file_lock::artifact_use::ArtifactUseAdmission::ProtocolUnavailable) => None,
             Err(source) => {

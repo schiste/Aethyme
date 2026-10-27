@@ -2041,7 +2041,7 @@ mod tests {
         )
         .unwrap()
         {
-            crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer) => producer,
+            crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer) => *producer,
             crate::file_lock::artifact_use::ArtifactUseAdmission::ProtocolUnavailable => {
                 panic!("Unix test filesystem should support directory sync")
             }
