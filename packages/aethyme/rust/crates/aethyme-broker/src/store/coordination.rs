@@ -1059,6 +1059,30 @@ impl BrokerStore {
         Ok(true)
     }
 
+    /// Check one session's unreleased, unexpired lease rows at a single time.
+    ///
+    /// This intentionally does not filter by session status: finish calls the
+    /// check after closing the session to verify that its close transaction
+    /// released the leases.
+    pub fn has_unreleased_unexpired_lease_for_session_at(
+        &self,
+        session_id: i64,
+        now: i64,
+    ) -> Result<bool, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM leases
+                     WHERE session_id = ?1
+                       AND released_at IS NULL
+                       AND (expires_at IS NULL OR expires_at > ?2)
+                 )",
+                params![session_id, now],
+                |row| row.get(0),
+            )
+            .map_err(BrokerError::from)
+    }
+
     /// Resolve publication advisories only after their affected session no
     /// longer has a live lease overlapping the advisory paths. Acknowledged
     /// advisories still complete their lifecycle once the condition clears.
@@ -1267,5 +1291,99 @@ impl BrokerStore {
                 field: "pull_request_watch.id",
                 value: id.to_string(),
             })
+    }
+}
+
+#[cfg(test)]
+mod finish_lease_query_tests {
+    use super::*;
+
+    fn new_session(name: &str, root: &std::path::Path) -> NewSession {
+        NewSession {
+            worktree_path: root
+                .join(format!("{name}-worktree"))
+                .to_string_lossy()
+                .into_owned(),
+            branch: format!("agent/finish-lease-{name}"),
+            origin: SessionOrigin::Spawned,
+            task: Some(name.to_owned()),
+            diff_base: None,
+            adoption_base: None,
+            adopted_head: None,
+            repository_contract: None,
+            pid: None,
+            command: None,
+            log_path: None,
+            agent_identity: None,
+        }
+    }
+
+    #[test]
+    fn post_close_lease_lookup_is_session_scoped_and_checks_closed_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open(&temp.path().join("broker.db")).unwrap();
+        let target = store
+            .register_session(&new_session("target", temp.path()))
+            .unwrap();
+        let unrelated = store
+            .register_session(&new_session("unrelated", temp.path()))
+            .unwrap();
+
+        store
+            .set_session_status(target.id, SessionStatus::Closed, None)
+            .unwrap();
+        store
+            .claim_lease(target.id, "unreleased-after-close", None)
+            .unwrap();
+        for index in 0..128 {
+            store
+                .claim_lease(unrelated.id, &format!("unrelated-lease-{index}"), None)
+                .unwrap();
+        }
+
+        let now = now_ms();
+        assert!(
+            !store
+                .active_leases_at(now)
+                .unwrap()
+                .iter()
+                .any(|lease| lease.session_id == target.id),
+            "active_leases intentionally excludes closed sessions"
+        );
+        assert!(
+            store
+                .has_unreleased_unexpired_lease_for_session_at(target.id, now)
+                .unwrap(),
+            "post-close verification must still see an unreleased target row"
+        );
+
+        store
+            .release_lease(target.id, "unreleased-after-close")
+            .unwrap();
+        assert!(
+            !store
+                .has_unreleased_unexpired_lease_for_session_at(target.id, now_ms())
+                .unwrap(),
+            "released target rows should no longer count"
+        );
+        assert!(
+            store
+                .has_unreleased_unexpired_lease_for_session_at(unrelated.id, now_ms())
+                .unwrap(),
+            "unrelated active rows should be queried independently"
+        );
+
+        let expired = store
+            .claim_lease(target.id, "expired-after-close", Some(1))
+            .unwrap();
+        assert!(
+            !store
+                .has_unreleased_unexpired_lease_for_session_at(
+                    target.id,
+                    expired.expires_at.unwrap(),
+                )
+                .unwrap(),
+            "a row expiring at the query snapshot is no longer active"
+        );
     }
 }
