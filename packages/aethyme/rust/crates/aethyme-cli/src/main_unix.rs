@@ -34,6 +34,7 @@ mod readiness_remediation;
 mod repository_deploy;
 mod repository_enrollment;
 mod repository_upgrade;
+mod terminal_preview;
 
 /// Upper bound for waiting on a freshly-spawned engine daemon. The socket
 /// binds only after the initial map build (~70s on a 12K-file repo), so

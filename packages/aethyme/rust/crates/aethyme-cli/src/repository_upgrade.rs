@@ -15,6 +15,7 @@ use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+use crate::terminal_preview::{DIFF_PREVIEW_LIMIT_BYTES, bounded_terminal_text_preview};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -3036,14 +3037,24 @@ pub fn initial_enrollment_plan(
     repo_hint: &Path,
     enrollment_session_id: Option<i64>,
 ) -> Result<RepositoryUpgradePlan, String> {
-    build_plan(
+    initial_enrollment_plan_with_diff(repo_hint, enrollment_session_id).map(|(report, _)| report)
+}
+
+/// Build the first-enrollment report and its exact generated-content diff from
+/// the same disposable proposal. Full diff text stays outside the report; the
+/// existing diff hash remains the plan-binding value.
+pub(crate) fn initial_enrollment_plan_with_diff(
+    repo_hint: &Path,
+    enrollment_session_id: Option<i64>,
+) -> Result<(RepositoryUpgradePlan, String), String> {
+    let built = build_plan(
         repo_hint,
         Some(RepositoryMode::Canonical),
         None,
         enrollment_session_id,
         RepositoryPlanIntent::SchemaUpgrade,
-    )
-    .map(|built| built.report)
+    )?;
+    Ok((built.report, built.migration_diff))
 }
 
 #[allow(dead_code)]
@@ -3699,15 +3710,46 @@ fn run_inner(args: &[String]) -> Result<(), String> {
         }
         println!("Next: {}", report.next_action);
         if let Some(migration_diff) = migration_diff {
-            println!("Migration diff:");
-            if migration_diff.is_empty() {
-                println!("(no changes)");
-            } else {
-                print!("{migration_diff}");
-            }
+            print!(
+                "{}",
+                render_migration_diff_preview(
+                    &migration_diff,
+                    &report.diff_sha256,
+                    DIFF_PREVIEW_LIMIT_BYTES,
+                )
+            );
         }
     }
     Ok(())
+}
+
+fn render_migration_diff_preview(
+    migration_diff: &str,
+    raw_diff_sha256: &str,
+    preview_limit_bytes: usize,
+) -> String {
+    let (preview, truncated) = bounded_terminal_text_preview(migration_diff, preview_limit_bytes);
+    let mut rendered = format!(
+        "Migration diff preview: {} escaped bytes shown from {} raw bytes; SHA-256 (raw) {}\nMigration diff:\n",
+        preview.len(),
+        migration_diff.len(),
+        raw_diff_sha256
+    );
+    if migration_diff.is_empty() {
+        rendered.push_str("(no changes)\n");
+        return rendered;
+    }
+
+    rendered.push_str(&preview);
+    if truncated {
+        if !preview.ends_with('\n') {
+            rendered.push('\n');
+        }
+        rendered.push_str(
+            "[terminal-safe diff preview truncated at a complete line boundary; raw SHA-256 covers the complete diff]\n",
+        );
+    }
+    rendered
 }
 
 fn run_recover(args: &[String]) -> Result<(), String> {
@@ -3767,6 +3809,54 @@ fn print_usage() {
         "  aethyme upgrade apply [--repo <path>] [--local-only] [--resolution-file <path>] --confirm <plan-sha256> [--json]"
     );
     println!("  aethyme upgrade recover [--repo <path>] --plan <plan-sha256> [--json]");
+}
+
+#[cfg(test)]
+mod migration_diff_preview_tests {
+    use super::render_migration_diff_preview;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn migration_preview_escapes_terminal_controls_and_keeps_raw_digest() {
+        let diff = "diff --git a/Procfile b/Procfile\n+printf '\u{1b}[31mowned\u{1b}[0m'\n";
+        let raw_digest = format!("{:x}", Sha256::digest(diff.as_bytes()));
+
+        let rendered = render_migration_diff_preview(diff, &raw_digest, 1024);
+
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(rendered.contains(r"\u{1b}[31mowned\u{1b}[0m"));
+        assert!(rendered.contains(&format!("SHA-256 (raw) {raw_digest}")));
+        let escaped_diff = diff.replace('\u{1b}', r"\u{1b}");
+        assert!(rendered.contains(&format!(
+            "{} escaped bytes shown from {} raw bytes",
+            escaped_diff.len(),
+            diff.len()
+        )));
+    }
+
+    #[test]
+    fn migration_preview_caps_after_control_escaping() {
+        let diff = format!("header\n+{}\nlast\n", "\u{1b}".repeat(32));
+        let raw_digest = format!("{:x}", Sha256::digest(diff.as_bytes()));
+
+        let rendered = render_migration_diff_preview(&diff, &raw_digest, 32);
+        let preview = rendered
+            .split_once("Migration diff:\n")
+            .expect("renderer emits a diff section")
+            .1
+            .split("[terminal-safe diff preview truncated")
+            .next()
+            .expect("preview precedes truncation notice");
+
+        assert!(preview.len() <= 32);
+        assert!(rendered.contains("[terminal-safe diff preview truncated"));
+        assert!(rendered.contains(&format!(
+            "{} escaped bytes shown from {} raw bytes",
+            preview.len(),
+            diff.len()
+        )));
+        assert!(!rendered.contains('\u{1b}'));
+    }
 }
 
 #[cfg(test)]
