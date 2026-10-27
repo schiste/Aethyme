@@ -18,6 +18,9 @@ use crate::repository_upgrade::{
 
 const PLAN_SCHEMA_VERSION: u32 = 1;
 const DIFF_PREVIEW_LIMIT_BYTES: usize = 256 * 1024;
+const CHANGE_INVENTORY_OUTPUT_LIMIT_BYTES: usize = 512 * 1024;
+const CHANGE_INVENTORY_TRUNCATION_NOTICE: &str =
+    "[rendered preview truncated at a complete line boundary; output byte limit reached]\n";
 const RUNTIME_EXCLUDE_BLOCK: &str = "# BEGIN Aethyme first-enrollment runtime\n/.aethyme/\n# END Aethyme first-enrollment runtime\n";
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -1429,19 +1432,28 @@ fn render_plan(plan: &FirstEnrollmentPlan) {
 
 fn render_change_inventory(plan: &FirstEnrollmentPlan, migration_diff: &str) -> String {
     let mut rendered = String::new();
+    let remote = escape_terminal_field(&plan.remote_base.remote);
+    let default_branch_ref = escape_terminal_field(&plan.remote_base.default_branch_ref);
     let _ = writeln!(
         rendered,
         "First-enrollment generated output preview for {}:",
-        plan.remote_base.remote
+        remote
     );
     let _ = writeln!(
         rendered,
-        "Canonical source: {}/{} @ {}",
-        plan.remote_base.remote, plan.remote_base.default_branch_ref, plan.remote_base.exact_sha
+        "Configured origin/default ref: {}/{} @ {}",
+        remote, default_branch_ref, plan.remote_base.exact_sha
     );
     let _ = writeln!(
         rendered,
         "Generated outputs grouped by ownership; per-file generator-source mapping is unavailable."
+    );
+    let _ = writeln!(rendered, "Plan digest: {}", plan.plan_digest);
+    let _ = writeln!(
+        rendered,
+        "Raw generated diff: {} bytes; SHA-256 (raw) {}",
+        migration_diff.len(),
+        plan.generated_tree.diff_sha256
     );
     for (ownership, title) in [
         (
@@ -1468,7 +1480,7 @@ fn render_change_inventory(plan: &FirstEnrollmentPlan, migration_diff: &str) -> 
                 rendered,
                 "    {:?} {} {} -> {}",
                 change.action,
-                change.path,
+                escape_terminal_field(&change.path),
                 change.before_sha256.as_deref().unwrap_or("missing"),
                 change.after_sha256.as_deref().unwrap_or("missing")
             );
@@ -1477,49 +1489,80 @@ fn render_change_inventory(plan: &FirstEnrollmentPlan, migration_diff: &str) -> 
             let _ = writeln!(rendered, "    (none)");
         }
     }
-    let _ = writeln!(rendered, "Plan digest: {}", plan.plan_digest);
-    let _ = writeln!(
-        rendered,
-        "Full generated diff: {} bytes; SHA-256 {}",
-        migration_diff.len(),
-        plan.generated_tree.diff_sha256
-    );
     rendered.push_str("Migration diff:\n");
     if migration_diff.is_empty() {
         rendered.push_str("(no changes)\n");
-        return rendered;
+        return bound_change_inventory_output(rendered);
     }
 
-    let (preview, truncated) = bounded_diff_preview(migration_diff, DIFF_PREVIEW_LIMIT_BYTES);
-    rendered.push_str(preview);
+    let (preview, truncated) =
+        bounded_terminal_text_preview(migration_diff, DIFF_PREVIEW_LIMIT_BYTES);
+    rendered.push_str(&preview);
     if !preview.ends_with('\n') {
         rendered.push('\n');
     }
     if truncated {
         let _ = writeln!(
             rendered,
-            "[diff preview truncated: showing {} of {} bytes; SHA-256 covers the complete proposal]",
+            "[terminal-safe diff preview truncated at a complete line boundary: showing {} escaped bytes from {} raw diff bytes; raw SHA-256 covers the complete proposal]",
             preview.len(),
             migration_diff.len()
         );
     }
-    rendered
+    bound_change_inventory_output(rendered)
 }
 
-fn bounded_diff_preview(diff: &str, byte_limit: usize) -> (&str, bool) {
-    if diff.len() <= byte_limit {
-        return (diff, false);
+fn escape_terminal_field(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_control() {
+            escaped.extend(character.escape_debug());
+        } else {
+            escaped.push(character);
+        }
     }
+    escaped
+}
 
-    let mut end = byte_limit.min(diff.len());
-    while !diff.is_char_boundary(end) {
-        end -= 1;
+fn bounded_terminal_text_preview(text: &str, byte_limit: usize) -> (String, bool) {
+    let mut preview = String::with_capacity(byte_limit.min(text.len()));
+    let mut truncated = false;
+    for character in text.chars() {
+        if character.is_control() && !matches!(character, '\n' | '\t') {
+            let escaped: String = character.escape_debug().collect();
+            if preview.len().saturating_add(escaped.len()) > byte_limit {
+                truncated = true;
+                break;
+            }
+            preview.push_str(&escaped);
+        } else {
+            let mut buffer = [0; 4];
+            let encoded = character.encode_utf8(&mut buffer);
+            if preview.len().saturating_add(encoded.len()) > byte_limit {
+                truncated = true;
+                break;
+            }
+            preview.push_str(encoded);
+        }
     }
-    let Some(last_complete_line) = diff[..end].rfind('\n') else {
-        return ("", true);
-    };
-    end = last_complete_line + 1;
-    (&diff[..end], true)
+    if truncated {
+        if let Some(last_complete_line) = preview.rfind('\n') {
+            preview.truncate(last_complete_line + 1);
+        } else {
+            preview.clear();
+        }
+    }
+    (preview, truncated)
+}
+
+fn bound_change_inventory_output(rendered: String) -> String {
+    let preview_limit = CHANGE_INVENTORY_OUTPUT_LIMIT_BYTES
+        .saturating_sub(CHANGE_INVENTORY_TRUNCATION_NOTICE.len());
+    let (mut preview, truncated) = bounded_terminal_text_preview(&rendered, preview_limit);
+    if truncated {
+        preview.push_str(CHANGE_INVENTORY_TRUNCATION_NOTICE);
+    }
+    preview
 }
 
 fn print_usage() {
@@ -1530,12 +1573,15 @@ fn print_usage() {
 
 #[cfg(test)]
 mod diff_preview_tests {
-    use super::bounded_diff_preview;
+    use super::{
+        CHANGE_INVENTORY_OUTPUT_LIMIT_BYTES, CHANGE_INVENTORY_TRUNCATION_NOTICE,
+        bound_change_inventory_output, bounded_terminal_text_preview, escape_terminal_field,
+    };
 
     #[test]
     fn bounded_preview_keeps_utf8_complete_lines_and_reports_truncation() {
         let diff = "header\nλ content beyond the limit\nnext\n";
-        let (preview, truncated) = bounded_diff_preview(diff, 10);
+        let (preview, truncated) = bounded_terminal_text_preview(diff, 10);
 
         assert!(truncated);
         assert_eq!(preview, "header\n");
@@ -1546,7 +1592,7 @@ mod diff_preview_tests {
     #[test]
     fn bounded_preview_does_not_split_a_very_long_first_line() {
         let diff = "λ".repeat(32);
-        let (preview, truncated) = bounded_diff_preview(&diff, 7);
+        let (preview, truncated) = bounded_terminal_text_preview(&diff, 7);
 
         assert!(truncated);
         assert!(preview.is_empty());
@@ -1555,9 +1601,59 @@ mod diff_preview_tests {
     #[test]
     fn bounded_preview_keeps_complete_diff_when_within_limit() {
         let diff = "diff --git a/file b/file\n";
-        let (preview, truncated) = bounded_diff_preview(diff, diff.len());
+        let (preview, truncated) = bounded_terminal_text_preview(diff, diff.len());
 
         assert!(!truncated);
         assert_eq!(preview, diff);
+    }
+
+    #[test]
+    fn procfile_preview_escapes_terminal_controls_before_bounding() {
+        let diff = "diff --git a/Procfile b/Procfile\n@@ -1 +1 @@\n-echo old\n+printf '\u{1b}[31mowned\u{1b}[0m'\n";
+        let (preview, truncated) = bounded_terminal_text_preview(diff, 256);
+
+        assert!(!truncated);
+        assert!(preview.contains(r"\u{1b}[31mowned\u{1b}[0m"));
+        assert!(preview.contains('\n'));
+        assert!(
+            !preview
+                .chars()
+                .any(|character| { character.is_control() && !matches!(character, '\n' | '\t') })
+        );
+    }
+
+    #[test]
+    fn preview_limit_applies_after_control_escape_expansion() {
+        let diff = format!("header\n+{}\nnext\n", "\u{1b}".repeat(24));
+        let (preview, truncated) = bounded_terminal_text_preview(&diff, 20);
+
+        assert!(truncated);
+        assert_eq!(preview, "header\n");
+        assert!(preview.len() <= 20);
+    }
+
+    #[test]
+    fn single_line_inventory_fields_escape_all_terminal_controls() {
+        assert_eq!(
+            escape_terminal_field("Procfile\u{1b}\n\tname"),
+            r"Procfile\u{1b}\n\tname"
+        );
+    }
+
+    #[test]
+    fn complete_inventory_output_stays_bounded_after_escaping() {
+        let rendered = format!(
+            "header\n{}\n",
+            "\u{1b}".repeat(CHANGE_INVENTORY_OUTPUT_LIMIT_BYTES)
+        );
+        let output = bound_change_inventory_output(rendered);
+
+        assert!(output.len() <= CHANGE_INVENTORY_OUTPUT_LIMIT_BYTES);
+        assert!(output.ends_with(CHANGE_INVENTORY_TRUNCATION_NOTICE));
+        assert!(
+            !output
+                .chars()
+                .any(|character| character.is_control() && character != '\n')
+        );
     }
 }

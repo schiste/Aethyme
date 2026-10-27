@@ -644,6 +644,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   waiter/holder relationships, pending operations and help snapshots in the
   focused selection. Test bounded output with explicit omission counts; a
   smaller display must still surface the coordination state callers need.
+- For human-facing previews containing repository-derived text, escape terminal
+  control characters, including ESC, in content, paths and metadata. Preserve
+  newline or tab only when it is intentional display structure, not in data
+  fields. Apply byte caps after escaping and label raw-source hashes separately
+  from the transformed preview.
 - For CLI JSON stream tests, parse complete stdout as one JSON value and
   check child output on the intended stream separately. Include both stdout
   and stderr in subprocess failure assertions: a structured refusal can be
