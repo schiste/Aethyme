@@ -62,8 +62,12 @@ fn real_git() -> String {
 /// A `git` that sleeps for one specific tag name and is otherwise the real thing,
 /// so exactly one coordinated operation holds the lock long enough to observe.
 fn slow_git_shim(dir: &Path) {
+    slow_git_shim_using(dir, &real_git());
+}
+
+fn slow_git_shim_using(dir: &Path, real: &str) {
     std::fs::create_dir_all(dir).unwrap();
-    let real = real_git();
+    let real = format!("'{}'", real.replace('\'', "'\\''"));
     let shim = dir.join("git");
     std::fs::write(
         &shim,
@@ -77,6 +81,28 @@ fn slow_git_shim(dir: &Path) {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn slow_git_shim_preserves_a_quoted_executable_path() {
+    let root = tempfile::tempdir().unwrap();
+    let executable = root.path().join("real git's executable");
+    std::os::unix::fs::symlink(real_git(), &executable).unwrap();
+    let bin = root.path().join("shim");
+    slow_git_shim_using(&bin, executable.to_str().unwrap());
+    let output = Command::new(bin.join("git"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    let expected = Command::new(&executable).arg("--version").output().unwrap();
+    assert!(expected.status.success());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, expected.stdout);
 }
 
 fn session_id(output: &Output) -> i64 {
