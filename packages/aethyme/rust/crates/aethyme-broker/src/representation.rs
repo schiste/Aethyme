@@ -970,7 +970,10 @@ mod tests {
         ));
         assert!(matches!(
             work_landed(&repo, &head, &target).unwrap(),
-            LandingVerdict::NotLanded { truncated: false, .. }
+            LandingVerdict::NotLanded {
+                truncated: false,
+                ..
+            }
         ));
         git(tmp.path(), &["cherry-pick", &head]);
         let landed = git(tmp.path(), &["rev-parse", "HEAD"]);
@@ -1014,7 +1017,10 @@ mod tests {
         ));
         assert!(matches!(
             work_landed(&repo, &head, &target).unwrap(),
-            LandingVerdict::NotLanded { truncated: false, .. }
+            LandingVerdict::NotLanded {
+                truncated: false,
+                ..
+            }
         ));
         git(tmp.path(), &["cherry-pick", &head]);
         let landed = git(tmp.path(), &["rev-parse", "HEAD"]);
@@ -1786,15 +1792,17 @@ mod tests {
         const ROOT_ENV: &str = "AETHYME_REPRESENTATION_TRACE_ROOT";
         const HEAD_ENV: &str = "AETHYME_REPRESENTATION_TRACE_HEAD";
         const TIP_ENV: &str = "AETHYME_REPRESENTATION_TRACE_TIP";
-        const TEST: &str =
-            "representation::tests::patch_equivalence_candidate_requires_matching_tree_entries_before_landed";
+        const TEST: &str = "representation::tests::patch_equivalence_candidate_requires_matching_tree_entries_before_landed";
         if let Some(root) = std::env::var_os(ROOT_ENV) {
             let repo = GitRepo::discover(Path::new(&root)).unwrap();
             let head = std::env::var(HEAD_ENV).unwrap();
             let tip = std::env::var(TIP_ENV).unwrap();
             assert!(matches!(
                 work_landed(&repo, &head, &tip).unwrap(),
-                LandingVerdict::NotLanded { truncated: false, .. }
+                LandingVerdict::NotLanded {
+                    truncated: false,
+                    ..
+                }
             ));
             return;
         }
