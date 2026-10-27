@@ -205,6 +205,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   Cargo `[env]` configuration: Cargo injects those values into test child
   processes, while direct execution does not. Replay and record relevant values
   explicitly, or classify the direct run as non-equivalent.
+- Before optimizing a release workflow's version-contract test, trace its child
+  binary helper: a test helper can invoke a Cargo binary build and compile a
+  second debug copy before the shipping release build. When the workflow already
+  produces the exact target binaries, point only that contract test at the
+  profile/target output directory and fail closed if either artifact is missing.
+  Preserve the version/source assertions and downstream packaging/signature
+  gates; leave generic testkit fallback behavior unchanged.
 - Treat full-repository static audits as validation work during a local build
   pause; route them to remote checks instead of running them locally. A prebuilt
   executable can still consume substantial CPU across bulk imports and scans.

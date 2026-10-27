@@ -1,8 +1,10 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use aethyme_testkit::bins::{aethyme_bin, engine_bin};
 use aethyme_testkit::paths::rust_workspace_root;
+
+const RELEASE_BINARY_DIR_ENV: &str = "AETHYME_RELEASE_BINARY_DIR";
 
 const PRODUCTION_CRATES: &[&str] = &[
     "aethyme-broker",
@@ -74,6 +76,69 @@ fn version_output(binary: &Path) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+fn release_binary_filename(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    }
+}
+
+fn version_binary(
+    name: &str,
+    release_binary_dir: Option<PathBuf>,
+    build_if_missing: impl FnOnce() -> PathBuf,
+) -> Result<PathBuf, String> {
+    let Some(release_binary_dir) = release_binary_dir else {
+        return Ok(build_if_missing());
+    };
+
+    let path = release_binary_dir.join(release_binary_filename(name));
+    if !path.is_file() {
+        return Err(format!(
+            "{RELEASE_BINARY_DIR_ENV} is set but the release binary is missing: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+#[test]
+fn release_binary_override_selects_existing_artifact_without_fallback() {
+    let directory = tempfile::tempdir().unwrap();
+    let expected = directory.path().join(release_binary_filename("aethyme"));
+    std::fs::write(&expected, b"fixture binary").unwrap();
+
+    let mut fallback_called = false;
+    let actual = version_binary("aethyme", Some(directory.path().to_path_buf()), || {
+        fallback_called = true;
+        PathBuf::from("unexpected-fallback")
+    })
+    .unwrap();
+
+    assert_eq!(actual, expected);
+    assert!(!fallback_called);
+}
+
+#[test]
+fn release_binary_override_refuses_missing_artifact_without_fallback() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut fallback_called = false;
+    let error = version_binary(
+        "aethyme-engine-cli",
+        Some(directory.path().to_path_buf()),
+        || {
+            fallback_called = true;
+            PathBuf::from("unexpected-fallback")
+        },
+    )
+    .unwrap_err();
+
+    assert!(error.contains(RELEASE_BINARY_DIR_ENV));
+    assert!(error.contains("aethyme-engine-cli"));
+    assert!(!fallback_called);
 }
 
 fn is_full_git_sha(value: &str) -> bool {
@@ -159,8 +224,13 @@ fn production_crates_and_binaries_share_the_release_version() {
         );
     }
 
-    let router = version_output(&aethyme_bin());
-    let engine = version_output(&engine_bin());
+    let release_binary_dir = std::env::var_os(RELEASE_BINARY_DIR_ENV).map(PathBuf::from);
+    let router_binary = version_binary("aethyme", release_binary_dir.clone(), aethyme_bin)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let engine_binary = version_binary("aethyme-engine-cli", release_binary_dir, engine_bin)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let router = version_output(&router_binary);
+    let engine = version_output(&engine_binary);
     assert_eq!(router.split_whitespace().nth(1), Some(expected.as_str()));
     assert_eq!(engine.split_whitespace().nth(1), Some(expected.as_str()));
 
@@ -340,6 +410,20 @@ fn release_workflow_uses_ephemeral_checkouts_and_source_sha_contract() {
         .expect("release workflow must run the release version contract");
     assert!(contract_step.contains("AETHYME_RELEASE_TAG: ${{ github.ref_name }}"));
     assert!(contract_step.contains("AETHYME_RELEASE_COMMIT: ${{ github.sha }}"));
+    assert!(contract_step.contains(
+        "AETHYME_RELEASE_BINARY_DIR: ${{ github.workspace }}/packages/aethyme/rust/target/${{ matrix.target }}/release"
+    ));
+
+    let matrix_release_build = workflow
+        .find("cargo build --release --locked --target \"${{ matrix.target }}\"")
+        .expect("release binaries must be built for the matrix target");
+    let contract_step_position = workflow
+        .find("- name: Verify release version contract")
+        .expect("release version contract step must be present");
+    assert!(
+        matrix_release_build < contract_step_position,
+        "the release contract must inspect binaries after they are built"
+    );
 }
 
 #[test]

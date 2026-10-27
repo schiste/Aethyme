@@ -91,12 +91,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends musl-tools
 
-      - name: Verify release version contract
-        env:
-          AETHYME_RELEASE_TAG: ${{ github.ref_name }}
-          AETHYME_RELEASE_COMMIT: ${{ github.sha }}
-        run: cargo test --locked -p aethyme-testkit --test release_contract
-
       - name: Build release binaries
         env:
           # cc-rs compiles the C dependencies with musl-gcc for the musl target.
@@ -104,6 +98,13 @@ jobs:
         run: |
           cargo build --release --locked --target "${{ matrix.target }}" \
             -p aethyme-cli --bin aethyme -p aethyme-engine --bin aethyme-engine-cli
+
+      - name: Verify release version contract
+        env:
+          AETHYME_RELEASE_TAG: ${{ github.ref_name }}
+          AETHYME_RELEASE_COMMIT: ${{ github.sha }}
+          AETHYME_RELEASE_BINARY_DIR: ${{ github.workspace }}/packages/aethyme/rust/target/${{ matrix.target }}/release
+        run: cargo test --locked -p aethyme-testkit --test release_contract
 
       - name: Verify embedded release versions
         env:
