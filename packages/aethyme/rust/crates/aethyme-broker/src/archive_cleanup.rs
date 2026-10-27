@@ -4,6 +4,7 @@
 //! revalidated its archive, worktree generation, Git identities, and residual
 //! snapshot. This module does not authorize deletion by itself.
 
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -15,12 +16,14 @@ use crate::atomic_file::write_synced_if_absent;
 
 pub(crate) const ARCHIVE_CLEANUP_INTENT_SCHEMA_VERSION: u32 = 1;
 /// Bump this when residual path or disposable-directory interpretation changes.
-pub(crate) const ARCHIVE_CLEANUP_POLICY_VERSION: u32 = 1;
+pub(crate) const ARCHIVE_CLEANUP_POLICY_VERSION: u32 = 2;
 const MAX_INTENT_FILE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RESIDUAL_ENTRIES: usize = 50_000;
 const MAX_RESIDUAL_PATH_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RELATIVE_PATH_BYTES: usize = 4096;
 const MAX_DISPOSABLE_ROOTS: usize = 50_000;
+const MAX_RELATIVE_PATH_COMPONENTS: usize = 256;
+const MAX_TOTAL_PATH_COMPONENTS: usize = 500_000;
 const MAX_IDENTITY_STRING_BYTES: usize = 256 * 1024;
 const INTENT_DIRECTORY_RELATIVE: &str = ".aethyme/run/archive-cleanup-intents";
 
@@ -158,6 +161,7 @@ impl ArchiveCleanupIntent {
         }
 
         let mut total_path_bytes = 0usize;
+        let mut total_path_components = 0usize;
         let mut previous: Option<&str> = None;
         for entry in &self.residual_entries {
             if !contained_relative_path(&entry.path)
@@ -177,6 +181,7 @@ impl ArchiveCleanupIntent {
             if total_path_bytes > MAX_RESIDUAL_PATH_BYTES {
                 return Err("archive cleanup residual manifest exceeds its path-byte bound".into());
             }
+            add_path_components(&mut total_path_components, &entry.path)?;
             if previous.is_some_and(|prior| prior >= entry.path.as_str()) {
                 return Err("archive cleanup residual paths are not unique and sorted".into());
             }
@@ -209,28 +214,45 @@ impl ArchiveCleanupIntent {
             if total_path_bytes > MAX_RESIDUAL_PATH_BYTES {
                 return Err("archive cleanup residual manifest exceeds its path-byte bound".into());
             }
-            if self.residual_entries.iter().any(|entry| {
-                entry.path == *root
-                    || entry
-                        .path
-                        .strip_prefix(root)
-                        .is_some_and(|suffix| suffix.starts_with('/'))
-                    || (entry.kind != ArchiveCleanupResidualKind::Directory
-                        && root
-                            .strip_prefix(&entry.path)
-                            .is_some_and(|suffix| suffix.starts_with('/')))
-            }) {
+            add_path_components(&mut total_path_components, root)?;
+            previous_root = Some(root);
+        }
+
+        // Index path ancestry once instead of comparing every disposable root
+        // with every residual entry. The component-count bound above keeps
+        // both these indexes and their construction work finite before they
+        // are allocated.
+        let mut residual_path_prefixes = BTreeSet::new();
+        let mut residual_non_directory_paths = BTreeSet::new();
+        for entry in &self.residual_entries {
+            residual_path_prefixes.insert(entry.path.as_str());
+            for (index, _) in entry.path.match_indices('/') {
+                residual_path_prefixes.insert(&entry.path[..index]);
+            }
+            if entry.kind != ArchiveCleanupResidualKind::Directory {
+                residual_non_directory_paths.insert(entry.path.as_str());
+            }
+        }
+
+        let mut disposable_roots = BTreeSet::new();
+        for root in &self.disposable_ignored_directory_roots {
+            if residual_path_prefixes.contains(root.as_str()) {
                 return Err(format!(
                     "archive cleanup residual manifest overlaps disposable directory {root:?}"
                 ));
             }
-            if previous_root.is_some_and(|prior| {
-                root.strip_prefix(prior)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-            }) {
-                return Err("archive cleanup disposable roots overlap".into());
+            for (index, _) in root.match_indices('/') {
+                let ancestor = &root[..index];
+                if disposable_roots.contains(ancestor) {
+                    return Err("archive cleanup disposable roots overlap".into());
+                }
+                if residual_non_directory_paths.contains(ancestor) {
+                    return Err(format!(
+                        "archive cleanup residual manifest overlaps disposable directory {root:?}"
+                    ));
+                }
             }
-            previous_root = Some(root);
+            disposable_roots.insert(root.as_str());
         }
         Ok(())
     }
@@ -836,7 +858,12 @@ fn absolute_path(value: &str) -> bool {
 }
 
 fn contained_relative_path(value: &str) -> bool {
-    if value.is_empty() || value.starts_with('/') || value.contains('\\') || value.contains('\0') {
+    if value.is_empty()
+        || value.starts_with('/')
+        || value.contains('\\')
+        || value.contains(':')
+        || value.contains('\0')
+    {
         return false;
     }
     value
@@ -844,12 +871,27 @@ fn contained_relative_path(value: &str) -> bool {
         .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
+fn add_path_components(total: &mut usize, path: &str) -> Result<(), String> {
+    let components = path.bytes().filter(|byte| *byte == b'/').count() + 1;
+    if components > MAX_RELATIVE_PATH_COMPONENTS {
+        return Err("archive cleanup path exceeds its component-depth bound".into());
+    }
+    *total = total
+        .checked_add(components)
+        .ok_or_else(|| "archive cleanup path-component count overflows".to_owned())?;
+    if *total > MAX_TOTAL_PATH_COMPONENTS {
+        return Err("archive cleanup paths exceed their total component bound".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ARCHIVE_CLEANUP_INTENT_SCHEMA_VERSION, ARCHIVE_CLEANUP_POLICY_VERSION,
-        ArchiveCleanupIntent, ArchiveCleanupResidualEntry, ArchiveCleanupResidualKind, intent_path,
-        read_bounded, write_new,
+        ArchiveCleanupIntent, ArchiveCleanupResidualEntry, ArchiveCleanupResidualKind,
+        MAX_RELATIVE_PATH_COMPONENTS, MAX_TOTAL_PATH_COMPONENTS, intent_path, read_bounded,
+        write_new,
     };
     use std::time::{Duration, Instant};
 
@@ -953,6 +995,82 @@ mod tests {
         let mut intent = sample_intent();
         intent.residual_entries[0].path = "target/new-file".into();
         assert!(intent.validate().is_err());
+    }
+
+    #[test]
+    fn disposable_root_prefix_checks_catch_nonadjacent_overlap() {
+        let mut intent = sample_intent();
+        // `a-x` sorts between `a` and `a/x`, so comparing only adjacent roots
+        // misses that the last root is inside the first.
+        intent.disposable_ignored_directory_roots = vec!["a".into(), "a-x".into(), "a/x".into()];
+        assert!(
+            intent
+                .validate()
+                .unwrap_err()
+                .contains("disposable roots overlap")
+        );
+    }
+
+    #[test]
+    fn relative_paths_reject_drive_syntax_colons_and_excessive_depth() {
+        let mut intent = sample_intent();
+        intent.residual_entries[0].path = "C:/outside".into();
+        assert!(intent.validate().is_err());
+
+        let mut intent = sample_intent();
+        intent.disposable_ignored_directory_roots = vec!["src/name:stream".into()];
+        assert!(intent.validate().is_err());
+
+        let mut intent = sample_intent();
+        intent.residual_entries[0].path =
+            std::iter::repeat_n("x", MAX_RELATIVE_PATH_COMPONENTS + 1)
+                .collect::<Vec<_>>()
+                .join("/");
+        assert!(
+            intent
+                .validate()
+                .unwrap_err()
+                .contains("component-depth bound")
+        );
+    }
+
+    #[test]
+    fn large_disjoint_manifest_and_root_lists_validate_with_bounded_indexes() {
+        let mut intent = sample_intent();
+        const ITEM_COUNT: usize = 10_000;
+        intent.residual_entries = (0..ITEM_COUNT)
+            .map(|index| ArchiveCleanupResidualEntry {
+                path: format!("files/{index:05}"),
+                kind: ArchiveCleanupResidualKind::RegularFile,
+                device: 1,
+                inode: index as u64 + 2,
+                mode: 0o644,
+                bytes: 0,
+                sha256: Some("0".repeat(64)),
+            })
+            .collect();
+        intent.disposable_ignored_directory_roots = (0..ITEM_COUNT)
+            .map(|index| format!("ignored/{index:05}"))
+            .collect();
+        assert!(intent.validate().is_ok());
+    }
+
+    #[test]
+    fn total_path_component_bound_is_checked_before_prefix_indexing() {
+        let mut intent = sample_intent();
+        let suffix = std::iter::repeat_n("x", MAX_RELATIVE_PATH_COMPONENTS - 1)
+            .collect::<Vec<_>>()
+            .join("/");
+        intent.disposable_ignored_directory_roots = (0..=MAX_TOTAL_PATH_COMPONENTS
+            / MAX_RELATIVE_PATH_COMPONENTS)
+            .map(|index| format!("root-{index:05}/{suffix}"))
+            .collect();
+        assert!(
+            intent
+                .validate()
+                .unwrap_err()
+                .contains("total component bound")
+        );
     }
 
     #[test]
