@@ -15,9 +15,11 @@ use sha2::{Digest, Sha256};
 use crate::repository_upgrade::{
     RepositoryPathOwnership, RepositoryTreeChange, RepositoryUpgradePlan,
 };
+use crate::terminal_preview::{
+    DIFF_PREVIEW_LIMIT_BYTES, bounded_terminal_text_preview, escape_terminal_field,
+};
 
 const PLAN_SCHEMA_VERSION: u32 = 1;
-const DIFF_PREVIEW_LIMIT_BYTES: usize = 256 * 1024;
 const CHANGE_INVENTORY_OUTPUT_LIMIT_BYTES: usize = 512 * 1024;
 const CHANGE_INVENTORY_TRUNCATION_NOTICE: &str =
     "[rendered preview truncated at a complete line boundary; output byte limit reached]\n";
@@ -1512,49 +1514,6 @@ fn render_change_inventory(plan: &FirstEnrollmentPlan, migration_diff: &str) -> 
     bound_change_inventory_output(rendered)
 }
 
-fn escape_terminal_field(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        if character.is_control() {
-            escaped.extend(character.escape_debug());
-        } else {
-            escaped.push(character);
-        }
-    }
-    escaped
-}
-
-fn bounded_terminal_text_preview(text: &str, byte_limit: usize) -> (String, bool) {
-    let mut preview = String::with_capacity(byte_limit.min(text.len()));
-    let mut truncated = false;
-    for character in text.chars() {
-        if character.is_control() && !matches!(character, '\n' | '\t') {
-            let escaped: String = character.escape_debug().collect();
-            if preview.len().saturating_add(escaped.len()) > byte_limit {
-                truncated = true;
-                break;
-            }
-            preview.push_str(&escaped);
-        } else {
-            let mut buffer = [0; 4];
-            let encoded = character.encode_utf8(&mut buffer);
-            if preview.len().saturating_add(encoded.len()) > byte_limit {
-                truncated = true;
-                break;
-            }
-            preview.push_str(encoded);
-        }
-    }
-    if truncated {
-        if let Some(last_complete_line) = preview.rfind('\n') {
-            preview.truncate(last_complete_line + 1);
-        } else {
-            preview.clear();
-        }
-    }
-    (preview, truncated)
-}
-
 fn bound_change_inventory_output(rendered: String) -> String {
     let preview_limit = CHANGE_INVENTORY_OUTPUT_LIMIT_BYTES
         .saturating_sub(CHANGE_INVENTORY_TRUNCATION_NOTICE.len());
@@ -1575,8 +1534,108 @@ fn print_usage() {
 mod diff_preview_tests {
     use super::{
         CHANGE_INVENTORY_OUTPUT_LIMIT_BYTES, CHANGE_INVENTORY_TRUNCATION_NOTICE,
-        bound_change_inventory_output, bounded_terminal_text_preview, escape_terminal_field,
+        EnrollmentLocalRef, EnrollmentRemoteBase, FirstEnrollmentPlan, HookManagerKind,
+        HookManagerState, bound_change_inventory_output, bounded_terminal_text_preview,
+        escape_terminal_field, render_change_inventory,
     };
+    use crate::repository_upgrade::{
+        CommandCapability, CompatibilityDecision, CompatibilityExecution, CompatibilitySeverity,
+        InvocationSurface, RepositoryCompatibility, RepositoryMode, RepositoryPathOwnership,
+        RepositoryTreeAction, RepositoryTreeChange, RepositoryUpgradePlan,
+    };
+
+    fn renderer_test_plan(path: &str) -> FirstEnrollmentPlan {
+        let change = RepositoryTreeChange {
+            path: path.into(),
+            action: RepositoryTreeAction::Update,
+            before_sha256: Some("a".repeat(64)),
+            after_sha256: Some("b".repeat(64)),
+            file_mode: Some("100644".into()),
+            ownership: RepositoryPathOwnership::AethymeOwned,
+            requires_resolution: false,
+        };
+        let generated_tree = RepositoryUpgradePlan {
+            schema_version: 1,
+            mode: RepositoryMode::Canonical,
+            from_schema: 0,
+            to_schema: 1,
+            repository_head: "c".repeat(40),
+            existing_managed_state_digest: "d".repeat(64),
+            compatibility: CompatibilityDecision {
+                repository: RepositoryCompatibility::Current,
+                repository_schema: Some(1),
+                capability: CommandCapability::Upgrade,
+                surface: InvocationSurface::UpgradeCommand,
+                allowed: true,
+                severity: CompatibilitySeverity::Info,
+                execution: CompatibilityExecution::Normal,
+                reason: "test".into(),
+                remediation: None,
+            },
+            active_sessions: vec![],
+            dirty_paths: vec![],
+            overlapping_dirty_paths: vec![],
+            disjoint_dirty_paths: vec![],
+            relevant_leases: vec![],
+            shared_policy_or_gate_migration: false,
+            warnings: vec![],
+            migrations: vec![],
+            changes: vec![change.clone()],
+            customizations: vec![],
+            resolution_choices: vec![],
+            planned_paths: vec![path.into()],
+            examined_paths: vec![path.into()],
+            diff_sha256: "e".repeat(64),
+            applied: false,
+            safe: true,
+            blockers: vec![],
+            plan_digest: "f".repeat(64),
+            next_action: "test".into(),
+        };
+
+        FirstEnrollmentPlan {
+            schema_version: 1,
+            remote_base: EnrollmentRemoteBase {
+                remote: "origin".into(),
+                default_branch_ref: "refs/heads/main".into(),
+                exact_sha: "c".repeat(40),
+            },
+            local_default: EnrollmentLocalRef {
+                ref_name: "refs/heads/main".into(),
+                exact_sha: Some("c".repeat(40)),
+            },
+            integration: EnrollmentLocalRef {
+                ref_name: "refs/heads/aethyme/integration".into(),
+                exact_sha: None,
+            },
+            local_ahead_upstream_commits: 0,
+            local_behind_upstream_commits: 0,
+            integration_can_rebase_to_upstream: true,
+            generated_tree,
+            generated_changes: vec![change],
+            planned_paths: vec![path.into()],
+            dirty_paths: vec![],
+            overlapping_dirty_paths: vec![],
+            disjoint_dirty_paths: vec![],
+            live_session_ids: vec![],
+            nonterminal_queue_entry_ids: vec![],
+            hook_manager: HookManagerState {
+                kind: HookManagerKind::Absent,
+                configured_value_sha256: None,
+            },
+            shared_activation_present: false,
+            shared_activation_sha256: None,
+            local_exclude_before_sha256: "0".repeat(64),
+            local_exclude_after_sha256: "0".repeat(64),
+            local_exclude_update_required: false,
+            preservation_refs: vec![],
+            safe: true,
+            blockers: vec![],
+            warnings: vec![],
+            plan_digest: "f".repeat(64),
+            next_action: "test".into(),
+        }
+    }
 
     #[test]
     fn bounded_preview_keeps_utf8_complete_lines_and_reports_truncation() {
@@ -1620,6 +1679,22 @@ mod diff_preview_tests {
                 .chars()
                 .any(|character| { character.is_control() && !matches!(character, '\n' | '\t') })
         );
+    }
+
+    #[test]
+    fn enrollment_renderer_escapes_procfile_and_path_controls() {
+        let path = "Procfile\u{1b}\nname";
+        let plan = renderer_test_plan(path);
+        let diff = "diff --git a/Procfile b/Procfile\n@@ -1 +1 @@\n-echo old\n+printf '\u{1b}[31mowned\u{1b}[0m'\n";
+        let rendered = render_change_inventory(&plan, diff);
+
+        assert!(rendered.contains("Configured origin/default ref: origin/refs/heads/main"));
+        assert!(rendered.contains(r"Procfile\u{1b}\nname"));
+        assert!(rendered.contains(r"\u{1b}[31mowned\u{1b}[0m"));
+        assert!(rendered.contains("SHA-256 (raw)"));
+        assert!(!rendered.contains("Canonical source:"));
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(rendered.len() <= CHANGE_INVENTORY_OUTPUT_LIMIT_BYTES);
     }
 
     #[test]

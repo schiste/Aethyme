@@ -231,7 +231,7 @@ fn first_enrollment_diff_shows_bounded_generated_proposal_without_changing_plan_
     );
     let preview = String::from_utf8(reviewed.stdout).unwrap();
     assert!(preview.contains(&format!(
-        "Canonical source: origin/refs/heads/main @ {source_sha}"
+        "Configured origin/default ref: origin/refs/heads/main @ {source_sha}"
     )));
     assert!(preview.contains(&format!("Plan digest: {plan_digest}")));
     assert!(preview.contains("per-file generator-source mapping is unavailable"));
@@ -241,9 +241,9 @@ fn first_enrollment_diff_shows_bounded_generated_proposal_without_changing_plan_
     assert!(preview.contains("    Create AGENTS.md "));
     assert!(preview.contains("  Repository-owned policy/config outputs:"));
     assert!(preview.contains("    Create .aethyme/config.toml "));
-    assert!(preview.contains(&format!("SHA-256 {diff_digest}")));
+    assert!(preview.contains(&format!("SHA-256 (raw) {diff_digest}")));
     assert!(preview.contains("diff --git a/"));
-    if !preview.contains("[diff preview truncated:") {
+    if !preview.contains("[terminal-safe diff preview truncated") {
         let patch = preview.split_once("Migration diff:\n").unwrap().1;
         assert_eq!(
             format!("{:x}", Sha256::digest(patch.as_bytes())),
