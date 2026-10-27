@@ -1064,21 +1064,36 @@ impl BrokerStore {
             .transpose()
     }
 
-    /// The newest queue entry for one exact session head, without loading
-    /// unrelated queue history.
-    pub fn latest_merge_queue_for_session_head(
+    /// Select the latest row for one session and its row for the current HEAD
+    /// in one SQLite statement snapshot. Return at most two rows in ascending
+    /// id order so head_delivery keeps its existing reverse-search precedence.
+    pub fn latest_merge_queue_for_session_and_head(
         &self,
         session_id: i64,
         head_commit: &str,
-    ) -> Result<Option<MergeQueueEntry>, BrokerError> {
-        self.conn
-            .query_row(
-                &format!("{MERGE_SELECT} WHERE session_id = ?1 AND head_commit = ?2 ORDER BY id DESC LIMIT 1"),
-                params![session_id, head_commit],
-                merge_from_row,
-            )
-            .optional()?
-            .transpose()
+    ) -> Result<Vec<MergeQueueEntry>, BrokerError> {
+        let sql = format!(
+            "WITH latest_for_session AS (
+                 SELECT id FROM merge_queue
+                 WHERE session_id = ?1
+                 ORDER BY id DESC LIMIT 1
+             ),
+             latest_for_head AS (
+                 SELECT id FROM merge_queue
+                 WHERE session_id = ?1 AND head_commit = ?2
+                 ORDER BY id DESC LIMIT 1
+             )
+             {MERGE_SELECT}
+             WHERE id IN (
+                 SELECT id FROM latest_for_session
+                 UNION
+                 SELECT id FROM latest_for_head
+             )
+             ORDER BY id ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![session_id, head_commit], merge_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// The latest queue entry per session, for all of `session_ids` at once.
@@ -1749,17 +1764,23 @@ mod finish_history_query_tests {
             .latest_merge_queue_for_session(target.id)
             .unwrap()
             .unwrap();
-        let latest_for_old_head = store
-            .latest_merge_queue_for_session_head(target.id, "target-old-head")
-            .unwrap()
+        let old_head_and_latest = store
+            .latest_merge_queue_for_session_and_head(target.id, "target-old-head")
             .unwrap();
-        let latest_for_current_head = store
-            .latest_merge_queue_for_session_head(target.id, "target-current-head")
-            .unwrap()
+        let current_head_and_latest = store
+            .latest_merge_queue_for_session_and_head(target.id, "target-current-head")
+            .unwrap();
+        let missing_head_and_latest = store
+            .latest_merge_queue_for_session_and_head(target.id, "no-target-row")
             .unwrap();
 
         assert_eq!(latest_for_session.id, current_target_head.id);
-        assert_eq!(latest_for_old_head.id, old_target_head.id);
-        assert_eq!(latest_for_current_head.id, current_target_head.id);
+        assert_eq!(old_head_and_latest.len(), 2);
+        assert_eq!(old_head_and_latest[0].id, old_target_head.id);
+        assert_eq!(old_head_and_latest[1].id, current_target_head.id);
+        assert_eq!(current_head_and_latest.len(), 1);
+        assert_eq!(current_head_and_latest[0].id, current_target_head.id);
+        assert_eq!(missing_head_and_latest.len(), 1);
+        assert_eq!(missing_head_and_latest[0].id, current_target_head.id);
     }
 }

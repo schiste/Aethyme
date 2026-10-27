@@ -628,26 +628,13 @@ impl Broker {
         let head = checkout.head_commit()?;
         report.dirty_paths = checkout.dirty_paths()?;
 
-        let latest_for_head = if latest_for_session
-            .as_ref()
-            .is_some_and(|entry| entry.head_commit == head)
-        {
-            None
-        } else {
-            self.store
-                .latest_merge_queue_for_session_head(session_id, &head)?
-        };
-        let mut queue = Vec::with_capacity(2);
-        if let Some(entry) = latest_for_head {
-            queue.push(entry);
-        }
-        if let Some(entry) = latest_for_session.as_ref()
-            && queue
-                .last()
-                .is_none_or(|candidate| candidate.id != entry.id)
-        {
-            queue.push(entry.clone());
-        }
+        let queue = self
+            .store
+            .latest_merge_queue_for_session_and_head(session_id, &head)?;
+        let latest_for_session = queue.last();
+        report.latest_queue_entry_id = latest_for_session.map(|entry| entry.id);
+        report.latest_queue_status = latest_for_session.map(|entry| entry.status);
+        report.delivery = self.finish_delivery(latest_for_session);
         let delivery = self.head_delivery(&session, &checkout, &head, &queue)?;
         if let Some(entry) = delivery.visible_entry {
             report.latest_queue_entry_id = Some(entry.id);

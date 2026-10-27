@@ -4,7 +4,7 @@ mod isolation;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::{GateStatus, NewGateResult, events};
+use aethyme_broker::{FinishOptions, GateStatus, MergeStatus, NewGateResult, events};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -201,6 +201,56 @@ fn interrupt_finish_cleanup(tmp: &isolation::FixtureRepo, session_id: i64, workt
     git(
         tmp.path(),
         &["worktree", "unlock", worktree.to_str().unwrap()],
+    );
+}
+
+#[test]
+fn finish_does_not_decode_unrelated_merge_queue_history() {
+    let (tmp, session_id, worktree, _) = promoted_fixture();
+    let mut broker = isolation::open(tmp.path());
+    let expected_entry = broker
+        .store()
+        .latest_merge_queue_for_session(session_id)
+        .unwrap()
+        .unwrap();
+    let unrelated = broker
+        .start_worktree("unrelated merge history", None)
+        .unwrap();
+
+    let database = rusqlite::Connection::open(tmp.path().join(".aethyme/broker.db")).unwrap();
+    database
+        .execute(
+            "INSERT INTO merge_queue
+                (session_id, head_commit, base_commit, status, created_at, updated_at)
+             VALUES (?1, 'malformed-unrelated-history', 'base', 'submitted',
+                     'not-an-integer', 'not-an-integer')",
+            [unrelated.id],
+        )
+        .unwrap();
+    drop(database);
+
+    assert!(
+        broker.store().merge_queue().is_err(),
+        "the fixture must fail if finish materializes the full queue history"
+    );
+
+    let report = broker
+        .finish_with_options(
+            session_id,
+            FinishOptions {
+                keep_worktree: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(report.status, aethyme_broker::FinishStatus::Closed);
+    assert!(report.closed, "{report:#?}");
+    assert_eq!(report.latest_queue_entry_id, Some(expected_entry.id));
+    assert_eq!(report.latest_queue_status, Some(MergeStatus::Promoted));
+    assert!(report.delivery.promoted, "{report:#?}");
+    assert!(report.cleanup.kept, "{report:#?}");
+    assert!(
+        worktree.exists(),
+        "keep-worktree should preserve the fixture"
     );
 }
 
