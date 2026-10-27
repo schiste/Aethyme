@@ -926,6 +926,43 @@ mod tests {
         assert_ne!(Some(blob), repo.blob_at(&base, "a.txt"));
     }
 
+    #[test]
+    fn a_rename_representation_requires_both_the_new_path_and_source_deletion() {
+        let (tmp, repo, _) = seeded();
+        write(tmp.path(), "old.txt", "same body\n");
+        let base = commit(tmp.path(), "old path baseline");
+        git(tmp.path(), &["checkout", "-q", "-b", "session"]);
+        git(tmp.path(), &["mv", "old.txt", "new.txt"]);
+        let head = commit(tmp.path(), "rename old path to new path");
+
+        let content = session_content(&repo, &base, &head).unwrap();
+        assert_eq!(content.paths.len(), 2);
+        assert!(content.paths.get("old.txt").unwrap().is_none());
+        assert!(content.paths.get("new.txt").unwrap().is_some());
+
+        git(tmp.path(), &["checkout", "-q", "main"]);
+        write(tmp.path(), "new.txt", "same body\n");
+        let both_paths = commit(tmp.path(), "add destination while keeping source");
+
+        assert!(
+            !content_at(&repo, &content, &both_paths)
+                .unwrap()
+                .is_present()
+        );
+        assert!(content_at(&repo, &content, &head).unwrap().is_present());
+        assert!(matches!(
+            find_landing(&repo, &content, &both_paths, DEFAULT_SEARCH_CAP)
+                .unwrap()
+                .outcome,
+            LandingOutcome::NotFound { .. }
+        ));
+        assert!(
+            find_landing(&repo, &content, &head, DEFAULT_SEARCH_CAP)
+                .unwrap()
+                .represented()
+        );
+    }
+
     /// The batched read must answer exactly what the per-path read answered.
     ///
     /// `session_content` reads every changed path in one `cat-file` instead of
