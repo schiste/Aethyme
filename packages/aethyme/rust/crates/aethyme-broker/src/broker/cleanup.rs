@@ -19,6 +19,17 @@ const WORKTREE_OWNERSHIP_WITNESS_MAX_BYTES: u64 = 8 * 1024;
 const CLEANUP_TARGET_SNAPSHOT_UNAVAILABLE: &str = "the cleanup plan could not resolve primary HEAD, so session eligibility was not checked against a target bound to the plan";
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_ORPHAN_RESIDUE_ENTRIES: usize = 100_000;
+// A full retry can enumerate once for inventory and once for removal, up to
+// three times. Keep one total cap across those traversals and any refill retry.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_ORPHAN_RESIDUE_ENUMERATED_ENTRIES: usize = MAX_ORPHAN_RESIDUE_ENTRIES * 8;
+// This also bounds the temporary per-directory name vectors while the full
+// inventory and removal walks share one operation budget.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_ORPHAN_RESIDUE_ENUMERATED_NAME_BYTES: usize = 32 * 1024 * 1024;
+// Includes each retained relative map key and its duplicated leaf name.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MAX_ORPHAN_RESIDUE_SNAPSHOT_PATH_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_ORPHAN_RESIDUE_DEPTH: usize = 128;
 const MAX_ORPHAN_DISPOSABLE_PREFIXES: usize = 16_384;
@@ -505,6 +516,101 @@ struct OrphanDirectoryBinding {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+struct OrphanResidueBudget {
+    deadline: std::time::Instant,
+    enumerated_entries: usize,
+    enumerated_name_bytes: usize,
+    traversal_entries: usize,
+    snapshot_path_bytes: usize,
+    max_enumerated_entries: usize,
+    max_enumerated_name_bytes: usize,
+    max_snapshot_path_bytes: usize,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl OrphanResidueBudget {
+    fn new(deadline: std::time::Instant) -> Self {
+        Self::with_limits(
+            deadline,
+            MAX_ORPHAN_RESIDUE_ENUMERATED_ENTRIES,
+            MAX_ORPHAN_RESIDUE_ENUMERATED_NAME_BYTES,
+            MAX_ORPHAN_RESIDUE_SNAPSHOT_PATH_BYTES,
+        )
+    }
+
+    fn with_limits(
+        deadline: std::time::Instant,
+        max_enumerated_entries: usize,
+        max_enumerated_name_bytes: usize,
+        max_snapshot_path_bytes: usize,
+    ) -> Self {
+        Self {
+            deadline,
+            enumerated_entries: 0,
+            enumerated_name_bytes: 0,
+            traversal_entries: 0,
+            snapshot_path_bytes: 0,
+            max_enumerated_entries,
+            max_enumerated_name_bytes,
+            max_snapshot_path_bytes,
+        }
+    }
+
+    fn check_deadline(&self) -> Result<(), String> {
+        if std::time::Instant::now() >= self.deadline {
+            Err("orphan residue processing exceeded its time budget".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn record_name(&mut self, name_bytes: usize) -> Result<(), String> {
+        self.check_deadline()?;
+        self.traversal_entries = self.traversal_entries.saturating_add(1);
+        if self.traversal_entries > MAX_ORPHAN_RESIDUE_ENTRIES {
+            return Err(format!(
+                "orphan residue exceeds the {}-entry safety limit",
+                MAX_ORPHAN_RESIDUE_ENTRIES
+            ));
+        }
+        self.enumerated_entries = self.enumerated_entries.saturating_add(1);
+        if self.enumerated_entries > self.max_enumerated_entries {
+            return Err("orphan residue exceeds its total enumeration safety limit".into());
+        }
+        self.enumerated_name_bytes = self.enumerated_name_bytes.saturating_add(name_bytes);
+        if self.enumerated_name_bytes > self.max_enumerated_name_bytes {
+            return Err("orphan residue exceeds its total name-byte safety limit".into());
+        }
+        Ok(())
+    }
+
+    fn retain_path(&mut self, parent: &str, name: &str) -> Result<(), String> {
+        let relative_bytes = parent
+            .len()
+            .checked_add(if parent.is_empty() { 0 } else { 1 })
+            .and_then(|bytes| bytes.checked_add(name.len()))
+            .ok_or_else(|| "orphan residue path size overflow".to_string())?;
+        let retained_bytes = relative_bytes
+            .checked_add(name.len())
+            .ok_or_else(|| "orphan residue path size overflow".to_string())?;
+        self.snapshot_path_bytes = self.snapshot_path_bytes.saturating_add(retained_bytes);
+        if self.snapshot_path_bytes > self.max_snapshot_path_bytes {
+            return Err("orphan residue exceeds its retained path safety limit".into());
+        }
+        Ok(())
+    }
+
+    fn begin_inventory(&mut self) {
+        self.traversal_entries = 0;
+        self.snapshot_path_bytes = 0;
+    }
+
+    fn begin_removal_pass(&mut self) {
+        self.traversal_entries = 0;
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct OrphanDirectoryEntries(*mut libc::DIR);
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -591,15 +697,13 @@ unsafe fn errno_location() -> *mut libc::c_int {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_orphan_directory_names(
     fd: RawFd,
-    deadline: std::time::Instant,
+    budget: &mut OrphanResidueBudget,
 ) -> Result<Vec<String>, String> {
     let mut stream = OrphanDirectoryEntries::open(fd)
         .map_err(|error| format!("cannot list pinned residue directory: {error}"))?;
     let mut names = Vec::new();
     loop {
-        if std::time::Instant::now() >= deadline {
-            return Err("orphan residue inventory exceeded its time budget".into());
-        }
+        budget.check_deadline()?;
         let Some(name) = stream
             .next_name()
             .map_err(|error| format!("cannot read pinned residue directory: {error}"))?
@@ -609,17 +713,12 @@ fn read_orphan_directory_names(
         if name == "." || name == ".." {
             continue;
         }
+        budget.record_name(name.as_bytes().len())?;
         let name = name.into_string().map_err(|_| {
             "orphan residue contains a non-UTF-8 path; preserved it for inspection".to_string()
         })?;
         if name.is_empty() || name.contains('/') {
             return Err("orphan residue contains an invalid path component".into());
-        }
-        if names.len() >= MAX_ORPHAN_RESIDUE_ENTRIES {
-            return Err(format!(
-                "orphan residue exceeds the {}-entry safety limit",
-                MAX_ORPHAN_RESIDUE_ENTRIES
-            ));
         }
         names.push(name);
     }
@@ -913,13 +1012,10 @@ fn collect_orphan_residue(
     proof: &crate::events::FinishCleanupRecoveryProof,
     tracked_files: &std::collections::BTreeMap<String, crate::git::GitTreeFile>,
     tracked_directories: &std::collections::BTreeSet<String>,
-    deadline: std::time::Instant,
-    visited: &mut usize,
+    budget: &mut OrphanResidueBudget,
     entries: &mut std::collections::BTreeMap<String, OrphanResidueEntry>,
 ) -> Result<(), String> {
-    if std::time::Instant::now() >= deadline {
-        return Err("orphan residue inventory exceeded its time budget".into());
-    }
+    budget.check_deadline()?;
     let directory_metadata = directory
         .metadata()
         .map_err(|error| format!("cannot inspect pinned residue directory: {error}"))?;
@@ -932,17 +1028,10 @@ fn collect_orphan_residue(
     {
         return Err("residue directory crosses a volume or mount; preserved it".into());
     }
-    for name in read_orphan_directory_names(directory.as_raw_fd(), deadline)? {
-        if std::time::Instant::now() >= deadline {
-            return Err("orphan residue inventory exceeded its time budget".into());
-        }
-        *visited = (*visited).saturating_add(1);
-        if *visited > MAX_ORPHAN_RESIDUE_ENTRIES {
-            return Err(format!(
-                "orphan residue exceeds the {}-entry safety limit",
-                MAX_ORPHAN_RESIDUE_ENTRIES
-            ));
-        }
+    let names = read_orphan_directory_names(directory.as_raw_fd(), budget)?;
+    for name in names {
+        budget.check_deadline()?;
+        budget.retain_path(relative_directory, &name)?;
         let relative = relative_orphan_path(relative_directory, &name);
         let depth = relative.bytes().filter(|byte| *byte == b'/').count() + 1;
         if depth > MAX_ORPHAN_RESIDUE_DEPTH {
@@ -1005,8 +1094,7 @@ fn collect_orphan_residue(
                     proof,
                     tracked_files,
                     tracked_directories,
-                    deadline,
-                    visited,
+                    budget,
                     entries,
                 )?;
             }
@@ -1065,7 +1153,7 @@ fn collect_orphan_residue(
                             &name_c,
                             metadata,
                             tracked.object_id.len(),
-                            deadline,
+                            budget.deadline,
                         )?
                     };
                     if actual != tracked.object_id {
@@ -1142,15 +1230,15 @@ fn remove_orphan_directory_contents(
     bindings: &mut Vec<OrphanDirectoryBinding>,
     entries: &std::collections::BTreeMap<String, OrphanResidueEntry>,
     proof: &crate::events::FinishCleanupRecoveryProof,
-    deadline: std::time::Instant,
+    budget: &mut OrphanResidueBudget,
 ) -> Result<OrphanRemovePass, String> {
-    if std::time::Instant::now() >= deadline {
+    if budget.check_deadline().is_err() {
         return Err(
             "orphan residue removal exceeded its time budget; preserved the remainder".into(),
         );
     }
     ensure_orphan_directory_bindings(root, bindings)?;
-    let names = read_orphan_directory_names(directory.as_raw_fd(), deadline)?;
+    let names = read_orphan_directory_names(directory.as_raw_fd(), budget)?;
     for name in &names {
         let relative = relative_orphan_path(relative_directory, name);
         if !entries.contains_key(&relative) {
@@ -1160,7 +1248,7 @@ fn remove_orphan_directory_contents(
 
     for directories_first in [true, false] {
         for name in &names {
-            if std::time::Instant::now() >= deadline {
+            if budget.check_deadline().is_err() {
                 return Err(
                     "orphan residue removal exceeded its time budget; preserved the remainder"
                         .into(),
@@ -1212,7 +1300,7 @@ fn remove_orphan_directory_contents(
                     identity: (entry.device, entry.inode),
                 });
                 let outcome = remove_orphan_directory_contents(
-                    root, &child, &relative, bindings, entries, proof, deadline,
+                    root, &child, &relative, bindings, entries, proof, budget,
                 );
                 bindings.pop();
                 if outcome? == OrphanRemovePass::Retry {
@@ -1259,7 +1347,7 @@ fn remove_orphan_directory_contents(
                                 &entry.name,
                                 current,
                                 expected.len(),
-                                deadline,
+                                budget.deadline,
                             )? != expected
                             {
                                 return Err(format!(
@@ -1333,8 +1421,9 @@ fn remove_orphan_residue_pass(
     root: &PinnedOrphanRoot,
     entries: &std::collections::BTreeMap<String, OrphanResidueEntry>,
     proof: &crate::events::FinishCleanupRecoveryProof,
-    deadline: std::time::Instant,
+    budget: &mut OrphanResidueBudget,
 ) -> Result<OrphanRemovePass, String> {
+    budget.begin_removal_pass();
     root.ensure_binding()?;
     let outcome = remove_orphan_directory_contents(
         root,
@@ -1343,7 +1432,7 @@ fn remove_orphan_residue_pass(
         &mut Vec::new(),
         entries,
         proof,
-        deadline,
+        budget,
     )?;
     if outcome == OrphanRemovePass::Retry {
         return Ok(outcome);
@@ -1359,6 +1448,7 @@ fn remove_authorized_orphan_tree(
 ) -> Result<(), String> {
     validate_disposable_prefixes(&proof.disposable_ignored_root_prefixes)?;
     let deadline = std::time::Instant::now() + ORPHAN_RESIDUE_SCAN_BUDGET;
+    let mut budget = OrphanResidueBudget::new(deadline);
     let Some(root) = PinnedOrphanRoot::open(root_path, proof)? else {
         return Ok(());
     };
@@ -1382,7 +1472,7 @@ fn remove_authorized_orphan_tree(
             .collect::<std::collections::BTreeMap<_, _>>();
         let tracked_directories = worktree_tracked_directories(&tracked_files);
         let mut entries = std::collections::BTreeMap::new();
-        let mut visited = 0;
+        budget.begin_inventory();
         collect_orphan_residue(
             &root,
             &root.root,
@@ -1390,11 +1480,10 @@ fn remove_authorized_orphan_tree(
             proof,
             &tracked_files,
             &tracked_directories,
-            deadline,
-            &mut visited,
+            &mut budget,
             &mut entries,
         )?;
-        match remove_orphan_residue_pass(&root, &entries, proof, deadline)? {
+        match remove_orphan_residue_pass(&root, &entries, proof, &mut budget)? {
             OrphanRemovePass::Complete => return Ok(()),
             OrphanRemovePass::Retry if attempt < 3 => {}
             OrphanRemovePass::Retry => break,
@@ -4972,7 +5061,8 @@ mod registered_removal_failure_tests {
         let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
         let metadata = std::fs::symlink_metadata(&worktree).unwrap();
         let expected_device = metadata.dev().saturating_add(1);
-        let mut visited = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut budget = OrphanResidueBudget::new(deadline);
         let mut entries = std::collections::BTreeMap::new();
         let tracked = std::collections::BTreeMap::new();
         let tracked_directories = std::collections::BTreeSet::new();
@@ -4986,8 +5076,7 @@ mod registered_removal_failure_tests {
             &proof,
             &tracked,
             &tracked_directories,
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-            &mut visited,
+            &mut budget,
             &mut entries,
         )
         .unwrap_err();
@@ -5022,7 +5111,7 @@ mod registered_removal_failure_tests {
             .collect::<std::collections::BTreeMap<_, _>>();
         let tracked_directories = worktree_tracked_directories(&tracked);
         let mut entries = std::collections::BTreeMap::new();
-        let mut visited = 0;
+        let mut budget = OrphanResidueBudget::new(deadline);
         collect_orphan_residue(
             &root,
             &root.root,
@@ -5030,8 +5119,7 @@ mod registered_removal_failure_tests {
             &proof,
             &tracked,
             &tracked_directories,
-            deadline,
-            &mut visited,
+            &mut budget,
             &mut entries,
         )
         .unwrap();
@@ -5040,7 +5128,7 @@ mod registered_removal_failure_tests {
         std::fs::rename(worktree.join("nested"), &outside).unwrap();
         symlink(&outside, worktree.join("nested")).unwrap();
 
-        let error = remove_orphan_residue_pass(&root, &entries, &proof, deadline).unwrap_err();
+        let error = remove_orphan_residue_pass(&root, &entries, &proof, &mut budget).unwrap_err();
         assert!(error.contains("changed after verification"), "{error}");
         assert_eq!(
             std::fs::read(outside.join("tracked.txt")).unwrap(),
@@ -5069,7 +5157,7 @@ mod registered_removal_failure_tests {
             .collect::<std::collections::BTreeMap<_, _>>();
         let tracked_directories = worktree_tracked_directories(&tracked);
         let mut entries = std::collections::BTreeMap::new();
-        let mut visited = 0;
+        let mut budget = OrphanResidueBudget::new(deadline);
         collect_orphan_residue(
             &root,
             &root.root,
@@ -5077,8 +5165,7 @@ mod registered_removal_failure_tests {
             &proof,
             &tracked,
             &tracked_directories,
-            deadline,
-            &mut visited,
+            &mut budget,
             &mut entries,
         )
         .unwrap();
@@ -5086,7 +5173,7 @@ mod registered_removal_failure_tests {
         let late_path = worktree.join("added-after-inventory.txt");
         std::fs::write(&late_path, b"preserve late path").unwrap();
         assert_eq!(
-            remove_orphan_residue_pass(&root, &entries, &proof, deadline).unwrap(),
+            remove_orphan_residue_pass(&root, &entries, &proof, &mut budget).unwrap(),
             OrphanRemovePass::Retry
         );
         assert_eq!(std::fs::read(&late_path).unwrap(), b"preserve late path");
@@ -5094,16 +5181,79 @@ mod registered_removal_failure_tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn orphan_residue_inventory_enforces_its_entry_limit() {
+    fn orphan_residue_inventory_enforces_a_seeded_enumeration_limit() {
         let owner = tempfile::tempdir().unwrap();
         let repository = repository_with_ignored_cleanup_fixture(owner.path());
         let storage = crate::test_storage::TestStorage::new();
         let mut broker = storage.open(&repository).unwrap();
         let (session, worktree) =
             start_represented_cleanup_session(&mut broker, "orphan recovery inventory cap");
+        let nested = worktree.join("local-dataset/outer");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("one"), b"1").unwrap();
+        std::fs::write(nested.join("two"), b"2").unwrap();
+        std::fs::write(nested.join("three"), b"3").unwrap();
         let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
         let root = PinnedOrphanRoot::open(&worktree, &proof).unwrap().unwrap();
-        let mut visited = MAX_ORPHAN_RESIDUE_ENTRIES;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut budget = OrphanResidueBudget::with_limits(deadline, 2, 1024, 1024);
+        let mut entries = std::collections::BTreeMap::new();
+        let tracked = std::collections::BTreeMap::new();
+        let tracked_directories = std::collections::BTreeSet::new();
+        let nested_directory = open_directory_at(
+            root.root.as_raw_fd(),
+            &CString::new("local-dataset").unwrap(),
+        )
+        .unwrap();
+
+        let error = collect_orphan_residue(
+            &root,
+            &nested_directory,
+            "local-dataset",
+            &proof,
+            &tracked,
+            &tracked_directories,
+            &mut budget,
+            &mut entries,
+        )
+        .unwrap_err();
+        assert!(error.contains("total enumeration safety limit"), "{error}");
+        assert!(nested.join("one").is_file());
+
+        let mut name_budget = OrphanResidueBudget::with_limits(deadline, 10, 1, 1024);
+        let mut name_entries = std::collections::BTreeMap::new();
+        let error = collect_orphan_residue(
+            &root,
+            &nested_directory,
+            "local-dataset",
+            &proof,
+            &tracked,
+            &tracked_directories,
+            &mut name_budget,
+            &mut name_entries,
+        )
+        .unwrap_err();
+        assert!(error.contains("total name-byte safety limit"), "{error}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn orphan_residue_inventory_enforces_a_seeded_retained_path_limit() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "orphan recovery path byte cap");
+        let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        let root = PinnedOrphanRoot::open(&worktree, &proof).unwrap().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut budget = OrphanResidueBudget::with_limits(
+            deadline,
+            MAX_ORPHAN_RESIDUE_ENUMERATED_ENTRIES,
+            MAX_ORPHAN_RESIDUE_ENUMERATED_NAME_BYTES,
+            1,
+        );
         let mut entries = std::collections::BTreeMap::new();
         let tracked = std::collections::BTreeMap::new();
         let tracked_directories = std::collections::BTreeSet::new();
@@ -5115,12 +5265,11 @@ mod registered_removal_failure_tests {
             &proof,
             &tracked,
             &tracked_directories,
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-            &mut visited,
+            &mut budget,
             &mut entries,
         )
         .unwrap_err();
-        assert!(error.contains("entry safety limit"), "{error}");
+        assert!(error.contains("retained path safety limit"), "{error}");
     }
 
     #[test]
