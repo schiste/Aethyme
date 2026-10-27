@@ -668,6 +668,29 @@ impl Broker {
             .steps
             .iter()
             .any(|step| step.cache == PreparationCachePolicy::RepositoryShared);
+        // Keep the checkout shared lock from before cache-root initialization
+        // through every synchronous write, child step, record update, and
+        // existing host-resource settlement. Each dispatched child also gets
+        // its own durable marker through the process supervisor, so a child
+        // that outlives a crashed broker remains visible after this scope's
+        // lock descriptor closes.
+        let _artifact_use_scope =
+            match crate::file_lock::artifact_use::begin_artifact_use_scope(self.main_root(), &root)
+            {
+                Ok(crate::file_lock::artifact_use::ArtifactUseScopeAdmission::Admitted(scope)) => {
+                    Some(scope)
+                }
+                Ok(
+                    crate::file_lock::artifact_use::ArtifactUseScopeAdmission::ProtocolUnavailable,
+                ) => None,
+                Err(source) => {
+                    return Err(crate::BrokerError::Io {
+                        path: root.clone(),
+                        source,
+                    }
+                    .into());
+                }
+            };
         let cache_root_binding = if shared {
             let binding = match config
                 .shared_cache
@@ -4964,6 +4987,37 @@ mod tests {
 
         let sentinel = worktree.join("managed-storage-command-started");
         assert!(!sentinel.exists());
+
+        #[cfg(unix)]
+        {
+            let reservation = match crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                broker.main_root(),
+                &worktree,
+            )
+            .unwrap()
+            {
+                crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(reservation) => {
+                    reservation
+                }
+                blocked => {
+                    panic!("fresh checkout should admit the test reclaimer: {blocked:?}")
+                }
+            };
+            let error = broker
+                .prepare_session(session.id, false, Duration::ZERO)
+                .expect_err("preparation must refuse while artifact reclamation is reserved");
+            assert!(matches!(
+                error,
+                BrokerOpError::Store(crate::BrokerError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::WouldBlock
+            ));
+            assert!(
+                !sentinel.exists(),
+                "preparation must not dispatch after artifact admission refusal"
+            );
+            drop(reservation);
+        }
+
         let result = broker.prepare_session(session.id, false, Duration::ZERO);
         assert!(
             !sentinel.exists(),
@@ -4974,6 +5028,16 @@ mod tests {
             Err(BrokerOpError::Preparation(
                 PreparationError::ManagedStorageNotReady { paths: 1, steps: 1 }
             ))
+        ));
+
+        #[cfg(unix)]
+        assert!(matches!(
+            crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                broker.main_root(),
+                &worktree,
+            )
+            .unwrap(),
+            crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(_)
         ));
     }
 

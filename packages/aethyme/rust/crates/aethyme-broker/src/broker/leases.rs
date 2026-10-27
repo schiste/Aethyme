@@ -1921,7 +1921,7 @@ impl Broker {
             session_id,
             command,
             record_receipt,
-            move |session, observation, dispatch| {
+            move |session, observation, artifact_use, dispatch| {
                 let mut execution_environment = vec![
                     (
                         "AETHYME_BROKER_SESSION_ID".to_owned(),
@@ -1964,7 +1964,10 @@ impl Broker {
                                 ));
                             }
                         };
-                        let result = match supervisor.with_observation(observation).run_with_timeout_and_dispatch(
+                        let result = match supervisor
+                            .with_observation(observation)
+                            .with_artifact_use(artifact_use.take())
+                            .run_with_timeout_and_dispatch(
                             Path::new(&session.worktree_path),
                             command,
                             &execution_environment,
@@ -2157,8 +2160,9 @@ impl Broker {
             session_id,
             command,
             false,
-            move |session, _observation, _dispatch| {
+            move |session, _observation, artifact_use, _dispatch| {
                 let result = supervisor
+                    .with_artifact_use(artifact_use.take())
                     .run(
                         Path::new(&session.worktree_path),
                         command,
@@ -2192,6 +2196,7 @@ impl Broker {
         F: FnOnce(
             &crate::types::Session,
             Option<crate::store::guarded_exec::HelperObservationTarget>,
+            &mut Option<crate::file_lock::artifact_use::ArtifactUseProducer>,
             &mut dyn FnMut(GuardedExecDispatchEvent),
         ) -> Result<GuardedCommandResult, BrokerOpError>,
     {
@@ -2224,27 +2229,58 @@ impl Broker {
             .map(|id| self.store.helper_observation_target(session_id, id))
             .transpose()?
             .flatten();
+        let mut artifact_use = match crate::file_lock::artifact_use::begin_artifact_use(
+            self.main_root(),
+            checkout.root(),
+            session_id,
+            &crate::file_lock::artifact_use::invocation_id("guarded-exec", session_id),
+        ) {
+            Ok(crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer)) => {
+                Some(*producer)
+            }
+            Ok(crate::file_lock::artifact_use::ArtifactUseAdmission::ProtocolUnavailable) => None,
+            Err(source) => {
+                if let Some(receipt_id) = receipt_id.as_deref() {
+                    crate::warn_unrecorded(
+                        "mark guarded exec not started after artifact admission failure",
+                        self.store
+                            .mark_guarded_exec_not_started(session_id, receipt_id),
+                    );
+                }
+                return Err(crate::BrokerError::Io {
+                    path: checkout.root().to_path_buf(),
+                    source,
+                }
+                .into());
+            }
+        };
         let mut pending_not_started_dispatch = false;
         let mut terminal_dispatch_recorded = false;
         let run_result = {
             let mut dispatch = |event| {
+                match event {
+                    GuardedExecDispatchEvent::NotStarted => {
+                        pending_not_started_dispatch = true;
+                        return;
+                    }
+                    GuardedExecDispatchEvent::Started
+                    | GuardedExecDispatchEvent::OutcomeUnknown(_) => {
+                        pending_not_started_dispatch = false;
+                    }
+                }
                 let Some(receipt_id) = receipt_id.as_deref() else {
                     return;
                 };
                 let result = match event {
                     GuardedExecDispatchEvent::NotStarted => {
-                        pending_not_started_dispatch = true;
-                        return;
+                        unreachable!("not-started dispatch returns before receipt persistence")
                     }
                     GuardedExecDispatchEvent::Started => {
-                        pending_not_started_dispatch = false;
                         self.store.mark_guarded_exec_running(session_id, receipt_id)
                     }
-                    GuardedExecDispatchEvent::OutcomeUnknown(cleanup) => {
-                        pending_not_started_dispatch = false;
-                        self.store
-                            .mark_guarded_exec_outcome_unknown(session_id, receipt_id, cleanup)
-                    }
+                    GuardedExecDispatchEvent::OutcomeUnknown(cleanup) => self
+                        .store
+                        .mark_guarded_exec_outcome_unknown(session_id, receipt_id, cleanup),
                 };
                 match result {
                     Ok(()) => {
@@ -2258,16 +2294,25 @@ impl Broker {
                     ),
                 }
             };
-            run(&session, observation, &mut dispatch)
+            run(&session, observation, &mut artifact_use, &mut dispatch)
         };
         let status = match run_result {
             Ok(status) => status,
             Err(error) => {
+                let known_not_started =
+                    pending_not_started_dispatch && matches!(&error, BrokerOpError::Spawn { .. });
+                if known_not_started
+                    && let Some(producer) = artifact_use.as_mut()
+                    && producer.is_pre_dispatch()
+                {
+                    crate::warn_unrecorded(
+                        "clear guarded exec artifact-use marker after confirmed no-start",
+                        producer.finish_not_started(),
+                    );
+                }
                 if let Some(receipt_id) = receipt_id.as_deref()
                     && !terminal_dispatch_recorded
                 {
-                    let known_not_started = pending_not_started_dispatch
-                        && matches!(&error, BrokerOpError::Spawn { .. });
                     let result = if known_not_started {
                         self.store
                             .mark_guarded_exec_not_started(session_id, receipt_id)
@@ -3042,6 +3087,84 @@ mod generic_guarded_exec_tests {
     }
 
     #[test]
+    fn real_guarded_exec_holds_artifact_admission_until_child_settlement() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker
+            .start_worktree("artifact admission guarded exec", None)
+            .unwrap();
+        let main_root = broker.main_root().to_path_buf();
+        let checkout = PathBuf::from(&session.worktree_path);
+        let rendezvous = tempfile::tempdir().unwrap();
+        let ready = rendezvous.path().join("ready");
+        let release = rendezvous.path().join("release");
+        let saw_ready = std::sync::Arc::new(AtomicBool::new(false));
+        let was_busy = std::sync::Arc::new(AtomicBool::new(false));
+        let heartbeat_ready = std::sync::Arc::clone(&saw_ready);
+        let heartbeat_busy = std::sync::Arc::clone(&was_busy);
+        let command = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "touch \"$READY_FILE\"; i=0; while [ ! -e \"$RELEASE_FILE\" ] && [ \"$i\" -lt 1000 ]; do i=$((i + 1)); /bin/sleep 0.01; done; [ -e \"$RELEASE_FILE\" ]".into(),
+        ];
+        let environment = vec![
+            ("READY_FILE".into(), ready.to_string_lossy().into_owned()),
+            (
+                "RELEASE_FILE".into(),
+                release.to_string_lossy().into_owned(),
+            ),
+        ];
+        let report = broker
+            .guarded_exec_with_env_heartbeat_and_mode(
+                session.id,
+                &command,
+                &environment,
+                move || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !ready.exists() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let ready_seen = ready.exists();
+                    let busy = matches!(
+                        crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                            &main_root, &checkout,
+                        ),
+                        Ok(
+                            crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(
+                                crate::file_lock::artifact_use::ArtifactUseReclaimBlock::Contended
+                            )
+                        )
+                    );
+                    heartbeat_ready.store(ready_seen, Ordering::Release);
+                    heartbeat_busy.store(busy, Ordering::Release);
+                    std::fs::write(&release, b"continue").map_err(|source| {
+                        BrokerOpError::Spawn {
+                            command: "artifact admission test release signal".into(),
+                            source,
+                        }
+                    })?;
+                    Ok(())
+                },
+                || crate::inline_exec_supervisor::GenericExecMode::Supervised,
+            )
+            .unwrap();
+
+        assert!(report.command_success);
+        assert!(saw_ready.load(Ordering::Acquire));
+        assert!(was_busy.load(Ordering::Acquire));
+        assert!(matches!(
+            crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                broker.main_root(),
+                Path::new(&session.worktree_path),
+            )
+            .unwrap(),
+            crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(_)
+        ));
+    }
+
+    #[test]
     fn supervised_exec_timeout_keeps_the_post_command_ownership_audit() {
         use std::time::Duration;
 
@@ -3074,6 +3197,14 @@ mod generic_guarded_exec_tests {
             std::fs::read_to_string(Path::new(&session.worktree_path).join("tracked.txt")).unwrap(),
             "before-timeout"
         );
+        assert!(matches!(
+            crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                broker.main_root(),
+                Path::new(&session.worktree_path),
+            )
+            .unwrap(),
+            crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(_)
+        ));
     }
 
     #[test]
@@ -3087,7 +3218,7 @@ mod generic_guarded_exec_tests {
                 session.id,
                 &["/bin/sh".into(), "-c".into(), "exit 0".into()],
                 true,
-                |_session, _observation, _dispatch| {
+                |_session, _observation, _artifact_use, _dispatch| {
                     Ok(GuardedCommandResult {
                         exit_code: None,
                         succeeded: false,
@@ -3135,7 +3266,7 @@ mod generic_guarded_exec_tests {
                 session.id,
                 &["fake-command".into()],
                 true,
-                |_session, _observation, dispatch| {
+                |_session, _observation, _artifact_use, dispatch| {
                     dispatch(GuardedExecDispatchEvent::NotStarted);
                     if matches!(failure, Failure::CommandUnknownWithVerifiedCleanup) {
                         dispatch(GuardedExecDispatchEvent::OutcomeUnknown("verified"));
