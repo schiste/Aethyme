@@ -8655,7 +8655,7 @@ mod tests {
         )
         .unwrap()
         {
-            crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer) => producer,
+            crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer) => *producer,
             crate::file_lock::artifact_use::ArtifactUseAdmission::ProtocolUnavailable => {
                 panic!("Unix artifact-use admission should be available in this fixture")
             }
