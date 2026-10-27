@@ -178,7 +178,7 @@ blocked.
    to check who agreed to drive the shared change. Do not infer an elected
    owner from overlap counts or automatically take another session's files.
    Once the shared commit is available, its owner sends each dependent session
-   `aethyme broker note send --session <owner> --to-session <dependent>
+   `aethyme broker advanced note send --session <owner> --to-session <dependent>
    --message "Shared change available at <commit>; sync before continuing"`.
    Dependents inspect their notes and sync their own sessions before editing
    the shared paths. Release the named claim after the handoff is complete.

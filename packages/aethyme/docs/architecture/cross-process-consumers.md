@@ -113,6 +113,9 @@ Already running broad writers retain their parent lock until completion; future
 old-runtime opens refuse schema 2. Deploy the matched router/engine to all local
 writers when activating this protocol. Broker operation details remain additive;
 this grants no new deletion rights.
+Canonical remote identities containing the reserved Git-resource separator are
+unsupported for remote writes. Such requests refuse before creating operation
+rows; existing ledger records remain intact. Use an unambiguous remote path.
 
 Opt-in push hooks outside the remote lock run against OID-pinned source
 refspecs; the real push uses the identical pinned sources. The original local

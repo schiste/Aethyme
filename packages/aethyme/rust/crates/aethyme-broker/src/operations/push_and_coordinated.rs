@@ -1557,6 +1557,37 @@ fn deferred_post_merge_cleanup(
 }
 
 impl Broker {
+    fn describe_prepared_operation_wait(
+        &mut self,
+        operation_id: i64,
+        holder: LockHolderInfo,
+        blocked_scope: &str,
+        enqueued_at: i64,
+        waiting_started_at: i64,
+    ) -> Result<String, BrokerOpError> {
+        let mut details: serde_json::Value = serde_json::from_str(&coordination_wait_details(
+            &holder,
+            enqueued_at,
+            waiting_started_at,
+        ))
+        .expect("coordination wait details are JSON");
+        details["coordination_wait"]["blocked_scope"] = json!(blocked_scope);
+        details["coordination_wait"]["safe_next_action"] = if holder.operation_id.is_some() {
+            json!(
+                "inspect the holder operation; a local broker commit may proceed in its own session"
+            )
+        } else {
+            json!(
+                "inspect live coordination waits for the blocked scope; the holder is not identified, so do not resolve a journal row by inference"
+            )
+        };
+        details["coordination_wait"]["missing_evidence"] =
+            json!("the matching operation lock has not been released");
+        self.store()
+            .annotate_prepared_operation(operation_id, &details.to_string())?;
+        Ok(holder.description)
+    }
+
     /// Return a bounded, read-only coordination measurement snapshot. The
     /// lock policy intentionally stays unchanged until this evidence shows
     /// that repository-wide contention remains material after local hooks are
@@ -2371,6 +2402,17 @@ impl Broker {
                 (Some(_), _, OperationProvider::Github) => unreachable!("validated above"),
                 (None, None, OperationProvider::Github) => unreachable!("validated above"),
             };
+        // Canonical identities must not be confused with derived host-resource
+        // keys. Preserve existing records; reject before any new write journals.
+        if request.provider == OperationProvider::Git
+            && effect != OperationEffect::Read
+            && resolved_target.is_some()
+            && repository.contains("::git-ref/")
+        {
+            return Err(BrokerOpError::InvalidCoordinatedOperation {
+                reason: "the canonical remote identity contains a reserved coordination marker; use a remote path without that marker before retrying".into(),
+            });
+        }
         // Derived before anything queues, from the command line alone. A
         // recognized comment or review write coordinates per resource; every
         // other command stays repository-wide (#181).
@@ -2578,13 +2620,20 @@ impl Broker {
                 &common_key,
                 (queued_operation_id, Some(request.session_id)),
                 || {
-                    Ok(lock_holder_info_for_scope(
+                    let holder = lock_holder_info_for_domain(
                         self.store(),
                         &repository,
                         None,
                         resource_scope.is_some(),
+                        Some(OperationProvider::Git),
+                    );
+                    self.describe_prepared_operation_wait(
+                        queued_operation_id,
+                        holder,
+                        &common_key,
+                        enqueued_at,
+                        waiting_started_at,
                     )
-                    .description)
                 },
                 admission.remaining_queue_wait(queue_wait),
                 OPERATION_LOCK_PROGRESS_INTERVAL,
@@ -2621,7 +2670,18 @@ impl Broker {
                     &key,
                     queued_operation_id,
                     Some(request.session_id),
-                    || Ok("another writer of the exact local tracking ref".into()),
+                    || {
+                        // Aliases share this local ref; a same-remote operation
+                        // does not prove who owns its destination lock.
+                        let holder = unidentified_lock_holder();
+                        self.describe_prepared_operation_wait(
+                            queued_operation_id,
+                            holder,
+                            &key,
+                            enqueued_at,
+                            waiting_started_at,
+                        )
+                    },
                     admission.remaining_queue_wait(queue_wait),
                     |holder, elapsed| {
                         eprintln!(
@@ -2652,9 +2712,13 @@ impl Broker {
                 &repository,
                 (queued_operation_id, Some(request.session_id)),
                 || {
-                    Ok(
-                        lock_holder_info_for_scope(self.store(), &repository, None, true)
-                            .description,
+                    let holder = lock_holder_info_for_scope(self.store(), &repository, None, true);
+                    self.describe_prepared_operation_wait(
+                        queued_operation_id,
+                        holder,
+                        &repository,
+                        enqueued_at,
+                        waiting_started_at,
                     )
                 },
                 admission.remaining_queue_wait(queue_wait),
@@ -2697,20 +2761,13 @@ impl Broker {
                         resource_scope.as_deref(),
                         false,
                     );
-                    let mut details: serde_json::Value = serde_json::from_str(
-                        &coordination_wait_details(&holder, enqueued_at, waiting_started_at),
+                    self.describe_prepared_operation_wait(
+                        queued_operation_id,
+                        holder,
+                        &lock_key,
+                        enqueued_at,
+                        waiting_started_at,
                     )
-                    .expect("coordination wait details are JSON");
-                    details["coordination_wait"]["blocked_scope"] = json!(lock_key);
-                    details["coordination_wait"]["safe_next_action"] = json!(
-                        "inspect the holder operation; a local broker commit may proceed in its own session"
-                    );
-                    details["coordination_wait"]["missing_evidence"] =
-                        json!("the matching operation lock has not been released");
-                    let details = details.to_string();
-                    self.store()
-                        .annotate_prepared_operation(queued_operation_id, &details)?;
-                    Ok(holder.description)
                 },
                 admission.remaining_queue_wait(queue_wait),
                 |holder, elapsed| {
@@ -2728,16 +2785,13 @@ impl Broker {
                 }
             }
         };
-        if request.provider == OperationProvider::Git && resource_scope.is_some() {
-            if let Err(error) =
+        if request.provider == OperationProvider::Git
+            && resource_scope.is_some()
+            && let Err(error) =
                 git_scopes::validate_repository(cwd, &request.args, admission, &repository)
-            {
-                self.resolve_unstarted_operation(
-                    queued_operation_id,
-                    "resource_profile_unavailable",
-                );
-                return Err(error);
-            }
+        {
+            self.resolve_unstarted_operation(queued_operation_id, "resource_profile_unavailable");
+            return Err(error);
         }
         if effect != OperationEffect::Read {
             let unresolved = if request.provider == OperationProvider::Git {

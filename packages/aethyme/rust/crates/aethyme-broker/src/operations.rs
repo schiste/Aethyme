@@ -654,8 +654,6 @@ fn output_within_capture_limit(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn output_within_observed(
     mut command: Command,
     deadline: AdmissionDeadline,
@@ -1585,9 +1583,14 @@ fn open_repository_write_lock_file(main_root: &Path, path: &Path) -> Result<File
         })
 }
 
-/// Acquire the write lock that coordinated local Git writes use for this
-/// checkout. Reusable submit planning is allowed only when `origin` identifies
-/// the repository, so this key is the same canonical one used by those writes.
+/// Let concurrency regressions observe the actual first Git lock lane.
+#[cfg(test)]
+pub(crate) fn local_git_coordination_lock_key(cwd: &Path) -> Result<String, BrokerOpError> {
+    git_scopes::common_lock_key(cwd)
+}
+
+/// Acquire both the common-directory lane and canonical remote compatibility
+/// lane used by coordinated writers before reusing a submission plan.
 pub(crate) fn try_acquire_local_repository_write_lock(
     main_root: &Path,
     checkout: &crate::GitRepo,
@@ -1972,10 +1975,8 @@ struct LockHolderInfo {
     started_at: Option<i64>,
 }
 
-/// The holder is whichever operation on this repository is recorded as
-/// running. An operation that has not registered yet is reported as such
-/// rather than as "no holder", because the lock is demonstrably held by
-/// someone.
+/// Describe a known matching running operation, or report that the holder
+/// cannot be identified in this repository journal (for example, another alias).
 #[cfg(test)]
 fn lock_holder_info(store: &mut crate::BrokerStore, repository: &str) -> LockHolderInfo {
     lock_holder_info_for_scope(store, repository, None, false)
@@ -1987,6 +1988,16 @@ fn lock_holder_info_for_scope(
     requested_scope: Option<&str>,
     wide_only: bool,
 ) -> LockHolderInfo {
+    lock_holder_info_for_domain(store, repository, requested_scope, wide_only, None)
+}
+
+fn lock_holder_info_for_domain(
+    store: &mut crate::BrokerStore,
+    repository: &str,
+    requested_scope: Option<&str>,
+    wide_only: bool,
+    provider: Option<OperationProvider>,
+) -> LockHolderInfo {
     let now = unix_now_ms();
     let running = store
         .unresolved_coordinated_operations(repository)
@@ -1995,6 +2006,8 @@ fn lock_holder_info_for_scope(
             operations.into_iter().find(|operation| {
                 let scope = stored_resource_scope(operation);
                 operation.status == OperationStatus::Running
+                    && operation.effect != OperationEffect::Read
+                    && provider.is_none_or(|provider| operation.provider == provider)
                     && if wide_only {
                         scope.is_none()
                     } else {
@@ -2023,14 +2036,18 @@ fn lock_holder_info_for_scope(
             scope: Some(operation.scope),
             started_at: Some(operation.created_at),
         },
-        None => LockHolderInfo {
-            description: "held by an operation that has not recorded itself yet".into(),
-            operation_id: None,
-            session_id: None,
-            pid: None,
-            scope: None,
-            started_at: None,
-        },
+        None => unidentified_lock_holder(),
+    }
+}
+
+fn unidentified_lock_holder() -> LockHolderInfo {
+    LockHolderInfo {
+        description: "holder not identified in this repository's operation journal".into(),
+        operation_id: None,
+        session_id: None,
+        pid: None,
+        scope: None,
+        started_at: None,
     }
 }
 

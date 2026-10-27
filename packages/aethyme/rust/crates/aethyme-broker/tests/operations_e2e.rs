@@ -2696,3 +2696,90 @@ fn opted_in_pre_push_refuses_source_ref_moved_during_dry_run() {
         "the provider must not publish the post-hook ref value"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn ambiguous_remote_identity_refuses_wide_and_scoped_writes_before_journaling() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "reserved-identity");
+    let renamed_remote = tmp.path().join("remote::git-ref/refs/heads/main.git");
+    std::fs::create_dir_all(renamed_remote.parent().unwrap()).unwrap();
+    std::fs::rename(&fixture.remote, &renamed_remote).unwrap();
+    git(
+        &fixture.worktree,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            renamed_remote.to_str().unwrap(),
+        ],
+    );
+    let target = GitRepo::discover(&fixture.worktree)
+        .unwrap()
+        .resolve_remote_target("origin", None)
+        .unwrap();
+    assert!(target.coordination_key.contains("::git-ref/"));
+    let operations_before = fixture
+        .broker
+        .store()
+        .coordinated_operations()
+        .unwrap()
+        .len();
+    let host_database = common::fixture_host_state_dir(tmp.path()).join("host-operations.db");
+    let host_rows = || {
+        if !host_database.exists() {
+            return 0_i64;
+        }
+        rusqlite::Connection::open(&host_database)
+            .unwrap()
+            .query_row("SELECT count(*) FROM host_operations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    let host_rows_before = host_rows();
+    let wide = exact_push_request(
+        fixture.session_id,
+        &fixture.worktree,
+        &["HEAD:refs/heads/main"],
+    );
+    let mut scoped = request(
+        fixture.session_id,
+        &[
+            "fetch",
+            "--atomic",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+            "--no-write-commit-graph",
+            "--no-prune",
+            "--no-prune-tags",
+            "--refmap=",
+            "--",
+            "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+        ],
+    );
+    scoped.resolved_target = Some(target);
+    for command in [wide, scoped] {
+        let error = fixture
+            .broker
+            .run_coordinated_operation(command)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("reserved coordination marker"),
+            "{error}"
+        );
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .coordinated_operations()
+                .unwrap()
+                .len(),
+            operations_before
+        );
+        assert_eq!(host_rows(), host_rows_before);
+    }
+}

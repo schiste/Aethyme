@@ -3447,10 +3447,10 @@ mod owned_merge_history_tests {
         let session_id = plan.session_id;
         let mut writer_broker = Broker::open(&root).unwrap();
         let checkout = GitRepo::discover(&root).unwrap();
-        let repository = checkout
-            .resolve_remote_target("origin", None)
-            .unwrap()
-            .coordination_key;
+        // This writer queues at the common-directory lane before the remote
+        // compatibility lane. Observe the actual held lock, not the old lane.
+        let repository =
+            crate::operations::local_git_coordination_lock_key(checkout.root()).unwrap();
         let initial_reuse_lock =
             try_submission_plan_reuse_lock(&root, &checkout, submit_broker.store_ref())
                 .expect("the fixture has a canonical origin and no unresolved writer");

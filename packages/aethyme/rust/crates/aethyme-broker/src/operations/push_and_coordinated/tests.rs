@@ -829,6 +829,47 @@ fn a_contended_lock_names_the_operation_holding_it() {
     .unwrap();
     drop(conn);
     let mut store = crate::BrokerStore::open(&db).unwrap();
+    // Running reads and another provider do not own the Git common lane.
+    for (provider, effect) in [
+        (OperationProvider::Git, OperationEffect::Read),
+        (OperationProvider::Github, OperationEffect::Write),
+    ] {
+        let unrelated = store
+            .create_coordinated_operation(&crate::NewCoordinatedOperation {
+                session_id: 37,
+                provider,
+                repository: "owner/repo".into(),
+                scope: "unrelated".into(),
+                effect,
+                authorization_reason: Some("test unrelated running command".into()),
+                command_json: "[]".into(),
+                pid: std::process::id() as i64,
+                host_operation_id: None,
+                identity_provenance: crate::OperationIdentityProvenance::VerifiedCanonical,
+            })
+            .unwrap();
+        store
+            .transition_coordinated_operation(unrelated.id, OperationStatus::Running, None, None)
+            .unwrap();
+        if effect == OperationEffect::Read {
+            assert!(
+                lock_holder_info(&mut store, "owner/repo")
+                    .operation_id
+                    .is_none()
+            );
+        }
+        let holder = lock_holder_info_for_domain(
+            &mut store,
+            "owner/repo",
+            None,
+            false,
+            Some(OperationProvider::Git),
+        );
+        assert!(
+            holder.operation_id.is_none(),
+            "unrelated operation is not the Git lock holder"
+        );
+    }
     let created = store
         .create_coordinated_operation(&crate::NewCoordinatedOperation {
             session_id: 37,
@@ -847,7 +888,14 @@ fn a_contended_lock_names_the_operation_holding_it() {
         .transition_coordinated_operation(created.id, OperationStatus::Running, None, None)
         .unwrap();
 
-    let described = lock_holder_info(&mut store, "owner/repo").description;
+    let described = lock_holder_info_for_domain(
+        &mut store,
+        "owner/repo",
+        None,
+        false,
+        Some(OperationProvider::Git),
+    )
+    .description;
     assert!(
         described.contains(&format!("operation {}", created.id))
             && described.contains("session 37")
@@ -858,8 +906,8 @@ fn a_contended_lock_names_the_operation_holding_it() {
     // A repository with nothing running must not claim a phantom holder.
     let other = lock_holder_info(&mut store, "owner/elsewhere").description;
     assert!(
-        other.contains("has not recorded itself"),
-        "an unregistered holder must be reported as such: {other}"
+        other.contains("holder not identified"),
+        "an unidentified holder must remain unknown: {other}"
     );
 }
 
