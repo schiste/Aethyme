@@ -2816,6 +2816,7 @@ fn restore_readme(plan: &CleanupResolvePlan, has_bundle: bool) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn write_over_cap_bundle(
         _checkout: &GitRepo,
         _delivery_targets: &[String],
