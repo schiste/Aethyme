@@ -439,7 +439,10 @@ pub use pr::{
     PrDispatchReport, PrDispatchStatus, PrError, PrMarker, PrSummary,
 };
 pub(crate) use pr_overlap::PlannedPathPrOverlapCheck;
-pub use pr_overlap::{PrOverlap, PrOverlapCheck};
+pub use pr_overlap::{
+    PrOverlap, PrOverlapCheck, PrOverlapLineDetails, PrOverlapLineRange, PrOverlapPathRanges,
+    PrOverlapRangeBasis,
+};
 pub use pr_projection::{
     COMMENT_MARKER, OwnedComment, PR_PROJECTION_SCHEMA_VERSION, PrProjectionAction,
     PrProjectionError, PrProjectionFacts, PrProjectionPolicy, ProjectedReview,
