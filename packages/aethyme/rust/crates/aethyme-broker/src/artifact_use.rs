@@ -91,6 +91,8 @@ pub(crate) enum ArtifactUseReclaimBlock {
     Contended,
     /// The advisory lock was available, but durable producer markers remain.
     UnknownProducer { markers: Vec<ArtifactUseMarker> },
+    /// This target does not support the protocol; automatic cleanup must stay off.
+    ProtocolUnavailable,
 }
 
 /// Result of a bounded, nonblocking attempt to reserve a checkout for cleanup.
@@ -98,6 +100,13 @@ pub(crate) enum ArtifactUseReclaimBlock {
 pub(crate) enum ArtifactUseReclaimTry {
     Acquired(ArtifactUseReclaimer),
     Blocked(ArtifactUseReclaimBlock),
+}
+
+/// A caller may continue ordinary work without admission only when cleanup
+/// remains disabled for every checkout on this unsupported target.
+pub(crate) enum ArtifactUseAdmission {
+    Admitted(ArtifactUseProducer),
+    ProtocolUnavailable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -290,6 +299,15 @@ impl ArtifactUseProducer {
         child: &std::process::Child,
         process_group: i32,
     ) -> io::Result<()> {
+        if self.marker_removed
+            || self.marker.phase != ArtifactUsePhase::PreDispatch
+            || self.marker.process.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "artifact-use producer already dispatched or its marker was settled",
+            ));
+        }
         self.marker.phase = ArtifactUsePhase::Running;
         self.marker.process = None;
         let pid = match i32::try_from(child.id()) {
@@ -354,13 +372,24 @@ impl ArtifactUseProducer {
                 "artifact-use command child is still running",
             ));
         }
-        if !crate::gates::gate_process_group_absent(process.process_group) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "artifact-use process group is present or could not be confirmed absent",
-            ));
+        #[cfg(unix)]
+        {
+            if !crate::gates::gate_process_group_absent(process.process_group) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "artifact-use process group is present or could not be confirmed absent",
+                ));
+            }
+            self.remove_marker()
         }
-        self.remove_marker()
+        #[cfg(not(unix))]
+        {
+            let _ = process.process_group;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "artifact-use process settlement is unavailable on this platform",
+            ))
+        }
     }
 
     fn persist_marker(&mut self) -> io::Result<()> {
@@ -407,17 +436,25 @@ pub(crate) struct ArtifactUseReclaimer {
 /// Begin a protocol-aware producer lifetime for one canonical checkout.
 /// Session IDs are evidence in the marker, not part of the lock key: distinct
 /// broker sessions that name the same checkout contend on the same inode.
+///
+/// On non-Unix targets, `ProtocolUnavailable` is a permanent target-level
+/// lane: callers may continue ordinary work only while every reclaimer remains
+/// blocked. On Unix, an error means admission failed and the caller must not
+/// dispatch the managed command.
 pub(crate) fn begin_artifact_use(
     primary_root: &Path,
     checkout_root: &Path,
     session_id: i64,
     invocation_id: &str,
-) -> io::Result<ArtifactUseProducer> {
+) -> io::Result<ArtifactUseAdmission> {
     if session_id <= 0 || invocation_id.is_empty() || invocation_id.len() > 256 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "artifact-use admission requires a positive session ID and a bounded invocation ID",
         ));
+    }
+    if !cfg!(unix) {
+        return Ok(ArtifactUseAdmission::ProtocolUnavailable);
     }
     let locations = ArtifactUseLocations::resolve(primary_root, checkout_root)?;
     if !locations.initialize_layout(ARTIFACT_LAYOUT_LOCK_WAIT)? {
@@ -479,23 +516,29 @@ pub(crate) fn begin_artifact_use(
             )),
         };
     }
-    Ok(ArtifactUseProducer {
+    Ok(ArtifactUseAdmission::Admitted(ArtifactUseProducer {
         _lock: lock,
         marker_file,
         marker_path,
         marker,
         marker_removed: false,
         locations,
-    })
+    }))
 }
 
 /// Make a bounded, nonblocking exclusive attempt for a future reclaimer. Any
 /// marker, malformed entry, cap overflow, or I/O error must retain the
-/// checkout; this function never deletes or repairs markers.
+/// checkout; this function never deletes or repairs markers. Non-Unix
+/// targets return `ProtocolUnavailable` permanently, regardless of inventory.
 pub(crate) fn try_artifact_use_reclaimer(
     primary_root: &Path,
     checkout_root: &Path,
 ) -> io::Result<ArtifactUseReclaimTry> {
+    if !cfg!(unix) {
+        return Ok(ArtifactUseReclaimTry::Blocked(
+            ArtifactUseReclaimBlock::ProtocolUnavailable,
+        ));
+    }
     let locations = ArtifactUseLocations::resolve(primary_root, checkout_root)?;
     if !locations.initialize_layout(Duration::ZERO)? {
         return Ok(ArtifactUseReclaimTry::Blocked(
@@ -671,7 +714,18 @@ fn remove_new_marker(path: &Path, file: &File, marker_dir: &Path) -> io::Result<
 }
 
 fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "artifact-use admission requires durable directory sync",
+        ))
+    }
 }
 
 fn path_exists(path: &Path) -> io::Result<bool> {
@@ -825,7 +879,7 @@ fn process_start_token(pid: i32) -> io::Result<(Option<u64>, &'static str)> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::process::{Command, Stdio};
@@ -842,7 +896,12 @@ mod tests {
         session: i64,
         invocation: &str,
     ) -> ArtifactUseProducer {
-        begin_artifact_use(primary, checkout, session, invocation).unwrap()
+        match begin_artifact_use(primary, checkout, session, invocation).unwrap() {
+            ArtifactUseAdmission::Admitted(producer) => producer,
+            ArtifactUseAdmission::ProtocolUnavailable => {
+                panic!("Unix test filesystem should support directory sync")
+            }
+        }
     }
 
     fn marker(locations: &ArtifactUseLocations, nonce: String) -> ArtifactUseMarker {
@@ -907,13 +966,12 @@ mod tests {
                 let barrier = std::sync::Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    let mut producer = begin_artifact_use(
+                    let mut producer = begin(
                         &primary_root,
                         &checkout_root,
                         session_id,
                         &format!("test:{session_id}:layout-race"),
-                    )
-                    .unwrap();
+                    );
                     producer.finish_not_started().unwrap();
                 })
             })
@@ -934,12 +992,85 @@ mod tests {
                 panic!("empty checkout should reserve after complete inventory: {blocked:?}")
             }
         };
-        let error = begin(primary.path(), &checkout, 23, "test:23:contended").unwrap_err();
+        let error = begin_artifact_use(primary.path(), &checkout, 23, "test:23:contended")
+            .err()
+            .unwrap();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         drop(reservation);
 
         let mut producer = begin(primary.path(), &checkout, 24, "test:24:resumed");
         producer.finish_not_started().unwrap();
+    }
+
+    #[test]
+    fn process_binding_is_single_use_and_settlement_is_terminal() {
+        use std::os::unix::process::CommandExt;
+
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = checkout(primary.path(), "checkout");
+        let mut producer = begin(primary.path(), &checkout, 25, "test:25:single-dispatch");
+
+        let mut first_command = Command::new("/bin/cat");
+        first_command
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let first_child = first_command.spawn().unwrap();
+        let first_group = i32::try_from(first_child.id()).unwrap();
+        let mut first = TestProcessGroupChild::new(first_child, first_group);
+        assert!(first.child.try_wait().unwrap().is_none());
+
+        producer
+            .mark_process_started(&first.child, first_group)
+            .unwrap();
+        let original_bytes = fs::read(&producer.marker_path).unwrap();
+        let original_process = producer.marker.process.clone().unwrap();
+
+        assert!(
+            producer
+                .mark_process_started(&first.child, first_group)
+                .is_err()
+        );
+        assert_eq!(fs::read(&producer.marker_path).unwrap(), original_bytes);
+
+        let mut second_command = Command::new("/bin/cat");
+        second_command
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let second_child = second_command.spawn().unwrap();
+        let second_group = i32::try_from(second_child.id()).unwrap();
+        let mut second = TestProcessGroupChild::new(second_child, second_group);
+        assert!(second.child.try_wait().unwrap().is_none());
+        assert!(
+            producer
+                .mark_process_started(&second.child, second_group)
+                .is_err()
+        );
+        assert_eq!(fs::read(&producer.marker_path).unwrap(), original_bytes);
+        assert_eq!(producer.marker.process.as_ref(), Some(&original_process));
+
+        assert!(!second.kill_leader().unwrap().success());
+        assert!(!first.kill_leader().unwrap().success());
+        producer
+            .finish_verified_quiescence(&mut first.child)
+            .unwrap();
+        assert!(!producer.marker_path.exists());
+
+        assert!(
+            producer
+                .mark_process_started(&first.child, first_group)
+                .is_err()
+        );
+        assert!(
+            producer
+                .finish_verified_quiescence(&mut first.child)
+                .is_err()
+        );
+        assert!(producer.finish_not_started().is_err());
+        assert!(!producer.marker_path.exists());
     }
 
     #[cfg(unix)]
@@ -1197,8 +1328,7 @@ mod tests {
                 PathBuf::from(std::env::var_os("AETHYME_ARTIFACT_USE_TEST_PRIMARY").unwrap());
             let checkout =
                 PathBuf::from(std::env::var_os("AETHYME_ARTIFACT_USE_TEST_CHECKOUT").unwrap());
-            let mut producer =
-                begin_artifact_use(&primary, &checkout, 15, "test:15:process-death").unwrap();
+            let mut producer = begin(&primary, &checkout, 15, "test:15:process-death");
             let mut command = Command::new("/bin/sleep");
             command.arg("30");
             let command_child = command.spawn().unwrap();
@@ -1252,6 +1382,7 @@ mod tests {
         assert_eq!(markers[0].phase, ArtifactUsePhase::Running);
         let process = markers[0].process.as_ref().unwrap();
         assert_ne!(process.pid as u32, std::process::id());
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         assert!(process.start_time.is_some());
         assert_eq!(process, &child_member);
         assert_eq!(
@@ -1342,5 +1473,26 @@ mod tests {
             ProcessStartIdentity::capture(std::process::id() as i32, process_group).unwrap();
         assert!(identity.start_time.is_some());
         assert!(!identity.start_time_clock.is_empty());
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+mod unsupported_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_platform_keeps_admission_and_cleanup_disabled() {
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = primary.path().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+
+        assert!(matches!(
+            begin_artifact_use(primary.path(), &checkout, 31, "test:31:unsupported").unwrap(),
+            ArtifactUseAdmission::ProtocolUnavailable
+        ));
+        assert!(matches!(
+            try_artifact_use_reclaimer(primary.path(), &checkout).unwrap(),
+            ArtifactUseReclaimTry::Blocked(ArtifactUseReclaimBlock::ProtocolUnavailable)
+        ));
     }
 }

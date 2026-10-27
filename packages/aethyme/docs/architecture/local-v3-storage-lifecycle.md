@@ -148,7 +148,14 @@ This source foundation is not yet wired into managed preparation, gates, or
 guarded execution; no cleanup path consumes it and it grants no deletion
 authority. A dropped producer guard leaves its marker for conservative review.
 Clients predating this protocol do not honor these locks and remain unknown.
-B2 must establish compatibility with those clients before cleanup can treat
+The admission protocol currently supports Unix targets with directory sync;
+non-Unix targets return `ProtocolUnavailable` and their reclaimer remains
+blocked regardless of inventory, keeping automatic artifact cleanup disabled.
+Unix filesystem sync errors fail admission and leave cleanup unknown; callers
+must not dispatch after an admission error. Process start tokens are currently
+available on macOS and Linux;
+markers without a token remain unknown after supervisor death. B2 must establish
+compatibility with older and unavailable clients before cleanup can treat
 artifact-use admission as deletion evidence.
 
 The opt-in `managed_storage` profile currently describes intended preparation
