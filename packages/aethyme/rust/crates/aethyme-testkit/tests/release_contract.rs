@@ -462,7 +462,7 @@ fn release_workflow_uses_ephemeral_checkouts_and_source_sha_contract() {
         );
     }
 
-    let contract_step = workflow_step_block(workflow, "Verify release version contract");
+    let contract_step = workflow_step_block(&workflow, "Verify release version contract");
     assert!(contract_step.contains("if: matrix.target != 'x86_64-unknown-linux-gnu'"));
     assert!(contract_step.contains("AETHYME_RELEASE_TAG: ${{ github.ref_name }}"));
     assert!(contract_step.contains("AETHYME_RELEASE_COMMIT: ${{ github.sha }}"));
@@ -470,7 +470,7 @@ fn release_workflow_uses_ephemeral_checkouts_and_source_sha_contract() {
         "AETHYME_RELEASE_BINARY_DIR: ${{ github.workspace }}/packages/aethyme/rust/target/${{ matrix.target }}/release"
     ));
 
-    let helper_contract_step = workflow_step_block(workflow, "Verify release helper contract");
+    let helper_contract_step = workflow_step_block(&workflow, "Verify release helper contract");
     assert!(helper_contract_step.contains("if: matrix.target == 'x86_64-unknown-linux-gnu'"));
     assert!(helper_contract_step.contains("AETHYME_RELEASE_TAG: ${{ github.ref_name }}"));
     assert!(helper_contract_step.contains("AETHYME_RELEASE_COMMIT: ${{ github.sha }}"));
@@ -481,7 +481,7 @@ fn release_workflow_uses_ephemeral_checkouts_and_source_sha_contract() {
         "AETHYME_RELEASE_HELPER_BINARY_DIR: ${{ github.workspace }}/packages/aethyme/rust/target/${{ matrix.target }}/release/examples"
     ));
     assert!(
-        workflow_step_block(workflow, "Build release manifest helpers")
+        workflow_step_block(&workflow, "Build release manifest helpers")
             .contains("if: matrix.target == 'x86_64-unknown-linux-gnu'")
     );
 
@@ -510,9 +510,9 @@ fn release_workflow_renders_the_homebrew_formula_from_the_manifest() {
         aethyme_testkit::paths::repo_root().join(".github/workflows/release.yml"),
     )
     .unwrap();
-    let helper_build = workflow_step_script(workflow, "Build release manifest helpers");
+    let helper_build = workflow_step_script(&workflow, "Build release manifest helpers");
     assert!(
-        workflow_step_block(workflow, "Build release manifest helpers")
+        workflow_step_block(&workflow, "Build release manifest helpers")
             .contains("if: matrix.target == 'x86_64-unknown-linux-gnu'")
     );
     assert!(
@@ -524,12 +524,12 @@ fn release_workflow_renders_the_homebrew_formula_from_the_manifest() {
     );
     assert!(helper_build.contains("sha256sum release_manifest homebrew_formula > SHA256SUMS"));
 
-    let download_products = workflow_step_script(workflow, "Download artifacts");
+    let download_products = workflow_step_script(&workflow, "Download artifacts");
     assert!(download_products.contains("--pattern 'aethyme-*' --dir dist"));
     assert!(download_products.contains("test \"$tar_count\" = \"5\""));
     assert!(download_products.contains("test \"$windows_count\" = \"1\""));
 
-    let download_helpers = workflow_step_script(workflow, "Download release helper artifact");
+    let download_helpers = workflow_step_script(&workflow, "Download release helper artifact");
     assert!(download_helpers.contains("--name \"release-helpers-${GITHUB_SHA}\""));
     assert!(download_helpers.contains("--dir \"$helper_artifact_dir\""));
     assert!(download_helpers.contains("test \"$helper_source_sha\" = \"$GITHUB_SHA\""));
@@ -537,7 +537,7 @@ fn release_workflow_renders_the_homebrew_formula_from_the_manifest() {
     assert!(download_helpers.contains("test ! -e dist/release_manifest"));
     assert!(download_helpers.contains("test ! -e dist/homebrew_formula"));
 
-    let upload_helpers = workflow_step_block(workflow, "Upload release helper artifact");
+    let upload_helpers = workflow_step_block(&workflow, "Upload release helper artifact");
     assert!(upload_helpers.contains("if: matrix.target == 'x86_64-unknown-linux-gnu'"));
     assert!(upload_helpers.contains("name: release-helpers-${{ github.sha }}"));
     assert!(upload_helpers.contains(
@@ -545,7 +545,7 @@ fn release_workflow_renders_the_homebrew_formula_from_the_manifest() {
     ));
     assert!(!upload_helpers.contains("name: aethyme-release-helpers-"));
 
-    let build_manifest = workflow_step_script(workflow, "Build release manifest and checksums");
+    let build_manifest = workflow_step_script(&workflow, "Build release manifest and checksums");
     let manifest_position = build_manifest
         .find("\"$AETHYME_RELEASE_HELPER_DIR/release_manifest\"")
         .unwrap();
