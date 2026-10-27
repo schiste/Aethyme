@@ -3940,15 +3940,20 @@ impl Broker {
         force: bool,
         archive_guard: Option<(&str, &Path)>,
     ) -> Result<(), BrokerOpError> {
+        let status_limits = CleanupStatusLimits::new(
+            self.landing_deadline.get(),
+            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+        );
+        // No cleanup path consumes archive intents yet. Even an otherwise
+        // verified archive guard must retain the checkout until a matching,
+        // fully validated resume path is wired.
+        self.refuse_pending_archive_cleanup_intent(session, status_limits.deadline)?;
         self.cleanup_under_lifecycle_claim_with_status_limits(
             session,
             force,
             archive_guard,
-            CleanupStatusLimits::new(
-                self.landing_deadline.get(),
-                crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
-                crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
-            ),
+            status_limits,
         )
     }
 
@@ -4085,6 +4090,63 @@ impl Broker {
         self.store
             .set_session_status(session_id, SessionStatus::Cleaned, None)?;
         Ok(())
+    }
+
+    /// A durable archive-removal intent must be consumed by its matching
+    /// archive recovery path. Ordinary cleanup, including forced cleanup, may
+    /// not bypass an unreadable or unresolved intent.
+    fn refuse_pending_archive_cleanup_intent(
+        &self,
+        session: &Session,
+        deadline: std::time::Instant,
+    ) -> Result<(), BrokerOpError> {
+        let intent = crate::archive_cleanup::read_pending_for_session(
+            self.main_root(),
+            session.id,
+            deadline,
+        )
+        .map_err(|reason| BrokerOpError::DirtyWorktree {
+            id: session.id,
+            reason: format!(
+                "archive cleanup state could not be verified; preserved the checkout for inspection: {reason}"
+            ),
+        })?;
+        let Some(intent) = intent else {
+            return Ok(());
+        };
+
+        let current_root = self.main_root().canonicalize().map_err(|error| {
+            BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason: format!(
+                    "archive cleanup intent repository identity could not be verified; preserved the checkout: {error}"
+                ),
+            }
+        })?;
+        let common_dir = self.main_git_common_dir().map_err(|error| {
+            BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason: format!(
+                    "archive cleanup intent repository identity could not be verified; preserved the checkout: {error}"
+                ),
+            }
+        })?;
+        let repository_key = crate::host_state::repository_key(&current_root, Some(&common_dir));
+        let current_root = current_root.to_string_lossy().into_owned();
+        if intent.repository_root != current_root
+            || intent.repository_key != repository_key
+            || intent.worktree_path != session.worktree_path
+            || intent.branch_ref != format!("refs/heads/{}", session.branch)
+        {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session.id,
+                reason: "a pending archive cleanup intent does not match this session; preserved the checkout and archive for inspection".into(),
+            });
+        }
+        Err(BrokerOpError::DirtyWorktree {
+            id: session.id,
+            reason: "a durable archive cleanup intent is pending; preserved the checkout and archive for verified recovery".into(),
+        })
     }
 
     /// Refuse to remove a checkout any other live session works in.
@@ -4507,6 +4569,60 @@ mod registered_removal_failure_tests {
         (session, worktree)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn create_pending_archive_cleanup_intent(
+        broker: &crate::Broker,
+        session: &crate::Session,
+        worktree: &Path,
+    ) -> std::path::PathBuf {
+        let branch_ref = format!("refs/heads/{}", session.branch);
+        let checkout = crate::git::GitRepo::discover(worktree).unwrap();
+        let proof = checkout
+            .finish_cleanup_recovery_proof(&branch_ref)
+            .expect("spawned checkout has a root generation witness");
+        let main_root = broker.main_root().canonicalize().unwrap();
+        let common_dir = broker.main_git_common_dir().unwrap();
+        let intent = crate::archive_cleanup::ArchiveCleanupIntent {
+            schema_version: crate::archive_cleanup::ARCHIVE_CLEANUP_INTENT_SCHEMA_VERSION,
+            policy_version: crate::archive_cleanup::ARCHIVE_CLEANUP_POLICY_VERSION,
+            session_id: session.id,
+            repository_key: crate::host_state::repository_key(&main_root, Some(&common_dir)),
+            repository_root: main_root.to_string_lossy().into_owned(),
+            worktree_path: proof.worktree_path,
+            branch_ref: proof.branch_ref,
+            branch_tip: proof.branch_tip,
+            head: proof.head,
+            plan_digest: "a".repeat(64),
+            archive_path: main_root
+                .join("recovery-archives")
+                .join(format!("{}-archive", session.id))
+                .to_string_lossy()
+                .into_owned(),
+            archive_manifest_sha256: "b".repeat(64),
+            ignored_policy_sha256: "c".repeat(64),
+            root_generation_sha256: proof.root_generation_sha256.unwrap(),
+            worktree_device: proof.worktree_device,
+            worktree_inode: proof.worktree_inode,
+            git_pointer_device: proof.git_pointer_device,
+            git_pointer_inode: proof.git_pointer_inode,
+            git_admin_path: proof.git_admin_path,
+            git_admin_device: proof.git_admin_device,
+            git_admin_inode: proof.git_admin_inode,
+            git_common_path: proof.git_common_path,
+            git_common_device: proof.git_common_device,
+            git_common_inode: proof.git_common_inode,
+            mount_identity_sha256: "d".repeat(64),
+            disposable_ignored_directory_roots: Vec::new(),
+            residual_entries: Vec::new(),
+        };
+        let directory = crate::archive_cleanup::intent_directory(&main_root);
+        std::fs::create_dir_all(&directory).unwrap();
+        crate::host_state::protect_host_state_path(&directory, true).unwrap();
+        let path = crate::archive_cleanup::intent_path(&directory, session.id).unwrap();
+        crate::archive_cleanup::write_new(&path, &intent).unwrap();
+        path
+    }
+
     fn persist_finish_cleanup_intent(
         broker: &mut crate::Broker,
         session: &crate::Session,
@@ -4608,6 +4724,127 @@ mod registered_removal_failure_tests {
         );
         assert_eq!(std::fs::read(first).unwrap(), b"keep one\n");
         assert_eq!(std::fs::read(second).unwrap(), b"keep two\n");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unresolved_archive_intent_blocks_even_forced_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = repository_with_ignored_cleanup_fixture(tmp.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "archive intent pending cleanup");
+        broker.close(session.id).unwrap();
+        let intent_path = create_pending_archive_cleanup_intent(&broker, &session, &worktree);
+        assert!(
+            intent_path.starts_with(broker.main_root()),
+            "intent must live under the authoritative broker repository root"
+        );
+        assert!(
+            !intent_path.starts_with(&worktree),
+            "intent must survive removal of the candidate worktree"
+        );
+        let archive_path = broker
+            .main_root()
+            .join("recovery-archives")
+            .join(format!("{}-archive", session.id));
+        assert!(
+            !intent_path.starts_with(&archive_path),
+            "intent must remain outside the immutable archive"
+        );
+        let branch_before = broker.repo.resolve_ref(&session.branch).unwrap();
+
+        let error = broker.cleanup(session.id, true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("durable archive cleanup intent is pending"),
+            "forced cleanup must report the pending intent and retain the candidate: {error}"
+        );
+        assert!(
+            worktree.is_dir(),
+            "pending intent cleanup removed the worktree"
+        );
+        assert_eq!(
+            broker.repo.resolve_ref(&session.branch),
+            Some(branch_before),
+            "pending intent cleanup removed the branch"
+        );
+        assert_eq!(
+            broker.store().session(session.id).unwrap().cleanup_state,
+            SessionCleanupState::Closed
+        );
+        assert!(
+            intent_path.is_file(),
+            "pending intent was consumed by ordinary cleanup"
+        );
+
+        let archive_error = broker
+            .cleanup_after_recovery_archive(session.id, &"d".repeat(64), &archive_path)
+            .unwrap_err();
+        assert!(
+            archive_error
+                .to_string()
+                .contains("durable archive cleanup intent is pending"),
+            "archive-guarded cleanup must not bypass an unresolved intent: {archive_error}"
+        );
+        assert!(worktree.is_dir());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unreadable_archive_intents_retain_the_candidate() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = repository_with_ignored_cleanup_fixture(tmp.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "invalid archive intent cleanup");
+        broker.close(session.id).unwrap();
+        let path = create_pending_archive_cleanup_intent(&broker, &session, &worktree);
+        let mut unsupported =
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap();
+        unsupported["schema_version"] = serde_json::json!(999);
+
+        for invalid in [
+            b"not json".to_vec(),
+            serde_json::to_vec(&unsupported).unwrap(),
+            vec![b'x'; 32 * 1024 * 1024 + 1],
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            crate::host_state::protect_host_state_path(&path, false).unwrap();
+            let error = broker.cleanup(session.id, true).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("archive cleanup state could not be verified"),
+                "invalid intent did not fail closed: {error}"
+            );
+            assert!(
+                worktree.is_dir(),
+                "invalid intent cleanup removed the worktree"
+            );
+        }
+
+        std::fs::remove_file(&path).unwrap();
+        let target = tmp.path().join("operator-choice.json");
+        std::fs::write(&target, b"operator bytes").unwrap();
+        symlink(&target, &path).unwrap();
+        let error = broker.cleanup(session.id, true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("archive cleanup state could not be verified"),
+            "symlink intent did not fail closed: {error}"
+        );
+        assert!(
+            worktree.is_dir(),
+            "symlink intent cleanup removed the worktree"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"operator bytes");
     }
 
     #[test]

@@ -22,6 +22,7 @@ const MAX_RESIDUAL_PATH_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RELATIVE_PATH_BYTES: usize = 4096;
 const MAX_DISPOSABLE_ROOTS: usize = 50_000;
 const MAX_IDENTITY_STRING_BYTES: usize = 256 * 1024;
+const INTENT_DIRECTORY_RELATIVE: &str = ".aethyme/run/archive-cleanup-intents";
 
 /// Immutable bindings captured before any archived worktree removal starts.
 ///
@@ -260,6 +261,402 @@ pub(crate) fn intent_path(directory: &Path, session_id: i64) -> Result<PathBuf, 
         return Err("archive cleanup intent session id must be positive".into());
     }
     Ok(directory.join(format!("{session_id}.json")))
+}
+
+/// The intent directory is rooted at the broker's primary repository, not a
+/// candidate worktree or the archive. That keeps the record available after a
+/// partial worktree removal and outside the archive's frozen file set.
+pub(crate) fn intent_directory(main_root: &Path) -> PathBuf {
+    main_root.join(INTENT_DIRECTORY_RELATIVE)
+}
+
+/// Read one session's pending intent from the authoritative repository root.
+/// Missing state is the only empty result; malformed or uninspectable state
+/// must retain the candidate.
+pub(crate) fn read_pending_for_session(
+    main_root: &Path,
+    session_id: i64,
+    deadline: Instant,
+) -> Result<Option<ArchiveCleanupIntent>, String> {
+    if session_id <= 0 {
+        return Err("archive cleanup intent session id must be positive".into());
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        read_pending_for_session_unix(main_root, session_id, deadline)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        read_pending_for_session_other(main_root, session_id, deadline)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct IntentDirectoryBinding {
+    parent_fd: std::os::fd::RawFd,
+    name: std::ffi::CString,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct PinnedIntentDirectory {
+    // Each descriptor is kept alive because the bindings below refer to it.
+    _directories: Vec<std::fs::File>,
+    bindings: Vec<IntentDirectoryBinding>,
+    directory_fd: std::os::fd::RawFd,
+    identity: (u64, u64),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_pending_for_session_unix(
+    main_root: &Path,
+    session_id: i64,
+    deadline: Instant,
+) -> Result<Option<ArchiveCleanupIntent>, String> {
+    use std::os::fd::FromRawFd;
+
+    let Some(directory) = open_intent_directory(main_root, deadline)? else {
+        return Ok(None);
+    };
+    let file_path = intent_path(&intent_directory(main_root), session_id)?;
+    let file_name = file_path
+        .file_name()
+        .ok_or_else(|| "archive cleanup intent has no file name".to_owned())?;
+    use std::os::unix::ffi::OsStrExt;
+    let file_name = std::ffi::CString::new(file_name.as_bytes())
+        .map_err(|_| "archive cleanup intent file name contains NUL".to_owned())?;
+
+    check_deadline(deadline)?;
+    let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    // SAFETY: the directory descriptor is pinned and the file name is one
+    // NUL-terminated component. O_NOFOLLOW prevents opening a symlink leaf.
+    let fd = unsafe { libc::openat(directory.directory_fd, file_name.as_ptr(), flags) };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            directory.ensure_binding()?;
+            return Ok(None);
+        }
+        return Err(format!(
+            "cannot safely open archive cleanup intent: {error}"
+        ));
+    }
+    // SAFETY: `openat` returned a new owned descriptor.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let opened_metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect opened archive cleanup intent: {error}"))?;
+    verify_intent_file_metadata(&opened_metadata)?;
+    if opened_metadata.len() > MAX_INTENT_FILE_BYTES {
+        return Err("archive cleanup intent exceeds its read byte bound".into());
+    }
+    directory.ensure_binding()?;
+
+    let capacity = usize::try_from(opened_metadata.len())
+        .map_err(|_| "archive cleanup intent size does not fit memory bounds".to_owned())?;
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        check_deadline(deadline)?;
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot read archive cleanup intent: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(count) > MAX_INTENT_FILE_BYTES as usize {
+            return Err("archive cleanup intent grew beyond its read byte bound".into());
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    check_deadline(deadline)?;
+    let after_read = file
+        .metadata()
+        .map_err(|error| format!("cannot recheck opened archive cleanup intent: {error}"))?;
+    verify_intent_file_metadata(&after_read)?;
+    if !same_file_snapshot(&opened_metadata, &after_read)
+        || bytes.len() != capacity
+        || !named_intent_matches(directory.directory_fd, &file_name, &after_read)?
+    {
+        return Err("archive cleanup intent changed while it was read".into());
+    }
+    directory.ensure_binding()?;
+    let intent = ArchiveCleanupIntent::decode(&bytes)?;
+    if intent.session_id != session_id {
+        return Err("archive cleanup intent session identity does not match its file".into());
+    }
+    check_deadline(deadline)?;
+    Ok(Some(intent))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_intent_directory(
+    main_root: &Path,
+    deadline: Instant,
+) -> Result<Option<PinnedIntentDirectory>, String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+
+    check_deadline(deadline)?;
+    let canonical_root = fs::canonicalize(main_root)
+        .map_err(|error| format!("cannot resolve broker repository root: {error}"))?;
+    if !canonical_root.is_absolute() {
+        return Err("broker repository root is not absolute".into());
+    }
+    let root_name = std::ffi::CString::new("/").expect("static root path has no NUL");
+    let root_flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+    // SAFETY: `root_name` is NUL-terminated and the returned descriptor is
+    // immediately owned below.
+    let root_fd = unsafe { libc::open(root_name.as_ptr(), root_flags) };
+    if root_fd < 0 {
+        return Err(format!(
+            "cannot safely open filesystem root for archive cleanup state: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `open` returned a new owned descriptor.
+    let mut directories = vec![unsafe { std::fs::File::from_raw_fd(root_fd) }];
+    let mut bindings = Vec::new();
+    for path_component in canonical_root.components() {
+        let component = match path_component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(component) => component,
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err("broker repository root is not a normalized absolute path".into());
+            }
+        };
+        check_deadline(deadline)?;
+        let parent = directories
+            .last()
+            .expect("filesystem root descriptor exists");
+        let name = std::ffi::CString::new(component.as_bytes())
+            .map_err(|_| "broker repository root component contains NUL".to_owned())?;
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+        // SAFETY: the parent descriptor is pinned and `name` is one component.
+        let child_fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if child_fd < 0 {
+            return Err(format!(
+                "cannot safely open broker repository root: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: `openat` returned a new owned descriptor.
+        let child = unsafe { std::fs::File::from_raw_fd(child_fd) };
+        let metadata = child
+            .metadata()
+            .map_err(|error| format!("cannot inspect broker repository root: {error}"))?;
+        if !metadata.is_dir() {
+            return Err("broker repository root contains a non-directory component".into());
+        }
+        bindings.push(IntentDirectoryBinding {
+            parent_fd: parent.as_raw_fd(),
+            name,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        });
+        directories.push(child);
+    }
+    for component in [".aethyme", "run", "archive-cleanup-intents"] {
+        check_deadline(deadline)?;
+        let parent = directories
+            .last()
+            .expect("repository root descriptor exists");
+        let name = std::ffi::CString::new(component).expect("static component has no NUL");
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+        // SAFETY: the parent descriptor is pinned and `name` is one component.
+        let child_fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if child_fd < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound {
+                verify_intent_directory_bindings(&bindings)?;
+                return Ok(None);
+            }
+            return Err(format!(
+                "cannot safely open archive cleanup intent directory: {error}"
+            ));
+        }
+        // SAFETY: `openat` returned a new owned descriptor.
+        let child = unsafe { std::fs::File::from_raw_fd(child_fd) };
+        let metadata = child
+            .metadata()
+            .map_err(|error| format!("cannot inspect archive cleanup intent directory: {error}"))?;
+        if !metadata.is_dir() {
+            return Err("archive cleanup intent path is not a real directory".into());
+        }
+        if component == "archive-cleanup-intents" {
+            verify_owned_private(&metadata)?;
+        }
+        bindings.push(IntentDirectoryBinding {
+            parent_fd: parent.as_raw_fd(),
+            name,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        });
+        directories.push(child);
+    }
+    let directory_fd = directories
+        .last()
+        .expect("intent directory descriptor exists")
+        .as_raw_fd();
+    let directory_metadata = directories
+        .last()
+        .expect("intent directory descriptor exists")
+        .metadata()
+        .map_err(|error| format!("cannot inspect archive cleanup intent directory: {error}"))?;
+    let directory = PinnedIntentDirectory {
+        _directories: directories,
+        bindings,
+        directory_fd,
+        identity: (directory_metadata.dev(), directory_metadata.ino()),
+    };
+    directory.ensure_binding()?;
+    Ok(Some(directory))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl PinnedIntentDirectory {
+    fn ensure_binding(&self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = self
+            ._directories
+            .last()
+            .expect("intent directory descriptor exists");
+        let metadata = directory
+            .metadata()
+            .map_err(|error| format!("cannot recheck archive cleanup intent directory: {error}"))?;
+        if !metadata.is_dir()
+            || (metadata.dev(), metadata.ino()) != self.identity
+            || verify_owned_private(&metadata).is_err()
+        {
+            return Err("archive cleanup intent directory is no longer private and owned".into());
+        }
+        verify_intent_directory_bindings(&self.bindings)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_intent_directory_bindings(bindings: &[IntentDirectoryBinding]) -> Result<(), String> {
+    for binding in bindings {
+        if !named_directory_matches(binding)? {
+            return Err("archive cleanup intent directory binding changed".into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn named_directory_matches(binding: &IntentDirectoryBinding) -> Result<bool, String> {
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    // SAFETY: the parent descriptor is pinned, the name is one component, and
+    // `stat` is a writable output buffer. AT_SYMLINK_NOFOLLOW inspects the leaf.
+    if unsafe {
+        libc::fstatat(
+            binding.parent_fd,
+            binding.name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(false);
+        }
+        return Err(format!(
+            "cannot recheck archive cleanup intent directory: {error}"
+        ));
+    }
+    let device = intent_stat_device(&stat)?;
+    Ok(device == binding.device
+        && stat.st_ino as u64 == binding.inode
+        && (stat.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFDIR as u32)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn named_intent_matches(
+    parent_fd: std::os::fd::RawFd,
+    name: &std::ffi::CString,
+    opened: &fs::Metadata,
+) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    // SAFETY: `parent_fd` is pinned, `name` is one component, and `stat` is a
+    // writable output buffer. AT_SYMLINK_NOFOLLOW refuses a replacement link.
+    if unsafe {
+        libc::fstatat(
+            parent_fd,
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(false);
+        }
+        return Err(format!(
+            "cannot recheck archive cleanup intent name: {error}"
+        ));
+    }
+    Ok(intent_stat_device(&stat)? == opened.dev()
+        && stat.st_ino as u64 == opened.ino()
+        && stat.st_mode as u32 == opened.mode() as u32
+        && u64::try_from(stat.st_size).ok() == Some(opened.len()))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn intent_stat_device(stat: &libc::stat) -> Result<u64, String> {
+    #[cfg(target_os = "linux")]
+    let device = stat.st_dev as u64;
+    #[cfg(target_os = "macos")]
+    let device = u64::try_from(stat.st_dev)
+        .map_err(|_| "archive cleanup intent has an invalid device id".to_owned())?;
+    Ok(device)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_intent_file_metadata(metadata: &fs::Metadata) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err("archive cleanup intent is not a single-link regular file".into());
+    }
+    verify_owned_private(metadata)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_pending_for_session_other(
+    main_root: &Path,
+    session_id: i64,
+    deadline: Instant,
+) -> Result<Option<ArchiveCleanupIntent>, String> {
+    let mut directory = main_root.to_path_buf();
+    for component in [".aethyme", "run", "archive-cleanup-intents"] {
+        check_deadline(deadline)?;
+        directory.push(component);
+        match fs::symlink_metadata(&directory) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect archive cleanup intent directory: {error}"
+                ));
+            }
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Err("archive cleanup intent path is not a real directory".into()),
+        }
+    }
+    let path = intent_path(&directory, session_id)?;
+    check_deadline(deadline)?;
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot inspect archive cleanup intent: {error}")),
+        Ok(_) => Err("archive cleanup intents require no-follow file support".into()),
+    }
 }
 
 /// Publish once; an existing file, directory, or symlink is never replaced.
