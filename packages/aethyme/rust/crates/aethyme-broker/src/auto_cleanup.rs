@@ -126,6 +126,29 @@ fn decode_auto_cleanup_cursor(value: Option<&str>) -> AutoCleanupCursor {
         .unwrap_or_default()
 }
 
+/// Reuse one process-table observation during planning, but take it lazily:
+/// most closed checkouts have no retained lease rows to classify. Apply gives
+/// each candidate its own fresh instance under the lifecycle claim.
+#[derive(Default)]
+struct LeaseProcessTableSnapshot {
+    snapshot: Option<Option<crate::session_holder::ProcessTable>>,
+}
+
+impl LeaseProcessTableSnapshot {
+    fn get_or_snapshot(&mut self) -> Option<&crate::session_holder::ProcessTable> {
+        self.snapshot
+            .get_or_insert_with(crate::session_holder::ProcessTable::snapshot)
+            .as_ref()
+    }
+}
+
+struct AutoCleanupVerdictOptions<'a> {
+    deep: bool,
+    deadline: Option<Instant>,
+    selected: Option<&'a ContainmentProof>,
+    lease_process_table: &'a mut LeaseProcessTableSnapshot,
+}
+
 fn checkout_group_cursor_session_id(group: &AutoCleanupCheckoutGroup) -> i64 {
     group
         .sessions
@@ -1256,15 +1279,19 @@ impl Broker {
     /// HEAD and the upstream tip, and the plan pins the tip, so an unchanged
     /// HEAD reuses it instead of repeating the deep landing search with no
     /// deadline; every other proof is re-read (#460).
-    pub(crate) fn auto_cleanup_verdict(
+    fn auto_cleanup_verdict(
         &mut self,
         candidate: &AutoCleanupCandidate,
         policy: &AutoCleanupPolicy,
         upstream: &(String, String),
-        deep: bool,
-        deadline: Option<Instant>,
-        selected: Option<&ContainmentProof>,
+        options: AutoCleanupVerdictOptions<'_>,
     ) -> Result<ContainmentProof, NotRemoved> {
+        let AutoCleanupVerdictOptions {
+            deep,
+            deadline,
+            selected,
+            lease_process_table,
+        } = options;
         let keep = NotRemoved::Keep;
         // Only a checkout a broker session record proves it created may go.
         // Candidates come from session records, never from scanning the
@@ -1411,18 +1438,27 @@ impl Broker {
         // with one system-wide snapshot.
         let now = now_ms();
         let ids = candidate.session_ids();
-        let liveness = self
-            .lease_liveness(now)
+        let leases = self
+            .store()
+            .unreleased_unexpired_leases_for_sessions_at(&ids, now)
             .map_err(|error| keep(format!("lease liveness unreadable: {error}")))?;
-        if let Some(lease) = liveness
-            .iter()
-            .find(|lease| ids.contains(&lease.session_id) && lease.liveness_evidence.holds)
-        {
-            return Err(keep(format!(
-                "lease on {} is {} and still holds",
-                lease.path,
-                lease.liveness.as_str()
-            )));
+        if !leases.is_empty() {
+            let lease_policy = crate::lease_liveness::LeaseLivenessPolicy::load(self.main_root());
+            let liveness = crate::lease_liveness::assess(
+                self.store(),
+                &leases,
+                lease_process_table.get_or_snapshot(),
+                now,
+                lease_policy,
+            )
+            .map_err(|error| keep(format!("lease liveness unreadable: {error}")))?;
+            if let Some(lease) = liveness.iter().find(|lease| lease.liveness_evidence.holds) {
+                return Err(keep(format!(
+                    "lease on {} is {} and still holds",
+                    lease.path,
+                    lease.liveness.as_str()
+                )));
+            }
         }
         let gates = crate::gates::running_gate_evidence(self.main_root());
         if let Some(gate) = gates.first() {
@@ -1541,6 +1577,7 @@ impl Broker {
         let mut upstream = None;
         let mut selected = Vec::new();
         let group_count = groups.len();
+        let mut lease_process_table = LeaseProcessTableSnapshot::default();
         for (index, group) in groups.into_iter().enumerate() {
             if deadline_expired(deadline) {
                 report.deferred += group_count - index;
@@ -1571,12 +1608,28 @@ impl Broker {
                         stop_for_deadline = true;
                     } else if let Some(upstream) = upstream.as_ref() {
                         let verdict = self.auto_cleanup_verdict(
-                            &candidate, &policy, upstream, false, deadline, None,
+                            &candidate,
+                            &policy,
+                            upstream,
+                            AutoCleanupVerdictOptions {
+                                deep: false,
+                                deadline,
+                                selected: None,
+                                lease_process_table: &mut lease_process_table,
+                            },
                         );
                         let verdict = match verdict {
                             Err(NotRemoved::Defer) if !deadline_expired(deadline) => self
                                 .auto_cleanup_verdict(
-                                    &candidate, &policy, upstream, true, deadline, None,
+                                    &candidate,
+                                    &policy,
+                                    upstream,
+                                    AutoCleanupVerdictOptions {
+                                        deep: true,
+                                        deadline,
+                                        selected: None,
+                                        lease_process_table: &mut lease_process_table,
+                                    },
                                 ),
                             verdict => verdict,
                         };
@@ -1709,13 +1762,17 @@ impl Broker {
                 }
             }
             // Revalidate every proof now, under the lock, right before removal.
+            let mut lease_process_table = LeaseProcessTableSnapshot::default();
             let proof = match self.auto_cleanup_verdict(
                 &candidate,
                 &policy,
                 &upstream,
-                true,
-                None,
-                Some(&selected_proof),
+                AutoCleanupVerdictOptions {
+                    deep: true,
+                    deadline: None,
+                    selected: Some(&selected_proof),
+                    lease_process_table: &mut lease_process_table,
+                },
             ) {
                 Ok(proof) => proof,
                 Err(NotRemoved::Keep(reason)) => {
