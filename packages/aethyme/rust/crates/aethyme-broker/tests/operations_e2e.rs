@@ -2626,3 +2626,160 @@ fn exact_push_inspection_refuses_a_changed_remote_repository() {
         serde_json::to_value(original).unwrap()
     );
 }
+/// The opt-in hook decision and the provider write must stay bound to the same
+/// source object. A hook moves the source ref after the dry run selected it;
+/// the broker must refuse the now-stale named ref instead of pushing its new
+/// value with the hook skipped.
+#[cfg(unix)]
+#[test]
+fn opted_in_pre_push_refuses_source_ref_moved_during_dry_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "hooks-pin");
+    let repo = fixture.broker.main_root().to_path_buf();
+    enable_hooks_outside_lock(&repo);
+
+    let source_ref = "refs/heads/agent/hooks-pin";
+    let inspected = commit_push_fixture(&fixture, "hook inspected commit\n");
+    let tree = git_output(
+        &fixture.worktree,
+        &["rev-parse", &format!("{inspected}^{{tree}}")],
+    );
+    let later = git_output(
+        &fixture.worktree,
+        &["commit-tree", &tree, "-p", &inspected, "-m", "later commit"],
+    );
+    git(
+        &fixture.worktree,
+        &["update-ref", "refs/heads/other", &later],
+    );
+    let remote_before = git_output(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+
+    // From this worktree, ../../../ is the repository root. The hook records
+    // Git's actual local SHA and then moves the branch using an expected-old
+    // value, so the race point is deterministic and cannot overwrite another
+    // writer's unrelated branch update.
+    let hook = format!(
+        "#!/bin/sh\nset -eu\nwhile read local_ref local_sha remote_ref remote_sha; do\n  printf '%s\\n' \"$local_sha\" > ../../../hook-seen\ndone\ngit update-ref refs/heads/agent/hooks-pin {later} {inspected}\n"
+    );
+    install_pre_push_hook(&repo, &hook);
+
+    let refspec = format!("{source_ref}:refs/heads/main");
+    let error = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &[&refspec],
+        ))
+        .expect_err("the stale source ref must refuse before the provider push");
+    assert!(
+        error
+            .to_string()
+            .contains("a local ref moved between the pre-push hook and acquiring the lock"),
+        "expected the final original-ref revalidation to refuse: {error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("hook-seen"))
+            .unwrap()
+            .trim(),
+        inspected,
+        "the hook must have received the same source object captured before it ran"
+    );
+    assert_eq!(
+        git_output(&fixture.worktree, &["rev-parse", source_ref]),
+        later,
+        "the hook's expected-old update moved the source ref"
+    );
+    assert_eq!(
+        git_output(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        remote_before,
+        "the provider must not publish the post-hook ref value"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ambiguous_remote_identity_refuses_wide_and_scoped_writes_before_journaling() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "reserved-identity");
+    let renamed_remote = tmp.path().join("remote::git-ref/refs/heads/main.git");
+    std::fs::create_dir_all(renamed_remote.parent().unwrap()).unwrap();
+    std::fs::rename(&fixture.remote, &renamed_remote).unwrap();
+    git(
+        &fixture.worktree,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            renamed_remote.to_str().unwrap(),
+        ],
+    );
+    let target = GitRepo::discover(&fixture.worktree)
+        .unwrap()
+        .resolve_remote_target("origin", None)
+        .unwrap();
+    assert!(target.coordination_key.contains("::git-ref/"));
+    let operations_before = fixture
+        .broker
+        .store()
+        .coordinated_operations()
+        .unwrap()
+        .len();
+    let host_database = common::fixture_host_state_dir(tmp.path()).join("host-operations.db");
+    let host_rows = || {
+        if !host_database.exists() {
+            return 0_i64;
+        }
+        rusqlite::Connection::open(&host_database)
+            .unwrap()
+            .query_row("SELECT count(*) FROM host_operations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    let host_rows_before = host_rows();
+    let wide = exact_push_request(
+        fixture.session_id,
+        &fixture.worktree,
+        &["HEAD:refs/heads/main"],
+    );
+    let mut scoped = request(
+        fixture.session_id,
+        &[
+            "fetch",
+            "--atomic",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+            "--no-write-commit-graph",
+            "--no-prune",
+            "--no-prune-tags",
+            "--refmap=",
+            "--",
+            "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+        ],
+    );
+    scoped.resolved_target = Some(target);
+    for command in [wide, scoped] {
+        let error = fixture
+            .broker
+            .run_coordinated_operation(command)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("reserved coordination marker"),
+            "{error}"
+        );
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .coordinated_operations()
+                .unwrap()
+                .len(),
+            operations_before
+        );
+        assert_eq!(host_rows(), host_rows_before);
+    }
+}

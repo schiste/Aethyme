@@ -49,6 +49,25 @@ def sha256_bytes(value):
     return hashlib.sha256(value).hexdigest()
 
 
+def redact_captured_output(stdout, stderr, values):
+    """Redact named secrets before a receipt is persisted; hash original bytes."""
+    if not isinstance(stdout, bytes) or not isinstance(stderr, bytes):
+        raise ValueError('captured output must be bytes')
+    if not isinstance(values, (tuple, list)):
+        raise ValueError('redaction values must be a sequence')
+    redacted_stdout = stdout
+    redacted_stderr = stderr
+    occurrences = 0
+    for value in values:
+        if not isinstance(value, str) or not value:
+            raise ValueError('redaction values must be nonempty strings')
+        token = value.encode('utf-8')
+        occurrences += redacted_stdout.count(token) + redacted_stderr.count(token)
+        redacted_stdout = redacted_stdout.replace(token, b'[redacted sensitive value]')
+        redacted_stderr = redacted_stderr.replace(token, b'[redacted sensitive value]')
+    return redacted_stdout, redacted_stderr, occurrences
+
+
 def hash_file(path, limit=None):
     digest = hashlib.sha256()
     total = 0
@@ -269,13 +288,18 @@ class BoundedCommandRunner:
         self.cleanup_incomplete = False
 
     def run(self, argv, cwd, label, timeout=COMMAND_TIMEOUT_SECONDS,
-            trace_path=None, input_bytes=None, barrier=None):
+            trace_path=None, input_bytes=None, barrier=None, redact_values=()):
         if self.cleanup_incomplete:
             raise RuntimeError('scenario stopped after uncertain process cleanup')
         require_waitid_support()
         if not isinstance(argv, (list, tuple)) or not argv or not all(
                 isinstance(arg, str) for arg in argv):
             raise RuntimeError('command argv must be a non-empty string sequence')
+        if not isinstance(redact_values, (tuple, list)) or any(
+                not isinstance(value, str) or not value for value in redact_values):
+            raise RuntimeError('redaction values must be nonempty strings')
+        if any(value in arg for value in redact_values for arg in argv):
+            raise RuntimeError('a sensitive value appeared in command arguments')
         cwd = fixture_path(cwd, self.root, 'command working directory', must_exist=True)
         validate_fixture_environment(self.env, self.root)
         with self.lock:
@@ -293,6 +317,9 @@ class BoundedCommandRunner:
         if input_bytes is not None and (not isinstance(input_bytes, bytes)
                                         or len(input_bytes) > 64 * 1024):
             raise RuntimeError('command input exceeded its 64 KiB limit')
+        if input_bytes is not None and any(
+                value.encode('utf-8') in input_bytes for value in redact_values):
+            raise RuntimeError('a sensitive value appeared in command input')
 
         barrier_ready_ns = None
         if barrier is not None:
@@ -437,22 +464,35 @@ class BoundedCommandRunner:
         trace_info = None
         if trace_path is not None and trace_path.exists() and not trace_path.is_symlink():
             trace_info = hash_file(trace_path, MAX_TRACE2_BYTES)
+        raw_stdout = bytes(stdout)
+        raw_stderr = bytes(stderr)
+        try:
+            raw_stdout.decode('utf-8')
+        except UnicodeDecodeError:
+            stdout_utf8_valid = False
+        else:
+            stdout_utf8_valid = True
+        receipt_stdout, receipt_stderr, redacted_occurrences = redact_captured_output(
+            raw_stdout, raw_stderr, redact_values)
         row = {
             'label': label, 'argv': list(argv), 'cwd': str(cwd),
             'started_wall_time_ns': started_wall, 'duration_ms': (ended_ns - started_ns) / 1_000_000,
             'start_monotonic_ns': started_ns, 'end_monotonic_ns': ended_ns,
             'barrier_ready_monotonic_ns': barrier_ready_ns, 'exit_code': returncode,
             'failure': failure, 'stdout_complete': failure is None,
-            'stdout_bytes': len(stdout), 'stdout_sha256': sha256_bytes(stdout),
-            'stdout': stdout.decode('utf-8', errors='replace'),
-            'stderr_bytes': len(stderr), 'stderr_sha256': sha256_bytes(stderr),
-            'stderr': stderr.decode('utf-8', errors='replace'),
+            'stdout_utf8_valid': stdout_utf8_valid,
+            'stdout_bytes': len(raw_stdout), 'stdout_sha256': sha256_bytes(raw_stdout),
+            'stdout': receipt_stdout.decode('utf-8', errors='replace'),
+            'stderr_bytes': len(raw_stderr), 'stderr_sha256': sha256_bytes(raw_stderr),
+            'stderr': receipt_stderr.decode('utf-8', errors='replace'),
             'stdin_bytes': len(input_bytes) if input_bytes is not None else 0,
             'stdin_sha256': sha256_bytes(input_bytes) if input_bytes is not None else None,
             'environment_sha256': sha256_bytes(canonical_json_bytes(child_env)),
             'trace2_path': str(trace_path) if trace_path is not None else None,
             'trace2': trace_info,
         }
+        if redact_values:
+            row['redacted_value_occurrences'] = redacted_occurrences
         self.receipts.append(row)
         if failure is not None:
             raise RuntimeError(f'{label}: {failure}')

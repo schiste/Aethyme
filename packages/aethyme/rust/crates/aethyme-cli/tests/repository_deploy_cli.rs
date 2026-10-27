@@ -2,6 +2,7 @@ use std::fs;
 use std::process::Command;
 
 use aethyme_testkit::{aethyme_bin, repo_root, tmp_dir};
+use sha2::{Digest, Sha256};
 
 fn repository(root: &std::path::Path) -> std::path::PathBuf {
     let repo = root.join("repo");
@@ -89,6 +90,175 @@ fn status(repo: &std::path::Path) -> String {
         .unwrap();
     assert!(output.status.success());
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn isolate_git_environment(
+    command: &mut Command,
+    home: &std::path::Path,
+    global_config: &std::path::Path,
+) {
+    let inherited_git_variables = std::env::vars_os()
+        .filter_map(|(key, _)| {
+            let is_git_variable = key.to_string_lossy().starts_with("GIT_");
+            is_git_variable.then_some(key)
+        })
+        .collect::<Vec<_>>();
+    for key in inherited_git_variables {
+        command.env_remove(key);
+    }
+    command
+        .env("HOME", home)
+        .env("GIT_CONFIG_GLOBAL", global_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+}
+
+fn fixture_git(
+    directory: &std::path::Path,
+    args: &[&str],
+    home: &std::path::Path,
+    global_config: &std::path::Path,
+) -> std::process::Output {
+    let mut command = Command::new("git");
+    isolate_git_environment(&mut command, home, global_config);
+    command.args(args).current_dir(directory).output().unwrap()
+}
+
+fn isolated_repository(
+    root: &std::path::Path,
+    home: &std::path::Path,
+    global_config: &std::path::Path,
+) -> std::path::PathBuf {
+    let repo = root.join("repo");
+    fs::create_dir(&repo).unwrap();
+    let initialized = fixture_git(&repo, &["init", "-b", "main"], home, global_config);
+    assert!(initialized.status.success());
+    let committed = fixture_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Aethyme Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+        home,
+        global_config,
+    );
+    assert!(committed.status.success());
+    repo
+}
+
+fn isolated_deploy_command(
+    repo: &std::path::Path,
+    home: &std::path::Path,
+    global_config: &std::path::Path,
+) -> Command {
+    let mut command = command(repo);
+    isolate_git_environment(&mut command, home, global_config);
+    command
+}
+
+#[test]
+fn first_enrollment_diff_shows_bounded_generated_proposal_without_changing_plan_digest() {
+    let temp = tmp_dir();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    let global_config = temp.path().join("empty-gitconfig");
+    fs::write(&global_config, b"").unwrap();
+    let repo = isolated_repository(temp.path(), &home, &global_config);
+
+    let origin = temp.path().join("origin.git");
+    let origin_string = origin.to_str().unwrap();
+    let initialized = fixture_git(
+        temp.path(),
+        &["init", "--bare", "--initial-branch=main", origin_string],
+        &home,
+        &global_config,
+    );
+    assert!(initialized.status.success());
+    let added = fixture_git(
+        &repo,
+        &["remote", "add", "origin", origin_string],
+        &home,
+        &global_config,
+    );
+    assert!(added.status.success());
+    let pushed = fixture_git(
+        &repo,
+        &["push", "--set-upstream", "origin", "main"],
+        &home,
+        &global_config,
+    );
+    assert!(
+        pushed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pushed.stderr)
+    );
+
+    let structured = isolated_deploy_command(&repo, &home, &global_config)
+        .args(["deploy", "plan", "--repo"])
+        .arg(&repo)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        structured.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&structured.stdout),
+        String::from_utf8_lossy(&structured.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&structured.stdout).unwrap();
+    let plan_digest = plan["plan_digest"].as_str().unwrap();
+    let diff_digest = plan["generated_tree"]["diff_sha256"].as_str().unwrap();
+    let source_sha = plan["remote_base"]["exact_sha"].as_str().unwrap();
+    assert_eq!(plan["remote_base"]["remote"], "origin");
+    assert_eq!(plan["remote_base"]["default_branch_ref"], "refs/heads/main");
+
+    let reviewed = isolated_deploy_command(&repo, &home, &global_config)
+        .args(["deploy", "plan", "--repo"])
+        .arg(&repo)
+        .arg("--diff")
+        .output()
+        .unwrap();
+    assert!(
+        reviewed.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&reviewed.stdout),
+        String::from_utf8_lossy(&reviewed.stderr)
+    );
+    let preview = String::from_utf8(reviewed.stdout).unwrap();
+    assert!(preview.contains(&format!(
+        "Configured origin/default ref: origin/refs/heads/main @ {source_sha}"
+    )));
+    assert!(preview.contains(&format!("Plan digest: {plan_digest}")));
+    assert!(preview.contains("per-file generator-source mapping is unavailable"));
+    assert!(preview.contains("  Aethyme-owned outputs:"));
+    assert!(preview.contains("    Create .claude/skills/aethyme/SKILL.md "));
+    assert!(preview.contains("  Managed-block outputs:"));
+    assert!(preview.contains("    Create AGENTS.md "));
+    assert!(preview.contains("  Repository-owned policy/config outputs:"));
+    assert!(preview.contains("    Create .aethyme/config.toml "));
+    assert!(preview.contains(&format!("SHA-256 (raw) {diff_digest}")));
+    assert!(preview.contains("diff --git a/"));
+    if !preview.contains("[terminal-safe diff preview truncated") {
+        let patch = preview.split_once("Migration diff:\n").unwrap().1;
+        assert_eq!(
+            format!("{:x}", Sha256::digest(patch.as_bytes())),
+            diff_digest
+        );
+    } else {
+        assert!(preview.contains("SHA-256 covers the complete proposal"));
+    }
+
+    let unchanged = fixture_git(&repo, &["status", "--porcelain"], &home, &global_config);
+    assert!(unchanged.status.success());
+    assert!(
+        unchanged.stdout.is_empty(),
+        "planning must not modify the checkout"
+    );
 }
 
 #[test]

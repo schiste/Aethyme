@@ -37,6 +37,9 @@ const MAX_GH_DIFFS_PER_PUSH: usize = 8;
 const MAX_DIFF_BYTES: usize = 4 << 20;
 /// A diff touching more files than this is too broad to say anything precise.
 const MAX_FILES_PER_DIFF: usize = 2_000;
+/// Detailed line coordinates stay small even when a PR touches many paths.
+const MAX_REPORTED_RANGE_FILES: usize = 5;
+const MAX_REPORTED_RANGES_PER_SIDE: usize = 8;
 /// A push reuses a PR listing younger than this instead of asking `gh` again.
 const LIST_REUSE_MS: i64 = 10 * 60_000;
 /// `status` ignores a listing older than this: the PRs it names may have
@@ -74,6 +77,50 @@ pub struct PrOverlap {
     /// True when, in at least one of those paths, the changed lines overlap or
     /// lie within three lines of each other -- the shape Git conflicts on.
     pub conflicting_hunks: bool,
+    /// Bounded old-side conflict spans for the paths above. Older recorded
+    /// checks omit this field; when present, `truncated` says some detail was
+    /// omitted and the path/conflict fields remain the complete comparison.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_ranges: Option<PrOverlapLineDetails>,
+}
+
+/// Bounded changed-line detail for one PR overlap.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PrOverlapLineDetails {
+    pub files: Vec<PrOverlapPathRanges>,
+    pub truncated: bool,
+    /// The PR-side diff is either verified against the captured local default
+    /// or supplied by GitHub when no matching local head ref is available.
+    pub pull_request_basis: PrOverlapRangeBasis,
+}
+
+/// The two changes' inclusive old-side conflict spans for one shared path.
+/// The session uses its diff against the captured default's merge base. The
+/// PR basis is recorded separately because it can come from the provider when
+/// no matching local head ref is available. Insertion-only spans can include
+/// the neighboring line boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PrOverlapPathRanges {
+    pub path: String,
+    pub session_old_side: Vec<PrOverlapLineRange>,
+    pub pull_request_old_side: Vec<PrOverlapLineRange>,
+}
+
+/// Provenance of the PR-side ranges shown in an overlap report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrOverlapRangeBasis {
+    TrackedDefaultMergeBase,
+    ProviderDiff,
+}
+
+/// A concrete inclusive old-side span or a parser-classified whole-file change.
+/// A span may start at line zero for an insertion before the first old line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PrOverlapLineRange {
+    Lines { start: u32, end: u32 },
+    WholeFile,
 }
 
 /// The result of comparing one session with the open PRs.
@@ -335,16 +382,55 @@ pub(crate) fn spans_conflict(left: &[(u32, u32)], right: &[(u32, u32)]) -> bool 
 }
 
 /// Compare one session's ranges with one PR's.
-fn compare(session: &FileRanges, pr: &FileRanges) -> Option<(Vec<String>, bool)> {
+fn display_ranges(ranges: &[(u32, u32)]) -> (Vec<PrOverlapLineRange>, bool) {
+    if ranges.contains(&WHOLE_FILE) {
+        return (vec![PrOverlapLineRange::WholeFile], false);
+    }
+    let truncated = ranges.len() > MAX_REPORTED_RANGES_PER_SIDE;
+    let displayed = ranges
+        .iter()
+        .take(MAX_REPORTED_RANGES_PER_SIDE)
+        .map(|&(start, end)| PrOverlapLineRange::Lines { start, end })
+        .collect();
+    (displayed, truncated)
+}
+
+fn compare(
+    session: &FileRanges,
+    pr: &FileRanges,
+    pull_request_basis: PrOverlapRangeBasis,
+) -> Option<(Vec<String>, bool, PrOverlapLineDetails)> {
     let mut files = Vec::new();
     let mut conflicting = false;
+    let mut line_files = Vec::new();
+    let mut truncated = false;
     for (path, spans) in session {
         if let Some(other) = pr.get(path) {
             files.push(path.clone());
             conflicting |= spans_conflict(spans, other);
+            if line_files.len() < MAX_REPORTED_RANGE_FILES {
+                let (session_ranges, session_truncated) = display_ranges(spans);
+                let (pr_ranges, pr_truncated) = display_ranges(other);
+                truncated |= session_truncated || pr_truncated;
+                line_files.push(PrOverlapPathRanges {
+                    path: path.clone(),
+                    session_old_side: session_ranges,
+                    pull_request_old_side: pr_ranges,
+                });
+            } else {
+                truncated = true;
+            }
         }
     }
-    (!files.is_empty()).then_some((files, conflicting))
+    (!files.is_empty()).then_some((
+        files,
+        conflicting,
+        PrOverlapLineDetails {
+            files: line_files,
+            truncated,
+            pull_request_basis,
+        },
+    ))
 }
 
 fn wait() -> QueueWait {
@@ -620,6 +706,7 @@ impl Broker {
             ..Default::default()
         };
         for pr in listing.prs.iter().filter(|pr| pr.head != branch) {
+            let mut pull_request_basis = PrOverlapRangeBasis::TrackedDefaultMergeBase;
             let ranges = match self.cached_ranges(pr, &default.commit) {
                 Some(ranges) => Some(ranges),
                 None => {
@@ -638,6 +725,9 @@ impl Broker {
                                 cwd,
                             )
                             .and_then(|diff| parse_unified_diff(&diff));
+                        if fresh.is_some() {
+                            pull_request_basis = PrOverlapRangeBasis::ProviderDiff;
+                        }
                     }
                     if local_base_verified
                         && let (Some(ranges), Some(head_oid)) = (&fresh, &pr.head_oid)
@@ -657,12 +747,15 @@ impl Broker {
             };
             match ranges {
                 Some(ranges) => {
-                    if let Some((files, conflicting_hunks)) = compare(&session_ranges, &ranges) {
+                    if let Some((files, conflicting_hunks, line_ranges)) =
+                        compare(&session_ranges, &ranges, pull_request_basis)
+                    {
                         check.overlaps.push(PrOverlap {
                             pr: pr.number,
                             url: pr.url.clone(),
                             files,
                             conflicting_hunks,
+                            line_ranges: Some(line_ranges),
                         });
                     }
                 }
@@ -723,12 +816,17 @@ impl Broker {
                 .or_else(|| self.local_pr_ranges(&default, pr));
             match ranges {
                 Some(ranges) => {
-                    if let Some((files, conflicting_hunks)) = compare(&session_ranges, &ranges) {
+                    if let Some((files, conflicting_hunks, line_ranges)) = compare(
+                        &session_ranges,
+                        &ranges,
+                        PrOverlapRangeBasis::TrackedDefaultMergeBase,
+                    ) {
                         check.overlaps.push(PrOverlap {
                             pr: pr.number,
                             url: pr.url.clone(),
                             files,
                             conflicting_hunks,
+                            line_ranges: Some(line_ranges),
                         });
                     }
                 }
@@ -1090,6 +1188,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn old_pr_overlap_records_omit_optional_line_details() {
+        let previous = r#"{"pr":4,"url":"u","files":["f"],"conflicting_hunks":false}"#;
+        let restored: PrOverlap = serde_json::from_str(previous).unwrap();
+        assert_eq!(restored.line_ranges, None);
+        assert!(
+            serde_json::to_value(restored)
+                .unwrap()
+                .get("line_ranges")
+                .is_none()
+        );
+    }
+
     const DIFF: &str = "\
 diff --git a/src/a.rs b/src/a.rs
 index 1111111..2222222 100644
@@ -1158,6 +1269,48 @@ diff --git a/f b/f
     }
 
     #[test]
+    fn overlap_line_details_are_explicit_and_bounded() {
+        let mut session = FileRanges::new();
+        let mut pull_request = FileRanges::new();
+        let range_count = MAX_REPORTED_RANGES_PER_SIDE as u32 + 1;
+        for index in 0..MAX_REPORTED_RANGE_FILES + 1 {
+            let path = format!("file-{index}.rs");
+            session.insert(
+                path.clone(),
+                (1..=range_count)
+                    .map(|line| (line * 10, line * 10))
+                    .collect(),
+            );
+            pull_request.insert(path, vec![WHOLE_FILE]);
+        }
+
+        let (files, _, details) =
+            compare(&session, &pull_request, PrOverlapRangeBasis::ProviderDiff).unwrap();
+        assert_eq!(files.len(), MAX_REPORTED_RANGE_FILES + 1);
+        assert_eq!(details.files.len(), MAX_REPORTED_RANGE_FILES);
+        assert!(details.truncated);
+        assert_eq!(
+            details.files[0].session_old_side.len(),
+            MAX_REPORTED_RANGES_PER_SIDE
+        );
+        assert_eq!(
+            details.files[0].pull_request_old_side,
+            vec![PrOverlapLineRange::WholeFile]
+        );
+        assert_eq!(
+            details.files[0].session_old_side[0],
+            PrOverlapLineRange::Lines { start: 10, end: 10 }
+        );
+        let encoded = serde_json::to_value(details).unwrap();
+        assert_eq!(encoded["truncated"], true);
+        assert_eq!(
+            encoded["files"][0]["pull_request_old_side"][0]["kind"],
+            "whole_file"
+        );
+        assert_eq!(encoded["pull_request_basis"], "provider_diff");
+    }
+
+    #[test]
     fn a_listing_keeps_open_prs_only() {
         let listing = r#"[
             {"number":1,"url":"u1","state":"OPEN","headRefName":"agent/a","headRefOid":"aaa"},
@@ -1179,6 +1332,7 @@ diff --git a/f b/f
                 url: "u".into(),
                 files: vec!["f".into()],
                 conflicting_hunks: false,
+                line_ranges: None,
             }],
             ..Default::default()
         };

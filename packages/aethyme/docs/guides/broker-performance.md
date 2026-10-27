@@ -1,6 +1,6 @@
 # Broker latency budgets
 
-Last Updated: 2026-10-26
+Last Updated: 2026-10-27
 
 The machine-readable source is
 [`broker-budgets.json`](../../../aethyme-eval/benchmarks/performance/broker-budgets.json).
@@ -148,6 +148,73 @@ from the trusted PR base. Rust, manifests, locks, shared Git experiment helpers,
 workflow changes outside the existing exact performance entry, deletions, mode
 changes and unlisted paths still select the full suite. This extension must
 itself land through full CI before later experiment-only PRs can use it.
+
+## Paired broker action matrix
+
+`broker-action-matrix-v2.json` defines a separate diagnostic profile. It keeps
+the schema-v1 absolute warning budgets in `broker-budgets.json` unchanged and
+records that file's digest in each run. The scenario inventory is versioned in
+`broker-action-scenarios-v1.json`.
+
+The matrix requires the signed v0.8.41 CLI and sibling engine pair as its
+baseline, verifies both hashes against the retained v0.8.41 rollout receipt,
+and runs the candidate CLI and sibling engine as the comparison pair. The old
+rollout timings are recorded as context only: they were not measured as paired
+runs on the same controlled fixture. The default is five repetitions with
+baseline/candidate order alternating. It compares medians and emits a warning
+only when the candidate increase exceeds the larger of 100 ms or 10% of the
+baseline median. The candidate's routine status median is also checked against
+the existing v1 absolute warning budget. None of these comparisons refuses a
+command or fails CI.
+
+Each repetition gets a fresh synthetic repository, local bare remote and six
+broker sessions. The v1 routine-status comparison is measured immediately after
+creating the first session, before the other five are added. The matrix also
+measures session start, lease plan, claim and release, exact overlap detail,
+an independently completing commit while another session waits in a
+pre-commit hook, a constrained local fetch and its read-only operation recovery
+view, generator preview, status with
+1,000 aged released resource rows, and session finish. The generator preview
+records source/ref identity, plan digest, ownership sections, full-diff hash
+and byte count, UTF-8 completeness and truncation notice. Older versions that
+can return inventory without generated content are reported as such rather
+than called unsupported.
+
+Every binary role and repetition gets a separate fixture-owned host-state
+directory and resource database. The baseline and candidate never share a
+ledger, so versioned storage compatibility floors are measured independently;
+the report records each isolated state root and its final inventory identity.
+
+The unprovable-fetch outcome remains explicitly unsupported: the harness does
+not fabricate an operation record or claim a provider-exit result it cannot
+prove. A separate bounded-output control checks that the runner refuses an
+oversized child output and confirms its fixture tree is unchanged. Grant
+tokens used while seeding history are redacted from retained output before
+receipt persistence; command hashes and byte counts describe the original
+captured bytes.
+
+Run it without compiling Aethyme, using an already-installed signed baseline
+pair, candidate pair and retained rollout receipt:
+
+```sh
+python3 packages/aethyme-eval/benchmarks/performance/broker_action_matrix.py \
+  --baseline-cli /absolute/path/to/v0.8.41/bin/aethyme \
+  --candidate-cli /absolute/path/to/candidate/bin/aethyme \
+  --v41-live-reference /absolute/path/to/aethyme-v0.8.41-rollout-report.json \
+  --git /absolute/path/to/git \
+  --output /tmp/unique-broker-action-matrix
+```
+
+The engine executable must be adjacent to each CLI as `aethyme-engine-cli`.
+`--repetitions` can select 3 through 15 samples; otherwise the versioned
+five-sample default is used. The new absolute output directory must be outside
+the source checkout. It retains the complete bounded command receipts, sample
+workload identities, binary and helper hashes, scenario digests and report.
+Treat the output as local diagnostic data because commands, output and local
+paths are retained. The local SSH shim serves only the fixture's bare remote,
+but the runner does not claim an OS-level network sandbox or instrument other
+egress. An incomplete run retains its partial report and receipts and exits
+unsuccessfully; unsupported scenarios are never converted into zero timings.
 
 ## Distinguish dependency cache hits from workspace reuse
 

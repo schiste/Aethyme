@@ -10,10 +10,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use crate::clock::epoch_ms as now_ms;
-use crate::file_lock::{ExclusiveFileLock, open_lock_file};
+use crate::file_lock::{ExclusiveFileLock, SharedFileLock, open_lock_file};
 use crate::{OperationEffect, OperationProvider, OperationStatus};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 INSERT OR IGNORE INTO meta VALUES ('schema_version', 1);
@@ -60,6 +60,10 @@ pub enum HostOperationError {
         operation_id: String,
         remote_key: String,
     },
+    #[error(
+        "host coordination lock for {remote_key} did not become available before the caller deadline"
+    )]
+    LockDeadline { remote_key: String },
     #[error("host operation {0} was not found")]
     NotFound(String),
     #[error("host operation {operation_id} is {actual}, expected {expected}")]
@@ -116,6 +120,16 @@ impl HostOperationGuard {
         provider: OperationProvider,
         effect: OperationEffect,
     ) -> Result<Self, HostOperationError> {
+        Self::begin_with_deadline(database, remote_key, provider, effect, None)
+    }
+
+    pub(crate) fn begin_with_deadline(
+        database: &Path,
+        remote_key: &str,
+        provider: OperationProvider,
+        effect: OperationEffect,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self, HostOperationError> {
         validate_remote_key(remote_key)?;
         if !matches!(
             effect,
@@ -127,8 +141,8 @@ impl HostOperationGuard {
             .parent()
             .ok_or(HostOperationError::StateDirectoryUnavailable)?;
         create_private_directory(state_directory)?;
-        let lock = HostRemoteLock::acquire(state_directory, remote_key)?;
-        let conn = open_database(database)?;
+        let lock = HostRemoteLock::acquire_with_deadline(state_directory, remote_key, deadline)?;
+        let conn = open_database_with_deadline(database, deadline)?;
         recover_or_block(&conn, remote_key)?;
         let operation_id = random_hex(&conn, 16)?;
         let now = now_ms();
@@ -232,13 +246,24 @@ pub fn reconcile_host_operation(
     operation_id: &str,
     succeeded: bool,
 ) -> Result<HostOperation, HostOperationError> {
-    let conn = open_database(database)?;
+    reconcile_host_operation_with_deadline(database, operation_id, succeeded, None)
+}
+
+pub(crate) fn reconcile_host_operation_with_deadline(
+    database: &Path,
+    operation_id: &str,
+    succeeded: bool,
+    deadline: Option<std::time::Instant>,
+) -> Result<HostOperation, HostOperationError> {
+    let conn = open_database_with_deadline(database, deadline)?;
     let operation = load_operation(&conn, operation_id)?
         .ok_or_else(|| HostOperationError::NotFound(operation_id.into()))?;
     let state_directory = database
         .parent()
         .ok_or(HostOperationError::StateDirectoryUnavailable)?;
-    let _lock = HostRemoteLock::acquire(state_directory, &operation.remote_key)?;
+    let _lock =
+        HostRemoteLock::acquire_with_deadline(state_directory, &operation.remote_key, deadline)?;
+    configure_database_wait(&conn, deadline)?;
     let operation = load_operation(&conn, operation_id)?
         .ok_or_else(|| HostOperationError::NotFound(operation_id.into()))?;
     let target = if succeeded {
@@ -281,29 +306,91 @@ pub fn host_operation(
 
 struct HostRemoteLock {
     _lock: ExclusiveFileLock,
+    _compatibility: Option<SharedFileLock>,
 }
 
 impl HostRemoteLock {
-    fn acquire(state_directory: &Path, remote_key: &str) -> Result<Self, HostOperationError> {
+    fn acquire_with_deadline(
+        state_directory: &Path,
+        remote_key: &str,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self, HostOperationError> {
         let directory = state_directory.join("operation-locks");
         create_private_directory(&directory)?;
-        let digest = format!("{:x}", Sha256::digest(remote_key.as_bytes()));
-        let path = directory.join(format!("{digest}.lock"));
-        let file = open_lock_file(&path).map_err(|source| io_error(&path, source))?;
-        protect(&path, false)?;
-        let lock = ExclusiveFileLock::acquire(file).map_err(|source| io_error(&path, source))?;
-        Ok(Self { _lock: lock })
+        let open = |key: &str| {
+            let digest = format!("{:x}", Sha256::digest(key.as_bytes()));
+            let path = directory.join(format!("{digest}.lock"));
+            let file = open_lock_file(&path).map_err(|source| io_error(&path, source))?;
+            protect(&path, false)?;
+            Ok::<_, HostOperationError>((path, file))
+        };
+        let pause = || {
+            if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+                Err(HostOperationError::LockDeadline {
+                    remote_key: remote_key.into(),
+                })
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                Ok(())
+            }
+        };
+        let compatibility = if let Some((parent, _)) = remote_key.split_once("::git-ref/") {
+            loop {
+                let (path, file) = open(parent)?;
+                if let Some(lock) =
+                    SharedFileLock::try_acquire(file).map_err(|source| io_error(&path, source))?
+                {
+                    break Some(lock);
+                }
+                pause()?;
+            }
+        } else {
+            None
+        };
+        let lock = loop {
+            let (path, file) = open(remote_key)?;
+            if let Some(lock) =
+                ExclusiveFileLock::try_acquire(file).map_err(|source| io_error(&path, source))?
+            {
+                break lock;
+            }
+            pause()?;
+        };
+        Ok(Self {
+            _lock: lock,
+            _compatibility: compatibility,
+        })
     }
 }
 
+fn configure_database_wait(
+    conn: &Connection,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), HostOperationError> {
+    let maximum = std::time::Duration::from_secs(5);
+    let remaining = deadline
+        .map(|at| at.saturating_duration_since(std::time::Instant::now()))
+        .unwrap_or(maximum)
+        .min(maximum);
+    conn.busy_timeout(remaining)?;
+    Ok(())
+}
+
 fn open_database(path: &Path) -> Result<Connection, HostOperationError> {
+    open_database_with_deadline(path, None)
+}
+
+fn open_database_with_deadline(
+    path: &Path,
+    deadline: Option<std::time::Instant>,
+) -> Result<Connection, HostOperationError> {
     let parent = path
         .parent()
         .ok_or(HostOperationError::StateDirectoryUnavailable)?;
     create_private_directory(parent)?;
     let conn = Connection::open(path)?;
     protect(path, false)?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    configure_database_wait(&conn, deadline)?;
     conn.pragma_update(None, "journal_mode", "wal")?;
     conn.pragma_update(None, "synchronous", "FULL")?;
     conn.execute_batch(SCHEMA)?;
@@ -312,7 +399,15 @@ fn open_database(path: &Path) -> Result<Connection, HostOperationError> {
         [],
         |row| row.get(0),
     )?;
-    if version != SCHEMA_VERSION {
+    if version == 1 {
+        // The row shape stays compatible, but v1 writers do not understand
+        // parent/resource crash barriers. Their existing version check must
+        // fence future writes before scoped Git coordination is enabled.
+        conn.execute(
+            "UPDATE meta SET value=?1 WHERE key='schema_version' AND value=1",
+            [SCHEMA_VERSION],
+        )?;
+    } else if version != SCHEMA_VERSION {
         return Err(HostOperationError::UnsupportedSchema(version));
     }
     Ok(conn)
@@ -321,13 +416,21 @@ fn open_database(path: &Path) -> Result<Connection, HostOperationError> {
 fn recover_or_block(conn: &Connection, remote_key: &str) -> Result<(), HostOperationError> {
     let mut stmt = conn.prepare(
         "SELECT operation_id, status FROM host_operations
-         WHERE remote_key=?1 AND status IN ('prepared', 'running', 'outcome_unknown')
+         WHERE (remote_key=?1 OR remote_key=?2
+           OR (?2 IS NULL AND substr(remote_key, 1, length(?1 || '::git-ref/')) = ?1 || '::git-ref/'))
+           AND status IN ('prepared', 'running', 'outcome_unknown')
          ORDER BY created_at, operation_id",
     )?;
     let rows = stmt
-        .query_map([remote_key], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
+        .query_map(
+            params![
+                remote_key,
+                remote_key
+                    .split_once("::git-ref/")
+                    .map(|(parent, _)| parent)
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?
         .collect::<Result<Vec<_>, _>>()?;
     drop(stmt);
     for (operation_id, status) in rows {
@@ -540,5 +643,143 @@ mod tests {
         assert!(json.contains("github.com/team/repo"));
         assert!(!json.contains('@'));
         assert!(!json.contains("://"));
+    }
+    #[test]
+    fn scoped_host_lanes_coexist_but_deadline_bound_wide_writer_waits() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("host-operations.db");
+        let base = "github.com/team/repo";
+        let first = HostOperationGuard::begin_with_deadline(
+            &database,
+            &format!("{base}::git-ref/refs/heads/main"),
+            OperationProvider::Git,
+            OperationEffect::Write,
+            Some(std::time::Instant::now()),
+        )
+        .unwrap();
+        let second = HostOperationGuard::begin_with_deadline(
+            &database,
+            &format!("{base}::git-ref/refs/heads/topic"),
+            OperationProvider::Git,
+            OperationEffect::Write,
+            Some(std::time::Instant::now()),
+        )
+        .unwrap();
+        let wide = HostOperationGuard::begin_with_deadline(
+            &database,
+            base,
+            OperationProvider::Git,
+            OperationEffect::Write,
+            Some(std::time::Instant::now()),
+        );
+        assert!(matches!(wide, Err(HostOperationError::LockDeadline { .. })));
+        drop(first);
+        drop(second);
+        HostOperationGuard::begin_with_deadline(
+            &database,
+            base,
+            OperationProvider::Git,
+            OperationEffect::Write,
+            Some(std::time::Instant::now()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unknown_scoped_host_write_fences_wide_but_not_unrelated_ref() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("host-operations.db");
+        let base = "github.com/team/repo";
+        let mut first = HostOperationGuard::begin(
+            &database,
+            &format!("{base}::git-ref/refs/heads/main"),
+            OperationProvider::Git,
+            OperationEffect::Write,
+        )
+        .unwrap();
+        first.mark_running().unwrap();
+        let id = first.operation().operation_id.clone();
+        drop(first);
+        let error = HostOperationGuard::begin_with_deadline(
+            &database,
+            base,
+            OperationProvider::Git,
+            OperationEffect::Write,
+            Some(std::time::Instant::now()),
+        );
+        assert!(
+            matches!(error, Err(HostOperationError::Blocked { operation_id, .. }) if operation_id == id)
+        );
+        let other = HostOperationGuard::begin_with_deadline(
+            &database,
+            &format!("{base}::git-ref/refs/heads/other"),
+            OperationProvider::Git,
+            OperationEffect::Write,
+            Some(std::time::Instant::now()),
+        )
+        .unwrap();
+        drop(other);
+        assert_eq!(
+            host_operation(&database, &id).unwrap().unwrap().status,
+            OperationStatus::OutcomeUnknown
+        );
+    }
+
+    #[test]
+    fn host_v1_adoption_preserves_wide_unknown_and_fences_old_version_check() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("host-operations.db");
+        let connection = Connection::open(&database).unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute(
+                "INSERT INTO host_operations (operation_id, remote_key, provider, effect,
+            status, holder_pid, created_at, updated_at) VALUES ('legacy', 'github.com/team/repo',
+            'git', 'write', 'outcome_unknown', 123, 1, 1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let result = HostOperationGuard::begin_with_deadline(
+            &database,
+            "github.com/team/repo::git-ref/refs/heads/main",
+            OperationProvider::Git,
+            OperationEffect::Write,
+            Some(std::time::Instant::now()),
+        );
+        assert!(
+            matches!(result, Err(HostOperationError::Blocked { operation_id, .. }) if operation_id == "legacy")
+        );
+        let connection = Connection::open(&database).unwrap();
+        let version: i64 = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_ne!(
+            version, 1,
+            "the old runtime's exact-version check must refuse future writes"
+        );
+        assert_eq!(
+            host_operation(&database, "legacy").unwrap().unwrap().status,
+            OperationStatus::OutcomeUnknown
+        );
+    }
+    #[test]
+    fn host_sqlite_wait_does_not_receive_a_fresh_five_second_budget() {
+        let connection = Connection::open_in_memory().unwrap();
+        configure_database_wait(&connection, Some(std::time::Instant::now())).unwrap();
+        let milliseconds: i64 = connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(milliseconds, 0);
+        configure_database_wait(&connection, None).unwrap();
+        let milliseconds: i64 = connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(milliseconds, 5000);
     }
 }

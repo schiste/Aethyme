@@ -2,6 +2,74 @@
 
 use super::*;
 
+#[derive(Debug, serde::Serialize)]
+struct SharedEditOwnerGroup {
+    session_id: i64,
+    owner_status: crate::SessionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_context: Option<String>,
+    owner_worktree: String,
+    claims: Vec<SharedEditOwnerClaim>,
+    safe_next_actions: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SharedEditOwnerClaim {
+    requested_path: String,
+    lease_path: String,
+    relation: crate::LeaseOverlapRelation,
+    kind: crate::LeaseKind,
+    expires_at: Option<i64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CoordinationHistoryDrilldown {
+    loaded: bool,
+    release_requests_command: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes_command: Option<String>,
+}
+
+fn shared_edit_owner_groups(report: &crate::LeasePlan) -> Vec<SharedEditOwnerGroup> {
+    let mut groups = std::collections::BTreeMap::new();
+    for path in &report.paths {
+        for overlap in &path.conflicts {
+            let owner = groups
+                .entry(overlap.session_id)
+                .or_insert_with(|| SharedEditOwnerGroup {
+                    session_id: overlap.session_id,
+                    owner_status: overlap.owner_status,
+                    owner_context: overlap.owner_context.clone(),
+                    owner_worktree: overlap.owner_worktree.clone(),
+                    claims: Vec::new(),
+                    safe_next_actions: Vec::new(),
+                });
+            owner.claims.push(SharedEditOwnerClaim {
+                requested_path: path.path.clone(),
+                lease_path: overlap.path.clone(),
+                relation: overlap.relation,
+                kind: overlap.kind,
+                expires_at: overlap.expires_at,
+            });
+            for action in &overlap.safe_next_actions {
+                if !owner.safe_next_actions.contains(action) {
+                    owner.safe_next_actions.push(action.clone());
+                }
+            }
+        }
+    }
+    groups.into_values().collect()
+}
+
+fn coordination_history_drilldown(session_id: Option<i64>) -> CoordinationHistoryDrilldown {
+    CoordinationHistoryDrilldown {
+        loaded: false,
+        release_requests_command: "aethyme broker status --json",
+        notes_command: session_id
+            .map(|id| format!("aethyme broker advanced note list --session {id}")),
+    }
+}
+
 pub(super) fn render_lease_plan(report: &crate::LeasePlan, json: bool) -> Result<(), UsageError> {
     if json {
         out!("{}", serde_json::to_string_pretty(report)?);
@@ -50,6 +118,46 @@ pub(super) fn render_lease_plan(report: &crate::LeasePlan, json: bool) -> Result
         if path.owned.is_empty() && path.conflicts.is_empty() {
             out!("  no active overlaps");
         }
+    }
+    let owners = shared_edit_owner_groups(report);
+    if !owners.is_empty() {
+        out!("Shared edit owners (grouped from this lease snapshot):");
+        for owner in owners {
+            let context = owner
+                .owner_context
+                .as_deref()
+                .map(|value| format!(" [{value}]"))
+                .unwrap_or_default();
+            out!(
+                "  session {} — {}{} at {}",
+                owner.session_id,
+                owner.owner_status.as_str(),
+                context,
+                owner.owner_worktree
+            );
+            for claim in &owner.claims {
+                out!(
+                    "    requested {} overlaps {} {} {} lease (expires {})",
+                    claim.requested_path,
+                    match claim.relation {
+                        crate::LeaseOverlapRelation::Exact => "exact",
+                        crate::LeaseOverlapRelation::Directory => "directory",
+                    },
+                    claim.kind.as_str(),
+                    claim.lease_path,
+                    claim
+                        .expires_at
+                        .map(|expiry| expiry.to_string())
+                        .unwrap_or_else(|| "never".to_string()),
+                );
+            }
+            for action in &owner.safe_next_actions {
+                out!("    next: {action}");
+            }
+        }
+        out!(
+            "  Coordination history was not loaded: inspect `aethyme broker status --json` for release requests and `aethyme broker advanced note list --session <id>` for messages."
+        );
     }
     Ok(())
 }
@@ -335,6 +443,20 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
             };
             if parsed.json {
                 let mut value = serde_json::to_value(&report)?;
+                value
+                    .as_object_mut()
+                    .expect("lease plan is an object")
+                    .insert(
+                        "shared_edit_owners".into(),
+                        serde_json::to_value(shared_edit_owner_groups(&report))?,
+                    );
+                value
+                    .as_object_mut()
+                    .expect("lease plan is an object")
+                    .insert(
+                        "coordination_history".into(),
+                        serde_json::to_value(coordination_history_drilldown(parsed.session))?,
+                    );
                 if let Some(coverage) = coverage {
                     value
                         .as_object_mut()
@@ -1072,4 +1194,85 @@ pub(super) fn run_ownership(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn planned_path(
+        requested_path: &str,
+        lease_path: &str,
+        relation: crate::LeaseOverlapRelation,
+        action: &str,
+    ) -> crate::LeasePathPlan {
+        crate::LeasePathPlan {
+            path: requested_path.into(),
+            owned: Vec::new(),
+            conflicts: vec![crate::LeasePlanOverlap {
+                relation,
+                session_id: 7,
+                path: lease_path.into(),
+                kind: crate::LeaseKind::Explicit,
+                expires_at: None,
+                owner_status: crate::SessionStatus::Active,
+                owner_worktree: "/worktrees/owner".into(),
+                owner_activity_at: 123,
+                owner_pid_alive: Some(true),
+                owner_context: Some("repo / task".into()),
+                liveness: None,
+                liveness_evidence: None,
+                safe_next_actions: vec![action.into()],
+            }],
+            would_conflict: true,
+        }
+    }
+
+    #[test]
+    fn lease_plan_groups_shared_owners_without_loading_history() {
+        let action = "aethyme broker advanced note send --to-session 7 --message <reason>";
+        let plan = crate::LeasePlan {
+            session_id: Some(5),
+            paths: vec![
+                planned_path(
+                    "src/a.rs",
+                    "src/a.rs",
+                    crate::LeaseOverlapRelation::Exact,
+                    action,
+                ),
+                planned_path(
+                    "src/b.rs",
+                    "src/",
+                    crate::LeaseOverlapRelation::Directory,
+                    action,
+                ),
+            ],
+            would_conflict: true,
+        };
+
+        let owners = shared_edit_owner_groups(&plan);
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].session_id, 7);
+        assert_eq!(owners[0].claims.len(), 2);
+        assert_eq!(owners[0].safe_next_actions, vec![action]);
+        assert_eq!(owners[0].claims[0].requested_path, "src/a.rs");
+        assert_eq!(owners[0].claims[0].lease_path, "src/a.rs");
+        assert_eq!(owners[0].claims[1].requested_path, "src/b.rs");
+        assert_eq!(owners[0].claims[1].lease_path, "src/");
+        let encoded = serde_json::to_value(&owners).unwrap();
+        assert_eq!(encoded[0]["owner_status"], "active");
+        assert_eq!(encoded[0]["claims"][1]["relation"], "directory");
+        assert_eq!(encoded[0]["safe_next_actions"][0], action);
+
+        let history = serde_json::to_value(coordination_history_drilldown(Some(5))).unwrap();
+        assert_eq!(history["loaded"], false);
+        assert_eq!(
+            history["release_requests_command"],
+            "aethyme broker status --json"
+        );
+        assert_eq!(
+            history["notes_command"],
+            "aethyme broker advanced note list --session 5"
+        );
+    }
 }

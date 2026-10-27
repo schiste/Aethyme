@@ -214,12 +214,21 @@ fn an_operation_waiting_for_the_lock_is_visible_as_prepared() {
                         && operation["authorization_reason"] == "queue behind the holder"
                 })
                 .expect("the waiting operation was found above");
-            let details: serde_json::Value = serde_json::from_str(
-                waiting["details_json"]
+            // Prepared is visible before the first lock attempt. Wait until
+            // contention has actually been observed and annotated.
+            let Some(details_json) = waiting["details_json"].as_str() else {
+                continue;
+            };
+            let details: serde_json::Value = serde_json::from_str(details_json).unwrap();
+            if details["coordination_wait"].is_null() {
+                continue;
+            }
+            assert!(
+                details["coordination_wait"]["blocked_scope"]
                     .as_str()
-                    .expect("waiting operation carries details"),
-            )
-            .unwrap();
+                    .is_some_and(|scope| scope.starts_with("git-common:")),
+                "the actual first blocking lane must be reported: {details}"
+            );
             assert_eq!(
                 details["coordination_wait"]["reason"],
                 "repository_write_lock"

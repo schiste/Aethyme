@@ -62,6 +62,14 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   before adding regressions. Integration tests cannot call crate-private APIs.
   Preserve optional-value types in assertions; a compile failure supplies no
   runtime test evidence and needlessly repeats the remote validation cycle.
+- For Rust compile review, trace the actual `mod` declarations, including
+  `#[path]`, and item visibility from each use site; filenames alone do not
+  establish module namespaces or sibling access.
+- Check newly emitted next-action commands against the public CLI resolver,
+  including product diagnostics, harness argv, and mirrored skills. Internal
+  broker help can contain legacy spellings that are rewritten at the public
+  boundary. Audit the whole changed batch after a spelling failure; fixing
+  the first reported caller does not establish that other scan groups pass.
 - Validate a command's complete action, arity, and required confirmation before
   opening broker state or scanning host or worktree inventories. Add a CLI
   regression that checks the structured refusal and confirms no repository or
@@ -90,6 +98,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   wall time, workload and binary identity, and raw samples. Do not equate an
   internal phase or coordinated-operation interval with end-to-end or network
   time. Use the existing non-gating performance workflow before adding builds.
+- For broker performance fixtures, command success is not enough: assert the
+  intended production profile with its recorded operation/profile witness and
+  verify the exact expected effects. A successful broad fallback is a
+  different scenario, not evidence for a narrow-path optimization. Validate
+  semantic results and source, binary, and fixture provenance before comparing
+  timings; unsupported or mismatched profiles, incomplete output, and missing
+  witnesses are unavailable samples, never eligible timings.
 - When investigating Git worktreeConfig migration, stage config.worktree files
   with explicit config --file paths before enabling the extension. Before enable,
   config --worktree can write shared local config in a single checkout; installed
@@ -644,6 +659,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   waiter/holder relationships, pending operations and help snapshots in the
   focused selection. Test bounded output with explicit omission counts; a
   smaller display must still surface the coordination state callers need.
+- For human-facing previews containing repository-derived text, escape terminal
+  control characters, including ESC, in content, paths and metadata. Preserve
+  newline or tab only when it is intentional display structure, not in data
+  fields. Apply byte caps after escaping and label raw-source hashes separately
+  from the transformed preview.
 - For CLI JSON stream tests, parse complete stdout as one JSON value and
   check child output on the intended stream separately. Include both stdout
   and stderr in subprocess failure assertions: a structured refusal can be

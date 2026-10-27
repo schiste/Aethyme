@@ -717,6 +717,11 @@ fn migration_diff_is_exact_local_and_separate_from_json() {
     let text = String::from_utf8(rendered.stdout).unwrap();
     let plan_digest = plan["plan_digest"].as_str().unwrap();
     assert!(text.contains(&format!("Plan SHA-256: {plan_digest}")));
+    assert!(text.contains("escaped bytes shown from"));
+    assert!(text.contains(&format!(
+        "SHA-256 (raw) {}",
+        plan["diff_sha256"].as_str().unwrap()
+    )));
     assert!(text.contains("diff --git a/"));
     assert!(!text.contains(repo.to_string_lossy().as_ref()));
     let patch = text.split_once("Migration diff:\n").unwrap().1;
