@@ -4,6 +4,28 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.41] - 2026-10-27
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0841).
+
+### Added
+
+- `aethyme broker commit --session <id> -- <git-commit-args>` runs a local commit under its session lock, preserving Git hooks and ownership checks without holding the repository-wide operation lock throughout the hooks. Existing `broker advanced git` behavior is unchanged.
+- Installation health diagnostics explain when a private host-state override separates host resource leases and capacity from other installations.
+- Session-start diagnostics identify when the running CLI build differs from PATH's selected router and list other known installation roots without executing their binaries.
+
+### Fixed
+
+- Unattended worktree cleanup and finish recovery bind ownership to a random generation marker created with the checkout. A replacement directory cannot inherit deletion authority merely by reusing the former directory's device and inode. Missing or changed markers retain the checkout.
+- Orphan checkout removal preserves unexpected files, links and modified tracked content rather than treating lost Git metadata as permission to delete arbitrary residue.
+- Shared-cache discovery bounds its search for an eligible owned cache; unrelated or foreign entries do not grant cache ownership.
+- Unknown-operation guidance names the original operation to inspect and reconcile, rather than the currently blocked request.
+- Release manifest and Homebrew helpers are built alongside the Linux binaries and handed to the attach job with source and checksum checks, avoiding a second cold helper build.
+
+### Internal
+
+- Adds managed-service lifecycle groundwork; automatic service teardown and the complete managed-service controller remain unimplemented.
+
 ## [0.8.40] - 2026-10-27
 
 **Breaking:** see [UPGRADING.md](UPGRADING.md#v0840).
