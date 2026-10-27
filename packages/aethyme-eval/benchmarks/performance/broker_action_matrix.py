@@ -662,6 +662,20 @@ def _fetch_profile_witness(payload, expected):
     }
 
 
+def _missing_fetch_witness_semantic(role, operation_id, duration_ms):
+    if role == 'candidate':
+        raise RuntimeError('candidate omitted durable strict-fetch completion evidence')
+    if role != 'baseline':
+        raise RuntimeError(f'unknown strict-fetch measurement role: {role}')
+    return {
+        'status': 'unsupported',
+        'reason': 'baseline completed the fetch but did not persist fetch_reconciliation schema 1',
+        'operation_id': operation_id,
+        'observed_command_duration_ms': duration_ms,
+        'comparison_eligible': False,
+    }
+
+
 def _run_provable_fetch(playground, sessions, timings, semantic, role):
     _validate_fixture_git_environment(playground['runner'].env)
     session = sessions['fetch_provable']
@@ -726,15 +740,8 @@ def _run_provable_fetch(playground, sessions, timings, semantic, role):
         'expected_args': ['fetch', *FETCH_FLAGS, '--', FETCH_REMOTE, refspec],
     })
     if witness is None:
-        if playground['role'] == 'candidate':
-            raise RuntimeError('candidate omitted durable strict-fetch completion evidence')
-        semantic['fetch_provable'] = {
-            'status': 'unsupported',
-            'reason': 'baseline completed the fetch but did not persist fetch_reconciliation schema 1',
-            'operation_id': operation['id'],
-            'observed_command_duration_ms': row['duration_ms'],
-            'comparison_eligible': False,
-        }
+        semantic['fetch_provable'] = _missing_fetch_witness_semantic(
+            role, operation['id'], row['duration_ms'])
     else:
         _record(timings, 'fetch_provable', row)
         semantic['fetch_provable'] = {

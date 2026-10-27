@@ -22,6 +22,7 @@ from broker_action_matrix import (
     _classify_deploy_preview,
     _compare_action,
     _fetch_profile_witness,
+    _missing_fetch_witness_semantic,
     _parse_deploy_preview,
     compare_samples,
     load_contracts,
@@ -328,6 +329,14 @@ class PairedActionMatrixTests(unittest.TestCase):
             }})
             with self.assertRaisesRegex(RuntimeError, 'exact completed profile'):
                 _fetch_profile_witness(payload, expected)
+
+    def test_missing_fetch_witness_is_only_an_unsupported_baseline_control(self):
+        baseline = _missing_fetch_witness_semantic('baseline', 11, 12.5)
+        self.assertEqual(baseline['status'], 'unsupported')
+        self.assertFalse(baseline['comparison_eligible'])
+        self.assertEqual(baseline['observed_command_duration_ms'], 12.5)
+        with self.assertRaisesRegex(RuntimeError, 'candidate omitted durable'):
+            _missing_fetch_witness_semantic('candidate', 11, 12.5)
 
     def test_v41_live_receipt_is_context_only_and_pins_both_executables(self):
         cli_hash = 'a' * 64
