@@ -638,6 +638,23 @@ impl Broker {
         &self,
         session_id: i64,
     ) -> Result<CleanupResolvePlan, BrokerOpError> {
+        self.cleanup_resolve_plan_with_limits(
+            session_id,
+            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+        )
+    }
+
+    fn cleanup_resolve_plan_with_limits(
+        &self,
+        session_id: i64,
+        status_output_bytes: usize,
+        status_path_fields: usize,
+        inventory_output_bytes: usize,
+        inventory_path_fields: usize,
+    ) -> Result<CleanupResolvePlan, BrokerOpError> {
         let refuse = |reason: String| BrokerOpError::CleanupResolveRefused {
             id: session_id,
             reason,
@@ -657,8 +674,13 @@ impl Broker {
             ));
         }
         let mut records = crate::measurement::SizeRecords::default();
-        let Some(item) =
-            self.cleanup_item_scanned(&session, crate::SizeScan::Recorded, &mut records)?
+        let Some(item) = self.cleanup_item_scanned_with_status_limits(
+            &session,
+            crate::SizeScan::Recorded,
+            &mut records,
+            status_output_bytes,
+            status_path_fields,
+        )?
         else {
             return Err(refuse(
                 "nothing is retained: its worktree and branch are already gone".into(),
@@ -722,8 +744,20 @@ impl Broker {
             (bytes, sha256_hex(&unstaged))
         };
 
+        let inventory_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let untracked_paths = checkout
+            .untracked_paths_until_with_limits(
+                inventory_deadline,
+                inventory_output_bytes,
+                inventory_path_fields,
+            )
+            .map_err(|error| {
+                refuse(format!(
+                    "could not completely list untracked archive paths: {error}"
+                ))
+            })?;
         let mut untracked_files = Vec::new();
-        for relative in checkout.untracked_paths()? {
+        for relative in untracked_paths {
             if relative.ends_with('/') {
                 return Err(refuse(format!(
                     "{relative} is a nested repository, which an archive of this checkout \
@@ -2890,6 +2924,57 @@ mod tests {
             discard_command: String::new(),
         };
         (tmp, repo, plan)
+    }
+
+    #[test]
+    fn incomplete_bounded_untracked_inventory_refuses_archive_plan_and_keeps_source() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        git(
+            &repository,
+            &["config", "user.name", "Archive inventory test"],
+        );
+        git(
+            &repository,
+            &["config", "user.email", "archive-inventory@example.invalid"],
+        );
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "README.md"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("bounded archive inventory", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        broker.close(session.id).unwrap();
+        let first = worktree.join("untracked-one.txt");
+        let second = worktree.join("untracked-two.txt");
+        std::fs::write(&first, "keep one\n").unwrap();
+        std::fs::write(&second, "keep two\n").unwrap();
+
+        let error = broker
+            .cleanup_resolve_plan_with_limits(session.id, 1024 * 1024, 16, 1024 * 1024, 1)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("could not completely list untracked archive paths"),
+            "an incomplete path inventory must refuse the archive plan: {error}"
+        );
+        assert!(
+            worktree.is_dir(),
+            "an incomplete inventory removed the checkout"
+        );
+        assert_eq!(std::fs::read(first).unwrap(), b"keep one\n");
+        assert_eq!(std::fs::read(second).unwrap(), b"keep two\n");
+        assert!(
+            !broker.recovery_archive_root().unwrap().exists(),
+            "planning with an incomplete inventory must not create an archive"
+        );
     }
 
     #[test]

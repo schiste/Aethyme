@@ -265,6 +265,10 @@ const MAX_GIT_BATCH_INPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_IGNORED_PATHS_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IGNORED_PATHS_ENTRIES: usize = 16_384;
 const MAX_IGNORED_PATH_BYTES: usize = 4_096;
+/// A cleanup status snapshot must fit in bounded memory. The path-field count
+/// includes the second NUL field emitted for a rename or copy.
+pub(crate) const MAX_CLEANUP_STATUS_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_CLEANUP_STATUS_PATH_FIELDS: usize = 16_384;
 /// Refuse recovery patches larger than this rather than buffering an
 /// unbounded diff in memory. The archive source remains untouched on refusal.
 const MAX_RECOVERY_PATCH_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
@@ -299,9 +303,19 @@ pub(crate) fn git_timeout() -> Duration {
 /// field. Preserve the established destination-path contract and consume both
 /// fields. Malformed output and non-UTF-8 paths refuse an ownership decision.
 fn parse_porcelain_entries_z(out: &[u8]) -> Result<Vec<([u8; 2], String)>, GitError> {
+    parse_porcelain_entries_z_with_path_limit(out, usize::MAX)
+}
+
+fn parse_porcelain_entries_z_with_path_limit(
+    out: &[u8],
+    max_path_fields: usize,
+) -> Result<Vec<([u8; 2], String)>, GitError> {
     const CODES: &[u8] = b" MTADRCU?!";
     let invalid = || GitError::UntrustedOutput {
         detail: "malformed or non-UTF-8 NUL-separated porcelain status".into(),
+    };
+    let over_limit = || GitError::UntrustedOutput {
+        detail: format!("git status returned more than {max_path_fields} path fields"),
     };
     if out.is_empty() {
         return Ok(Vec::new());
@@ -311,6 +325,7 @@ fn parse_porcelain_entries_z(out: &[u8]) -> Result<Vec<([u8; 2], String)>, GitEr
     }
     let mut fields = out[..out.len() - 1].split(|byte| *byte == 0);
     let mut entries = Vec::new();
+    let mut path_fields = 0usize;
     while let Some(record) = fields.next() {
         if record.len() < 4
             || record[2] != b' '
@@ -321,6 +336,10 @@ fn parse_porcelain_entries_z(out: &[u8]) -> Result<Vec<([u8; 2], String)>, GitEr
             return Err(invalid());
         }
         let path = std::str::from_utf8(&record[3..]).map_err(|_| invalid())?;
+        if path_fields >= max_path_fields {
+            return Err(over_limit());
+        }
+        path_fields += 1;
         let xy = [record[0], record[1]];
         if xy.iter().any(|code| matches!(code, b'R' | b'C')) {
             let source = fields
@@ -328,6 +347,10 @@ fn parse_porcelain_entries_z(out: &[u8]) -> Result<Vec<([u8; 2], String)>, GitEr
                 .filter(|source| !source.is_empty())
                 .ok_or_else(invalid)?;
             std::str::from_utf8(source).map_err(|_| invalid())?;
+            if path_fields >= max_path_fields {
+                return Err(over_limit());
+            }
+            path_fields += 1;
         }
         entries.push((xy, path.to_owned()));
     }
@@ -4758,27 +4781,19 @@ impl GitRepo {
         Ok((dirty, untracked))
     }
 
-    /// Whether every remaining non-ignored change is an unstaged deletion of
-    /// a tracked path, and each ignored path is disposable under the current
-    /// cleanup policy. This narrow state is used only to
-    /// resume an authenticated finish cleanup after Git has already removed
-    /// part of the worktree.
-    pub(crate) fn has_only_unstaged_tracked_deletions(
+    pub(crate) fn has_only_unstaged_tracked_deletions_until_with_limits(
         &self,
         policy: &crate::AutoCleanupPolicy,
+        deadline: Instant,
+        max_output_bytes: usize,
+        max_path_fields: usize,
     ) -> Result<bool, GitError> {
-        require_trustworthy_porcelain()?;
-        let entries = parse_porcelain_entries_z(&run_git_bytes(
-            &self.root,
-            &[
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=all",
-                "--ignored=matching",
-                "--ignore-submodules=none",
-            ],
-        )?)?;
+        let entries = self.cleanup_status_entries_until_with_limits(
+            deadline,
+            max_output_bytes,
+            max_path_fields,
+            true,
+        )?;
         Ok(only_unstaged_tracked_deletions(&entries, |path| {
             crate::auto_cleanup::classify_ignored(&self.root, path, policy).is_ok()
         }))
@@ -4945,6 +4960,102 @@ impl GitRepo {
         .filter(|(xy, _path)| *xy == [b'?', b'?'])
         .map(|(_xy, path)| path)
         .collect())
+    }
+
+    pub(crate) fn dirty_and_untracked_paths_until_with_limits(
+        &self,
+        deadline: Instant,
+        max_output_bytes: usize,
+        max_path_fields: usize,
+    ) -> Result<(Vec<String>, Vec<String>), GitError> {
+        let entries = self.cleanup_status_entries_until_with_limits(
+            deadline,
+            max_output_bytes,
+            max_path_fields,
+            false,
+        )?;
+        let mut dirty = Vec::with_capacity(entries.len());
+        let mut untracked = Vec::new();
+        for (status, path) in entries {
+            if status == [b'?', b'?'] {
+                untracked.push(path.clone());
+            }
+            dirty.push(path);
+        }
+        Ok((dirty, untracked))
+    }
+
+    fn cleanup_status_entries_until_with_limits(
+        &self,
+        deadline: Instant,
+        max_output_bytes: usize,
+        max_path_fields: usize,
+        include_matching_ignored: bool,
+    ) -> Result<Vec<([u8; 2], String)>, GitError> {
+        let mut args = vec![
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ];
+        if include_matching_ignored {
+            args.push("--ignored=matching");
+        }
+        let deadline = active_git_deadline().map_or(deadline, |active| active.min(deadline));
+        ensure_bounded_git_listing_before(deadline, &args)?;
+        if std::env::vars_os().any(|(key, _)| unsafe_graph_git_environment_key(&key)) {
+            return Err(GitError::UntrustedOutput {
+                detail: "inherited Git routing overrides make cleanup status unknown".into(),
+            });
+        }
+        require_trustworthy_porcelain()?;
+        ensure_bounded_git_listing_before(deadline, &args)?;
+        let mut command = ignored_paths_git_command(&self.root, &args);
+        let output =
+            run_git_process_output_limited(&mut command, &args, deadline, max_output_bytes)?;
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+
+        let entries = parse_porcelain_entries_z_with_path_limit(&output.stdout, max_path_fields)?;
+        ensure_bounded_git_listing_before(deadline, &args)?;
+        Ok(entries)
+    }
+
+    pub(crate) fn untracked_paths_until_with_limits(
+        &self,
+        deadline: Instant,
+        max_output_bytes: usize,
+        max_path_fields: usize,
+    ) -> Result<Vec<String>, GitError> {
+        self.dirty_and_untracked_paths_until_with_limits(
+            deadline,
+            max_output_bytes,
+            max_path_fields,
+        )
+        .map(|(_, untracked)| untracked)
+    }
+
+    pub(crate) fn is_dirty_until_with_limits(
+        &self,
+        deadline: Instant,
+        max_output_bytes: usize,
+        max_path_fields: usize,
+    ) -> Result<bool, GitError> {
+        self.dirty_and_untracked_paths_until_with_limits(
+            deadline,
+            max_output_bytes,
+            max_path_fields,
+        )
+        .map(|(dirty, _)| !dirty.is_empty())
     }
 
     /// A binary-safe patch of this checkout's staged (`cached`) or unstaged
@@ -5525,14 +5636,14 @@ impl GitRepo {
         ];
 
         let deadline = active_git_deadline().map_or(deadline, |active| active.min(deadline));
-        ensure_ignored_listing_before(deadline, ARGS)?;
+        ensure_bounded_git_listing_before(deadline, ARGS)?;
         if std::env::vars_os().any(|(key, _)| unsafe_graph_git_environment_key(&key)) {
             return Err(GitError::UntrustedOutput {
                 detail: "inherited Git routing overrides make ignored paths unknown".into(),
             });
         }
         require_trustworthy_porcelain()?;
-        ensure_ignored_listing_before(deadline, ARGS)?;
+        ensure_bounded_git_listing_before(deadline, ARGS)?;
         let mut command = ignored_paths_git_command(&self.root, ARGS);
         let output = run_git_process_output_limited(
             &mut command,
@@ -5549,11 +5660,11 @@ impl GitRepo {
 
         let raw_paths =
             parse_ignored_paths_with_cap(&output.stdout, ARGS, MAX_IGNORED_PATHS_ENTRIES)?;
-        ensure_ignored_listing_before(deadline, ARGS)?;
+        ensure_bounded_git_listing_before(deadline, ARGS)?;
 
         let mut entries = Vec::with_capacity(raw_paths.len());
         for mut raw in raw_paths {
-            ensure_ignored_listing_before(deadline, ARGS)?;
+            ensure_bounded_git_listing_before(deadline, ARGS)?;
 
             let directory_marker = raw.ends_with('/');
             if directory_marker {
@@ -5585,7 +5696,7 @@ impl GitRepo {
             });
         }
 
-        ensure_ignored_listing_before(deadline, ARGS)?;
+        ensure_bounded_git_listing_before(deadline, ARGS)?;
         Ok(entries)
     }
 }
@@ -5606,7 +5717,7 @@ fn ignored_paths_git_command(root: &Path, args: &[&str]) -> Command {
     command
 }
 
-fn ensure_ignored_listing_before(deadline: Instant, args: &[&str]) -> Result<(), GitError> {
+fn ensure_bounded_git_listing_before(deadline: Instant, args: &[&str]) -> Result<(), GitError> {
     if Instant::now() >= deadline {
         note_git_timeout();
         Err(GitError::TimedOut {
@@ -5744,7 +5855,7 @@ fn ignored_directory_is_real(
     let components = relative.split('/').collect::<Vec<_>>();
     let mut path = root.to_path_buf();
     for (index, component) in components.iter().enumerate() {
-        ensure_ignored_listing_before(deadline, args)?;
+        ensure_bounded_git_listing_before(deadline, args)?;
         path.push(component);
         let metadata = fs::symlink_metadata(&path).map_err(|source| GitError::UntrustedOutput {
             detail: format!(
@@ -6229,7 +6340,7 @@ mod path_line_tests {
 
 #[cfg(test)]
 mod porcelain_tests {
-    use super::parse_porcelain_entries_z;
+    use super::{parse_porcelain_entries_z, parse_porcelain_entries_z_with_path_limit};
 
     #[test]
     fn nul_status_preserves_literal_whitespace_quotes_and_arrows() {
@@ -6268,6 +6379,137 @@ mod porcelain_tests {
         );
         assert!(parse_porcelain_entries_z(b"R  new\0").is_err());
         assert!(parse_porcelain_entries_z(b"R  new\0\0").is_err());
+    }
+
+    #[test]
+    fn bounded_nul_status_counts_both_rename_path_fields() {
+        let out = b"R  new -> name\0old\nname\0?? later\0";
+        assert!(parse_porcelain_entries_z_with_path_limit(out, 2).is_err());
+        assert_eq!(
+            parse_porcelain_entries_z_with_path_limit(out, 3).unwrap(),
+            vec![(*b"R ", "new -> name".into()), (*b"??", "later".into())]
+        );
+    }
+}
+
+#[cfg(test)]
+mod bounded_cleanup_status_tests {
+    use super::{GitError, GitRepo};
+    use std::path::Path;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_status_preserves_unix_literal_names_and_refuses_partial_results() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(root.path().join("tracked.txt"), "base\n").unwrap();
+        git(root.path(), &["add", "tracked.txt"]);
+        git(root.path(), &["commit", "-qm", "initial"]);
+        std::fs::write(root.path().join("line\nbreak"), "one").unwrap();
+        std::fs::write(root.path().join("quote\"and->arrow"), "two").unwrap();
+        let repo = GitRepo::discover(root.path()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+
+        let (dirty, untracked) = repo
+            .dirty_and_untracked_paths_until_with_limits(deadline, 4096, 8)
+            .unwrap();
+        assert_eq!(dirty.len(), 2);
+        assert_eq!(untracked.len(), 2);
+        assert!(untracked.contains(&"line\nbreak".to_owned()));
+        assert!(untracked.contains(&"quote\"and->arrow".to_owned()));
+
+        let byte_error = repo
+            .dirty_and_untracked_paths_until_with_limits(deadline, 1, 8)
+            .unwrap_err();
+        assert!(matches!(byte_error, GitError::UntrustedOutput { .. }));
+
+        let path_error = repo
+            .dirty_and_untracked_paths_until_with_limits(deadline, 4096, 1)
+            .unwrap_err();
+        assert!(matches!(path_error, GitError::UntrustedOutput { .. }));
+    }
+
+    #[test]
+    fn bounded_status_refuses_partial_results_on_all_platforms() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(root.path().join("tracked.txt"), "base\n").unwrap();
+        git(root.path(), &["add", "tracked.txt"]);
+        git(root.path(), &["commit", "-qm", "initial"]);
+        std::fs::write(root.path().join("tracked.txt"), "changed\n").unwrap();
+        std::fs::write(root.path().join("untracked.txt"), "untracked").unwrap();
+
+        let repo = GitRepo::discover(root.path()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let byte_error = repo
+            .dirty_and_untracked_paths_until_with_limits(deadline, 1, 8)
+            .unwrap_err();
+        assert!(matches!(byte_error, GitError::UntrustedOutput { .. }));
+        let path_error = repo
+            .dirty_and_untracked_paths_until_with_limits(deadline, 4096, 1)
+            .unwrap_err();
+        assert!(matches!(path_error, GitError::UntrustedOutput { .. }));
+    }
+
+    #[test]
+    fn bounded_finish_status_keeps_matching_ignored_paths_in_its_proof() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            root.path().join(".gitignore"),
+            "/opaque-cache/\n/private.dat\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("tracked.txt"), "base\n").unwrap();
+        git(root.path(), &["add", "tracked.txt", ".gitignore"]);
+        git(root.path(), &["commit", "-qm", "initial"]);
+        std::fs::create_dir_all(root.path().join("opaque-cache")).unwrap();
+        std::fs::write(root.path().join("opaque-cache/output"), "discardable").unwrap();
+        std::fs::remove_file(root.path().join("tracked.txt")).unwrap();
+
+        let repo = GitRepo::discover(root.path()).unwrap();
+        let policy = crate::AutoCleanupPolicy::default();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        assert!(
+            repo.has_only_unstaged_tracked_deletions_until_with_limits(&policy, deadline, 4096, 8)
+                .unwrap()
+        );
+
+        let path_error = repo
+            .has_only_unstaged_tracked_deletions_until_with_limits(&policy, deadline, 4096, 1)
+            .unwrap_err();
+        assert!(matches!(path_error, GitError::UntrustedOutput { .. }));
+
+        std::fs::write(root.path().join("private.dat"), "preserve").unwrap();
+        assert!(
+            !repo
+                .has_only_unstaged_tracked_deletions_until_with_limits(&policy, deadline, 4096, 8)
+                .unwrap()
+        );
     }
 }
 
