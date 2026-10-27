@@ -361,6 +361,20 @@ fn valid_git_mode(field: &[u8]) -> bool {
     field.len() == 6 && field.iter().all(|byte| (b'0'..=b'7').contains(byte))
 }
 
+fn valid_tree_entry_mode_type(mode: &[u8], object_type: &[u8]) -> bool {
+    valid_git_mode(mode)
+        && match mode {
+            b"040000" => object_type == b"tree",
+            b"100644" | b"100755" | b"120000" => object_type == b"blob",
+            b"160000" => object_type == b"commit",
+            _ => false,
+        }
+}
+
+fn valid_index_entry_mode(mode: &[u8]) -> bool {
+    valid_git_mode(mode) && matches!(mode, b"100644" | b"100755" | b"120000" | b"160000")
+}
+
 fn valid_git_object_id(field: &[u8]) -> bool {
     matches!(field.len(), 40 | 64) && field.iter().all(u8::is_ascii_hexdigit)
 }
@@ -378,10 +392,8 @@ fn parse_tree_gitlinks(out: &[u8], args: &[&str]) -> Result<Vec<String>, GitErro
         let object_type = fields.next().ok_or_else(invalid)?;
         let object_id = fields.next().ok_or_else(invalid)?;
         if fields.next().is_some()
-            || !valid_git_mode(mode)
+            || !valid_tree_entry_mode_type(mode, object_type)
             || !valid_git_object_id(object_id)
-            || !matches!(object_type, b"blob" | b"tree" | b"commit")
-            || ((mode == b"160000") != (object_type == b"commit"))
         {
             return Err(invalid());
         }
@@ -409,7 +421,7 @@ fn parse_index_gitlinks(out: &[u8], args: &[&str]) -> Result<Vec<String>, GitErr
         let object_id = fields.next().ok_or_else(invalid)?;
         let stage = fields.next().ok_or_else(invalid)?;
         if fields.next().is_some()
-            || !valid_git_mode(mode)
+            || !valid_index_entry_mode(mode)
             || !valid_git_object_id(object_id)
             || !matches!(stage, b"0" | b"1" | b"2" | b"3")
         {
@@ -6333,6 +6345,8 @@ mod gitlink_census_tests {
         for out in [
             format!("160000 commit {oid}\tsub").into_bytes(),
             format!("160000 blob {oid}\tsub\0").into_bytes(),
+            format!("100644 tree {oid}\tregular.txt\0").into_bytes(),
+            format!("020000 blob {oid}\tunknown-mode\0").into_bytes(),
             invalid_tree_path,
         ] {
             assert!(parse_tree_gitlinks(&out, &["ls-tree"]).is_err(), "{out:?}");
@@ -6341,6 +6355,7 @@ mod gitlink_census_tests {
         invalid_index_path.extend_from_slice(&[0xff, 0]);
         for out in [
             format!("160000 {oid} 4\tsub\0").into_bytes(),
+            format!("040000 {oid} 0\tdirectory\0").into_bytes(),
             format!("160000 {oid} 2\tsub").into_bytes(),
             invalid_index_path,
         ] {
