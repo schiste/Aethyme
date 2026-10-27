@@ -2919,10 +2919,28 @@ impl HostResourceCoordinator {
         &self,
         request: &HostResourceRequest,
     ) -> Result<Option<HostResourceGrant>, HostResourceError> {
+        self.recover_request_inner(request, false)
+    }
+
+    // Keep supervised recovery internal until a durable service journal and
+    // recovery lock bind the caller. An exact request is identity, not a public
+    // capability to retrieve another controller's private ownership token.
+    fn recover_request_inner(
+        &self,
+        request: &HostResourceRequest,
+        supervised: bool,
+    ) -> Result<Option<HostResourceGrant>, HostResourceError> {
         validate_request(request)?;
-        let digest = request_digest(request)?;
-        let found = self
-            .conn
+        let digest = if supervised {
+            supervised_request_digest(request)?
+        } else {
+            request_digest(request)?
+        };
+        // Read identity, state, allocations and hold from one SQLite snapshot.
+        // Reconciliation may settle the grant concurrently; recovery must not
+        // combine a pre-settlement token with post-settlement hold observations.
+        let tx = self.conn.unchecked_transaction()?;
+        let found = tx
             .query_row(
                 "SELECT request_digest,ownership_token FROM resource_leases WHERE request_id=?1",
                 [&request.request_id],
@@ -2937,8 +2955,17 @@ impl HostResourceCoordinator {
                 request.request_id.clone(),
             ));
         }
-        let lease = load_lease(&self.conn, "request_id", &request.request_id)?
+        let lease = load_lease(&tx, "request_id", &request.request_id)?
             .ok_or_else(|| HostResourceError::LeaseNotFound(request.request_id.clone()))?;
+        if supervised
+            && lease.state != HostLeaseState::Released
+            && !has_supervised_capacity_hold(&tx, &lease.lease_id, lease.generation)?
+        {
+            return Err(HostResourceError::InvalidRequest(
+                "supervised recovery requires its generation-bound hold".into(),
+            ));
+        }
+        tx.commit()?;
         Ok(Some(HostResourceGrant {
             lease,
             ownership_token: token,
@@ -7408,6 +7435,228 @@ mod tests {
         ));
         assert!(!environment_prepared);
         assert!(!child_marker.exists());
+    }
+
+    // Include SQLite's connection-local write counter as well as the public
+    // inventory: recovery may not silently renew or mutate a hidden hold.
+    fn recovery_snapshot(
+        coordinator: &HostResourceCoordinator,
+    ) -> (Vec<HostResourceLease>, i64, i64, i64) {
+        (
+            coordinator.list(true).unwrap(),
+            coordinator
+                .conn
+                .query_row("SELECT value FROM meta WHERE key='generation'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+            coordinator
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM resource_supervised_capacity_holds",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            coordinator
+                .conn
+                .query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn supervised_recovery_after_reopen_preserves_the_exact_grant_without_writes() {
+        let t = tempfile::tempdir().unwrap();
+        let database = t.path().join("h.db");
+        let request = capacity_request(
+            "recover-supervised",
+            "workers",
+            1,
+            1,
+            Some(std::process::id()),
+        );
+        let mut coordinator = HostResourceCoordinator::open(&database).unwrap();
+        let original = coordinator.acquire_inner(&request, true).unwrap();
+        drop(coordinator);
+        let coordinator = HostResourceCoordinator::open(&database).unwrap();
+        let before = recovery_snapshot(&coordinator);
+        for _ in 0..2 {
+            assert_eq!(
+                coordinator.recover_request_inner(&request, true).unwrap(),
+                Some(original.clone())
+            );
+            assert_eq!(recovery_snapshot(&coordinator), before);
+        }
+    }
+
+    #[test]
+    fn supervised_recovery_requires_the_exact_request_and_digest_mode() {
+        let t = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let request =
+            capacity_request("supervised-mode", "workers", 1, 2, Some(std::process::id()));
+        coordinator.acquire_inner(&request, true).unwrap();
+        let before = recovery_snapshot(&coordinator);
+        assert!(matches!(
+            coordinator.recover_request(&request),
+            Err(HostResourceError::IdempotencyMismatch(_))
+        ));
+        let mut changed = request.clone();
+        changed.run_id.push_str("-different");
+        assert!(matches!(
+            coordinator.recover_request_inner(&changed, true),
+            Err(HostResourceError::IdempotencyMismatch(_))
+        ));
+        assert_eq!(recovery_snapshot(&coordinator), before);
+        assert!(matches!(
+            coordinator.acquire_inner(&request, true),
+            Err(HostResourceError::RequestNotActive { .. })
+        ));
+
+        let ordinary = capacity_request(
+            "ordinary-mode",
+            "ordinary-workers",
+            1,
+            2,
+            Some(std::process::id()),
+        );
+        let grant = coordinator.acquire(&ordinary).unwrap();
+        let before = recovery_snapshot(&coordinator);
+        assert!(matches!(
+            coordinator.recover_request_inner(&ordinary, true),
+            Err(HostResourceError::IdempotencyMismatch(_))
+        ));
+        assert_eq!(coordinator.recover_request(&ordinary).unwrap(), Some(grant));
+        assert_eq!(recovery_snapshot(&coordinator), before);
+    }
+
+    #[test]
+    fn supervised_recovery_of_a_missing_request_does_not_acquire() {
+        let t = tempfile::tempdir().unwrap();
+        let coordinator = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let request = capacity_request("never-admitted", "workers", 1, 1, None);
+        let before = recovery_snapshot(&coordinator);
+        assert_eq!(
+            coordinator.recover_request_inner(&request, true).unwrap(),
+            None
+        );
+        assert_eq!(coordinator.recover_request(&request).unwrap(), None);
+        assert_eq!(recovery_snapshot(&coordinator), before);
+    }
+
+    #[test]
+    fn supervised_recovery_preserves_quarantine_and_does_not_release_capacity() {
+        let t = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let request = capacity_request(
+            "quarantined-recovery",
+            "workers",
+            1,
+            1,
+            Some(std::process::id()),
+        );
+        let original = coordinator.acquire_inner(&request, true).unwrap();
+        coordinator
+            .quarantine(
+                &original.lease.lease_id,
+                original.lease.generation,
+                &original.ownership_token,
+            )
+            .unwrap();
+        let before = recovery_snapshot(&coordinator);
+        let recovered = coordinator
+            .recover_request_inner(&request, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.lease.state, HostLeaseState::Quarantined);
+        assert_eq!(recovered.lease.lease_id, original.lease.lease_id);
+        assert_eq!(recovered.lease.generation, original.lease.generation);
+        assert_eq!(recovered.ownership_token, original.ownership_token);
+        assert_eq!(recovery_snapshot(&coordinator), before);
+        assert!(matches!(
+            coordinator.release(
+                &recovered.lease.lease_id,
+                recovered.lease.generation,
+                &recovered.ownership_token
+            ),
+            Err(HostResourceError::InvalidRequest(_))
+        ));
+        let contender = capacity_request(
+            "recovery-contender",
+            "workers",
+            1,
+            1,
+            Some(std::process::id()),
+        );
+        assert!(!coordinator.plan(&contender).unwrap().available);
+    }
+
+    #[test]
+    fn supervised_recovery_returns_terminal_history_without_reactivating_it() {
+        let t = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let request = capacity_request(
+            "terminal-recovery",
+            "workers",
+            1,
+            1,
+            Some(std::process::id()),
+        );
+        let original = coordinator.acquire_inner(&request, true).unwrap();
+        let terminal = coordinator
+            .release_supervised_verified(
+                &original.lease.lease_id,
+                original.lease.generation,
+                &original.ownership_token,
+            )
+            .unwrap();
+        let before = recovery_snapshot(&coordinator);
+        let recovered = coordinator
+            .recover_request_inner(&request, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.lease, terminal);
+        assert_eq!(recovered.lease.state, HostLeaseState::Released);
+        assert_eq!(recovered.ownership_token, original.ownership_token);
+        assert_eq!(recovery_snapshot(&coordinator), before);
+        assert!(matches!(
+            coordinator.acquire_inner(&request, true),
+            Err(HostResourceError::RequestNotActive { .. })
+        ));
+    }
+
+    #[test]
+    fn supervised_recovery_refuses_a_missing_or_wrong_generation_hold() {
+        for wrong_generation in [false, true] {
+            let t = tempfile::tempdir().unwrap();
+            let mut coordinator = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+            let request = capacity_request(
+                "corrupt-recovery",
+                "workers",
+                1,
+                1,
+                Some(std::process::id()),
+            );
+            let grant = coordinator.acquire_inner(&request, true).unwrap();
+            // Deliberately corrupt only this isolated fixture's private hold.
+            if wrong_generation {
+                coordinator.conn.execute("UPDATE resource_supervised_capacity_holds SET generation=generation+1 WHERE lease_id=?1", [&grant.lease.lease_id]).unwrap();
+            } else {
+                coordinator
+                    .conn
+                    .execute(
+                        "DELETE FROM resource_supervised_capacity_holds WHERE lease_id=?1",
+                        [&grant.lease.lease_id],
+                    )
+                    .unwrap();
+            }
+            let before = recovery_snapshot(&coordinator);
+            assert!(
+                matches!(coordinator.recover_request_inner(&request, true), Err(HostResourceError::InvalidRequest(message)) if message == "supervised recovery requires its generation-bound hold")
+            );
+            assert_eq!(recovery_snapshot(&coordinator), before);
+        }
     }
 
     #[test]

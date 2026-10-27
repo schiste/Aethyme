@@ -126,6 +126,7 @@ pub mod local_target;
 pub mod local_wave;
 mod main_drift;
 pub mod main_reconcile;
+pub mod managed_services;
 mod measurement;
 mod merge;
 mod merge_chain;
