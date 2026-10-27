@@ -6156,6 +6156,18 @@ mod tests {
         let layout = StorageRootLayout::KeyedContainer(fixture.storage_root.clone());
         let roots = storage_root_entries(&fixture.storage_root, &layout).unwrap();
         assert_eq!(roots, vec![fixture.placement_root.clone()]);
+        let bounded_marker_bytes = crate::preparation::read_bounded_regular_file_for_liveness(
+            &fixture.placement_root.join(WORKTREE_ROOT_MARKER),
+            WORKTREE_ROOT_MARKER_MAX_BYTES,
+            Instant::now() + WORKTREE_CACHE_ROOT_DISCOVERY_BUDGET,
+        )
+        .unwrap()
+        .expect("the fixture has a readable bounded placement marker");
+        let bounded_marker: WorktreeRootMarker =
+            serde_json::from_slice(&bounded_marker_bytes).unwrap();
+        assert_eq!(bounded_marker, fixture.marker);
+        assert_eq!(bounded_marker.schema_version, WORKTREE_ROOT_SCHEMA_VERSION);
+        assert!(!bounded_marker.repository_key.is_empty());
         let invoking_repository = ThisRepository::observe(&fixture.invoking_root).unwrap();
         let marker_root = normalise(&fixture.marker.repository_root);
         let foreign_repository = GitRepo::discover(&fixture.marker.repository_root).unwrap();
