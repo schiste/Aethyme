@@ -342,7 +342,7 @@ fn executor_parent_restart_helper() {
     let g2 = f.prepare("new").unwrap();
     let a = agent(&mut f);
     let r1 = request(&mut f, &a, &g1, "old-command").unwrap();
-    let mut old=launch(&mut f,&a,&r1,shell("exec 3>open-child.txt; (sleep 2; printf late >&3; cat .git/HEAD > watcher-read.txt) >/dev/null 2>&1 & printf launched > child-launched.txt")).unwrap();
+    let mut old=launch(&mut f,&a,&r1,shell("exec 3>open-child.txt; (sleep 2; printf late >&3; cat .git/HEAD > watcher-read.tmp && mv watcher-read.tmp watcher-read.txt) >/dev/null 2>&1 & printf launched > child-launched.txt")).unwrap();
     assert_eq!(finish(&mut f, &a, &mut old), Completion::Current(0));
     assert!(!g1.absolute_root().join("watcher-read.txt").exists());
     drop(a);
