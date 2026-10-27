@@ -1,4 +1,5 @@
 """Offline controls for the synthetic concurrent-submit diagnostic; no broker calls."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,7 @@ from broker_concurrent_submit import (
     deterministic_payload,
     make_env,
     output_tree_size,
+    redact_captured_output,
     parse_trace2,
     scenario_fixture,
     setup_scenario,
@@ -272,6 +274,41 @@ class BoundedProcessTests(unittest.TestCase):
         self.assertEqual(row['stderr'], 'err\n')
         self.assertTrue(row['stdout_complete'])
         self.assertEqual(row['exit_code'], 0)
+
+    def test_named_output_redaction_preserves_raw_hashes_and_never_persists_secret(self):
+        secret = 'private-' + 'token-12345'
+        code = (
+            'import os; value="private-" + "token-12345"; '
+            'os.write(1, value.encode()); os.write(2, value.encode())'
+        )
+        row = self.runner.run([sys.executable, '-c', code], self.root,
+                              'redacted-output', redact_values=(secret,))
+        raw = secret.encode()
+        saved = self.receipts.path.read_bytes()
+        self.assertNotIn(secret.encode(), saved)
+        self.assertEqual(row['stdout'], '[redacted sensitive value]')
+        self.assertEqual(row['stderr'], '[redacted sensitive value]')
+        self.assertEqual(row['stdout_bytes'], len(raw))
+        self.assertEqual(row['stderr_bytes'], len(raw))
+        self.assertEqual(row['stdout_sha256'], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(row['stderr_sha256'], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(row['redacted_value_occurrences'], 2)
+
+    def test_runner_marks_invalid_utf8_from_original_stdout_bytes(self):
+        row = self.runner.run(
+            [sys.executable, '-c', 'import os; os.write(1, b"\\xed\\xa0\\x80")'],
+            self.root, 'invalid-utf8-output')
+        self.assertFalse(row['stdout_utf8_valid'])
+        self.assertEqual(row['stdout_bytes'], 3)
+        self.assertEqual(len(row['stdout'].encode('utf-8')), 3)
+
+    def test_byte_redaction_rejects_invalid_or_missing_token_inputs(self):
+        self.assertEqual(redact_captured_output(b'a-secret-b', b'secret', ('secret',)),
+                         (b'a-[redacted sensitive value]-b',
+                          b'[redacted sensitive value]', 2))
+        for values in (None, ('',), (b'secret',)):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                redact_captured_output(b'', b'', values)
 
     def test_output_limit_refuses_and_records_bounded_failure(self):
         code = (f'import sys, time; sys.stdout.write("x" * {MAX_STDOUT_BYTES + 1}); '
