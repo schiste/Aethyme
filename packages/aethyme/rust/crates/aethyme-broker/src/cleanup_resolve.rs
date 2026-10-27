@@ -97,8 +97,10 @@ pub struct ArchivedFile {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CleanupResolvePlan {
     pub schema_version: u32,
-    /// Binds the head, delivery targets, patches, untracked files, ignored
-    /// root classifications, protected ignored files and cleanup policy.
+    /// Binds the head, delivery targets, patches, untracked files, standalone
+    /// ignored classifications, protected ignored files and cleanup policy.
+    /// Policy-approved disposable directory listings are informational in the
+    /// v4 digest. Standalone ignored paths remain bound. Replan on upgrade.
     pub digest: String,
     pub session_id: i64,
     pub worktree_path: String,
@@ -166,7 +168,7 @@ struct DigestInputV2<'a> {
 }
 
 #[derive(serde::Serialize)]
-struct DigestInputV3<'a> {
+struct DigestInputV4<'a> {
     schema_version: u32,
     recovery_archive_schema_version: u32,
     max_recovery_bundle_bytes: u64,
@@ -235,6 +237,17 @@ struct RecoveryManifest<'a> {
 struct RecoveryBundleIntegrity {
     bytes: u64,
     sha256: String,
+}
+
+/// Directory disposal is authorized by the bound policy and freshly checked
+/// classification. Keep every standalone ignored path in the proof, even when
+/// policy calls it disposable output; new standalone files must still refuse.
+fn authorization_ignored_paths(paths: &[IgnoredPath]) -> Vec<IgnoredPath> {
+    paths
+        .iter()
+        .filter(|path| path.classification != IgnoredPathClassification::DisposableDirectory)
+        .cloned()
+        .collect()
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -798,7 +811,8 @@ impl Broker {
             serde_json::to_vec(&ignored_policy_proof).map_err(|error| refuse(error.to_string()))?;
         let ignored_policy_sha256 = sha256_hex(&ignored_policy_bytes);
 
-        let digest_input = DigestInputV3 {
+        let bound_ignored_paths = authorization_ignored_paths(&ignored_paths);
+        let digest_input = DigestInputV4 {
             schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
             recovery_archive_schema_version: RECOVERY_ARCHIVE_SCHEMA_VERSION,
             max_recovery_bundle_bytes: MAX_RECOVERY_BUNDLE_BYTES,
@@ -811,12 +825,12 @@ impl Broker {
             staged_patch_sha256: &staged_patch_sha256,
             unstaged_patch_sha256: &unstaged_patch_sha256,
             untracked_files: &untracked_files,
-            ignored_paths: &ignored_paths,
+            ignored_paths: &bound_ignored_paths,
             ignored_files: &ignored_files,
             ignored_policy: &ignored_policy_proof,
         };
         let mut hasher = Sha256::new();
-        hasher.update(b"aethyme-cleanup-resolve-v3\0");
+        hasher.update(b"aethyme-cleanup-resolve-v4\0");
         hasher
             .update(serde_json::to_vec(&digest_input).map_err(|error| refuse(error.to_string()))?);
         let digest = format!("{:x}", hasher.finalize());
@@ -1704,7 +1718,14 @@ fn verify_recovery_archive_payload_for_plan(
         || manifest.unstaged_patch.bytes != plan.unstaged_patch_bytes
         || manifest.unstaged_patch.sha256 != plan.unstaged_patch_sha256
         || manifest.untracked_files != plan.untracked_files
-        || manifest.ignored_paths.as_deref() != Some(plan.ignored_paths.as_slice())
+        || !manifest.ignored_paths.as_deref().is_some_and(|paths| {
+            if manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION {
+                authorization_ignored_paths(paths)
+                    == authorization_ignored_paths(&plan.ignored_paths)
+            } else {
+                paths == plan.ignored_paths.as_slice()
+            }
+        })
         || manifest.ignored_files.as_deref() != Some(plan.ignored_files.as_slice())
         || manifest.ignored_policy_sha256.as_deref() != Some(plan.ignored_policy_sha256.as_str())
     {
@@ -3505,6 +3526,71 @@ mod tests {
     }
 
     #[test]
+    fn disposable_ignored_directory_added_after_archive_verification_does_not_stall_cleanup() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            repository.join(".gitignore"),
+            "/.aethyme/\n/test-results/\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("archive disposable directory churn fixture", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        std::fs::write(worktree.join("new.txt"), "recover me\n").unwrap();
+        broker.close(session.id).unwrap();
+        let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+        assert!(plan.ignored_files.is_empty());
+        let digest = plan.digest.clone();
+        let late_worktree = worktree.clone();
+        let outcome = broker
+            .cleanup_resolve_apply_with_post_archive_hook(session.id, &digest, move || {
+                std::fs::create_dir(late_worktree.join("test-results")).unwrap();
+                std::fs::write(
+                    late_worktree.join("test-results/generated.txt"),
+                    "generated",
+                )
+                .unwrap();
+            })
+            .unwrap();
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        assert!(outcome.cleanup_error.is_none(), "{outcome:?}");
+        assert!(!worktree.exists());
+        assert_eq!(
+            std::fs::read(outcome.archive.join("untracked/new.txt")).unwrap(),
+            b"recover me\n"
+        );
+    }
+
+    #[test]
+    fn ignored_authorization_keeps_every_standalone_descriptor() {
+        let ignored = vec![
+            IgnoredPath {
+                path: "cache/".into(),
+                classification: IgnoredPathClassification::DisposableDirectory,
+            },
+            IgnoredPath {
+                path: ".DS_Store".into(),
+                classification: IgnoredPathClassification::DisposableOutput,
+            },
+            IgnoredPath {
+                path: "private.txt".into(),
+                classification: IgnoredPathClassification::PreservedFile,
+            },
+        ];
+        assert_eq!(authorization_ignored_paths(&ignored), ignored[1..].to_vec());
+    }
+
+    #[test]
     fn ignored_content_added_after_archive_verification_keeps_the_worktree() {
         let owner = tempfile::tempdir().unwrap();
         let repository = owner.path().join("repository");
@@ -3545,6 +3631,51 @@ mod tests {
         assert!(worktree.is_dir());
         assert_eq!(
             std::fs::read(worktree.join("private.txt")).unwrap(),
+            b"preserve me\n"
+        );
+    }
+
+    #[test]
+    fn standalone_generated_output_added_after_archive_verification_keeps_the_worktree() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join(".gitignore"), "/.aethyme/\n/.DS_Store\n").unwrap();
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("archive cleanup recheck fixture", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        std::fs::write(worktree.join("new.txt"), "recover me\n").unwrap();
+        broker.close(session.id).unwrap();
+
+        let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+        let digest = plan.digest.clone();
+        let late_ignored = worktree.join(".DS_Store");
+        let outcome = broker
+            .cleanup_resolve_apply_with_post_archive_hook(session.id, &digest, move || {
+                std::fs::write(&late_ignored, "preserve me\n").unwrap();
+            })
+            .unwrap();
+
+        assert!(!outcome.worktree_removed);
+        assert!(
+            outcome
+                .cleanup_error
+                .as_deref()
+                .is_some_and(|error| { error.contains("changed after archive verification") })
+        );
+        assert!(outcome.archive.join(MANIFEST_FILE).is_file());
+        assert!(outcome.archive.join("untracked/new.txt").is_file());
+        assert!(worktree.is_dir());
+        assert_eq!(
+            std::fs::read(worktree.join(".DS_Store")).unwrap(),
             b"preserve me\n"
         );
     }
