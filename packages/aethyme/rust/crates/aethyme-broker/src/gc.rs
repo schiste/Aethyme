@@ -25,7 +25,7 @@ use crate::{
 mod tree_removal;
 pub(crate) use tree_removal::{
     PinnedTreeRemoval, TreeObjectIdentity, TreeRemoval, TreeRemovalError, remove_condemned_tree,
-    remove_condemned_tree_with_progress,
+    remove_condemned_tree_with_progress, remove_condemned_tree_with_progress_and_guard,
 };
 
 pub const GC_PLAN_SCHEMA_VERSION: u32 = 4;
