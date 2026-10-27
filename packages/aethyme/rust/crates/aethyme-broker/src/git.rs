@@ -4781,23 +4781,6 @@ impl GitRepo {
         Ok((dirty, untracked))
     }
 
-    /// Whether every remaining non-ignored change is an unstaged deletion of
-    /// a tracked path, and each ignored path is disposable under the current
-    /// cleanup policy. This narrow state is used only to
-    /// resume an authenticated finish cleanup after Git has already removed
-    /// part of the worktree.
-    pub(crate) fn has_only_unstaged_tracked_deletions(
-        &self,
-        policy: &crate::AutoCleanupPolicy,
-    ) -> Result<bool, GitError> {
-        self.has_only_unstaged_tracked_deletions_until_with_limits(
-            policy,
-            Instant::now() + Duration::from_secs(15),
-            MAX_CLEANUP_STATUS_OUTPUT_BYTES,
-            MAX_CLEANUP_STATUS_PATH_FIELDS,
-        )
-    }
-
     pub(crate) fn has_only_unstaged_tracked_deletions_until_with_limits(
         &self,
         policy: &crate::AutoCleanupPolicy,
