@@ -538,6 +538,12 @@ blocked.
    The guard fails if the command leaves dirty paths outside your explicit
    leases or in files that were untracked before your session began.
 
+   For preservation archives, measure free space on the actual destination
+   volume and add checked known payload and metadata sizes to the existing
+   reserve before staging. If a component has no known size, describe this as
+   known-minimum admission; keep the source until the archive is fully written
+   and verified.
+
 4. **While working**: commit early and small. Only committed work can be
    verified and integrated. Never switch branches inside someone else's
    worktree; never edit files outside your own worktree.
@@ -1146,6 +1152,7 @@ mod tests {
             "Worktrees do not inherit ignored dependencies such as `node_modules/` or",
             "aethyme broker advanced leases claim <path>",
             "aethyme broker advanced exec --session",
+            "For preservation archives, measure free space on the actual destination",
             "AETHYME_TEST_DB_SUFFIX",
             "aethyme broker finish cleanup --all-cleaned --apply",
             "aethyme broker advanced operations reconcile",
