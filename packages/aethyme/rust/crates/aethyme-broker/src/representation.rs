@@ -98,8 +98,11 @@ impl SessionContent {
 #[serde(rename_all = "snake_case")]
 pub enum ContentVerdict {
     Present,
-    /// The first path that does not match, with both sides named so a refusal
-    /// can say what is missing rather than only that something is.
+    /// Object IDs agree, but committed entry modes or types differ.
+    TreeEntryMismatch {
+        paths: Vec<String>,
+    },
+    /// The first object mismatch, with both sides named.
     Absent {
         path: String,
         wanted: Option<String>,
@@ -214,11 +217,11 @@ pub fn session_content(
     base: &str,
     head: &str,
 ) -> Result<SessionContent, BrokerOpError> {
-    let changed = repo.changed_between(base, head).map_err(|source| {
-        BrokerOpError::RepresentationUnavailable {
+    let changed = repo
+        .changed_between_all_paths(base, head)
+        .map_err(|source| BrokerOpError::RepresentationUnavailable {
             reason: format!("cannot diff {} to {}: {source}", short(base), short(head)),
-        }
-    })?;
+        })?;
 
     // One `cat-file` for the whole diff, not one `rev-parse` per path. The
     // cleanup plan behind `broker status` builds this map for every retained
@@ -276,7 +279,38 @@ pub fn content_at(
             });
         }
     }
+    if !tree_entries_equal(repo, content, target)? {
+        return Ok(ContentVerdict::TreeEntryMismatch {
+            paths: content.paths.keys().cloned().collect(),
+        });
+    }
     Ok(ContentVerdict::Present)
+}
+
+/// Object identity omits executable bits and the distinction between a blob
+/// stored as a regular file or a symlink. Verify complete tree entries only
+/// after the inexpensive batched object comparison finds a prospective match.
+fn tree_entries_equal(
+    repo: &GitRepo,
+    content: &SessionContent,
+    target: &str,
+) -> Result<bool, BrokerOpError> {
+    repo.paths_equal(
+        &content.head,
+        target,
+        &content.paths.keys().cloned().collect::<Vec<_>>(),
+    )
+    .map_err(|source| {
+        if matches!(&source, crate::GitError::TimedOut { .. }) {
+            landing_search_budget_expired(format!(
+                "while verifying committed entry modes: {source}"
+            ))
+        } else {
+            BrokerOpError::RepresentationUnavailable {
+                reason: format!("cannot verify committed entry types and modes: {source}"),
+            }
+        }
+    })
 }
 
 /// Candidates asked about per `cat-file` batch. Most landings are found near
@@ -428,7 +462,7 @@ fn find_landing_with_limits(
                 .zip(found)
                 .take_while(|((_, wanted), found)| *wanted == *found)
                 .count();
-            if matched == paths.len() {
+            if matched == paths.len() && tree_entries_equal(repo, content, candidate)? {
                 return Ok(LandingSearch {
                     outcome: LandingOutcome::Landed(Landing {
                         commit: candidate.clone(),
@@ -440,6 +474,10 @@ fn find_landing_with_limits(
                     examined: position + 1,
                     truncated: false,
                 });
+            }
+            if matched == paths.len() {
+                // Blob equality alone does not establish any complete entry match.
+                continue;
             }
             if best.as_ref().is_none_or(|(_, prev, _)| matched > *prev) {
                 best = Some((candidate.clone(), matched, paths[matched].0.clone()));
@@ -845,7 +883,13 @@ mod tests {
     use std::process::Command;
 
     fn git(root: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(name);
+            }
+        }
+        let output = command
             .args(args)
             .current_dir(root)
             .env("GIT_AUTHOR_NAME", "t")
@@ -886,6 +930,80 @@ mod tests {
         (tmp, repo, base)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn executable_mode_must_land_even_when_blob_identity_is_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, repo, _) = seeded();
+        // Brackets are literal path bytes; newline must survive the NUL census.
+        let path = "[run]\n.sh";
+        write(tmp.path(), path, "#!/bin/sh\nexit 0\n");
+        let base = commit(tmp.path(), "regular non-executable baseline");
+        git(tmp.path(), &["checkout", "-q", "-b", "session"]);
+        std::fs::set_permissions(
+            tmp.path().join(path),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let head = commit(tmp.path(), "make executable");
+        assert_eq!(repo.blob_at(&base, path), repo.blob_at(&head, path));
+        let content = session_content(&repo, &base, &head).unwrap();
+        assert!(matches!(
+            content_at(&repo, &content, &base).unwrap(),
+            ContentVerdict::TreeEntryMismatch { .. }
+        ));
+        git(tmp.path(), &["checkout", "-q", "main"]);
+        write(tmp.path(), "unrelated.txt", "target change\n");
+        let target = commit(tmp.path(), "unrelated target change");
+        assert!(matches!(
+            find_landing(&repo, &content, &target, DEFAULT_SEARCH_CAP)
+                .unwrap()
+                .outcome,
+            LandingOutcome::NotFound { .. }
+        ));
+        git(tmp.path(), &["cherry-pick", &head]);
+        let landed = git(tmp.path(), &["rev-parse", "HEAD"]);
+        assert!(content_at(&repo, &content, &landed).unwrap().is_present());
+        assert!(
+            find_landing(&repo, &content, &landed, DEFAULT_SEARCH_CAP)
+                .unwrap()
+                .represented()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_type_must_land_even_when_blob_identity_is_unchanged() {
+        use std::os::unix::fs::symlink;
+        let (tmp, repo, _) = seeded();
+        write(tmp.path(), "entry", "destination.txt");
+        let base = commit(tmp.path(), "regular file baseline");
+        git(tmp.path(), &["checkout", "-q", "-b", "session"]);
+        std::fs::remove_file(tmp.path().join("entry")).unwrap();
+        symlink("destination.txt", tmp.path().join("entry")).unwrap();
+        let head = commit(tmp.path(), "convert to symlink");
+        assert_eq!(repo.blob_at(&base, "entry"), repo.blob_at(&head, "entry"));
+        let content = session_content(&repo, &base, &head).unwrap();
+        assert!(!content_at(&repo, &content, &base).unwrap().is_present());
+        git(tmp.path(), &["checkout", "-q", "main"]);
+        write(tmp.path(), "unrelated.txt", "target change\n");
+        let target = commit(tmp.path(), "unrelated target change");
+        assert!(matches!(
+            find_landing(&repo, &content, &target, DEFAULT_SEARCH_CAP)
+                .unwrap()
+                .outcome,
+            LandingOutcome::NotFound { .. }
+        ));
+        git(tmp.path(), &["cherry-pick", &head]);
+        let landed = git(tmp.path(), &["rev-parse", "HEAD"]);
+        assert!(content_at(&repo, &content, &landed).unwrap().is_present());
+        assert!(
+            find_landing(&repo, &content, &landed, DEFAULT_SEARCH_CAP)
+                .unwrap()
+                .represented()
+        );
+    }
+
     fn cached_landing_fixture() -> (tempfile::TempDir, GitRepo, String, String, String) {
         let (tmp, repo, base) = seeded();
         git(tmp.path(), &["checkout", "-q", "-b", "session"]);
@@ -924,6 +1042,43 @@ mod tests {
         // The intermediate "first" state is deliberately not represented: a
         // squash merge lands the net diff, so the net diff is what must be found.
         assert_ne!(Some(blob), repo.blob_at(&base, "a.txt"));
+    }
+
+    #[test]
+    fn a_rename_representation_requires_both_the_new_path_and_source_deletion() {
+        let (tmp, repo, _) = seeded();
+        write(tmp.path(), "old.txt", "same body\n");
+        let base = commit(tmp.path(), "old path baseline");
+        git(tmp.path(), &["checkout", "-q", "-b", "session"]);
+        git(tmp.path(), &["mv", "old.txt", "new.txt"]);
+        let head = commit(tmp.path(), "rename old path to new path");
+
+        let content = session_content(&repo, &base, &head).unwrap();
+        assert_eq!(content.paths.len(), 2);
+        assert!(content.paths.get("old.txt").unwrap().is_none());
+        assert!(content.paths.get("new.txt").unwrap().is_some());
+
+        git(tmp.path(), &["checkout", "-q", "main"]);
+        write(tmp.path(), "new.txt", "same body\n");
+        let both_paths = commit(tmp.path(), "add destination while keeping source");
+
+        assert!(
+            !content_at(&repo, &content, &both_paths)
+                .unwrap()
+                .is_present()
+        );
+        assert!(content_at(&repo, &content, &head).unwrap().is_present());
+        assert!(matches!(
+            find_landing(&repo, &content, &both_paths, DEFAULT_SEARCH_CAP)
+                .unwrap()
+                .outcome,
+            LandingOutcome::NotFound { .. }
+        ));
+        assert!(
+            find_landing(&repo, &content, &head, DEFAULT_SEARCH_CAP)
+                .unwrap()
+                .represented()
+        );
     }
 
     /// The batched read must answer exactly what the per-path read answered.
