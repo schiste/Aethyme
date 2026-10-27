@@ -170,41 +170,37 @@ class PairedActionMatrixTests(unittest.TestCase):
         self.assertNotIn('baseline_median_ms', result)
 
     @staticmethod
-    def deploy_preview(source='a' * 40, full_bytes=0,
+    def deploy_preview(source='a' * 40, plan_digest='b' * 64, full_bytes=0,
                        full_sha=('e3b0c44298fc1c149afbf4c8996fb924'
                                  '27ae41e4649b934ca495991b7852b855'),
-                       preview_bytes=0, preview_raw_bytes=None,
-                       preview_sha=('e3b0c44298fc1c149afbf4c8996fb924'
-                                    '27ae41e4649b934ca495991b7852b855')):
-        if preview_raw_bytes is None:
-            preview_raw_bytes = full_bytes
-        return '\n'.join((
+                       migration_body='(no changes)\n', notices=''):
+        header = '\n'.join((
+            'First-enrollment generated output preview for origin:',
             f'Configured origin/default ref: origin/refs/heads/main @ {source}',
             'Generated outputs grouped by ownership; per-file generator-source mapping is unavailable.',
+            f'Plan digest: {plan_digest}',
+            f'Raw generated diff: {full_bytes} bytes; SHA-256 (raw) {full_sha}',
             'Aethyme-owned outputs:',
             'Managed-block outputs:',
             'Repository-owned policy/config outputs:',
-            'Plan digest: ' + 'b' * 64,
-            f'Raw generated diff: {full_bytes} bytes; SHA-256 (raw) {full_sha}',
-            f'Migration diff preview: {preview_bytes} escaped bytes shown from '
-            f'{preview_raw_bytes} raw bytes; SHA-256 (raw) {preview_sha}',
-            'Migration diff:',
         ))
+        return f'{header}\nMigration diff:\n{migration_body}{notices}'
 
     def test_generator_inventory_can_be_supported_without_generated_content(self):
-        preview = '\n'.join((
-            'Configured origin/default ref: origin/refs/heads/main @ ' + 'a' * 40,
-            'Generated outputs grouped by ownership; per-file generator-source mapping is unavailable.',
-            'Aethyme-owned outputs:',
-            'Managed-block outputs:',
-            'Repository-owned policy/config outputs:',
-            'Plan digest: ' + 'b' * 64,
-            'Migration diff:',
-        ))
+        diff = 'diff --git a/a b/a\n' * 20
+        shown = 'diff --git a/a b/a\n'
+        notice = (
+            '[terminal-safe diff preview truncated at a complete line boundary: '
+            f'showing {len(shown.encode())} escaped bytes from {len(diff.encode())} raw diff bytes; '
+            'raw SHA-256 covers the complete proposal]\n')
+        preview = self.deploy_preview(
+            full_bytes=len(diff.encode()), full_sha='c' * 64,
+            migration_body=shown, notices=notice)
         result = _parse_deploy_preview(preview, 'a' * 40)
         self.assertTrue(result['inventory_supported'])
         self.assertFalse(result['generated_content_available'])
         self.assertTrue(result['source_matches_seed'])
+        self.assertTrue(result['truncation_explicit'])
 
     def test_zero_byte_generated_diff_is_still_available_content(self):
         result = _parse_deploy_preview(self.deploy_preview(), 'a' * 40)
@@ -212,8 +208,49 @@ class PairedActionMatrixTests(unittest.TestCase):
         self.assertTrue(result['generated_content_available'])
         self.assertEqual(result['content_identity']['raw_diff_bytes'], 0)
 
-    def test_mismatched_generated_diff_preview_is_not_comparable_content(self):
-        preview = self.deploy_preview(full_bytes=5, preview_raw_bytes=6)
+    def test_actual_untruncated_enrollment_diff_format_is_comparable_content(self):
+        diff = 'diff --git a/file b/file\n'
+        preview = self.deploy_preview(
+            plan_digest='b' * 64, full_bytes=len(diff.encode()), full_sha='c' * 64,
+            migration_body=diff)
+        result = _parse_deploy_preview(preview, 'a' * 40)
+        self.assertTrue(result['inventory_supported'])
+        self.assertTrue(result['generated_content_available'])
+        self.assertEqual(result['content_identity']['raw_diff_sha256'], 'c' * 64)
+
+    def test_word_truncated_in_generated_diff_is_not_a_renderer_notice(self):
+        diff = 'diff --git a/file b/file\n+This text was truncated earlier\n'
+        result = _parse_deploy_preview(
+            self.deploy_preview(full_bytes=len(diff.encode()), full_sha='c' * 64,
+                                migration_body=diff), 'a' * 40)
+        self.assertFalse(result['truncation_explicit'])
+        self.assertTrue(result['generated_content_available'])
+
+    def test_outer_inventory_truncation_keeps_content_unavailable(self):
+        notice = '[rendered preview truncated at a complete line boundary; output byte limit reached]\n'
+        diff = 'diff --git a/file b/file\n'
+        preview = self.deploy_preview(
+            full_bytes=len(diff.encode()), full_sha='c' * 64,
+            migration_body=diff, notices=notice)
+        result = _parse_deploy_preview(preview, 'a' * 40)
+        self.assertTrue(result['inventory_supported'])
+        self.assertFalse(result['generated_content_available'])
+        self.assertTrue(result['truncation_explicit'])
+
+    def test_diff_truncation_notice_must_match_the_raw_diff_header(self):
+        notice = (
+            '[terminal-safe diff preview truncated at a complete line boundary: '
+            'showing 1 escaped bytes from 7 raw diff bytes; '
+            'raw SHA-256 covers the complete proposal]\n')
+        result = _parse_deploy_preview(
+            self.deploy_preview(full_bytes=8, full_sha='c' * 64,
+                                migration_body='x\n', notices=notice), 'a' * 40)
+        self.assertTrue(result['truncation_explicit'])
+        self.assertFalse(result['truncation_evidence_matches'])
+        self.assertFalse(result['generated_content_available'])
+
+    def test_empty_diff_requires_the_actual_empty_sha256(self):
+        preview = self.deploy_preview(full_sha='c' * 64)
         result = _parse_deploy_preview(preview, 'a' * 40)
         self.assertTrue(result['inventory_supported'])
         self.assertFalse(result['generated_content_available'])
@@ -228,26 +265,45 @@ class PairedActionMatrixTests(unittest.TestCase):
 
     def test_ineligible_timing_and_different_preview_content_are_not_compared(self):
         paired = {**self.paired, 'repetitions': 1}
+        baseline_preview = _parse_deploy_preview(
+            self.deploy_preview(plan_digest='b' * 64, full_bytes=5,
+                                full_sha='a' * 64,
+                                migration_body='diff\n'), 'a' * 40)
+        candidate_preview = _parse_deploy_preview(
+            self.deploy_preview(plan_digest='d' * 64, full_bytes=5,
+                                full_sha='a' * 64,
+                                migration_body='diff\n'), 'a' * 40)
         baseline = [{'status': 'complete', 'timings_ms': {'deploy_plan_diff': 10.0},
                      'semantic': {'deploy_plan_diff': {
                          'status': 'supported_content_available',
                          'comparison_eligible': False,
                          'comparison_ineligibility_reason': 'invalid stdout evidence',
-                         'content_identity': {'raw_diff_sha256': 'a' * 64},
+                         'content_identity': baseline_preview['content_identity'],
                      }}}]
         candidate = [{'status': 'complete', 'timings_ms': {'deploy_plan_diff': 10.0},
                       'semantic': {'deploy_plan_diff': {
                           'status': 'supported_content_available',
                           'comparison_eligible': True,
-                          'content_identity': {'raw_diff_sha256': 'a' * 64},
+                          'content_identity': candidate_preview['content_identity'],
                       }}}]
         result = _compare_action(baseline, candidate, 'deploy_plan_diff', paired)
         self.assertEqual(result['status'], 'unavailable')
         self.assertIn('invalid stdout evidence', result['reason'])
 
         baseline[0]['semantic']['deploy_plan_diff']['comparison_eligible'] = True
-        candidate[0]['semantic']['deploy_plan_diff']['content_identity'] = {
-            'raw_diff_sha256': 'b' * 64}
+        self.assertEqual(
+            baseline[0]['semantic']['deploy_plan_diff']['content_identity'],
+            candidate[0]['semantic']['deploy_plan_diff']['content_identity'],
+            'fixture-specific plan digests should not make identical generated content incomparable')
+        result = _compare_action(baseline, candidate, 'deploy_plan_diff', paired)
+        self.assertEqual(result['status'], 'compared')
+
+        different_preview = _parse_deploy_preview(
+            self.deploy_preview(plan_digest='e' * 64, full_bytes=5,
+                                full_sha='b' * 64,
+                                migration_body='other\n'), 'a' * 40)
+        candidate[0]['semantic']['deploy_plan_diff']['content_identity'] = (
+            different_preview['content_identity'])
         result = _compare_action(baseline, candidate, 'deploy_plan_diff', paired)
         self.assertEqual(result['status'], 'unavailable')
         self.assertIn('content contracts differ', result['reason'])

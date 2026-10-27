@@ -786,40 +786,59 @@ def _parse_deploy_preview(text, expected_source):
     digest = re.search(r'Plan digest: ([0-9a-f]{64})', text)
     full_diff = re.search(
         r'Raw generated diff: ([0-9]+) bytes; SHA-256 \(raw\) ([0-9a-f]{64})', text)
-    migration_preview = re.search(
-        r'Migration diff preview: ([0-9]+) escaped bytes shown from ([0-9]+) raw bytes; '
-        r'SHA-256 \(raw\) ([0-9a-f]{64})', text)
+    migration_heading = re.search(r'(?m)^Migration diff:\r?\n', text)
+    diff_truncation = re.search(
+        r'(?m)^\[terminal-safe diff preview truncated at a complete line boundary: '
+        r'showing ([0-9]+) escaped bytes from ([0-9]+) raw diff bytes; '
+        r'raw SHA-256 covers the complete proposal\][ \t]*\r?$', text)
+    output_truncation = re.search(
+        r'(?m)^\[rendered preview truncated at a complete line boundary; '
+        r'output byte limit reached\][ \t]*\r?$', text)
+    output_truncated = output_truncation is not None
     sections = ('Aethyme-owned outputs:', 'Managed-block outputs:',
                 'Repository-owned policy/config outputs:')
     present_sections = [name for name in sections if name in text]
     generated_bytes = int(full_diff.group(1)) if full_diff else None
-    preview_escaped_bytes = int(migration_preview.group(1)) if migration_preview else None
-    preview_raw_bytes = int(migration_preview.group(2)) if migration_preview else None
-    preview_raw_sha256 = migration_preview.group(3) if migration_preview else None
+    preview_escaped_bytes = int(diff_truncation.group(1)) if diff_truncation else None
+    preview_raw_bytes = int(diff_truncation.group(2)) if diff_truncation else None
     source_matches_seed = bool(source and source.group(1) == expected_source)
     ownership_grouping = (
         'Generated outputs grouped by ownership; per-file generator-source mapping is unavailable.'
         in text)
     inventory_supported = bool(
         source and digest and ownership_grouping and len(present_sections) == len(sections)
-        and 'Migration diff:' in text)
-    generated_content_available = bool(
-        full_diff and migration_preview
-        and preview_raw_bytes == generated_bytes
-        and preview_raw_sha256 == full_diff.group(2))
-    preview_truncated = bool(re.search(r'\btruncated\b', text, re.IGNORECASE))
+        and migration_heading)
+    migration_body = text[migration_heading.end():] if migration_heading else ''
+    for marker in (
+            diff_truncation.group(0) if diff_truncation else None,
+            output_truncation.group(0) if output_truncation else None):
+        if marker:
+            migration_body = migration_body.split(marker, maxsplit=1)[0]
+    migration_body_size = len(migration_body.encode('utf-8'))
+    migration_body_content = migration_body.strip()
+    empty_diff_sha256 = hashlib.sha256(b'').hexdigest()
+    truncation_evidence_matches = bool(
+        not diff_truncation
+        or (preview_raw_bytes == generated_bytes
+            and preview_escaped_bytes in {
+                migration_body_size, max(0, migration_body_size - 1)}))
+    complete_diff_body = bool(
+        full_diff and migration_heading and not diff_truncation and not output_truncated
+        and ((generated_bytes == 0 and full_diff.group(2) == empty_diff_sha256
+              and migration_body_content == '(no changes)')
+             or (generated_bytes is not None and generated_bytes > 0
+                 and bool(migration_body_content))))
+    generated_content_available = complete_diff_body
+    preview_truncated = bool(diff_truncation or output_truncated)
     content_identity = None
     if inventory_supported and generated_content_available:
         content_identity = {
             'contract': 'first_enrollment_generated_diff_preview_v1',
             'source_commit': source.group(1),
-            'plan_digest': digest.group(1),
             'raw_diff_bytes': generated_bytes,
             'raw_diff_sha256': full_diff.group(2),
-            'escaped_preview_bytes': preview_escaped_bytes,
-            'preview_raw_sha256': preview_raw_sha256,
-            'preview_truncated': preview_truncated,
-            'complete_stdout_sha256': hashlib.sha256(text.encode('utf-8')).hexdigest(),
+            'rendered_diff_preview_sha256': hashlib.sha256(
+                migration_body.encode('utf-8')).hexdigest(),
         }
     return {
         'source_commit': source.group(1) if source else None,
@@ -831,7 +850,8 @@ def _parse_deploy_preview(text, expected_source):
         'ownership_grouping_present': ownership_grouping,
         'migration_preview_escaped_bytes': preview_escaped_bytes,
         'migration_preview_raw_bytes': preview_raw_bytes,
-        'migration_preview_raw_sha256': preview_raw_sha256,
+        'migration_preview_raw_sha256': None,
+        'truncation_evidence_matches': truncation_evidence_matches,
         'migration_diff_present': 'Migration diff:' in text,
         'truncation_explicit': preview_truncated,
         'inventory_supported': inventory_supported,
