@@ -692,6 +692,144 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+/// Run one normal local Git commit with session ownership checks before and
+/// after the command. Git's configured commit hooks remain enabled.
+pub(super) fn run_commit(parsed: Parsed) -> Result<(), UsageError> {
+    if parsed.read_only_snapshot {
+        return Err(read_only_refusal(
+            &parsed,
+            "broker commit",
+            "run it from the live session worktree",
+        ));
+    }
+    let session = parsed
+        .session
+        .ok_or(UsageError::Message("commit requires --session <id>".into()))?;
+    if parsed.exec_command.is_empty() {
+        return Err(UsageError::Message(
+            "commit requires Git commit arguments after --".into(),
+        ));
+    }
+    crate::broker::validate_session_commit_args(&parsed.exec_command)
+        .map_err(UsageError::Message)?;
+    if let Some(reason) = crate::git::session_commit_git_environment_refusal() {
+        return Err(UsageError::Message(reason.into()));
+    }
+    let requested_timeout = exec_timeout_from_seconds(parsed.timeout_seconds)?;
+    let caller_cwd = std::env::current_dir()
+        .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;
+    let mut broker = open_broker(false)?;
+    let report = broker.guarded_commit_for_cli(
+        session,
+        &caller_cwd,
+        &parsed.exec_command,
+        parsed.non_interactive,
+        parsed.json,
+        requested_timeout,
+    )?;
+    if parsed.json {
+        let mut value = serde_json::to_value(&report)?;
+        let object = value
+            .as_object_mut()
+            .expect("guarded commit report is an object");
+        object.insert(
+            "outcome".into(),
+            serde_json::Value::String(
+                if report.post_commit_audit_complete {
+                    if report.ok {
+                        "passed"
+                    } else if !report.execution.command_success {
+                        "command_failed"
+                    } else {
+                        "ownership_failed"
+                    }
+                } else {
+                    "post_commit_audit_unknown"
+                }
+                .into(),
+            ),
+        );
+        out!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        out!(
+            "commit session {}: command {}{}",
+            session,
+            if report.execution.command_timed_out {
+                "timed out"
+            } else if report.execution.command_success {
+                "passed"
+            } else {
+                "failed"
+            },
+            report
+                .execution
+                .exit_code
+                .map(|code| format!(" ({code})"))
+                .unwrap_or_default()
+        );
+        out!(
+            "  command ran: {}",
+            match report.command_ran {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "unknown",
+            }
+        );
+        out!("  execution receipt: {}", report.execution_receipt_id);
+        out!(
+            "  committed-path ownership audit: {}",
+            if !report.post_commit_audit_complete {
+                "unknown; inspect the worktree before retrying"
+            } else if report
+                .committed_ownership
+                .as_ref()
+                .is_some_and(|audit| audit.ok)
+            {
+                "passed"
+            } else {
+                "failed; the command already ran and its changes remain"
+            }
+        );
+        if let Some(paths) = &report.committed_paths {
+            out!(
+                "  committed paths: {}",
+                if paths.is_empty() {
+                    "none".to_owned()
+                } else {
+                    capped_join(paths, 8)
+                }
+            );
+        }
+        if let Some(error) = &report.post_commit_audit_error {
+            out!("  post-commit audit detail: {error}");
+        }
+    }
+    if !report.ok {
+        return Err(UsageError::Message(if !report.post_commit_audit_complete {
+            format!(
+                "broker commit ran, but its complete post-commit ownership audit is unknown; inspect the worktree and execution receipt {} before retrying",
+                report.execution_receipt_id
+            )
+        } else if !report.execution.command_success {
+            format!(
+                "broker commit ran and exited {}; inspect the worktree and execution receipt {} before retrying",
+                report
+                    .execution
+                    .exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "by signal".into()),
+                report.execution_receipt_id
+            )
+        } else {
+            format!(
+                "broker commit ran, but ownership verification failed; inspect the worktree and execution receipt {} before retrying",
+                report.execution_receipt_id
+            )
+        }));
+    }
+    Ok(())
+}
+
 fn exec_status_usage_error() -> UsageError {
     exec_status_usage_error_with_detail(None)
 }

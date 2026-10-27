@@ -126,6 +126,7 @@ const COMMANDS: &[&str] = &[
     "broker submit promote",
     "broker submit promotion-record",
     "broker push",
+    "broker commit",
     "broker finish",
     "broker finish close",
     "broker finish cleanup",

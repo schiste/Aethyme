@@ -26,6 +26,32 @@ fn exec_timeout_is_parsed_separately_from_child_arguments() {
     super::validate_flags("exec", &parsed).unwrap();
 }
 
+#[test]
+fn session_commit_parses_its_flags_before_git_arguments() {
+    let args = [
+        "--session",
+        "42",
+        "--non-interactive",
+        "--timeout",
+        "17",
+        "--json",
+        "--",
+        "-m",
+        "commit message",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    let parsed = super::parse(&args).unwrap();
+
+    assert_eq!(parsed.session, Some(42));
+    assert!(parsed.non_interactive);
+    assert_eq!(parsed.timeout_seconds, Some(17));
+    assert!(parsed.json);
+    assert_eq!(parsed.exec_command, vec!["-m", "commit message"]);
+    super::validate_flags("commit", &parsed).unwrap();
+}
+
 /// One entry of `gh pr view --json comments`. `id` is spelled the way `gh`
 /// really spells it -- a GraphQL node id -- so a test can never accidentally
 /// pass by reading the field the edit endpoint cannot use.

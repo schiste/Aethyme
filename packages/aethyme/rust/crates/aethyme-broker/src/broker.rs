@@ -554,6 +554,8 @@ pub enum BrokerOpError {
     /// branch, or the remote holds work this session never pushed.
     #[error("broker push refused: {reason}")]
     SessionPushRefused { reason: String },
+    #[error("broker commit refused: {reason}")]
+    SessionCommitRefused { reason: String },
     #[error(
         "broker push {phase} failed (operation {operation_id}, {status}){}",
         if stderr.is_empty() { String::new() } else { format!(": {stderr}") }
@@ -3397,6 +3399,7 @@ mod cleanup;
 mod finish;
 mod gates;
 mod leases;
+pub(crate) use leases::validate_session_commit_args;
 pub(crate) mod lifecycle;
 mod scope_capture;
 mod status;

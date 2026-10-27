@@ -3960,6 +3960,14 @@ impl Broker {
         status_limits: CleanupStatusLimits,
     ) -> Result<(), BrokerOpError> {
         let session_id = session.id;
+        let _session_commit_claim =
+            crate::file_lock::try_acquire_session_commit_lock(self.main_root(), session_id)
+                .map_err(|source| BrokerOpError::DirtyWorktree {
+                    id: session_id,
+                    reason: format!(
+                        "the session-local commit lane is busy or unavailable; preserved the worktree: {source}"
+                    ),
+                })?;
         let worktree_path = PathBuf::from(&session.worktree_path);
         if archive_guard.is_some() && session.origin != SessionOrigin::Spawned {
             return Err(BrokerOpError::CleanupResolveRefused {
