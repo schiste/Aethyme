@@ -4662,11 +4662,29 @@ impl GitRepo {
         require_trustworthy_porcelain()?;
         const HEAD_ARGS: &[&str] = &["ls-tree", "-r", "--full-tree", "-z", "HEAD"];
         const INDEX_ARGS: &[&str] = &["ls-files", "--stage", "--full-name", "-z"];
-        let mut paths = parse_tree_gitlinks(&run_git_bytes(&self.root, HEAD_ARGS)?, HEAD_ARGS)?;
-        paths.extend(parse_index_gitlinks(
-            &run_git_bytes(&self.root, INDEX_ARGS)?,
-            INDEX_ARGS,
-        )?);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let run = |args: &[&str]| -> Result<Vec<u8>, GitError> {
+            let mut command = git_command();
+            command
+                .args(args)
+                .current_dir(&self.root)
+                .env("GIT_OPTIONAL_LOCKS", "0");
+            let output = run_git_process_output_limited(
+                &mut command,
+                args,
+                deadline,
+                MAX_GIT_BATCH_OUTPUT_BYTES,
+            )?;
+            if !output.status.success() {
+                return Err(GitError::Git {
+                    args: args.join(" "),
+                    stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                });
+            }
+            Ok(output.stdout)
+        };
+        let mut paths = parse_tree_gitlinks(&run(HEAD_ARGS)?, HEAD_ARGS)?;
+        paths.extend(parse_index_gitlinks(&run(INDEX_ARGS)?, INDEX_ARGS)?);
         paths.sort();
         paths.dedup();
         Ok(paths)
@@ -4840,18 +4858,21 @@ impl GitRepo {
 
     /// Ignored roots via `ls-files`, with ignored directories collapsed. The
     /// listing is a cleanup proof: unsupported path names fail closed instead
-    /// of being dropped by the display-oriented path parser.
+    /// of being dropped by the display-oriented path parser. It uses the
+    /// bounded listing runner and refuses incomplete output.
     pub fn ignored_paths_readonly(&self) -> Result<Vec<String>, GitError> {
-        let args = [
-            "ls-files",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "--directory",
-            "-z",
-        ];
-        let output = run_git_bytes(&self.root, &args)?;
-        parse_nul_paths_strict(&output, &args)
+        let deadline = Instant::now() + Duration::from_secs(15);
+        Ok(self
+            .ignored_paths_readonly_until(deadline)?
+            .into_iter()
+            .map(|entry| {
+                if entry.directory_marker {
+                    format!("{}/", entry.relative)
+                } else {
+                    entry.relative
+                }
+            })
+            .collect())
     }
 
     /// Tracked paths whose working content differs from HEAD, limited to
