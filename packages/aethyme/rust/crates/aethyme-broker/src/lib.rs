@@ -23,6 +23,7 @@
 mod advisories;
 pub mod agent_hook;
 pub mod analysis_view;
+mod archive_cleanup;
 mod artifact_catalog;
 mod artifact_claim;
 mod atomic_file;
