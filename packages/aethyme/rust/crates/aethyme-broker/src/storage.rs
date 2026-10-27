@@ -589,6 +589,7 @@ pub(crate) fn storage_plan_with_context(
         .as_ref()
         .and_then(|binding| binding.instance_nonce.as_deref());
     let mut enumerate_children = preparation_live_root_children;
+    let mut additional_worktree_volume_cache_bindings = Vec::new();
     let plan = build_plan(
         &main_root,
         &storage_layout,
@@ -601,6 +602,7 @@ pub(crate) fn storage_plan_with_context(
         &mut records,
         &worktree_volume_cache_bindings,
         context.host_resource_db_path.as_deref(),
+        &mut additional_worktree_volume_cache_bindings,
         &mut enumerate_children,
     )?;
     if let Some(binding) = preparation_cache_root_binding.as_ref() {
@@ -698,6 +700,7 @@ pub(crate) fn storage_apply_with_context(
         .as_ref()
         .map(|binding| binding.path.clone());
     let mut enumerate_children = preparation_live_root_children;
+    let mut additional_worktree_volume_cache_bindings = Vec::new();
     let plan = build_apply_plan(
         &main_root,
         &storage_layout,
@@ -713,6 +716,7 @@ pub(crate) fn storage_apply_with_context(
         &mut records,
         &worktree_volume_cache_bindings,
         context.host_resource_db_path.as_deref(),
+        &mut additional_worktree_volume_cache_bindings,
         &mut enumerate_children,
     )?;
     if let Some(binding) = preparation_cache_root_binding.as_ref() {
@@ -732,13 +736,28 @@ pub(crate) fn storage_apply_with_context(
         .into_iter()
         .collect::<Vec<_>>();
     cache_bindings.extend(worktree_volume_cache_bindings);
-    let worktree_volume_cache_paths = worktree_volume_cache_paths(&cache_bindings);
+    let mut verified_worktree_cache_paths = worktree_volume_cache_paths(&cache_bindings);
+    verified_worktree_cache_paths.extend(worktree_volume_cache_paths(
+        &additional_worktree_volume_cache_bindings,
+    ));
     let live_roots = preparation_live_roots(
         &main_root,
         &plan.primary_checkouts,
         &plan.roots,
-        &worktree_volume_cache_paths,
+        &verified_worktree_cache_paths,
     )?;
+    // Additional roots only make their reserved child safe to recognize while
+    // resolving liveness. They never enter `cache_bindings`, which is the set
+    // that authorizes preparation-cache candidates for deletion.
+    for binding in &additional_worktree_volume_cache_bindings {
+        binding
+            .validate()
+            .map_err(|error| StorageError::Unavailable {
+                reason: format!(
+                    "additional worktree-volume preparation-cache root changed during apply: {error}"
+                ),
+            })?;
+    }
 
     let mut applied = Vec::new();
     let mut failures = Vec::new();
@@ -840,6 +859,7 @@ fn build_apply_plan<F>(
     records: &mut crate::measurement::SizeRecords,
     worktree_volume_cache_bindings: &[crate::broker::PreparationCacheRootBinding],
     host_resource_db_path: Option<&Path>,
+    additional_worktree_volume_cache_bindings: &mut Vec<crate::broker::PreparationCacheRootBinding>,
     enumerate_children: &mut F,
 ) -> Result<StoragePlan, StorageError>
 where
@@ -857,6 +877,7 @@ where
         records,
         worktree_volume_cache_bindings,
         host_resource_db_path,
+        additional_worktree_volume_cache_bindings,
         enumerate_children,
     )
 }
@@ -876,6 +897,7 @@ fn build_plan<F>(
     records: &mut crate::measurement::SizeRecords,
     worktree_volume_cache_bindings: &[crate::broker::PreparationCacheRootBinding],
     host_resource_db_path: Option<&Path>,
+    additional_worktree_volume_cache_bindings: &mut Vec<crate::broker::PreparationCacheRootBinding>,
     enumerate_children: &mut F,
 ) -> Result<StoragePlan, StorageError>
 where
@@ -988,6 +1010,7 @@ where
         &preparation_candidates,
     );
     let recovery_archives = inspect_recovery_archives(&storage_root, scan, records);
+    *additional_worktree_volume_cache_bindings = additional_cache_bindings;
     Ok(StoragePlan {
         schema_version: STORAGE_PLAN_SCHEMA_VERSION,
         evaluated_at,
@@ -5940,6 +5963,7 @@ mod tests {
             F: FnMut(&Path) -> Result<Vec<PathBuf>, StorageError>,
         {
             let mut records = crate::measurement::SizeRecords::default();
+            let mut additional_worktree_volume_cache_bindings = Vec::new();
             if apply {
                 build_apply_plan(
                     &self.main_root,
@@ -5952,6 +5976,7 @@ mod tests {
                     &mut records,
                     &self.bindings,
                     None,
+                    &mut additional_worktree_volume_cache_bindings,
                     enumerate_children,
                 )
             } else {
@@ -5967,6 +5992,7 @@ mod tests {
                     &mut records,
                     &self.bindings,
                     None,
+                    &mut additional_worktree_volume_cache_bindings,
                     enumerate_children,
                 )
             }
@@ -6070,6 +6096,7 @@ mod tests {
         fn build_plan(&self, apply: bool) -> Result<StoragePlan, StorageError> {
             let mut records = crate::measurement::SizeRecords::default();
             let mut enumerate_children = preparation_live_root_children;
+            let mut additional_worktree_volume_cache_bindings = Vec::new();
             let layout = StorageRootLayout::KeyedContainer(self.storage_root.clone());
             if apply {
                 build_apply_plan(
@@ -6083,6 +6110,7 @@ mod tests {
                     &mut records,
                     &[],
                     Some(&self.resource_db_path),
+                    &mut additional_worktree_volume_cache_bindings,
                     &mut enumerate_children,
                 )
             } else {
@@ -6098,8 +6126,22 @@ mod tests {
                     &mut records,
                     &[],
                     Some(&self.resource_db_path),
+                    &mut additional_worktree_volume_cache_bindings,
                     &mut enumerate_children,
                 )
+            }
+        }
+
+        fn invoking_storage_context(&self) -> crate::broker::BrokerStorageContext {
+            let invoking_repo = GitRepo::discover(&self.invoking_root).unwrap();
+            crate::broker::BrokerStorageContext {
+                repository_root: Some(self.invoking_root.clone()),
+                git_common_dir: Some(invoking_repo.git_common_dir().unwrap()),
+                host_state_dir: self.resource_db_path.parent().map(Path::to_path_buf),
+                host_resource_db_path: Some(self.resource_db_path.clone()),
+                worktree_root_override: Some(self.storage_root.clone()),
+                host_state_dir_is_explicit: true,
+                ..crate::broker::BrokerStorageContext::default()
             }
         }
     }
@@ -6132,6 +6174,31 @@ mod tests {
             "foreign cache entries are not inspected or granted deletion authority"
         );
         assert!(fixture.foreign_cache_entry.join("payload.bin").is_file());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn storage_apply_recognizes_foreign_cache_root_without_reclaiming_its_entries() {
+        let fixture = ForeignCacheRootFixture::new();
+        let context = fixture.invoking_storage_context();
+        let plan = storage_plan_with_context(&fixture.invoking_root, &context).unwrap();
+
+        let report =
+            storage_apply_with_context(&fixture.invoking_root, &plan.digest, &context).unwrap();
+
+        assert!(report.complete, "apply report: {:?}", report.failures);
+        assert!(
+            report.applied.iter().all(|item| {
+                !item.path.starts_with(&fixture.placement_root)
+                    && !item.path.starts_with(&fixture.foreign_cache_entry)
+            }),
+            "the foreign placement and cache paths are not apply candidates"
+        );
+        assert_eq!(
+            std::fs::read(fixture.foreign_cache_entry.join("payload.bin")).unwrap(),
+            b"foreign cache",
+            "apply recognizes the reserved cache child but retains foreign cache data"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -8753,6 +8820,7 @@ mod tests {
         let mut records = crate::measurement::SizeRecords::default();
         records.record_usage(&root_key, 0, Some(1), 1);
         let mut enumerate_children = preparation_live_root_children;
+        let mut additional_worktree_volume_cache_bindings = Vec::new();
         let plan = build_apply_plan(
             repository.root(),
             &StorageRootLayout::DirectRoot(storage_root.clone()),
@@ -8764,6 +8832,7 @@ mod tests {
             &mut records,
             &[],
             None,
+            &mut additional_worktree_volume_cache_bindings,
             &mut enumerate_children,
         )
         .unwrap();
