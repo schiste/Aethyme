@@ -2875,6 +2875,7 @@ mod unix {
                         ..baseline
                     },
                     SidecarMetadataViolation::NotRegularFile,
+                    "not a regular file",
                 ),
                 (
                     ProbeMetadata {
@@ -2882,6 +2883,7 @@ mod unix {
                         ..baseline
                     },
                     SidecarMetadataViolation::WrongOwner,
+                    "not owned by the effective user",
                 ),
                 (
                     ProbeMetadata {
@@ -2889,6 +2891,7 @@ mod unix {
                         ..baseline
                     },
                     SidecarMetadataViolation::ZeroLinks,
+                    "has zero links",
                 ),
                 (
                     ProbeMetadata {
@@ -2896,6 +2899,7 @@ mod unix {
                         ..baseline
                     },
                     SidecarMetadataViolation::MultipleLinks,
+                    "has multiple links",
                 ),
                 (
                     ProbeMetadata {
@@ -2903,6 +2907,7 @@ mod unix {
                         ..baseline
                     },
                     SidecarMetadataViolation::GroupWritable,
+                    "is group-writable",
                 ),
                 (
                     ProbeMetadata {
@@ -2910,10 +2915,12 @@ mod unix {
                         ..baseline
                     },
                     SidecarMetadataViolation::WorldWritable,
+                    "is world-writable",
                 ),
             ];
-            for (metadata, expected) in cases {
+            for (metadata, expected, description) in cases {
                 assert_eq!(sidecar_metadata_violation(&metadata), Some(expected));
+                assert_eq!(expected.description(), description);
             }
 
             let mut changed_identity = file_identity(&baseline);
@@ -2921,6 +2928,10 @@ mod unix {
             assert_eq!(
                 sidecar_snapshot_violation(&baseline, changed_identity),
                 Some(SidecarMetadataViolation::IdentityChanged)
+            );
+            assert_eq!(
+                SidecarMetadataViolation::IdentityChanged.description(),
+                "identity changed from the lstat snapshot"
             );
 
             let path = Path::new("broker.db-wal");
