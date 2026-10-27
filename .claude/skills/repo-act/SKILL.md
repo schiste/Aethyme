@@ -131,6 +131,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   buffered reads, retries and expired deadlines; measure elapsed gains with a
   rebuilt pair in a separate uninstrumented Playground run.
 
+- For bounded searches that stop on success, charge the base work and actual
+  batches rather than rejecting the complete hypothetical search window.
+  Exercise an early exact match whose full window exceeds the budget, and a
+  partially searched window that exhausts it. Exhaustion must remain unknown,
+  never a negative or a successful cleanup proof; keep independent type/mode
+  checks and advance any cached search-profile version when behavior changes.
+
 - For deadline-bounded cleanup, separate candidate discovery from the
   assertion that partial work completed. One short wall-clock budget may expire
   during discovery. Use a deterministic deadline seam to prove partial progress
