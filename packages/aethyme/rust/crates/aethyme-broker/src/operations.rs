@@ -626,13 +626,43 @@ fn output_within(
     )
 }
 
+#[derive(Clone, Debug)]
+struct ProviderObservation {
+    pid: u32,
+    identity: Option<crate::artifact_use::ProcessStartIdentity>,
+    // Only the owner of the actual Child handle may produce this witness.
+    // A PID probe or disappearance is never converted into an exit result.
+    exit: Option<(bool, Option<i32>)>,
+}
+
 fn output_within_capture_limit(
+    command: Command,
+    deadline: AdmissionDeadline,
+    repository: &str,
+    stage: &str,
+    heartbeat: Option<&OperationHeartbeat>,
+    capture_limit: usize,
+) -> Result<CapturedOutput, BrokerOpError> {
+    output_within_observed(
+        command,
+        deadline,
+        repository,
+        stage,
+        heartbeat,
+        capture_limit,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn output_within_observed(
     mut command: Command,
     deadline: AdmissionDeadline,
     repository: &str,
     stage: &str,
     heartbeat: Option<&OperationHeartbeat>,
     capture_limit: usize,
+    mut observer: Option<&mut dyn FnMut(ProviderObservation)>,
 ) -> Result<CapturedOutput, BrokerOpError> {
     let mut child = command
         .stdout(Stdio::piped())
@@ -642,6 +672,20 @@ fn output_within_capture_limit(
             path: PathBuf::from("git"),
             source,
         })?;
+    let mut observation = ProviderObservation {
+        pid: child.id(),
+        identity: None,
+        exit: None,
+    };
+    if observer.is_some() {
+        // SAFETY: getpgid only reads kernel process metadata for this child.
+        let group = unsafe { libc::getpgid(child.id() as i32) };
+        observation.identity =
+            crate::artifact_use::ProcessStartIdentity::capture(child.id() as i32, group).ok();
+        if let Some(observer) = observer.as_mut() {
+            observer(observation.clone());
+        }
+    }
     let stdout = child
         .stdout
         .take()
@@ -688,7 +732,12 @@ fn output_within_capture_limit(
             // process tree.
             if exited.is_none() {
                 let _ = child.kill();
-                let _ = child.wait();
+                if let Ok(status) = child.wait() {
+                    observation.exit = Some((status.success(), status.code()));
+                    if let Some(observer) = observer.as_mut() {
+                        observer(observation.clone());
+                    }
+                }
             }
             // Detached readers end when their inherited descriptors close.
             drop(stdout_reader);
@@ -701,7 +750,13 @@ fn output_within_capture_limit(
         }
         if exited.is_none() {
             match child.try_wait() {
-                Ok(Some(status)) => exited = Some(status),
+                Ok(Some(status)) => {
+                    observation.exit = Some((status.success(), status.code()));
+                    if let Some(observer) = observer.as_mut() {
+                        observer(observation.clone());
+                    }
+                    exited = Some(status);
+                }
                 Ok(None) => {}
                 Err(source) => {
                     discard_output_capture(&stdout_capture);
@@ -1274,6 +1329,7 @@ pub(crate) struct RepositoryWriteLock {
     acquired_at: Instant,
     acquired_at_ms: i64,
     queue_wait_ms: i64,
+    _compatibility_guard: Option<Box<RepositoryWriteLock>>,
 }
 
 impl RepositoryWriteLock {
@@ -1298,6 +1354,7 @@ impl RepositoryWriteLock {
                 acquired_at: Instant::now(),
                 acquired_at_ms: unix_now_ms(),
                 queue_wait_ms: 0,
+                _compatibility_guard: None,
             }));
         }
         let error = std::io::Error::last_os_error();
@@ -1333,13 +1390,60 @@ impl RepositoryWriteLock {
     fn acquire_with_progress_interval(
         main_root: &Path,
         repository: &str,
+        owner: (i64, Option<i64>),
+        describe_holder: impl FnMut() -> Result<String, BrokerOpError>,
+        queue_wait: QueueWait,
+        progress_interval: Duration,
+        report_progress: impl FnMut(&str, Duration),
+    ) -> Result<Self, BrokerOpError> {
+        Self::acquire_mode(
+            main_root,
+            repository,
+            owner,
+            describe_holder,
+            queue_wait,
+            progress_interval,
+            report_progress,
+            false,
+        )
+    }
+
+    /// Scoped Git writers share the historical repository lock before taking
+    /// their exact resource lock. A legacy or wide exclusive writer therefore
+    /// still excludes every scoped writer; different resources may coexist.
+    fn acquire_shared(
+        main_root: &Path,
+        repository: &str,
+        owner: (i64, Option<i64>),
+        describe_holder: impl FnMut() -> Result<String, BrokerOpError>,
+        queue_wait: QueueWait,
+        report_progress: impl FnMut(&str, Duration),
+    ) -> Result<Self, BrokerOpError> {
+        Self::acquire_mode(
+            main_root,
+            repository,
+            owner,
+            describe_holder,
+            queue_wait,
+            OPERATION_LOCK_PROGRESS_INTERVAL,
+            report_progress,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_mode(
+        main_root: &Path,
+        repository: &str,
         (operation_id, session_id): (i64, Option<i64>),
         mut describe_holder: impl FnMut() -> Result<String, BrokerOpError>,
         queue_wait: QueueWait,
         progress_interval: Duration,
         mut report_progress: impl FnMut(&str, Duration),
+        shared: bool,
     ) -> Result<Self, BrokerOpError> {
         debug_assert!(!progress_interval.is_zero());
+        let lock_mode = if shared { libc::LOCK_SH } else { libc::LOCK_EX };
         let path = repository_write_lock_path(main_root, repository);
         let file = open_repository_write_lock_file(main_root, &path)?;
         // Try without blocking first, so the uncontended path stays a single
@@ -1348,13 +1452,14 @@ impl RepositoryWriteLock {
         // `as_raw_fd` yields a valid descriptor. `flock` takes the descriptor by
         // value and only sets an advisory lock on it; it dereferences nothing
         // and cannot invalidate the borrow.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let rc = unsafe { libc::flock(file.as_raw_fd(), lock_mode | libc::LOCK_NB) };
         if rc == 0 {
             return Ok(Self {
                 file,
                 acquired_at: Instant::now(),
                 acquired_at_ms: unix_now_ms(),
                 queue_wait_ms: 0,
+                _compatibility_guard: None,
             });
         }
         let error = std::io::Error::last_os_error();
@@ -1398,7 +1503,7 @@ impl RepositoryWriteLock {
             // progress. flock grants no FIFO order either way, so polling gives
             // up no queue position a blocking wait would have kept.
             // SAFETY: as above — `file` is live and owned by this function.
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            let rc = unsafe { libc::flock(file.as_raw_fd(), lock_mode | libc::LOCK_NB) };
             if rc == 0 {
                 break;
             }
@@ -1447,6 +1552,7 @@ impl RepositoryWriteLock {
             acquired_at: Instant::now(),
             acquired_at_ms: unix_now_ms(),
             queue_wait_ms: waited.elapsed().as_millis() as i64,
+            _compatibility_guard: None,
         })
     }
 
@@ -1487,9 +1593,15 @@ pub(crate) fn try_acquire_local_repository_write_lock(
     let Some(repository) = local_repository_coordination_key(checkout, None)? else {
         return Ok(None);
     };
+    let key = git_scopes::common_lock_key(checkout.root())?;
+    let Some(common) = RepositoryWriteLock::try_acquire_nonblocking(main_root, &key)? else {
+        return Ok(None);
+    };
     Ok(
-        RepositoryWriteLock::try_acquire_nonblocking(main_root, &repository)?
-            .map(|lock| (repository, lock)),
+        RepositoryWriteLock::try_acquire_nonblocking(main_root, &repository)?.map(|mut lock| {
+            lock._compatibility_guard = Some(Box::new(common));
+            (repository, lock)
+        }),
     )
 }
 
@@ -1862,15 +1974,35 @@ struct LockHolderInfo {
 /// running. An operation that has not registered yet is reported as such
 /// rather than as "no holder", because the lock is demonstrably held by
 /// someone.
+#[cfg(test)]
 fn lock_holder_info(store: &mut crate::BrokerStore, repository: &str) -> LockHolderInfo {
+    lock_holder_info_for_scope(store, repository, None, false)
+}
+
+fn lock_holder_info_for_scope(
+    store: &mut crate::BrokerStore,
+    repository: &str,
+    requested_scope: Option<&str>,
+    wide_only: bool,
+) -> LockHolderInfo {
     let now = unix_now_ms();
     let running = store
         .unresolved_coordinated_operations(repository)
         .ok()
         .and_then(|operations| {
-            operations
-                .into_iter()
-                .find(|operation| operation.status == OperationStatus::Running)
+            operations.into_iter().find(|operation| {
+                let scope = stored_resource_scope(operation);
+                operation.status == OperationStatus::Running
+                    && if wide_only {
+                        scope.is_none()
+                    } else {
+                        git_scopes::scopes_conflict(
+                            operation.provider,
+                            scope.as_deref(),
+                            requested_scope,
+                        )
+                    }
+            })
         });
     match running {
         Some(operation) => LockHolderInfo {
@@ -2956,8 +3088,8 @@ fn first_positional(args: &[String]) -> Option<&str> {
 /// it cannot involve a provider round-trip (#181). A comment or review write
 /// has no affected ref, and the resource it does touch is already an operand.
 fn resource_lock_scope(provider: OperationProvider, args: &[String]) -> Option<String> {
-    if provider != OperationProvider::Github {
-        return None;
+    if provider == OperationProvider::Git {
+        return git_scopes::resource_scope(args);
     }
     match args.first()?.as_str() {
         command @ ("pr" | "issue") => {
@@ -3223,6 +3355,7 @@ fn journal_details(
     details
 }
 
+mod git_scopes;
 mod push_and_coordinated;
 mod redaction;
 pub(crate) use push_and_coordinated::{github_command, is_within, worktree_relative_push_sources};

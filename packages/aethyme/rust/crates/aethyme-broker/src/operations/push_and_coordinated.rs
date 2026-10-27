@@ -2484,6 +2484,121 @@ impl Broker {
         let lock_wait_started_at = (effect != OperationEffect::Read).then(unix_now_ms);
         let waiting_started_at = lock_wait_started_at.unwrap_or_else(unix_now_ms);
         let enqueued_at = operation.created_at;
+        // Keep the historical exclusive lane as the parent of every narrow
+        // Git lane. Holding it shared preserves exclusion with old clients and
+        // unknown commands instead of silently fragmenting the lock protocol.
+        // Local ref footprint is keyed by the common Git directory, not a
+        // selected remote: origin and upstream can share the same local refs.
+        // Always acquire this before the historical remote lane.
+        let _git_common_guard = if effect != OperationEffect::Read
+            && request.provider == OperationProvider::Git
+        {
+            let common_key = git_scopes::common_lock_key(cwd)?;
+            let main_root = self.main_root().to_path_buf();
+            match RepositoryWriteLock::acquire_mode(
+                &main_root,
+                &common_key,
+                (queued_operation_id, Some(request.session_id)),
+                || {
+                    Ok(lock_holder_info_for_scope(
+                        self.store(),
+                        &repository,
+                        None,
+                        resource_scope.is_some(),
+                    )
+                    .description)
+                },
+                admission.remaining_queue_wait(queue_wait),
+                OPERATION_LOCK_PROGRESS_INTERVAL,
+                |holder, elapsed| {
+                    eprintln!(
+                        "[coordination] waiting for local Git common-directory lane: {holder} ({})",
+                        humanize_duration(elapsed.as_secs())
+                    )
+                },
+                resource_scope.is_some(),
+            ) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    self.resolve_unstarted_operation(
+                        queued_operation_id,
+                        "local_git_lane_unavailable",
+                    );
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        let _git_destination_guard =
+            if let Some(footprint) = git_scopes::fetch_footprint(&request.args) {
+                let key = format!(
+                    "{}::{}",
+                    git_scopes::common_lock_key(cwd)?,
+                    footprint.destination_ref
+                );
+                let main_root = self.main_root().to_path_buf();
+                match RepositoryWriteLock::acquire(
+                    &main_root,
+                    &key,
+                    queued_operation_id,
+                    Some(request.session_id),
+                    || Ok("another writer of the exact local tracking ref".into()),
+                    admission.remaining_queue_wait(queue_wait),
+                    |holder, elapsed| {
+                        eprintln!(
+                            "[coordination] waiting for {key}: {holder} ({})",
+                            humanize_duration(elapsed.as_secs())
+                        )
+                    },
+                ) {
+                    Ok(guard) => Some(guard),
+                    Err(error) => {
+                        self.resolve_unstarted_operation(
+                            queued_operation_id,
+                            "local_ref_lane_unavailable",
+                        );
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+        let _git_repository_guard = if effect != OperationEffect::Read
+            && request.provider == OperationProvider::Git
+            && resource_scope.is_some()
+        {
+            let main_root = self.main_root().to_path_buf();
+            match RepositoryWriteLock::acquire_shared(
+                &main_root,
+                &repository,
+                (queued_operation_id, Some(request.session_id)),
+                || {
+                    Ok(
+                        lock_holder_info_for_scope(self.store(), &repository, None, true)
+                            .description,
+                    )
+                },
+                admission.remaining_queue_wait(queue_wait),
+                |holder, elapsed| {
+                    eprintln!(
+                        "[coordination] waiting for Git repository compatibility lane: {holder} ({}); local broker commit may proceed in its own session",
+                        humanize_duration(elapsed.as_secs())
+                    )
+                },
+            ) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    self.resolve_unstarted_operation(
+                        queued_operation_id,
+                        "repository_lane_unavailable",
+                    );
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         let lock = if effect == OperationEffect::Read {
             None
         } else {
@@ -2498,9 +2613,23 @@ impl Broker {
                 queued_operation_id,
                 Some(request.session_id),
                 || {
-                    let holder = lock_holder_info(self.store(), &repository);
-                    let details =
-                        coordination_wait_details(&holder, enqueued_at, waiting_started_at);
+                    let holder = lock_holder_info_for_scope(
+                        self.store(),
+                        &repository,
+                        resource_scope.as_deref(),
+                        false,
+                    );
+                    let mut details: serde_json::Value = serde_json::from_str(
+                        &coordination_wait_details(&holder, enqueued_at, waiting_started_at),
+                    )
+                    .expect("coordination wait details are JSON");
+                    details["coordination_wait"]["blocked_scope"] = json!(lock_key);
+                    details["coordination_wait"]["safe_next_action"] = json!(
+                        "inspect the holder operation; a local broker commit may proceed in its own session"
+                    );
+                    details["coordination_wait"]["missing_evidence"] =
+                        json!("the matching operation lock has not been released");
+                    let details = details.to_string();
                     self.store()
                         .annotate_prepared_operation(queued_operation_id, &details)?;
                     Ok(holder.description)
@@ -2521,16 +2650,64 @@ impl Broker {
                 }
             }
         };
+        if request.provider == OperationProvider::Git && resource_scope.is_some() {
+            if let Err(error) =
+                git_scopes::validate_repository(cwd, &request.args, admission, &repository)
+            {
+                self.resolve_unstarted_operation(
+                    queued_operation_id,
+                    "resource_profile_unavailable",
+                );
+                return Err(error);
+            }
+        }
         if effect != OperationEffect::Read {
-            let unresolved = self
-                .store()
-                .unresolved_coordinated_operations(&repository)?;
+            let unresolved = if request.provider == OperationProvider::Git {
+                // Every Git operation in this broker executes in a worktree of
+                // the same common directory. Unknown broad writes on another
+                // remote therefore still fence local ref uncertainty.
+                self.store()
+                    .pending_coordinated_operations()?
+                    .into_iter()
+                    .filter(|operation| {
+                        operation.provider == OperationProvider::Git
+                            || operation.repository == repository
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                self.store()
+                    .unresolved_coordinated_operations(&repository)?
+            };
             for operation in unresolved {
                 // Two operations block each other only where they would have
                 // serialised. An unknown-outcome comment write leaves no ref
                 // ambiguous, so it must not write-block a push -- and a stalled
                 // push says nothing about a comment thread (#181).
-                if stored_resource_scope(&operation) != resource_scope {
+                let recorded_scope = stored_resource_scope(&operation);
+                if request.provider == OperationProvider::Git
+                    && operation.provider == OperationProvider::Git
+                    && recorded_scope.is_some()
+                    && resource_scope.is_some()
+                    && operation.repository != repository
+                {
+                    let recorded: Option<Vec<String>> =
+                        serde_json::from_str(&operation.command_json).ok();
+                    let recorded_fetch = recorded
+                        .as_ref()
+                        .and_then(|args| args.get(1..))
+                        .and_then(git_scopes::fetch_footprint);
+                    let requested_fetch = git_scopes::fetch_footprint(&request.args);
+                    if !matches!((recorded_fetch, requested_fetch), (Some(left), Some(right))
+                        if left.destination_ref == right.destination_ref)
+                    {
+                        continue;
+                    }
+                }
+                if !git_scopes::scopes_conflict(
+                    request.provider,
+                    recorded_scope.as_deref(),
+                    resource_scope.as_deref(),
+                ) {
                     continue;
                 }
                 match operation.status {
@@ -2554,6 +2731,9 @@ impl Broker {
                             operation.exit_code,
                             Some(r#"{"reason":"process_ended_without_outcome"}"#),
                         )?;
+                        if git_scopes::try_reconcile(self, &blocking, cwd, admission)? {
+                            continue;
+                        }
                         self.resolve_unstarted_operation(queued_operation_id, "repository_blocked");
                         return Err(BrokerOpError::CoordinatedOperationBlocked {
                             repository,
@@ -2562,6 +2742,9 @@ impl Broker {
                         });
                     }
                     OperationStatus::OutcomeUnknown => {
+                        if git_scopes::try_reconcile(self, &operation, cwd, admission)? {
+                            continue;
+                        }
                         let recovery = UnknownOutcomeRecovery::from_operation(&operation);
                         self.resolve_unstarted_operation(queued_operation_id, "repository_blocked");
                         return Err(BrokerOpError::CoordinatedOperationBlocked {
@@ -2574,6 +2757,26 @@ impl Broker {
                 }
             }
         }
+        let mut fetch_journal = if request.provider == OperationProvider::Git {
+            match git_scopes::FetchJournal::prepare(
+                queued_operation_id,
+                cwd,
+                &request.args,
+                admission,
+                &repository,
+            ) {
+                Ok(journal) => journal,
+                Err(error) => {
+                    self.resolve_unstarted_operation(
+                        queued_operation_id,
+                        "fetch_evidence_unavailable",
+                    );
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         let mut host_guard = if is_remote_write {
             Some(crate::HostOperationGuard::begin(
                 &self.host_operation_database_path()?,
@@ -2660,6 +2863,10 @@ impl Broker {
         if let Some(heartbeat) = operation_heartbeat.as_ref() {
             add_operation_liveness(&mut running_details, heartbeat.liveness(unix_now_ms()));
         }
+        if let Some(journal) = &fetch_journal {
+            running_details["fetch_reconciliation"] = serde_json::to_value(journal)
+                .expect("fetch journal contains only serializable fields");
+        }
         self.store().transition_coordinated_operation(
             operation.id,
             OperationStatus::Running,
@@ -2727,13 +2934,34 @@ impl Broker {
         // Split the budget a read spent by phase, so a timeout says whether
         // the broker or the provider used it (#555).
         let preparation_ms = admission.elapsed_ms();
-        let output = match output_within(
-            command,
-            admission,
-            &repository,
-            "executing coordinated operation",
-            operation_heartbeat.as_ref(),
-        ) {
+        let provider_output = {
+            let records_fetch = fetch_journal.is_some();
+            let mut observe_provider = |observation| {
+                if let Some(journal) = &mut fetch_journal {
+                    journal.observe(observation);
+                    let serialized = serde_json::to_string(&*journal)
+                        .expect("fetch journal contains only serializable fields");
+                    let update = self
+                        .store()
+                        .record_fetch_observation(operation.id, &serialized);
+                    crate::warn_unrecorded("persisting exact fetch provider evidence", update);
+                }
+            };
+            output_within_observed(
+                command,
+                admission,
+                &repository,
+                "executing coordinated operation",
+                operation_heartbeat.as_ref(),
+                MAX_COORDINATED_OUTPUT_BYTES,
+                if records_fetch {
+                    Some(&mut observe_provider)
+                } else {
+                    None
+                },
+            )
+        };
+        let output = match provider_output {
             Ok(output) => output,
             Err(BrokerOpError::AdmissionTimedOut {
                 repository,

@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-10-25
+Last Updated: 2026-10-27
 
 When code outside the `packages/aethyme/` Rust source tree invokes an
 Aethyme command, it crosses a process boundary. Static
@@ -82,6 +82,51 @@ An absent or aged-out observation is unknown, not proof of success or cleanup.
 These diagnostics introduce no process-signaling, lease-release or worktree-removal
 authority. Gate/preparation and legacy interactive execution do not gain this
 observation unless they use the receipt-bearing supervised path.
+
+## Broker Git resource profiles and coordination visibility
+
+Git commands retain repository-exclusive coordination unless their entire argv
+matches a closed single-ref profile. The fetch profile explicitly disables tags,
+FETCH_HEAD writes, submodule recursion, maintenance, commit-graph writes, pruning
+and configured refmaps. Scoped operations hold the historical repository lock
+shared and the derived branch resource lock exclusive. All current Git writers
+also take a device/inode-bound common-directory lane (shared for strict profiles,
+exclusive otherwise); fetches additionally lock their exact local destination.
+This prevents remote aliases and symlink spellings from splitting local write
+coordination. Legacy clients retain same-remote historical exclusion only;
+upgrade all writers before depending on cross-remote concurrency. Caller `--scope` labels never select a lock. Unknown outcomes
+from broad operations still fence all Git resource scopes. Unsupported hooks,
+custom refmaps, shallow repositories and unrecognized configuration retain the
+broad command spelling; a strict profile refuses before spawning.
+
+A strict fetch's operation details may contain `fetch_reconciliation` schema 1:
+exact source/destination, prior destination, common-directory device/inode,
+provider process generation and an actual child-wait result. Minimal timeout and
+crash transitions preserve this key. Automatic reconciliation requires normal
+child completion, unchanged identity/configuration, the same canonical remote
+and fresh exact local/remote ref evidence. Missing proof, signal termination,
+remote advancement or provider errors remain unknown; no fetch is retried and
+PID disappearance alone never grants authority. Legacy records gain no synthetic
+completion evidence. This protocol adds no schema migration or new deletion rights.
+
+Coordination wait details retain schema 1 and add `blocked_scope`,
+`safe_next_action` and `missing_evidence`. Matching running operations supply the
+holder identity and existing phase/progress timestamp. A resource wait does not
+attribute unrelated ref activity as its holder.
+
+`broker push` overlap rows may include bounded `line_ranges` alongside the complete
+`files` and `conflicting_hunks` result. At most five shared paths and eight inclusive
+old-side conflict spans per side/path are shown, with explicit truncation and
+whole-file markers; line 0 can represent an insertion before the first old line.
+`pull_request_basis` distinguishes a locally verified tracked-default merge base
+from `provider_diff`, whose exact base was not verified locally. Provider ranges
+are diagnostic and must not be assumed to share a coordinate basis.
+
+`broker advanced leases plan --json` adds `shared_edit_owners` derived only from
+its existing conflict snapshot. `coordination_history.loaded: false` explicitly
+means notes and release-request history were not scanned; the included status and
+note-list commands provide a deliberate drilldown. No source/output relationship
+is inferred from generated-path classification.
 
 ## Inventory
 

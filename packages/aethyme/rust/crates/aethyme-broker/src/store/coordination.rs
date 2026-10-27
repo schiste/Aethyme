@@ -94,6 +94,22 @@ impl BrokerStore {
         Ok(operations)
     }
 
+    /// Persist the child-owner witness without resurrecting a concurrently
+    /// reconciled operation or overwriting heartbeat/progress fields.
+    pub(crate) fn record_fetch_observation(
+        &mut self,
+        id: i64,
+        journal: &str,
+    ) -> Result<bool, BrokerError> {
+        let changed = self.conn.execute(
+            "UPDATE coordinated_operations SET details_json = json_set(COALESCE(details_json, '{}'),
+                 '$.fetch_reconciliation', json(?2)), updated_at = ?3
+             WHERE id = ?1 AND status = 'running'",
+            params![id, journal, now_ms()],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub fn transition_coordinated_operation(
         &mut self,
         id: i64,
@@ -104,6 +120,24 @@ impl BrokerStore {
         let operation = self
             .coordinated_operation(id)?
             .ok_or(BrokerError::CoordinatedOperationNotFound(id))?;
+        // Completion evidence must survive timeout and crash transitions whose
+        // new details contain only a reason. Preserve this protocol key only;
+        // unrelated previous output is deliberately not carried forward.
+        let mut details =
+            details_json.and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
+        if let Some(proof) = operation
+            .details_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .and_then(|value| value.get("fetch_reconciliation").cloned())
+        {
+            let destination = details.get_or_insert_with(|| serde_json::json!({}));
+            if let Some(object) = destination.as_object_mut() {
+                object.entry("fetch_reconciliation").or_insert(proof);
+            }
+        }
+        let preserved_details = details.map(|value| value.to_string());
+        let details_json = preserved_details.as_deref().or(details_json);
         let now = now_ms();
         let finished_at = matches!(
             status,

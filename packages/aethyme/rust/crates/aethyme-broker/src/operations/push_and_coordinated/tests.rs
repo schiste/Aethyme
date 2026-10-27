@@ -2199,3 +2199,106 @@ fn push_kind_falls_back_to_mixed_when_the_shape_is_uncertain() {
     }
     assert_eq!(push_kind(&["fetch", "origin"]), None);
 }
+
+#[test]
+fn fetch_completion_journal_survives_minimal_unknown_transition() {
+    let root = tempfile::tempdir().unwrap();
+    let database = root.path().join("broker.db");
+    drop(crate::BrokerStore::open(&database).unwrap());
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection.execute_batch("INSERT INTO sessions (id, worktree_path, branch, origin, status, created_at, updated_at, last_activity_at) VALUES (37, '/repo/one', 'agent/one', 'adopted', 'active', 1, 1, 1);").unwrap();
+    drop(connection);
+    let mut store = crate::BrokerStore::open(&database).unwrap();
+    let operation = store
+        .create_coordinated_operation(&crate::NewCoordinatedOperation {
+            session_id: 37,
+            provider: OperationProvider::Git,
+            repository: "owner/repo".into(),
+            scope: "fetch".into(),
+            effect: OperationEffect::Write,
+            authorization_reason: Some("test".into()),
+            command_json: "[\"git\",\"fetch\"]".into(),
+            pid: std::process::id() as i64,
+            host_operation_id: None,
+            identity_provenance: crate::OperationIdentityProvenance::VerifiedCanonical,
+        })
+        .unwrap();
+    let proof = json!({"schema_version": 1, "operation_id": operation.id,
+        "completion": {"pid": 123, "success": true, "exit_code": 0}});
+    store
+        .transition_coordinated_operation(
+            operation.id,
+            OperationStatus::Running,
+            None,
+            Some(&json!({"fetch_reconciliation": proof, "stderr": "old output"}).to_string()),
+        )
+        .unwrap();
+    let unknown = store
+        .transition_coordinated_operation(
+            operation.id,
+            OperationStatus::OutcomeUnknown,
+            None,
+            Some(r#"{"reason":"process_ended_without_outcome"}"#),
+        )
+        .unwrap();
+    let details: serde_json::Value =
+        serde_json::from_str(unknown.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(details["fetch_reconciliation"], proof);
+    assert_eq!(details["reason"], "process_ended_without_outcome");
+    assert!(details.get("stderr").is_none());
+}
+
+#[test]
+fn exact_fetch_profile_validates_git_config_and_observes_exact_refs() {
+    let (root, target) = push_fixture();
+    let args = git_scopes::canonical_fetch_args("origin", "main").unwrap();
+    let deadline = AdmissionDeadline::start(QueueWait::Seconds(10));
+    git_scopes::validate_repository(root.path(), &args, deadline, &target.coordination_key)
+        .unwrap();
+    let oid = crate::GitRepo::discover(root.path())
+        .unwrap()
+        .resolve_ref("HEAD")
+        .unwrap();
+    let output = Command::new("git")
+        .current_dir(root.path())
+        .args(["update-ref", "refs/remotes/origin/main", &oid])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        git_scopes::observe_ref(
+            root.path(),
+            "refs/remotes/origin/main",
+            deadline,
+            &target.coordination_key
+        )
+        .unwrap(),
+        Some(oid)
+    );
+    assert_eq!(
+        git_scopes::observe_ref(
+            root.path(),
+            "refs/remotes/origin/absent",
+            deadline,
+            &target.coordination_key
+        )
+        .unwrap(),
+        None
+    );
+    let output = Command::new("git")
+        .current_dir(root.path())
+        .args([
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/heads/*",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        git_scopes::validate_repository(root.path(), &args, deadline, &target.coordination_key)
+            .is_err(),
+        "a second expanding refmap must force the wide lane"
+    );
+}
