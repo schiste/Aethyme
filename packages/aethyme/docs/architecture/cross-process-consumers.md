@@ -882,8 +882,12 @@ report; `execution_receipt_id` identifies its durable receipt. The committed
 path census and its ownership audit are separate from the post-command dirty
 path audit in `execution`. A report is returned only after the commit command
 ran; a nonzero result can mean the command failed, ownership failed, or the
-post-commit audit is unknown. Inspect the receipt and reported paths before
-retrying. A refusal before dispatch has no commit report or execution receipt.
+post-commit audit is unknown. Only the broker's own preflight refusals above
+are guaranteed to happen before receipt creation. A supervisor/helper setup or
+launch failure after preflight can leave a `starting` receipt and no commit
+report; inspect `aethyme broker advanced exec-status` and treat an unresolved
+receipt as unknown. Every returned JSON report sets `command_ran` to true.
+Inspect the receipt and reported paths before retrying.
 
 ### Lease scope and guarded-execution reporting
 
