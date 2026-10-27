@@ -169,8 +169,11 @@ pub(crate) fn describe_host_state_sqlite(error: &rusqlite::Error) -> String {
     format!(
         "{base} — the host-scoped coordination database could not be opened. A sandbox or \
          permission policy that confines writes to the invoking checkout denies it; this is \
-         not a missing or outdated installation. Point AETHYME_HOST_STATE_DIR at a writable \
-         location, or grant this process access."
+         not a missing or outdated installation. For shared work, grant this process access \
+         to the same host-state directory used by the other Aethyme sessions. Set \
+         AETHYME_HOST_STATE_DIR to a writable directory only for intentionally isolated work; \
+         it creates a private coordination domain and does not share host resource leases or \
+         capacity with sessions using the shared directory."
     )
 }
 
@@ -246,6 +249,27 @@ mod tests {
         assert!(text.contains("AETHYME_HOST_STATE_DIR"), "{text}");
         assert!(
             text.contains("not a missing or outdated installation"),
+            "{text}"
+        );
+        assert!(
+            text.contains("For shared work, grant this process access"),
+            "{text}"
+        );
+        assert!(
+            text.contains("same host-state directory used by the other Aethyme sessions"),
+            "{text}"
+        );
+        assert!(
+            text.contains("only for intentionally isolated work"),
+            "{text}"
+        );
+        assert!(text.contains("private coordination domain"), "{text}");
+        assert!(
+            text.contains("does not share host resource leases or capacity"),
+            "{text}"
+        );
+        assert!(
+            text.contains("sessions using the shared directory"),
             "{text}"
         );
 
