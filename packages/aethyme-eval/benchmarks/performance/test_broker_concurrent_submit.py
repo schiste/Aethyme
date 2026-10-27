@@ -295,12 +295,14 @@ class BoundedProcessTests(unittest.TestCase):
         self.assertEqual(row['redacted_value_occurrences'], 2)
 
     def test_runner_marks_invalid_utf8_from_original_stdout_bytes(self):
+        raw = b'\xed\xa0\x80'
         row = self.runner.run(
             [sys.executable, '-c', 'import os; os.write(1, b"\\xed\\xa0\\x80")'],
             self.root, 'invalid-utf8-output')
         self.assertFalse(row['stdout_utf8_valid'])
-        self.assertEqual(row['stdout_bytes'], 3)
-        self.assertEqual(len(row['stdout'].encode('utf-8')), 3)
+        self.assertEqual(row['stdout_bytes'], len(raw))
+        self.assertEqual(row['stdout_sha256'], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(row['stdout'], raw.decode('utf-8', errors='replace'))
 
     def test_byte_redaction_rejects_invalid_or_missing_token_inputs(self):
         self.assertEqual(redact_captured_output(b'a-secret-b', b'secret', ('secret',)),
