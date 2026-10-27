@@ -872,7 +872,7 @@ fn valid_git_object_id(value: &str) -> bool {
 }
 
 fn read_recovery_manifest(path: &Path) -> Result<Vec<u8>, String> {
-    let (mut file, metadata) = open_regular_file_no_follow(path)
+    let (file, metadata) = open_regular_file_no_follow(path)
         .map_err(|error| format!("cannot safely open manifest: {error}"))?;
     if metadata.len() > MAX_RECOVERY_MANIFEST_BYTES {
         return Err("manifest exceeds the ownership check byte bound".into());
