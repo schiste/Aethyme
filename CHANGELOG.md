@@ -12,6 +12,7 @@ artifacts and their exact source revision are recorded in each signed
 
 - `aethyme broker commit --session <id> -- <git-commit-args>` runs a local commit under its session lock, preserving Git hooks and ownership checks without holding the repository-wide operation lock throughout the hooks. Existing `broker advanced git` behavior is unchanged.
 - Installation health diagnostics explain when a private host-state override separates host resource leases and capacity from other installations.
+- Session-start diagnostics identify when the running CLI build differs from PATH's selected router and list other known installation roots without executing their binaries.
 
 ### Fixed
 
