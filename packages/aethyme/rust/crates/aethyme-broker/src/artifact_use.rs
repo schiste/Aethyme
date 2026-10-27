@@ -21,13 +21,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const MARKER_SCHEMA_VERSION: u32 = 1;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "B1 ships the fail-closed reclaimer surface before a production cleanup caller exists."
-    )
-)]
+// B1 exercises the fail-closed reclaimer surface in tests but has no production
+// cleanup caller yet. These item-scoped allowances cover only that surface.
+#[cfg_attr(not(test), allow(dead_code))]
 const MAX_MARKERS_PER_CHECKOUT: usize = 256;
 const MAX_MARKER_BYTES: u64 = 16 * 1024;
 const ARTIFACT_LAYOUT_LOCK_WAIT: Duration = Duration::from_secs(1);
@@ -95,13 +91,7 @@ pub(crate) enum ArtifactUsePhase {
 }
 
 /// Why a future artifact reclamation attempt could not prove the checkout idle.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "B1 ships the fail-closed reclaimer surface before a production cleanup caller exists."
-    )
-)]
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ArtifactUseReclaimBlock {
     /// A producer or another exclusive user currently holds the inode lock.
@@ -113,13 +103,7 @@ pub(crate) enum ArtifactUseReclaimBlock {
 }
 
 /// Result of a bounded, nonblocking attempt to reserve a checkout for cleanup.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "B1 ships the fail-closed reclaimer surface before a production cleanup caller exists."
-    )
-)]
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) enum ArtifactUseReclaimTry {
     Acquired(ArtifactUseReclaimer),
@@ -473,13 +457,7 @@ impl ArtifactUseProducer {
 /// An exclusive reservation returned only when the full durable marker
 /// inventory was readable and empty. It is a synchronization primitive, not
 /// cleanup authority.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "B1 ships the fail-closed reclaimer surface before a production cleanup caller exists."
-    )
-)]
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct ArtifactUseReclaimer {
     _lock: super::ExclusiveFileLock,
@@ -624,13 +602,7 @@ pub(crate) fn begin_artifact_use_scope(
 /// marker, malformed entry, cap overflow, or I/O error must retain the
 /// checkout; this function never deletes or repairs markers. Non-Unix
 /// targets return `ProtocolUnavailable` permanently, regardless of inventory.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "B1 ships the fail-closed reclaimer surface before a production cleanup caller exists."
-    )
-)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn try_artifact_use_reclaimer(
     primary_root: &Path,
     checkout_root: &Path,
@@ -667,13 +639,7 @@ pub(crate) fn try_artifact_use_reclaimer(
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "B1 ships the fail-closed reclaimer surface before a production cleanup caller exists."
-    )
-)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn read_marker_inventory(locations: &ArtifactUseLocations) -> io::Result<Vec<ArtifactUseMarker>> {
     let directory_metadata = match fs::symlink_metadata(&locations.marker_dir) {
         Ok(metadata) => metadata,
@@ -737,13 +703,7 @@ fn read_marker_inventory(locations: &ArtifactUseLocations) -> io::Result<Vec<Art
     Ok(markers)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "B1 ships the fail-closed reclaimer surface before a production cleanup caller exists."
-    )
-)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn read_marker_file(path: &Path) -> io::Result<ArtifactUseMarker> {
     let mut file = open_existing_nofollow(path)?;
     super::verify_named_lock_file(path, &file)?;
@@ -779,13 +739,7 @@ fn create_marker_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "B1 ships the fail-closed reclaimer surface before a production cleanup caller exists."
-    )
-)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn open_existing_nofollow(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
