@@ -136,6 +136,16 @@ fn release_metadata_error(
 }
 
 #[test]
+fn repository_engine_pin_matches_the_newline_terminated_release_version() {
+    let pin = aethyme_testkit::paths::repo_root().join(".aethyme/engine-version");
+    assert_eq!(
+        std::fs::read(pin).unwrap(),
+        format!("{}\n", product_version()).into_bytes(),
+        "the engine pin must contain the exact workspace version followed by a newline"
+    );
+}
+
+#[test]
 fn production_crates_and_binaries_share_the_release_version() {
     let root = rust_workspace_root();
     let expected = product_version();
