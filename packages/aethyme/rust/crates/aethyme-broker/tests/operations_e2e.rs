@@ -138,6 +138,19 @@ fn exact_push_request(session_id: i64, worktree: &Path, refspecs: &[&str]) -> Co
 }
 
 #[cfg(unix)]
+fn shell_path(path: &Path) -> String {
+    format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
+}
+
+#[cfg(unix)]
+fn shell_fixture_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("broker operations ' shell paths ")
+        .tempdir()
+        .unwrap()
+}
+
+#[cfg(unix)]
 fn write_executable(path: &Path, contents: &str) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -878,7 +891,7 @@ fn local_pre_push_rejection_records_that_the_remote_was_not_contacted() {
 #[cfg(unix)]
 #[test]
 fn exact_push_is_succeeded_when_transport_exits_nonzero_after_every_update() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = shell_fixture_tempdir();
     let mut fixture = push_fixture(tmp.path(), "push-succeeded");
     let proposed = commit_push_fixture(&fixture, "landed\n");
     let git_exec_path = git_output(&fixture.worktree, &["--exec-path"]);
@@ -894,7 +907,7 @@ fn exact_push_is_succeeded_when_transport_exits_nonzero_after_every_update() {
         &[
             "config",
             "remote.origin.receivepack",
-            receive_pack.to_str().unwrap(),
+            &shell_path(&receive_pack),
         ],
     );
 
@@ -1151,7 +1164,7 @@ fn exact_push_inspection_proposes_success_without_clearing_the_write_barrier() {
 #[cfg(unix)]
 #[test]
 fn missing_post_push_evidence_keeps_an_exact_push_unknown() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = shell_fixture_tempdir();
     let mut fixture = push_fixture(tmp.path(), "push-missing");
     commit_push_fixture(&fixture, "missing evidence\n");
     let receive_pack = tmp.path().join("remove-remote-then-fail");
@@ -1164,7 +1177,7 @@ fn missing_post_push_evidence_keeps_an_exact_push_unknown() {
         &[
             "config",
             "remote.origin.receivepack",
-            receive_pack.to_str().unwrap(),
+            &shell_path(&receive_pack),
         ],
     );
 
@@ -1201,7 +1214,7 @@ fn missing_post_push_evidence_keeps_an_exact_push_unknown() {
 #[cfg(unix)]
 #[test]
 fn bounded_remote_write_timeout_is_journaled_unknown_and_blocks_retry() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = shell_fixture_tempdir();
     let mut fixture = push_fixture(tmp.path(), "push-timeout");
     commit_push_fixture(&fixture, "timeout\n");
     let receive_pack = tmp.path().join("sleeping-receive-pack");
@@ -1211,7 +1224,7 @@ fn bounded_remote_write_timeout_is_journaled_unknown_and_blocks_retry() {
         &[
             "config",
             "remote.origin.receivepack",
-            receive_pack.to_str().unwrap(),
+            &shell_path(&receive_pack),
         ],
     );
 
@@ -1292,7 +1305,7 @@ fn bounded_local_write_timeout_is_failed_without_remote_recovery() {
 #[cfg(unix)]
 #[test]
 fn a_read_that_times_out_reports_the_phase_and_needs_no_reconciliation() {
-    let tmp = common::FixtureRepository::new();
+    let tmp = common::FixtureRepository::from_tempdir(shell_fixture_tempdir());
     init_repo(tmp.path());
     let worktree = add_worktree(tmp.path(), "read-timeout");
     let mut broker = common::open_fixture_repository_broker(&tmp)
@@ -1306,7 +1319,7 @@ fn a_read_that_times_out_reports_the_phase_and_needs_no_reconciliation() {
     std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     git(
         tmp.path(),
-        &["config", "core.fsmonitor", hook.to_str().unwrap()],
+        &["config", "core.fsmonitor", &shell_path(&hook)],
     );
     let command = request(session.id, &["status"]);
 
@@ -1978,14 +1991,17 @@ fn a_slow_pre_lock_hook_exhausts_the_queue_timeout_and_settles_the_row() {
 #[cfg(unix)]
 #[test]
 fn an_opted_in_push_runs_its_hook_once_and_succeeds() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = shell_fixture_tempdir();
     let mut fixture = push_fixture(tmp.path(), "hooks-once");
     let repo = fixture.broker.main_root().to_path_buf();
     enable_hooks_outside_lock(&repo);
     let counter = tmp.path().join("hook-runs");
     install_pre_push_hook(
         &repo,
-        &format!("#!/bin/sh\nprintf 'x' >> {}\nexit 0\n", counter.display()),
+        &format!(
+            "#!/bin/sh\nprintf 'x' >> {}\nexit 0\n",
+            shell_path(&counter)
+        ),
     );
     let head = commit_push_fixture(&fixture, "work\n");
 
@@ -2015,13 +2031,16 @@ fn an_opted_in_push_runs_its_hook_once_and_succeeds() {
 #[cfg(unix)]
 #[test]
 fn without_opting_in_the_hook_still_runs_inside_the_push() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = shell_fixture_tempdir();
     let mut fixture = push_fixture(tmp.path(), "hooks-default");
     let repo = fixture.broker.main_root().to_path_buf();
     let counter = tmp.path().join("hook-runs");
     install_pre_push_hook(
         &repo,
-        &format!("#!/bin/sh\nprintf 'x' >> {}\nexit 0\n", counter.display()),
+        &format!(
+            "#!/bin/sh\nprintf 'x' >> {}\nexit 0\n",
+            shell_path(&counter)
+        ),
     );
     commit_push_fixture(&fixture, "work\n");
 
@@ -2049,7 +2068,7 @@ fn install_push_kind_recording_hook(repo: &Path, log: &Path) {
         repo,
         &format!(
             "#!/bin/sh\nprintf '%s|%s\\n' \"${{AETHYME_PUSH_KIND-unset}}\" \"$(printf '%s' \"${{AETHYME_PUSH_REFS-}}\" | tr '\\n' ',')\" >> {}\nexit 0\n",
-            log.display()
+            shell_path(log)
         ),
     );
 }
@@ -2062,7 +2081,7 @@ fn install_push_kind_recording_hook(repo: &Path, log: &Path) {
 #[cfg(unix)]
 #[test]
 fn a_delete_only_push_skips_the_dry_run_and_tells_the_hook() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = shell_fixture_tempdir();
     let mut fixture = push_fixture(tmp.path(), "delete-only");
     let repo = fixture.broker.main_root().to_path_buf();
     git(&repo, &["push", "-q", "origin", "main:refs/heads/feature"]);
@@ -2099,7 +2118,7 @@ fn a_delete_only_push_skips_the_dry_run_and_tells_the_hook() {
 #[cfg(unix)]
 #[test]
 fn an_update_push_tells_the_hook_it_is_an_update() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = shell_fixture_tempdir();
     let mut fixture = push_fixture(tmp.path(), "update-kind");
     let repo = fixture.broker.main_root().to_path_buf();
     let log = tmp.path().join("hook-env");
@@ -2126,7 +2145,7 @@ fn an_update_push_tells_the_hook_it_is_an_update() {
 #[cfg(unix)]
 #[test]
 fn a_mixed_push_is_verified_and_tells_the_hook_it_is_mixed() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = shell_fixture_tempdir();
     let mut fixture = push_fixture(tmp.path(), "mixed-kind");
     let repo = fixture.broker.main_root().to_path_buf();
     git(&repo, &["push", "-q", "origin", "main:refs/heads/old"]);
