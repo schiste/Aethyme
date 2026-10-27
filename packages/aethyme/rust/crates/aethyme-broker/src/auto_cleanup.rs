@@ -130,7 +130,7 @@ fn decode_auto_cleanup_cursor(value: Option<&str>) -> AutoCleanupCursor {
 /// most closed checkouts have no retained lease rows to classify. Apply gives
 /// each candidate its own fresh instance under the lifecycle claim.
 #[derive(Default)]
-pub(crate) struct LeaseProcessTableSnapshot {
+struct LeaseProcessTableSnapshot {
     snapshot: Option<Option<crate::session_holder::ProcessTable>>,
 }
 
@@ -140,6 +140,13 @@ impl LeaseProcessTableSnapshot {
             .get_or_insert_with(crate::session_holder::ProcessTable::snapshot)
             .as_ref()
     }
+}
+
+struct AutoCleanupVerdictOptions<'a> {
+    deep: bool,
+    deadline: Option<Instant>,
+    selected: Option<&'a ContainmentProof>,
+    lease_process_table: &'a mut LeaseProcessTableSnapshot,
 }
 
 fn checkout_group_cursor_session_id(group: &AutoCleanupCheckoutGroup) -> i64 {
@@ -1272,16 +1279,19 @@ impl Broker {
     /// HEAD and the upstream tip, and the plan pins the tip, so an unchanged
     /// HEAD reuses it instead of repeating the deep landing search with no
     /// deadline; every other proof is re-read (#460).
-    pub(crate) fn auto_cleanup_verdict(
+    fn auto_cleanup_verdict(
         &mut self,
         candidate: &AutoCleanupCandidate,
         policy: &AutoCleanupPolicy,
         upstream: &(String, String),
-        deep: bool,
-        deadline: Option<Instant>,
-        selected: Option<&ContainmentProof>,
-        lease_process_table: &mut LeaseProcessTableSnapshot,
+        options: AutoCleanupVerdictOptions<'_>,
     ) -> Result<ContainmentProof, NotRemoved> {
+        let AutoCleanupVerdictOptions {
+            deep,
+            deadline,
+            selected,
+            lease_process_table,
+        } = options;
         let keep = NotRemoved::Keep;
         // Only a checkout a broker session record proves it created may go.
         // Candidates come from session records, never from scanning the
@@ -1601,10 +1611,12 @@ impl Broker {
                             &candidate,
                             &policy,
                             upstream,
-                            false,
-                            deadline,
-                            None,
-                            &mut lease_process_table,
+                            AutoCleanupVerdictOptions {
+                                deep: false,
+                                deadline,
+                                selected: None,
+                                lease_process_table: &mut lease_process_table,
+                            },
                         );
                         let verdict = match verdict {
                             Err(NotRemoved::Defer) if !deadline_expired(deadline) => self
@@ -1612,10 +1624,12 @@ impl Broker {
                                     &candidate,
                                     &policy,
                                     upstream,
-                                    true,
-                                    deadline,
-                                    None,
-                                    &mut lease_process_table,
+                                    AutoCleanupVerdictOptions {
+                                        deep: true,
+                                        deadline,
+                                        selected: None,
+                                        lease_process_table: &mut lease_process_table,
+                                    },
                                 ),
                             verdict => verdict,
                         };
@@ -1753,10 +1767,12 @@ impl Broker {
                 &candidate,
                 &policy,
                 &upstream,
-                true,
-                None,
-                Some(&selected_proof),
-                &mut lease_process_table,
+                AutoCleanupVerdictOptions {
+                    deep: true,
+                    deadline: None,
+                    selected: Some(&selected_proof),
+                    lease_process_table: &mut lease_process_table,
+                },
             ) {
                 Ok(proof) => proof,
                 Err(NotRemoved::Keep(reason)) => {
