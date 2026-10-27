@@ -202,6 +202,22 @@ The broker starts the private `broker gc __continue-artifacts <canonical-main-ro
 
 Changing the private command, marker, canonical-root argument, runtime-alignment check, or lock handoff without updating both launcher and child can strand cleanup requests or run a mismatched binary. The child must leave incomplete requests retryable and must not report them complete.
 
+Before removing an eligible closed-session build cache, the sweep also tries the
+B1 per-checkout cooperative exclusive artifact-use admission after candidate
+eligibility is rechecked and before publishing a new removal intent or
+performing deletion. The reservation stays held through tree removal and the
+interrupted-path progress update. A busy producer, unknown marker, malformed or unavailable inventory, or unavailable protocol
+retains the cache and keeps the cleanup
+request pending and incomplete. While a path is present as a symlink or
+replacement, it remains blocked and queued. Proven absence can retire a
+queued path without removal; other eligibility revocations remain separately
+reported. A resolved present path goes through fresh eligibility and admission
+checks. This exclusion does not authorize
+cleanup of open worktrees and does not prove participation by older clients,
+unmanaged direct commands, or escaped descendants; an empty marker inventory
+alone is not cleanup authority. It adds no report field or schema; blocker
+reason strings remain opaque to consumers.
+
 The nine durable cache-sweep keys are scoped by a SHA-256 namespace derived
 from the complete captured broker storage context. Linked worktrees in the
 same repository and using the same captured context share sweep state; a

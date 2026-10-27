@@ -1278,10 +1278,11 @@ mod unix {
 
         use tempfile::tempdir;
 
+        use super::super::remove_condemned_tree_with_progress;
         use super::*;
         use crate::gc::{
             PinnedTreeRemoval as PublicPinnedTreeRemoval, remove_condemned_tree,
-            remove_condemned_tree_with_progress, remove_condemned_tree_with_progress_and_guard,
+            remove_condemned_tree_with_progress_and_guard,
         };
 
         fn remove_with_hook<F>(
