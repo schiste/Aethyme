@@ -5177,6 +5177,55 @@ mod registered_removal_failure_tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
+    fn pinned_orphan_root_rechecks_its_generation_before_each_removal_pass() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "orphan root generation recheck");
+        let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        let root = PinnedOrphanRoot::open(&worktree, &proof).unwrap().unwrap();
+        let replacement = [0x5a_u8; 32];
+
+        #[cfg(target_os = "linux")]
+        let name = c"user.aethyme.root-generation";
+        #[cfg(target_os = "macos")]
+        let name = c"com.aethyme.root-generation";
+
+        #[cfg(target_os = "linux")]
+        // SAFETY: the descriptor is the pinned root directory and the xattr
+        // name/value buffers remain live for the duration of the call.
+        let result = unsafe {
+            libc::fsetxattr(
+                root.root.as_raw_fd(),
+                name.as_ptr(),
+                replacement.as_ptr().cast(),
+                replacement.len(),
+                libc::XATTR_REPLACE,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        // SAFETY: the descriptor is the pinned root directory and the xattr
+        // name/value buffers remain live for the duration of the call.
+        let result = unsafe {
+            libc::fsetxattr(
+                root.root.as_raw_fd(),
+                name.as_ptr(),
+                replacement.as_ptr().cast(),
+                replacement.len(),
+                0,
+                libc::XATTR_REPLACE,
+            )
+        };
+        assert_eq!(result, 0);
+
+        let error = root.ensure_binding().unwrap_err();
+        assert!(error.contains("generation changed"), "{error}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
     fn orphan_removal_does_not_follow_a_directory_replaced_by_a_symlink() {
         use std::os::unix::fs::symlink;
 
