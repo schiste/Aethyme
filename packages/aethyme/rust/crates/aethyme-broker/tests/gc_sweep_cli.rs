@@ -3244,14 +3244,28 @@ fn a_remembered_path_through_a_symlink_is_never_removed() {
         std::fs::write(repo.path().join(".git/info/exclude"), "link/\na/\n").unwrap();
         remember_interrupted_tree(repo.path(), &worktree.join("link/.pnpm-store"));
         enable_sweep(repo.path());
-        sweep(repo.path(), container.path());
+        let report = sweep(repo.path(), container.path());
+        assert_eq!(
+            report["complete"], false,
+            "a present symlink component keeps the sweep incomplete: {report}"
+        );
         assert!(
             store.join("keep").exists(),
             "symlink target must survive (outside: {points_outside})"
         );
+        let expected_path = worktree
+            .join("link/.pnpm-store")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             meta(repo.path(), "gc.artifact_sweep.interrupted_path").as_deref(),
-            Some("")
+            Some(expected_path.as_str()),
+            "a present symlink path remains queued until it is resolved"
+        );
+        assert!(
+            meta(repo.path(), "gc.artifact_sweep.blocked_paths")
+                .expect("the symlink blocker is reported")
+                .contains("symlink_component")
         );
     }
 }
