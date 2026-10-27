@@ -1083,6 +1083,47 @@ impl BrokerStore {
             .map_err(BrokerError::from)
     }
 
+    /// Return only the unreleased, unexpired lease rows owned by `session_ids`
+    /// at one caller-supplied snapshot time, regardless of session status.
+    ///
+    /// Cleanup uses this after confirming its candidate sessions are closed:
+    /// the general active-lease view intentionally filters those sessions
+    /// out, while a retained row must still be classified for unknown/stale
+    /// holder evidence. Chunks stay below SQLite's older 999-variable limit.
+    pub(crate) fn unreleased_unexpired_leases_for_sessions_at(
+        &self,
+        session_ids: &[i64],
+        now: i64,
+    ) -> Result<Vec<Lease>, BrokerError> {
+        const SESSION_ID_CHUNK: usize = 900;
+
+        let mut session_ids = session_ids.to_vec();
+        session_ids.sort_unstable();
+        session_ids.dedup();
+        let mut leases = Vec::new();
+        for session_ids in session_ids.chunks(SESSION_ID_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", session_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let now_parameter = session_ids.len() + 1;
+            let sql = format!(
+                "{LEASE_SELECT}
+                 WHERE session_id IN ({placeholders})
+                   AND released_at IS NULL
+                   AND (expires_at IS NULL OR expires_at > ?{now_parameter})
+                 ORDER BY id"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let parameters = session_ids.iter().copied().chain(std::iter::once(now));
+            let rows = stmt.query_map(rusqlite::params_from_iter(parameters), lease_from_row)?;
+            for row in rows {
+                leases.push(row??);
+            }
+        }
+        leases.sort_by_key(|lease| lease.id);
+        Ok(leases)
+    }
+
     /// Resolve publication advisories only after their affected session no
     /// longer has a live lease overlapping the advisory paths. Acknowledged
     /// advisories still complete their lifecycle once the condition clears.
@@ -1356,6 +1397,28 @@ mod finish_lease_query_tests {
                 .unwrap(),
             "post-close verification must still see an unreleased target row"
         );
+        let scoped = store
+            .unreleased_unexpired_leases_for_sessions_at(&[target.id], now)
+            .unwrap();
+        assert_eq!(scoped.len(), 1, "unrelated lease history stays out");
+        assert_eq!(scoped[0].session_id, target.id);
+        assert_eq!(scoped[0].path, "unreleased-after-close");
+        let mut chunked_ids = (-900..0).collect::<Vec<_>>();
+        chunked_ids.push(target.id);
+        let chunked = store
+            .unreleased_unexpired_leases_for_sessions_at(&chunked_ids, now)
+            .unwrap();
+        assert_eq!(chunked.len(), 1, "the final ID chunk is queried");
+        assert_eq!(chunked[0].session_id, target.id);
+        let repeated_ids = vec![target.id; 901];
+        assert_eq!(
+            store
+                .unreleased_unexpired_leases_for_sessions_at(&repeated_ids, now)
+                .unwrap()
+                .len(),
+            1,
+            "duplicate IDs across query chunks must not duplicate leases"
+        );
 
         store
             .release_lease(target.id, "unreleased-after-close")
@@ -1365,6 +1428,12 @@ mod finish_lease_query_tests {
                 .has_unreleased_unexpired_lease_for_session_at(target.id, now_ms())
                 .unwrap(),
             "released target rows should no longer count"
+        );
+        assert!(
+            store
+                .unreleased_unexpired_leases_for_sessions_at(&[target.id], now_ms())
+                .unwrap()
+                .is_empty()
         );
         assert!(
             store
@@ -1384,6 +1453,15 @@ mod finish_lease_query_tests {
                 )
                 .unwrap(),
             "a row expiring at the query snapshot is no longer active"
+        );
+        assert!(
+            store
+                .unreleased_unexpired_leases_for_sessions_at(
+                    &[target.id],
+                    expired.expires_at.unwrap(),
+                )
+                .unwrap()
+                .is_empty()
         );
     }
 }
