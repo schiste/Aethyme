@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::atomic_file::write_synced_if_absent;
 
 pub(crate) const ARCHIVE_CLEANUP_INTENT_SCHEMA_VERSION: u32 = 1;
+/// Bump this when residual path or disposable-directory interpretation changes.
 pub(crate) const ARCHIVE_CLEANUP_POLICY_VERSION: u32 = 1;
 const MAX_INTENT_FILE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RESIDUAL_ENTRIES: usize = 50_000;
@@ -311,10 +312,7 @@ pub(crate) fn read_bounded(path: &Path, deadline: Instant) -> Result<ArchiveClea
     let opened_metadata = file
         .metadata()
         .map_err(|error| format!("cannot inspect opened archive cleanup intent: {error}"))?;
-    if !opened_metadata.is_file()
-        || !same_file_identity(&path_metadata, &opened_metadata)
-        || opened_metadata.len() != path_metadata.len()
-    {
+    if !opened_metadata.is_file() || !same_file_snapshot(&path_metadata, &opened_metadata) {
         return Err("archive cleanup intent changed while it was opened".into());
     }
     verify_owned_private(&opened_metadata)?;
@@ -337,16 +335,15 @@ pub(crate) fn read_bounded(path: &Path, deadline: Instant) -> Result<ArchiveClea
         bytes.extend_from_slice(&buffer[..count]);
     }
     check_deadline(deadline)?;
-    if bytes.len() != capacity
-        || file
-            .metadata()
-            .map_err(|error| format!("cannot recheck archive cleanup intent: {error}"))?
-            .len()
-            != opened_metadata.len()
-    {
+    let after_read = file
+        .metadata()
+        .map_err(|error| format!("cannot recheck archive cleanup intent: {error}"))?;
+    if bytes.len() != capacity || !same_file_snapshot(&opened_metadata, &after_read) {
         return Err("archive cleanup intent changed while it was read".into());
     }
-    ArchiveCleanupIntent::decode(&bytes)
+    let intent = ArchiveCleanupIntent::decode(&bytes)?;
+    check_deadline(deadline)?;
+    Ok(intent)
 }
 
 fn check_deadline(deadline: Instant) -> Result<(), String> {
@@ -392,8 +389,26 @@ fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
+#[cfg(unix)]
+fn same_file_snapshot(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    same_file_identity(left, right)
+        && left.len() == right.len()
+        && left.uid() == right.uid()
+        && left.mode() == right.mode()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
+}
+
 #[cfg(not(unix))]
 fn same_file_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(not(unix))]
+fn same_file_snapshot(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
     false
 }
 
