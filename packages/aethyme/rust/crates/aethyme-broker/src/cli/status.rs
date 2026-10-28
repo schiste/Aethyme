@@ -477,6 +477,14 @@ pub(super) fn run_events(parsed: Parsed) -> Result<(), UsageError> {
     }
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     let mut cursor = parsed.since.unwrap_or(0);
+    // Register before reading so a commit between the first query and wait is
+    // buffered by the OS watcher and cannot be missed.
+    let event_wakeup = if parsed.follow {
+        let path = crate::broker_db_path(broker.main_root())?;
+        Some(super::event_watch::EventWakeup::watch_database(&path).map_err(UsageError::Message)?)
+    } else {
+        None
+    };
     // --follow survives transient read errors (e.g. a checkpoint
     // or a busy writer) with bounded retries instead of dying.
     let mut consecutive_errors = 0u32;
@@ -493,7 +501,11 @@ pub(super) fn run_events(parsed: Parsed) -> Result<(), UsageError> {
                 Err(err) if parsed.follow && consecutive_errors < 5 => {
                     consecutive_errors += 1;
                     eprintln!("events: transient read error ({err}); retrying");
-                    std::thread::sleep(std::time::Duration::from_millis(700));
+                    if let Some(event_wakeup) = &event_wakeup {
+                        event_wakeup
+                            .wait_timeout(std::time::Duration::from_millis(700))
+                            .map_err(UsageError::Message)?;
+                    }
                     continue;
                 }
                 Err(err) => return Err(err.into()),
@@ -519,7 +531,9 @@ pub(super) fn run_events(parsed: Parsed) -> Result<(), UsageError> {
         if !parsed.follow {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(700));
+        if let Some(event_wakeup) = &event_wakeup {
+            event_wakeup.wait().map_err(UsageError::Message)?;
+        }
     }
     Ok(())
 }

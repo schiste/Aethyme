@@ -76,6 +76,10 @@ One JSON object per line:
 6. **Retention:** the log is append-only in normal operation.
    `aethyme broker advanced events prune --keep-days <n>` is an explicit operator
    action; cursors survive it (rule 1).
+7. **Follow waits:** `--follow` waits for local filesystem notifications
+   on the broker database directory, then reads rows after its current event
+   id. Notifications can coalesce; the durable log and cursor remain
+   authoritative, so every wakeup is followed by a query.
 
 ## Event catalog
 
