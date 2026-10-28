@@ -942,7 +942,8 @@ impl BrokerStore {
         Ok(sessions)
     }
 
-    /// Complete protection projection; never cap live identities to a GC page.
+    /// Complete protection projection used by the pagination regression.
+    #[cfg(test)]
     pub(crate) fn live_session_worktrees(&self) -> Result<Vec<(i64, String)>, BrokerError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, worktree_path FROM sessions WHERE status <> 'cleaned' ORDER BY id",

@@ -566,9 +566,10 @@ pub fn inspect_gate_quality(repo: &crate::GitRepo) -> Result<GateDoctorReport, G
 }
 
 /// Run all gates, or one explicitly selected gate, in a disposable detached
-/// worktree at exact committed HEAD. Runtime rows and logs live in a temporary
-/// broker-owned directory, so the repository's normal gate cache is neither
-/// read nor populated.
+/// worktree at exact committed HEAD. Result/cache rows live in a temporary
+/// broker-owned database, so the repository's normal gate cache is neither
+/// read nor populated. Logs and live-use coordination use the primary
+/// repository's normal gate runtime namespace.
 pub fn probe_gate_quality(
     repo: &crate::GitRepo,
     only: Option<&str>,
@@ -613,10 +614,13 @@ pub fn probe_gate_quality(
     let runtime = tempfile::tempdir().map_err(|error| GateDoctorError::Probe(error.to_string()))?;
     let mut store = crate::BrokerStore::open(&runtime.path().join("probe.db"))
         .map_err(|error| GateDoctorError::Probe(error.to_string()))?;
+    // Gate coordination uses the real repository lifecycle and artifact-use
+    // namespace. Only result/cache storage is disposable; substituting the
+    // temporary database directory for the repository loses that identity.
     let outcomes = if let Some(name) = only {
         crate::gates::run_named(
             &mut store,
-            runtime.path(),
+            &main_root,
             &checkout,
             &gates,
             &[],
@@ -627,7 +631,7 @@ pub fn probe_gate_quality(
     } else {
         crate::gates::run_all_with_progress(
             &mut store,
-            runtime.path(),
+            &main_root,
             &checkout,
             &gates,
             None,

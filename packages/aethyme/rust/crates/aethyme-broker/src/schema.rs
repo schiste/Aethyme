@@ -2736,8 +2736,21 @@ mod tests {
             'not_run', 'unknown', 1, 1);",
         )
         .unwrap();
-        migrate(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+        // Isolate the historical v57 change from later protocol floors.
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute_batch(MIGRATION_V57).unwrap();
+        set_meta(&tx, "schema_version", 57);
+        tx.commit().unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 57);
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM meta WHERE key = 'min_compatible_schema'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "54"
+        );
         assert!(table_exists(&conn, "guarded_exec_helper_observations").unwrap());
         assert!(schema_is_compatible_with(&conn, 56, 54).unwrap());
         assert!(!schema_is_compatible_with(&conn, 56, 53).unwrap());

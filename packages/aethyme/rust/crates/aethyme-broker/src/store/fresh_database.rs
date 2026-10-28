@@ -1369,9 +1369,10 @@ mod unix {
             )));
         }
         let floor = strict_compatibility_floor(&connection)?;
-        if floor != 54 {
+        let expected_floor = crate::schema::MIN_COMPATIBLE_SCHEMA.max(54);
+        if floor != expected_floor {
             return Err(refusal(format!(
-                "fresh database compatibility floor is {floor}, expected 54"
+                "fresh database compatibility floor is {floor}, expected {expected_floor}"
             )));
         }
         let journal_mode: String =
@@ -2485,6 +2486,35 @@ mod unix {
             .unwrap();
             assert!(verified.identity.matches_fresh(&identity));
             (paths, base, verified)
+        }
+
+        #[test]
+        fn fresh_stage_rejects_tampered_compatibility_floor() {
+            let repo = tempfile::tempdir().unwrap();
+            let (paths, base, _verified) = create_verified_stage(repo.path());
+            let expected_floor = crate::schema::MIN_COMPATIBLE_SCHEMA.max(54);
+            for floor in [expected_floor - 1, expected_floor + 1] {
+                let connection = Connection::open(&paths.stage_path).unwrap();
+                connection
+                    .execute(
+                        "UPDATE meta SET value = ?1 WHERE key = 'min_compatible_schema'",
+                        [floor.to_string()],
+                    )
+                    .unwrap();
+                drop(connection);
+                let error = match verify_database(
+                    &paths,
+                    &paths.stage_path,
+                    &base,
+                    DatabaseProof::UnpublishedStage,
+                ) {
+                    Ok(_) => panic!("a changed floor must refuse fresh publication"),
+                    Err(error) => error,
+                };
+                assert!(error.to_string().contains(&format!(
+                    "fresh database compatibility floor is {floor}, expected {expected_floor}"
+                )));
+            }
         }
 
         fn prepare_legacy_database(

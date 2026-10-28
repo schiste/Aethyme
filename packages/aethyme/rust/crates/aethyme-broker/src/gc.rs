@@ -5632,6 +5632,10 @@ impl Broker {
     /// path before unlinking. Later passes resume those exact paths and rotate
     /// the session cursor past incomplete worktrees so a wide or blocked
     /// checkout cannot starve the rest of the backlog (#222).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Keep cleanup evidence, queue state and output accumulators explicit at this private boundary"
+    )]
     fn reclaim_ignored_directory_roots_under_claims(
         &mut self,
         root: &Path,

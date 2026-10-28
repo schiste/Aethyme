@@ -4,6 +4,23 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.44] - 2026-10-28
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0844).
+
+### Added
+
+- Bounded, resumable idle-session retirement makes abandoned sessions eligible for later cleanup while preserving active or uncertain task holders and the default fifteen-day closed-checkout grace.
+- Optional `[cleanup].ignored_directory_sweep` broadens in-place reclamation to Git-ignored directories in retained closed checkouts. It defaults off until the new runtime protocol is activated.
+- Maintenance reports optional retirement counts and typed deferral reasons separately from removed checkouts.
+
+### Fixed
+
+- Cleanup considers every session sharing a checkout, rechecks ownership and current use under lifecycle claims, and preserves ambiguous cohorts.
+- Repository-selected clean filters and version probes publish artifact-use protection before running. Verified process-group completion settles that protection even when hashing times out; uncertain completion remains fenced.
+- Runtime marker files no longer perturb working-tree hash keys, while tracked runtime-path changes remain inputs.
+- Fresh database publication verifies the current compatibility floor rather than requiring the historical binding floor.
+
 ## [0.8.43] - 2026-10-28
 
 **Breaking:** see [UPGRADING.md](UPGRADING.md#v0843).

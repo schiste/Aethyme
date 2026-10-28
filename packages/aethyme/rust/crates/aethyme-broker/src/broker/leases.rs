@@ -437,8 +437,8 @@ impl Broker {
             // had (#176). Closing here does not delete anything -- it makes the
             // worktree a cleanup *candidate*, which `cleanup_item` then judges
             // on its own merits. Candidacy is granted; eligibility is earned.
-            if !derived_status.is_closed() {
-                if matches!(
+            if !derived_status.is_closed()
+                && matches!(
                     self.try_close_abandoned_session(
                         session.id,
                         now_ms,
@@ -447,9 +447,9 @@ impl Broker {
                         true,
                     )?,
                     AbandonedSessionCloseOutcome::Closed
-                ) {
-                    derived_status = SessionStatus::Closed;
-                }
+                )
+            {
+                derived_status = SessionStatus::Closed;
             }
             views.push(AgentView {
                 session,
