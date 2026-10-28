@@ -492,7 +492,19 @@ blocked.
      --repo <owner/name> --reason "<authorization>" -- <gh-args> ...
    ```
 
-   The broker classifies known commands and fails closed on ambiguity. Add
+   The broker classifies known commands and fails closed on ambiguity.
+
+   For a cross-session PR merge, if the broker reports that the head branch
+   belongs to another session, inspect that session's task and worktree status,
+   including changed paths, then compare those paths and behavior with the PR's
+   diff. If the holder has uncommitted changes to the PR's files or logically
+   overlapping work, coordinate before merging. Independent hunks in the same
+   file do not by themselves require waiting. For an explicitly authorized
+   cross-session merge, include `--effect destructive --destructive
+   --cross-session <owner-id>` before `--`; this override does not bypass draft,
+   review, or check requirements. Never edit another session's worktree.
+
+   Add
    `--effect write|destructive --scope <resource>` before `--` for an
    unrecognized command. Destructive operations also require `--destructive`.
    Every coordinated write requires a concise `--reason` identifying the user
