@@ -6461,6 +6461,13 @@ impl Broker {
             }
             let sheltered = overlaps_live_worktree(&root, &live_worktrees);
             if sheltered {
+                blocked_interrupted_paths.push(BlockedInterruptedPath {
+                    path: Some(root.to_string_lossy().into_owned()),
+                    reason: "live_session",
+                });
+                // Retention is a deferral, not completion: revisit this
+                // closed checkout after its live alias releases ownership.
+                scan_completed = false;
                 continue;
             }
             let expected_ignored_cohort = if ignored_directory_policy.is_some() {
@@ -6870,7 +6877,7 @@ impl Broker {
                     }
                 };
                 let current_session = self.store().session(session.id)?;
-                if current_session.status != crate::SessionStatus::Cleaned
+                if current_session.status != crate::SessionStatus::Closed
                     || current_session.cleanup_state != crate::SessionCleanupState::Closed
                     || current_session.worktree_path != session.worktree_path
                     || current_session.branch != session.branch
@@ -7553,6 +7560,28 @@ impl Broker {
                 write_journal(&journal_path, &journal)?;
                 continue;
             }
+            // A fresh live-owner observation takes precedence over the old
+            // content verdict, so an adopted checkout is retained and does
+            // not pin the remaining cleanup journal.
+            {
+                // Re-check even if the path was absent in the reviewed plan:
+                // another session may have recreated and adopted it since.
+                match self
+                    .refuse_live_checkout(candidate.session_id, Path::new(&candidate.worktree_path))
+                {
+                    Ok(()) => {}
+                    Err(BrokerOpError::WorktreeInUseByLiveSession { .. }) => {
+                        retained_live(&mut failures);
+                        journal.remaining_worktrees.remove(0);
+                        write_journal(&journal_path, &journal)?;
+                        continue;
+                    }
+                    Err(error) => {
+                        failures.push(format!("session {}: {error}", candidate.session_id));
+                        break;
+                    }
+                }
+            }
             let mut records = crate::measurement::SizeRecords::default();
             let current = if session.origin == crate::SessionOrigin::Spawned {
                 self.cleanup_item_scanned(&session, crate::SizeScan::Recorded, &mut records)?
@@ -7570,24 +7599,6 @@ impl Broker {
                         candidate.session_id
                     ));
                     break;
-                }
-                // Immediately before removal, with no walk in between.
-                // `cleanup` repeats this check right before it removes, which
-                // is the guard every caller shares; this one keeps the entry
-                // from pinning the journal.
-                let live_worktrees = self
-                    .store()
-                    .live_sessions()?
-                    .iter()
-                    .map(|session| PathBuf::from(&session.worktree_path))
-                    .collect::<Vec<_>>();
-                if candidate.worktree_present
-                    && overlaps_live_worktree(Path::new(&candidate.worktree_path), &live_worktrees)
-                {
-                    retained_live(&mut failures);
-                    journal.remaining_worktrees.remove(0);
-                    write_journal(&journal_path, &journal)?;
-                    continue;
                 }
                 match self.cleanup(candidate.session_id, false) {
                     Ok(()) => {}

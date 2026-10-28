@@ -705,13 +705,23 @@ impl Broker {
         let leases = self
             .store_ref()
             .unreleased_unexpired_leases_for_sessions_at(&[session_id], observed_at)?;
-        if !leases.is_empty() {
+        // Implicit leases are a projection of the session's diff, not an
+        // independent activity signal. Once its holder and activity checks
+        // permit retirement, those leases must close with the session; an
+        // unbound legacy session otherwise holds them forever. Explicit
+        // claims retain their own conservative liveness guard.
+        let explicit_leases = leases
+            .iter()
+            .filter(|lease| lease.kind == LeaseKind::Explicit)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !explicit_leases.is_empty() {
             let lease_table = holder
                 .binding_event_id
                 .and_then(|event_id| process_table.table_for(session_id, event_id));
             let liveness = match crate::lease_liveness::assess(
                 self.store_ref(),
-                &leases,
+                &explicit_leases,
                 lease_table,
                 observed_at,
                 crate::lease_liveness::LeaseLivenessPolicy::load(self.main_root()),

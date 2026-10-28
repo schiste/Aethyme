@@ -13,6 +13,10 @@ The default open-session abandonment window is 72 hours. Maintenance uses the
 latest recorded activity and worktree activity, and protects a session when its
 recorded task holder is alive or its identity cannot be checked. A shared agent
 service is not evidence that every task it once hosted remains active.
+Implicit file leases describe the session's diff and are released atomically
+with an otherwise eligible retirement; they do not keep an abandoned session
+open forever. An explicit claim with active or unknown holder liveness still
+protects its session and needs resolution before retirement.
 
 Closed checkouts have a 15-day grace period. Configure retention in the primary
 repository's `.aethyme/broker.toml`:

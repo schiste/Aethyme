@@ -327,7 +327,17 @@ fn a_deep_proof_the_budget_cannot_afford_is_deferred_not_removed() {
         .unwrap()
         .unwrap();
     assert!(report.removed.is_empty(), "{report:#?}");
-    assert_eq!(report.deferred, 1);
+    // The expired budget defers both retirement and checkout inspection.
+    assert_eq!(report.deferred, 2, "{report:#?}");
+    assert_eq!(report.sessions_retired, 0);
+    assert!(matches!(
+        report.retirement_deferred_reasons.as_slice(),
+        [
+            aethyme_broker::SessionRetirementDeferredReason::DeadlineExceeded {
+                after_session_id: 0
+            }
+        ]
+    ));
     assert!(worktree.exists());
 }
 
@@ -344,7 +354,17 @@ fn deadline_before_first_candidate_does_not_advance_cleanup_cursor() {
         .unwrap();
 
     assert!(report.removed.is_empty(), "{report:#?}");
-    assert_eq!(report.deferred, 1, "{report:#?}");
+    // The expired budget defers both retirement and checkout inspection.
+    assert_eq!(report.deferred, 2, "{report:#?}");
+    assert_eq!(report.sessions_retired, 0);
+    assert!(matches!(
+        report.retirement_deferred_reasons.as_slice(),
+        [
+            aethyme_broker::SessionRetirementDeferredReason::DeadlineExceeded {
+                after_session_id: 0
+            }
+        ]
+    ));
     assert_eq!(
         broker.store().meta_get("auto_cleanup.cursor").unwrap(),
         cursor_before,

@@ -4184,6 +4184,10 @@ impl Broker {
                     ),
                 })?;
         let worktree_path = PathBuf::from(&session.worktree_path);
+        // Report the live owner before an eligibility verdict can turn the
+        // same protection into a generic dirty-content refusal. The lifecycle
+        // claim remains held and destructive branches repeat this guard.
+        self.refuse_live_checkout(session_id, &worktree_path)?;
         let artifact_use_reclaimer = if worktree_path_is_real_directory(&worktree_path, session_id)?
         {
             match crate::file_lock::artifact_use::try_artifact_use_reclaimer(

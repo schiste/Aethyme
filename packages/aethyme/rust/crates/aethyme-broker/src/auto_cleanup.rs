@@ -1294,7 +1294,7 @@ impl Broker {
             }
             if group.sessions.is_empty()
                 || group.sessions.iter().any(|session| {
-                    session.status != crate::types::SessionStatus::Cleaned
+                    session.status != crate::types::SessionStatus::Closed
                         || session.cleanup_state != SessionCleanupState::Closed
                 })
             {
@@ -1344,7 +1344,7 @@ impl Broker {
                 match live_worktree_overlap(&resolved, row_path) {
                     LiveOverlapEvidence::Disjoint => {}
                     LiveOverlapEvidence::Overlap
-                        if row.status == crate::types::SessionStatus::Cleaned
+                        if row.status == crate::types::SessionStatus::Closed
                             && row.cleanup_state == SessionCleanupState::Closed
                             && group_ids.contains(&row.id) => {}
                     LiveOverlapEvidence::Overlap | LiveOverlapEvidence::Unknown => {
@@ -1420,7 +1420,7 @@ impl Broker {
         }
         let expected_path = worktree.to_string_lossy().into_owned();
         let current = self.store().session(session_id)?;
-        if current.status != crate::types::SessionStatus::Cleaned
+        if current.status != crate::types::SessionStatus::Closed
             || current.cleanup_state != SessionCleanupState::Closed
             || current.origin != SessionOrigin::Spawned
             || current.worktree_path != expected_path
@@ -1449,7 +1449,7 @@ impl Broker {
         };
         if group.sessions.is_empty()
             || group.sessions.iter().any(|session| {
-                session.status != crate::types::SessionStatus::Cleaned
+                session.status != crate::types::SessionStatus::Closed
                     || session.cleanup_state != SessionCleanupState::Closed
             })
         {
@@ -1471,7 +1471,7 @@ impl Broker {
             match live_worktree_overlap(&resolved, &row_path) {
                 LiveOverlapEvidence::Disjoint => {}
                 LiveOverlapEvidence::Overlap
-                    if row.status == crate::types::SessionStatus::Cleaned
+                    if row.status == crate::types::SessionStatus::Closed
                         && row.cleanup_state == SessionCleanupState::Closed
                         && group_ids.contains(&row.id) => {}
                 LiveOverlapEvidence::Overlap | LiveOverlapEvidence::Unknown => {
@@ -1531,7 +1531,7 @@ impl Broker {
             return Ok(None);
         }
         let current_after = self.store().session(session_id)?;
-        if current_after.status != crate::types::SessionStatus::Cleaned
+        if current_after.status != crate::types::SessionStatus::Closed
             || current_after.cleanup_state != SessionCleanupState::Closed
             || current_after.worktree_path != current.worktree_path
             || current_after.branch != current.branch

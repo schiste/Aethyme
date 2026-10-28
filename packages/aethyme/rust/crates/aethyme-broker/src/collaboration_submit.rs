@@ -1253,8 +1253,8 @@ mod tests {
         assert_eq!(
             fence(required.repo.path()),
             Some(crate::CollaborationFence {
-                // Fresh identity-bound databases fence older root-unaware writers.
-                min_compatible_schema: 54,
+                // The current artifact-use protocol floor also applies to required capture.
+                min_compatible_schema: crate::schema::MIN_COMPATIBLE_SCHEMA,
                 reason: crate::schema::COLLABORATION_FENCE_REASON.into(),
                 source: "committed".into(),
                 state: "active",

@@ -510,3 +510,54 @@ fn a_resumed_gc_apply_retains_a_checkout_adopted_after_review() {
     );
     assert!(worktree.join("resumed.txt").exists());
 }
+
+#[test]
+fn a_resumed_gc_apply_retains_a_checkout_recreated_after_an_absent_path_plan() {
+    let (tmp, mut broker) = repository(Some(0));
+    let (id, worktree) = session_with_commit(&mut broker, "recreated", true);
+    let branch = broker.store().session(id).unwrap().branch;
+    broker.close(id).unwrap();
+    git(
+        &tmp.path(),
+        &["worktree", "remove", worktree.to_str().unwrap()],
+    );
+    assert!(!worktree.exists());
+
+    let plan = broker.gc_plan().unwrap();
+    let candidate = plan
+        .worktrees
+        .iter()
+        .find(|item| item.session_id == id)
+        .unwrap();
+    assert!(!candidate.worktree_present);
+    let started = broker.gc_apply_bounded(&plan.digest, Some(0)).unwrap();
+    assert!(!started.complete);
+    assert!(started.sessions_cleaned.is_empty());
+
+    git(
+        &tmp.path(),
+        &["worktree", "add", worktree.to_str().unwrap(), &branch],
+    );
+    let live = broker
+        .adopt(&worktree, Some("recreated follow-up"))
+        .unwrap();
+    let resumed = broker.gc_apply(&plan.digest).unwrap();
+    assert!(!resumed.sessions_cleaned.contains(&id), "{resumed:?}");
+    assert!(
+        resumed
+            .failures
+            .iter()
+            .any(|failure| failure.contains("live session")),
+        "{resumed:?}"
+    );
+    assert!(worktree.join("recreated.txt").exists());
+    assert!(
+        resumed.complete,
+        "a retained live checkout must not pin the journal: {resumed:?}"
+    );
+    assert_eq!(
+        broker.store().session(id).unwrap().cleanup_state,
+        SessionCleanupState::Closed
+    );
+    assert!(!broker.store().session(live.id).unwrap().status.is_closed());
+}
