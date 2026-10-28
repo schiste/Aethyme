@@ -144,7 +144,7 @@ keep = ["*-investigation"]     # worktrees never removed automatically
 ```
 
 State-only closed checkouts also respect `[retention]
-closed_worktree_grace_hours` in `.aethyme/broker.toml` (24 hours by default;
+closed_worktree_grace_hours` in `.aethyme/broker.toml` (360 hours / 15 days by default;
 `0` disables the window). Automatic cleanup and reviewed GC share this check.
 Automatic apply reloads retention before removal, so a newly raised grace
 period or unreadable policy retains the checkout. Explicit `finish cleanup`

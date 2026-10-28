@@ -33,6 +33,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- When changing a retention default, inspect fixtures that inherit the default
+  as well as tests with explicit overrides. Update their age assumptions and
+  reference documentation; exercise retention and expiry on both sides of the
+  new window. Distinguish automatic grace from explicit reviewed cleanup, and
+  report live policy overrides separately from an unreleased code default.
 - For graph consumer changes, include a real producer-to-materialization-to-query
   fixture alongside hand-built store tests. Verify relationship endpoints resolve
   to the expected typed nodes, and move persisted fragments to a differently
