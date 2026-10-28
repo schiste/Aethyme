@@ -44,6 +44,7 @@ noyalib = { workspace = true }
 toml = { workspace = true }
 # Gate trigger globs (gates.toml). Same matcher family ripgrep uses.
 globset = { workspace = true }
+notify = "=8.2.1"
 # Folding paths the way case- and normalization-insensitive file systems
 # do, so a protected path cannot be written under another spelling (#665).
 unicode-normalization = { workspace = true }
