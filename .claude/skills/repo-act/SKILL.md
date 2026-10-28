@@ -321,11 +321,15 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   isolated Git subprocesses, call `env_remove` for inherited `GIT_*` names,
   preserve unrelated variables such as `PATH`, then set the fixture's intended
   author/committer values. For Git-backed fixtures that generate managed files
-  before staging, also set a fixture-owned `HOME`, an empty
-  `GIT_CONFIG_GLOBAL`, and `GIT_CONFIG_NOSYSTEM=1` on every CLI and Git child
-  before initial deployment and `git add`; a host `core.excludesFile` can hide
-  generated files from `git add -A`. Keep isolation on each child command and
-  do not compensate with fixture ignore rules or force-adds. For byte-for-byte
+  before staging, set fixture-owned `HOME`, empty `GIT_CONFIG_GLOBAL` and
+  `GIT_CONFIG_NOSYSTEM=1` on setup children that access Git before initial
+  deployment and `git add`; a host `core.excludesFile` can hide generated files
+  from `git add -A`. If a broker CLI rejects fixture-owned `GIT_CONFIG_*`
+  selectors during preflight, remove them only from that CLI invocation and
+  restore the same isolation inside a fixture-owned PATH `git` proxy that
+  executes the pinned Git binary. Keep the proxy and PATH scoped to that
+  invocation; never mutate a shared runner environment in concurrent tests.
+  Do not compensate with fixture ignore rules or force-adds. For byte-for-byte
   Git fixture snapshots, disable automatic maintenance during setup with
   command-local `maintenance.auto=false` and `gc.auto=0`; an asynchronously
   removed maintenance lock can otherwise look like a product write. Preserve
