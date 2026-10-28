@@ -1296,6 +1296,57 @@ fn worktree_git_dir(worktree: &Path) -> Option<PathBuf> {
     })
 }
 
+/// Resolve a checkout's `.git` directory without invoking Git. A valid `.git`
+/// directory or gitdir file is canonicalized; missing targets are reported as
+/// known absence, while malformed or unreadable metadata remains an error.
+pub(crate) fn checked_worktree_git_dir(
+    worktree: &Path,
+) -> Result<Option<PathBuf>, std::io::Error> {
+    let dot_git = worktree.join(".git");
+    let metadata = match std::fs::metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let target = if metadata.is_dir() {
+        dot_git
+    } else if metadata.is_file() {
+        let text = match std::fs::read_to_string(&dot_git) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let target = text
+            .lines()
+            .find_map(|line| line.strip_prefix("gitdir:"))
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "malformed .git file without a gitdir target",
+                )
+            })?;
+        let target = Path::new(target);
+        if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            worktree.join(target)
+        }
+    } else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            ".git is neither a directory nor a gitdir file",
+        ));
+    };
+
+    match std::fs::canonicalize(target) {
+        Ok(target) => Ok(Some(target)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Refuse ambient repository/path/history selectors before graph verification
 /// can snapshot anything, unless its isolating scope is already active.
 /// Scoped Git commands strip every inherited `GIT_*` variable, so harmless

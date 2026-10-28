@@ -4723,10 +4723,11 @@ impl Broker {
         scope: ArtifactSweepScope,
         report: &crate::auto_cleanup::AutoCleanupReport,
     ) -> Result<(), BrokerOpError> {
+        let retirement_deferred = !report.retirement_deferred_reasons.is_empty();
         if !matches!(
             scope,
             ArtifactSweepScope::Inline | ArtifactSweepScope::Drain
-        ) || !report.enabled
+        ) || (!report.enabled && !retirement_deferred)
             || report.deferred == 0
         {
             return Ok(());
@@ -5045,7 +5046,7 @@ impl Broker {
         }
         let report = self.auto_remove_disposable_checkouts(Some(deadline))?;
         let policy_valid = report.config_error.is_none();
-        let no_deferred_work = !report.enabled || report.deferred == 0;
+        let no_deferred_work = report.deferred == 0;
         let mut generation_completed = false;
         if policy_valid && no_deferred_work {
             let latest_request = self
@@ -7683,6 +7684,36 @@ mod tests {
             !broker.auto_checkout_cleanup_recovery_requested().unwrap(),
             "a disabled cleanup policy cannot create a worker request"
         );
+
+        let deferred_retirement = crate::auto_cleanup::AutoCleanupReport {
+            enabled: false,
+            deferred: 1,
+            retirement_deferred_reasons: vec![
+                crate::auto_cleanup::SessionRetirementDeferredReason::MoreSessionsRemain {
+                    after_session_id: 3,
+                    high_water_session_id: 4,
+                },
+            ],
+            ..crate::auto_cleanup::AutoCleanupReport::default()
+        };
+        broker
+            .persist_auto_checkout_cleanup_request(
+                ArtifactSweepScope::Inline,
+                &deferred_retirement,
+            )
+            .unwrap();
+        let retirement_generation = broker
+            .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY)
+            .unwrap()
+            .expect("retirement backlog persists even when checkout removal is disabled");
+        assert!(broker.auto_checkout_cleanup_recovery_requested().unwrap());
+        broker
+            .artifact_sweep_meta_set(
+                AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY,
+                &retirement_generation,
+            )
+            .unwrap();
+
         broker
             .persist_auto_checkout_cleanup_request(ArtifactSweepScope::Drain, &deferred)
             .unwrap();

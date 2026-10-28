@@ -3126,7 +3126,21 @@ fn push_auto_cleanup_advice(view: &mut StatusView, report: Option<crate::AutoCle
     let Some(report) = report else {
         return;
     };
-    if report.removed.is_empty() && report.kept.is_empty() && report.config_error.is_none() {
+    let actionable_retirement_issue = report.retirement_deferred_reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            crate::SessionRetirementDeferredReason::RetentionPolicyUnavailable { .. }
+                | crate::SessionRetirementDeferredReason::HolderLivenessUnavailable { .. }
+                | crate::SessionRetirementDeferredReason::WorktreeActivityUnavailable { .. }
+                | crate::SessionRetirementDeferredReason::LeaseLivenessUnavailable { .. }
+        )
+    });
+    if report.removed.is_empty()
+        && report.kept.is_empty()
+        && report.config_error.is_none()
+        && report.sessions_retired == 0
+        && !actionable_retirement_issue
+    {
         return;
     }
     let mut evidence = report
@@ -3149,6 +3163,56 @@ fn push_auto_cleanup_advice(view: &mut StatusView, report: Option<crate::AutoCle
             .iter()
             .map(|kept| format!("kept {}: {}", kept.worktree, kept.reason)),
     );
+    if report.sessions_retired > 0 {
+        evidence.push(format!(
+            "retired {} abandoned session(s)",
+            report.sessions_retired
+        ));
+    }
+    evidence.extend(
+        report
+            .retirement_deferred_reasons
+            .iter()
+            .map(|reason| match reason {
+                crate::SessionRetirementDeferredReason::RetentionPolicyUnavailable {
+                    message,
+                } => format!(
+                    "session retirement deferred: retention policy unavailable: {message}"
+                ),
+                crate::SessionRetirementDeferredReason::DeadlineExceeded { after_session_id } => {
+                    format!(
+                        "session retirement time budget expired after session {after_session_id}"
+                    )
+                }
+                crate::SessionRetirementDeferredReason::HolderLivenessUnavailable {
+                    session_id,
+                } => format!(
+                    "session {session_id} remains open because its recorded holder could not be checked"
+                ),
+                crate::SessionRetirementDeferredReason::WorktreeActivityUnavailable {
+                    session_id,
+                } => format!(
+                    "session {session_id} remains open because worktree activity metadata could not be checked"
+                ),
+                crate::SessionRetirementDeferredReason::LifecycleBusy { session_id } => format!(
+                    "session {session_id} retirement will retry after the repository lifecycle operation"
+                ),
+                crate::SessionRetirementDeferredReason::DatabaseBusy { session_id } => format!(
+                    "session {session_id} retirement will retry after the broker database writer releases its lock"
+                ),
+                crate::SessionRetirementDeferredReason::LeaseLivenessUnavailable {
+                    session_id,
+                } => format!(
+                    "session {session_id} remains open because active leases still hold or their liveness could not be checked"
+                ),
+                crate::SessionRetirementDeferredReason::MoreSessionsRemain {
+                    after_session_id,
+                    high_water_session_id,
+                } => format!(
+                    "session retirement will continue after {after_session_id} through {high_water_session_id}"
+                ),
+            }),
+    );
     if let Some(error) = &report.config_error {
         evidence.push(format!(
             "[cleanup] is invalid, auto-removal is off: {error}"
@@ -3156,14 +3220,15 @@ fn push_auto_cleanup_advice(view: &mut StatusView, report: Option<crate::AutoCle
     }
     view.advice.push(StatusAdvice {
         id: "cleanup.auto-removal",
-        severity: if report.config_error.is_some() {
+        severity: if report.config_error.is_some() || actionable_retirement_issue {
             StatusAdviceSeverity::Warning
         } else {
             StatusAdviceSeverity::Info
         },
-        reason: "the unattended sweep removes closed checkouts whose work is provably on the remote default branch",
+        reason: "unattended maintenance retires sessions after the configured idle window and removes closed checkouts only when their work is provably on the remote default branch",
         summary: format!(
-            "last auto-cleanup removed {} checkout(s), kept {}, deferred {}",
+            "last auto-cleanup retired {} session(s), removed {} checkout(s), kept {}, deferred {}",
+            report.sessions_retired,
             report.removed.len(),
             report.kept.len(),
             report.deferred
@@ -3399,7 +3464,7 @@ mod cleanup;
 mod finish;
 mod gates;
 mod leases;
-pub(crate) use leases::validate_session_commit_args;
+pub(crate) use leases::{AbandonedSessionCloseOutcome, validate_session_commit_args};
 pub(crate) mod lifecycle;
 mod scope_capture;
 mod status;
