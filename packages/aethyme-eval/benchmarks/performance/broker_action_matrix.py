@@ -331,6 +331,57 @@ def _validate_fixture_git_environment(env):
         raise RuntimeError('fixture inherited Git routing/configuration overrides')
 
 
+def _create_commit_git_proxy(root, git):
+    proxy_dir = Path(root) / 'commit-git-proxy'
+    proxy_dir.mkdir(mode=0o700)
+    real_git = Path(git).resolve(strict=True)
+    if not real_git.is_file():
+        raise RuntimeError('commit Git proxy requires the pinned real Git executable')
+    proxy = proxy_dir / 'git'
+    proxy.write_text(
+        '#!/bin/sh\nset -eu\n'
+        'exec /usr/bin/env GIT_CONFIG_NOSYSTEM=1 '
+        f'GIT_CONFIG_GLOBAL={shlex.quote(os.devnull)} '
+        f'{shlex.quote(str(real_git))} "$@"\n')
+    proxy.chmod(0o700)
+    return proxy_dir
+
+
+def _commit_argv(playground, args):
+    runner_env = playground['runner'].env
+    existing_path = runner_env.get('PATH')
+    proxy_dir = Path(playground['commit_git_proxy'])
+    proxy = proxy_dir / 'git'
+    if (not isinstance(existing_path, str) or not existing_path
+            or proxy_dir.is_symlink() or not proxy_dir.is_dir()
+            or proxy.is_symlink() or not proxy.is_file() or not os.access(proxy, os.X_OK)):
+        raise RuntimeError('fixture commit Git proxy is missing or invalid')
+    if not isinstance(args, (list, tuple)) or not all(isinstance(arg, str) for arg in args):
+        raise ValueError('commit command arguments must be strings')
+    child_path = os.pathsep.join((str(proxy_dir), existing_path))
+    return ['/usr/bin/env', '-u', 'GIT_CONFIG_GLOBAL', '-u', 'GIT_CONFIG_NOSYSTEM',
+            f'PATH={child_path}', str(playground['binary']), *args]
+
+
+def _commit_git_isolation_context(playground):
+    runner_env = playground['runner'].env
+    proxy_dir = Path(playground['commit_git_proxy'])
+    proxy = proxy_dir / 'git'
+    child_path = os.pathsep.join((str(proxy_dir), runner_env['PATH']))
+    return {
+        'status': 'verified',
+        'broker_child_unsets': ['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM'],
+        'provider_git_config': {
+            'GIT_CONFIG_GLOBAL': os.devnull,
+            'GIT_CONFIG_NOSYSTEM': '1',
+        },
+        'real_git_sha256': hash_file(Path(playground['git']).resolve(strict=True),
+                                     MAX_BINARY_BYTES)['sha256'],
+        'proxy_sha256': hash_file(proxy, MAX_CONTRACT_BYTES)['sha256'],
+        'commit_child_path_sha256': hashlib.sha256(child_path.encode('utf-8')).hexdigest(),
+    }
+
+
 def _lease_plan_payload(row):
     payload = _json(row, 'lease plan')
     paths = payload.get('paths') if isinstance(payload, dict) else None
@@ -367,6 +418,7 @@ def action_playground(name, binary, git, sample_output, command_timeout_seconds)
         create_shims(tools)
         env = make_env(root, tools, binary, git, remote)
         _validate_fixture_git_environment(env)
+        commit_git_proxy = _create_commit_git_proxy(root, git)
         receipts = ReceiptLog(sample_output)
         runner = MatrixCommandRunner(root, sample_output, env, receipts,
                                      command_timeout_seconds)
@@ -412,6 +464,7 @@ def action_playground(name, binary, git, sample_output, command_timeout_seconds)
             'git_version': git_version,
             'binary': binary,
             'git': git,
+            'commit_git_proxy': commit_git_proxy,
             'sample_output': sample_output,
         }
 
@@ -486,10 +539,11 @@ def _run_slow_hook_commits(playground, sessions, timings, semantic, hold_ms):
             str(hook_dir))
 
     def commit(session, message, label):
-        return _cli(playground,
-                    ['broker', 'commit', '--session', str(session['id']), '--timeout', '30',
-                     '--json', '--', '-m', message],
-                    session['worktree'], label)
+        return runner.run(
+            _commit_argv(playground,
+                         ['broker', 'commit', '--session', str(session['id']), '--timeout', '30',
+                          '--json', '--', '-m', message]),
+            session['worktree'], label)
 
     start_commit_ns = None
     enter_deadline = time.monotonic() + 10
@@ -522,6 +576,7 @@ def _run_slow_hook_commits(playground, sessions, timings, semantic, hold_ms):
     _check_commit(slow_row, 'slow-hook session commit')
     _record(timings, 'broker_commit_slow_hook', slow_row)
     _record(timings, 'broker_commit_independent', peer_row)
+    semantic['commit_git_isolation'] = _commit_git_isolation_context(playground)
     semantic['slow_hook_independent_commit'] = {
         'status': 'verified',
         'peer_completed_before_hook_release': True,

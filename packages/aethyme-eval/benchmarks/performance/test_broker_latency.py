@@ -1,9 +1,13 @@
 """Fast, dependency-free controls for the warning policy; no builds or broker calls."""
 import copy
+import hashlib
 import json
+import os
 from pathlib import Path
-import unittest
+import subprocess
+import sys
 import tempfile
+import unittest
 from unittest.mock import patch
 
 from broker_latency import (
@@ -18,6 +22,9 @@ from broker_latency import (
     validate_resource_inventory,
 )
 from broker_action_matrix import (
+    _commit_argv,
+    _commit_git_isolation_context,
+    _create_commit_git_proxy,
     _baseline_unsupported_fetch_option,
     FETCH_FLAGS,
     _classify_deploy_preview,
@@ -463,6 +470,75 @@ class PairedActionMatrixTests(unittest.TestCase):
                              2.5)
             with self.assertRaisesRegex(ValueError, 'does not match'):
                 load_v41_context(path, {**identity, 'engine_sha256': 'd' * 64})
+
+
+class CommitGitProxyTests(unittest.TestCase):
+    def test_commit_git_proxy_is_child_scoped_and_quotes_pinned_executable(self):
+        with tempfile.TemporaryDirectory(prefix="broker proxy's ") as temporary:
+            root = Path(temporary)
+            pinned_git = root / "real git's executable"
+            pinned_git.write_text(
+                '#!' + sys.executable + '\n'
+                'import json, os, sys\n'
+                "print(json.dumps({'global': os.environ.get('GIT_CONFIG_GLOBAL'), "
+                "'nosystem': os.environ.get('GIT_CONFIG_NOSYSTEM'), "
+                "'argv': sys.argv[1:]}))\n")
+            pinned_git.chmod(0o700)
+            proxy_dir = _create_commit_git_proxy(root, pinned_git)
+            fake_cli = root / 'fake broker cli'
+            fake_cli.write_text(
+                '#!' + sys.executable + '\n'
+                'import json, os, subprocess, sys\n'
+                "provider = subprocess.run(['git', 'argument with spaces', \"apostrophe's\", ''], "
+                'check=True, capture_output=True, text=True, timeout=5)\n'
+                "print(json.dumps({'global_present': 'GIT_CONFIG_GLOBAL' in os.environ, "
+                "'nosystem_present': 'GIT_CONFIG_NOSYSTEM' in os.environ, "
+                "'path': os.environ['PATH'], 'cli_args': sys.argv[1:], "
+                "'provider': json.loads(provider.stdout)}))\n")
+            fake_cli.chmod(0o700)
+
+            class Runner:
+                pass
+
+            runner = Runner()
+            runner.env = {
+                'PATH': os.pathsep.join(('/usr/bin', '/bin')),
+                'HOME': str(root),
+                'GIT_CONFIG_GLOBAL': str(root / 'empty-global'),
+                'GIT_CONFIG_NOSYSTEM': '1',
+            }
+            playground = {
+                'runner': runner, 'commit_git_proxy': proxy_dir, 'binary': fake_cli,
+                'git': pinned_git,
+            }
+            runner_env_before = runner.env.copy()
+            first = _commit_argv(playground, ['broker', 'commit', '--session', '1'])
+            second = _commit_argv(playground, ['broker', 'commit', '--session', '2'])
+            self.assertEqual(first[:5], ['/usr/bin/env', '-u', 'GIT_CONFIG_GLOBAL',
+                                         '-u', 'GIT_CONFIG_NOSYSTEM'])
+            self.assertEqual(first[5], second[5])
+            self.assertEqual(first[6], str(fake_cli))
+            self.assertEqual(runner.env, runner_env_before)
+            context = _commit_git_isolation_context(playground)
+            self.assertEqual(context['real_git_sha256'],
+                             hashlib.sha256(pinned_git.read_bytes()).hexdigest())
+            self.assertEqual(context['proxy_sha256'],
+                             hashlib.sha256((proxy_dir / 'git').read_bytes()).hexdigest())
+            self.assertEqual(context['commit_child_path_sha256'],
+                             hashlib.sha256(first[5][len('PATH='):].encode('utf-8')).hexdigest())
+
+            result = subprocess.run(first, env=runner.env, capture_output=True, text=True,
+                                    check=True, timeout=10)
+            payload = json.loads(result.stdout)
+            self.assertFalse(payload['global_present'])
+            self.assertFalse(payload['nosystem_present'])
+            self.assertEqual(payload['path'].split(os.pathsep)[0], str(proxy_dir))
+            self.assertEqual(payload['cli_args'], ['broker', 'commit', '--session', '1'])
+            self.assertEqual(payload['provider']['global'], os.devnull)
+            self.assertEqual(payload['provider']['nosystem'], '1')
+            self.assertEqual(payload['provider']['argv'],
+                             ['argument with spaces', "apostrophe's", ''])
+            self.assertEqual(runner.env, runner_env_before)
 
 
 class AgedHistoryTests(unittest.TestCase):
