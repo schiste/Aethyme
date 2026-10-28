@@ -196,7 +196,7 @@ fn an_unlanded_closed_worktree_is_not_proposed() {
 
 #[test]
 fn a_closed_worktree_inside_its_grace_period_is_not_proposed() {
-    // No key: the shipped 24 hour default applies.
+    // No key: the shipped 15 day default applies.
     let (_tmp, mut broker) = repository(None);
     let (id, worktree) = session_with_commit(&mut broker, "recent", true);
     broker.close(id).unwrap();
@@ -342,23 +342,46 @@ fn cleanup_keeps_the_time_a_session_was_first_closed() {
 }
 
 #[test]
+fn default_close_grace_keeps_fourteen_days_but_expires_after_fifteen() {
+    for (days, expected_proposed) in [(14, false), (16, true)] {
+        let (tmp, mut broker) = repository(None);
+        let (id, _worktree) = session_with_commit(&mut broker, "default-grace", true);
+        broker.close(id).unwrap();
+        drop(broker);
+        let closed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - days * 24 * 3_600_000;
+        set_closed_at(&tmp.path(), id, closed_at);
+
+        let mut broker = tmp.open();
+        assert_eq!(
+            proposed(&mut broker).contains(&id),
+            expected_proposed,
+            "default grace at {days} days"
+        );
+    }
+}
+
+#[test]
 fn closing_again_does_not_restart_the_grace_period() {
     let (tmp, mut broker) = repository(None);
     let (id, _worktree) = session_with_commit(&mut broker, "reclosed", true);
     broker.close(id).unwrap();
     drop(broker);
-    let two_days_ago = std::time::SystemTime::now()
+    let sixteen_days_ago = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
-        - 48 * 3_600_000;
-    set_closed_at(&tmp.path(), id, two_days_ago);
+        - 16 * 24 * 3_600_000;
+    set_closed_at(&tmp.path(), id, sixteen_days_ago);
 
     let mut broker = tmp.open();
     broker.close(id).unwrap();
     assert_eq!(
         broker.store().session(id).unwrap().closed_at,
-        Some(two_days_ago)
+        Some(sixteen_days_ago)
     );
     assert!(proposed(&mut broker).contains(&id));
 }
