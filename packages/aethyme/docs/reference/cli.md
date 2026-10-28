@@ -842,8 +842,8 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker finish cleanup audit [--repo <path>] [--detail] [--json]`
 - `aethyme broker advanced main reconcile plan [--detail] [--resolution-file <path>] [--write-resolution-template <path>] [--json]`
 - `aethyme broker advanced main reconcile apply --session <id> --confirm <sha256> [--resolution-file <path>] [--json]`
-- `aethyme broker gc plan [--include-active-gate-cache] [--json]`
-- `aethyme broker gc apply --confirm <sha256> [--include-active-gate-cache] [--json]`
+- `aethyme broker gc plan [--include-active-gate-cache] [--full-scan] [--json]`
+- `aethyme broker gc apply --confirm <sha256> [--include-active-gate-cache] [--full-scan] [--json]`
 - `aethyme broker gc abandon --confirm <pending-digest> [--json]`
 - `aethyme broker gc forget-abandoned --confirm <archived-plan-digest> [--json]`
 - `aethyme broker gc sweep [--json]`
@@ -1685,6 +1685,10 @@ repository's archive, an unreadable manifest -- is listed under
 plan` lists every directory under `<host state>/recovery-archives/` in
 `recovery_archives[]` (count, broker-written count, bytes when measured, oldest
 creation time); that listing is reporting only and outside the storage digest.
+The default repository GC plan defers the whole archive inventory when its
+archive directory is nonempty: bundle verification can hash up to 1 GiB. Use
+`gc plan --full-scan` to inspect archives, and pass `--full-scan` to the emitted
+`gc apply` command so it rebuilds the same kind of plan.
 
 `broker gc reclaim plan` inventories regenerable build directories inside this
 repository's broker worktree root and saves the reviewed decision set under a
@@ -1882,7 +1886,7 @@ byte totals. The *ordering* is not: it changes the candidate lists, so a plan
 that crosses the budget threshold produces a different digest and has to be
 re-confirmed.
 
-### The routine check and the expensive audit
+### The routine check, bounded plan and exhaustive audit
 
 Sizing a directory has no shortcut: the filesystem stores no subtree total, so
 every byte figure costs a full recursive walk. On the machine that motivated
@@ -1892,12 +1896,25 @@ mandated first step of every session — reached the same walk through the same
 code, so the routine check and the expensive audit were one path wearing two
 names.
 
-They are now two paths.
+They now have distinct paths.
 
-**The expensive audit** is `gc plan`, `gc apply`, and `cleanup --apply`. It
-walks every retained worktree, build cache and orphaned root, and writes each
-measured size to `.aethyme/worktree-sizes.json`. Its totals are measurements and
-it alone produces an authorization digest.
+**The default operator plan** is `gc plan`. It measures candidate worktrees,
+build caches, gate-cache entries and orphaned roots with a cooperative shared
+10-second inspection deadline. A plan that reaches the deadline or an
+inventory limit lists its `deferred_checks` and has no authorization digest;
+partial measurements never authorize apply. A complete default plan still
+produces measured totals and a digest. Use `gc plan --full-scan` when the
+inventory is incomplete or a longer review is needed. It removes the default
+10-second deadline and artifact-discovery entry cap; artifact discovery still
+stops at six directory levels. This can take much longer because it walks
+retained worktrees, caches and orphaned roots and verifies recovery archives.
+Pass the same `--include-active-gate-cache` and
+`--full-scan` options to `gc apply` that the plan's emitted command shows. An
+existing GC journal resumes without a fresh plan scan.
+
+Both modes write each fully measured size to `.aethyme/worktree-sizes.json`;
+only complete measurements are recorded. The shared deadline is cooperative:
+an in-flight database query or filesystem call can finish after it.
 
 **The routine check** is `broker status`, `broker status doctor`, `aethyme certify` and
 the verify loop. It reads those records and walks nothing. Counts, dispositions,

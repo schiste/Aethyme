@@ -884,17 +884,24 @@ Usage:
       later plan. --session scopes both to one session's worktree. Nothing
       here is recreated for you: a reclaimed worktree pays a cold build next
       time.
-  aethyme broker gc plan [--include-active-gate-cache] [--json]
+  aethyme broker gc plan [--include-active-gate-cache] [--full-scan] [--json]
       Report exact retention-eligible rows, runtime files, represented
       worktrees/refs, finished sessions' build caches, this repository's gate
-      cache, estimated bytes, blockers, and a stable plan digest. The newest
+      cache, estimated bytes, blockers, and (when complete) a stable plan digest. The newest
       gate cache of each kind is kept (active) unless
       --include-active-gate-cache is given; the next gate then rebuilds it
-      from scratch.
-  aethyme broker gc apply --confirm <sha256> [--include-active-gate-cache] [--json]
+      from scratch. The default plan has a cooperative 10-second shared
+      inspection budget;
+      an incomplete plan has no apply digest. A nonempty recovery archive
+      inventory is deferred by default because verifying its bundles can be
+      expensive. --full-scan removes the default 10-second time budget and
+      artifact-discovery entry cap; discovery still stops at six directory
+      levels.
+  aethyme broker gc apply --confirm <sha256> [--include-active-gate-cache] [--full-scan] [--json]
       Apply or resume the exact reviewed plan under an exclusive lock. A
       recovery journal makes interrupted row, file, and worktree cleanup safe.
-      Pass --include-active-gate-cache when the plan was made with it.
+      Pass the same --include-active-gate-cache and --full-scan options used
+      for the plan. An existing journal resumes without a fresh plan scan.
   aethyme broker gc abandon --confirm <pending-digest> [--json]
       Archive a schema 2 or 3 pending journal without resuming or removing
       retained data. Requires a fresh plan review before later apply.
@@ -1624,6 +1631,9 @@ struct Parsed {
     apply: bool,
     dry_run: bool,
     include_active_gate_cache: bool,
+    /// `gc plan`/`gc apply`: request exhaustive inventory instead of the
+    /// default deadline-bound operator scan.
+    full_scan: bool,
     /// `worktrees --measure`: walk every checkout instead of a budget.
     measure: bool,
     /// `gates affected --timings`: emit the timing object instead of the array.
@@ -1767,6 +1777,7 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         apply: false,
         dry_run: false,
         include_active_gate_cache: false,
+        full_scan: false,
         measure: false,
         timings: false,
         destructive: false,
@@ -1852,6 +1863,7 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
             "--apply" => parsed.apply = true,
             "--dry-run" => parsed.dry_run = true,
             "--include-active-gate-cache" => parsed.include_active_gate_cache = true,
+            "--full-scan" => parsed.full_scan = true,
             "--measure" => parsed.measure = true,
             "--timings" => parsed.timings = true,
             "--from-provider" => parsed.from_provider = true,

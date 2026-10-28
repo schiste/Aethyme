@@ -75,18 +75,22 @@ fn gc_journal_archive_budget_admits(count: usize, bytes: u64, incoming: u64) -> 
 /// for nested workspaces and package directories, shallow enough to keep the
 /// scan bounded on large trees.
 const ARTIFACT_SCAN_DEPTH: usize = 6;
-/// Maximum number of directory entries the unattended scanner examines in
-/// one worktree pass. The wall-clock budget remains the primary limit; this
-/// also bounds broad trees when metadata calls are unusually cheap.
+/// Maximum number of directory entries the artifact scanner examines in one
+/// worktree pass. The wall-clock budget remains the primary limit; this also
+/// bounds broad trees when metadata calls are unusually cheap.
 const ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET: usize = 16_384;
 
 /// How long a recorded-size plan spends looking for build directories in
 /// retained worktrees before it stops and reports how many it did not scan.
 /// `doctor`, `certify` and the verify loop take that path, and on a
 /// repository with hundreds of retained worktrees an unbounded walk ran for
-/// minutes (#460). A measuring `gc plan` scans everything.
+/// minutes (#460). The explicit `gc plan --full-scan` path has no such scan
+/// budget.
 pub const HEALTH_CHECK_ARTIFACT_SCAN_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(10);
+/// Default cap for an operator's manual `gc plan` inventory. `--full-scan`
+/// retains the exhaustive reviewed plan path for repositories that need it.
+pub(crate) const MANUAL_GC_PLAN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// An ignored directory must be larger than this before `gc plan` reports it
 /// as an unclassified artifact. Small ignored directories are common project
@@ -1095,31 +1099,142 @@ fn collect_artifact_scan(root: &Path, extras: &[String], checkout: &GitRepo) -> 
     scan
 }
 
+/// The measuring CLI scan also reports ignored directories outside the
+/// artifact catalog. Each unknown directory may require a Git subprocess, so
+/// the discovery walk shares the plan deadline and an entry cap with sizing.
+fn collect_artifact_scan_until(
+    root: &Path,
+    extras: &[String],
+    checkout: &GitRepo,
+    deadline: Instant,
+    entry_budget: usize,
+) -> (ArtifactScan, bool) {
+    let _git_deadline = crate::git::limit_git_until(deadline);
+
+    fn visit(
+        root: &Path,
+        current: &Path,
+        depth: usize,
+        extras: &[String],
+        checkout: &GitRepo,
+        deadline: Instant,
+        entry_budget: usize,
+        entries_examined: &mut usize,
+        scan: &mut ArtifactScan,
+    ) -> bool {
+        if Instant::now() >= deadline || *entries_examined >= entry_budget {
+            return false;
+        }
+        if depth > ARTIFACT_SCAN_DEPTH {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(current) else {
+            return false;
+        };
+        for entry in entries {
+            if Instant::now() >= deadline || *entries_examined >= entry_budget {
+                return false;
+            }
+            let Ok(entry) = entry else {
+                return false;
+            };
+            *entries_examined = (*entries_examined).saturating_add(1);
+            let path = entry.path();
+            if !is_real_directory(&path) || path.file_name().is_some_and(|name| name == ".git") {
+                continue;
+            }
+            if artifact_witness_for_with_extras(&path, extras).is_some() {
+                scan.classified.push(path);
+                continue;
+            }
+            let name = path.file_name().and_then(|name| name.to_str());
+            let is_unknown_name = name.is_some_and(|name| !is_known_artifact_name(name, extras));
+            if is_unknown_name && let Some(relative) = repo_relative(root, &path) {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                let ignored = match checkout.path_is_ignored_checked(&relative) {
+                    Ok(ignored) => ignored,
+                    // A command failure is not evidence that the directory
+                    // is safe to descend into or report as unignored.
+                    Err(_) => return false,
+                };
+                if ignored {
+                    scan.declined.push(path);
+                    continue;
+                }
+            }
+            if !visit(
+                root,
+                &path,
+                depth + 1,
+                extras,
+                checkout,
+                deadline,
+                entry_budget,
+                entries_examined,
+                scan,
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    let mut scan = ArtifactScan::default();
+    let mut entries_examined = 0;
+    let complete = visit(
+        root,
+        root,
+        0,
+        extras,
+        checkout,
+        deadline,
+        entry_budget,
+        &mut entries_examined,
+        &mut scan,
+    );
+    (scan, complete)
+}
+
 fn declined_artifacts(
     session_id: i64,
     worktree_path: &str,
     root: &Path,
     paths: Vec<PathBuf>,
     extras: &[String],
-) -> Vec<GcDeclinedArtifact> {
-    paths
-        .into_iter()
-        .filter_map(|path| {
-            let relative_dir = repo_relative(root, &path)?;
-            let usage =
-                crate::disk_headroom::directory_usage_without_following_links(&path).ok()?;
-            (usage.bytes > UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES).then(|| {
-                GcDeclinedArtifact {
-                    session_id,
-                    worktree_path: worktree_path.to_owned(),
-                    relative_dir,
-                    estimated_bytes: usage.bytes,
-                    estimated_inodes: Some(usage.inodes),
-                    reason: declined_reason(&path, extras).into(),
-                }
-            })
-        })
-        .collect()
+    deadline: Option<Instant>,
+) -> (Vec<GcDeclinedArtifact>, bool) {
+    let mut declined = Vec::new();
+    for path in paths {
+        if deadline_expired(deadline) {
+            return (declined, false);
+        }
+        let Some(relative_dir) = repo_relative(root, &path) else {
+            continue;
+        };
+        let usage = match deadline {
+            Some(deadline) => crate::disk_headroom::directory_usage_bounded(&path, deadline),
+            None => crate::disk_headroom::directory_usage_without_following_links(&path).ok(),
+        };
+        let Some(usage) = usage else {
+            if deadline.is_some() {
+                return (declined, false);
+            }
+            continue;
+        };
+        if usage.bytes > UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES {
+            declined.push(GcDeclinedArtifact {
+                session_id,
+                worktree_path: worktree_path.to_owned(),
+                relative_dir,
+                estimated_bytes: usage.bytes,
+                estimated_inodes: Some(usage.inodes),
+                reason: declined_reason(&path, extras).into(),
+            });
+        }
+    }
+    (declined, true)
 }
 
 /// Why an ignored directory was reported rather than proposed.
@@ -3091,6 +3206,7 @@ impl Broker {
             excluded,
             size_scan,
             budget,
+            None,
         )
     }
 
@@ -3107,12 +3223,15 @@ impl Broker {
         excluded: ArtifactExclusions<'_>,
         size_scan: crate::SizeScan,
         budget: Option<std::time::Duration>,
+        deadline: Option<Instant>,
     ) -> ArtifactCandidates {
         let ArtifactExclusions {
             already_removed,
             live_worktrees,
         } = excluded;
         let started = std::time::Instant::now();
+        let scan_deadline = deadline.or_else(|| budget.map(|budget| started + budget));
+        let _git_deadline = scan_deadline.map(crate::git::limit_git_until);
         let mut candidates = Vec::new();
         let mut declined = Vec::new();
         let mut not_scanned = 0;
@@ -3140,33 +3259,48 @@ impl Broker {
             if overlaps_live_worktree(&root, live_worktrees) {
                 continue;
             }
-            if budget.is_some_and(|budget| started.elapsed() >= budget) {
+            if deadline_expired(scan_deadline) {
                 not_scanned += 1;
                 continue;
             }
             let Ok(checkout) = GitRepo::discover(&root) else {
+                if deadline_expired(scan_deadline) {
+                    not_scanned += 1;
+                }
                 continue;
             };
             // Ignored directories outside the catalog are only reported with
             // their size, so a pass that measures nothing skips finding them:
             // that search costs one `git check-ignore` per directory walked.
-            let artifact_scan = if size_scan.measures() {
-                collect_artifact_scan(&root, &policy.artefact_directories, &checkout)
-            } else if let Some(budget) = budget {
+            let (artifact_scan, discovery_complete) = if size_scan.measures()
+                && let Some(deadline) = scan_deadline
+            {
+                collect_artifact_scan_until(
+                    &root,
+                    &policy.artefact_directories,
+                    &checkout,
+                    deadline,
+                    ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
+                )
+            } else if size_scan.measures() {
+                (
+                    collect_artifact_scan(&root, &policy.artefact_directories, &checkout),
+                    true,
+                )
+            } else if let Some(deadline) = scan_deadline {
                 let discovery = collect_artifact_dirs_bounded(
                     &root,
                     &policy.artefact_directories,
-                    started + budget,
+                    deadline,
                     ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
                 );
-                if !discovery.complete {
-                    not_scanned += 1;
-                    continue;
-                }
-                ArtifactScan {
-                    classified: discovery.classified,
-                    declined: Vec::new(),
-                }
+                (
+                    ArtifactScan {
+                        classified: discovery.classified,
+                        declined: Vec::new(),
+                    },
+                    discovery.complete,
+                )
             } else {
                 let mut classified = Vec::new();
                 collect_artifact_dirs_with_extras(
@@ -3176,16 +3310,43 @@ impl Broker {
                     &policy.artefact_directories,
                     &mut classified,
                 );
-                ArtifactScan {
-                    classified,
-                    declined: Vec::new(),
-                }
+                (
+                    ArtifactScan {
+                        classified,
+                        declined: Vec::new(),
+                    },
+                    true,
+                )
             };
+            if !discovery_complete {
+                not_scanned += 1;
+                continue;
+            }
+            let candidates_before_worktree = candidates.len();
+            let mut worktree_complete = true;
             for dir in artifact_scan.classified {
+                if deadline_expired(scan_deadline) {
+                    worktree_complete = false;
+                    break;
+                }
                 let Some(relative) = repo_relative(&root, &dir) else {
                     continue;
                 };
-                if !checkout.path_is_ignored(&relative) {
+                let ignored = match scan_deadline {
+                    Some(_) => match checkout.path_is_ignored_checked(&relative) {
+                        Ok(ignored) => ignored,
+                        Err(_) => {
+                            worktree_complete = false;
+                            break;
+                        }
+                    },
+                    None => checkout.path_is_ignored(&relative),
+                };
+                if deadline_expired(scan_deadline) {
+                    worktree_complete = false;
+                    break;
+                }
+                if !ignored {
                     continue;
                 }
                 // Discovery is `read_dir` plus one `check-ignore`; sizing is
@@ -3195,10 +3356,22 @@ impl Broker {
                 // holding no bytes and nothing but itself (an empty `target/`)
                 // frees nothing worth a candidate.
                 let usage = if size_scan.measures() {
-                    match crate::disk_headroom::directory_usage_without_following_links(&dir) {
-                        Ok(usage) if usage.bytes == 0 && usage.inodes <= 1 => continue,
-                        Ok(usage) => Some(usage),
-                        Err(_) => continue,
+                    let measured = match scan_deadline {
+                        Some(deadline) => {
+                            crate::disk_headroom::directory_usage_bounded(&dir, deadline)
+                        }
+                        None => {
+                            crate::disk_headroom::directory_usage_without_following_links(&dir).ok()
+                        }
+                    };
+                    match measured {
+                        Some(usage) if usage.bytes == 0 && usage.inodes <= 1 => continue,
+                        Some(usage) => Some(usage),
+                        None if scan_deadline.is_some() => {
+                            worktree_complete = false;
+                            break;
+                        }
+                        None => continue,
                     }
                 } else {
                     None
@@ -3212,14 +3385,26 @@ impl Broker {
                     idle_days,
                 });
             }
+            if !worktree_complete {
+                candidates.truncate(candidates_before_worktree);
+                not_scanned += 1;
+                continue;
+            }
             if size_scan.measures() {
-                declined.extend(declined_artifacts(
+                let (reported_declined, declined_complete) = declined_artifacts(
                     item.session_id,
                     &item.worktree_path,
                     &root,
                     artifact_scan.declined,
                     &policy.artefact_directories,
-                ));
+                    scan_deadline,
+                );
+                if !declined_complete {
+                    candidates.truncate(candidates_before_worktree);
+                    not_scanned += 1;
+                    continue;
+                }
+                declined.extend(reported_declined);
             }
         }
         candidates.sort_by(|left, right| {
@@ -3263,11 +3448,48 @@ impl Broker {
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             return Ok((Vec::new(), None, false));
         }
+        let archive_scan = if let Some(deadline) = deadline {
+            let root = self.recovery_archive_root()?;
+            if std::time::Instant::now() >= deadline {
+                return Ok((Vec::new(), None, false));
+            }
+            match std::fs::symlink_metadata(&root) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok((Vec::new(), None, true));
+                }
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                _ => return Ok((Vec::new(), None, false)),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok((Vec::new(), None, false));
+            }
+            match std::fs::read_dir(&root) {
+                Ok(mut entries) => match entries.next() {
+                    None => {
+                        return Ok((Vec::new(), None, true));
+                    }
+                    Some(Ok(_)) => {
+                        // Verifying a recovery archive can hash a bundle up to
+                        // 1 GiB. Keep the default plan bounded by deferring the
+                        // entire archive set; `--full-scan` performs the
+                        // exhaustive ownership and integrity checks.
+                        return Ok((Vec::new(), None, false));
+                    }
+                    Some(Err(_)) => return Ok((Vec::new(), None, false)),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok((Vec::new(), None, true));
+                }
+                Err(_) => return Ok((Vec::new(), None, false)),
+            }
+        } else {
+            self.recovery_archives()?
+        };
         let crate::cleanup_resolve::RecoveryArchiveScan {
             root,
             owned,
             unowned,
-        } = self.recovery_archives()?;
+        } = archive_scan;
         if owned.is_empty() && unowned.is_empty() {
             return Ok((Vec::new(), None, true));
         }
@@ -3542,6 +3764,24 @@ impl Broker {
         self.gc_plan_scanned(crate::SizeScan::Measure, false)
     }
 
+    /// The default operator-facing plan is cooperative and deadline-bound.
+    /// `full_scan` selects the exhaustive compatibility path explicitly.
+    pub(crate) fn gc_plan_for_cli(
+        &mut self,
+        include_active_gate_cache: bool,
+        full_scan: bool,
+    ) -> Result<GcPlan, BrokerOpError> {
+        if full_scan {
+            self.gc_plan_scanned(crate::SizeScan::Measure, include_active_gate_cache)
+        } else {
+            self.gc_plan_scanned_until(
+                crate::SizeScan::Measure,
+                include_active_gate_cache,
+                Some(Instant::now() + MANUAL_GC_PLAN_BUDGET),
+            )
+        }
+    }
+
     /// Retire an ineligible frozen journal after the operator confirms its
     /// exact digest. This archives only the journal bytes: it never resumes,
     /// replans, or removes any retained row, file, worktree, or artifact.
@@ -3810,6 +4050,7 @@ impl Broker {
         include_active_gate_cache: bool,
         deadline: Option<std::time::Instant>,
     ) -> Result<GcPlan, BrokerOpError> {
+        let _git_deadline = deadline.map(crate::git::limit_git_until);
         // The budget is cooperative: loops and stage boundaries check it, but
         // an in-flight SQLite query or filesystem syscall cannot be cancelled
         // by this deadline and may finish after it.
@@ -3820,14 +4061,14 @@ impl Broker {
         let policy = retention_config.policy;
         let retention_config_warnings = retention_config.warnings;
         let exposure_cutoff = cutoff(age_anchor_ms, policy.publication_exposure_days);
-        let cleanup = match deadline.filter(|_| !scan.measures()) {
-            Some(deadline) => self.cleanup_plan_scanned_within(
-                scan,
-                Some(deadline.saturating_duration_since(std::time::Instant::now())),
-            )?,
-            None => self.cleanup_plan_scanned(scan)?,
+        let (cleanup, cleanup_size_records_complete) = match deadline {
+            Some(deadline) => self.cleanup_plan_scanned_until(scan, deadline)?,
+            None => (self.cleanup_plan_scanned(scan)?, true),
         };
         let mut deferred_checks = Vec::new();
+        if !cleanup_size_records_complete {
+            deferred_checks.push("cleanup_size_records".into());
+        }
         if cleanup.eligibility_not_inspected_count > 0 {
             deferred_checks.push("cleanup_eligibility".into());
         }
@@ -4201,14 +4442,12 @@ impl Broker {
             .iter()
             .map(|worktree| worktree.session_id)
             .collect::<Vec<_>>();
-        let artifact_budget =
-            deadline.map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
         let ArtifactCandidates {
             candidates: mut artifacts,
             declined: declined_artifacts,
             not_scanned: artifact_worktrees_not_scanned,
-        } = match artifact_budget {
-            Some(budget) => self.artifact_candidates_within(
+        } = match deadline {
+            Some(deadline) => self.artifact_candidates_within(
                 age_anchor_ms,
                 &policy,
                 &cleanup.worktrees,
@@ -4218,7 +4457,8 @@ impl Broker {
                     live_worktrees: &live_worktrees,
                 },
                 scan,
-                Some(budget),
+                None,
+                Some(deadline),
             ),
             None => self.artifact_candidates(
                 age_anchor_ms,
@@ -4323,7 +4563,7 @@ impl Broker {
                 }
             }
         };
-        if scan.measures() {
+        if scan.measures() && size_records_complete {
             crate::warn_unrecorded(
                 "record gate cache sizes",
                 crate::measurement::save_size_records(&main_root, &size_records),
@@ -4623,6 +4863,11 @@ impl Broker {
         }
         deferred_checks.sort();
         deferred_checks.dedup();
+        if deadline_expired(deadline) {
+            deferred_checks.push("plan_deadline".into());
+            deferred_checks.sort();
+            deferred_checks.dedup();
+        }
         let clears_retained_bytes_budget = deferred_checks.is_empty()
             && crate::reclaim_order::clears_budget(
                 estimated_retained_bytes,
@@ -4686,8 +4931,18 @@ impl Broker {
         // Reporting only and outside the digest: what the last unattended
         // pass removed and why it kept the rest (#588).
         plan.auto_cleanup = self.last_auto_cleanup_report();
-        if scan.measures() {
+        if scan.measures() && plan.deferred_checks.is_empty() {
             plan.finish_digest()?;
+        }
+        if deadline_expired(deadline) {
+            plan.digest.clear();
+            plan.deferred_checks.push("plan_deadline".into());
+            plan.deferred_checks.sort();
+            plan.deferred_checks.dedup();
+            if plan.budget_verdict == crate::BudgetVerdict::Within {
+                plan.budget_verdict = crate::BudgetVerdict::Unknown;
+            }
+            plan.clears_retained_bytes_budget = false;
         }
         Ok(plan)
     }
@@ -4703,7 +4958,20 @@ impl Broker {
         &mut self,
         confirm: &str,
     ) -> Result<GcApplyReport, BrokerOpError> {
-        self.gc_apply_with(confirm, None, true)
+        self.gc_apply_with(confirm, None, true, None)
+    }
+
+    /// CLI apply uses the same scan mode as the plan command. An existing
+    /// journal is still resumed directly; this deadline only covers the fresh
+    /// plan needed when no journal exists.
+    pub(crate) fn gc_apply_for_cli(
+        &mut self,
+        confirm: &str,
+        include_active_gate_cache: bool,
+        full_scan: bool,
+    ) -> Result<GcApplyReport, BrokerOpError> {
+        let planning_deadline = (!full_scan).then(|| Instant::now() + MANUAL_GC_PLAN_BUDGET);
+        self.gc_apply_with(confirm, None, include_active_gate_cache, planning_deadline)
     }
 
     /// The retention summary `doctor`, `certify` and the verify loop report.
@@ -7307,7 +7575,7 @@ impl Broker {
         confirm: &str,
         budget_ms: Option<u64>,
     ) -> Result<GcApplyReport, BrokerOpError> {
-        self.gc_apply_with(confirm, budget_ms, false)
+        self.gc_apply_with(confirm, budget_ms, false, None)
     }
 
     fn gc_apply_with(
@@ -7315,6 +7583,7 @@ impl Broker {
         confirm: &str,
         budget_ms: Option<u64>,
         include_active_gate_cache: bool,
+        planning_deadline: Option<Instant>,
     ) -> Result<GcApplyReport, BrokerOpError> {
         if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BrokerOpError::GcConfirmationNotSha256);
@@ -7349,8 +7618,16 @@ impl Broker {
                 journal
             }
             None => {
-                let plan =
-                    self.gc_plan_scanned(crate::SizeScan::Measure, include_active_gate_cache)?;
+                let plan = match planning_deadline {
+                    Some(deadline) => self.gc_plan_scanned_until(
+                        crate::SizeScan::Measure,
+                        include_active_gate_cache,
+                        Some(deadline),
+                    )?,
+                    None => {
+                        self.gc_plan_scanned(crate::SizeScan::Measure, include_active_gate_cache)?
+                    }
+                };
                 if !plan.digest.eq_ignore_ascii_case(confirm) {
                     return Err(BrokerOpError::GcConfirmationMismatch {
                         actual: confirm.to_owned(),
@@ -9684,6 +9961,126 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
+    fn expired_measured_gc_plan_has_no_apply_digest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let plan = broker
+            .gc_plan_scanned_until(
+                crate::SizeScan::Measure,
+                false,
+                Some(Instant::now() - Duration::from_millis(1)),
+            )
+            .unwrap();
+
+        assert!(plan.digest.is_empty());
+        assert!(
+            plan.deferred_checks
+                .iter()
+                .any(|check| check == "plan_deadline")
+        );
+        assert!(plan.rows.is_empty());
+        assert!(plan.files.is_empty());
+        assert!(plan.worktrees.is_empty());
+        assert!(plan.artifacts.is_empty());
+        assert!(plan.orphans.is_empty());
+        assert!(plan.gate_caches.is_empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn bounded_artifact_discovery_stops_after_its_entry_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        for index in 0..64 {
+            std::fs::write(root.join(format!("fixture-{index}.txt")), "fixture\n").unwrap();
+        }
+        let checkout = GitRepo::discover(&root).unwrap();
+
+        let (scan, complete) = collect_artifact_scan_until(
+            &root,
+            &[],
+            &checkout,
+            Instant::now() + Duration::from_secs(2),
+            8,
+        );
+
+        assert!(!complete, "exceeding the entry budget is incomplete");
+        assert!(scan.classified.is_empty());
+        assert!(scan.declined.is_empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn bounded_artifact_discovery_defers_when_git_ignore_check_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(root.join("unclassified-output")).unwrap();
+        let checkout = GitRepo::discover(&root).unwrap();
+        std::fs::remove_dir_all(root.join(".git")).unwrap();
+
+        let (scan, complete) = collect_artifact_scan_until(
+            &root,
+            &[],
+            &checkout,
+            Instant::now() + Duration::from_secs(2),
+            64,
+        );
+
+        assert!(
+            !complete,
+            "a failed check-ignore is an incomplete inventory"
+        );
+        assert!(scan.classified.is_empty());
+        assert!(scan.declined.is_empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn oversized_size_cache_is_deferred_without_overwriting_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        let runtime = root.join(".aethyme");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let cache_path = runtime.join("worktree-sizes.json");
+        // The bounded size-cache reader admits at most 8 MiB.
+        let original = vec![b'x'; 8 * 1024 * 1024 + 1];
+        std::fs::write(&cache_path, &original).unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let plan = broker
+            .gc_plan_scanned_until(
+                crate::SizeScan::Measure,
+                false,
+                Some(Instant::now() + Duration::from_secs(5)),
+            )
+            .unwrap();
+
+        assert!(plan.digest.is_empty());
+        assert!(
+            plan.deferred_checks
+                .iter()
+                .any(|check| check == "cleanup_size_records")
+        );
+        assert_eq!(std::fs::read(cache_path).unwrap(), original);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
     fn artifact_sweep_preserves_shared_consumers_with_or_without_a_bound_worktree_root() {
         for bound in [false, true] {
             let tmp = tempfile::tempdir().unwrap();
@@ -10820,6 +11217,7 @@ mod tests {
                 },
                 crate::SizeScan::Recorded,
                 budget,
+                None,
             )
         };
 

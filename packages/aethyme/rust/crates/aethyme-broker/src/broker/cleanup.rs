@@ -85,6 +85,7 @@ struct CleanupInspectionContext<'a> {
     delivery_targets: CleanupDeliveryTargets<'a>,
     landing_cache: &'a mut crate::representation::LandingVerdictCache,
     status_limits: CleanupStatusLimits,
+    size_deadline: Option<std::time::Instant>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2493,6 +2494,7 @@ impl Broker {
                 delivery_targets: CleanupDeliveryTargets::ArchivePreservation(delivery_targets),
                 landing_cache: &mut landing_cache,
                 status_limits,
+                size_deadline: None,
             },
         )
     }
@@ -2545,6 +2547,7 @@ impl Broker {
                 delivery_targets: CleanupDeliveryTargets::Fresh,
                 landing_cache: &mut landing_cache,
                 status_limits,
+                size_deadline: None,
             },
         )
     }
@@ -2566,6 +2569,7 @@ impl Broker {
             delivery_targets,
             landing_cache,
             status_limits,
+            size_deadline,
         } = inspection;
         let worktree_path = PathBuf::from(&session.worktree_path);
         let worktree_present = worktree_path.exists();
@@ -2599,7 +2603,10 @@ impl Broker {
             broker_owned && matches!(&live_owner, Ok(None)),
             scan,
             records,
-            |path| crate::disk_headroom::directory_usage_without_following_links(path).ok(),
+            |path| match size_deadline {
+                Some(deadline) => crate::disk_headroom::directory_usage_bounded(path, deadline),
+                None => crate::disk_headroom::directory_usage_without_following_links(path).ok(),
+            },
         );
         let (mut disposition, mut reason, provenance) = if let Err(reason) = &live_owner {
             (CleanupDisposition::InspectionFailed, reason.clone(), None)
@@ -2844,6 +2851,26 @@ impl Broker {
         self.cleanup_plan_scanned_within_and_cache(scan, budget, &mut landing_cache)
     }
 
+    pub(crate) fn cleanup_plan_scanned_until(
+        &self,
+        scan: crate::SizeScan,
+        deadline: std::time::Instant,
+    ) -> Result<(CleanupPlan, bool), BrokerOpError> {
+        let mut landing_cache = crate::representation::LandingVerdictCache::default();
+        let budget_label = (!scan.measures()).then_some(HEALTH_CHECK_ELIGIBILITY_BUDGET);
+        let records = crate::measurement::load_size_records_until(&self.main_root, deadline);
+        let records_complete = records.is_some();
+        let plan = self.cleanup_plan_scanned_core(
+            scan,
+            Some(deadline),
+            budget_label,
+            &mut landing_cache,
+            records.unwrap_or_default(),
+            records_complete,
+        )?;
+        Ok((plan, records_complete))
+    }
+
     pub(crate) fn cleanup_plan_scanned_within_and_cache(
         &self,
         scan: crate::SizeScan,
@@ -2854,8 +2881,26 @@ impl Broker {
             budget.is_none() || !scan.measures(),
             "a measuring plan authorizes removal and must inspect every worktree"
         );
-        let started = std::time::Instant::now();
-        let deadline = budget.map(|budget| started + budget);
+        let deadline = budget.map(|budget| std::time::Instant::now() + budget);
+        self.cleanup_plan_scanned_core(
+            scan,
+            deadline,
+            budget,
+            landing_cache,
+            crate::measurement::load_size_records(&self.main_root),
+            true,
+        )
+    }
+
+    fn cleanup_plan_scanned_core(
+        &self,
+        scan: crate::SizeScan,
+        deadline: Option<std::time::Instant>,
+        budget: Option<std::time::Duration>,
+        landing_cache: &mut crate::representation::LandingVerdictCache,
+        mut records: crate::measurement::SizeRecords,
+        records_complete: bool,
+    ) -> Result<CleanupPlan, BrokerOpError> {
         // Cleared on every exit below, including an error return.
         struct ClearOnDrop<'a>(&'a std::cell::Cell<Option<std::time::Instant>>);
         impl Drop for ClearOnDrop<'_> {
@@ -2870,7 +2915,6 @@ impl Broker {
             target_snapshot: target_snapshot.refs.clone(),
             ..CleanupPlan::default()
         };
-        let mut records = crate::measurement::load_size_records(&self.main_root);
         let mut retained = crate::MeasuredTotal::default();
         let mut reclaimable = crate::MeasuredTotal::default();
         let mut known = std::collections::BTreeSet::new();
@@ -2880,26 +2924,43 @@ impl Broker {
         // An incomplete ownership index cannot authorize any candidate. A
         // bounded health report must defer inspection, rather than fail the
         // entire status command. Unbounded removal plans remain strict.
-        let live_checkouts = if budget.is_some() {
+        let live_checkouts = if deadline.is_some() {
             self.cleanup_live_checkout_snapshot_until(deadline)?
         } else {
             Some(self.cleanup_live_checkout_snapshot(deadline)?)
         };
-        for session in self.store.cleaned_sessions()? {
+        let sessions = self.store.cleaned_sessions()?;
+        for (index, session) in sessions.iter().enumerate() {
             if session.origin != SessionOrigin::Spawned {
                 continue;
             }
+            if scan.measures()
+                && deadline.is_some()
+                && (live_checkouts.is_none()
+                    || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline))
+            {
+                plan.eligibility_not_inspected_count += sessions[index..]
+                    .iter()
+                    .filter(|session| session.origin == SessionOrigin::Spawned)
+                    .count();
+                break;
+            }
             let mut over_budget = live_checkouts.is_none()
-                || budget.is_some_and(|budget| started.elapsed() >= budget);
+                || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
+            let deferred_reason = if scan.measures() {
+                "GC plan reached its shared time budget; repeat with `aethyme broker gc plan --full-scan` for a complete inspection".to_owned()
+            } else {
+                format!(
+                    "eligibility not inspected within the {} s health-check budget; run `aethyme broker gc plan` for the full inspection",
+                    budget.unwrap_or_default().as_secs()
+                )
+            };
             let item = if over_budget {
                 self.cleanup_item_not_inspected(
                     &session,
                     &records,
                     branch_tips.as_ref(),
-                    format!(
-                        "eligibility not inspected within the {} s health-check budget; run `aethyme broker gc plan` for the full inspection",
-                        budget.unwrap_or_default().as_secs()
-                    ),
+                    deferred_reason.clone(),
                 )
             } else {
                 let item = self.cleanup_item_scanned_with_tips(
@@ -2922,24 +2983,30 @@ impl Broker {
                             crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
                             crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
                         ),
+                        size_deadline: deadline,
                     },
                 )?;
+                if scan.measures()
+                    && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                {
+                    plan.eligibility_not_inspected_count += sessions[index..]
+                        .iter()
+                        .filter(|session| session.origin == SessionOrigin::Spawned)
+                        .count();
+                    break;
+                }
                 // A landing search the deadline stopped reads as a failed
                 // inspection; it is the budget, so say so instead (#460).
-                if item
-                    .as_ref()
-                    .is_some_and(|item| item.disposition == CleanupDisposition::InspectionFailed)
-                    && budget.is_some_and(|budget| started.elapsed() >= budget)
+                if item.as_ref().is_some_and(|item| {
+                    item.disposition == CleanupDisposition::InspectionFailed || scan.measures()
+                }) && deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
                 {
                     over_budget = true;
                     self.cleanup_item_not_inspected(
                         &session,
                         &records,
                         branch_tips.as_ref(),
-                        format!(
-                            "eligibility not inspected within the {} s health-check budget; run `aethyme broker gc plan` for the full inspection",
-                            budget.unwrap_or_default().as_secs()
-                        ),
+                        deferred_reason,
                     )
                 } else {
                     item
@@ -2997,16 +3064,20 @@ impl Broker {
         plan.estimated_retained_bytes = retained.bytes;
         plan.estimated_reclaimable_bytes = reclaimable.bytes;
         plan.unmeasured_worktree_count = retained.unmeasured;
-        if scan.measures() {
+        if scan.measures() && records_complete {
             // Only a pass that enumerated everything may prune: a routine
             // check sees whatever subset it asked about.
-            records.retain_paths(&known);
+            if deadline.is_none() {
+                records.retain_paths(&known);
+            }
             crate::warn_unrecorded(
                 "save worktree size records",
                 crate::measurement::save_size_records(&self.main_root, &records),
             );
-            let bytes = serde_json::to_vec(&plan)?;
-            plan.digest = format!("{:x}", Sha256::digest(bytes));
+            if deadline.is_none() && plan.eligibility_not_inspected_count == 0 {
+                let bytes = serde_json::to_vec(&plan)?;
+                plan.digest = format!("{:x}", Sha256::digest(bytes));
+            }
         }
         // Set after the digest, deliberately. The digest is what an operator
         // confirms and what `cleanup_cleaned_worktrees` re-plans to match, so
