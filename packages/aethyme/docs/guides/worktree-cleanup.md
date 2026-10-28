@@ -1,6 +1,6 @@
 # Closed-session worktree cleanup
 
-Last Updated: 2026-10-26
+Last Updated: 2026-10-28
 
 Removing a session worktree is a reviewed operation, with one deterministic
 exception described under *Automatic removal* below. A closed session is not
@@ -139,13 +139,15 @@ Anything the sweep cannot decide keeps the checkout, with the reason in
 [cleanup]
 auto_remove = true             # the default; false turns checkout removal off
 strict = false                 # the default; all Git-ignored directories disposable
+ignored_directory_sweep = false # opt in to reclaim ignored folders in retained checkouts
 regenerable = [".gradle/**"]    # extra artifact-file/link classification
 keep = ["*-investigation"]     # worktrees never removed automatically
 ```
 
 State-only closed checkouts also respect `[retention]
 closed_worktree_grace_hours` in `.aethyme/broker.toml` (360 hours / 15 days by default;
-`0` disables the window). Automatic cleanup and reviewed GC share this check.
+`0` disables the window). Automatic checkout cleanup and reviewed whole-checkout
+GC share this check; in-place artifact reclamation has its own retention rules.
 Automatic apply reloads retention before removal, so a newly raised grace
 period or unreadable policy retains the checkout. Explicit `finish cleanup`
 remains available without waiting for the window.
@@ -156,6 +158,19 @@ them. Ignoring a directory therefore opts its contents into disposal. Move
 irreplaceable records outside disposable checkouts, or enable `strict = true`.
 Standalone ignored files such as a root `.env` remain protected. Removal unlinks
 symlinks without deleting their external targets.
+
+`ignored_directory_sweep` controls a separate in-place lane for reclaiming
+ignored folders from retained closed checkouts. It defaults to `false`; setting
+it to `true` can reclaim opaque ignored folders while preserving the checkout,
+tracked work, standalone ignored files, and `keep` pins. This in-place lane also
+excludes protected Git administration and broker metadata roots from selection.
+Metadata and nested repositories inside another disposable ignored directory
+remain disposable contents of that directory. It does not shorten
+`closed_worktree_grace_hours`. Enable it only after older Aethyme broker
+processes have exited and the repository is on a release with the durable
+artifact-use protocol. That protocol is available on Unix; unattended ignored
+folder and whole-checkout cleanup remain blocked on unsupported targets. Explicit
+normal cleanup keeps its existing platform checks there.
 
 Strict mode also disables automatic artifact sweeps, including already queued
 background removals. Remove the leftovers manually, or inspect an explicit

@@ -16,12 +16,30 @@ version and the target, oldest first. Each schema migration runs on first open
 and is one-way, so rollback is limited to the oldest binary that still reads
 the newest schema you have opened.
 
-Breaking releases: [v0.8.43](#v0843), [v0.8.42](#v0842), [v0.8.41](#v0841), [v0.8.40](#v0840), [v0.8.38](#v0838), [v0.8.37](#v0837), [v0.8.33](#v0833), [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
+Breaking releases: [v0.8.44](#v0844), [v0.8.43](#v0843), [v0.8.42](#v0842), [v0.8.41](#v0841), [v0.8.40](#v0840), [v0.8.38](#v0838), [v0.8.37](#v0837), [v0.8.33](#v0833), [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
 [v0.7.25](#v0725), [v0.7.23](#v0723), [v0.7.22](#v0722), [v0.7.19](#v0719),
 [v0.7.18](#v0718), [v0.7.16](#v0716), [v0.7.9](#v079), [v0.7.8](#v078),
 [v0.7.4](#v074), [v0.7.2](#v072),
 [v0.7.1](#v071), [v0.5.0](#v050), [v0.3.0](#v030),
 [v0.2.2](#v022), [v0.2.0](#v020).
+
+## v0.8.44
+
+### Compatibility
+
+The repository broker database advances to schema 58 with compatibility floor 58. This protocol fence blocks fresh opens by older binaries; it does not revoke connections they already hold. Older runtimes cannot safely coordinate the new artifact-use and unattended reclamation protocol. Optional retirement report fields are additive and may be absent in saved reports.
+
+The default fifteen-day closed-checkout grace is unchanged. Broader in-place cleanup is default-off and uses the existing disposable ignored-directory policy; ignored directories can contain datasets or saved records, so preserve irreplaceable material outside disposable checkouts. Standalone ignored files remain protected. Protocol-dependent unattended cleanup remains blocked on unsupported platforms.
+
+### Migrate and verify
+
+Before the new runtime first opens a live database, take consistent backups and preserve repository configuration. For every enrolled repository affected by the shared router/engine update, temporarily set `[retention]` settings `session_abandoned_after_hours = 0`, `auto_cleanup_worktrees_on_finish = false`, and `artifact_sweep_budget_ms = 0` in `.aethyme/broker.toml`, plus `[cleanup]` settings `strict = true`, `auto_remove = false`, and `ignored_directory_sweep = false` in `.aethyme/config.toml`. Finish-time cleanup is independent of `auto_remove`. Inspect `.aethyme/gc-journal.json` before the first normal open: startup can resume a previously confirmed GC plan independently of these automatic-maintenance holds. Resolve any pending journal through the reviewed GC recovery workflow before proceeding.
+
+Install the matching signed router and engine pair. Let every older client with an open broker database connection finish, and verify process identity plus database, WAL and SHM handles; absence of a gate PID file is insufficient. Only after the floor is committed and the old-client drain is proved, restore the reviewed retention/cleanup settings and optionally enable `ignored_directory_sweep = true`. Preserve concurrent configuration edits. Inspect typed maintenance deferrals and confirm active work remains protected. See `packages/aethyme/docs/guides/automatic-checkout-maintenance.md` for the policy details.
+
+### Rollback
+
+Do not lower the compatibility marker or run older binaries against the migrated live database. Keep maintenance held if any completion evidence is uncertain. Prefer the matching current runtime. Any reviewed restoration of a pre-upgrade backup must account for activity recorded since that backup; never replace a live database or erase newer work to bypass the fence.
 
 ## v0.8.43
 

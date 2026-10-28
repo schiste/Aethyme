@@ -401,21 +401,66 @@ fn bulk_cleanup_refuses_a_closed_row_whose_checkout_a_live_session_adopted() {
     let (_tmp, mut broker) = repository(Some(0));
     let (id, live_id, worktree) = closed_then_adopted(&mut broker, "bulk");
     let plan = broker.cleanup_cleaned_worktrees(false, None).unwrap().plan;
-    assert!(plan.worktrees.iter().any(|item| item.session_id == id));
+    let item = plan
+        .worktrees
+        .iter()
+        .find(|item| item.session_id == id)
+        .unwrap();
+    assert_eq!(
+        item.disposition,
+        aethyme_broker::CleanupDisposition::UnsafePath
+    );
+    assert!(item.reason.contains(&format!("live session {live_id}")));
+    assert!(
+        item.provenance.is_none(),
+        "a live checkout needs no landing search"
+    );
+    assert_eq!(plan.eligible_worktree_count, 0);
 
     let report = broker
         .cleanup_cleaned_worktrees(true, Some(&plan.digest))
         .unwrap();
     assert!(report.removed_session_ids.is_empty(), "{report:?}");
-    assert_eq!(report.failures.len(), 1);
     assert!(
-        report.failures[0]
-            .reason
-            .contains(&format!("live session {live_id}")),
-        "{:?}",
-        report.failures
+        report.failures.is_empty(),
+        "the plan must not propose a known live checkout"
     );
     assert!(worktree.join("bulk.txt").exists());
+}
+
+#[test]
+fn cleanup_protects_a_checkout_inside_an_open_session_path() {
+    let (tmp, mut broker) = repository(Some(0));
+    let (id, live_id, worktree) = closed_then_adopted(&mut broker, "live-parent");
+    // Model a live session owning a containing checkout. The safety boundary
+    // is path containment, regardless of the closed row's own landing proof.
+    let parent = worktree.parent().unwrap();
+    let db = rusqlite::Connection::open(tmp.path().join(".aethyme/broker.db")).unwrap();
+    db.execute(
+        "UPDATE sessions SET worktree_path = ?1 WHERE id = ?2",
+        rusqlite::params![parent.to_string_lossy(), live_id],
+    )
+    .unwrap();
+    drop(db);
+    let plan = broker.cleanup_cleaned_worktrees(false, None).unwrap().plan;
+    let item = plan
+        .worktrees
+        .iter()
+        .find(|item| item.session_id == id)
+        .unwrap();
+    assert_eq!(
+        item.disposition,
+        aethyme_broker::CleanupDisposition::UnsafePath
+    );
+    assert!(item.reason.contains(&format!("live session {live_id}")));
+    for force in [false, true] {
+        assert!(matches!(
+            broker.cleanup(id, force).unwrap_err(),
+            BrokerOpError::WorktreeInUseByLiveSession { id: refused_id, live_id: refused_live, .. }
+                if refused_id == id && refused_live == live_id
+        ));
+        assert!(worktree.join("live-parent.txt").exists());
+    }
 }
 
 #[test]
@@ -464,4 +509,55 @@ fn a_resumed_gc_apply_retains_a_checkout_adopted_after_review() {
         "{resumed:?}"
     );
     assert!(worktree.join("resumed.txt").exists());
+}
+
+#[test]
+fn a_resumed_gc_apply_retains_a_checkout_recreated_after_an_absent_path_plan() {
+    let (tmp, mut broker) = repository(Some(0));
+    let (id, worktree) = session_with_commit(&mut broker, "recreated", true);
+    let branch = broker.store().session(id).unwrap().branch;
+    broker.close(id).unwrap();
+    git(
+        &tmp.path(),
+        &["worktree", "remove", worktree.to_str().unwrap()],
+    );
+    assert!(!worktree.exists());
+
+    let plan = broker.gc_plan().unwrap();
+    let candidate = plan
+        .worktrees
+        .iter()
+        .find(|item| item.session_id == id)
+        .unwrap();
+    assert!(!candidate.worktree_present);
+    let started = broker.gc_apply_bounded(&plan.digest, Some(0)).unwrap();
+    assert!(!started.complete);
+    assert!(started.sessions_cleaned.is_empty());
+
+    git(
+        &tmp.path(),
+        &["worktree", "add", worktree.to_str().unwrap(), &branch],
+    );
+    let live = broker
+        .adopt(&worktree, Some("recreated follow-up"))
+        .unwrap();
+    let resumed = broker.gc_apply(&plan.digest).unwrap();
+    assert!(!resumed.sessions_cleaned.contains(&id), "{resumed:?}");
+    assert!(
+        resumed
+            .failures
+            .iter()
+            .any(|failure| failure.contains("live session")),
+        "{resumed:?}"
+    );
+    assert!(worktree.join("recreated.txt").exists());
+    assert!(
+        resumed.complete,
+        "a retained live checkout must not pin the journal: {resumed:?}"
+    );
+    assert_eq!(
+        broker.store().session(id).unwrap().cleanup_state,
+        SessionCleanupState::Closed
+    );
+    assert!(!broker.store().session(live.id).unwrap().status.is_closed());
 }

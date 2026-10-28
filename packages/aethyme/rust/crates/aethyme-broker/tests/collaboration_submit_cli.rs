@@ -444,11 +444,11 @@ fn status_reports_the_collaboration_fence() {
         String::from_utf8_lossy(&output.stderr)
     );
     let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    // This fresh database has the v54 repository identity binding floor.
+    // A fresh database requires the v58 durable artifact-use protocol.
     assert_eq!(
         status["collaboration_fence"],
         serde_json::json!({
-            "min_compatible_schema": 54,
+            "min_compatible_schema": 58,
             "reason": "collaboration capture required",
             "source": "committed",
             "state": "active",
@@ -458,7 +458,7 @@ fn status_reports_the_collaboration_fence() {
     assert!(
         String::from_utf8_lossy(&text.stdout).contains(&format!(
             "Collaboration fence: broker.db requires schema {}",
-            54
+            58
         )),
         "{}",
         String::from_utf8_lossy(&text.stdout)

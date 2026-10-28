@@ -19,8 +19,9 @@
 ///
 /// `agent_alive` is deliberately a three-way value. `Some(true)` means a pid
 /// was checked and answered; `Some(false)` means it was checked and is gone;
-/// `None` means there is nothing to check -- an adopted session the broker
-/// never spawned. Collapsing `None` into either answer is how this goes
+/// `None` means no task-specific holder is recorded. Callers with a recorded
+/// holder resolve its exact process identity before passing this value.
+/// Collapsing `None` into either answer is how this goes
 /// wrong: treat it as alive and adopted sessions pin their disk forever,
 /// treat it as dead and a working agent loses its worktree mid-task.
 #[derive(Debug, Clone, PartialEq, Eq)]

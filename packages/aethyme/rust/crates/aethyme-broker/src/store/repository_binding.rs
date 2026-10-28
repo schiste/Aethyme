@@ -1324,16 +1324,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn binding_transitions_accept_current_additive_schema_but_keep_introduction_floor() {
+    fn binding_transitions_accept_current_schema_and_preserve_its_floor() {
         let directory = tempfile::tempdir().unwrap();
         let store = open_store(&directory);
         assert_eq!(
             crate::schema::current_version(&store.conn).unwrap(),
             crate::schema::SCHEMA_VERSION
         );
-        assert_eq!(floor(&store), "52");
+        assert_eq!(
+            floor(&store),
+            crate::schema::MIN_COMPATIBLE_SCHEMA.to_string()
+        );
         ensure_current_binding_schema(&store.conn).unwrap();
-        assert_eq!(floor(&store), "52");
+        assert_eq!(
+            floor(&store),
+            crate::schema::MIN_COMPATIBLE_SCHEMA.to_string()
+        );
 
         store
             .conn
@@ -1343,7 +1349,10 @@ mod tests {
             )
             .unwrap();
         assert!(ensure_current_binding_schema(&store.conn).is_err());
-        assert_eq!(floor(&store), "52");
+        assert_eq!(
+            floor(&store),
+            crate::schema::MIN_COMPATIBLE_SCHEMA.to_string()
+        );
     }
 
     #[test]
@@ -1682,7 +1691,12 @@ mod tests {
         let identity = fresh_identity(&store);
         let fresh = store.repository_worktree_binding().unwrap();
         assert_eq!(fresh.origin, Some(RepositoryWorktreeBindingOrigin::Fresh));
-        assert_eq!(floor(&store), "54");
+        assert_eq!(
+            floor(&store),
+            crate::schema::MIN_COMPATIBLE_SCHEMA
+                .max(REPOSITORY_BINDING_SCHEMA_VERSION)
+                .to_string()
+        );
 
         let binding_before_wrong_nonce = store.repository_worktree_binding().unwrap();
         let floor_before_wrong_nonce = floor(&store);
@@ -1749,7 +1763,12 @@ mod tests {
             .unwrap();
         assert_eq!(bound.state, RepositoryWorktreeBindingState::Bound);
         assert_eq!(bound.origin, Some(RepositoryWorktreeBindingOrigin::Fresh));
-        assert_eq!(floor(&store), "54");
+        assert_eq!(
+            floor(&store),
+            crate::schema::MIN_COMPATIBLE_SCHEMA
+                .max(REPOSITORY_BINDING_SCHEMA_VERSION)
+                .to_string()
+        );
         assert!(matches!(
             store.reserve_fresh_repository_worktree_root(&reservation),
             Err(BrokerError::RepositoryWorktreeBindingTransition { .. })
@@ -1757,12 +1776,15 @@ mod tests {
     }
 
     #[test]
-    fn legacy_binding_requires_matching_confirmation_and_raises_floor_atomically() {
+    fn legacy_binding_requires_matching_confirmation_and_preserves_current_floor() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = open_store(&directory);
         let legacy = store.repository_worktree_binding().unwrap();
         assert_eq!(legacy.state, RepositoryWorktreeBindingState::LegacyUnbound);
-        assert_eq!(floor(&store), "52");
+        assert_eq!(
+            floor(&store),
+            crate::schema::MIN_COMPATIBLE_SCHEMA.to_string()
+        );
 
         let mut wrong = legacy_confirmation(&directory);
         wrong.confirmed_digest = "d4".repeat(32);
@@ -1770,7 +1792,10 @@ mod tests {
             store.bind_legacy_repository_worktree(&wrong),
             Err(BrokerError::RepositoryWorktreeBindingConfirmationMismatch)
         ));
-        assert_eq!(floor(&store), "52");
+        assert_eq!(
+            floor(&store),
+            crate::schema::MIN_COMPATIBLE_SCHEMA.to_string()
+        );
         assert_eq!(
             store.repository_worktree_binding().unwrap().state,
             RepositoryWorktreeBindingState::LegacyUnbound
@@ -1786,7 +1811,12 @@ mod tests {
             bound.root_layout,
             Some(RepositoryWorktreeRootLayout::DirectRoot)
         );
-        assert_eq!(floor(&store), "54");
+        assert_eq!(
+            floor(&store),
+            crate::schema::MIN_COMPATIBLE_SCHEMA
+                .max(REPOSITORY_BINDING_SCHEMA_VERSION)
+                .to_string()
+        );
     }
 
     #[cfg(unix)]

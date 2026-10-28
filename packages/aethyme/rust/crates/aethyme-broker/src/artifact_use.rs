@@ -477,6 +477,41 @@ pub(crate) fn begin_artifact_use(
     session_id: i64,
     invocation_id: &str,
 ) -> io::Result<ArtifactUseAdmission> {
+    begin_artifact_use_with_layout_wait(
+        primary_root,
+        checkout_root,
+        session_id,
+        invocation_id,
+        ARTIFACT_LAYOUT_LOCK_WAIT,
+    )
+}
+
+/// Begin a producer without waiting for another process to initialize the
+/// marker layout. Gate admission calls this while holding the brief lifecycle
+/// claim, so contention must refuse before dispatch instead of holding that
+/// claim while polling.
+pub(crate) fn begin_artifact_use_nonblocking(
+    primary_root: &Path,
+    checkout_root: &Path,
+    session_id: i64,
+    invocation_id: &str,
+) -> io::Result<ArtifactUseAdmission> {
+    begin_artifact_use_with_layout_wait(
+        primary_root,
+        checkout_root,
+        session_id,
+        invocation_id,
+        Duration::ZERO,
+    )
+}
+
+fn begin_artifact_use_with_layout_wait(
+    primary_root: &Path,
+    checkout_root: &Path,
+    session_id: i64,
+    invocation_id: &str,
+    layout_wait: Duration,
+) -> io::Result<ArtifactUseAdmission> {
     if session_id < 0 || invocation_id.is_empty() || invocation_id.len() > 256 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -487,7 +522,7 @@ pub(crate) fn begin_artifact_use(
         return Ok(ArtifactUseAdmission::ProtocolUnavailable);
     }
     let locations = ArtifactUseLocations::resolve(primary_root, checkout_root)?;
-    if !locations.initialize_layout(ARTIFACT_LAYOUT_LOCK_WAIT)? {
+    if !locations.initialize_layout(layout_wait)? {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             "artifact-use layout is being initialized; retry producer admission",

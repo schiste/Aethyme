@@ -259,6 +259,10 @@ const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Batch metadata and patch-id output must stay finite even for an unusually
 /// large repository. Patch bodies themselves are streamed between Git.
 const MAX_GIT_BATCH_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+/// Per-stream cap for private-index tree hashing, whose Git child may invoke
+/// repository-configured clean filters.
+#[cfg(unix)]
+const MAX_WORKING_TREE_HASH_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_GIT_BATCH_INPUT_BYTES: usize = 16 * 1024 * 1024;
 /// A complete ignored-path census stays finite. Hitting any cap makes the
 /// listing unknown; callers must not treat it as an empty or partial result.
@@ -1296,6 +1300,55 @@ fn worktree_git_dir(worktree: &Path) -> Option<PathBuf> {
     })
 }
 
+/// Resolve a checkout's `.git` directory without invoking Git. A valid `.git`
+/// directory or gitdir file is canonicalized; missing targets are reported as
+/// known absence, while malformed or unreadable metadata remains an error.
+pub(crate) fn checked_worktree_git_dir(worktree: &Path) -> Result<Option<PathBuf>, std::io::Error> {
+    let dot_git = worktree.join(".git");
+    let metadata = match std::fs::metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let target = if metadata.is_dir() {
+        dot_git
+    } else if metadata.is_file() {
+        let text = match std::fs::read_to_string(&dot_git) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let target = text
+            .lines()
+            .find_map(|line| line.strip_prefix("gitdir:"))
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "malformed .git file without a gitdir target",
+                )
+            })?;
+        let target = Path::new(target);
+        if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            worktree.join(target)
+        }
+    } else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            ".git is neither a directory nor a gitdir file",
+        ));
+    };
+
+    match std::fs::canonicalize(target) {
+        Ok(target) => Ok(Some(target)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Refuse ambient repository/path/history selectors before graph verification
 /// can snapshot anything, unless its isolating scope is already active.
 /// Scoped Git commands strip every inherited `GIT_*` variable, so harmless
@@ -1527,10 +1580,139 @@ fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
     Ok(output.stdout)
 }
 
+fn run_git_bytes_with_index_for_tree_hash(
+    cwd: &Path,
+    index_file: &str,
+    args: &[&str],
+    writers_quiescent: &mut bool,
+) -> Result<Vec<u8>, GitError> {
+    let mut command = git_command();
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_INDEX_FILE", index_file);
+
+    #[cfg(unix)]
+    {
+        let output =
+            run_git_process_output_in_owned_group(command, args, git_timeout(), writers_quiescent)?;
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        Ok(output.stdout)
+    }
+    #[cfg(not(unix))]
+    {
+        // This platform cannot attest owned-group quiescence. Its automatic
+        // artifact-use consumers remain disabled.
+        *writers_quiescent = false;
+        let output = run_git_command_output(command, args, git_timeout())?;
+        Ok(output.stdout)
+    }
+}
+
+fn untracked_hash_pathspecs(output: &[u8]) -> Result<Vec<u8>, GitError> {
+    const ARGS: &str = "ls-files --others --exclude-standard -z";
+    let malformed = || GitError::UntrustedOutput {
+        detail: format!("git {ARGS} emitted malformed NUL-separated paths"),
+    };
+    if output.is_empty() {
+        return Ok(Vec::new());
+    }
+    if output.last() != Some(&0) {
+        return Err(malformed());
+    }
+
+    let mut pathspecs = Vec::with_capacity(output.len());
+    for path in output[..output.len() - 1].split(|byte| *byte == 0) {
+        if path.is_empty() {
+            return Err(malformed());
+        }
+        let path_text = String::from_utf8_lossy(path);
+        if crate::runtime_paths::is_broker_runtime_path(&path_text) {
+            continue;
+        }
+        pathspecs.extend_from_slice(path);
+        pathspecs.push(0);
+    }
+    Ok(pathspecs)
+}
+
+#[cfg(test)]
+mod untracked_hash_pathspec_tests {
+    use super::untracked_hash_pathspecs;
+
+    #[test]
+    fn accepts_empty_output_and_rejects_malformed_nul_framing() {
+        assert_eq!(untracked_hash_pathspecs(b"").unwrap(), Vec::<u8>::new());
+        assert!(untracked_hash_pathspecs(b"unterminated").is_err());
+        assert!(untracked_hash_pathspecs(b"\0").is_err());
+        assert!(untracked_hash_pathspecs(b"one\0\0").is_err());
+    }
+
+    #[test]
+    fn filters_runtime_paths_and_preserves_literal_non_utf8_names() {
+        let output = b".aethyme/run/worker.json\0.aethyme/broker.db-wal\0.aethyme/run\0:(exclude)**.txt\0non-utf8-\xff.txt\0";
+        assert_eq!(
+            untracked_hash_pathspecs(output).unwrap(),
+            b".aethyme/run\0:(exclude)**.txt\0non-utf8-\xff.txt\0"
+        );
+    }
+}
+
 /// Like [`run_git`] but against a private index file (GIT_INDEX_FILE) so
 /// staging operations never disturb the checkout's real index.
 fn run_git_with_index(cwd: &Path, index_file: &str, args: &[&str]) -> Result<String, GitError> {
     run_git_inner(cwd, Some(index_file), args)
+}
+
+fn run_git_with_index_for_tree_hash(
+    cwd: &Path,
+    index_file: &str,
+    args: &[&str],
+    writers_quiescent: &mut bool,
+) -> Result<String, GitError> {
+    #[cfg(unix)]
+    {
+        run_git_with_index_in_owned_group(cwd, index_file, args, writers_quiescent)
+    }
+    #[cfg(not(unix))]
+    {
+        // This platform cannot attest owned-group quiescence. Its automatic
+        // artifact-use consumers remain disabled.
+        *writers_quiescent = false;
+        run_git_with_index(cwd, index_file, args)
+    }
+}
+
+#[cfg(unix)]
+fn run_git_with_index_in_owned_group(
+    cwd: &Path,
+    index_file: &str,
+    args: &[&str],
+    writers_quiescent: &mut bool,
+) -> Result<String, GitError> {
+    let mut command = git_command();
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_INDEX_FILE", index_file);
+    let output =
+        run_git_process_output_in_owned_group(command, args, git_timeout(), writers_quiescent)?;
+    if !output.status.success() {
+        return Err(GitError::Git {
+            args: args.join(" "),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
 }
 
 fn run_git_inner(cwd: &Path, index_file: Option<&str>, args: &[&str]) -> Result<String, GitError> {
@@ -2024,6 +2206,69 @@ fn run_git_process_output(
     Ok(output)
 }
 
+#[cfg(unix)]
+fn run_git_process_output_in_owned_group(
+    mut command: Command,
+    args: &[&str],
+    budget: Duration,
+    writers_quiescent: &mut bool,
+) -> Result<std::process::Output, GitError> {
+    let budget = match active_git_deadline() {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                note_git_timeout();
+                return Err(GitError::TimedOut {
+                    args: args.join(" "),
+                    seconds: 1,
+                });
+            }
+            budget.min(remaining)
+        }
+        None => budget,
+    };
+    let deadline = Instant::now()
+        .checked_add(budget)
+        .ok_or_else(|| GitError::Spawn {
+            args: args.join(" "),
+            source: std::io::Error::other("git process-group deadline overflow"),
+        })?;
+    *writers_quiescent = false;
+    let output = crate::bounded_output::output_limited_in_owned_group(
+        &mut command,
+        budget,
+        MAX_WORKING_TREE_HASH_OUTPUT_BYTES,
+    )
+    .map_err(|source| GitError::Spawn {
+        args: args.join(" "),
+        source,
+    })?;
+    // Every LimitedOutput variant from this runner has verified owned-group
+    // cleanup, including deadline and output-cap failures. An I/O or cleanup
+    // error returned above leaves the proof false.
+    *writers_quiescent = true;
+    match output {
+        crate::bounded_output::LimitedOutput::Completed(output) if Instant::now() < deadline => {
+            Ok(output)
+        }
+        crate::bounded_output::LimitedOutput::Completed(_)
+        | crate::bounded_output::LimitedOutput::Deadline => {
+            note_git_timeout();
+            Err(GitError::TimedOut {
+                args: args.join(" "),
+                seconds: budget.as_secs().max(1),
+            })
+        }
+        crate::bounded_output::LimitedOutput::OutputLimit => Err(GitError::UntrustedOutput {
+            detail: format!(
+                "git {} exceeded the private-index hash output cap of {} bytes per stream",
+                args.join(" "),
+                MAX_WORKING_TREE_HASH_OUTPUT_BYTES
+            ),
+        }),
+    }
+}
+
 fn effective_git_deadline(
     args: &str,
     budget: Duration,
@@ -2325,6 +2570,14 @@ pub struct RemoteDefaultBranch {
 /// removable root; only a lock with exactly this reason is released by it.
 pub const BROKER_WORKTREE_LOCK_REASON: &str =
     "aethyme: worktree on a configured, possibly removable root";
+
+/// Completion evidence is separate from the hash result: a failed operation
+/// can still prove that its repository-selected child processes were stopped.
+#[derive(Debug)]
+pub(crate) struct WorkingTreeHashObservation {
+    pub(crate) result: Result<String, GitError>,
+    pub(crate) writers_quiescent: bool,
+}
 
 /// A handle on one git checkout (the main repository or a linked
 /// worktree). Constructed via [`GitRepo::discover`].
@@ -4758,12 +5011,33 @@ impl GitRepo {
         GitRepo::discover(dest)
     }
 
-    /// Deterministic tree hash of the checkout's current *working state*
+    /// Deterministic tree hash of the checkout's current source working state
     /// (HEAD + staged + unstaged + untracked, .gitignore respected) — the
-    /// gate-result cache key. Uses a throwaway index so the real index is
-    /// never touched; identical content in different worktrees hashes
-    /// identically, which is what makes cross-agent gate dedup work.
+    /// gate-result cache key. Untracked broker runtime paths are excluded so
+    /// publishing a broker marker cannot invalidate its own cache key; tracked
+    /// changes under those paths remain included. Uses a throwaway index so
+    /// the real index is never touched; identical content in different
+    /// worktrees hashes identically, which is what makes cross-agent gate
+    /// dedup work.
+    /// On Unix, each private-index Git child runs in an owned process group;
+    /// completion also proves same-group clean-filter descendants are quiescent.
     pub fn working_tree_hash(&self) -> Result<String, GitError> {
+        self.working_tree_hash_observation().result
+    }
+
+    pub(crate) fn working_tree_hash_observation(&self) -> WorkingTreeHashObservation {
+        let mut writers_quiescent = true;
+        let result = self.working_tree_hash_with_quiescence(&mut writers_quiescent);
+        WorkingTreeHashObservation {
+            result,
+            writers_quiescent,
+        }
+    }
+
+    fn working_tree_hash_with_quiescence(
+        &self,
+        writers_quiescent: &mut bool,
+    ) -> Result<String, GitError> {
         let index_dir = self.git_common_dir()?.join("aethyme-broker/indexes");
         std::fs::create_dir_all(&index_dir).map_err(|source| GitError::Spawn {
             args: format!("create_dir_all {}", index_dir.display()),
@@ -4782,9 +5056,67 @@ impl GitRepo {
                 .unwrap_or_default()
         ));
         let result = (|| {
-            run_git_with_index(&self.root, &tmp_str, &["read-tree", "HEAD"])?;
-            run_git_with_index(&self.root, &tmp_str, &["add", "-A", "."])?;
-            run_git_with_index(&self.root, &tmp_str, &["write-tree"])
+            run_git_with_index_for_tree_hash(
+                &self.root,
+                &tmp_str,
+                &["read-tree", "HEAD"],
+                writers_quiescent,
+            )?;
+            // Capture tracked edits and deletions first, including anything
+            // intentionally tracked beneath a runtime path. Enumerate only
+            // Git-visible untracked files for the second pass, then filter
+            // broker runtime paths in memory. Negative pathspecs after `.`
+            // can make Git report an ignored parent directory such as
+            // `.aethyme` itself, even when every ignored runtime child is
+            // excluded.
+            run_git_with_index_for_tree_hash(
+                &self.root,
+                &tmp_str,
+                &["add", "-u", "--", "."],
+                writers_quiescent,
+            )?;
+            let untracked = run_git_bytes_with_index_for_tree_hash(
+                &self.root,
+                &tmp_str,
+                &["ls-files", "--others", "--exclude-standard", "-z"],
+                writers_quiescent,
+            )?;
+            let pathspecs = untracked_hash_pathspecs(&untracked)?;
+            if !pathspecs.is_empty() {
+                let mut pathspec_file =
+                    tempfile::NamedTempFile::new_in(&index_dir).map_err(|source| {
+                        GitError::Spawn {
+                            args: format!("create pathspec file in {}", index_dir.display()),
+                            source,
+                        }
+                    })?;
+                pathspec_file
+                    .write_all(&pathspecs)
+                    .map_err(|source| GitError::Spawn {
+                        args: format!("write {}", pathspec_file.path().display()),
+                        source,
+                    })?;
+                let pathspec_arg =
+                    format!("--pathspec-from-file={}", pathspec_file.path().display());
+                run_git_with_index_for_tree_hash(
+                    &self.root,
+                    &tmp_str,
+                    &[
+                        "--literal-pathspecs",
+                        "add",
+                        "-A",
+                        &pathspec_arg,
+                        "--pathspec-file-nul",
+                    ],
+                    writers_quiescent,
+                )?;
+            }
+            run_git_with_index_for_tree_hash(
+                &self.root,
+                &tmp_str,
+                &["write-tree"],
+                writers_quiescent,
+            )
         })();
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(lock);
@@ -9636,5 +9968,199 @@ mod object_batch_bound_tests {
             error,
             GitError::TimedOut { ref args, .. } if args.contains("cat-file")
         ));
+    }
+}
+
+#[cfg(test)]
+mod working_tree_hash_runtime_path_tests {
+    use super::GitRepo;
+    use std::path::Path;
+
+    fn git(root: &Path, args: &[&str]) {
+        super::run_isolated_graph_git(root, args)
+            .unwrap_or_else(|error| panic!("git {}: {error}", args.join(" ")));
+    }
+
+    fn repository() -> (tempfile::TempDir, GitRepo) {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q", "-b", "main"]);
+        git(
+            root.path(),
+            &["config", "user.name", "Working tree hash test"],
+        );
+        git(
+            root.path(),
+            &["config", "user.email", "working-tree-hash@example.invalid"],
+        );
+        std::fs::write(root.path().join("tracked.txt"), "baseline\n").unwrap();
+        git(root.path(), &["add", "tracked.txt"]);
+        git(root.path(), &["commit", "-qm", "initial"]);
+        let repo = GitRepo::discover(root.path()).unwrap();
+        (root, repo)
+    }
+
+    fn write(root: &Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn working_tree_hash_omits_untracked_runtime_but_keeps_other_untracked_files() {
+        let (root, repo) = repository();
+        let baseline = repo.working_tree_hash().unwrap();
+
+        // A directory rule does not classify a same-named standalone file.
+        write(root.path(), ".aethyme/run", "ordinary file\n");
+        assert_ne!(repo.working_tree_hash().unwrap(), baseline);
+        std::fs::remove_file(root.path().join(".aethyme/run")).unwrap();
+        assert_eq!(repo.working_tree_hash().unwrap(), baseline);
+
+        write(root.path(), ".aethyme/run/worker.json", "marker\n");
+        write(root.path(), ".aethyme/logs/worker.log", "log\n");
+        write(root.path(), ".aethyme/gc.lock", "lock\n");
+        write(root.path(), ".aethyme/broker.db-wal", "wal\n");
+        write(
+            root.path(),
+            ".aethyme/broker-action-required.md/child",
+            "runtime child\n",
+        );
+        assert_eq!(repo.working_tree_hash().unwrap(), baseline);
+
+        #[cfg(unix)]
+        let pathspec_name = ":(exclude)literal [glob]*.txt";
+        #[cfg(not(unix))]
+        let pathspec_name = "new-source [literal].txt";
+        write(root.path(), pathspec_name, "ordinary untracked content\n");
+        assert_ne!(repo.working_tree_hash().unwrap(), baseline);
+    }
+
+    #[test]
+    fn working_tree_hash_handles_an_ignored_runtime_parent() {
+        let (root, repo) = repository();
+        write(root.path(), ".gitignore", ".aethyme/\n");
+        git(root.path(), &["add", ".gitignore"]);
+        git(root.path(), &["commit", "-qm", "ignore runtime root"]);
+
+        let baseline = repo.working_tree_hash().unwrap();
+        write(root.path(), ".aethyme/broker.db", "runtime database\n");
+        write(root.path(), ".aethyme/run/worker.json", "runtime marker\n");
+        write(root.path(), ".aethyme/logs/worker.log", "runtime log\n");
+
+        assert_eq!(repo.working_tree_hash().unwrap(), baseline);
+    }
+
+    #[test]
+    fn working_tree_hash_keeps_tracked_runtime_edits_in_the_key() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q", "-b", "main"]);
+        git(
+            root.path(),
+            &["config", "user.name", "Working tree hash test"],
+        );
+        git(
+            root.path(),
+            &["config", "user.email", "working-tree-hash@example.invalid"],
+        );
+        write(root.path(), ".gitignore", ".aethyme/\n");
+        git(root.path(), &["add", ".gitignore"]);
+        write(root.path(), ".aethyme/run/tracked-policy.json", "before\n");
+        git(
+            root.path(),
+            &["add", "-f", ".aethyme/run/tracked-policy.json"],
+        );
+        git(root.path(), &["commit", "-qm", "track runtime policy"]);
+
+        let repo = GitRepo::discover(root.path()).unwrap();
+        let baseline = repo.working_tree_hash().unwrap();
+        let tracked_policy = root.path().join(".aethyme/run/tracked-policy.json");
+        write(root.path(), ".aethyme/run/tracked-policy.json", "after\n");
+        assert_ne!(repo.working_tree_hash().unwrap(), baseline);
+        std::fs::remove_file(tracked_policy).unwrap();
+        assert_ne!(repo.working_tree_hash().unwrap(), baseline);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod working_tree_hash_process_group_tests {
+    use super::{GitError, GitRepo, run_isolated_graph_git};
+    use std::path::Path;
+    use std::time::Duration;
+
+    fn git(root: &Path, args: &[&str]) {
+        run_isolated_graph_git(root, args)
+            .unwrap_or_else(|error| panic!("git {}: {error}", args.join(" ")));
+    }
+
+    fn repository() -> (tempfile::TempDir, GitRepo) {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q", "-b", "main"]);
+        git(
+            root.path(),
+            &["config", "user.name", "Tree hash group test"],
+        );
+        git(
+            root.path(),
+            &["config", "user.email", "tree-hash-group@example.invalid"],
+        );
+        std::fs::write(root.path().join("tracked.txt"), "baseline\n").unwrap();
+        git(root.path(), &["add", "tracked.txt"]);
+        git(root.path(), &["commit", "-qm", "initial"]);
+        let repo = GitRepo::discover(root.path()).unwrap();
+        (root, repo)
+    }
+
+    fn configure_clean_filter(root: &Path, script: &str) {
+        std::fs::write(root.join(".git/clean-filter.sh"), script).unwrap();
+        git(
+            root,
+            &[
+                "config",
+                "filter.aethyme-test.clean",
+                "sh .git/clean-filter.sh",
+            ],
+        );
+        git(root, &["config", "filter.aethyme-test.required", "true"]);
+        std::fs::write(
+            root.join(".gitattributes"),
+            "tracked.txt filter=aethyme-test\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("tracked.txt"), "changed content\n").unwrap();
+    }
+
+    #[test]
+    fn working_tree_hash_waits_out_a_clean_filter_background_writer() {
+        let (root, repo) = repository();
+        configure_clean_filter(
+            root.path(),
+            "#!/bin/sh\ncat >/dev/null\n(sleep 0.5; printf leaked > .git/clean-filter-descendant-ran) </dev/null >/dev/null 2>&1 &\nprintf normalized\n",
+        );
+
+        assert!(!repo.working_tree_hash().unwrap().is_empty());
+        std::thread::sleep(Duration::from_millis(650));
+        assert!(
+            !root
+                .path()
+                .join(".git/clean-filter-descendant-ran")
+                .exists(),
+            "tree hashing must prove its owned Git process group is quiescent"
+        );
+    }
+
+    #[test]
+    fn working_tree_hash_preserves_a_completed_nonzero_git_error() {
+        let (root, repo) = repository();
+        configure_clean_filter(
+            root.path(),
+            "#!/bin/sh\ncat >/dev/null\nprintf filter-failed >&2\nexit 23\n",
+        );
+
+        let error = repo.working_tree_hash().unwrap_err();
+
+        assert!(
+            matches!(error, GitError::Git { ref args, .. } if args.contains("add")),
+            "a completed nonzero Git child keeps the ordinary Git error: {error:?}"
+        );
     }
 }

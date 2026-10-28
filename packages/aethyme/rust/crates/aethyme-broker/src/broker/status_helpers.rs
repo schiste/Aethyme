@@ -1769,6 +1769,114 @@ pub(super) fn worktree_activity_ms(main_root: &Path, session: &Session) -> Optio
     newest
 }
 
+/// Checked activity evidence for an abandonment decision. A missing checkout
+/// retains the age-only rule, but an existing checkout with unreadable Git
+/// metadata must remain protected rather than looking maximally old.
+pub(crate) fn checked_worktree_activity_ms(
+    main_root: &Path,
+    session: &Session,
+) -> Result<Option<i64>, std::io::Error> {
+    let worktree = Path::new(&session.worktree_path);
+    match std::fs::symlink_metadata(worktree) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "recorded worktree path is not a directory",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+
+    let git_dir = crate::git::checked_worktree_git_dir(worktree)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "existing worktree has no resolvable Git metadata directory",
+        )
+    })?;
+    let expected_common_dir =
+        crate::git::checked_worktree_git_dir(main_root)?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "primary checkout has no resolvable Git metadata directory",
+            )
+        })?;
+    let actual_common_dir = checked_git_common_dir(&git_dir)?;
+    let expected_common_dir = checked_git_common_dir(&expected_common_dir)?;
+    if actual_common_dir != expected_common_dir {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "recorded worktree belongs to a different Git repository",
+        ));
+    }
+
+    let mut newest: Option<i64> = None;
+    for file in ["index", "HEAD"] {
+        let path = git_dir.join(file);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "Git worktree metadata is not a regular file: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let mtime = metadata.modified()?;
+        let duration = mtime
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            })?;
+        let millis = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
+        newest = Some(newest.map_or(millis, |known| known.max(millis)));
+    }
+    newest.map(Some).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "existing worktree has no readable Git activity metadata",
+        )
+    })
+}
+
+fn checked_git_common_dir(git_dir: &Path) -> Result<PathBuf, std::io::Error> {
+    let path = git_dir.join("commondir");
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => Some(metadata),
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Git commondir metadata is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let Some(_metadata) = metadata else {
+        return std::fs::canonicalize(git_dir);
+    };
+    let target = std::fs::read_to_string(path)?;
+    let target = target.trim();
+    if target.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Git commondir metadata is empty",
+        ));
+    }
+    let target = Path::new(target);
+    std::fs::canonicalize(if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        git_dir.join(target)
+    })
+}
+
 /// Spawned agents own a process group whose id is their stored supervisor PID.
 /// Keep the session protected through detached descendant cleanup, including
 /// the interval after the supervisor is reaped. Legacy plain PIDs still use
