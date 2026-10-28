@@ -208,10 +208,7 @@ fn decide(
         HookEvent::PreToolUse => on_pre_tool_use(&mut broker, session.as_ref(), event_json),
         HookEvent::Stop => {
             if let Err(error) = touch(&mut broker, session.as_ref()) {
-                crate::warn_unrecorded::<(), _>(
-                    "record stopped session activity",
-                    Err(error),
-                );
+                crate::warn_unrecorded::<(), _>("record stopped session activity", Err(error));
             }
             HookOutcome::Silent
         }

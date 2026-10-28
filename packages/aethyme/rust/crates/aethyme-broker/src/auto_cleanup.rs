@@ -1477,7 +1477,11 @@ impl Broker {
                 }
             }
         }
-        let Some(selected) = group.sessions.iter().find(|session| session.id == session_id) else {
+        let Some(selected) = group
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        else {
             return Ok(None);
         };
         if selected.worktree_path != current.worktree_path
@@ -2020,8 +2024,7 @@ impl Broker {
                 return Ok(summary);
             }
         };
-        let window_ms = i64::from(policy.session_abandoned_after_hours)
-            .saturating_mul(3_600_000);
+        let window_ms = i64::from(policy.session_abandoned_after_hours).saturating_mul(3_600_000);
         if window_ms <= 0 {
             return Ok(summary);
         }
@@ -2112,8 +2115,7 @@ impl Broker {
             let allow_snapshot = match deadline {
                 Some(deadline) => {
                     deadline.saturating_duration_since(Instant::now())
-                        > crate::session_holder::PROCESS_TABLE_TIMEOUT
-                            + Duration::from_millis(100)
+                        > crate::session_holder::PROCESS_TABLE_TIMEOUT + Duration::from_millis(100)
                 }
                 None => true,
             };
@@ -2152,15 +2154,19 @@ impl Broker {
                 }
                 crate::broker::AbandonedSessionCloseOutcome::LifecycleBusy => {
                     summary.deferred += 1;
-                    summary.reasons.push(SessionRetirementDeferredReason::LifecycleBusy {
-                        session_id: session.id,
-                    });
+                    summary
+                        .reasons
+                        .push(SessionRetirementDeferredReason::LifecycleBusy {
+                            session_id: session.id,
+                        });
                 }
                 crate::broker::AbandonedSessionCloseOutcome::DatabaseBusy => {
                     summary.deferred += 1;
-                    summary.reasons.push(SessionRetirementDeferredReason::DatabaseBusy {
-                        session_id: session.id,
-                    });
+                    summary
+                        .reasons
+                        .push(SessionRetirementDeferredReason::DatabaseBusy {
+                            session_id: session.id,
+                        });
                     // Keep the cursor on this row. Do not perform another DB
                     // write while the competing writer still holds the lock.
                     return Ok(summary);
@@ -2209,9 +2215,11 @@ impl Broker {
         deadline: Option<Instant>,
     ) -> Result<AutoCleanupReport, BrokerOpError> {
         let retirement = self.retire_abandoned_sessions(deadline)?;
-        if retirement.reasons.iter().any(|reason| {
-            matches!(reason, SessionRetirementDeferredReason::DatabaseBusy { .. })
-        }) {
+        if retirement
+            .reasons
+            .iter()
+            .any(|reason| matches!(reason, SessionRetirementDeferredReason::DatabaseBusy { .. }))
+        {
             // A busy abandonment CAS is a reason to defer this pass as a
             // whole. In particular, skip checkout planning and its cursor
             // writes while the other database writer may still be active.
@@ -2672,10 +2680,9 @@ mod tests {
         AUTO_CLEANUP_CURSOR_KEY, AutoCleanupCursor, AutoCleanupGroupInspection, AutoCleanupPolicy,
         LiveOverlapEvidence, ResolvedWorktreePath, SESSION_RETIREMENT_CURSOR_VERSION,
         SessionCleanupState, SessionRetirementCursor, SessionRetirementDeferredReason,
-        auto_cleanup_lap_range,
-        classify_ignored, decode_auto_cleanup_cursor, decode_session_retirement_cursor,
-        first_live_worktree_overlap, group_closed_checkout_sessions, ignored_content_reason,
-        resolve_worktree_paths_until,
+        auto_cleanup_lap_range, classify_ignored, decode_auto_cleanup_cursor,
+        decode_session_retirement_cursor, first_live_worktree_overlap,
+        group_closed_checkout_sessions, ignored_content_reason, resolve_worktree_paths_until,
     };
     #[cfg(unix)]
     use crate::git::GitRepo;
@@ -2886,7 +2893,10 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["config", "user.name", "Auto cleanup test"]);
-        git(&root, &["config", "user.email", "auto-cleanup@example.invalid"]);
+        git(
+            &root,
+            &["config", "user.email", "auto-cleanup@example.invalid"],
+        );
         git(&root, &["commit", "--allow-empty", "-qm", "fixture"]);
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
         std::fs::write(
@@ -3381,19 +3391,21 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["config", "user.name", "Auto cleanup test"]);
-        git(&root, &["config", "user.email", "auto-cleanup@example.invalid"]);
+        git(
+            &root,
+            &["config", "user.email", "auto-cleanup@example.invalid"],
+        );
         git(&root, &["commit", "--allow-empty", "-qm", "fixture"]);
         let storage = crate::test_storage::TestStorage::new();
         let mut broker = storage.open(&root).unwrap();
         let first = broker.start_worktree("retirement page one", None).unwrap();
         let second = broker.start_worktree("retirement page two", None).unwrap();
-        let third = broker.start_worktree("retirement page three", None).unwrap();
+        let third = broker
+            .start_worktree("retirement page three", None)
+            .unwrap();
         let high_water = broker.store().open_session_max_id().unwrap();
 
-        let first_page = broker
-            .store()
-            .open_session_page(0, high_water, 1)
-            .unwrap();
+        let first_page = broker.store().open_session_page(0, high_water, 1).unwrap();
         assert_eq!(first_page.len(), 1);
         assert_eq!(first_page[0].id, first.id);
         let second_page = broker
@@ -3410,11 +3422,13 @@ mod tests {
             tail.iter().map(|session| session.id).collect::<Vec<_>>(),
             vec![third.id]
         );
-        assert!(broker
-            .store()
-            .open_session_page(third.id, high_water, 1)
-            .unwrap()
-            .is_empty());
+        assert!(
+            broker
+                .store()
+                .open_session_page(third.id, high_water, 1)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]
@@ -3451,7 +3465,10 @@ mod tests {
                 true,
             )
             .unwrap();
-        assert_eq!(outcome, crate::broker::AbandonedSessionCloseOutcome::DatabaseBusy);
+        assert_eq!(
+            outcome,
+            crate::broker::AbandonedSessionCloseOutcome::DatabaseBusy
+        );
         assert!(
             started.elapsed() < Duration::from_millis(250),
             "a competing database writer defers retirement without delaying maintenance"
@@ -3494,7 +3511,10 @@ mod tests {
                 if *session_id == session.id
         ));
         assert_eq!(
-            broker.store().meta_get(SESSION_RETIREMENT_CURSOR_KEY).unwrap(),
+            broker
+                .store()
+                .meta_get(SESSION_RETIREMENT_CURSOR_KEY)
+                .unwrap(),
             Some(raw_cursor)
         );
         assert_eq!(
@@ -3539,7 +3559,10 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["config", "user.name", "Auto cleanup test"]);
-        git(&root, &["config", "user.email", "auto-cleanup@example.invalid"]);
+        git(
+            &root,
+            &["config", "user.email", "auto-cleanup@example.invalid"],
+        );
         git(&root, &["commit", "--allow-empty", "-qm", "fixture"]);
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
         std::fs::write(
@@ -3725,9 +3748,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".aethyme")).unwrap();
         let config = dir.path().join(".aethyme/config.toml");
-        assert!(!AutoCleanupPolicy::load(dir.path())
-            .unwrap()
-            .ignored_directory_sweep);
+        assert!(
+            !AutoCleanupPolicy::load(dir.path())
+                .unwrap()
+                .ignored_directory_sweep
+        );
 
         std::fs::write(&config, "[cleanup]\nignored_directory_sweep = true\n").unwrap();
         let enabled = AutoCleanupPolicy::load(dir.path()).unwrap();
@@ -3744,7 +3769,6 @@ mod tests {
         std::fs::write(&config, "[cleanup]\nignored_directory_sweep = \"yes\"\n").unwrap();
         assert!(AutoCleanupPolicy::load(dir.path()).is_err());
     }
-
 }
 
 fn ensure_auto_cleanup_path_absent(path: &Path) -> Result<(), BrokerOpError> {

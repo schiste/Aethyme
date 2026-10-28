@@ -236,11 +236,11 @@ impl BrokerStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let session_state: Option<(String, String)> = tx
             .query_row(
-            "SELECT status, cleanup_state FROM sessions WHERE id = ?1",
-            [session_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
+                "SELECT status, cleanup_state FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
         let Some((status, cleanup_state)) = session_state else {
             return Err(BrokerError::SessionNotFound(session_id));
         };

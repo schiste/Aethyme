@@ -618,15 +618,15 @@ impl Broker {
         let database_activity = fs_activity.max(candidate.last_activity_at);
         if !matches!(
             crate::decide_abandonment(
-            &SessionActivity {
-                session_id,
-                last_activity_at: database_activity,
-                created_at: candidate.created_at,
-                agent_alive: None,
-                closed: false,
-            },
-            decision_now_ms,
-            abandon_after_ms,
+                &SessionActivity {
+                    session_id,
+                    last_activity_at: database_activity,
+                    created_at: candidate.created_at,
+                    agent_alive: None,
+                    closed: false,
+                },
+                decision_now_ms,
+                abandon_after_ms,
             ),
             crate::AbandonmentVerdict::Abandoned { .. }
         ) {
@@ -685,8 +685,7 @@ impl Broker {
             },
             observed_at,
             abandon_after_ms,
-        )
-        else {
+        ) else {
             return Ok(AbandonedSessionCloseOutcome::NotDue);
         };
 
@@ -707,9 +706,9 @@ impl Broker {
             .store_ref()
             .unreleased_unexpired_leases_for_sessions_at(&[session_id], observed_at)?;
         if !leases.is_empty() {
-            let lease_table = holder.binding_event_id.and_then(|event_id| {
-                process_table.table_for(session_id, event_id)
-            });
+            let lease_table = holder
+                .binding_event_id
+                .and_then(|event_id| process_table.table_for(session_id, event_id));
             let liveness = match crate::lease_liveness::assess(
                 self.store_ref(),
                 &leases,

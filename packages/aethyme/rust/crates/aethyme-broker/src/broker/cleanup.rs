@@ -1673,11 +1673,12 @@ impl Broker {
             }
             .into());
         }
-        let claim = crate::file_lock::try_acquire_repository_lifecycle_lock(&main_root)
-            .map_err(|source| BrokerError::Io {
+        let claim = crate::file_lock::try_acquire_repository_lifecycle_lock(&main_root).map_err(
+            |source| BrokerError::Io {
                 path: main_root.join(".aethyme/run"),
                 source,
-            })?;
+            },
+        )?;
         if claim.is_some() {
             // The floor may have advanced while the nonblocking claim was
             // acquired. Keep it only if current committed markers permit us.
@@ -2605,7 +2606,9 @@ impl Broker {
         } else if let Ok(Some(live_id)) = live_owner {
             (
                 CleanupDisposition::UnsafePath,
-                format!("checkout overlaps live session {live_id}; preserved its worktree and branch"),
+                format!(
+                    "checkout overlaps live session {live_id}; preserved its worktree and branch"
+                ),
                 None,
             )
         } else if let Some(reason) = unreachable {
@@ -4181,14 +4184,15 @@ impl Broker {
                     ),
                 })?;
         let worktree_path = PathBuf::from(&session.worktree_path);
-        let artifact_use_reclaimer = if worktree_path_is_real_directory(&worktree_path, session_id)? {
+        let artifact_use_reclaimer = if worktree_path_is_real_directory(&worktree_path, session_id)?
+        {
             match crate::file_lock::artifact_use::try_artifact_use_reclaimer(
                 self.main_root(),
                 &worktree_path,
             ) {
-                Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(
-                    reclaimer,
-                )) => Some(reclaimer),
+                Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(reclaimer)) => {
+                    Some(reclaimer)
+                }
                 Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(
                     crate::file_lock::artifact_use::ArtifactUseReclaimBlock::ProtocolUnavailable,
                 )) => {
@@ -4203,7 +4207,9 @@ impl Broker {
                     {
                         return Err(BrokerOpError::DirtyWorktree {
                             id: session_id,
-                            reason: "artifact-use protection is unavailable; preserved the worktree".into(),
+                            reason:
+                                "artifact-use protection is unavailable; preserved the worktree"
+                                    .into(),
                         });
                     }
                 }
@@ -4426,9 +4432,9 @@ impl Broker {
         .deadline;
         let sessions = self.store.live_sessions()?;
         let paths = crate::auto_cleanup::resolve_live_worktree_paths(&sessions, Some(deadline))
-        .ok_or_else(|| BrokerOpError::RepresentationUnavailable {
-            reason: "live checkout ownership observation exceeded its deadline".into(),
-        })?;
+            .ok_or_else(|| BrokerOpError::RepresentationUnavailable {
+                reason: "live checkout ownership observation exceeded its deadline".into(),
+            })?;
         Ok(sessions
             .into_iter()
             .map(|session| session.id)
@@ -4450,11 +4456,7 @@ impl Broker {
         session_id: i64,
         worktree: &Path,
     ) -> Result<(), BrokerOpError> {
-        self.refuse_live_checkout_with_deadline(
-            session_id,
-            worktree,
-            self.landing_deadline.get(),
-        )
+        self.refuse_live_checkout_with_deadline(session_id, worktree, self.landing_deadline.get())
     }
 
     /// Refuse a live checkout using the caller's remaining maintenance budget.
@@ -4478,10 +4480,12 @@ impl Broker {
         deadline: Option<std::time::Instant>,
     ) -> Result<(), BrokerOpError> {
         let live_checkouts = self.cleanup_live_checkout_snapshot(deadline)?;
-        let live_owner = overlapping_live_checkout(session_id, worktree, &live_checkouts)
-            .map_err(|reason| BrokerOpError::DirtyWorktree {
-                id: session_id,
-                reason,
+        let live_owner =
+            overlapping_live_checkout(session_id, worktree, &live_checkouts).map_err(|reason| {
+                BrokerOpError::DirtyWorktree {
+                    id: session_id,
+                    reason,
+                }
             })?;
         if let Some(live_id) = live_owner {
             return Err(BrokerOpError::WorktreeInUseByLiveSession {
@@ -4510,7 +4514,9 @@ fn overlapping_live_checkout(
             LiveOverlapEvidence::Disjoint => {}
             LiveOverlapEvidence::Overlap => return Ok(Some(*live_id)),
             LiveOverlapEvidence::Unknown => {
-                return Err(crate::auto_cleanup::overlap_resolution_error(&candidate, path));
+                return Err(crate::auto_cleanup::overlap_resolution_error(
+                    &candidate, path,
+                ));
             }
         }
     }

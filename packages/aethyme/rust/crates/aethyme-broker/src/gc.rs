@@ -538,9 +538,7 @@ fn decode_interrupted_ignored_directories(value: Option<&str>) -> Result<Vec<Str
     let mut seen = BTreeSet::new();
     for entry in queue.paths {
         let path = Path::new(&entry.path);
-        if !path.is_absolute()
-            || has_parent_dir_component(path)
-            || !seen.insert(entry.path.clone())
+        if !path.is_absolute() || has_parent_dir_component(path) || !seen.insert(entry.path.clone())
         {
             return Err(());
         }
@@ -5684,7 +5682,10 @@ impl Broker {
         if check_deadline(Some(deadline)) {
             return Ok((0, false));
         }
-        if crate::AutoCleanupPolicy::load(self.main_root()).ok().as_ref() != Some(cleanup_policy)
+        if crate::AutoCleanupPolicy::load(self.main_root())
+            .ok()
+            .as_ref()
+            != Some(cleanup_policy)
             || !ignored_directory_sweep_policy_allows_checkout(cleanup_policy, root)
         {
             for path in candidates {
@@ -5697,13 +5698,11 @@ impl Broker {
         }
 
         let artifact_use_reclaimer =
-            match crate::file_lock::artifact_use::try_artifact_use_reclaimer(
-                self.main_root(),
-                root,
-            ) {
-                Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(
-                    reclaimer,
-                )) => reclaimer,
+            match crate::file_lock::artifact_use::try_artifact_use_reclaimer(self.main_root(), root)
+            {
+                Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(reclaimer)) => {
+                    reclaimer
+                }
                 Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(block)) => {
                     let reason = match block {
                         crate::file_lock::artifact_use::ArtifactUseReclaimBlock::Contended => {
@@ -5737,11 +5736,8 @@ impl Broker {
         if check_deadline(Some(deadline)) {
             return Ok((0, false));
         }
-        let current_cohort = self.closed_artifact_checkout_cohort_snapshot(
-            owner_session_id,
-            root,
-            Some(deadline),
-        )?;
+        let current_cohort =
+            self.closed_artifact_checkout_cohort_snapshot(owner_session_id, root, Some(deadline))?;
         if current_cohort.as_ref() != Some(expected_cohort) {
             for path in candidates {
                 blocked.push(BlockedInterruptedPath {
@@ -5838,7 +5834,8 @@ impl Broker {
                 continue;
             }
             match std::fs::symlink_metadata(path) {
-                Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(metadata)
+                    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
                 Ok(_) => {
                     blocked.push(BlockedInterruptedPath {
                         path: Some(path.to_string_lossy().into_owned()),
@@ -5897,10 +5894,7 @@ impl Broker {
                     let policy_current = crate::AutoCleanupPolicy::load(self.main_root())
                         .map_err(|error| std::io::Error::other(error.to_string()))?;
                     if &policy_current != cleanup_policy
-                        || !ignored_directory_sweep_policy_allows_checkout(
-                            &policy_current,
-                            root,
-                        )
+                        || !ignored_directory_sweep_policy_allows_checkout(&policy_current, root)
                     {
                         return Err(std::io::Error::other(
                             "ignored-directory cleanup policy changed before unlink",
@@ -5976,8 +5970,7 @@ impl Broker {
                     complete = false;
                 }
                 Err(error) => {
-                    entries_reclaimed =
-                        entries_reclaimed.saturating_add(error.entries_reclaimed);
+                    entries_reclaimed = entries_reclaimed.saturating_add(error.entries_reclaimed);
                     blocked.push(BlockedInterruptedPath {
                         path: Some(path_key),
                         reason: "ignored_directory_removal_unavailable",
@@ -6196,7 +6189,10 @@ impl Broker {
             ));
         };
         let live_sessions = self.store().live_sessions()?;
-        let live = live_sessions.iter().map(|session| session.id).collect::<Vec<_>>();
+        let live = live_sessions
+            .iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
         let live_worktrees = live_sessions
             .iter()
             .map(|session| PathBuf::from(&session.worktree_path))
@@ -6309,8 +6305,8 @@ impl Broker {
                 Vec::new()
             }
         };
-        let ignored_directory_queue_value = self
-            .artifact_sweep_meta_get(ARTIFACT_SWEEP_IGNORED_DIR_INTERRUPTED_KEY)?;
+        let ignored_directory_queue_value =
+            self.artifact_sweep_meta_get(ARTIFACT_SWEEP_IGNORED_DIR_INTERRUPTED_KEY)?;
         let mut ignored_directory_queue_valid = true;
         let mut ignored_directory_paths = match decode_interrupted_ignored_directories(
             ignored_directory_queue_value.as_deref(),
@@ -6586,14 +6582,10 @@ impl Broker {
                     Ok(discovery) => {
                         ignored_directory_discovery_complete = discovery.complete;
                         if expected_ignored_cohort.is_some()
-                            && ignored_directory_sweep_policy_allows_checkout(
-                                cleanup_policy,
-                                &root,
-                            )
+                            && ignored_directory_sweep_policy_allows_checkout(cleanup_policy, &root)
                         {
-                            ignored_directory_candidates.extend(
-                                discovery.generic_roots.iter().cloned(),
-                            );
+                            ignored_directory_candidates
+                                .extend(discovery.generic_roots.iter().cloned());
                             for queued in &ignored_directory_paths {
                                 let queued_path = PathBuf::from(queued);
                                 if !queued_path.starts_with(&root) {
@@ -6752,8 +6744,8 @@ impl Broker {
                         .any(|ignored_root| dir.starts_with(ignored_root))
                 });
                 if let Some(cleanup_policy) = ignored_directory_policy.as_ref() {
-                    let (reclaimed, ignored_complete) =
-                        self.reclaim_ignored_directory_roots_under_claims(
+                    let (reclaimed, ignored_complete) = self
+                        .reclaim_ignored_directory_roots_under_claims(
                             &root,
                             expected_ignored_cohort.as_ref(),
                             &ignored_directory_candidates,
@@ -7746,11 +7738,9 @@ impl Broker {
                     continue;
                 }
                 let live_checkout = match deadline {
-                    Some(deadline) => self.refuse_live_checkout_until(
-                        candidate.session_id,
-                        &root,
-                        deadline,
-                    ),
+                    Some(deadline) => {
+                        self.refuse_live_checkout_until(candidate.session_id, &root, deadline)
+                    }
                     None => self.refuse_live_checkout(candidate.session_id, &root),
                 };
                 match live_checkout {
@@ -7774,8 +7764,7 @@ impl Broker {
                 }
                 let artifact_use_reclaimer =
                     match crate::file_lock::artifact_use::try_artifact_use_reclaimer(
-                        &main_root,
-                        &root,
+                        &main_root, &root,
                     ) {
                         Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(
                             reclaimer,
@@ -8082,7 +8071,10 @@ mod tests {
     use std::cell::RefCell;
 
     enum ArtifactSweepTestMutation {
-        InterruptAfterFirstUnlink { path: PathBuf, attempts: usize },
+        InterruptAfterFirstUnlink {
+            path: PathBuf,
+            attempts: usize,
+        },
         RewriteFileBeforeRemoval {
             path: PathBuf,
             file: PathBuf,
@@ -8110,13 +8102,12 @@ mod tests {
 
     impl ArtifactSweepTestMutationInterrupt {
         fn after_first_unlink(path: &Path) -> Self {
-            let previous = ARTIFACT_SWEEP_TEST_MUTATION_INTERRUPT
-                .with(|state| {
-                    state.replace(Some(ArtifactSweepTestMutation::InterruptAfterFirstUnlink {
-                        path: path.to_path_buf(),
-                        attempts: 0,
-                    }))
-                });
+            let previous = ARTIFACT_SWEEP_TEST_MUTATION_INTERRUPT.with(|state| {
+                state.replace(Some(ArtifactSweepTestMutation::InterruptAfterFirstUnlink {
+                    path: path.to_path_buf(),
+                    attempts: 0,
+                }))
+            });
             Self { previous }
         }
 
@@ -8777,10 +8768,7 @@ mod tests {
             ..crate::auto_cleanup::AutoCleanupReport::default()
         };
         broker
-            .persist_auto_checkout_cleanup_request(
-                ArtifactSweepScope::Inline,
-                &deferred_retirement,
-            )
+            .persist_auto_checkout_cleanup_request(ArtifactSweepScope::Inline, &deferred_retirement)
             .unwrap();
         let retirement_generation = broker
             .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY)
@@ -8788,10 +8776,7 @@ mod tests {
             .expect("retirement backlog persists even when checkout removal is disabled");
         assert!(broker.auto_checkout_cleanup_recovery_requested().unwrap());
         broker
-            .artifact_sweep_meta_set(
-                AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY,
-                &retirement_generation,
-            )
+            .artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY, &retirement_generation)
             .unwrap();
 
         broker
@@ -10170,9 +10155,18 @@ mod tests {
 
         assert!(complete);
         assert!(removed > 0);
-        assert!(!ignored_directory.exists(), "the opt-in ignored folder is disposable");
-        assert!(!cache.exists(), "the existing artifact catalog still applies");
-        assert_eq!(std::fs::read(&standalone_file).unwrap(), b"standalone ignored file");
+        assert!(
+            !ignored_directory.exists(),
+            "the opt-in ignored folder is disposable"
+        );
+        assert!(
+            !cache.exists(),
+            "the existing artifact catalog still applies"
+        );
+        assert_eq!(
+            std::fs::read(&standalone_file).unwrap(),
+            b"standalone ignored file"
+        );
         assert_eq!(
             std::fs::read(&protected_record).unwrap(),
             b"broker-owned qualification record",
@@ -10183,7 +10177,12 @@ mod tests {
             broker.store().session(session_id).unwrap().status,
             crate::SessionStatus::Closed
         );
-        assert_eq!(load_retention_policy(&root).unwrap().closed_worktree_grace_hours, 360);
+        assert_eq!(
+            load_retention_policy(&root)
+                .unwrap()
+                .closed_worktree_grace_hours,
+            360
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -10194,9 +10193,11 @@ mod tests {
         let (ignored_directory, standalone_file) = unknown_ignored_directory(&worktree);
         enable_closed_artifact_sweep(&root);
 
-        assert!(!crate::AutoCleanupPolicy::load(&root)
-            .unwrap()
-            .ignored_directory_sweep);
+        assert!(
+            !crate::AutoCleanupPolicy::load(&root)
+                .unwrap()
+                .ignored_directory_sweep
+        );
         let (_, _) = run_closed_artifact_sweep(&mut broker, &root, session_id);
         assert!(ignored_directory.is_dir());
         assert!(standalone_file.is_file());
@@ -10226,7 +10227,10 @@ mod tests {
             decode_interrupted_ignored_directories(Some(&encoded)).unwrap(),
             vec![path.clone()]
         );
-        assert_eq!(decode_interrupted_paths(Some(&path)).unwrap(), vec![path.clone()]);
+        assert_eq!(
+            decode_interrupted_paths(Some(&path)).unwrap(),
+            vec![path.clone()]
+        );
         assert!(decode_interrupted_ignored_directories(Some(&path)).is_err());
         assert!(decode_interrupted_ignored_directories(Some(
             r#"{"version":2,"paths":[{"kind":"ignored_directory_root","path":"/tmp/closed-checkout/ignored-data"}]}"#
@@ -10251,11 +10255,12 @@ mod tests {
         enable_closed_artifact_sweep(&root);
         enable_ignored_directory_sweep(&root);
 
-        let _change_policy_after_plan = ArtifactSweepTestMutationInterrupt::rewrite_file_before_removal(
-            &ignored_directory,
-            &root.join(".aethyme/config.toml"),
-            "[cleanup]\nauto_remove = false\nstrict = true\nignored_directory_sweep = true\n",
-        );
+        let _change_policy_after_plan =
+            ArtifactSweepTestMutationInterrupt::rewrite_file_before_removal(
+                &ignored_directory,
+                &root.join(".aethyme/config.toml"),
+                "[cleanup]\nauto_remove = false\nstrict = true\nignored_directory_sweep = true\n",
+            );
         let (complete, _) = run_closed_artifact_sweep(&mut broker, &root, session_id);
 
         assert!(!complete);
@@ -10283,11 +10288,12 @@ mod tests {
         enable_closed_artifact_sweep(&root);
         enable_ignored_directory_sweep(&root);
 
-        let _remove_ignore_after_plan = ArtifactSweepTestMutationInterrupt::rewrite_file_before_removal(
-            &ignored_directory,
-            &worktree.join(".gitignore"),
-            "/.aethyme/\n/target/\n/ignored-root.txt\n",
-        );
+        let _remove_ignore_after_plan =
+            ArtifactSweepTestMutationInterrupt::rewrite_file_before_removal(
+                &ignored_directory,
+                &worktree.join(".gitignore"),
+                "/.aethyme/\n/target/\n/ignored-root.txt\n",
+            );
         let (complete, _) = run_closed_artifact_sweep(&mut broker, &root, session_id);
 
         assert!(!complete);
@@ -10356,14 +10362,16 @@ mod tests {
         let (complete, _) = run_closed_artifact_sweep(&mut broker, &root, session_id);
         assert!(complete);
         assert!(!ignored_directory.exists());
-        assert!(decode_interrupted_ignored_directories(
-            broker
-                .artifact_sweep_meta_get(ARTIFACT_SWEEP_IGNORED_DIR_INTERRUPTED_KEY)
-                .unwrap()
-                .as_deref()
-        )
-        .unwrap()
-        .is_empty());
+        assert!(
+            decode_interrupted_ignored_directories(
+                broker
+                    .artifact_sweep_meta_get(ARTIFACT_SWEEP_IGNORED_DIR_INTERRUPTED_KEY)
+                    .unwrap()
+                    .as_deref()
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -10379,18 +10387,22 @@ mod tests {
         enable_closed_artifact_sweep(&root);
         enable_ignored_directory_sweep(&root);
 
-        let _replace_after_plan = ArtifactSweepTestMutationInterrupt::replace_directory_with_symlink(
-            &ignored_directory,
-            &ignored_directory,
-            &moved_directory,
-            &replacement,
-        );
+        let _replace_after_plan =
+            ArtifactSweepTestMutationInterrupt::replace_directory_with_symlink(
+                &ignored_directory,
+                &ignored_directory,
+                &moved_directory,
+                &replacement,
+            );
         let (complete, _) = run_closed_artifact_sweep(&mut broker, &root, session_id);
 
         assert!(!complete);
         assert!(ignored_directory.is_symlink());
         assert!(moved_directory.join("unique-dataset.sqlite").is_file());
-        assert_eq!(std::fs::read(replacement.join("keep")).unwrap(), b"outside target");
+        assert_eq!(
+            std::fs::read(replacement.join("keep")).unwrap(),
+            b"outside target"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -10422,7 +10434,11 @@ mod tests {
 
         assert!(!complete);
         assert!(worktree.is_symlink());
-        assert!(moved_checkout.join("ignored-data/unique-dataset.sqlite").is_file());
+        assert!(
+            moved_checkout
+                .join("ignored-data/unique-dataset.sqlite")
+                .is_file()
+        );
         assert_eq!(
             std::fs::read(replacement.join("ignored-data/keep")).unwrap(),
             b"replacement checkout contents"

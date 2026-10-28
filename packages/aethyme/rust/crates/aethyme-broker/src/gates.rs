@@ -2632,9 +2632,7 @@ impl GateArtifactUseGuard {
         }
     }
 
-    fn producer_mut(
-        &mut self,
-    ) -> Option<&mut crate::file_lock::artifact_use::ArtifactUseProducer> {
+    fn producer_mut(&mut self) -> Option<&mut crate::file_lock::artifact_use::ArtifactUseProducer> {
         self.producer.as_mut()
     }
 
@@ -2694,24 +2692,30 @@ fn begin_gate_artifact_use(
     }
 
     store.require_live_schema_compatible()?;
-    let canonical_main = main_root.canonicalize().map_err(|source| crate::BrokerError::Io {
-        path: main_root.to_path_buf(),
-        source,
-    })?;
-    let primary_repo = GitRepo::discover(&canonical_main)?;
-    let primary_repo_root = primary_repo.root().canonicalize().map_err(|source| {
-        crate::BrokerError::Io {
-            path: primary_repo.root().to_path_buf(),
+    let canonical_main = main_root
+        .canonicalize()
+        .map_err(|source| crate::BrokerError::Io {
+            path: main_root.to_path_buf(),
             source,
-        }
-    })?;
-    let common_dir = primary_repo.git_common_dir()?.canonicalize().map_err(|source| {
-        crate::BrokerError::Io {
+        })?;
+    let primary_repo = GitRepo::discover(&canonical_main)?;
+    let primary_repo_root =
+        primary_repo
+            .root()
+            .canonicalize()
+            .map_err(|source| crate::BrokerError::Io {
+                path: primary_repo.root().to_path_buf(),
+                source,
+            })?;
+    let common_dir = primary_repo
+        .git_common_dir()?
+        .canonicalize()
+        .map_err(|source| crate::BrokerError::Io {
             path: canonical_main.join(".git"),
             source,
-        }
-    })?;
-    if primary_repo_root != canonical_main || common_dir.parent() != Some(canonical_main.as_path()) {
+        })?;
+    if primary_repo_root != canonical_main || common_dir.parent() != Some(canonical_main.as_path())
+    {
         return Err(crate::git::GitError::UntrustedOutput {
             detail: "gate admission could not confirm the primary repository identity".into(),
         }
@@ -2732,10 +2736,14 @@ fn begin_gate_artifact_use(
         })?;
     store.require_live_schema_compatible()?;
 
-    let checkout_root = checkout.root().canonicalize().map_err(|source| crate::BrokerError::Io {
-        path: checkout.root().to_path_buf(),
-        source,
-    })?;
+    let checkout_root =
+        checkout
+            .root()
+            .canonicalize()
+            .map_err(|source| crate::BrokerError::Io {
+                path: checkout.root().to_path_buf(),
+                source,
+            })?;
     let marker_session_id = if let Some(session_id) = session_id {
         let session = store.session(session_id)?;
         if session.status.is_closed() || session.cleanup_state != crate::SessionCleanupState::Open {
@@ -2754,18 +2762,21 @@ fn begin_gate_artifact_use(
             // Submission gates run in a temporary linked worktree. Permit that
             // lane only when it shares the still-open session's Git common dir.
             let session_repo = GitRepo::discover(&session_root)?;
-            let session_common = session_repo.git_common_dir()?.canonicalize().map_err(|source| {
-                crate::BrokerError::Io {
-                    path: session_root.join(".git"),
-                    source,
-                }
-            })?;
-            let checkout_common = checkout.git_common_dir()?.canonicalize().map_err(|source| {
-                crate::BrokerError::Io {
+            let session_common =
+                session_repo
+                    .git_common_dir()?
+                    .canonicalize()
+                    .map_err(|source| crate::BrokerError::Io {
+                        path: session_root.join(".git"),
+                        source,
+                    })?;
+            let checkout_common = checkout
+                .git_common_dir()?
+                .canonicalize()
+                .map_err(|source| crate::BrokerError::Io {
                     path: checkout_root.join(".git"),
                     source,
-                }
-            })?;
+                })?;
             if session_common != checkout_common {
                 return Err(crate::git::GitError::UntrustedOutput {
                     detail: format!(
@@ -2780,7 +2791,10 @@ fn begin_gate_artifact_use(
     } else {
         let checkout_text = checkout_root.to_string_lossy().into_owned();
         match store.session_for_worktree(&checkout_text)? {
-            Some(session) if session.status.is_closed() || session.cleanup_state != crate::SessionCleanupState::Open => {
+            Some(session)
+                if session.status.is_closed()
+                    || session.cleanup_state != crate::SessionCleanupState::Open =>
+            {
                 return Err(crate::broker::BrokerOpError::ClosedSessionOperation {
                     session_id: session.id,
                     repository_root: canonical_main.to_string_lossy().into_owned(),
@@ -2875,10 +2889,7 @@ where
     let progress = runtime.progress;
     let admission_host = runtime.admission_host;
     let mut invocation_artifact_use = Some(begin_gate_artifact_use(
-        store,
-        main_root,
-        checkout,
-        session_id,
+        store, main_root, checkout, session_id,
     )?);
     invocation_artifact_use
         .as_mut()
@@ -2998,10 +3009,12 @@ where
         };
         if let Some(hit) = cached_result {
             if let Some(mut artifact_use) = artifact_use.take() {
-                artifact_use.finish_not_started().map_err(|source| crate::BrokerError::Io {
-                    path: checkout.root().to_path_buf(),
-                    source,
-                })?;
+                artifact_use
+                    .finish_not_started()
+                    .map_err(|source| crate::BrokerError::Io {
+                        path: checkout.root().to_path_buf(),
+                        source,
+                    })?;
             }
             let saved_ms = hit.duration_ms.unwrap_or(0);
             progress.report(&format!(
@@ -3080,10 +3093,12 @@ where
         // directories or preparing a managed cache. A cache hit above has no
         // such writes and remains usable even when a build volume is low.
         if let Some(diagnostic) = gate_admission(store, main_root, checkout, gate) {
-            artifact_use.finish_not_started().map_err(|source| crate::BrokerError::Io {
-                path: checkout.root().to_path_buf(),
-                source,
-            })?;
+            artifact_use
+                .finish_not_started()
+                .map_err(|source| crate::BrokerError::Io {
+                    path: checkout.root().to_path_buf(),
+                    source,
+                })?;
             // Persist at most one bounded diagnostic row, and only when a
             // separate probe confirms the broker database itself can accept it.
             // The full preflight may have stopped at an earlier low-volume probe.
@@ -3152,10 +3167,12 @@ where
             threshold,
         } = crate::gate_admission::admit_gate_with(gate, progress, admission_host)
         {
-            artifact_use.finish_not_started().map_err(|source| crate::BrokerError::Io {
-                path: checkout.root().to_path_buf(),
-                source,
-            })?;
+            artifact_use
+                .finish_not_started()
+                .map_err(|source| crate::BrokerError::Io {
+                    path: checkout.root().to_path_buf(),
+                    source,
+                })?;
             let diagnostic = format!(
                 "host load stayed above its admission threshold for {}s: {}; retry after load falls",
                 waited.as_secs(),
@@ -3191,10 +3208,12 @@ where
         let owner_locks = match owner_locks {
             Ok(locks) => locks,
             Err(source) if source.kind() == std::io::ErrorKind::TimedOut => {
-                artifact_use.finish_not_started().map_err(|source| crate::BrokerError::Io {
-                    path: checkout.root().to_path_buf(),
-                    source,
-                })?;
+                artifact_use
+                    .finish_not_started()
+                    .map_err(|source| crate::BrokerError::Io {
+                        path: checkout.root().to_path_buf(),
+                        source,
+                    })?;
                 outcomes.push(record_gate_preflight_resource_failure(store,GatePreflightResourceFailure {
                     gate,tree:&tree,session_id,wait_duration_ms:wait_started.elapsed().as_millis() as i64,
                     log_path:&log_path,diagnostic:"native gate admission deadline exhausted before command dispatch",progress,
@@ -3228,10 +3247,12 @@ where
             Ok(runtime) => runtime,
             Err(message) => {
                 drop(owner_locks);
-                artifact_use.finish_not_started().map_err(|source| crate::BrokerError::Io {
-                    path: checkout.root().to_path_buf(),
-                    source,
-                })?;
+                artifact_use
+                    .finish_not_started()
+                    .map_err(|source| crate::BrokerError::Io {
+                        path: checkout.root().to_path_buf(),
+                        source,
+                    })?;
                 let diagnostic = format!("host resource acquisition failed: {message}");
                 let outcome = record_gate_preflight_resource_failure(
                     store,
@@ -5386,7 +5407,10 @@ mod tests {
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, GateStatus::Error);
-        assert!(artifact_marker_seen.get(), "marker must precede storage admission");
+        assert!(
+            artifact_marker_seen.get(),
+            "marker must precede storage admission"
+        );
         assert_eq!(
             outcomes[0].failure_class,
             Some(GateFailureClass::ResourceContention)
@@ -5497,7 +5521,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(profile_captures.get(), 1);
-        assert!(profile_marker_seen.get(), "profile probes need a visible marker");
+        assert!(
+            profile_marker_seen.get(),
+            "profile probes need a visible marker"
+        );
         assert_eq!(outcomes.len(), 1);
         assert!(outcomes[0].cached);
         assert_eq!(outcomes[0].status, GateStatus::Pass);
@@ -5820,7 +5847,10 @@ mod tests {
         )
         .join()
         .unwrap();
-        assert!(refused.is_err(), "busy artifact admission must abort before dispatch");
+        assert!(
+            refused.is_err(),
+            "busy artifact admission must abort before dispatch"
+        );
         assert!(
             !conflict_sentinel.exists(),
             "the real gate entrypoint must not dispatch after artifact admission refusal"
@@ -5897,7 +5927,15 @@ mod tests {
             .unwrap();
         assert!(commit.success());
         let commit = std::process::Command::new("git")
-            .args(["-c", "user.name=Gate test", "-c", "user.email=gate@example.invalid", "commit", "-m", "add filter fixture"])
+            .args([
+                "-c",
+                "user.name=Gate test",
+                "-c",
+                "user.email=gate@example.invalid",
+                "commit",
+                "-m",
+                "add filter fixture",
+            ])
             .current_dir(&checkout_root)
             .status()
             .unwrap();
@@ -5913,17 +5951,8 @@ mod tests {
         let mut permissions = std::fs::metadata(&filter_script).unwrap().permissions();
         permissions.set_mode(0o700);
         std::fs::set_permissions(&filter_script, permissions).unwrap();
-        let quote = |path: &Path| {
-            format!(
-                "'{}'",
-                path.to_string_lossy().replace('\'', "'\\''")
-            )
-        };
-        let clean_command = format!(
-            "sh {} {}",
-            quote(&filter_script),
-            quote(&filter_observed)
-        );
+        let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+        let clean_command = format!("sh {} {}", quote(&filter_script), quote(&filter_observed));
         let config = std::process::Command::new("git")
             .args(["config", "filter.observe-marker.clean", &clean_command])
             .current_dir(&checkout_root)

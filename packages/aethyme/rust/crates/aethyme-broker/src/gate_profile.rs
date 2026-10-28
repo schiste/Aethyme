@@ -305,16 +305,14 @@ fn probe_version(
             (Err(format!("spawn {}: {}", error.kind(), error)), true)
         }
         Err(error) => (Err(format!("spawn {}: {}", error.kind(), error)), false),
-        Ok(crate::bounded_output::LimitedOutput::Completed(output)) => {
-            (
-                Ok(ToolVersionFingerprint::Present {
-                    exit_code: output.status.code().unwrap_or(-1),
-                    stdout: output.stdout,
-                    stderr: output.stderr,
-                }),
-                true,
-            )
-        }
+        Ok(crate::bounded_output::LimitedOutput::Completed(output)) => (
+            Ok(ToolVersionFingerprint::Present {
+                exit_code: output.status.code().unwrap_or(-1),
+                stdout: output.stdout,
+                stderr: output.stderr,
+            }),
+            true,
+        ),
     };
     ProbeObservation {
         result,
@@ -409,8 +407,7 @@ mod tests {
             args: &["--version"],
         };
 
-        let observed =
-            probe_version(&probe, checkout.path(), Some(tools.path().as_os_str()));
+        let observed = probe_version(&probe, checkout.path(), Some(tools.path().as_os_str()));
         assert!(observed.writers_quiescent);
         match observed.result.unwrap() {
             ToolVersionFingerprint::Present {
@@ -441,10 +438,8 @@ mod tests {
     #[test]
     fn missing_optional_tools_are_quiescent_profile_inputs() {
         let directory = tempfile::tempdir().unwrap();
-        let profile = ExecutionProfile::capture(
-            directory.path(),
-            Some(directory.path().as_os_str()),
-        );
+        let profile =
+            ExecutionProfile::capture(directory.path(), Some(directory.path().as_os_str()));
         assert!(profile.writers_quiescent());
         assert!(profile.digest().is_some());
     }

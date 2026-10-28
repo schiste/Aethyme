@@ -103,7 +103,11 @@ pub fn session_registered_payload(origin: &str, branch: &str, worktree_path: &st
 
 /// `session.abandoned`: an unattended session crossed its configured age
 /// window while its recorded owner and lease evidence allowed closure.
-pub fn session_abandoned_payload(idle_ms: i64, abandon_after_ms: i64, pid_alive: Option<bool>) -> String {
+pub fn session_abandoned_payload(
+    idle_ms: i64,
+    abandon_after_ms: i64,
+    pid_alive: Option<bool>,
+) -> String {
     json!({
         "idle_ms": idle_ms,
         "abandon_after_ms": abandon_after_ms,

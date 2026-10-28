@@ -406,7 +406,10 @@ fn bulk_cleanup_refuses_a_closed_row_whose_checkout_a_live_session_adopted() {
         .iter()
         .find(|item| item.session_id == id)
         .unwrap();
-    assert_eq!(item.disposition, aethyme_broker::CleanupDisposition::UnsafePath);
+    assert_eq!(
+        item.disposition,
+        aethyme_broker::CleanupDisposition::UnsafePath
+    );
     assert!(item.reason.contains(&format!("live session {live_id}")));
     assert!(
         item.provenance.is_none(),
@@ -445,7 +448,10 @@ fn cleanup_protects_a_checkout_inside_an_open_session_path() {
         .iter()
         .find(|item| item.session_id == id)
         .unwrap();
-    assert_eq!(item.disposition, aethyme_broker::CleanupDisposition::UnsafePath);
+    assert_eq!(
+        item.disposition,
+        aethyme_broker::CleanupDisposition::UnsafePath
+    );
     assert!(item.reason.contains(&format!("live session {live_id}")));
     for force in [false, true] {
         assert!(matches!(

@@ -1144,10 +1144,8 @@ impl BrokerStore {
                        AND (expires_at IS NULL OR expires_at > ?2)
                      ORDER BY id"
                 ))?;
-                let rows = stmt.query_map(
-                    params![expected_session.id, observed_at_ms],
-                    lease_from_row,
-                )?;
+                let rows =
+                    stmt.query_map(params![expected_session.id, observed_at_ms], lease_from_row)?;
                 let mut leases = Vec::new();
                 for row in rows {
                     leases.push(row??);
@@ -1214,10 +1212,7 @@ impl BrokerStore {
             Err(BrokerError::Sqlite(error))
                 if matches!(
                     error.sqlite_error_code(),
-                    Some(
-                        rusqlite::ErrorCode::DatabaseBusy
-                            | rusqlite::ErrorCode::DatabaseLocked
-                    )
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
                 ) =>
             {
                 Err(BrokerError::SessionRetirementDatabaseBusy)
@@ -2366,15 +2361,11 @@ mod abandoned_close_cas_tests {
         let refreshed = store.session(observed.id).unwrap();
         assert!(refreshed.updated_at > observed.updated_at);
 
-        assert!(!store
-            .abandon_session_if_unchanged(
-                &observed,
-                None,
-                &[],
-                now_ms(),
-                "{}",
-            )
-            .unwrap());
+        assert!(
+            !store
+                .abandon_session_if_unchanged(&observed, None, &[], now_ms(), "{}",)
+                .unwrap()
+        );
         assert_unclosed_without_abandoned_event(&store, observed.id);
     }
 
@@ -2389,15 +2380,11 @@ mod abandoned_close_cas_tests {
             )
             .unwrap();
 
-        assert!(!store
-            .abandon_session_if_unchanged(
-                &observed,
-                None,
-                &[],
-                now_ms(),
-                "{}",
-            )
-            .unwrap());
+        assert!(
+            !store
+                .abandon_session_if_unchanged(&observed, None, &[], now_ms(), "{}",)
+                .unwrap()
+        );
         assert_unclosed_without_abandoned_event(&store, observed.id);
     }
 
@@ -2408,13 +2395,7 @@ mod abandoned_close_cas_tests {
         writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
 
         let started = std::time::Instant::now();
-        let result = store.abandon_session_if_unchanged(
-            &observed,
-            None,
-            &[],
-            now_ms(),
-            "{}",
-        );
+        let result = store.abandon_session_if_unchanged(&observed, None, &[], now_ms(), "{}");
         assert!(matches!(
             result,
             Err(BrokerError::SessionRetirementDatabaseBusy)

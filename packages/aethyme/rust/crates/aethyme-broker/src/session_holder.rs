@@ -334,8 +334,11 @@ impl RecordedHolderProcessTable {
                 return None;
             }
             self.snapshot = Some(ProcessTable::snapshot());
-            self.observed_event_ids
-                .extend(self.prefetched_event_ids.iter().map(|(id, event)| (*id, *event)));
+            self.observed_event_ids.extend(
+                self.prefetched_event_ids
+                    .iter()
+                    .map(|(id, event)| (*id, *event)),
+            );
         }
         if self.observed_event_ids.get(&session_id) != Some(&event_id) {
             if !allow_snapshot {
@@ -1080,7 +1083,10 @@ mod tests {
         let caller = Caller::Agent(table.process(5000).unwrap());
         bind_test_holder(&mut store, session_id, &holder);
 
-        assert!(!table.is_alive(&holder), "the PID now names another process");
+        assert!(
+            !table.is_alive(&holder),
+            "the PID now names another process"
+        );
         assert_eq!(
             admit(&mut store, session_id, &caller, &table, false).unwrap(),
             HolderCheck::Bound {
@@ -1159,7 +1165,9 @@ mod tests {
         }
         let storage = crate::test_storage::TestStorage::new();
         let mut broker = storage.open(&root).unwrap();
-        let session = broker.start_worktree("recorded holder fixture", None).unwrap();
+        let session = broker
+            .start_worktree("recorded holder fixture", None)
+            .unwrap();
 
         let mut no_holder = RecordedHolderProcessTable::default();
         let unbound = recorded_holder_liveness(broker.store(), session.id, &mut no_holder, false);

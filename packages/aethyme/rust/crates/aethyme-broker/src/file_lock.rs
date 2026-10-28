@@ -338,13 +338,17 @@ mod tests {
     fn try_lifecycle_claim_returns_none_without_waiting_when_busy() {
         let repository = tempfile::tempdir().unwrap();
         let held = acquire_repository_lifecycle_lock(repository.path()).unwrap();
-        assert!(try_acquire_repository_lifecycle_lock(repository.path())
-            .unwrap()
-            .is_none());
+        assert!(
+            try_acquire_repository_lifecycle_lock(repository.path())
+                .unwrap()
+                .is_none()
+        );
         drop(held);
-        assert!(try_acquire_repository_lifecycle_lock(repository.path())
-            .unwrap()
-            .is_some());
+        assert!(
+            try_acquire_repository_lifecycle_lock(repository.path())
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

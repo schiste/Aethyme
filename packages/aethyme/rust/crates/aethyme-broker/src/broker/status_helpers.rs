@@ -1795,12 +1795,13 @@ pub(super) fn checked_worktree_activity_ms(
             "existing worktree has no resolvable Git metadata directory",
         )
     })?;
-    let expected_common_dir = crate::git::checked_worktree_git_dir(main_root)?.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "primary checkout has no resolvable Git metadata directory",
-        )
-    })?;
+    let expected_common_dir =
+        crate::git::checked_worktree_git_dir(main_root)?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "primary checkout has no resolvable Git metadata directory",
+            )
+        })?;
     let actual_common_dir = checked_git_common_dir(&git_dir)?;
     let expected_common_dir = checked_git_common_dir(&expected_common_dir)?;
     if actual_common_dir != expected_common_dir {
@@ -1818,16 +1819,21 @@ pub(super) fn checked_worktree_activity_ms(
             Ok(_) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Git worktree metadata is not a regular file: {}", path.display()),
+                    format!(
+                        "Git worktree metadata is not a regular file: {}",
+                        path.display()
+                    ),
                 ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
         let mtime = metadata.modified()?;
-        let duration = mtime.duration_since(std::time::UNIX_EPOCH).map_err(|error| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
-        })?;
+        let duration = mtime
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            })?;
         let millis = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
         newest = Some(newest.map_or(millis, |known| known.max(millis)));
     }

@@ -1299,9 +1299,7 @@ fn worktree_git_dir(worktree: &Path) -> Option<PathBuf> {
 /// Resolve a checkout's `.git` directory without invoking Git. A valid `.git`
 /// directory or gitdir file is canonicalized; missing targets are reported as
 /// known absence, while malformed or unreadable metadata remains an error.
-pub(crate) fn checked_worktree_git_dir(
-    worktree: &Path,
-) -> Result<Option<PathBuf>, std::io::Error> {
+pub(crate) fn checked_worktree_git_dir(worktree: &Path) -> Result<Option<PathBuf>, std::io::Error> {
     let dot_git = worktree.join(".git");
     let metadata = match std::fs::metadata(&dot_git) {
         Ok(metadata) => metadata,
@@ -4842,8 +4840,9 @@ impl GitRepo {
             // on the second pass therefore only omit untracked operational
             // state and cannot hide tracked inputs from the cache key.
             run_git_with_index(&self.root, &tmp_str, &["add", "-u", "--", "."])?;
-            let exclusions = crate::runtime_paths::broker_runtime_untracked_git_pathspec_exclusions()
-                .collect::<Vec<_>>();
+            let exclusions =
+                crate::runtime_paths::broker_runtime_untracked_git_pathspec_exclusions()
+                    .collect::<Vec<_>>();
             let mut add_all_args = vec!["add", "-A", "--", "."];
             add_all_args.extend(exclusions.iter().map(String::as_str));
             run_git_with_index(&self.root, &tmp_str, &add_all_args)?;
@@ -9715,7 +9714,10 @@ mod working_tree_hash_runtime_path_tests {
     fn repository() -> (tempfile::TempDir, GitRepo) {
         let root = tempfile::tempdir().unwrap();
         git(root.path(), &["init", "-q", "-b", "main"]);
-        git(root.path(), &["config", "user.name", "Working tree hash test"]);
+        git(
+            root.path(),
+            &["config", "user.name", "Working tree hash test"],
+        );
         git(
             root.path(),
             &["config", "user.email", "working-tree-hash@example.invalid"],
@@ -9755,7 +9757,11 @@ mod working_tree_hash_runtime_path_tests {
         );
         assert_eq!(repo.working_tree_hash().unwrap(), baseline);
 
-        write(root.path(), "new-source.txt", "ordinary untracked content\n");
+        write(
+            root.path(),
+            "new-source.txt",
+            "ordinary untracked content\n",
+        );
         assert_ne!(repo.working_tree_hash().unwrap(), baseline);
     }
 
@@ -9763,7 +9769,10 @@ mod working_tree_hash_runtime_path_tests {
     fn working_tree_hash_keeps_tracked_runtime_edits_in_the_key() {
         let root = tempfile::tempdir().unwrap();
         git(root.path(), &["init", "-q", "-b", "main"]);
-        git(root.path(), &["config", "user.name", "Working tree hash test"]);
+        git(
+            root.path(),
+            &["config", "user.name", "Working tree hash test"],
+        );
         git(
             root.path(),
             &["config", "user.email", "working-tree-hash@example.invalid"],
