@@ -199,6 +199,11 @@ pub struct AutoCleanupPolicy {
     /// Require a checkout with no ignored leftovers. Otherwise all Git-ignored
     /// directories are disposable without inspecting their contents.
     pub strict: bool,
+    /// Allow the background artifact sweep to reclaim arbitrary Git-ignored
+    /// directory roots in retained closed checkouts. Defaults off so existing
+    /// checkouts keep the whole-worktree grace unless an operator enables this
+    /// in-place cleanup lane after its host protocol is ready.
+    pub ignored_directory_sweep: bool,
     /// Extra globs, relative to the worktree root, that count as regenerable
     /// in addition to [`BUILT_IN_REGENERABLE`].
     pub regenerable: Vec<String>,
@@ -212,6 +217,7 @@ impl Default for AutoCleanupPolicy {
         Self {
             auto_remove: true,
             strict: false,
+            ignored_directory_sweep: false,
             regenerable: Vec::new(),
             keep: Vec::new(),
         }
@@ -251,6 +257,11 @@ impl AutoCleanupPolicy {
                     policy.strict = value
                         .as_bool()
                         .ok_or_else(|| "[cleanup] strict must be true or false".to_string())?;
+                }
+                "ignored_directory_sweep" => {
+                    policy.ignored_directory_sweep = value.as_bool().ok_or_else(|| {
+                        "[cleanup] ignored_directory_sweep must be true or false".to_string()
+                    })?;
                 }
                 "regenerable" | "keep" => {
                     let list = value
@@ -601,6 +612,44 @@ pub(crate) struct AutoCleanupCandidate {
 struct AutoCleanupCheckoutGroup {
     worktree: PathBuf,
     sessions: Vec<Session>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClosedArtifactSessionSnapshot {
+    id: i64,
+    worktree_path: String,
+    branch: String,
+    origin: SessionOrigin,
+    updated_at: i64,
+    spawned_instance_witness: Option<crate::events::SpawnedWorktreeInstanceWitness>,
+}
+
+/// Complete retained-session identity for one artifact-reclamation checkout.
+/// Equality pins the closed canonical cohort and spawn-time owner across the
+/// discovery-to-removal window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClosedArtifactCheckoutCohort {
+    worktree: PathBuf,
+    sessions: Vec<ClosedArtifactSessionSnapshot>,
+    owner_session_id: i64,
+}
+
+impl ClosedArtifactCheckoutCohort {
+    pub(crate) fn owner_session_id(&self) -> i64 {
+        self.owner_session_id
+    }
+
+    pub(crate) fn matches_checkout_instance(&self, checkout: &GitRepo) -> bool {
+        self.worktree.as_path() == checkout.root()
+            && self
+                .sessions
+                .iter()
+                .find(|session| session.id == self.owner_session_id)
+                .and_then(|session| session.spawned_instance_witness.as_ref())
+                .is_some_and(|expected| {
+                    checkout.spawned_worktree_instance_witness().as_ref() == Some(expected)
+                })
+    }
 }
 
 struct AutoCleanupGroupScan {
@@ -1129,6 +1178,333 @@ impl Broker {
         }
         *expected_raw = Some(value);
         Ok(())
+    }
+
+    /// Build the complete closed-checkout ownership index once for a bounded
+    /// artifact-sweep pass. The session table and canonical aliases are
+    /// resolved once; callers use the returned owner/cohort snapshots to avoid
+    /// rescanning every retained row for each ignored directory.
+    pub(crate) fn closed_artifact_checkout_cohort_index(
+        &mut self,
+        closed: Vec<Session>,
+        live: &[Session],
+        deadline: Option<Instant>,
+    ) -> Result<
+        Option<std::collections::BTreeMap<PathBuf, ClosedArtifactCheckoutCohort>>,
+        BrokerOpError,
+    > {
+        if deadline_expired(deadline) {
+            return Ok(None);
+        }
+        let all_rows = closed
+            .iter()
+            .cloned()
+            .chain(live.iter().cloned())
+            .collect::<Vec<_>>();
+        let mut all_resolved = Vec::with_capacity(all_rows.len());
+        for row in &all_rows {
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
+            all_resolved.push((
+                row,
+                ResolvedWorktreePath::resolve(Path::new(&row.worktree_path)),
+            ));
+        }
+        // A row with an unresolved path makes every candidate's alias proof
+        // unknown, just as the pairwise classifier did. Keep the whole pass
+        // incomplete instead of repeatedly comparing every candidate with
+        // every unresolved row.
+        if all_resolved
+            .iter()
+            .any(|(_, resolved)| !resolved.resolution_errors.is_empty())
+        {
+            return Ok(None);
+        }
+        let mut rows_at_path = std::collections::BTreeMap::<PathBuf, Vec<usize>>::new();
+        let mut rows_below_path = std::collections::BTreeMap::<PathBuf, Vec<usize>>::new();
+        let mut rows_at_git_dir = std::collections::BTreeMap::<PathBuf, Vec<usize>>::new();
+        for (index, (_, resolved)) in all_resolved.iter().enumerate() {
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
+            for path in [&resolved.raw, &resolved.canonical_or_raw] {
+                rows_at_path.entry(path.clone()).or_default().push(index);
+                for ancestor in path.ancestors() {
+                    if deadline_expired(deadline) {
+                        return Ok(None);
+                    }
+                    rows_below_path
+                        .entry(ancestor.to_path_buf())
+                        .or_default()
+                        .push(index);
+                }
+            }
+            if let Some(git_dir) = &resolved.git_dir {
+                rows_at_git_dir
+                    .entry(git_dir.clone())
+                    .or_default()
+                    .push(index);
+            }
+        }
+        let Some(groups) = group_closed_checkout_sessions(closed, deadline) else {
+            return Ok(None);
+        };
+        let mut index = std::collections::BTreeMap::new();
+        for group in groups {
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
+            if group.sessions.is_empty()
+                || group.sessions.iter().any(|session| {
+                    session.status != crate::types::SessionStatus::Cleaned
+                        || session.cleanup_state != SessionCleanupState::Closed
+                })
+            {
+                continue;
+            }
+            match std::fs::symlink_metadata(&group.worktree) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    continue;
+                }
+                Ok(_) => {}
+                Err(_) => continue,
+            }
+            let resolved = ResolvedWorktreePath::resolve(&group.worktree);
+            if !resolved.resolution_errors.is_empty() || deadline_expired(deadline) {
+                continue;
+            }
+            let group_ids = group
+                .sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut possible_aliases = std::collections::BTreeSet::new();
+            for path in [&resolved.raw, &resolved.canonical_or_raw] {
+                for ancestor in path.ancestors() {
+                    if deadline_expired(deadline) {
+                        return Ok(None);
+                    }
+                    if let Some(rows) = rows_at_path.get(ancestor) {
+                        possible_aliases.extend(rows.iter().copied());
+                    }
+                }
+                if let Some(rows) = rows_below_path.get(path) {
+                    possible_aliases.extend(rows.iter().copied());
+                }
+            }
+            if let Some(git_dir) = &resolved.git_dir
+                && let Some(rows) = rows_at_git_dir.get(git_dir)
+            {
+                possible_aliases.extend(rows.iter().copied());
+            }
+            let mut aliases_are_closed = true;
+            for index in possible_aliases {
+                if deadline_expired(deadline) {
+                    return Ok(None);
+                }
+                let (row, row_path) = &all_resolved[index];
+                match live_worktree_overlap(&resolved, row_path) {
+                    LiveOverlapEvidence::Disjoint => {}
+                    LiveOverlapEvidence::Overlap
+                        if row.status == crate::types::SessionStatus::Cleaned
+                            && row.cleanup_state == SessionCleanupState::Closed
+                            && group_ids.contains(&row.id) => {}
+                    LiveOverlapEvidence::Overlap | LiveOverlapEvidence::Unknown => {
+                        aliases_are_closed = false;
+                        break;
+                    }
+                }
+            }
+            if !aliases_are_closed {
+                continue;
+            }
+
+            let mut sessions = Vec::with_capacity(group.sessions.len());
+            let mut owner_session_id = None;
+            for session in &group.sessions {
+                if deadline_expired(deadline) {
+                    return Ok(None);
+                }
+                let spawned_instance_witness = if session.origin == SessionOrigin::Spawned {
+                    self.store().spawned_worktree_instance_witness(session.id)?
+                } else {
+                    None
+                };
+                if owner_session_id.is_none()
+                    && session.origin == SessionOrigin::Spawned
+                    && spawned_instance_witness.as_ref().is_some_and(|witness| {
+                        witness.worktree_path == group.worktree.to_string_lossy()
+                    })
+                {
+                    owner_session_id = Some(session.id);
+                }
+                sessions.push(ClosedArtifactSessionSnapshot {
+                    id: session.id,
+                    worktree_path: session.worktree_path.clone(),
+                    branch: session.branch.clone(),
+                    origin: session.origin,
+                    updated_at: session.updated_at,
+                    spawned_instance_witness,
+                });
+            }
+            let Some(owner_session_id) = owner_session_id else {
+                continue;
+            };
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
+            index.insert(
+                resolved.canonical_or_raw.clone(),
+                ClosedArtifactCheckoutCohort {
+                    worktree: resolved.canonical_or_raw,
+                    sessions,
+                    owner_session_id,
+                },
+            );
+        }
+        if deadline_expired(deadline) {
+            return Ok(None);
+        }
+        Ok(Some(index))
+    }
+
+    /// Snapshot one retained checkout's full canonical cohort and its
+    /// spawn-time owner. Adopted rows participate in the cohort identity but
+    /// cannot supply automatic cleanup authority.
+    pub(crate) fn closed_artifact_checkout_cohort_snapshot(
+        &mut self,
+        session_id: i64,
+        worktree: &Path,
+        deadline: Option<Instant>,
+    ) -> Result<Option<ClosedArtifactCheckoutCohort>, BrokerOpError> {
+        if deadline_expired(deadline) {
+            return Ok(None);
+        }
+        let expected_path = worktree.to_string_lossy().into_owned();
+        let current = self.store().session(session_id)?;
+        if current.status != crate::types::SessionStatus::Cleaned
+            || current.cleanup_state != SessionCleanupState::Closed
+            || current.origin != SessionOrigin::Spawned
+            || current.worktree_path != expected_path
+        {
+            return Ok(None);
+        }
+
+        let resolved = ResolvedWorktreePath::resolve(worktree);
+        if !resolved.resolution_errors.is_empty() || deadline_expired(deadline) {
+            return Ok(None);
+        }
+        let closed = self.store().cleaned_sessions()?;
+        let all_rows = closed
+            .iter()
+            .cloned()
+            .chain(self.store().live_sessions()?)
+            .collect::<Vec<_>>();
+        let Some(groups) = group_closed_checkout_sessions(closed, deadline) else {
+            return Ok(None);
+        };
+        let Some(group) = groups
+            .into_iter()
+            .find(|group| group.worktree == resolved.canonical_or_raw)
+        else {
+            return Ok(None);
+        };
+        if group.sessions.is_empty()
+            || group.sessions.iter().any(|session| {
+                session.status != crate::types::SessionStatus::Cleaned
+                    || session.cleanup_state != SessionCleanupState::Closed
+            })
+        {
+            return Ok(None);
+        }
+        // Every session row that can name this canonical checkout participates
+        // in the proof. A live, non-closed, or unresolvable alias blocks the
+        // cohort even if the selected row itself is clean and closed.
+        let group_ids = group
+            .sessions
+            .iter()
+            .map(|session| session.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        for row in &all_rows {
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
+            let row_path = ResolvedWorktreePath::resolve(Path::new(&row.worktree_path));
+            match live_worktree_overlap(&resolved, &row_path) {
+                LiveOverlapEvidence::Disjoint => {}
+                LiveOverlapEvidence::Overlap
+                    if row.status == crate::types::SessionStatus::Cleaned
+                        && row.cleanup_state == SessionCleanupState::Closed
+                        && group_ids.contains(&row.id) => {}
+                LiveOverlapEvidence::Overlap | LiveOverlapEvidence::Unknown => {
+                    return Ok(None);
+                }
+            }
+        }
+        let Some(selected) = group.sessions.iter().find(|session| session.id == session_id) else {
+            return Ok(None);
+        };
+        if selected.worktree_path != current.worktree_path
+            || selected.branch != current.branch
+            || selected.origin != current.origin
+            || selected.updated_at != current.updated_at
+        {
+            return Ok(None);
+        }
+
+        let _git_deadline = deadline.map(crate::git::limit_git_until);
+        let checkout = GitRepo::discover(&group.worktree)?;
+        let current_witness = checkout.spawned_worktree_instance_witness();
+        let mut sessions = Vec::with_capacity(group.sessions.len());
+        for session in &group.sessions {
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
+            let spawned_instance_witness = if session.origin == SessionOrigin::Spawned {
+                self.store().spawned_worktree_instance_witness(session.id)?
+            } else {
+                None
+            };
+            if session.id == session_id {
+                let Some(expected_witness) = spawned_instance_witness.as_ref() else {
+                    return Ok(None);
+                };
+                if expected_witness.worktree_path != group.worktree.to_string_lossy()
+                    || current_witness.as_ref() != Some(expected_witness)
+                    || !self.is_broker_owned_worktree_checked(session, &group.worktree)?
+                {
+                    return Ok(None);
+                }
+            }
+            sessions.push(ClosedArtifactSessionSnapshot {
+                id: session.id,
+                worktree_path: session.worktree_path.clone(),
+                branch: session.branch.clone(),
+                origin: session.origin,
+                updated_at: session.updated_at,
+                spawned_instance_witness,
+            });
+        }
+        if deadline_expired(deadline) {
+            return Ok(None);
+        }
+        let current_after = self.store().session(session_id)?;
+        if current_after.status != crate::types::SessionStatus::Cleaned
+            || current_after.cleanup_state != SessionCleanupState::Closed
+            || current_after.worktree_path != current.worktree_path
+            || current_after.branch != current.branch
+            || current_after.origin != current.origin
+            || current_after.updated_at != current.updated_at
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(ClosedArtifactCheckoutCohort {
+            worktree: group.worktree,
+            sessions,
+            owner_session_id: session_id,
+        }))
     }
 
     /// Collect complete canonical cohorts and a complete live-path index.
@@ -1786,6 +2162,38 @@ impl Broker {
                     continue;
                 }
             };
+            let artifact_use_reclaimer =
+                match crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                    self.main_root(),
+                    &candidate.worktree,
+                ) {
+                    Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(
+                        reclaimer,
+                    )) => reclaimer,
+                    Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(block)) => {
+                        let reason = match block {
+                            crate::file_lock::artifact_use::ArtifactUseReclaimBlock::Contended => {
+                                "checkout has an active artifact producer; kept the worktree"
+                            }
+                            crate::file_lock::artifact_use::ArtifactUseReclaimBlock::UnknownProducer {
+                                ..
+                            } => "checkout has unresolved artifact-use markers; kept the worktree",
+                            crate::file_lock::artifact_use::ArtifactUseReclaimBlock::ProtocolUnavailable => {
+                                "artifact-use protection is unavailable; kept the worktree"
+                            }
+                        };
+                        keep_it(&mut report, reason.into());
+                        continue;
+                    }
+                    Err(error) => {
+                        keep_it(
+                            &mut report,
+                            format!("artifact-use inventory failed; kept the worktree: {error}"),
+                        );
+                        continue;
+                    }
+                };
+            let _artifact_use_reclaimer = artifact_use_reclaimer;
             if let Some(reason) = crate::reclaim::open_file_snapshot_blocker_for_worktree(
                 &open_file_snapshot,
                 &candidate.worktree,
@@ -2716,6 +3124,32 @@ mod tests {
         write("[cleanup]\nautoremove = true\n");
         assert!(AutoCleanupPolicy::load(dir.path()).is_err());
     }
+
+    #[test]
+    fn ignored_directory_sweep_is_opt_in_and_strict_always_disables_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".aethyme")).unwrap();
+        let config = dir.path().join(".aethyme/config.toml");
+        assert!(!AutoCleanupPolicy::load(dir.path())
+            .unwrap()
+            .ignored_directory_sweep);
+
+        std::fs::write(&config, "[cleanup]\nignored_directory_sweep = true\n").unwrap();
+        let enabled = AutoCleanupPolicy::load(dir.path()).unwrap();
+        assert!(enabled.ignored_directory_sweep && !enabled.strict);
+
+        std::fs::write(
+            &config,
+            "[cleanup]\nignored_directory_sweep = true\nstrict = true\n",
+        )
+        .unwrap();
+        let strict = AutoCleanupPolicy::load(dir.path()).unwrap();
+        assert!(strict.ignored_directory_sweep && strict.strict);
+
+        std::fs::write(&config, "[cleanup]\nignored_directory_sweep = \"yes\"\n").unwrap();
+        assert!(AutoCleanupPolicy::load(dir.path()).is_err());
+    }
+
 }
 
 fn ensure_auto_cleanup_path_absent(path: &Path) -> Result<(), BrokerOpError> {
