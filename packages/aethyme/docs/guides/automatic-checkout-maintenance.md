@@ -1,0 +1,87 @@
+# Automatic checkout maintenance
+
+Last Updated: 2026-10-28
+
+A session becoming closed and its checkout being removed are separate steps.
+Idle-session retirement makes a checkout eligible for later inspection; it does
+not authorize deletion. Checkout removal still checks ownership, other session
+records, content delivery, protected files, process use, and current policy.
+
+## Retention windows
+
+The default open-session abandonment window is 72 hours. Maintenance uses the
+latest recorded activity and worktree activity, and protects a session when its
+recorded task holder is alive or its identity cannot be checked. A shared agent
+service is not evidence that every task it once hosted remains active.
+
+Closed checkouts have a 15-day grace period. Configure retention in the primary
+repository's `.aethyme/broker.toml`:
+
+```toml
+[retention]
+session_abandoned_after_hours = 72
+closed_worktree_grace_hours = 360
+```
+
+Retirement runs in bounded pages with a durable cursor, so an old backlog does
+not require one unbounded foreground pass. Unreadable retention configuration
+keeps sessions open and reports a deferral. Recent activity and active holders
+remain protected regardless of a session's position in the page.
+
+## Ignored folders
+
+Normal whole-checkout cleanup treats Git-ignored directories as disposable by
+default. That includes local datasets and saved records. Preserve anything
+irreplaceable outside the checkout before closing it. Standalone ignored files
+remain protected by the cleanup policy.
+
+The background artifact sweep historically recognizes a catalog of generated
+folders. Broader in-place reclamation is separately opt-in in the primary
+repository's `.aethyme/config.toml`:
+
+```toml
+[cleanup]
+ignored_directory_sweep = true
+```
+
+Keep this setting off during a runtime transition until old broker clients have
+exited and the new gate-use protocol is active. Raising a database compatibility
+floor prevents fresh old clients from opening it; it does not stop a process
+that already has an open connection. Do not infer a completed drain from the
+absence of a gate PID file: a gate may still be waiting for admission.
+
+The broader sweep checks current Git ignore rules, the complete closed checkout
+cohort, and active artifact-use claims before deletion. It does not follow
+symlinks or remove broker and Git metadata. A queued interrupted deletion is
+revalidated against current policy before resuming; its queue record alone is
+not permission to delete.
+
+To retain ignored leftovers and pause automatic artifact sweeps:
+
+```toml
+[cleanup]
+strict = true
+```
+
+`auto_remove = false` disables automatic whole-checkout removal; it does not
+replace strict mode for in-place artifact reclamation.
+
+## Inspecting retained checkouts
+
+Use the broker's normal cleanup workflow. A targeted cleanup avoids the full
+bulk plan's recursive size inventory:
+
+```sh
+aethyme broker finish cleanup <session-id> --json
+```
+
+Several session records can name the same physical checkout. Count distinct
+canonical checkout paths and inspect every record in that cohort. A closed row
+cannot authorize removal while another row still owns the checkout.
+
+A successful archive is not necessarily a successful removal. Inspect the
+structured removal result and verify the checkout path is absent before
+reporting it removed. Keep recovery archives until their preservation purpose
+has been fulfilled. Estimated file sizes are not measured physical reclaimed
+space, because clones, hard links, snapshots, and concurrent writers affect
+volume usage.
