@@ -23,9 +23,7 @@ use crate::graph_impact::{
     GraphImpactProvider, GraphImpactQuery, GraphImpactReport, GraphImpactStatus,
     GraphStoreImpactProvider, revision_bound_impact_report,
 };
-use crate::session_abandonment::{
-    AbandonmentVerdict, SessionActivity, decide as decide_abandonment,
-};
+use crate::session_abandonment::SessionActivity;
 use crate::store::BrokerStore;
 use crate::types::{
     Advisory, AdvisoryList, GateStatus, LeaseKind, MergeQueueEntry, MergeStatus, NewAdvisory,

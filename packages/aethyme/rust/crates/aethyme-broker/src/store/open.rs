@@ -1121,6 +1121,7 @@ impl BrokerStore {
                     session_from_row,
                 )
                 .optional()?
+                .transpose()?
             else {
                 return Ok(false);
             };

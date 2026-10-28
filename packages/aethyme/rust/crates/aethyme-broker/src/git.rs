@@ -1590,13 +1590,17 @@ fn run_git_with_index_for_tree_hash(
     cwd: &Path,
     index_file: &str,
     args: &[&str],
+    writers_quiescent: &mut bool,
 ) -> Result<String, GitError> {
     #[cfg(unix)]
     {
-        run_git_with_index_in_owned_group(cwd, index_file, args)
+        run_git_with_index_in_owned_group(cwd, index_file, args, writers_quiescent)
     }
     #[cfg(not(unix))]
     {
+        // This platform cannot attest owned-group quiescence. Its automatic
+        // artifact-use consumers remain disabled.
+        *writers_quiescent = false;
         run_git_with_index(cwd, index_file, args)
     }
 }
@@ -1606,6 +1610,7 @@ fn run_git_with_index_in_owned_group(
     cwd: &Path,
     index_file: &str,
     args: &[&str],
+    writers_quiescent: &mut bool,
 ) -> Result<String, GitError> {
     let mut command = git_command();
     command
@@ -1613,7 +1618,8 @@ fn run_git_with_index_in_owned_group(
         .current_dir(cwd)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_INDEX_FILE", index_file);
-    let output = run_git_process_output_in_owned_group(command, args, git_timeout())?;
+    let output =
+        run_git_process_output_in_owned_group(command, args, git_timeout(), writers_quiescent)?;
     if !output.status.success() {
         return Err(GitError::Git {
             args: args.join(" "),
@@ -2121,6 +2127,7 @@ fn run_git_process_output_in_owned_group(
     mut command: Command,
     args: &[&str],
     budget: Duration,
+    writers_quiescent: &mut bool,
 ) -> Result<std::process::Output, GitError> {
     let budget = match active_git_deadline() {
         Some(deadline) => {
@@ -2142,6 +2149,7 @@ fn run_git_process_output_in_owned_group(
             args: args.join(" "),
             source: std::io::Error::other("git process-group deadline overflow"),
         })?;
+    *writers_quiescent = false;
     let output = crate::bounded_output::output_limited_in_owned_group(
         &mut command,
         budget,
@@ -2151,6 +2159,10 @@ fn run_git_process_output_in_owned_group(
         args: args.join(" "),
         source,
     })?;
+    // Every LimitedOutput variant from this runner has verified owned-group
+    // cleanup, including deadline and output-cap failures. An I/O or cleanup
+    // error returned above leaves the proof false.
+    *writers_quiescent = true;
     match output {
         crate::bounded_output::LimitedOutput::Completed(output) if Instant::now() < deadline => {
             Ok(output)
@@ -2474,6 +2486,14 @@ pub struct RemoteDefaultBranch {
 /// removable root; only a lock with exactly this reason is released by it.
 pub const BROKER_WORKTREE_LOCK_REASON: &str =
     "aethyme: worktree on a configured, possibly removable root";
+
+/// Completion evidence is separate from the hash result: a failed operation
+/// can still prove that its repository-selected child processes were stopped.
+#[derive(Debug)]
+pub(crate) struct WorkingTreeHashObservation {
+    pub(crate) result: Result<String, GitError>,
+    pub(crate) writers_quiescent: bool,
+}
 
 /// A handle on one git checkout (the main repository or a linked
 /// worktree). Constructed via [`GitRepo::discover`].
@@ -4918,6 +4938,22 @@ impl GitRepo {
     /// On Unix, each private-index Git child runs in an owned process group;
     /// completion also proves same-group clean-filter descendants are quiescent.
     pub fn working_tree_hash(&self) -> Result<String, GitError> {
+        self.working_tree_hash_observation().result
+    }
+
+    pub(crate) fn working_tree_hash_observation(&self) -> WorkingTreeHashObservation {
+        let mut writers_quiescent = true;
+        let result = self.working_tree_hash_with_quiescence(&mut writers_quiescent);
+        WorkingTreeHashObservation {
+            result,
+            writers_quiescent,
+        }
+    }
+
+    fn working_tree_hash_with_quiescence(
+        &self,
+        writers_quiescent: &mut bool,
+    ) -> Result<String, GitError> {
         let index_dir = self.git_common_dir()?.join("aethyme-broker/indexes");
         std::fs::create_dir_all(&index_dir).map_err(|source| GitError::Spawn {
             args: format!("create_dir_all {}", index_dir.display()),
@@ -4936,19 +4972,39 @@ impl GitRepo {
                 .unwrap_or_default()
         ));
         let result = (|| {
-            run_git_with_index_for_tree_hash(&self.root, &tmp_str, &["read-tree", "HEAD"])?;
+            run_git_with_index_for_tree_hash(
+                &self.root,
+                &tmp_str,
+                &["read-tree", "HEAD"],
+                writers_quiescent,
+            )?;
             // Capture tracked edits and deletions first, including anything
             // intentionally tracked beneath a runtime path. The exclusions
             // on the second pass therefore only omit untracked operational
             // state and cannot hide tracked inputs from the cache key.
-            run_git_with_index_for_tree_hash(&self.root, &tmp_str, &["add", "-u", "--", "."])?;
+            run_git_with_index_for_tree_hash(
+                &self.root,
+                &tmp_str,
+                &["add", "-u", "--", "."],
+                writers_quiescent,
+            )?;
             let exclusions =
                 crate::runtime_paths::broker_runtime_untracked_git_pathspec_exclusions()
                     .collect::<Vec<_>>();
             let mut add_all_args = vec!["add", "-A", "--", "."];
             add_all_args.extend(exclusions.iter().map(String::as_str));
-            run_git_with_index_for_tree_hash(&self.root, &tmp_str, &add_all_args)?;
-            run_git_with_index_for_tree_hash(&self.root, &tmp_str, &["write-tree"])
+            run_git_with_index_for_tree_hash(
+                &self.root,
+                &tmp_str,
+                &add_all_args,
+                writers_quiescent,
+            )?;
+            run_git_with_index_for_tree_hash(
+                &self.root,
+                &tmp_str,
+                &["write-tree"],
+                writers_quiescent,
+            )
         })();
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(lock);

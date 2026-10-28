@@ -2895,28 +2895,16 @@ where
         .as_mut()
         .expect("invocation marker was just created")
         .dispatch_attempted();
-    let tree = match checkout.working_tree_hash() {
-        Ok(tree) => tree,
-        Err(error @ crate::git::GitError::Git { .. }) => {
-            // This variant means Git completed and returned a nonzero status;
-            // its configured clean-filter command has returned too. Other
-            // error variants do not prove that an invoked filter is gone.
-            invocation_artifact_use
-                .as_mut()
-                .expect("invocation marker remains until a gate is selected")
-                .confirm_no_spawn_or_quiescence();
-            return Err(error.into());
-        }
-        Err(error) => return Err(error.into()),
-    };
-    // A successful working-tree hash means Git completed its private-index
-    // operations, including any configured clean-filter commands. Keep the
-    // marker on every error or interrupted path, where that completion is
-    // unknown.
-    invocation_artifact_use
-        .as_mut()
-        .expect("invocation marker remains until a gate is selected")
-        .confirm_no_spawn_or_quiescence();
+    let hash = checkout.working_tree_hash_observation();
+    if hash.writers_quiescent {
+        invocation_artifact_use
+            .as_mut()
+            .expect("invocation marker remains until a gate is selected")
+            .confirm_no_spawn_or_quiescence();
+    }
+    // A timeout or output-cap failure may have stopped every owned writer.
+    // Settle that proven case too; unresolved cleanup keeps its marker.
+    let tree = hash.result?;
     if let Some(session_id) = session_id {
         // This stop/recovery pass precedes admission for a new gate so
         // obsolete process groups are stopped promptly. It records one
@@ -6005,6 +5993,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn completed_nonzero_clean_filter_settles_marker_without_dispatch() {
+        assert_clean_filter_failure_settles_marker(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopped_timed_out_clean_filter_settles_marker_without_dispatch() {
+        assert_clean_filter_failure_settles_marker(true);
+    }
+
+    #[cfg(unix)]
+    fn assert_clean_filter_failure_settles_marker(timeout: bool) {
         let root = tempfile::tempdir().unwrap();
         let checkout_root = root.path().join("checkout");
         init_repo(&checkout_root);
@@ -6035,8 +6034,13 @@ mod tests {
             .status()
             .unwrap();
         assert!(commit.success());
+        let filter_command = if timeout {
+            "printf started > .git/timeout-filter-started; sleep 30; cat"
+        } else {
+            "exit 1"
+        };
         let config = std::process::Command::new("git")
-            .args(["config", "filter.fail-clean.clean", "exit 1"])
+            .args(["config", "filter.fail-clean.clean", filter_command])
             .current_dir(&checkout_root)
             .status()
             .unwrap();
@@ -6054,6 +6058,8 @@ mod tests {
         let gate = synthetic_gate("failing-clean-filter", false, "touch should-not-run");
         let progress = Lines::default();
         let admission_host = SequencedAdmissionHost::new(vec![None]);
+        let _git_deadline =
+            timeout.then(|| crate::git::limit_git_until(Instant::now() + Duration::from_secs(3)));
         let result = run_selections_with_admission(
             &mut store,
             &checkout_root,
@@ -6076,6 +6082,9 @@ mod tests {
         );
 
         assert!(result.is_err());
+        if timeout {
+            assert!(checkout_root.join(".git/timeout-filter-started").exists());
+        }
         assert!(!checkout_root.join("should-not-run").exists());
         assert!(matches!(
             crate::file_lock::artifact_use::try_artifact_use_reclaimer(

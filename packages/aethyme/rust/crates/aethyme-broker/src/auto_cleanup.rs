@@ -2715,6 +2715,7 @@ mod tests {
         decode_session_retirement_cursor, first_live_worktree_overlap,
         group_closed_checkout_sessions, ignored_content_reason, resolve_worktree_paths_until,
     };
+    use super::{SESSION_RETIREMENT_CURSOR_KEY, now_ms};
     #[cfg(unix)]
     use crate::git::GitRepo;
     use std::path::Path;

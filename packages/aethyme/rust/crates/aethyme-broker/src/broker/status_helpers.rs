@@ -1772,7 +1772,7 @@ pub(super) fn worktree_activity_ms(main_root: &Path, session: &Session) -> Optio
 /// Checked activity evidence for an abandonment decision. A missing checkout
 /// retains the age-only rule, but an existing checkout with unreadable Git
 /// metadata must remain protected rather than looking maximally old.
-pub(super) fn checked_worktree_activity_ms(
+pub(crate) fn checked_worktree_activity_ms(
     main_root: &Path,
     session: &Session,
 ) -> Result<Option<i64>, std::io::Error> {

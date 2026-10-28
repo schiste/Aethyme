@@ -6434,6 +6434,7 @@ mod tracked_submodule_cleanup_tests {
 #[cfg(test)]
 mod cleanup_target_snapshot_tests {
     use super::CleanupDisposition;
+    use crate::BrokerOpError;
     use crate::test_storage::TestStorage;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};

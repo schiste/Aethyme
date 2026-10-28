@@ -6571,7 +6571,7 @@ impl Broker {
             let mut ignored_directory_discovery = None;
             let mut ignored_directory_candidates = BTreeSet::new();
             let mut ignored_directory_discovery_complete = true;
-            if ignored_directory_policy.is_some() {
+            if let Some(cleanup_policy) = ignored_directory_policy.as_ref() {
                 match discover_ignored_directory_roots_bounded(
                     &root,
                     &checkout,
@@ -6867,7 +6867,7 @@ impl Broker {
                 };
                 let current_session = self.store().session(session.id)?;
                 if current_session.status != crate::SessionStatus::Cleaned
-                    || current_session.cleanup_state != SessionCleanupState::Closed
+                    || current_session.cleanup_state != crate::SessionCleanupState::Closed
                     || current_session.worktree_path != session.worktree_path
                     || current_session.branch != session.branch
                     || current_session.origin != session.origin
@@ -7726,7 +7726,7 @@ impl Broker {
                 };
                 let current_session = self.store().session(candidate.session_id)?;
                 if !current_session.status.is_closed()
-                    || current_session.cleanup_state != SessionCleanupState::Closed
+                    || current_session.cleanup_state != crate::SessionCleanupState::Closed
                     || current_session.worktree_path != candidate.worktree_path
                 {
                     failures.push(format!(
