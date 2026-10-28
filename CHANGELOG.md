@@ -4,6 +4,29 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.42] - 2026-10-28
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0842).
+
+### Added
+
+- Eligible coordinated Git fetches and pushes use exact ref lanes while retaining common-directory and remote compatibility locks. Unknown forms remain in the conservative repository-wide lane.
+- Strict fetches retain provider-completion witnesses. Recovery can accept a completed fetch only when its recorded process, repository, configuration, and current local/remote refs prove the outcome; uncertain outcomes remain blocked.
+- Lease diagnostics show bounded changed-line ranges and grouped owners. Explicit claims, notes, and release guidance support shared-edit handoffs without inferring semantic independence.
+- Git lock waits identify their lane, holder evidence, and next actions where available.
+- Deployment and upgrade plans can preview bounded generated-file diffs with raw-content digests and escaped terminal output.
+
+### Fixed
+
+- Releasing an explicit path claim preserves same-path implicit lease observations.
+- Host database contention respects the remaining admission deadline, and scoped Git operations preserve parent/resource crash barriers.
+- Broker operation test fixtures quote paths containing spaces and apostrophes and keep timed-out providers owned and reaped.
+
+### Validation
+
+- Adds a warning-only paired Playground matrix for broker actions. Five local pairs showed no warning-band regression in ten comparable actions, but no broad speedup; routine status remained above its 150 ms warning budget. Strict fetch and complete diff evidence have no equivalent baseline comparison.
+- Hosted workspace qualification passed 6,200 tests with 37 skips before this metadata-only release update; focused native qualification passed 225 tests. Release metadata and artifacts are checked separately by the release workflows.
+
 ## [0.8.41] - 2026-10-27
 
 **Breaking:** see [UPGRADING.md](UPGRADING.md#v0841).
