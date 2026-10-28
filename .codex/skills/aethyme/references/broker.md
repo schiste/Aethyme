@@ -415,6 +415,12 @@ blocked.
    A closed or `cleaned` session is not proof of physical removal. Report each
    path's cleanup result or blocker, keeping uninspected and unsupported scopes
    unknown. Preserve complete audit output and disclose incomplete scans.
+   Group session rows by canonical checkout identity before counting or planning
+   removal. Inspect every alias in the group: one closed row does not establish
+   that the checkout is unused. Recheck current ownership and process use before
+   each native cleanup, preserve other aliases' branch refs, and stop an exact
+   sweep on an ambiguous result. Save per-target results and verify path absence;
+   do not count a successful close as a removed checkout.
    Filesystem birth time, descendant modification time, broker activity, and
    source edits are different observations; label the date used. Walk without
    following symlinks and distinguish summed file bytes from unique physical
