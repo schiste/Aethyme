@@ -155,6 +155,22 @@ fn a_dirty_worktree_is_archived_restored_and_then_removed() {
     std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
     std::fs::write(worktree.join("target/debug/cache.bin"), vec![9_u8; 4096]).unwrap();
 
+    let human = run(
+        tmp.path(),
+        &["finish", "cleanup", "resolve", &id, "--archive"],
+    );
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let human_text = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        human_text.contains(
+            "committed work: landing not evaluated; recovery preserves target-absent commits"
+        ),
+        "{human_text}"
+    );
     let reviewed = plan(tmp.path(), &id);
     assert_eq!(reviewed["disposition"], "dirty");
     assert_eq!(reviewed["unlanded_commits"].as_array().unwrap().len(), 1);
@@ -242,7 +258,7 @@ fn a_dirty_worktree_is_archived_restored_and_then_removed() {
 }
 
 #[test]
-fn pending_commits_are_carried_by_a_verified_bundle() {
+fn target_absent_commits_are_carried_by_a_verified_bundle() {
     let tmp = repo();
     let mut broker = isolation::open(tmp.path());
     let session = broker.start_worktree("pending fixture", None).unwrap();
@@ -259,7 +275,8 @@ fn pending_commits_are_carried_by_a_verified_bundle() {
     let id = session.id.to_string();
 
     let reviewed = plan(tmp.path(), &id);
-    assert_eq!(reviewed["disposition"], "pending_commits");
+    assert_eq!(reviewed["disposition"], "unproven_provenance");
+    assert_eq!(reviewed["landing"]["state"], "not_evaluated_for_recovery");
     assert_eq!(reviewed["unlanded_commits"].as_array().unwrap().len(), 2);
     assert_eq!(reviewed["staged_patch_bytes"], 0);
     assert_eq!(reviewed["unstaged_patch_bytes"], 0);
@@ -284,7 +301,7 @@ fn pending_commits_are_carried_by_a_verified_bundle() {
         serde_json::from_slice(&std::fs::read(archive.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest["head"], head);
     assert_eq!(manifest["bundle"], "commits.bundle");
-    assert_eq!(manifest["landing"]["state"], "not_landed");
+    assert_eq!(manifest["landing"]["state"], "not_evaluated_for_recovery");
 
     let events = run(
         tmp.path(),
@@ -599,6 +616,48 @@ fn a_failed_archive_leaves_the_worktree_in_place() {
 }
 
 #[test]
+fn squash_landed_content_is_recoverable_without_a_landing_claim() {
+    let tmp = repo();
+    let mut broker = isolation::open(tmp.path());
+    let session = broker
+        .start_worktree("squash recovery fixture", None)
+        .unwrap();
+    let worktree = PathBuf::from(&session.worktree_path);
+    std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
+    git(&worktree, &["add", "done.txt"]);
+    git(&worktree, &["commit", "-qm", "session work"]);
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+    git(tmp.path(), &["merge", "--squash", &session.branch]);
+    git(tmp.path(), &["commit", "-qm", "squash delivery"]);
+    assert_ne!(git(tmp.path(), &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        git(tmp.path(), &["rev-parse", "HEAD^{tree}"]),
+        git(&worktree, &["rev-parse", "HEAD^{tree}"])
+    );
+    broker.close(session.id).unwrap();
+    drop(broker);
+    let id = session.id.to_string();
+    let reviewed = plan(tmp.path(), &id);
+    assert_eq!(reviewed["disposition"], "unproven_provenance");
+    assert_eq!(reviewed["landing"]["state"], "not_evaluated_for_recovery");
+    assert_eq!(reviewed["unlanded_commits"], serde_json::json!([head]));
+    let outcome = json(&apply(
+        tmp.path(),
+        &id,
+        reviewed["digest"].as_str().unwrap(),
+    ));
+    assert_eq!(outcome["worktree_removed"], true);
+    assert!(!worktree.exists());
+    let archive = PathBuf::from(outcome["archive"].as_str().unwrap());
+    let bundle = archive
+        .join("commits.bundle")
+        .to_string_lossy()
+        .into_owned();
+    git(tmp.path(), &["bundle", "verify", "-q", &bundle]);
+    assert!(git(tmp.path(), &["bundle", "list-heads", &bundle]).starts_with(&head));
+}
+
+#[test]
 fn live_eligible_and_unmarked_requests_are_refused() {
     let tmp = repo();
     let mut broker = isolation::open(tmp.path());
@@ -609,7 +668,9 @@ fn live_eligible_and_unmarked_requests_are_refused() {
     std::fs::write(landed_path.join("done.txt"), "done\n").unwrap();
     git(&landed_path, &["add", "done.txt"]);
     git(&landed_path, &["commit", "-qm", "done"]);
-    assert!(broker.submit(landed.id).unwrap().promoted);
+    // Recovery's cheap eligibility check proves ancestry, not replayed or
+    // squash delivery. Keep this refusal fixture ancestry-represented.
+    git(tmp.path(), &["merge", "--ff-only", &landed.branch]);
     assert!(
         broker
             .finish_with_options(

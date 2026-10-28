@@ -206,9 +206,10 @@ Verdicts and what each means:
 | `pending_commits` | commits after the adoption boundary that were never accepted |
 | `unproven_provenance` | the session HEAD cannot be related to its recorded boundary, or the boundary is not on any delivery target |
 
-`unproven_provenance` means the **SHA** is unreachable. It does not mean the
-work is lost — a cherry-pick or a squash merge lands identical content under a
-different SHA, and the broker cannot see that. Proving it is step 4.
+`unproven_provenance` means the broker could not establish the required
+representation proof. The work may have landed under a different SHA, or a
+bounded history inspection may have been unavailable. This is not evidence that
+the work was lost or that deletion is safe.
 
 Adopted worktrees are never in the bulk sweep. Neither are live sessions.
 
@@ -224,6 +225,45 @@ dirty between plan and apply is skipped, not deleted on the older reading.
 
 This removes only what it could prove. Everything else is left, and that is the
 correct outcome — not a failure to reclaim.
+
+## Preserve unique work before removing a checkout
+
+For one closed, broker-spawned checkout that ordinary cleanup retains:
+
+```sh
+aethyme broker finish cleanup resolve <session-id> --archive --json
+```
+
+Review the complete plan, then confirm its digest with the same command plus
+`--confirm <sha256>`. Recovery preserves commits absent from the listed delivery
+targets, staged and unstaged patches, untracked files, and protected standalone
+ignored files and links. Disposable ignored directories follow the configured
+cleanup policy. Live checkouts, unsafe paths, incomplete inventories and
+unsupported nested repositories remain protected.
+
+Resolve plan schema `3` uses a versioned content digest that binds the session,
+checkout path, branch ref and tip, HEAD, patch hashes, complete preserved-file
+inventory and ignored-content policy. Delivery targets and target-absent commits
+are evidence for building the archive, rather than inputs to that content
+confirmation. Historical content matching is not needed for preservation:
+`landing.state` is `not_evaluated_for_recovery`. This is neither a positive nor a
+negative landing verdict. Clean sessions without a direct ancestry proof are
+reported as `unproven_provenance`, including work that might have been delivered
+by squash or replay. Clean ancestry-proven sessions need no recovery archive and
+the public planner directs them to ordinary cleanup.
+
+Recovery archive schema `4` records that evidence snapshot alongside the content
+proof; older archive schemas remain readable and verifiable. Before removal,
+the broker checks the current content proof, verifies the original archive,
+and proves every omitted Git prerequisite remains reachable from a current
+delivery target. An upstream fast-forward can therefore preserve eligibility;
+changed content, branch state, lost history or unavailable evidence retains the
+checkout and archive.
+
+Archive creation and checkout removal are separate results. Inspect
+`worktree_removed` and `cleanup_error` even after a successful command, and keep
+the reported archive path. Never count an archived-but-retained checkout as
+removed or use `--force` to work around a refusal.
 
 ## 4. Prove containment before discarding anything else
 
