@@ -556,3 +556,15 @@ blocked.
    An explicitly authorized operator or release workflow may merge, tag, push,
    force-push, or delete refs through the broker; authorization does not permit
    bypassing coordination.
+
+   Before a release version bump, inspect
+   `packages/aethyme/rust/crates/aethyme-testkit/tests/release_contract.rs`
+   and the current `CHANGELOG.md`/`UPGRADING.md` rules. Update the workspace
+   version, `Cargo.lock`, `.aethyme/engine-version`, and changelog entry; add an
+   `UPGRADING.md` section only when the release-note contract requires one, and
+   verify the staged router and engine CLI both report the release version and
+   expected source commit.
+   Regenerate graph fragments only when `.aethyme/config.toml` declares them
+   authoritative and they are committed, after updating the engine pin and
+   using that pinned engine. Do not infer that graph generation applies from a
+   generic release-contract assertion when this repository has graph disabled.
