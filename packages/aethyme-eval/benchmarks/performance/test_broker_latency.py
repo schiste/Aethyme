@@ -459,7 +459,7 @@ class PairedActionMatrixTests(unittest.TestCase):
                 'duration_ms': 12.5,
             }
 
-        def broker_error(error_message, code=3, schema='aethyme.broker-error/v1', **extra):
+        def broker_error(error_message, code=1, schema='aethyme.broker-error/v1', **extra):
             return json.dumps({
                 'error': {'code': code, 'message': error_message},
                 'schema': schema,
