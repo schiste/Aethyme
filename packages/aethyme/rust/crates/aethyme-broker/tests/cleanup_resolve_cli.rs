@@ -284,7 +284,7 @@ fn pending_commits_are_carried_by_a_verified_bundle() {
         serde_json::from_slice(&std::fs::read(archive.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest["head"], head);
     assert_eq!(manifest["bundle"], "commits.bundle");
-    assert_eq!(manifest["landing"]["state"], "not_landed");
+    assert_eq!(manifest["landing"]["state"], "not_evaluated_for_recovery");
 
     let events = run(
         tmp.path(),
