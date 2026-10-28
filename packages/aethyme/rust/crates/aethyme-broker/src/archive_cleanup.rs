@@ -91,6 +91,13 @@ pub(crate) enum ArchiveCleanupResidualKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "The production archive cleanup producer is staged separately; tests validate this contract."
+    )
+)]
 pub(crate) enum IntentWriteError {
     Invalid(String),
     Existing,
@@ -257,6 +264,13 @@ impl ArchiveCleanupIntent {
         Ok(())
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "The production archive cleanup producer is staged separately; tests validate this contract."
+        )
+    )]
     pub(crate) fn encode(&self) -> Result<Vec<u8>, String> {
         self.validate()?;
         let bytes = serde_json::to_vec(self)
@@ -572,6 +586,8 @@ fn verify_intent_directory_bindings(bindings: &[IntentDirectoryBinding]) -> Resu
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn named_directory_matches(binding: &IntentDirectoryBinding) -> Result<bool, String> {
+    // SAFETY: zero is a valid representation for the integer fields in libc::stat;
+    // fstatat fills this output buffer before any field is read.
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
     // SAFETY: the parent descriptor is pinned, the name is one component, and
     // `stat` is a writable output buffer. AT_SYMLINK_NOFOLLOW inspects the leaf.
@@ -595,7 +611,7 @@ fn named_directory_matches(binding: &IntentDirectoryBinding) -> Result<bool, Str
     let device = intent_stat_device(&stat)?;
     Ok(device == binding.device
         && stat.st_ino as u64 == binding.inode
-        && (stat.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFDIR as u32)
+        && ((stat.st_mode & libc::S_IFMT) == libc::S_IFDIR))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -606,6 +622,8 @@ fn named_intent_matches(
 ) -> Result<bool, String> {
     use std::os::unix::fs::MetadataExt;
 
+    // SAFETY: zero is a valid representation for the integer fields in libc::stat;
+    // fstatat fills this output buffer before any field is read.
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
     // SAFETY: `parent_fd` is pinned, `name` is one component, and `stat` is a
     // writable output buffer. AT_SYMLINK_NOFOLLOW refuses a replacement link.
@@ -628,14 +646,24 @@ fn named_intent_matches(
     }
     Ok(intent_stat_device(&stat)? == opened.dev()
         && stat.st_ino as u64 == opened.ino()
-        && stat.st_mode as u32 == opened.mode() as u32
+        && intent_stat_mode(&stat) == opened.mode()
         && u64::try_from(stat.st_size).ok() == Some(opened.len()))
+}
+
+#[cfg(target_os = "linux")]
+fn intent_stat_mode(stat: &libc::stat) -> u32 {
+    stat.st_mode
+}
+
+#[cfg(target_os = "macos")]
+fn intent_stat_mode(stat: &libc::stat) -> u32 {
+    u32::from(stat.st_mode)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn intent_stat_device(stat: &libc::stat) -> Result<u64, String> {
     #[cfg(target_os = "linux")]
-    let device = stat.st_dev as u64;
+    let device = stat.st_dev;
     #[cfg(target_os = "macos")]
     let device = u64::try_from(stat.st_dev)
         .map_err(|_| "archive cleanup intent has an invalid device id".to_owned())?;
@@ -682,6 +710,13 @@ fn read_pending_for_session_other(
 }
 
 /// Publish once; an existing file, directory, or symlink is never replaced.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "The production archive cleanup producer is staged separately; tests validate this contract."
+    )
+)]
 pub(crate) fn write_new(
     path: &Path,
     intent: &ArchiveCleanupIntent,
@@ -701,6 +736,13 @@ pub(crate) fn write_new(
 }
 
 /// Read a bounded, owner-owned regular intent file without following links.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "The production archive cleanup recovery consumer is staged separately; tests validate this contract."
+    )
+)]
 pub(crate) fn read_bounded(path: &Path, deadline: Instant) -> Result<ArchiveCleanupIntent, String> {
     check_deadline(deadline)?;
     verify_private_parent(path)?;
@@ -785,6 +827,13 @@ fn verify_owned_private(metadata: &fs::Metadata) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "The production archive cleanup producer is staged separately; tests validate this contract."
+    )
+)]
 fn verify_private_parent(path: &Path) -> Result<(), String> {
     let parent = path
         .parent()
@@ -895,6 +944,12 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
+    fn private_tempdir() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        crate::host_state::protect_host_state_path(directory.path(), true).unwrap();
+        directory
+    }
+
     fn sample_intent() -> ArchiveCleanupIntent {
         ArchiveCleanupIntent {
             schema_version: ARCHIVE_CLEANUP_INTENT_SCHEMA_VERSION,
@@ -937,7 +992,7 @@ mod tests {
 
     #[test]
     fn intent_round_trip_preserves_archive_generation_and_residual_bindings() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let path = intent_path(directory.path(), 42).unwrap();
         let intent = sample_intent();
         write_new(&path, &intent).unwrap();
@@ -947,7 +1002,7 @@ mod tests {
 
     #[test]
     fn existing_intent_is_never_replaced() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let path = intent_path(directory.path(), 42).unwrap();
         let intent = sample_intent();
         write_new(&path, &intent).unwrap();
@@ -962,7 +1017,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlink_intent_is_rejected_without_following_or_replacing_it() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let target = directory.path().join("operator-choice.json");
         std::fs::write(&target, b"operator data").unwrap();
         let path = intent_path(directory.path(), 42).unwrap();
@@ -1075,7 +1130,7 @@ mod tests {
 
     #[test]
     fn expired_and_oversized_intents_are_rejected_before_decode() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let path = intent_path(directory.path(), 42).unwrap();
         std::fs::write(&path, vec![b'x'; 32 * 1024 * 1024 + 1]).unwrap();
         crate::host_state::protect_host_state_path(&path, false).unwrap();
@@ -1095,7 +1150,7 @@ mod tests {
     fn group_or_world_readable_intent_is_rejected() {
         use std::os::unix::fs::PermissionsExt;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let path = intent_path(directory.path(), 42).unwrap();
         write_new(&path, &sample_intent()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();

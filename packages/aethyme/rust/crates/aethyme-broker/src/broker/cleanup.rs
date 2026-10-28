@@ -5039,8 +5039,9 @@ mod registered_removal_failure_tests {
             "pending intent was consumed by ordinary cleanup"
         );
 
+        let cleanup_plan = broker.cleanup_resolve_plan(session.id).unwrap();
         let archive_error = broker
-            .cleanup_after_recovery_archive(session.id, &"d".repeat(64), &archive_path)
+            .cleanup_after_recovery_archive(session.id, &cleanup_plan, &archive_path)
             .unwrap_err();
         assert!(
             archive_error
