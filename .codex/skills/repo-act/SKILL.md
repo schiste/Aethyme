@@ -524,6 +524,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   and mutant byte lengths plus one byte. Before touching source, exercise the
   actual mutation and restoration on scratch files seeded with pinned source bytes;
   equal-sized toy replacements cannot validate a size-changing mutation.
+- Treat recovery archive verification and checkout removal as separate outcomes.
+  A successful command can return `worktree_removed: false`; inspect its
+  `cleanup_error`, preserve the archive path, and verify the exact checkout is
+  absent before counting a removal. A stale-plan refusal requires fresh review,
+  never a forced retry.
 - When recording cleanup results, validate the pinned progress record and exact
   removed set before updating progress. Hold the progress lock through an atomic
   replacement, directory sync, and readback; publish the verification proof only
