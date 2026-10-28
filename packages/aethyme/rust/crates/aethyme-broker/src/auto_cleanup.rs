@@ -774,7 +774,7 @@ fn checkout_git_dir_checked(worktree: &Path) -> Result<Option<PathBuf>, std::io:
 }
 
 #[derive(Debug, Clone)]
-struct ResolvedWorktreePath {
+pub(crate) struct ResolvedWorktreePath {
     raw: PathBuf,
     canonical_or_raw: PathBuf,
     git_dir: Option<PathBuf>,
@@ -782,7 +782,7 @@ struct ResolvedWorktreePath {
 }
 
 impl ResolvedWorktreePath {
-    fn resolve(path: &Path) -> Self {
+    pub(crate) fn resolve(path: &Path) -> Self {
         let (canonical_or_raw, path_error) = match std::fs::canonicalize(path) {
             Ok(path) => (path, None),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -813,7 +813,7 @@ impl ResolvedWorktreePath {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LiveOverlapEvidence {
+pub(crate) enum LiveOverlapEvidence {
     Disjoint,
     Overlap,
     Unknown,
@@ -826,7 +826,7 @@ fn deadline_expired(deadline: Option<Instant>) -> bool {
 /// Resolve every live path once, retaining the store's order so a candidate
 /// reports the same first matching session as the former per-pair check. An
 /// expired or partial index is never used to authorize cleanup.
-fn resolve_live_worktree_paths(
+pub(crate) fn resolve_live_worktree_paths(
     live: &[Session],
     deadline: Option<Instant>,
 ) -> Option<Vec<ResolvedWorktreePath>> {
@@ -855,7 +855,7 @@ fn resolve_worktree_paths_until<'a>(
     Some(resolved)
 }
 
-fn live_worktree_overlap(
+pub(crate) fn live_worktree_overlap(
     candidate: &ResolvedWorktreePath,
     live: &ResolvedWorktreePath,
 ) -> LiveOverlapEvidence {
@@ -892,7 +892,7 @@ fn first_live_worktree_overlap(
     )
 }
 
-fn overlap_resolution_error(
+pub(crate) fn overlap_resolution_error(
     candidate: &ResolvedWorktreePath,
     live: &ResolvedWorktreePath,
 ) -> String {

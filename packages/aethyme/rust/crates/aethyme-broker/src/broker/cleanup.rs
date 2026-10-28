@@ -81,6 +81,7 @@ impl CleanupStatusLimits {
 
 struct CleanupInspectionContext<'a> {
     branch_tips: Option<&'a std::collections::BTreeMap<String, String>>,
+    live_checkouts: &'a [(i64, crate::auto_cleanup::ResolvedWorktreePath)],
     delivery_targets: CleanupDeliveryTargets<'a>,
     landing_cache: &'a mut crate::representation::LandingVerdictCache,
     status_limits: CleanupStatusLimits,
@@ -2430,12 +2431,14 @@ impl Broker {
         delivery_targets: &[String],
     ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
         let mut landing_cache = crate::representation::LandingVerdictCache::default();
+        let live_checkouts = self.cleanup_live_checkout_snapshot(Some(status_limits.deadline))?;
         self.cleanup_item_scanned_with_tips(
             session,
             scan,
             records,
             CleanupInspectionContext {
                 branch_tips: None,
+                live_checkouts: &live_checkouts,
                 delivery_targets: CleanupDeliveryTargets::ArchivePreservation(delivery_targets),
                 landing_cache: &mut landing_cache,
                 status_limits,
@@ -2480,12 +2483,14 @@ impl Broker {
         status_limits: CleanupStatusLimits,
     ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
         let mut landing_cache = crate::representation::LandingVerdictCache::default();
+        let live_checkouts = self.cleanup_live_checkout_snapshot(Some(status_limits.deadline))?;
         self.cleanup_item_scanned_with_tips(
             session,
             scan,
             records,
             CleanupInspectionContext {
                 branch_tips: None,
+                live_checkouts: &live_checkouts,
                 delivery_targets: CleanupDeliveryTargets::Fresh,
                 landing_cache: &mut landing_cache,
                 status_limits,
@@ -2506,6 +2511,7 @@ impl Broker {
     ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
         let CleanupInspectionContext {
             branch_tips,
+            live_checkouts,
             delivery_targets,
             landing_cache,
             status_limits,
@@ -2530,16 +2536,29 @@ impl Broker {
             .flatten();
         let broker_owned =
             unreachable.is_none() && self.is_broker_owned_worktree(session, &worktree_path);
+        let live_owner = if worktree_present {
+            overlapping_live_checkout(session.id, &worktree_path, live_checkouts)
+        } else {
+            Ok(None)
+        };
         let (estimated_bytes, estimated_inodes) = worktree_size_estimate(
             &worktree_path,
             &session.worktree_path,
             worktree_present,
-            broker_owned,
+            broker_owned && matches!(&live_owner, Ok(None)),
             scan,
             records,
             |path| crate::disk_headroom::directory_usage_without_following_links(path).ok(),
         );
-        let (mut disposition, mut reason, provenance) = if let Some(reason) = unreachable {
+        let (mut disposition, mut reason, provenance) = if let Err(reason) = &live_owner {
+            (CleanupDisposition::InspectionFailed, reason.clone(), None)
+        } else if let Ok(Some(live_id)) = live_owner {
+            (
+                CleanupDisposition::UnsafePath,
+                format!("checkout overlaps live session {live_id}; preserved its worktree and branch"),
+                None,
+            )
+        } else if let Some(reason) = unreachable {
             // An unplugged drive is not a deleted worktree. Proposing cleanup
             // here would act on a checkout nobody can see, so it stays blocked
             // until the volume is back.
@@ -2805,6 +2824,7 @@ impl Broker {
         // One listing instead of one `rev-parse` per session ever recorded:
         // this plan is on `broker status`'s path through `cleanup_retention`.
         let branch_tips = self.repo.local_branch_tips();
+        let live_checkouts = self.cleanup_live_checkout_snapshot(deadline)?;
         for session in self.store.cleaned_sessions()? {
             if session.origin != SessionOrigin::Spawned {
                 continue;
@@ -2827,6 +2847,7 @@ impl Broker {
                     &mut records,
                     CleanupInspectionContext {
                         branch_tips: branch_tips.as_ref(),
+                        live_checkouts: &live_checkouts,
                         delivery_targets: target_snapshot
                             .delivery_targets
                             .as_deref()
@@ -4284,6 +4305,31 @@ impl Broker {
         Ok(())
     }
 
+    // Reuse one ownership observation across a full plan instead of opening
+    // the session table and canonicalizing every live path per closed row.
+    // Apply takes a fresh observation under the lifecycle claim.
+    fn cleanup_live_checkout_snapshot(
+        &self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<(i64, crate::auto_cleanup::ResolvedWorktreePath)>, BrokerOpError> {
+        let deadline = CleanupStatusLimits::new(
+            deadline,
+            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+        )
+        .deadline;
+        let sessions = self.store.live_sessions()?;
+        let paths = crate::auto_cleanup::resolve_live_worktree_paths(&sessions, Some(deadline))
+        .ok_or_else(|| BrokerOpError::RepresentationUnavailable {
+            reason: "live checkout ownership observation exceeded its deadline".into(),
+        })?;
+        Ok(sessions
+            .into_iter()
+            .map(|session| session.id)
+            .zip(paths)
+            .collect())
+    }
+
     /// Refuse to remove a checkout any other live session works in.
     ///
     /// A closed session's directory can be adopted again (`start --adopt`,
@@ -4292,27 +4338,50 @@ impl Broker {
     /// so no proof about the closed row authorizes removing it -- and no
     /// `--force` does either. Checked immediately before removal, because
     /// adoption takes no GC lock; paths are compared canonically, and a live
-    /// checkout nested inside the directory counts too.
+    /// checkout nested inside the directory or containing it counts too.
     pub(crate) fn refuse_live_checkout(
         &self,
         session_id: i64,
         worktree: &Path,
     ) -> Result<(), BrokerOpError> {
-        let canonical =
-            |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let root = canonical(worktree);
-        for live in self.store.live_sessions()? {
-            if live.id != session_id && canonical(Path::new(&live.worktree_path)).starts_with(&root)
-            {
-                return Err(BrokerOpError::WorktreeInUseByLiveSession {
-                    id: session_id,
-                    live_id: live.id,
-                    path: worktree.to_string_lossy().into_owned(),
-                });
-            }
+        let live_checkouts = self.cleanup_live_checkout_snapshot(self.landing_deadline.get())?;
+        let live_owner = overlapping_live_checkout(session_id, worktree, &live_checkouts)
+            .map_err(|reason| BrokerOpError::DirtyWorktree {
+                id: session_id,
+                reason,
+            })?;
+        if let Some(live_id) = live_owner {
+            return Err(BrokerOpError::WorktreeInUseByLiveSession {
+                id: session_id,
+                live_id,
+                path: worktree.to_string_lossy().into_owned(),
+            });
         }
         Ok(())
     }
+}
+
+fn overlapping_live_checkout(
+    session_id: i64,
+    worktree: &Path,
+    live_checkouts: &[(i64, crate::auto_cleanup::ResolvedWorktreePath)],
+) -> Result<Option<i64>, String> {
+    use crate::auto_cleanup::{LiveOverlapEvidence, ResolvedWorktreePath};
+
+    let candidate = ResolvedWorktreePath::resolve(worktree);
+    for (live_id, path) in live_checkouts {
+        if *live_id == session_id {
+            continue;
+        }
+        match crate::auto_cleanup::live_worktree_overlap(&candidate, path) {
+            LiveOverlapEvidence::Disjoint => {}
+            LiveOverlapEvidence::Overlap => return Ok(Some(*live_id)),
+            LiveOverlapEvidence::Unknown => {
+                return Err(crate::auto_cleanup::overlap_resolution_error(&candidate, path));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn worktree_path_is_real_directory(path: &Path, session_id: i64) -> Result<bool, BrokerOpError> {
@@ -6306,6 +6375,23 @@ mod cleanup_target_snapshot_tests {
             }
         }
         UpstreamLookupTrace { starts }
+    }
+
+    #[test]
+    fn cleanup_live_ownership_snapshot_honors_its_effective_deadline() {
+        let parent = tempfile::tempdir().unwrap();
+        let repository = initialized_repository(parent.path());
+        let storage = TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker.start_worktree("live ownership", None).unwrap();
+        let expired = broker.cleanup_live_checkout_snapshot(Some(std::time::Instant::now()));
+        assert!(matches!(
+            expired,
+            Err(BrokerOpError::RepresentationUnavailable { .. })
+        ));
+        let observed = broker.cleanup_live_checkout_snapshot(None).unwrap();
+        assert!(observed.iter().any(|(id, _)| *id == session.id));
+        assert!(Path::new(&session.worktree_path).is_dir());
     }
 
     #[test]
