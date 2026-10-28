@@ -328,6 +328,23 @@ is the point, and an unexplained `--force` is indistinguishable from a guess.
 
 ## 6. Retry and recovery
 
+`aethyme broker gc plan` uses a cooperative shared 10-second inspection budget.
+An in-flight database query or filesystem call can finish after that deadline.
+A plan that reaches the budget, entry cap, or an unavailable inventory reports the
+deferred checks and has no apply digest. Use `aethyme broker gc plan
+--full-scan` when the inventory is incomplete or needs more time. It removes
+the default deadline and artifact-discovery entry cap; discovery still stops
+at six directory levels. Then use the emitted
+`aethyme broker gc apply` command with the same `--full-scan` option. This
+path can take much longer because it measures candidate worktrees and caches
+and verifies recovery archives. In particular, the default plan defers the entire recovery
+archive inventory whenever its archive directory is nonempty; it does not
+hash archive bundles during the bounded scan. If you only need regenerable
+build output, `aethyme broker gc reclaim plan` provides the targeted review.
+
+An apply with an existing journal resumes that authorized journal directly;
+the planning flags only control the fresh-plan check when no journal exists.
+
 Cleanup is idempotent and needs no live agent. A removal interrupted partway is
 judged and completed on the next run rather than refused, so the recovery for an
 interrupted sweep is to run the sweep again.

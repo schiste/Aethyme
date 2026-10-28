@@ -543,11 +543,21 @@ fn parse_accepts_gc_plan_and_confirmed_apply() {
     assert_eq!(plan.positional, vec!["plan"]);
     assert!(plan.json);
 
+    let Ok(full_plan) = super::parse(&args(&["plan", "--full-scan", "--json"])) else {
+        panic!("explicit full gc plan should parse");
+    };
+    assert!(full_plan.full_scan);
+
     let Ok(apply) = super::parse(&args(&["apply", "--confirm", "aabb"])) else {
         panic!("gc apply should parse");
     };
     assert_eq!(apply.positional, vec!["apply"]);
     assert_eq!(apply.confirm.as_deref(), Some("aabb"));
+
+    let Ok(full_apply) = super::parse(&args(&["apply", "--confirm", "aabb", "--full-scan"])) else {
+        panic!("gc apply with the plan scan mode should parse");
+    };
+    assert!(full_apply.full_scan);
 
     let Ok(abandon) = super::parse(&args(&["abandon", "--confirm", "aabb"])) else {
         panic!("gc abandon should parse");
@@ -1210,6 +1220,13 @@ fn a_flag_valid_elsewhere_is_refused_with_where_it_applies() {
             "{subcommand} {positional:?} {flags:?}: {message}"
         );
     }
+}
+
+#[test]
+fn full_scan_is_only_valid_for_gc_plan_and_apply() {
+    assert_eq!(refusal("gc", &["plan"], &["--full-scan"]), None);
+    assert_eq!(refusal("gc", &["apply"], &["--full-scan"]), None);
+    assert!(refusal("gc", &["sweep"], &["--full-scan"]).is_some());
 }
 
 /// `adopt --base` keeps the explanation of why no base can apply.

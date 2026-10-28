@@ -618,9 +618,17 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     // `plan` reads `--confirm` only to refuse it by name.
     (
         "gc plan",
-        &["--detail", "--confirm", "--include-active-gate-cache"],
+        &[
+            "--detail",
+            "--confirm",
+            "--include-active-gate-cache",
+            "--full-scan",
+        ],
     ),
-    ("gc apply", &["--confirm", "--include-active-gate-cache"]),
+    (
+        "gc apply",
+        &["--confirm", "--include-active-gate-cache", "--full-scan"],
+    ),
     ("gc sweep", &[]),
     ("gc __continue-artifacts", &[]),
     ("worktrees", &["--measure"]),

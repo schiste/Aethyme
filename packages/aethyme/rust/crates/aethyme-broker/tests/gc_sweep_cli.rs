@@ -405,6 +405,16 @@ fn plan_json(repo: &Path, container: &Path) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn full_scan_plan_json(repo: &Path, container: &Path) -> serde_json::Value {
+    let output = run(repo, container, &["gc", "plan", "--full-scan", "--json"]);
+    assert!(
+        output.status.success(),
+        "gc plan --full-scan: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
 fn reclaim_plan_json(repo: &Path, container: &Path) -> serde_json::Value {
     let output = run(repo, container, &["gc", "reclaim", "plan", "--json"]);
     assert!(
@@ -930,17 +940,14 @@ fn registered_orphan(repo: &Path, container: &Path, origin: &Path) -> PathBuf {
 }
 
 #[test]
-fn orphaned_roots_are_swept_while_owned_and_unmarked_roots_are_protected() {
+fn orphaned_roots_are_swept_while_owned_roots_are_protected() {
     let (repo, container) =
         fixture("[retention]\norphan_worktree_roots_days = 0\nartifact_sweep_budget_ms = 0\n");
     let missing = container.path().join("deleted-repository");
     let orphan = registered_orphan(repo.path(), container.path(), &missing);
     let owned = stamp_root(container.path(), "repo-owned", repo.path());
-    let unmarked = container.path().join("repo-unmarked");
-    std::fs::create_dir_all(&unmarked).unwrap();
-    std::fs::write(unmarked.join("stray.txt"), "bytes\n").unwrap();
 
-    let plan = plan_json(repo.path(), container.path());
+    let plan = full_scan_plan_json(repo.path(), container.path());
     let keys: Vec<&str> = plan["orphans"]
         .as_array()
         .unwrap()
@@ -949,6 +956,50 @@ fn orphaned_roots_are_swept_while_owned_and_unmarked_roots_are_protected() {
         .collect();
     assert_eq!(keys, vec![orphan.file_name().unwrap().to_str().unwrap()]);
     assert!(plan["orphans"][0]["estimated_bytes"].as_u64().unwrap() > 0);
+    let digest = plan["digest"].as_str().unwrap();
+    assert_eq!(
+        digest.len(),
+        64,
+        "complete inventory must be applicable: {plan:#}"
+    );
+
+    let output = run(
+        repo.path(),
+        container.path(),
+        &["gc", "apply", "--confirm", digest, "--full-scan"],
+    );
+    assert!(
+        output.status.success(),
+        "gc apply: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !orphan.exists(),
+        "the registered orphan should be reclaimed"
+    );
+    assert!(owned.exists(), "a root with a live owner must survive");
+}
+
+#[test]
+fn unmarked_worktree_root_defers_orphan_removal() {
+    let (repo, container) =
+        fixture("[retention]\norphan_worktree_roots_days = 0\nartifact_sweep_budget_ms = 0\n");
+    let missing = container.path().join("deleted-repository");
+    let orphan = registered_orphan(repo.path(), container.path(), &missing);
+    let unmarked = container.path().join("repo-unmarked");
+    std::fs::create_dir_all(&unmarked).unwrap();
+    std::fs::write(unmarked.join("stray.txt"), "bytes\n").unwrap();
+
+    let plan = full_scan_plan_json(repo.path(), container.path());
+    assert_eq!(plan["digest"].as_str(), Some(""), "{plan:#}");
+    assert!(
+        plan["deferred_checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check == "orphan_scan"),
+        "unmarked roots must leave orphan discovery incomplete: {plan:#}"
+    );
     assert!(
         plan["blockers"]
             .as_array()
@@ -958,20 +1009,31 @@ fn orphaned_roots_are_swept_while_owned_and_unmarked_roots_are_protected() {
         "a root with no breadcrumb must be reported, never removed blind"
     );
 
-    let digest = plan["digest"].as_str().unwrap();
+    let unissued_confirmation = "a".repeat(64);
     let output = run(
         repo.path(),
         container.path(),
-        &["gc", "apply", "--confirm", digest],
+        &[
+            "gc",
+            "apply",
+            "--confirm",
+            &unissued_confirmation,
+            "--full-scan",
+        ],
     );
     assert!(
-        output.status.success(),
-        "gc apply: {}",
-        String::from_utf8_lossy(&output.stderr)
+        !output.status.success(),
+        "GC must refuse apply when orphan discovery is incomplete"
     );
-    assert!(!orphan.exists(), "the orphaned root should be reclaimed");
-    assert!(owned.exists(), "a root with a live owner must survive");
-    assert!(unmarked.exists(), "an unmarked root must survive");
+    assert!(
+        orphan.exists(),
+        "an incomplete plan must not remove a registered orphan"
+    );
+    let orphan_payload = std::fs::read(orphan.join("some-session/leftover.txt")).unwrap();
+    assert_eq!(orphan_payload.as_slice(), b"registered bytes\n");
+    assert!(unmarked.exists(), "an unmarked root must remain protected");
+    let stray_payload = std::fs::read(unmarked.join("stray.txt")).unwrap();
+    assert_eq!(stray_payload.as_slice(), b"bytes\n");
 }
 
 #[test]

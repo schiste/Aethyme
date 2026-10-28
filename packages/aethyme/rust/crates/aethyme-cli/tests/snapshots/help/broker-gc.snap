@@ -1,16 +1,23 @@
 exit: 0
 --- stdout
-  aethyme broker gc plan [--include-active-gate-cache] [--json]
+  aethyme broker gc plan [--include-active-gate-cache] [--full-scan] [--json]
       Report exact retention-eligible rows, runtime files, represented
       worktrees/refs, finished sessions' build caches, this repository's gate
-      cache, estimated bytes, blockers, and a stable plan digest. The newest
+      cache, estimated bytes, blockers, and (when complete) a stable plan digest. The newest
       gate cache of each kind is kept (active) unless
       --include-active-gate-cache is given; the next gate then rebuilds it
-      from scratch.
-  aethyme broker gc apply --confirm <sha256> [--include-active-gate-cache] [--json]
+      from scratch. The default plan has a cooperative 10-second shared
+      inspection budget;
+      an incomplete plan has no apply digest. A nonempty recovery archive
+      inventory is deferred by default because verifying its bundles can be
+      expensive. --full-scan removes the default 10-second time budget and
+      artifact-discovery entry cap; discovery still stops at six directory
+      levels.
+  aethyme broker gc apply --confirm <sha256> [--include-active-gate-cache] [--full-scan] [--json]
       Apply or resume the exact reviewed plan under an exclusive lock. A
       recovery journal makes interrupted row, file, and worktree cleanup safe.
-      Pass --include-active-gate-cache when the plan was made with it.
+      Pass the same --include-active-gate-cache and --full-scan options used
+      for the plan. An existing journal resumes without a fresh plan scan.
   aethyme broker gc abandon --confirm <pending-digest> [--json]
       Archive a schema 2 or 3 pending journal without resuming or removing
       retained data. Requires a fresh plan review before later apply.

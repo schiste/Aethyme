@@ -248,10 +248,15 @@ pub(super) fn render_storage_apply(report: &crate::StorageApplyReport) {
     }
 }
 
-pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
+pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool, full_scan: bool) {
+    let digest_status = if plan.digest.is_empty() {
+        "incomplete; no apply digest"
+    } else {
+        plan.digest.as_str()
+    };
     out!(
         "GC plan {}: {} rows, {} files, {} represented worktrees, {} build caches, {} gate cache entries, {} orphaned roots, {} reclaimable",
-        plan.digest,
+        digest_status,
         plan.rows.len(),
         plan.files.len(),
         plan.worktrees.len(),
@@ -316,6 +321,24 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
     }
     for warning in &plan.retention_config_warnings {
         out!("  retention warning: {warning}");
+    }
+    if !plan.deferred_checks.is_empty() {
+        out!("  deferred checks: {}", plan.deferred_checks.join(", "));
+        if !full_scan
+            && plan
+                .deferred_checks
+                .iter()
+                .any(|check| check == "recovery_archives")
+        {
+            out!("  recovery archives: nonempty archive inventory is verified only by --full-scan");
+        }
+        if full_scan {
+            out!("  next: resolve the deferred checks and review a new plan");
+        } else {
+            out!(
+                "  next: use `aethyme broker gc reclaim plan` for build caches or repeat with `aethyme broker gc plan --full-scan` for an exhaustive inventory"
+            );
+        }
     }
     if !plan.declined_artifacts.is_empty() {
         out!(
@@ -572,7 +595,9 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
             blocker.reason
         );
     });
-    if plan.rows.is_empty()
+    if !plan.deferred_checks.is_empty() || plan.digest.is_empty() {
+        out!("  apply: unavailable until the plan is complete");
+    } else if plan.rows.is_empty()
         && plan.files.is_empty()
         && plan.worktrees.is_empty()
         && plan.artifacts.is_empty()
@@ -585,7 +610,7 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
         out!("  apply: nothing eligible");
     } else {
         out!(
-            "  apply: aethyme broker gc apply --confirm {}{}",
+            "  apply: aethyme broker gc apply --confirm {}{}{}",
             plan.digest,
             if plan
                 .gate_cache
@@ -595,7 +620,8 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool) {
                 " --include-active-gate-cache"
             } else {
                 ""
-            }
+            },
+            if full_scan { " --full-scan" } else { "" }
         );
     }
 }
@@ -973,26 +999,23 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
                     "gc plan does not accept --confirm; review its emitted digest".into(),
                 ));
             }
-            let plan = if parsed.include_active_gate_cache {
-                broker.gc_plan_including_active_gate_cache()?
-            } else {
-                broker.gc_plan()?
-            };
+            let plan =
+                broker.gc_plan_for_cli(parsed.include_active_gate_cache, parsed.full_scan)?;
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
-                render_gc_plan(&plan, parsed.detail);
+                render_gc_plan(&plan, parsed.detail, parsed.full_scan);
             }
         }
         "apply" => {
             let confirm = parsed.confirm.as_deref().ok_or_else(|| {
                 UsageError::Message("gc apply requires --confirm <sha256>".into())
             })?;
-            let report = if parsed.include_active_gate_cache {
-                broker.gc_apply_including_active_gate_cache(confirm)?
-            } else {
-                broker.gc_apply(confirm)?
-            };
+            let report = broker.gc_apply_for_cli(
+                confirm,
+                parsed.include_active_gate_cache,
+                parsed.full_scan,
+            )?;
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
