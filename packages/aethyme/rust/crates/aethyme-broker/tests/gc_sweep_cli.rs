@@ -405,6 +405,16 @@ fn plan_json(repo: &Path, container: &Path) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn full_scan_plan_json(repo: &Path, container: &Path) -> serde_json::Value {
+    let output = run(repo, container, &["gc", "plan", "--full-scan", "--json"]);
+    assert!(
+        output.status.success(),
+        "gc plan --full-scan: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
 fn reclaim_plan_json(repo: &Path, container: &Path) -> serde_json::Value {
     let output = run(repo, container, &["gc", "reclaim", "plan", "--json"]);
     assert!(
@@ -940,7 +950,7 @@ fn orphaned_roots_are_swept_while_owned_and_unmarked_roots_are_protected() {
     std::fs::create_dir_all(&unmarked).unwrap();
     std::fs::write(unmarked.join("stray.txt"), "bytes\n").unwrap();
 
-    let plan = plan_json(repo.path(), container.path());
+    let plan = full_scan_plan_json(repo.path(), container.path());
     let keys: Vec<&str> = plan["orphans"]
         .as_array()
         .unwrap()
@@ -962,7 +972,7 @@ fn orphaned_roots_are_swept_while_owned_and_unmarked_roots_are_protected() {
     let output = run(
         repo.path(),
         container.path(),
-        &["gc", "apply", "--confirm", digest],
+        &["gc", "apply", "--confirm", digest, "--full-scan"],
     );
     assert!(
         output.status.success(),

@@ -127,7 +127,7 @@ fn age(archive: &Path, days: i64) {
 }
 
 fn plan(repo: &Path) -> serde_json::Value {
-    json(&run(repo, &["gc", "plan", "--json"]))
+    json(&run(repo, &["gc", "plan", "--full-scan", "--json"]))
 }
 
 fn proposed(plan: &serde_json::Value) -> Vec<serde_json::Value> {
@@ -149,6 +149,28 @@ fn unowned(plan: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+#[test]
+fn default_plan_defers_a_nonempty_archive_inventory_without_a_digest() {
+    let tmp = repo();
+    archived_session(tmp.path(), "archived", true);
+
+    let reviewed = json(&run(tmp.path(), &["gc", "plan", "--json"]));
+
+    assert!(
+        reviewed["digest"].as_str().unwrap().is_empty(),
+        "{reviewed}"
+    );
+    assert!(proposed(&reviewed).is_empty(), "{reviewed}");
+    assert!(
+        reviewed["deferred_checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check == "recovery_archives"),
+        "{reviewed}"
+    );
+}
+
 fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap()
 }
@@ -167,7 +189,7 @@ fn an_expired_unlanded_archive_is_proposed_and_says_it_holds_unlanded_work() {
     let reason = candidates[0]["reason"].as_str().unwrap();
     assert!(reason.contains("contains unlanded work"), "{reason}");
 
-    let text = run(tmp.path(), &["gc", "plan"]);
+    let text = run(tmp.path(), &["gc", "plan", "--full-scan"]);
     let text = String::from_utf8_lossy(&text.stdout);
     assert!(text.contains("recovery archive:"), "{text}");
     assert!(text.contains("contains unlanded work"), "{text}");
@@ -271,7 +293,7 @@ fn applying_the_reviewed_plan_removes_exactly_the_proposed_archive() {
     let digest = plan(tmp.path())["digest"].as_str().unwrap().to_owned();
     let report = json(&run(
         tmp.path(),
-        &["gc", "apply", "--confirm", &digest, "--json"],
+        &["gc", "apply", "--confirm", &digest, "--full-scan", "--json"],
     ));
     let removed = report["recovery_archives_removed"].as_array().unwrap();
     assert_eq!(removed.len(), 1, "{report}");
@@ -302,7 +324,10 @@ fn a_digest_reviewed_before_another_archive_expired_is_refused() {
 
     // The set changes after review: the second archive now expires too.
     age(&second, 45);
-    let output = run(tmp.path(), &["gc", "apply", "--confirm", &digest, "--json"]);
+    let output = run(
+        tmp.path(),
+        &["gc", "apply", "--confirm", &digest, "--full-scan", "--json"],
+    );
     assert!(!output.status.success(), "a stale digest must be refused");
     assert!(first.exists() && second.exists(), "nothing was removed");
 }

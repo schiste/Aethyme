@@ -200,10 +200,16 @@ fn run_every_deleter(host: &Host, container: Option<&Path>) {
         String::from_utf8_lossy(&finished.stderr)
     );
     host.json(container, &["gc", "sweep", "--json"]);
-    let plan = host.json(container, &["gc", "plan", "--json"]);
+    let plan = host.json(container, &["gc", "plan", "--full-scan", "--json"]);
     let applied = host.cli(
         container,
-        &["gc", "apply", "--confirm", plan["digest"].as_str().unwrap()],
+        &[
+            "gc",
+            "apply",
+            "--confirm",
+            plan["digest"].as_str().unwrap(),
+            "--full-scan",
+        ],
     );
     assert!(
         applied.status.success(),
