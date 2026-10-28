@@ -17,8 +17,12 @@ For an existing-repository runtime upgrade that crosses a schema or
 destructive-maintenance protocol boundary, take consistent database backups
 before the new runtime's first normal open. When destructive-maintenance
 behavior changes, apply these holds before that open in every enrolled
-repository affected by the shared router/engine pair. In `.aethyme/broker.toml`,
-set `[retention] session_abandoned_after_hours = 0`,
+repository affected by the shared router/engine pair. Before adding temporary
+hold keys, verify that both the installed and target runtime parsers accept
+each key; an older parser may reject a target-only key. While waiting for the
+target artifact, use only keys accepted by both or stage the verified target
+runtime before applying target-only keys. In `.aethyme/broker.toml`, set
+`[retention] session_abandoned_after_hours = 0`,
 `auto_cleanup_worktrees_on_finish = false`, and `artifact_sweep_budget_ms = 0`.
 In `.aethyme/config.toml`, set `[cleanup] strict = true`,
 `ignored_directory_sweep = false`, and `auto_remove = false`. Together, these
