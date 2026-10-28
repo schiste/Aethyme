@@ -4809,11 +4809,14 @@ impl GitRepo {
         GitRepo::discover(dest)
     }
 
-    /// Deterministic tree hash of the checkout's current *working state*
+    /// Deterministic tree hash of the checkout's current source working state
     /// (HEAD + staged + unstaged + untracked, .gitignore respected) — the
-    /// gate-result cache key. Uses a throwaway index so the real index is
-    /// never touched; identical content in different worktrees hashes
-    /// identically, which is what makes cross-agent gate dedup work.
+    /// gate-result cache key. Untracked broker runtime paths are excluded so
+    /// publishing a broker marker cannot invalidate its own cache key; tracked
+    /// changes under those paths remain included. Uses a throwaway index so
+    /// the real index is never touched; identical content in different
+    /// worktrees hashes identically, which is what makes cross-agent gate
+    /// dedup work.
     pub fn working_tree_hash(&self) -> Result<String, GitError> {
         let index_dir = self.git_common_dir()?.join("aethyme-broker/indexes");
         std::fs::create_dir_all(&index_dir).map_err(|source| GitError::Spawn {
@@ -4834,7 +4837,16 @@ impl GitRepo {
         ));
         let result = (|| {
             run_git_with_index(&self.root, &tmp_str, &["read-tree", "HEAD"])?;
-            run_git_with_index(&self.root, &tmp_str, &["add", "-A", "."])?;
+            // Capture tracked edits and deletions first, including anything
+            // intentionally tracked beneath a runtime path. The exclusions
+            // on the second pass therefore only omit untracked operational
+            // state and cannot hide tracked inputs from the cache key.
+            run_git_with_index(&self.root, &tmp_str, &["add", "-u", "--", "."])?;
+            let exclusions = crate::runtime_paths::broker_runtime_untracked_git_pathspec_exclusions()
+                .collect::<Vec<_>>();
+            let mut add_all_args = vec!["add", "-A", "--", "."];
+            add_all_args.extend(exclusions.iter().map(String::as_str));
+            run_git_with_index(&self.root, &tmp_str, &add_all_args)?;
             run_git_with_index(&self.root, &tmp_str, &["write-tree"])
         })();
         let _ = std::fs::remove_file(&tmp);
@@ -9687,5 +9699,85 @@ mod object_batch_bound_tests {
             error,
             GitError::TimedOut { ref args, .. } if args.contains("cat-file")
         ));
+    }
+}
+
+#[cfg(test)]
+mod working_tree_hash_runtime_path_tests {
+    use super::GitRepo;
+    use std::path::Path;
+
+    fn git(root: &Path, args: &[&str]) {
+        super::run_isolated_graph_git(root, args)
+            .unwrap_or_else(|error| panic!("git {}: {error}", args.join(" ")));
+    }
+
+    fn repository() -> (tempfile::TempDir, GitRepo) {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q", "-b", "main"]);
+        git(root.path(), &["config", "user.name", "Working tree hash test"]);
+        git(
+            root.path(),
+            &["config", "user.email", "working-tree-hash@example.invalid"],
+        );
+        std::fs::write(root.path().join("tracked.txt"), "baseline\n").unwrap();
+        git(root.path(), &["add", "tracked.txt"]);
+        git(root.path(), &["commit", "-qm", "initial"]);
+        let repo = GitRepo::discover(root.path()).unwrap();
+        (root, repo)
+    }
+
+    fn write(root: &Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn working_tree_hash_omits_untracked_runtime_but_keeps_other_untracked_files() {
+        let (root, repo) = repository();
+        let baseline = repo.working_tree_hash().unwrap();
+
+        // A directory rule does not classify a same-named standalone file.
+        write(root.path(), ".aethyme/run", "ordinary file\n");
+        assert_ne!(repo.working_tree_hash().unwrap(), baseline);
+        std::fs::remove_file(root.path().join(".aethyme/run")).unwrap();
+        assert_eq!(repo.working_tree_hash().unwrap(), baseline);
+
+        write(root.path(), ".aethyme/run/worker.json", "marker\n");
+        write(root.path(), ".aethyme/logs/worker.log", "log\n");
+        write(root.path(), ".aethyme/gc.lock", "lock\n");
+        write(root.path(), ".aethyme/broker.db-wal", "wal\n");
+        write(
+            root.path(),
+            ".aethyme/broker-action-required.md/child",
+            "runtime child\n",
+        );
+        assert_eq!(repo.working_tree_hash().unwrap(), baseline);
+
+        write(root.path(), "new-source.txt", "ordinary untracked content\n");
+        assert_ne!(repo.working_tree_hash().unwrap(), baseline);
+    }
+
+    #[test]
+    fn working_tree_hash_keeps_tracked_runtime_edits_in_the_key() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q", "-b", "main"]);
+        git(root.path(), &["config", "user.name", "Working tree hash test"]);
+        git(
+            root.path(),
+            &["config", "user.email", "working-tree-hash@example.invalid"],
+        );
+        write(root.path(), ".aethyme/run/tracked-policy.json", "before\n");
+        git(root.path(), &["add", ".aethyme/run/tracked-policy.json"]);
+        git(root.path(), &["commit", "-qm", "track runtime policy"]);
+
+        let repo = GitRepo::discover(root.path()).unwrap();
+        let baseline = repo.working_tree_hash().unwrap();
+        let tracked_policy = root.path().join(".aethyme/run/tracked-policy.json");
+        write(root.path(), ".aethyme/run/tracked-policy.json", "after\n");
+        assert_ne!(repo.working_tree_hash().unwrap(), baseline);
+        std::fs::remove_file(tracked_policy).unwrap();
+        assert_ne!(repo.working_tree_hash().unwrap(), baseline);
     }
 }

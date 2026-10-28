@@ -2607,6 +2607,219 @@ fn run_selections(
     )
 }
 
+/// Own the per-gate marker from preflight through command settlement. A known
+/// not-started path removes it explicitly; Drop is the conservative fallback
+/// for early errors and leaves any running/ambiguous marker untouched.
+struct GateArtifactUseGuard {
+    producer: Option<crate::file_lock::artifact_use::ArtifactUseProducer>,
+    no_spawn_proven: bool,
+}
+
+impl GateArtifactUseGuard {
+    #[cfg(test)]
+    fn without_marker() -> Self {
+        Self {
+            producer: None,
+            no_spawn_proven: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_producer(producer: crate::file_lock::artifact_use::ArtifactUseProducer) -> Self {
+        Self {
+            producer: Some(producer),
+            no_spawn_proven: true,
+        }
+    }
+
+    fn producer_mut(
+        &mut self,
+    ) -> Option<&mut crate::file_lock::artifact_use::ArtifactUseProducer> {
+        self.producer.as_mut()
+    }
+
+    fn finish_not_started(&mut self) -> std::io::Result<()> {
+        let Some(producer) = self.producer.as_mut() else {
+            return Ok(());
+        };
+        if !producer.is_pre_dispatch() {
+            return Ok(());
+        }
+        if !self.no_spawn_proven {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "gate producer may have dispatched a checkout writer; retain its marker",
+            ));
+        }
+        producer.finish_not_started()
+    }
+
+    fn dispatch_attempted(&mut self) {
+        self.no_spawn_proven = false;
+    }
+
+    fn confirm_no_spawn_or_quiescence(&mut self) {
+        self.no_spawn_proven = true;
+    }
+}
+
+impl Drop for GateArtifactUseGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.finish_not_started() {
+            crate::warn_unrecorded(
+                "settle a gate pre-dispatch artifact marker",
+                Err::<(), _>(error),
+            );
+        }
+    }
+}
+
+/// Publish the existing durable producer marker while holding the same short
+/// lifecycle claim used by checkout removal. The claim orders the status/path
+/// check and marker creation; it is released before gate admission can wait.
+fn begin_gate_artifact_use(
+    store: &BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    session_id: Option<i64>,
+) -> Result<GateArtifactUseGuard, crate::broker::BrokerOpError> {
+    // Unsupported targets keep their established gate behavior. The matching
+    // reclaimer returns ProtocolUnavailable there, so no automatic deletion
+    // authority is enabled on a target without this producer protocol.
+    if !cfg!(unix) {
+        return Ok(GateArtifactUseGuard {
+            producer: None,
+            no_spawn_proven: true,
+        });
+    }
+
+    store.require_live_schema_compatible()?;
+    let canonical_main = main_root.canonicalize().map_err(|source| crate::BrokerError::Io {
+        path: main_root.to_path_buf(),
+        source,
+    })?;
+    let primary_repo = GitRepo::discover(&canonical_main)?;
+    let primary_repo_root = primary_repo.root().canonicalize().map_err(|source| {
+        crate::BrokerError::Io {
+            path: primary_repo.root().to_path_buf(),
+            source,
+        }
+    })?;
+    let common_dir = primary_repo.git_common_dir()?.canonicalize().map_err(|source| {
+        crate::BrokerError::Io {
+            path: canonical_main.join(".git"),
+            source,
+        }
+    })?;
+    if primary_repo_root != canonical_main || common_dir.parent() != Some(canonical_main.as_path()) {
+        return Err(crate::git::GitError::UntrustedOutput {
+            detail: "gate admission could not confirm the primary repository identity".into(),
+        }
+        .into());
+    }
+
+    let lifecycle_claim = crate::file_lock::try_acquire_repository_lifecycle_lock(&canonical_main)
+        .map_err(|source| crate::BrokerError::Io {
+            path: canonical_main.join(".aethyme/run/worktree-lifecycle.lock"),
+            source,
+        })?
+        .ok_or_else(|| crate::BrokerError::Io {
+            path: canonical_main.join(".aethyme/run/worktree-lifecycle.lock"),
+            source: std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "a checkout lifecycle operation is in progress; retry gate admission",
+            ),
+        })?;
+    store.require_live_schema_compatible()?;
+
+    let checkout_root = checkout.root().canonicalize().map_err(|source| crate::BrokerError::Io {
+        path: checkout.root().to_path_buf(),
+        source,
+    })?;
+    let marker_session_id = if let Some(session_id) = session_id {
+        let session = store.session(session_id)?;
+        if session.status.is_closed() || session.cleanup_state != crate::SessionCleanupState::Open {
+            return Err(crate::broker::BrokerOpError::ClosedSessionOperation {
+                session_id,
+                repository_root: canonical_main.to_string_lossy().into_owned(),
+            });
+        }
+        let session_root = Path::new(&session.worktree_path)
+            .canonicalize()
+            .map_err(|source| crate::BrokerError::Io {
+                path: PathBuf::from(&session.worktree_path),
+                source,
+            })?;
+        if session_root != checkout_root {
+            // Submission gates run in a temporary linked worktree. Permit that
+            // lane only when it shares the still-open session's Git common dir.
+            let session_repo = GitRepo::discover(&session_root)?;
+            let session_common = session_repo.git_common_dir()?.canonicalize().map_err(|source| {
+                crate::BrokerError::Io {
+                    path: session_root.join(".git"),
+                    source,
+                }
+            })?;
+            let checkout_common = checkout.git_common_dir()?.canonicalize().map_err(|source| {
+                crate::BrokerError::Io {
+                    path: checkout_root.join(".git"),
+                    source,
+                }
+            })?;
+            if session_common != checkout_common {
+                return Err(crate::git::GitError::UntrustedOutput {
+                    detail: format!(
+                        "gate checkout {} does not match session {session_id}'s worktree or Git common directory",
+                        checkout_root.display()
+                    ),
+                }
+                .into());
+            }
+        }
+        session_id
+    } else {
+        let checkout_text = checkout_root.to_string_lossy().into_owned();
+        match store.session_for_worktree(&checkout_text)? {
+            Some(session) if session.status.is_closed() || session.cleanup_state != crate::SessionCleanupState::Open => {
+                return Err(crate::broker::BrokerOpError::ClosedSessionOperation {
+                    session_id: session.id,
+                    repository_root: canonical_main.to_string_lossy().into_owned(),
+                });
+            }
+            Some(session) => session.id,
+            None => {
+                if let Some(session) = store.closed_session_for_worktree(&checkout_text)? {
+                    return Err(crate::broker::BrokerOpError::ClosedSessionOperation {
+                        session_id: session.id,
+                        repository_root: canonical_main.to_string_lossy().into_owned(),
+                    });
+                }
+                0
+            }
+        }
+    };
+
+    let admission = crate::file_lock::artifact_use::begin_artifact_use_nonblocking(
+        &canonical_main,
+        &checkout_root,
+        marker_session_id,
+        &crate::file_lock::artifact_use::invocation_id("gate", marker_session_id),
+    )
+    .map_err(|source| crate::BrokerError::Io {
+        path: checkout_root.clone(),
+        source,
+    })?;
+    drop(lifecycle_claim);
+    let producer = match admission {
+        crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer) => Some(*producer),
+        crate::file_lock::artifact_use::ArtifactUseAdmission::ProtocolUnavailable => None,
+    };
+    Ok(GateArtifactUseGuard {
+        producer,
+        no_spawn_proven: true,
+    })
+}
+
 /// Keeps both storage admission probes injectable for ordering regressions.
 #[allow(clippy::too_many_arguments)]
 fn run_selections_with_admission<CachedEventAdmission, GateAdmission>(
@@ -2661,7 +2874,38 @@ where
 {
     let progress = runtime.progress;
     let admission_host = runtime.admission_host;
-    let tree = checkout.working_tree_hash()?;
+    let mut invocation_artifact_use = Some(begin_gate_artifact_use(
+        store,
+        main_root,
+        checkout,
+        session_id,
+    )?);
+    invocation_artifact_use
+        .as_mut()
+        .expect("invocation marker was just created")
+        .dispatch_attempted();
+    let tree = match checkout.working_tree_hash() {
+        Ok(tree) => tree,
+        Err(error @ crate::git::GitError::Git { .. }) => {
+            // This variant means Git completed and returned a nonzero status;
+            // its configured clean-filter command has returned too. Other
+            // error variants do not prove that an invoked filter is gone.
+            invocation_artifact_use
+                .as_mut()
+                .expect("invocation marker remains until a gate is selected")
+                .confirm_no_spawn_or_quiescence();
+            return Err(error.into());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    // A successful working-tree hash means Git completed its private-index
+    // operations, including any configured clean-filter commands. Keep the
+    // marker on every error or interrupted path, where that completion is
+    // unknown.
+    invocation_artifact_use
+        .as_mut()
+        .expect("invocation marker remains until a gate is selected")
+        .confirm_no_spawn_or_quiescence();
     if let Some(session_id) = session_id {
         // This stop/recovery pass precedes admission for a new gate so
         // obsolete process groups are stopped promptly. It records one
@@ -2698,8 +2942,30 @@ where
             selection.gate
         };
         let worker_id = gate_worker_id(session_id, &gate.name);
+        let mut artifact_use = invocation_artifact_use.take();
         if gate.cache && execution_profile.is_none() {
-            execution_profile = Some(capture_profile(checkout.root(), subprocess_path.as_deref()));
+            let mut profile_guard = match artifact_use.take() {
+                Some(profile_guard) => profile_guard,
+                None => begin_gate_artifact_use(store, main_root, checkout, session_id)?,
+            };
+            // Profile capture runs repository-selected binaries before the
+            // cache lookup. Retain the durable pre-dispatch marker unless the
+            // capture reports that every owned probe group was reaped or did
+            // not spawn.
+            profile_guard.dispatch_attempted();
+            let profile = capture_profile(checkout.root(), subprocess_path.as_deref());
+            if !profile.writers_quiescent() {
+                return Err(crate::BrokerError::Io {
+                    path: checkout.root().to_path_buf(),
+                    source: std::io::Error::other(
+                        "execution-profile probe quiescence is unknown; gate dispatch refused and artifact-use marker retained",
+                    ),
+                }
+                .into());
+            }
+            profile_guard.confirm_no_spawn_or_quiescence();
+            artifact_use = Some(profile_guard);
+            execution_profile = Some(profile);
         }
         let profile = if gate.cache {
             execution_profile.as_ref()
@@ -2731,6 +2997,12 @@ where
             None
         };
         if let Some(hit) = cached_result {
+            if let Some(mut artifact_use) = artifact_use.take() {
+                artifact_use.finish_not_started().map_err(|source| crate::BrokerError::Io {
+                    path: checkout.root().to_path_buf(),
+                    source,
+                })?;
+            }
             let saved_ms = hit.duration_ms.unwrap_or(0);
             progress.report(&format!(
                 "gate {} cached ({}, tree {}, source run {}, saved {}ms)",
@@ -2795,10 +3067,23 @@ where
             continue;
         }
 
+        // A cache miss keeps the marker created before the tree/profile probes
+        // (or acquires one here when those probes already completed in an
+        // earlier selection) through storage, load, owner-lock and resource
+        // admission, all before any gate-owned path is created.
+        let mut artifact_use = match artifact_use {
+            Some(artifact_use) => artifact_use,
+            None => begin_gate_artifact_use(store, main_root, checkout, session_id)?,
+        };
+
         // Check every volume this run will write before making run/log
         // directories or preparing a managed cache. A cache hit above has no
         // such writes and remains usable even when a build volume is low.
         if let Some(diagnostic) = gate_admission(store, main_root, checkout, gate) {
+            artifact_use.finish_not_started().map_err(|source| crate::BrokerError::Io {
+                path: checkout.root().to_path_buf(),
+                source,
+            })?;
             // Persist at most one bounded diagnostic row, and only when a
             // separate probe confirms the broker database itself can accept it.
             // The full preflight may have stopped at an earlier low-volume probe.
@@ -2867,6 +3152,10 @@ where
             threshold,
         } = crate::gate_admission::admit_gate_with(gate, progress, admission_host)
         {
+            artifact_use.finish_not_started().map_err(|source| crate::BrokerError::Io {
+                path: checkout.root().to_path_buf(),
+                source,
+            })?;
             let diagnostic = format!(
                 "host load stayed above its admission threshold for {}s: {}; retry after load falls",
                 waited.as_secs(),
@@ -2902,6 +3191,10 @@ where
         let owner_locks = match owner_locks {
             Ok(locks) => locks,
             Err(source) if source.kind() == std::io::ErrorKind::TimedOut => {
+                artifact_use.finish_not_started().map_err(|source| crate::BrokerError::Io {
+                    path: checkout.root().to_path_buf(),
+                    source,
+                })?;
                 outcomes.push(record_gate_preflight_resource_failure(store,GatePreflightResourceFailure {
                     gate,tree:&tree,session_id,wait_duration_ms:wait_started.elapsed().as_millis() as i64,
                     log_path:&log_path,diagnostic:"native gate admission deadline exhausted before command dispatch",progress,
@@ -2909,6 +3202,13 @@ where
                 break;
             }
             Err(source) => {
+                artifact_use.finish_not_started().map_err(|settlement| crate::BrokerError::Io {
+                    path: checkout.root().to_path_buf(),
+                    source: std::io::Error::new(
+                        settlement.kind(),
+                        format!("{source}; could not settle pre-dispatch artifact marker: {settlement}"),
+                    ),
+                })?;
                 return Err(crate::BrokerError::Io {
                     path: owner_dir,
                     source,
@@ -2928,6 +3228,10 @@ where
             Ok(runtime) => runtime,
             Err(message) => {
                 drop(owner_locks);
+                artifact_use.finish_not_started().map_err(|source| crate::BrokerError::Io {
+                    path: checkout.root().to_path_buf(),
+                    source,
+                })?;
                 let diagnostic = format!("host resource acquisition failed: {message}");
                 let outcome = record_gate_preflight_resource_failure(
                     store,
@@ -2953,54 +3257,6 @@ where
                 expires_at: runtime.grant.lease.expires_at,
                 allocations: runtime.grant.lease.allocations.clone(),
             });
-        let mut artifact_use = match crate::file_lock::artifact_use::begin_artifact_use(
-            main_root,
-            checkout.root(),
-            session_id.unwrap_or(0),
-            &crate::file_lock::artifact_use::invocation_id("gate", session_id.unwrap_or(0)),
-        ) {
-            Ok(crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer)) => {
-                Some(*producer)
-            }
-            Ok(crate::file_lock::artifact_use::ArtifactUseAdmission::ProtocolUnavailable) => None,
-            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
-                if let Some(runtime) = resource_runtime.as_mut() {
-                    crate::warn_unrecorded(
-                        "release a gate host resource lease after artifact admission refusal",
-                        runtime.release(),
-                    );
-                }
-                drop(owner_locks);
-                let diagnostic = format!("managed artifact admission is busy: {source}");
-                outcomes.push(record_gate_preflight_resource_failure(
-                    store,
-                    GatePreflightResourceFailure {
-                        gate,
-                        tree: &tree,
-                        session_id,
-                        wait_duration_ms: wait_started.elapsed().as_millis() as i64,
-                        log_path: &log_path,
-                        diagnostic: &diagnostic,
-                        progress,
-                    },
-                )?);
-                break;
-            }
-            Err(source) => {
-                if let Some(runtime) = resource_runtime.as_mut() {
-                    crate::warn_unrecorded(
-                        "release a gate host resource lease after artifact admission failure",
-                        runtime.release(),
-                    );
-                }
-                drop(owner_locks);
-                return Err(crate::BrokerError::Io {
-                    path: checkout.root().to_path_buf(),
-                    source,
-                }
-                .into());
-            }
-        };
         let repository = git_origin_fingerprint(checkout);
         let mut managed_cache_runtime = match prepare_managed_gate_cache(
             gate.managed_cache.as_ref(),
@@ -3013,17 +3269,11 @@ where
             Ok(runtime) => runtime,
             Err(error) => {
                 let message = format!("managed cache preparation failed: {error}");
-                let message = if let Some(producer) = artifact_use.as_mut()
-                    && producer.is_pre_dispatch()
-                {
-                    match producer.finish_not_started() {
-                        Ok(()) => message,
-                        Err(settlement_error) => format!(
-                            "{message}; pre-dispatch artifact-use marker remains unknown: {settlement_error}"
-                        ),
-                    }
-                } else {
-                    message
+                let message = match artifact_use.finish_not_started() {
+                    Ok(()) => message,
+                    Err(settlement_error) => format!(
+                        "{message}; pre-dispatch artifact-use marker remains unknown: {settlement_error}"
+                    ),
                 };
                 let _ = std::fs::write(&log_path, format!("aethyme {message}\n"));
                 progress.report(&format!("gate {} environment error: {message}", gate.name));
@@ -3113,19 +3363,11 @@ where
                         resource.release(),
                     );
                 }
-                let diagnostic = if let Some(producer) = artifact_use.as_mut()
-                    && producer.is_pre_dispatch()
-                {
-                    match producer.finish_not_started() {
-                        Ok(()) => {
-                            "native gate allowance exhausted before command dispatch".to_owned()
-                        }
-                        Err(error) => format!(
-                            "native gate allowance exhausted before command dispatch; artifact-use marker remains unknown: {error}"
-                        ),
-                    }
-                } else {
-                    "native gate allowance exhausted before command dispatch".to_owned()
+                let diagnostic = match artifact_use.finish_not_started() {
+                    Ok(()) => "native gate allowance exhausted before command dispatch".to_owned(),
+                    Err(error) => format!(
+                        "native gate allowance exhausted before command dispatch; artifact-use marker remains unknown: {error}"
+                    ),
                 };
                 outcomes.push(record_gate_preflight_resource_failure(
                     store,
@@ -3174,7 +3416,7 @@ where
                 command_process_group: Some(&command_process_group),
                 run_labels: &run_labels,
             },
-            artifact_use.as_mut(),
+            &mut artifact_use,
         );
         let writers_quiescent = gate_process_group_absent(
             command_process_group.load(std::sync::atomic::Ordering::Acquire),
@@ -4252,31 +4494,15 @@ fn remove_gate_pidfile_after_setup_failure(pidfile: &Path, reason: &str) {
 fn run_gate_command(
     command: &str,
     context: GateCommandContext<'_>,
-    mut artifact_use: Option<&mut crate::file_lock::artifact_use::ArtifactUseProducer>,
+    artifact_use: &mut GateArtifactUseGuard,
 ) -> Result<GateCommandOutcome, std::io::Error> {
-    let result = run_gate_command_inner(command, &context, &mut artifact_use);
-    if result.is_err()
-        && let Some(producer) = artifact_use
-        && producer.is_pre_dispatch()
-        && let Err(settlement_error) = producer.finish_not_started()
-    {
-        return match result {
-            Err(source) => Err(std::io::Error::new(
-                source.kind(),
-                format!(
-                    "{source}; pre-dispatch artifact-use marker remains unknown: {settlement_error}"
-                ),
-            )),
-            Ok(_) => unreachable!("only an error result enters pre-dispatch settlement"),
-        };
-    }
-    result
+    run_gate_command_inner(command, &context, artifact_use)
 }
 
 fn run_gate_command_inner(
     command: &str,
     context: &GateCommandContext<'_>,
-    artifact_use: &mut Option<&mut crate::file_lock::artifact_use::ArtifactUseProducer>,
+    artifact_use: &mut GateArtifactUseGuard,
 ) -> Result<GateCommandOutcome, std::io::Error> {
     use std::os::unix::process::CommandExt;
 
@@ -4435,14 +4661,24 @@ fn run_gate_command_inner(
     if let Some(path) = context.subprocess_path {
         process.env("PATH", path);
     }
-    let mut child = spawn_gate_command(&mut process, context.absolute_deadline)?;
+    artifact_use.dispatch_attempted();
+    let mut child = match spawn_gate_command(&mut process, context.absolute_deadline) {
+        Ok(child) => child,
+        Err(error) => {
+            // A failed spawn call confirms that this invocation has no child.
+            artifact_use.confirm_no_spawn_or_quiescence();
+            return Err(error);
+        }
+    };
     if let Some(slot) = context.command_process_group {
         slot.store(child.id() as i32, std::sync::atomic::Ordering::Release);
     }
     let process_group = child.id() as i32;
-    if let Some(producer) = artifact_use.as_deref_mut()
-        && let Err(error) = producer.mark_process_started(&child, process_group)
-    {
+    let marker_start = match artifact_use.producer_mut() {
+        Some(producer) => producer.mark_process_started(&child, process_group),
+        None => Ok(()),
+    };
+    if let Err(error) = marker_start {
         // The leader is still our unreaped child, so this assigned group id
         // cannot have been recycled. Keep the marker if either the child or
         // original group cannot be confirmed settled.
@@ -4453,7 +4689,7 @@ fn run_gate_command_inner(
         let wait_error = child.wait().err();
         let settlement = if gate_process_group_absent(process_group) {
             artifact_use
-                .as_deref_mut()
+                .producer_mut()
                 .expect("producer was present")
                 .finish_verified_quiescence(&mut child)
                 .err()
@@ -4746,15 +4982,21 @@ fn run_gate_command_inner(
     if let Some(pidfile) = &pidfile {
         let _ = std::fs::remove_file(pidfile);
     }
-    let artifact_use_error = if let Some(producer) = artifact_use.as_deref_mut()
-        && producer.is_unsettled_running()
-    {
-        producer
-            .finish_verified_quiescence(&mut child)
-            .err()
-            .map(|error| format!("gate artifact-use settlement could not be confirmed: {error}"))
-    } else {
-        None
+    let marker_settlement = match artifact_use.producer_mut() {
+        Some(producer) if producer.is_unsettled_running() => {
+            Some(producer.finish_verified_quiescence(&mut child))
+        }
+        _ => None,
+    };
+    let artifact_use_error = match marker_settlement {
+        Some(Ok(())) => {
+            artifact_use.confirm_no_spawn_or_quiescence();
+            None
+        }
+        Some(Err(error)) => Some(format!(
+            "gate artifact-use settlement could not be confirmed: {error}"
+        )),
+        None => None,
     };
     let capture_error = if pipes_incomplete {
         Some(format!(
@@ -4984,6 +5226,8 @@ fn preserve_failed_gate_log(log_path: &Path, status: GateStatus) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn managed_cache_shortfall_refuses_admission_on_its_own_volume() {
@@ -5103,6 +5347,7 @@ mod tests {
             .unwrap();
         let progress = Lines::default();
         let admission_host = SequencedAdmissionHost::new(vec![None]);
+        let artifact_marker_seen = std::cell::Cell::new(false);
 
         let outcomes = run_selections_with_admission(
             &mut store,
@@ -5122,12 +5367,26 @@ mod tests {
                 storage: GateStorageLocations::default(),
             },
             |_, _| Some("broker database is below the gate reserve".to_string()),
-            |_, _, _, _| Some("gate checkout is below the gate reserve".to_string()),
+            |_, _, _, _| {
+                artifact_marker_seen.set(matches!(
+                    crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                        &checkout_root,
+                        &checkout_root,
+                    ),
+                    Ok(
+                        crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(
+                            crate::file_lock::artifact_use::ArtifactUseReclaimBlock::Contended
+                        )
+                    )
+                ));
+                Some("gate checkout is below the gate reserve".to_string())
+            },
         )
         .unwrap();
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, GateStatus::Error);
+        assert!(artifact_marker_seen.get(), "marker must precede storage admission");
         assert_eq!(
             outcomes[0].failure_class,
             Some(GateFailureClass::ResourceContention)
@@ -5199,6 +5458,7 @@ mod tests {
         let admission_host = SequencedAdmissionHost::new(vec![None]);
 
         let profile_captures = std::cell::Cell::new(0);
+        let profile_marker_seen = std::cell::Cell::new(false);
         let outcomes = run_selections_with_profile_capture(
             &mut store,
             &checkout_root,
@@ -5220,12 +5480,24 @@ mod tests {
             |_, _, _, _| panic!("a cache hit cannot dispatch a gate"),
             |_, _| {
                 profile_captures.set(profile_captures.get() + 1);
+                profile_marker_seen.set(matches!(
+                    crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                        &checkout_root,
+                        &checkout_root,
+                    ),
+                    Ok(
+                        crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(
+                            crate::file_lock::artifact_use::ArtifactUseReclaimBlock::Contended
+                        )
+                    )
+                ));
                 execution_profile.clone()
             },
         )
         .unwrap();
 
         assert_eq!(profile_captures.get(), 1);
+        assert!(profile_marker_seen.get(), "profile probes need a visible marker");
         assert_eq!(outcomes.len(), 1);
         assert!(outcomes[0].cached);
         assert_eq!(outcomes[0].status, GateStatus::Pass);
@@ -5234,6 +5506,140 @@ mod tests {
             line.contains("cache hit event unrecorded") && line.contains("below the gate reserve")
         }));
         assert!(!checkout_root.join(".aethyme/logs/gates").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uncertain_profile_probe_retains_marker_and_refuses_gate_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        init_repo(&checkout_root);
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        let database = root.path().join("broker.db");
+        let mut store = BrokerStore::open(&database).unwrap();
+        let gate = synthetic_gate("uncertain-profile", true, "touch profile-child-started");
+        let progress = Lines::default();
+        let admission_host = SequencedAdmissionHost::new(vec![None]);
+
+        let result = run_selections_with_profile_capture(
+            &mut store,
+            &checkout_root,
+            &checkout,
+            vec![Selection {
+                gate: &gate,
+                triggered_by: None,
+                owner_paths: Vec::new(),
+            }],
+            None,
+            CachePolicy::Use,
+            GateRuntimeContext {
+                progress: &progress,
+                admission_host: &admission_host,
+                deadline: None,
+                storage: GateStorageLocations::default(),
+            },
+            |_, _| None,
+            |_, _, _, _| panic!("uncertain profile must not reach gate admission"),
+            |_, _| crate::gate_profile::ExecutionProfile::fixture_uncertain(),
+        );
+
+        assert!(result.is_err());
+        assert!(!checkout_root.join("profile-child-started").exists());
+        assert!(matches!(
+            crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                &checkout_root,
+                &checkout_root,
+            )
+            .unwrap(),
+            crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(
+                crate::file_lock::artifact_use::ArtifactUseReclaimBlock::UnknownProducer { .. }
+            )
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quiescent_incomplete_profile_runs_uncached_and_settles_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        init_repo(&checkout_root);
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        let database = root.path().join("broker.db");
+        let mut store = BrokerStore::open(&database).unwrap();
+        let gate = synthetic_gate("quiescent-profile", true, "touch profile-child-started");
+        let progress = Lines::default();
+        let admission_host = SequencedAdmissionHost::new(vec![None]);
+
+        let outcomes = run_selections_with_profile_capture(
+            &mut store,
+            &checkout_root,
+            &checkout,
+            vec![Selection {
+                gate: &gate,
+                triggered_by: None,
+                owner_paths: Vec::new(),
+            }],
+            None,
+            CachePolicy::Use,
+            GateRuntimeContext {
+                progress: &progress,
+                admission_host: &admission_host,
+                deadline: None,
+                storage: GateStorageLocations::default(),
+            },
+            |_, _| None,
+            |_, _, _, _| None,
+            |_, _| crate::gate_profile::ExecutionProfile::fixture_incomplete_quiescent(),
+        )
+        .unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].status, GateStatus::Pass);
+        assert!(!outcomes[0].cached);
+        assert!(checkout_root.join("profile-child-started").exists());
+        assert!(matches!(
+            crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                &checkout_root,
+                &checkout_root,
+            )
+            .unwrap(),
+            crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unwinding_after_dispatch_attempt_retains_predispatch_marker() {
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+        let producer = match crate::file_lock::artifact_use::begin_artifact_use(
+            root.path(),
+            root.path(),
+            0,
+            "gate-test:0:dispatch-unwind",
+        )
+        .unwrap()
+        {
+            crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer) => *producer,
+            crate::file_lock::artifact_use::ArtifactUseAdmission::ProtocolUnavailable => {
+                panic!("Unix test filesystem should support directory sync")
+            }
+        };
+        let guard = GateArtifactUseGuard::with_producer(producer);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = guard;
+            guard.dispatch_attempted();
+            panic!("simulated interruption after the dispatch boundary");
+        }));
+
+        assert!(unwind.is_err());
+        assert!(matches!(
+            crate::file_lock::artifact_use::try_artifact_use_reclaimer(root.path(), root.path())
+                .unwrap(),
+            crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(
+                crate::file_lock::artifact_use::ArtifactUseReclaimBlock::UnknownProducer { .. }
+            )
+        ));
     }
 
     #[test]
@@ -5354,7 +5760,7 @@ mod tests {
         checkout_root: PathBuf,
         database: PathBuf,
         command: String,
-    ) -> std::thread::JoinHandle<Vec<GateRunOutcome>> {
+    ) -> std::thread::JoinHandle<Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError>> {
         std::thread::spawn(move || {
             let mut store = BrokerStore::open(&database).unwrap();
             let checkout = GitRepo::discover(&checkout_root).unwrap();
@@ -5382,7 +5788,6 @@ mod tests {
                 |_, _| None,
                 |_, _, _, _| None,
             )
-            .unwrap()
         })
     }
 
@@ -5415,11 +5820,7 @@ mod tests {
         )
         .join()
         .unwrap();
-        assert_eq!(refused.len(), 1);
-        assert_eq!(
-            refused[0].failure_class,
-            Some(GateFailureClass::ResourceContention)
-        );
+        assert!(refused.is_err(), "busy artifact admission must abort before dispatch");
         assert!(
             !conflict_sentinel.exists(),
             "the real gate entrypoint must not dispatch after artifact admission refusal"
@@ -5451,7 +5852,7 @@ mod tests {
             )
         );
         let release_result = std::fs::write(&release, b"continue");
-        let completed = running.join().unwrap();
+        let completed = running.join().unwrap().unwrap();
 
         assert!(release_result.is_ok(), "could not release controlled gate");
         assert!(
@@ -5474,6 +5875,244 @@ mod tests {
             .unwrap(),
             crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(_)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn working_tree_clean_filter_runs_under_artifact_use_marker() {
+        let owner = tempfile::tempdir().unwrap();
+        let checkout_root = owner.path().join("checkout");
+        init_repo(&checkout_root);
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        std::fs::write(
+            checkout_root.join(".gitattributes"),
+            "filter-input.txt filter=observe-marker\n",
+        )
+        .unwrap();
+        std::fs::write(checkout_root.join("filter-input.txt"), b"initial\n").unwrap();
+        let commit = std::process::Command::new("git")
+            .args(["add", "--", ".gitattributes", "filter-input.txt"])
+            .current_dir(&checkout_root)
+            .status()
+            .unwrap();
+        assert!(commit.success());
+        let commit = std::process::Command::new("git")
+            .args(["-c", "user.name=Gate test", "-c", "user.email=gate@example.invalid", "commit", "-m", "add filter fixture"])
+            .current_dir(&checkout_root)
+            .status()
+            .unwrap();
+        assert!(commit.success());
+
+        let filter_script = owner.path().join("observe-filter.sh");
+        let filter_observed = owner.path().join("filter-observed");
+        std::fs::write(
+            &filter_script,
+            "#!/bin/sh\nfor marker in .aethyme/run/artifact-use/*.markers/*.json; do\n  if [ -f \"$marker\" ]; then : > \"$1\"; break; fi\ndone\ncat\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&filter_script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&filter_script, permissions).unwrap();
+        let quote = |path: &Path| {
+            format!(
+                "'{}'",
+                path.to_string_lossy().replace('\'', "'\\''")
+            )
+        };
+        let clean_command = format!(
+            "sh {} {}",
+            quote(&filter_script),
+            quote(&filter_observed)
+        );
+        let config = std::process::Command::new("git")
+            .args(["config", "filter.observe-marker.clean", &clean_command])
+            .current_dir(&checkout_root)
+            .status()
+            .unwrap();
+        assert!(config.success());
+        let config = std::process::Command::new("git")
+            .args(["config", "filter.observe-marker.required", "true"])
+            .current_dir(&checkout_root)
+            .status()
+            .unwrap();
+        assert!(config.success());
+        std::fs::write(checkout_root.join("filter-input.txt"), b"changed\n").unwrap();
+
+        let database = owner.path().join("broker.db");
+        let mut store = BrokerStore::open(&database).unwrap();
+        let gate = synthetic_gate("filter-marker", false, "true");
+        let progress = Lines::default();
+        let admission_host = SequencedAdmissionHost::new(vec![None]);
+        let outcomes = run_selections_with_admission(
+            &mut store,
+            &checkout_root,
+            &checkout,
+            vec![Selection {
+                gate: &gate,
+                triggered_by: None,
+                owner_paths: Vec::new(),
+            }],
+            None,
+            CachePolicy::Use,
+            GateRuntimeContext {
+                progress: &progress,
+                admission_host: &admission_host,
+                deadline: None,
+                storage: GateStorageLocations::default(),
+            },
+            |_, _| None,
+            |_, _, _, _| None,
+        )
+        .unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].status, GateStatus::Pass);
+        assert!(
+            filter_observed.exists(),
+            "the working-tree clean filter must observe the marker before it can write"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_nonzero_clean_filter_settles_marker_without_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        init_repo(&checkout_root);
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        std::fs::write(
+            checkout_root.join(".gitattributes"),
+            "filter-input.txt filter=fail-clean\n",
+        )
+        .unwrap();
+        std::fs::write(checkout_root.join("filter-input.txt"), b"initial\n").unwrap();
+        let add = std::process::Command::new("git")
+            .args(["add", "--", ".gitattributes", "filter-input.txt"])
+            .current_dir(&checkout_root)
+            .status()
+            .unwrap();
+        assert!(add.success());
+        let commit = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Gate test",
+                "-c",
+                "user.email=gate@example.invalid",
+                "commit",
+                "-m",
+                "add failing filter fixture",
+            ])
+            .current_dir(&checkout_root)
+            .status()
+            .unwrap();
+        assert!(commit.success());
+        let config = std::process::Command::new("git")
+            .args(["config", "filter.fail-clean.clean", "exit 1"])
+            .current_dir(&checkout_root)
+            .status()
+            .unwrap();
+        assert!(config.success());
+        let config = std::process::Command::new("git")
+            .args(["config", "filter.fail-clean.required", "true"])
+            .current_dir(&checkout_root)
+            .status()
+            .unwrap();
+        assert!(config.success());
+        std::fs::write(checkout_root.join("filter-input.txt"), b"changed\n").unwrap();
+
+        let database = root.path().join("broker.db");
+        let mut store = BrokerStore::open(&database).unwrap();
+        let gate = synthetic_gate("failing-clean-filter", false, "touch should-not-run");
+        let progress = Lines::default();
+        let admission_host = SequencedAdmissionHost::new(vec![None]);
+        let result = run_selections_with_admission(
+            &mut store,
+            &checkout_root,
+            &checkout,
+            vec![Selection {
+                gate: &gate,
+                triggered_by: None,
+                owner_paths: Vec::new(),
+            }],
+            None,
+            CachePolicy::Use,
+            GateRuntimeContext {
+                progress: &progress,
+                admission_host: &admission_host,
+                deadline: None,
+                storage: GateStorageLocations::default(),
+            },
+            |_, _| None,
+            |_, _, _, _| None,
+        );
+
+        assert!(result.is_err());
+        assert!(!checkout_root.join("should-not-run").exists());
+        assert!(matches!(
+            crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                &checkout_root,
+                &checkout_root,
+            )
+            .unwrap(),
+            crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closed_session_gate_refuses_before_dispatching_child() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        init_repo(&checkout_root);
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        let database = root.path().join("broker.db");
+        let mut store = BrokerStore::open(&database).unwrap();
+        let session = store
+            .register_session(&crate::types::NewSession {
+                worktree_path: checkout_root.display().to_string(),
+                branch: "agent/test-closed-gate-marker".to_string(),
+                origin: crate::types::SessionOrigin::Spawned,
+                task: None,
+                diff_base: None,
+                adoption_base: None,
+                adopted_head: None,
+                repository_contract: None,
+                pid: None,
+                command: None,
+                log_path: None,
+                agent_identity: None,
+            })
+            .unwrap();
+        store
+            .set_session_status(session.id, crate::SessionStatus::Closed, None)
+            .unwrap();
+        let gate = synthetic_gate("closed-session", false, "touch closed-child-started");
+        let progress = Lines::default();
+        let admission_host = SequencedAdmissionHost::new(vec![None]);
+
+        let result = run_selections_with_admission(
+            &mut store,
+            &checkout_root,
+            &checkout,
+            vec![Selection {
+                gate: &gate,
+                triggered_by: None,
+                owner_paths: Vec::new(),
+            }],
+            Some(session.id),
+            CachePolicy::Use,
+            GateRuntimeContext {
+                progress: &progress,
+                admission_host: &admission_host,
+                deadline: None,
+                storage: GateStorageLocations::default(),
+            },
+            |_, _| None,
+            |_, _, _, _| None,
+        );
+
+        assert!(result.is_err());
+        assert!(!checkout_root.join("closed-child-started").exists());
     }
 
     #[test]
@@ -5509,7 +6148,11 @@ mod tests {
             command_process_group: None,
             run_labels: &labels,
         };
-        let result = run_gate_command("touch dispatched", context(), None);
+        let result = run_gate_command(
+            "touch dispatched",
+            context(),
+            &mut GateArtifactUseGuard::without_marker(),
+        );
         assert_eq!(result.err().unwrap().kind(), std::io::ErrorKind::TimedOut);
         assert!(!root.path().join("dispatched").exists());
         let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
@@ -5785,7 +6428,7 @@ mod tests {
         let progress = Lines::default();
         let database = std::cell::OnceCell::new();
         let labels = crate::gate_debris::GateRunLabels::new("bounded-output", None, "synthetic");
-        let mut producer = match crate::file_lock::artifact_use::begin_artifact_use(
+        let producer = match crate::file_lock::artifact_use::begin_artifact_use(
             root.path(),
             root.path(),
             0,
@@ -5798,6 +6441,7 @@ mod tests {
                 panic!("Unix test filesystem should support directory sync")
             }
         };
+        let mut artifact_use = GateArtifactUseGuard::with_producer(producer);
         let status = run_gate_command(
             "printf stdout; printf stderr >&2",
             command_context(
@@ -5809,7 +6453,7 @@ mod tests {
                 &database,
                 &labels,
             ),
-            Some(&mut producer),
+            &mut artifact_use,
         )
         .unwrap();
 
@@ -5820,7 +6464,7 @@ mod tests {
         let log = std::fs::read_to_string(log_path).unwrap();
         assert!(log.contains("stdout"));
         assert!(log.contains("stderr"));
-        drop(producer);
+        drop(artifact_use);
         assert!(matches!(
             crate::file_lock::artifact_use::try_artifact_use_reclaimer(root.path(), root.path())
                 .unwrap(),
@@ -5858,7 +6502,7 @@ mod tests {
                 &database,
                 &labels,
             ),
-            None,
+            &mut GateArtifactUseGuard::without_marker(),
         )
         .unwrap();
 
@@ -5895,7 +6539,7 @@ mod tests {
                 &database,
                 &labels,
             ),
-            None,
+            &mut GateArtifactUseGuard::without_marker(),
         )
         .unwrap();
         let (status, class, exit) = classify_gate_result("sh -c gate", &log_path, Ok(outcome));

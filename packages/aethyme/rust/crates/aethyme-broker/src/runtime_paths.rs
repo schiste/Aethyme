@@ -94,6 +94,28 @@ pub fn broker_runtime_ignore_patterns() -> impl Iterator<Item = &'static str> {
         .map(|rule| rule.gitignore_pattern)
 }
 
+/// Git pathspec exclusions for untracked runtime state while hashing a
+/// working tree. Callers must first stage tracked changes so an operational
+/// path that is intentionally tracked still contributes to the tree.
+pub(crate) fn broker_runtime_untracked_git_pathspec_exclusions() -> impl Iterator<Item = String> {
+    BROKER_RUNTIME_PATH_RULES.iter().flat_map(|rule| {
+        let patterns = match rule.kind {
+            RuntimePathKind::Exact => vec![
+                rule.gitignore_pattern.to_owned(),
+                format!("{}/**", rule.gitignore_pattern),
+            ],
+            RuntimePathKind::Directory => vec![format!("{}**", rule.gitignore_pattern)],
+            RuntimePathKind::FilePrefix => vec![
+                rule.gitignore_pattern.to_owned(),
+                format!("{}/**", rule.gitignore_pattern),
+            ],
+        };
+        patterns
+            .into_iter()
+            .map(|pattern| format!(":(exclude,glob){pattern}"))
+    })
+}
+
 pub(crate) fn managed_gitignore_block() -> String {
     let mut block = String::from(MANAGED_GITIGNORE_BEGIN_LINE);
     block.push('\n');
@@ -163,5 +185,18 @@ mod tests {
         assert!(!is_broker_runtime_path(".aethyme/graph/example.rs.bin"));
         assert!(!is_broker_runtime_path("operator-note.txt"));
         assert!(is_broker_runtime_path(".aethyme/gc.lock/child"));
+    }
+
+    #[test]
+    fn untracked_hash_exclusions_follow_runtime_rule_kinds() {
+        let exclusions =
+            super::broker_runtime_untracked_git_pathspec_exclusions().collect::<Vec<_>>();
+
+        assert!(exclusions.contains(&":(exclude,glob).aethyme/run/**".to_owned()));
+        assert!(exclusions.contains(&":(exclude,glob).aethyme/gc.lock".to_owned()));
+        assert!(exclusions.contains(&":(exclude,glob).aethyme/gc.lock/**".to_owned()));
+        assert!(exclusions.contains(&":(exclude,glob).aethyme/broker.db*".to_owned()));
+        assert!(exclusions.contains(&":(exclude,glob).aethyme/broker.db*/**".to_owned()));
+        assert!(!exclusions.contains(&":(exclude,glob).aethyme/run".to_owned()));
     }
 }
