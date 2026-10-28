@@ -4,6 +4,20 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.43] - 2026-10-28
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0843).
+
+### Changed
+
+- State-only closed checkouts now have a fifteen-day default grace period before automatic cleanup or reviewed GC may propose removal. Explicit repository retention overrides keep their configured value.
+- Recovery plans use schema 3 and a versioned content confirmation; archives use schema 4. Delivery observations are recorded separately, so advancing delivery refs alone need not invalidate unchanged checkout content.
+
+### Fixed
+
+- Recovery preservation no longer performs an exact-content landing-history search. It still verifies complete committed and uncommitted content, branch identity, archive integrity, live use and retained Git prerequisites before removal.
+- Human recovery plans explicitly say when landing was not evaluated. Legacy archive schemas and frozen digest formats remain readable.
+
 ## [0.8.42] - 2026-10-28
 
 **Breaking:** see [UPGRADING.md](UPGRADING.md#v0842).

@@ -1663,8 +1663,11 @@ Older archive schemas remain readable and verifiable.
 A successful command can still return `worktree_removed: false`; inspect
 `cleanup_error` and preserve the reported archive path. The event
 `broker.cleanup.archived` records archive creation, independently of removal.
-Already eligible, live and adopted sessions are refused by the public planner;
-explicit discard remains `cleanup <session-id> --force`. See the
+Clean sessions whose HEAD is ancestry-proven in a delivery target, live sessions
+and adopted sessions are refused by the public planner. Other clean sessions
+are reported as `unproven_provenance`: recovery does not distinguish pending
+work from squash or replay delivery by searching content history. They can be
+preserved without making a delivery claim. Explicit discard remains `cleanup <session-id> --force`. See the
 [cleanup guide](../guides/worktree-cleanup.md) for the complete recovery contract.
 
 Archives never expire on their own. `broker gc plan` proposes one as a reviewed,

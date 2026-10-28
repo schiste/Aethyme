@@ -51,7 +51,7 @@ enum CleanupDeliveryTargets<'a> {
 }
 
 enum CleanupProvenanceAssessment {
-    Checked(CleanupProvenance, String),
+    Checked(Box<CleanupProvenance>, String),
     ArchivePreservation { ancestry_proven: bool },
 }
 
@@ -1780,7 +1780,9 @@ impl Broker {
                 delivery_targets,
                 landing_cache,
             )
-            .map(|(provenance, reason)| CleanupProvenanceAssessment::Checked(provenance, reason))
+            .map(|(provenance, reason)| {
+                CleanupProvenanceAssessment::Checked(Box::new(provenance), reason)
+            })
         })
     }
 
@@ -1864,7 +1866,7 @@ impl Broker {
 
         let session_head = checkout.head_commit()?;
         let (provenance, reason) = match inspect_provenance(&session_head) {
-            Ok(CleanupProvenanceAssessment::Checked(provenance, reason)) => (provenance, reason),
+            Ok(CleanupProvenanceAssessment::Checked(provenance, reason)) => (*provenance, reason),
             Ok(CleanupProvenanceAssessment::ArchivePreservation { ancestry_proven }) => {
                 return Ok(if ancestry_proven {
                     (

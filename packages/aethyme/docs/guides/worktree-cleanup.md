@@ -247,7 +247,10 @@ inventory and ignored-content policy. Delivery targets and target-absent commits
 are evidence for building the archive, rather than inputs to that content
 confirmation. Historical content matching is not needed for preservation:
 `landing.state` is `not_evaluated_for_recovery`. This is neither a positive nor a
-negative landing verdict.
+negative landing verdict. Clean sessions without a direct ancestry proof are
+reported as `unproven_provenance`, including work that might have been delivered
+by squash or replay. Clean ancestry-proven sessions need no recovery archive and
+the public planner directs them to ordinary cleanup.
 
 Recovery archive schema `4` records that evidence snapshot alongside the content
 proof; older archive schemas remain readable and verifiable. Before removal,
