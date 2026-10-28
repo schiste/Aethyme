@@ -91,13 +91,6 @@ pub(crate) enum ArchiveCleanupResidualKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "The production archive cleanup producer is staged separately; tests validate this contract."
-    )
-)]
 pub(crate) enum IntentWriteError {
     Invalid(String),
     Existing,
@@ -264,13 +257,6 @@ impl ArchiveCleanupIntent {
         Ok(())
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "The production archive cleanup producer is staged separately; tests validate this contract."
-        )
-    )]
     pub(crate) fn encode(&self) -> Result<Vec<u8>, String> {
         self.validate()?;
         let bytes = serde_json::to_vec(self)
@@ -827,13 +813,6 @@ fn verify_owned_private(metadata: &fs::Metadata) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "The production archive cleanup producer is staged separately; tests validate this contract."
-    )
-)]
 fn verify_private_parent(path: &Path) -> Result<(), String> {
     let parent = path
         .parent()
