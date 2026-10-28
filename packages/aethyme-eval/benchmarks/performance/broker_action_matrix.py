@@ -448,8 +448,8 @@ def action_playground(name, binary, git, sample_output, command_timeout_seconds)
         seed_tree = run_git(runner, git, repo, f'{name}:seed-tree', 'rev-parse',
                             f'{baseline}^{{tree}}').strip()
         run_git(runner, git, repo, f'{name}:add-origin', 'remote', 'add', 'origin', REMOTE_URL)
-        run_git(runner, git, repo, f'{name}:add-local-fetch-remote', 'remote', 'add',
-                FETCH_REMOTE, str(remote))
+        run_git(runner, git, repo, f'{name}:add-fetch-remote', 'remote', 'add',
+                FETCH_REMOTE, REMOTE_URL)
         run_git(runner, git, repo, f'{name}:publish-main', 'push', '-q', 'origin', 'main')
         run_git(runner, git, repo, f'{name}:publish-provable-fetch-ref', 'push', '-q', 'origin',
                 'main:refs/heads/perf-proven')
@@ -631,18 +631,18 @@ def _fetch_profile_witness(payload, expected):
     fetch_evidence = evidence.get('fetch') if isinstance(evidence, dict) else None
     push_evidence = evidence.get('push') if isinstance(evidence, dict) else None
     if (target.get('remote_name') != expected['remote_name']
-            or target.get('normalized_host') != 'local'
+            or target.get('normalized_host') != expected['remote_host']
             or target.get('repository_path') != expected['remote_path']
             or target.get('coordination_key') != expected['repository']
-            or target.get('caller_assertion') is not None
+            or target.get('caller_assertion') != expected['caller_assertion']
             or not isinstance(evidence, dict)
-            or evidence.get('caller_assertion') != 'not_supplied'
+            or evidence.get('caller_assertion') != 'matched_repository_path'
             or evidence.get('identity') != 'fetch_and_push_matched'
             or not isinstance(fetch_evidence, dict)
-            or fetch_evidence.get('syntax') != 'local_path'
+            or fetch_evidence.get('syntax') != 'scp'
             or not isinstance(push_evidence, dict)
-            or push_evidence.get('syntax') != 'local_path'):
-        raise RuntimeError('fetch operation did not bind the expected local-path identity')
+            or push_evidence.get('syntax') != 'scp'):
+        raise RuntimeError('fetch operation did not bind the expected SSH-shaped repository identity')
 
     details_raw = operation.get('details_json')
     if details_raw is None:
@@ -742,7 +742,7 @@ def _baseline_unsupported_fetch_option(role, receipt, expected_argv):
     if (receipt.get('label') != 'action:fetch_provable'
             or receipt.get('argv') != expected_argv
             or isinstance(exit_code, bool) or not isinstance(exit_code, int)
-            or exit_code <= 0
+            or exit_code != 1
             or receipt.get('failure') != f'command exited with status {exit_code}'
             or receipt.get('stdout_complete') is not False
             or receipt.get('stdout_utf8_valid') is not True
@@ -763,11 +763,24 @@ def _baseline_unsupported_fetch_option(role, receipt, expected_argv):
         digest = receipt.get(field)
         if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
             return None
-    output = f"{receipt['stdout']}\n{receipt['stderr']}"
+    stdout = receipt['stdout']
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    if (not isinstance(payload, dict) or payload.get('schema') != 'aethyme.broker-error/v1'
+            or 'operation' in payload or 'resolved_target' in payload):
+        return None
+    error = payload.get('error')
+    code = error.get('code') if isinstance(error, dict) else None
+    message = error.get('message') if isinstance(error, dict) else None
+    if (isinstance(code, bool) or not isinstance(code, int) or code != 1
+            or not isinstance(message, str)):
+        return None
     for option in BASELINE_UNSUPPORTED_FETCH_OPTIONS:
         refusal = (
             f'unsupported fetch option "{option}" prevents deterministic remote resolution')
-        if refusal in output:
+        if message == refusal:
             return option
     return None
 
@@ -777,9 +790,9 @@ def _run_provable_fetch(playground, sessions, timings, semantic, role):
     session = sessions['fetch_provable']
     repo = Path(playground['repo'])
     worktree = Path(session['worktree'])
-    remote_path = Path(playground['remote']).resolve(strict=True)
-    expected_repository_path = remote_path.as_posix().removesuffix('.git').rstrip('/')
-    expected_repository = f'local:{expected_repository_path}'
+    expected_remote_host = 'github.com'
+    expected_repository_path = WORKTREE_REPO
+    expected_repository = f'{expected_remote_host}/{expected_repository_path}'
     expected_ref = FETCH_DESTINATION_REF
     before_ref = run_git(
         playground['runner'], playground['git'], worktree,
@@ -799,6 +812,7 @@ def _run_provable_fetch(playground, sessions, timings, semantic, role):
     refspec = f'{source_ref}:{expected_ref}'
     args = [
         'broker', 'advanced', 'git', '--session', str(session['id']),
+        '--repo', WORKTREE_REPO,
         '--effect', 'write', '--scope', 'fetch',
         '--reason', 'synthetic paired action measurement', '--json', '--',
         'fetch', *FETCH_FLAGS, '--', FETCH_REMOTE, refspec,
@@ -851,7 +865,9 @@ def _run_provable_fetch(playground, sessions, timings, semantic, role):
     witness = _fetch_profile_witness(payload, {
         'session_id': session['id'],
         'repository': expected_repository,
+        'remote_host': expected_remote_host,
         'remote_path': expected_repository_path,
+        'caller_assertion': WORKTREE_REPO,
         'remote_name': FETCH_REMOTE,
         'source_ref': source_ref,
         'destination_ref': expected_ref,
@@ -878,10 +894,15 @@ def _run_provable_fetch(playground, sessions, timings, semantic, role):
             'provider_start_time': witness['provider_start_time'],
             'completion_observed_at': witness['completion_observed_at'],
             'canonical_repository': expected_repository,
+            'normalized_host': expected_remote_host,
+            'repository_path': expected_repository_path,
+            'coordination_key': expected_repository,
+            'caller_assertion': WORKTREE_REPO,
             'remote_name': FETCH_REMOTE,
             'git_environment': (
                 'fixture allowlist; inherited Git routing/configuration/SSH selectors absent; '
-                'local-path remote with no custom core.sshCommand during fetch'),
+                'GitHub-shaped SSH alias routed through the fixture local-bare SSH shim; '
+                'no custom core.sshCommand during fetch'),
         }
     show = _cli(playground,
                 ['broker', 'advanced', 'operations', 'show', str(operation['id']), '--json'],
