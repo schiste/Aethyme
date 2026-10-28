@@ -1580,6 +1580,90 @@ fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
     Ok(output.stdout)
 }
 
+fn run_git_bytes_with_index_for_tree_hash(
+    cwd: &Path,
+    index_file: &str,
+    args: &[&str],
+    writers_quiescent: &mut bool,
+) -> Result<Vec<u8>, GitError> {
+    let mut command = git_command();
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_INDEX_FILE", index_file);
+
+    #[cfg(unix)]
+    {
+        let output =
+            run_git_process_output_in_owned_group(command, args, git_timeout(), writers_quiescent)?;
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        Ok(output.stdout)
+    }
+    #[cfg(not(unix))]
+    {
+        // This platform cannot attest owned-group quiescence. Its automatic
+        // artifact-use consumers remain disabled.
+        *writers_quiescent = false;
+        let output = run_git_command_output(command, args, git_timeout())?;
+        Ok(output.stdout)
+    }
+}
+
+fn untracked_hash_pathspecs(output: &[u8]) -> Result<Vec<u8>, GitError> {
+    const ARGS: &str = "ls-files --others --exclude-standard -z";
+    let malformed = || GitError::UntrustedOutput {
+        detail: format!("git {ARGS} emitted malformed NUL-separated paths"),
+    };
+    if output.is_empty() {
+        return Ok(Vec::new());
+    }
+    if output.last() != Some(&0) {
+        return Err(malformed());
+    }
+
+    let mut pathspecs = Vec::with_capacity(output.len());
+    for path in output[..output.len() - 1].split(|byte| *byte == 0) {
+        if path.is_empty() {
+            return Err(malformed());
+        }
+        let path_text = String::from_utf8_lossy(path);
+        if crate::runtime_paths::is_broker_runtime_path(&path_text) {
+            continue;
+        }
+        pathspecs.extend_from_slice(path);
+        pathspecs.push(0);
+    }
+    Ok(pathspecs)
+}
+
+#[cfg(test)]
+mod untracked_hash_pathspec_tests {
+    use super::untracked_hash_pathspecs;
+
+    #[test]
+    fn accepts_empty_output_and_rejects_malformed_nul_framing() {
+        assert_eq!(untracked_hash_pathspecs(b"").unwrap(), Vec::<u8>::new());
+        assert!(untracked_hash_pathspecs(b"unterminated").is_err());
+        assert!(untracked_hash_pathspecs(b"\0").is_err());
+        assert!(untracked_hash_pathspecs(b"one\0\0").is_err());
+    }
+
+    #[test]
+    fn filters_runtime_paths_and_preserves_literal_non_utf8_names() {
+        let output = b".aethyme/run/worker.json\0.aethyme/broker.db-wal\0.aethyme/run\0:(exclude)**.txt\0non-utf8-\xff.txt\0";
+        assert_eq!(
+            untracked_hash_pathspecs(output).unwrap(),
+            b".aethyme/run\0:(exclude)**.txt\0non-utf8-\xff.txt\0"
+        );
+    }
+}
+
 /// Like [`run_git`] but against a private index file (GIT_INDEX_FILE) so
 /// staging operations never disturb the checkout's real index.
 fn run_git_with_index(cwd: &Path, index_file: &str, args: &[&str]) -> Result<String, GitError> {
@@ -4979,26 +5063,54 @@ impl GitRepo {
                 writers_quiescent,
             )?;
             // Capture tracked edits and deletions first, including anything
-            // intentionally tracked beneath a runtime path. The exclusions
-            // on the second pass therefore only omit untracked operational
-            // state and cannot hide tracked inputs from the cache key.
+            // intentionally tracked beneath a runtime path. Enumerate only
+            // Git-visible untracked files for the second pass, then filter
+            // broker runtime paths in memory. Negative pathspecs after `.`
+            // can make Git report an ignored parent directory such as
+            // `.aethyme` itself, even when every ignored runtime child is
+            // excluded.
             run_git_with_index_for_tree_hash(
                 &self.root,
                 &tmp_str,
                 &["add", "-u", "--", "."],
                 writers_quiescent,
             )?;
-            let exclusions =
-                crate::runtime_paths::broker_runtime_untracked_git_pathspec_exclusions()
-                    .collect::<Vec<_>>();
-            let mut add_all_args = vec!["add", "-A", "--", "."];
-            add_all_args.extend(exclusions.iter().map(String::as_str));
-            run_git_with_index_for_tree_hash(
+            let untracked = run_git_bytes_with_index_for_tree_hash(
                 &self.root,
                 &tmp_str,
-                &add_all_args,
+                &["ls-files", "--others", "--exclude-standard", "-z"],
                 writers_quiescent,
             )?;
+            let pathspecs = untracked_hash_pathspecs(&untracked)?;
+            if !pathspecs.is_empty() {
+                let mut pathspec_file =
+                    tempfile::NamedTempFile::new_in(&index_dir).map_err(|source| {
+                        GitError::Spawn {
+                            args: format!("create pathspec file in {}", index_dir.display()),
+                            source,
+                        }
+                    })?;
+                pathspec_file
+                    .write_all(&pathspecs)
+                    .map_err(|source| GitError::Spawn {
+                        args: format!("write {}", pathspec_file.path().display()),
+                        source,
+                    })?;
+                let pathspec_arg =
+                    format!("--pathspec-from-file={}", pathspec_file.path().display());
+                run_git_with_index_for_tree_hash(
+                    &self.root,
+                    &tmp_str,
+                    &[
+                        "--literal-pathspecs",
+                        "add",
+                        "-A",
+                        &pathspec_arg,
+                        "--pathspec-file-nul",
+                    ],
+                    writers_quiescent,
+                )?;
+            }
             run_git_with_index_for_tree_hash(
                 &self.root,
                 &tmp_str,
@@ -9915,12 +10027,27 @@ mod working_tree_hash_runtime_path_tests {
         );
         assert_eq!(repo.working_tree_hash().unwrap(), baseline);
 
-        write(
-            root.path(),
-            "new-source.txt",
-            "ordinary untracked content\n",
-        );
+        #[cfg(unix)]
+        let pathspec_name = ":(exclude)literal [glob]*.txt";
+        #[cfg(not(unix))]
+        let pathspec_name = "new-source [literal].txt";
+        write(root.path(), pathspec_name, "ordinary untracked content\n");
         assert_ne!(repo.working_tree_hash().unwrap(), baseline);
+    }
+
+    #[test]
+    fn working_tree_hash_handles_an_ignored_runtime_parent() {
+        let (root, repo) = repository();
+        write(root.path(), ".gitignore", ".aethyme/\n");
+        git(root.path(), &["add", ".gitignore"]);
+        git(root.path(), &["commit", "-qm", "ignore runtime root"]);
+
+        let baseline = repo.working_tree_hash().unwrap();
+        write(root.path(), ".aethyme/broker.db", "runtime database\n");
+        write(root.path(), ".aethyme/run/worker.json", "runtime marker\n");
+        write(root.path(), ".aethyme/logs/worker.log", "runtime log\n");
+
+        assert_eq!(repo.working_tree_hash().unwrap(), baseline);
     }
 
     #[test]
@@ -9935,8 +10062,13 @@ mod working_tree_hash_runtime_path_tests {
             root.path(),
             &["config", "user.email", "working-tree-hash@example.invalid"],
         );
+        write(root.path(), ".gitignore", ".aethyme/\n");
+        git(root.path(), &["add", ".gitignore"]);
         write(root.path(), ".aethyme/run/tracked-policy.json", "before\n");
-        git(root.path(), &["add", ".aethyme/run/tracked-policy.json"]);
+        git(
+            root.path(),
+            &["add", "-f", ".aethyme/run/tracked-policy.json"],
+        );
         git(root.path(), &["commit", "-qm", "track runtime policy"]);
 
         let repo = GitRepo::discover(root.path()).unwrap();
