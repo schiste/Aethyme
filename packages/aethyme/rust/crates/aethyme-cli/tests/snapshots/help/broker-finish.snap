@@ -26,9 +26,12 @@ exit: 0
       by default; --apply revalidates and removes only clean worktrees whose
       session work is represented on main, integration, or configured upstream.
       Adopted worktrees are never included in the bulk sweep.
-  aethyme broker finish cleanup resolve <session-id> --archive [--confirm <sha256>] [--json]
+  aethyme broker finish cleanup resolve <session-id> --archive [--owner-authorized-adopted] [--confirm <sha256>] [--json]
       Preserve, then remove, a closed session's worktree that cleanup refuses
       because it is dirty, holds pending commits, or cannot be proved landed.
+      Adopted worktrees require --owner-authorized-adopted on both planning and
+      apply; this is an explicit operator attestation and does not prove who
+      originally adopted the checkout.
       Without --confirm it prints what would be archived and a digest. With it,
       it writes a recovery archive under the host state directory (a bundle of
       commits no delivery target holds, staged and unstaged patches, untracked

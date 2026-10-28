@@ -2421,6 +2421,151 @@ impl Broker {
         )
     }
 
+    /// Run the same bounded cleanliness/provenance preflight for an adopted
+    /// checkout without treating its path as broker-owned. This is callable
+    /// only from the explicit adopted recovery path, which separately binds
+    /// the Git registration and filesystem identity into its plan.
+    pub(crate) fn cleanup_adopted_recovery_eligibility(
+        &self,
+        session: &Session,
+        worktree: &Path,
+        status_output_bytes: usize,
+        status_path_fields: usize,
+        delivery_targets: &[String],
+    ) -> Result<(CleanupDisposition, String), BrokerOpError> {
+        let refuse = |reason: String| BrokerOpError::CleanupResolveRefused {
+            id: session.id,
+            reason,
+        };
+        if session.origin != SessionOrigin::Adopted || !session.status.is_closed() {
+            return Err(refuse("adopted recovery requires a closed adopted session".into()));
+        }
+        let status_limits = CleanupStatusLimits::new(
+            self.landing_deadline.get(),
+            status_output_bytes,
+            status_path_fields,
+        );
+
+        let canonical_target = worktree
+            .canonicalize()
+            .map_err(|error| {
+                refuse(format!(
+                    "cannot resolve adopted checkout for gate evidence: {error}"
+                ))
+            })?;
+        let gate_evidence = crate::gates::running_session_gate_evidence_until(
+            self.main_root(),
+            session.id,
+            || std::time::Instant::now() >= status_limits.deadline,
+            4096,
+        )
+        .ok_or_else(|| {
+            refuse(
+                "session gate activity could not be completely checked within its scan budget and deadline"
+                    .into(),
+            )
+        })?;
+        let ensure_other_gate_owner_is_disjoint =
+            |owner_session_id: i64, evidence_name: &str| -> Result<(), BrokerOpError> {
+                let owner = self.store_ref().session(owner_session_id).map_err(|error| {
+                    refuse(format!(
+                        "cannot resolve session {owner_session_id} recorded in gate activity \
+                         {evidence_name}: {error}"
+                    ))
+                })?;
+                let owner_path = Path::new(&owner.worktree_path);
+                if !owner_path.is_absolute() {
+                    return Err(refuse(format!(
+                        "session {owner_session_id} has a non-absolute checkout path in gate activity {evidence_name}"
+                    )));
+                }
+                let owner_root = owner_path.canonicalize().map_err(|error| {
+                    refuse(format!(
+                        "cannot resolve session {owner_session_id} checkout from gate activity \
+                         {evidence_name}: {error}"
+                    ))
+                })?;
+                if canonical_target.starts_with(&owner_root)
+                    || owner_root.starts_with(&canonical_target)
+                {
+                    return Err(refuse(format!(
+                        "gate activity {evidence_name} belongs to a session whose checkout \
+                         overlaps this adopted worktree"
+                    )));
+                }
+                Ok(())
+            };
+        for witness in gate_evidence {
+            match witness {
+                crate::gates::SessionGateEvidence::RunningPidfile { name, pid } => {
+                    return Err(refuse(format!(
+                        "gate pidfile {name} names running process {pid} for this session"
+                    )));
+                }
+                crate::gates::SessionGateEvidence::OwnerLockForSession { name, session_id } => {
+                    if session_id == session.id {
+                        return Err(refuse(format!(
+                            "gate owner lock {name} is held by this adopted session"
+                        )));
+                    }
+                    ensure_other_gate_owner_is_disjoint(session_id, &name)?;
+                }
+                crate::gates::SessionGateEvidence::GateOwnerLockWaiter {
+                    name,
+                    pid,
+                    session_id,
+                } => {
+                    if session_id == session.id {
+                        return Err(refuse(format!(
+                            "gate owner-lock waiter {name} (process {pid}) is active for this adopted session"
+                        )));
+                    }
+                    ensure_other_gate_owner_is_disjoint(session_id, &name)?;
+                }
+                crate::gates::SessionGateEvidence::Unknown { name, reason } => {
+                    return Err(refuse(format!(
+                        "gate activity {name} is unknown: {reason}"
+                    )));
+                }
+            }
+        }
+        if self
+            .store
+            .has_unreleased_unexpired_lease_for_session_at(session.id, crate::clock::epoch_ms())?
+        {
+            return Err(refuse("the adopted session still has an active lease".into()));
+        }
+        if let Some(operation) = crate::git::worktree_operation_in_progress(worktree) {
+            return Err(refuse(format!(
+                "the adopted checkout has a Git operation in progress ({operation})"
+            )));
+        }
+        self.refuse_overlapping_live_checkout(session.id, worktree)?;
+        match crate::reclaim::open_file_snapshot_under(worktree) {
+            snapshot @ crate::reclaim::OpenFileSnapshot::Complete(_) => {
+                if let Some(reason) =
+                    crate::reclaim::open_file_snapshot_blocker_for_worktree(&snapshot, worktree)
+                {
+                    return Err(refuse(reason));
+                }
+            }
+            crate::reclaim::OpenFileSnapshot::Incomplete { reason, .. } => {
+                return Err(refuse(format!(
+                    "open-file use could not be completely checked: {reason}"
+                )));
+            }
+        }
+
+        let (disposition, reason, _) = self.cleanup_eligibility_with_provenance(
+            worktree,
+            status_limits,
+            |head| {
+                self.archive_preservation_ancestry(head, delivery_targets, status_limits.deadline)
+            },
+        )?;
+        Ok((disposition, reason))
+    }
+
     fn cleanup_item_for_recovery_archive_with_limits(
         &self,
         session: &Session,
@@ -4072,6 +4217,90 @@ impl Broker {
         self.cleanup_under_lifecycle_claim(&session, true, Some((archived_plan, archive_path)))
     }
 
+    /// Verify the same reviewed archive contract for spawned and explicitly
+    /// authorized adopted checkouts. Call only while lifecycle and session
+    /// commit claims are held, immediately before Git removes the registration.
+    fn verify_recovery_archive_before_removal(
+        &self,
+        session: &Session,
+        archived_plan: &crate::CleanupResolvePlan,
+        archive_path: &Path,
+        status_limits: CleanupStatusLimits,
+    ) -> Result<(), BrokerOpError> {
+        let refuse = |reason: String| BrokerOpError::CleanupResolveRefused {
+            id: session.id,
+            reason,
+        };
+        let adopted = session.origin == SessionOrigin::Adopted;
+        if archived_plan.session_id != session.id
+            || archived_plan.owner_authorized_adopted != adopted
+            || archived_plan.adopted_checkout.is_some() != adopted
+        {
+            return Err(refuse(
+                "the archive plan does not authorize this session origin; preserved the archive, worktree, and branch".into(),
+            ));
+        }
+        let worktree_path = Path::new(&session.worktree_path);
+        if !worktree_path_is_real_directory(worktree_path, session.id)? {
+            return Err(refuse(
+                "the archived checkout is no longer present for identity and content revalidation; preserved the session branch and archive".into(),
+            ));
+        }
+        if adopted {
+            self.refuse_overlapping_live_checkout(session.id, worktree_path)?;
+        } else {
+            self.refuse_live_checkout(session.id, worktree_path)?;
+        }
+        let _archive_deadline = crate::git::limit_git_until(status_limits.deadline);
+        let current = if archived_plan.owner_authorized_adopted {
+            self.cleanup_resolve_revalidation_plan_with_owner_authorized_adopted(session.id, true)?
+        } else {
+            self.cleanup_resolve_revalidation_plan(session.id)?
+        };
+        if current.digest != archived_plan.digest {
+            return Err(refuse(
+                "worktree contents, adoption boundary, checkout identity, or ignored cleanup policy changed after archive verification; the archive was kept and the worktree remains in place; review a new resolve plan before retrying".into(),
+            ));
+        }
+
+        // Bundle prerequisites are the reviewed delivery targets whose
+        // reachable commits were omitted. Each must remain rooted in current
+        // delivery history; local object existence alone is insufficient.
+        let _deadline = crate::git::limit_git_until(status_limits.deadline);
+        for prerequisite in &archived_plan.delivery_targets {
+            let mut retained = false;
+            let mut unavailable = None;
+            for target in &current.delivery_targets {
+                match self.repo_handle().is_ancestor_checked(prerequisite, target) {
+                    Ok(true) => {
+                        retained = true;
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(error) => unavailable = Some(error.to_string()),
+                }
+            }
+            if !retained {
+                return Err(refuse(match unavailable {
+                    Some(error) => format!(
+                        "archive prerequisite reachability could not be verified; the archive and checkout were preserved: {error}"
+                    ),
+                    None => "archive prerequisites are no longer retained by current delivery history; the archive and checkout were preserved".into(),
+                }));
+            }
+        }
+        crate::cleanup_resolve::verify_recovery_archive_for_plan(
+            self.repo_handle(),
+            archive_path,
+            archived_plan,
+        )
+        .map_err(|reason| {
+            refuse(format!(
+                "the verified archive changed before worktree removal; the worktree remains in place: {reason}"
+            ))
+        })
+    }
+
     /// Perform cleanup while the caller holds the repository lifecycle claim.
     /// Finish uses this after recording its durable cleanup intent under the
     /// same claim; reacquiring here would deadlock on the persistent lock.
@@ -4110,11 +4339,16 @@ impl Broker {
                     ),
                 })?;
         let worktree_path = PathBuf::from(&session.worktree_path);
-        if archive_guard.is_some() && session.origin != SessionOrigin::Spawned {
+        if let Some((archived_plan, _)) = archive_guard
+            && (archived_plan.session_id != session_id
+                || archived_plan.owner_authorized_adopted
+                    != (session.origin == SessionOrigin::Adopted)
+                || archived_plan.adopted_checkout.is_some()
+                    != (session.origin == SessionOrigin::Adopted))
+        {
             return Err(BrokerOpError::CleanupResolveRefused {
                 id: session_id,
-                reason: "only broker-spawned worktrees can be removed after archive resolution"
-                    .into(),
+                reason: "the archive plan does not authorize this session origin".into(),
             });
         }
         if !force
@@ -4127,7 +4361,22 @@ impl Broker {
             return self.resume_interrupted_finish_orphan_cleanup(session, &proof);
         }
         if session.origin == SessionOrigin::Adopted {
-            if worktree_path_is_real_directory(&worktree_path, session_id)? {
+            let checkout_present = worktree_path_is_real_directory(&worktree_path, session_id)?;
+            if archive_guard.is_some() && !checkout_present {
+                return Err(BrokerOpError::CleanupResolveRefused {
+                    id: session_id,
+                    reason: "the archived adopted checkout is no longer present for identity and content revalidation; preserved the session branch and archive".into(),
+                });
+            }
+            if checkout_present {
+                if let Some((archived_plan, archive_path)) = archive_guard {
+                    self.verify_recovery_archive_before_removal(
+                        session,
+                        archived_plan,
+                        archive_path,
+                        status_limits,
+                    )?;
+                }
                 if !force {
                     let targets = self.cleanup_delivery_targets()?;
                     let mut landing_cache = crate::representation::LandingVerdictCache::default();
@@ -4145,7 +4394,7 @@ impl Broker {
                         });
                     }
                 }
-                self.refuse_live_checkout(session_id, &worktree_path)?;
+                self.refuse_overlapping_live_checkout(session_id, &worktree_path)?;
                 self.repo
                     .worktree_remove_registered(&worktree_path, force)?;
             }
@@ -4207,54 +4456,12 @@ impl Broker {
         if retained_checkout_present {
             self.refuse_live_checkout(session_id, &worktree_path)?;
             if let Some((archived_plan, archive_path)) = archive_guard {
-                let _archive_deadline = crate::git::limit_git_until(status_limits.deadline);
-                let current = self.cleanup_resolve_revalidation_plan(session_id)?;
-                if current.digest != archived_plan.digest {
-                    return Err(BrokerOpError::CleanupResolveRefused {
-                        id: session_id,
-                        reason: "worktree contents or ignored cleanup policy changed after archive verification; the archive was kept and the worktree remains in place; review a new resolve plan before retrying".into(),
-                    });
-                }
-                // A bundle omits commits reachable from its reviewed delivery
-                // targets. Each prerequisite must remain rooted in current
-                // delivery history; local object existence alone is insufficient.
-                {
-                    let _deadline = crate::git::limit_git_until(status_limits.deadline);
-                    for prerequisite in &archived_plan.delivery_targets {
-                        let mut retained = false;
-                        let mut unavailable = None;
-                        for target in &current.delivery_targets {
-                            match self.repo_handle().is_ancestor_checked(prerequisite, target) {
-                                Ok(true) => {
-                                    retained = true;
-                                    break;
-                                }
-                                Ok(false) => {}
-                                Err(error) => unavailable = Some(error.to_string()),
-                            }
-                        }
-                        if !retained {
-                            return Err(BrokerOpError::CleanupResolveRefused {
-                                id: session_id,
-                                reason: match unavailable {
-                                    Some(error) => format!("archive prerequisite reachability could not be verified; the archive and checkout were preserved: {error}"),
-                                    None => "archive prerequisites are no longer retained by current delivery history; the archive and checkout were preserved".into(),
-                                },
-                            });
-                        }
-                    }
-                }
-                crate::cleanup_resolve::verify_recovery_archive_for_plan(
-                    self.repo_handle(),
-                    archive_path,
+                self.verify_recovery_archive_before_removal(
+                    session,
                     archived_plan,
-                )
-                .map_err(|reason| BrokerOpError::CleanupResolveRefused {
-                    id: session_id,
-                    reason: format!(
-                        "the verified archive changed before worktree removal; the worktree remains in place: {reason}"
-                    ),
-                })?;
+                    archive_path,
+                    status_limits,
+                )?;
             }
             if self.is_orphaned_worktree_of_this_repository_checked(&worktree_path)? {
                 removed_orphan_branch = Some(self.remove_proven_orphan_worktree(
@@ -4304,6 +4511,47 @@ impl Broker {
         for live in self.store.live_sessions()? {
             if live.id != session_id && canonical(Path::new(&live.worktree_path)).starts_with(&root)
             {
+                return Err(BrokerOpError::WorktreeInUseByLiveSession {
+                    id: session_id,
+                    live_id: live.id,
+                    path: worktree.to_string_lossy().into_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Adopted recovery also refuses an active live checkout that contains
+    /// the target path. Removing that nested adopted worktree would otherwise
+    /// delete part of the active session's working directory. Both paths must
+    /// canonicalize so an unknown association cannot authorize retirement.
+    pub(crate) fn refuse_overlapping_live_checkout(
+        &self,
+        session_id: i64,
+        worktree: &Path,
+    ) -> Result<(), BrokerOpError> {
+        let root = worktree.canonicalize().map_err(|error| {
+            BrokerOpError::CleanupResolveRefused {
+                id: session_id,
+                reason: format!(
+                    "cannot resolve the adopted checkout path while checking live associations: {error}"
+                ),
+            }
+        })?;
+        for live in self.store.live_sessions()? {
+            if live.id == session_id {
+                continue;
+            }
+            let live_root = Path::new(&live.worktree_path).canonicalize().map_err(|error| {
+                BrokerOpError::CleanupResolveRefused {
+                    id: session_id,
+                    reason: format!(
+                        "cannot prove that live session {} is outside the adopted checkout because its path cannot be resolved: {error}",
+                        live.id
+                    ),
+                }
+            })?;
+            if root.starts_with(&live_root) || live_root.starts_with(&root) {
                 return Err(BrokerOpError::WorktreeInUseByLiveSession {
                     id: session_id,
                     live_id: live.id,

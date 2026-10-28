@@ -822,9 +822,12 @@ Usage:
       by default; --apply revalidates and removes only clean worktrees whose
       session work is represented on main, integration, or configured upstream.
       Adopted worktrees are never included in the bulk sweep.
-  aethyme broker cleanup resolve <session-id> --archive [--confirm <sha256>] [--json]
+  aethyme broker cleanup resolve <session-id> --archive [--owner-authorized-adopted] [--confirm <sha256>] [--json]
       Preserve, then remove, a closed session's worktree that cleanup refuses
       because it is dirty, holds pending commits, or cannot be proved landed.
+      Adopted worktrees require --owner-authorized-adopted on both planning and
+      apply; this is an explicit operator attestation and does not prove who
+      originally adopted the checkout.
       Without --confirm it prints what would be archived and a digest. With it,
       it writes a recovery archive under the host state directory (a bundle of
       commits no delivery target holds, staged and unstaged patches, untracked
@@ -1615,6 +1618,7 @@ struct Parsed {
     all: bool,
     all_cleaned: bool,
     archive: bool,
+    owner_authorized_adopted: bool,
     abandon: bool,
     keep_worktree: bool,
     chau7: bool,
@@ -1758,6 +1762,7 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         all: false,
         all_cleaned: false,
         archive: false,
+        owner_authorized_adopted: false,
         abandon: false,
         keep_worktree: false,
         chau7: false,
@@ -1842,6 +1847,7 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
             "--all" => parsed.all = true,
             "--all-cleaned" => parsed.all_cleaned = true,
             "--archive" => parsed.archive = true,
+            "--owner-authorized-adopted" => parsed.owner_authorized_adopted = true,
             "--abandon" => parsed.abandon = true,
             "--keep-worktree" => parsed.keep_worktree = true,
             "--open-pr" => parsed.open_pr = true,

@@ -1046,3 +1046,31 @@ unavailable for cleanup authorization, never as `present`. Exact-content
 landing evidence requires matching complete committed entries; executable bits
 and symlink types are part of the proof. Existing ancestry and patch proofs
 retain their separate requirements.
+
+### Explicit adopted cleanup resolve
+
+`broker finish cleanup resolve <session-id> --archive` continues to refuse
+adopted sessions by default. Operators can opt in to one closed adopted
+checkout by passing `--owner-authorized-adopted` for both the read-only plan
+and its `--confirm` apply. This is an operator attestation, not proof of who
+originally adopted the checkout. The plan uses a separate adopted digest
+contract and recovery manifest v5, binding the adoption boundary, current
+branch and HEAD, canonical repository and checkout paths, Git worktree admin
+and backpointer identities, the resolved archive destination, preserved
+content and ignored-path policy. Apply repeats the liveness, registration,
+identity, content and archive checks under the lifecycle and session commit
+claims. Bounded gate evidence checks session PID files, owner locks, and gate
+owner-lock wait records; activity owned by another session is unrelated only
+when its stored checkout resolves canonically outside this one. Unattributed
+or incomplete evidence refuses.
+Git removes only the registered checkout; the session branch remains at its
+reviewed object ID. The archive destination must be outside the
+checkout and its Git admin/common directories. Disposable ignored folders
+remain listed in the plan but are not copied; protected ignored files are
+archived, and strict policy still refuses leftovers. Manifest readers keep
+the frozen v1-v4 compatibility paths.
+
+This inventory is point-in-time evidence. Do not deploy or apply adopted
+retirement until the separate gate-admission lifecycle protocol is qualified
+and pre-protocol clients are drained or otherwise excluded; this scanner alone
+does not close the race with a new gate starting after its final scan.

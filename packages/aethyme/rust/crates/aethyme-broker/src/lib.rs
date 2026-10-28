@@ -298,8 +298,9 @@ pub use cleanup_audit::{
     CLEANUP_AUDIT_SCHEMA_VERSION, CheckoutState, CleanupAudit, CommittedWork,
 };
 pub use cleanup_resolve::{
-    ArchivedFile, CLEANUP_RESOLVE_SCHEMA_VERSION, CleanupResolveOutcome, CleanupResolvePlan,
-    IgnoredPath, IgnoredPathClassification, RecoveryLandingAssessment, RecoveryLandingState,
+    AdoptedCheckoutIdentity, ArchivedFile, CLEANUP_RESOLVE_SCHEMA_VERSION,
+    CleanupResolveOutcome, CleanupResolvePlan, IgnoredPath, IgnoredPathClassification,
+    RecoveryLandingAssessment, RecoveryLandingState,
 };
 pub use console::{
     CONSOLE_EXCLUSIVE_KEY, CONSOLE_INTEGRATION_REF, CONSOLE_MARKER_DIGEST_ENV, CONSOLE_MARKER_ENV,

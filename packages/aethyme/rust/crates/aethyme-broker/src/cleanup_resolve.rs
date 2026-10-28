@@ -41,6 +41,8 @@ const LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 1;
 const PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 2;
 const PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 3;
 const RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 4;
+const ADOPTED_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 5;
+const ADOPTED_RECOVERY_IDENTITY_SCHEMA_VERSION: u32 = 1;
 const MAX_RECOVERY_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_RECOVERY_BUNDLE_STDERR_BYTES: usize = 64 * 1024;
 const MAX_RECOVERY_BUNDLE_METADATA_OUTPUT_BYTES: usize = 64 * 1024;
@@ -134,11 +136,52 @@ pub struct CleanupResolvePlan {
     pub ignored_bytes: u64,
     /// Digest of the strict/regenerable policy inputs bound into `digest`.
     pub ignored_policy_sha256: String,
+    /// Present only for the explicitly operator-authorized adopted-checkout
+    /// path. Its schema and digest domain are separate from spawned recovery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adopted_checkout: Option<AdoptedCheckoutIdentity>,
+    /// True only when the operator supplied the explicit adopted-retirement
+    /// attestation for both planning and apply.
+    #[serde(skip_serializing_if = "is_false")]
+    pub owner_authorized_adopted: bool,
     /// The directory the archive will be written beneath.
     pub archive_root: PathBuf,
     pub apply_command: String,
     /// The existing discard path, named so the choice is explicit.
     pub discard_command: String,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+/// Exact adopted-session boundary and registered linked-checkout identity
+/// observed by the explicit recovery plan. This is an auditable, versioned
+/// operator authorization contract, not proof of who originally adopted it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdoptedCheckoutIdentity {
+    pub schema_version: u32,
+    pub adoption_base: String,
+    pub adopted_head: String,
+    pub diff_base: String,
+    pub canonical_worktree_path: String,
+    pub worktree_device: u64,
+    pub worktree_inode: u64,
+    pub git_pointer_device: u64,
+    pub git_pointer_inode: u64,
+    pub git_pointer_sha256: String,
+    pub git_admin_path: String,
+    pub git_admin_device: u64,
+    pub git_admin_inode: u64,
+    pub git_backpointer_sha256: String,
+    pub git_common_path: String,
+    pub git_common_device: u64,
+    pub git_common_inode: u64,
+    /// Some adopted worktrees also have a broker root-generation marker.
+    /// Bind it when present; `.git` admin and backpointer identity remain
+    /// required for every supported adopted checkout.
+    pub root_generation_sha256: Option<String>,
 }
 
 /// Recovery's landing-proof assessment. The known verdict keeps its legacy
@@ -249,6 +292,41 @@ struct DigestInputV5<'a> {
     ignored_policy: &'a IgnoredPolicyProof<'a>,
 }
 
+/// New adopted-retirement contract. V5 stays frozen for spawned archives.
+#[derive(serde::Serialize)]
+struct DigestInputV6<'a> {
+    schema_version: u32,
+    recovery_archive_schema_version: u32,
+    max_recovery_bundle_bytes: u64,
+    owner_authorized_adopted: bool,
+    origin: &'static str,
+    session_id: i64,
+    repository_path: &'a str,
+    worktree_path: &'a str,
+    branch_ref: &'a str,
+    branch_tip: Option<&'a str>,
+    head: &'a str,
+    adopted_checkout: &'a AdoptedCheckoutIdentity,
+    archive_root: &'a str,
+    staged_patch_sha256: &'a str,
+    unstaged_patch_sha256: &'a str,
+    untracked_files: &'a [ArchivedFile],
+    ignored_paths: &'a [IgnoredPath],
+    ignored_files: &'a [ArchivedFile],
+    ignored_policy: &'a IgnoredPolicyProof<'a>,
+}
+
+#[derive(Clone, Copy)]
+struct RecoveryPlanEligibility {
+    allow_eligible: bool,
+    owner_authorized_adopted: bool,
+}
+
+struct RecoveryArchiveApplyMode<B> {
+    owner_authorized_adopted: bool,
+    bundle: RecoveryBundleWriter<B>,
+}
+
 #[derive(serde::Serialize)]
 struct IgnoredPolicyProof<'a> {
     strict: bool,
@@ -296,6 +374,10 @@ struct RecoveryManifest<'a> {
     ignored_paths: &'a [IgnoredPath],
     ignored_files: &'a [ArchivedFile],
     ignored_policy_sha256: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adopted_checkout: Option<&'a AdoptedCheckoutIdentity>,
 }
 
 struct RecoveryBundleIntegrity {
@@ -423,6 +505,377 @@ fn permission_mode(metadata: &std::fs::Metadata) -> Option<u32> {
         let _ = metadata;
         None
     }
+}
+
+#[cfg(unix)]
+fn unix_file_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(unix)]
+fn adopted_checkout_identity(
+    session: &crate::Session,
+    repository: &GitRepo,
+    checkout: &GitRepo,
+    worktree: &Path,
+    branch_ref: &str,
+    branch_tip: &str,
+    head: &str,
+) -> Result<AdoptedCheckoutIdentity, String> {
+    if session.origin != SessionOrigin::Adopted {
+        return Err("the explicit adopted-retirement flag applies only to adopted sessions".into());
+    }
+    let adoption_base = session
+        .adoption_base
+        .as_deref()
+        .filter(|value| valid_git_object_id(value))
+        .ok_or_else(|| "the adopted session has no valid immutable adoption_base".to_owned())?;
+    let adopted_head = session
+        .adopted_head
+        .as_deref()
+        .filter(|value| valid_git_object_id(value))
+        .ok_or_else(|| "the adopted session has no valid immutable adopted_head".to_owned())?;
+    let diff_base = session
+        .diff_base
+        .as_deref()
+        .filter(|value| valid_git_object_id(value))
+        .ok_or_else(|| "the adopted session has no valid diff_base".to_owned())?;
+
+    let configured_worktree_metadata = std::fs::symlink_metadata(worktree)
+        .map_err(|error| format!("cannot inspect adopted worktree path: {error}"))?;
+    if configured_worktree_metadata.file_type().is_symlink()
+        || !configured_worktree_metadata.is_dir()
+    {
+        return Err("the adopted worktree path is not a real directory".into());
+    }
+    let canonical_worktree = worktree
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize the adopted worktree: {error}"))?;
+    let canonical_worktree_path = canonical_worktree
+        .to_str()
+        .ok_or_else(|| "the adopted checkout path is not UTF-8 and cannot be bound safely".to_owned())?;
+    if canonical_worktree_path != session.worktree_path.as_str()
+        && Path::new(&session.worktree_path)
+            .canonicalize()
+            .ok()
+            .as_deref()
+            != Some(canonical_worktree.as_path())
+    {
+        return Err("the adopted session path no longer names its canonical checkout".into());
+    }
+    let root_metadata = std::fs::symlink_metadata(&canonical_worktree)
+        .map_err(|error| format!("cannot inspect adopted worktree root: {error}"))?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err("the adopted worktree root is not a real directory".into());
+    }
+    let (worktree_device, worktree_inode) = unix_file_identity(&root_metadata);
+    let repository_common = repository
+        .git_common_dir()
+        .map_err(|error| format!("cannot resolve repository Git directory: {error}"))?
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize repository Git directory: {error}"))?;
+    let checkout_common = checkout
+        .git_common_dir()
+        .map_err(|error| format!("cannot resolve checkout Git directory: {error}"))?
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize checkout Git directory: {error}"))?;
+    if checkout.root() != canonical_worktree || repository_common != checkout_common {
+        return Err("the adopted checkout is not registered in the current repository".into());
+    }
+
+    let pointer_path = canonical_worktree.join(".git");
+    let (mut pointer, pointer_metadata) = open_regular_file_no_follow(&pointer_path)
+        .map_err(|error| format!("cannot safely inspect the adopted .git pointer: {error}"))?;
+    if pointer_metadata.len() > 4096 {
+        return Err("the adopted .git pointer exceeds its identity bound".into());
+    }
+    let mut pointer_bytes = Vec::with_capacity(pointer_metadata.len() as usize);
+    pointer
+        .take(4097)
+        .read_to_end(&mut pointer_bytes)
+        .map_err(|error| format!("cannot read the adopted .git pointer: {error}"))?;
+    if pointer_bytes.len() > 4096 {
+        return Err("the adopted .git pointer grew beyond its identity bound".into());
+    }
+    let pointer_text = std::str::from_utf8(&pointer_bytes)
+        .map_err(|_| "the adopted .git pointer is not UTF-8".to_owned())?;
+    let mut pointer_lines = pointer_text.lines();
+    let pointer_target = pointer_lines
+        .next()
+        .and_then(|line| line.strip_prefix("gitdir:"))
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .ok_or_else(|| "the adopted .git pointer has no gitdir target".to_owned())?;
+    if pointer_lines.next().is_some() {
+        return Err("the adopted .git pointer has unexpected extra records".into());
+    }
+    let pointed_admin = PathBuf::from(pointer_target);
+    let pointed_admin = if pointed_admin.is_absolute() {
+        pointed_admin
+    } else {
+        canonical_worktree.join(pointed_admin)
+    };
+    let pointed_admin_metadata = std::fs::symlink_metadata(&pointed_admin)
+        .map_err(|error| format!("cannot inspect adopted Git admin directory: {error}"))?;
+    if pointed_admin_metadata.file_type().is_symlink() || !pointed_admin_metadata.is_dir() {
+        return Err("the adopted Git admin path is not a real directory".into());
+    }
+    let canonical_admin = pointed_admin
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve the adopted Git admin directory: {error}"))?;
+    let admin_metadata = std::fs::symlink_metadata(&canonical_admin)
+        .map_err(|error| format!("cannot inspect adopted Git admin directory: {error}"))?;
+    if admin_metadata.file_type().is_symlink() || !admin_metadata.is_dir() {
+        return Err("the adopted Git admin path is not a real directory".into());
+    }
+    let (git_admin_device, git_admin_inode) = unix_file_identity(&admin_metadata);
+
+    let canonical_common = repository_common;
+    let worktrees_dir = canonical_common.join("worktrees");
+    let canonical_worktrees = worktrees_dir
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve registered worktree admin directory: {error}"))?;
+    if canonical_admin.parent() != Some(canonical_worktrees.as_path()) {
+        return Err("the adopted Git admin directory is outside this repository's worktrees".into());
+    }
+    let canonical_admin_path = canonical_admin
+        .to_str()
+        .ok_or_else(|| "the adopted Git admin path is not UTF-8 and cannot be bound safely".to_owned())?;
+    let common_metadata = std::fs::symlink_metadata(&canonical_common)
+        .map_err(|error| format!("cannot inspect repository Git common directory: {error}"))?;
+    if common_metadata.file_type().is_symlink() || !common_metadata.is_dir() {
+        return Err("the repository Git common directory is not a real directory".into());
+    }
+    let (git_common_device, git_common_inode) = unix_file_identity(&common_metadata);
+    let canonical_common_path = canonical_common
+        .to_str()
+        .ok_or_else(|| "the Git common path is not UTF-8 and cannot be bound safely".to_owned())?;
+
+    let backpointer_path = canonical_admin.join("gitdir");
+    let backpointer = read_regular_file_no_follow(&backpointer_path, 4096)
+        .map_err(|error| format!("cannot safely inspect Git admin backpointer: {error}"))?;
+    let backpointer_text = std::str::from_utf8(&backpointer)
+        .map_err(|_| "the Git admin backpointer is not UTF-8".to_owned())?
+        .trim();
+    let backpointer_path = PathBuf::from(backpointer_text);
+    let backpointer_path = if backpointer_path.is_absolute() {
+        backpointer_path
+    } else {
+        canonical_admin.join(backpointer_path)
+    };
+    if backpointer_path
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve Git admin backpointer: {error}"))?
+        != pointer_path
+    {
+        return Err("the Git admin backpointer does not identify this checkout".into());
+    }
+
+    let registration = repository
+        .worktree_inventory()
+        .map_err(|error| format!("cannot inspect Git worktree registrations: {error}"))?
+        .into_iter()
+        .filter(|entry| {
+            entry.path.canonicalize().ok().as_deref() == Some(canonical_worktree.as_path())
+        })
+        .collect::<Vec<_>>();
+    if registration.len() != 1 {
+        return Err("the adopted checkout does not have exactly one Git registration".into());
+    }
+    let registration = &registration[0];
+    if registration.bare
+        || registration.detached
+        || registration.locked
+        || registration.prunable
+        || registration.branch.as_deref() != Some(branch_ref)
+        || registration.head.as_deref() != Some(head)
+        || branch_tip != head
+    {
+        return Err("the adopted Git registration, branch, or HEAD changed".into());
+    }
+    let root_generation_sha256 = crate::root_generation::read_path_with_identity(&canonical_worktree)
+        .and_then(|(device, inode, digest)| {
+            ((device, inode) == (worktree_device, worktree_inode)).then_some(digest)
+        });
+
+    let final_root_metadata = std::fs::symlink_metadata(worktree)
+        .map_err(|error| format!("cannot recheck adopted worktree path: {error}"))?;
+    if final_root_metadata.file_type().is_symlink()
+        || !final_root_metadata.is_dir()
+        || unix_file_identity(&final_root_metadata) != (worktree_device, worktree_inode)
+    {
+        return Err("the adopted worktree directory identity changed during inspection".into());
+    }
+    let (mut final_pointer, final_pointer_metadata) = open_regular_file_no_follow(&pointer_path)
+        .map_err(|error| format!("cannot recheck the adopted .git pointer: {error}"))?;
+    let mut final_pointer_bytes = Vec::new();
+    final_pointer
+        .take(4097)
+        .read_to_end(&mut final_pointer_bytes)
+        .map_err(|error| format!("cannot reread the adopted .git pointer: {error}"))?;
+    if unix_file_identity(&final_pointer_metadata)
+        != unix_file_identity(&pointer_metadata)
+        || final_pointer_bytes.len() > 4096
+        || sha256_hex(&final_pointer_bytes) != sha256_hex(&pointer_bytes)
+    {
+        return Err("the adopted .git pointer identity changed during inspection".into());
+    }
+    let final_admin_metadata = std::fs::symlink_metadata(&canonical_admin)
+        .map_err(|error| format!("cannot recheck adopted Git admin directory: {error}"))?;
+    if final_admin_metadata.file_type().is_symlink()
+        || !final_admin_metadata.is_dir()
+        || unix_file_identity(&final_admin_metadata) != (git_admin_device, git_admin_inode)
+    {
+        return Err("the adopted Git admin directory identity changed during inspection".into());
+    }
+    let final_backpointer = read_regular_file_no_follow(&canonical_admin.join("gitdir"), 4096)
+        .map_err(|error| format!("cannot reread Git admin backpointer: {error}"))?;
+    if sha256_hex(&final_backpointer) != sha256_hex(&backpointer) {
+        return Err("the Git admin backpointer changed during inspection".into());
+    }
+    let final_common_metadata = std::fs::symlink_metadata(&canonical_common)
+        .map_err(|error| format!("cannot recheck repository Git common directory: {error}"))?;
+    if final_common_metadata.file_type().is_symlink()
+        || !final_common_metadata.is_dir()
+        || unix_file_identity(&final_common_metadata) != (git_common_device, git_common_inode)
+    {
+        return Err("the Git common directory identity changed during inspection".into());
+    }
+    let final_root_generation_sha256 = crate::root_generation::read_path_with_identity(&canonical_worktree)
+        .and_then(|(device, inode, digest)| {
+            ((device, inode) == (worktree_device, worktree_inode)).then_some(digest)
+        });
+    if final_root_generation_sha256 != root_generation_sha256 {
+        return Err("the adopted worktree generation changed during inspection".into());
+    }
+    if checkout.head_commit().ok().as_deref() != Some(head)
+        || repository.resolve_ref(branch_ref).as_deref() != Some(branch_tip)
+    {
+        return Err("the adopted branch or HEAD changed during inspection".into());
+    }
+    let final_registration = repository
+        .worktree_inventory()
+        .map_err(|error| format!("cannot recheck Git worktree registrations: {error}"))?
+        .into_iter()
+        .filter(|entry| {
+            entry.path.canonicalize().ok().as_deref() == Some(canonical_worktree.as_path())
+        })
+        .collect::<Vec<_>>();
+    if final_registration.len() != 1
+        || final_registration[0].bare
+        || final_registration[0].detached
+        || final_registration[0].locked
+        || final_registration[0].prunable
+        || final_registration[0].branch.as_deref() != Some(branch_ref)
+        || final_registration[0].head.as_deref() != Some(head)
+    {
+        return Err("the adopted Git registration changed during inspection".into());
+    }
+
+    Ok(AdoptedCheckoutIdentity {
+        schema_version: ADOPTED_RECOVERY_IDENTITY_SCHEMA_VERSION,
+        adoption_base: adoption_base.to_owned(),
+        adopted_head: adopted_head.to_owned(),
+        diff_base: diff_base.to_owned(),
+        canonical_worktree_path: canonical_worktree_path.to_owned(),
+        worktree_device,
+        worktree_inode,
+        git_pointer_device: unix_file_identity(&pointer_metadata).0,
+        git_pointer_inode: unix_file_identity(&pointer_metadata).1,
+        git_pointer_sha256: sha256_hex(&pointer_bytes),
+        git_admin_path: canonical_admin_path.to_owned(),
+        git_admin_device,
+        git_admin_inode,
+        git_backpointer_sha256: sha256_hex(&backpointer),
+        git_common_path: canonical_common_path.to_owned(),
+        git_common_device,
+        git_common_inode,
+        root_generation_sha256,
+    })
+}
+
+/// Resolve a possibly not-yet-created archive directory without creating it.
+/// Existing symlink ancestors are resolved, while a symlink at the requested
+/// archive root is refused. This makes the path that the adopted plan binds
+/// the same physical destination that staging will later inspect.
+fn canonicalize_planned_archive_root(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err("the configured recovery archive root is not a normalized absolute path".into());
+    }
+
+    let mut cursor = path.to_path_buf();
+    let mut missing_components = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata) => {
+                if cursor.as_path() == path && metadata.file_type().is_symlink() {
+                    return Err("the configured recovery archive root is a symbolic link".into());
+                }
+                if !std::fs::metadata(&cursor)
+                    .map_err(|error| format!("cannot inspect archive destination ancestor: {error}"))?
+                    .is_dir()
+                {
+                    return Err("the configured recovery archive path is not a directory".into());
+                }
+                let mut canonical = cursor
+                    .canonicalize()
+                    .map_err(|error| format!("cannot resolve archive destination ancestor: {error}"))?;
+                for component in missing_components.into_iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = cursor.file_name() else {
+                    return Err("the configured recovery archive path has no existing ancestor".into());
+                };
+                missing_components.push(name.to_os_string());
+                let Some(parent) = cursor.parent() else {
+                    return Err("the configured recovery archive path has no parent".into());
+                };
+                cursor = parent.to_path_buf();
+            }
+            Err(error) => {
+                return Err(format!("cannot inspect archive destination: {error}"));
+            }
+        }
+    }
+}
+
+fn ensure_adopted_archive_root_is_external(
+    archive_root: &Path,
+    checkout: &AdoptedCheckoutIdentity,
+) -> Result<(), String> {
+    for (label, protected) in [
+        ("adopted checkout", checkout.canonical_worktree_path.as_str()),
+        ("Git worktree admin directory", checkout.git_admin_path.as_str()),
+        ("Git common directory", checkout.git_common_path.as_str()),
+    ] {
+        if archive_root.starts_with(Path::new(protected)) {
+            return Err(format!(
+                "the recovery archive destination is inside the {label}; refusing to stage data beneath a path that retirement may remove"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn adopted_checkout_identity(
+    _session: &crate::Session,
+    _repository: &GitRepo,
+    _checkout: &GitRepo,
+    _worktree: &Path,
+    _branch_ref: &str,
+    _branch_tip: &str,
+    _head: &str,
+) -> Result<AdoptedCheckoutIdentity, String> {
+    Err("adopted recovery requires filesystem identity support on this platform".into())
 }
 
 fn open_regular_file_no_follow(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
@@ -777,12 +1230,30 @@ impl Broker {
         &self,
         session_id: i64,
     ) -> Result<CleanupResolvePlan, BrokerOpError> {
+        self.cleanup_resolve_plan_with_owner_authorized_adopted(session_id, false)
+    }
+
+    /// Plan adopted-checkout retirement only when the operator explicitly
+    /// attests that the adopted worktree may be archived and removed.
+    pub fn cleanup_resolve_plan_owner_authorized_adopted(
+        &self,
+        session_id: i64,
+    ) -> Result<CleanupResolvePlan, BrokerOpError> {
+        self.cleanup_resolve_plan_with_owner_authorized_adopted(session_id, true)
+    }
+
+    fn cleanup_resolve_plan_with_owner_authorized_adopted(
+        &self,
+        session_id: i64,
+        owner_authorized_adopted: bool,
+    ) -> Result<CleanupResolvePlan, BrokerOpError> {
         self.cleanup_resolve_plan_with_limits(
             session_id,
             crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
             crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
             crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
             crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+            owner_authorized_adopted,
         )
     }
 
@@ -793,6 +1264,7 @@ impl Broker {
         status_path_fields: usize,
         inventory_output_bytes: usize,
         inventory_path_fields: usize,
+        owner_authorized_adopted: bool,
     ) -> Result<CleanupResolvePlan, BrokerOpError> {
         self.cleanup_resolve_plan_with_limits_and_eligibility(
             session_id,
@@ -800,7 +1272,10 @@ impl Broker {
             status_path_fields,
             inventory_output_bytes,
             inventory_path_fields,
-            false,
+            RecoveryPlanEligibility {
+                allow_eligible: false,
+                owner_authorized_adopted,
+            },
         )
     }
 
@@ -811,13 +1286,24 @@ impl Broker {
         &self,
         session_id: i64,
     ) -> Result<CleanupResolvePlan, BrokerOpError> {
+        self.cleanup_resolve_revalidation_plan_with_owner_authorized_adopted(session_id, false)
+    }
+
+    pub(crate) fn cleanup_resolve_revalidation_plan_with_owner_authorized_adopted(
+        &self,
+        session_id: i64,
+        owner_authorized_adopted: bool,
+    ) -> Result<CleanupResolvePlan, BrokerOpError> {
         self.cleanup_resolve_plan_with_limits_and_eligibility(
             session_id,
             crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
             crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
             crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
             crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
-            true,
+            RecoveryPlanEligibility {
+                allow_eligible: true,
+                owner_authorized_adopted,
+            },
         )
     }
 
@@ -828,7 +1314,7 @@ impl Broker {
         status_path_fields: usize,
         inventory_output_bytes: usize,
         inventory_path_fields: usize,
-        allow_eligible: bool,
+        eligibility: RecoveryPlanEligibility,
     ) -> Result<CleanupResolvePlan, BrokerOpError> {
         let refuse = |reason: String| BrokerOpError::CleanupResolveRefused {
             id: session_id,
@@ -841,45 +1327,72 @@ impl Broker {
                 session.status.as_str()
             )));
         }
-        if session.origin != SessionOrigin::Spawned {
+        if session.origin == SessionOrigin::Adopted && !eligibility.owner_authorized_adopted {
             return Err(refuse(
-                "only broker-spawned worktrees are archived and removed; an adopted checkout \
-                 belongs to whoever adopted it"
+                "adopted worktrees require the explicit --owner-authorized-adopted flag for both planning and apply"
                     .into(),
+            ));
+        }
+        if session.origin == SessionOrigin::Spawned && eligibility.owner_authorized_adopted {
+            return Err(refuse(
+                "--owner-authorized-adopted applies only to adopted sessions".into(),
             ));
         }
         // Pin one delivery-target snapshot before the recovery-specific
         // eligibility pass. It is the evidence snapshot the archive records.
         let delivery_targets = self.cleanup_delivery_targets()?;
-        let mut records = crate::measurement::SizeRecords::default();
-        let Some(item) = self.cleanup_item_for_recovery_archive_with_status_limits(
-            &session,
-            crate::SizeScan::Recorded,
-            &mut records,
-            status_output_bytes,
-            status_path_fields,
-            &delivery_targets,
-        )?
-        else {
-            return Err(refuse(
-                "nothing is retained: its worktree and branch are already gone".into(),
-            ));
-        };
-        match item.disposition {
+        let worktree = PathBuf::from(&session.worktree_path);
+        let (branch_ref, branch_tip, disposition, reason, discard_command) =
+            if session.origin == SessionOrigin::Adopted {
+                let branch_ref = format!("refs/heads/{}", session.branch);
+                let branch_tip = self.repo_handle().resolve_ref(&branch_ref).ok_or_else(|| {
+                    refuse("the adopted session branch is no longer present".into())
+                })?;
+                let (disposition, reason) = self.cleanup_adopted_recovery_eligibility(
+                    &session,
+                    &worktree,
+                    status_output_bytes,
+                    status_path_fields,
+                    &delivery_targets,
+                )?;
+                (branch_ref, Some(branch_tip), disposition, reason, String::new())
+            } else {
+                let mut records = crate::measurement::SizeRecords::default();
+                let Some(item) = self.cleanup_item_for_recovery_archive_with_status_limits(
+                    &session,
+                    crate::SizeScan::Recorded,
+                    &mut records,
+                    status_output_bytes,
+                    status_path_fields,
+                    &delivery_targets,
+                )?
+                else {
+                    return Err(refuse(
+                        "nothing is retained: its worktree and branch are already gone".into(),
+                    ));
+                };
+                (
+                    item.branch_ref,
+                    item.branch_tip,
+                    item.disposition,
+                    item.reason,
+                    item.force_cleanup_command,
+                )
+            };
+        match disposition {
             CleanupDisposition::Eligible => {}
             CleanupDisposition::UnsafePath | CleanupDisposition::InspectionFailed => {
                 return Err(refuse(format!(
                     "its worktree is {} ({}), which resolve does not archive",
-                    item.disposition.as_str(),
-                    item.reason
+                    disposition.as_str(),
+                    reason
                 )));
             }
             CleanupDisposition::Dirty
             | CleanupDisposition::PendingCommits
             | CleanupDisposition::UnprovenProvenance => {}
         }
-        let worktree = PathBuf::from(&session.worktree_path);
-        if !item.worktree_present || crate::broker::is_orphaned_worktree_directory(&worktree) {
+        if crate::broker::is_orphaned_worktree_directory(&worktree) {
             return Err(refuse(
                 "its worktree is not a readable Git checkout, so there is nothing to archive \
                  from; the session branch still records its commits"
@@ -900,7 +1413,22 @@ impl Broker {
             ));
         }
         let head = checkout.head_commit()?;
-        let branch_tip = item.branch_tip.clone();
+        let adopted_checkout = if eligibility.owner_authorized_adopted {
+            Some(
+                adopted_checkout_identity(
+                    &session,
+                    self.repo_handle(),
+                    &checkout,
+                    &worktree,
+                    &branch_ref,
+                    branch_tip.as_deref().unwrap_or_default(),
+                    &head,
+                )
+                .map_err(|reason| refuse(reason))?,
+            )
+        } else {
+            None
+        };
         if branch_tip.as_deref().is_some_and(|tip| tip != head) {
             return Err(refuse(format!(
                 "the session branch tip {} differs from the worktree HEAD {}; refusing to archive only one of the two commits",
@@ -908,11 +1436,11 @@ impl Broker {
                 head
             )));
         }
-        if item.disposition == CleanupDisposition::Eligible && !allow_eligible {
+        if disposition == CleanupDisposition::Eligible && !eligibility.allow_eligible {
             return Err(refuse(format!(
                 "cleanup can already remove it without an archive ({}); run \
                  `aethyme broker finish cleanup {session_id}`",
-                item.reason
+                reason
             )));
         }
         let unlanded_commits = checkout.commits_not_on_any(&head, &delivery_targets)?;
@@ -987,49 +1515,107 @@ impl Broker {
         let ignored_policy_sha256 = sha256_hex(&ignored_policy_bytes);
 
         let bound_ignored_paths = authorization_ignored_paths(&ignored_paths);
-        let repository_path = self
+        let canonical_repository_path = self
             .main_root()
             .canonicalize()
-            .map_err(|error| refuse(format!("cannot resolve repository identity: {error}")))?
-            .to_string_lossy()
-            .into_owned();
-        let digest_input = DigestInputV5 {
-            schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
-            recovery_archive_schema_version: RECOVERY_ARCHIVE_SCHEMA_VERSION,
-            max_recovery_bundle_bytes: MAX_RECOVERY_BUNDLE_BYTES,
-            session_id,
-            repository_path: &repository_path,
-            worktree_path: &session.worktree_path,
-            branch_ref: &item.branch_ref,
-            branch_tip: branch_tip.as_deref(),
-            head: &head,
-            staged_patch_sha256: &staged_patch_sha256,
-            unstaged_patch_sha256: &unstaged_patch_sha256,
-            untracked_files: &untracked_files,
-            ignored_paths: &bound_ignored_paths,
-            ignored_files: &ignored_files,
-            ignored_policy: &ignored_policy_proof,
+            .map_err(|error| refuse(format!("cannot resolve repository identity: {error}")))?;
+        if eligibility.owner_authorized_adopted && canonical_repository_path.to_str().is_none() {
+            return Err(refuse(
+                "the canonical repository path is not UTF-8 and cannot be bound safely".into(),
+            ));
+        }
+        let repository_path = canonical_repository_path.to_string_lossy().into_owned();
+        let configured_archive_root = self.recovery_archive_root()?;
+        let archive_root = if let Some(adopted_checkout) = adopted_checkout.as_ref() {
+            let archive_root = canonicalize_planned_archive_root(&configured_archive_root)
+                .map_err(|reason| refuse(reason))?;
+            ensure_adopted_archive_root_is_external(&archive_root, adopted_checkout)
+                .map_err(|reason| refuse(reason))?;
+            archive_root
+        } else {
+            configured_archive_root
         };
-        let mut hasher = Sha256::new();
-        hasher.update(b"aethyme-cleanup-resolve-v5\0");
-        hasher
-            .update(serde_json::to_vec(&digest_input).map_err(|error| refuse(error.to_string()))?);
-        let digest = format!("{:x}", hasher.finalize());
+        if eligibility.owner_authorized_adopted && archive_root.to_str().is_none() {
+            return Err(refuse(
+                "the canonical recovery archive destination is not UTF-8 and cannot be bound safely".into(),
+            ));
+        }
+        let archive_root_string = archive_root.to_string_lossy();
+        let digest = if let Some(adopted_checkout) = adopted_checkout.as_ref() {
+            let input = DigestInputV6 {
+                schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
+                recovery_archive_schema_version: ADOPTED_RECOVERY_ARCHIVE_SCHEMA_VERSION,
+                max_recovery_bundle_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+                owner_authorized_adopted: true,
+                origin: "adopted",
+                session_id,
+                repository_path: &repository_path,
+                worktree_path: &session.worktree_path,
+                branch_ref: &branch_ref,
+                branch_tip: branch_tip.as_deref(),
+                head: &head,
+                adopted_checkout,
+                archive_root: archive_root_string.as_ref(),
+                staged_patch_sha256: &staged_patch_sha256,
+                unstaged_patch_sha256: &unstaged_patch_sha256,
+                untracked_files: &untracked_files,
+                // Unlike V5, the explicit adopted contract binds the complete
+                // ignored-root list, including policy-discarded directories.
+                ignored_paths: &ignored_paths,
+                ignored_files: &ignored_files,
+                ignored_policy: &ignored_policy_proof,
+            };
+            let mut hasher = Sha256::new();
+            hasher.update(b"aethyme-cleanup-resolve-v6-adopted\0");
+            hasher.update(
+                serde_json::to_vec(&input).map_err(|error| refuse(error.to_string()))?,
+            );
+            format!("{:x}", hasher.finalize())
+        } else {
+            let input = DigestInputV5 {
+                schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
+                recovery_archive_schema_version: RECOVERY_ARCHIVE_SCHEMA_VERSION,
+                max_recovery_bundle_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+                session_id,
+                repository_path: &repository_path,
+                worktree_path: &session.worktree_path,
+                branch_ref: &branch_ref,
+                branch_tip: branch_tip.as_deref(),
+                head: &head,
+                staged_patch_sha256: &staged_patch_sha256,
+                unstaged_patch_sha256: &unstaged_patch_sha256,
+                untracked_files: &untracked_files,
+                ignored_paths: &bound_ignored_paths,
+                ignored_files: &ignored_files,
+                ignored_policy: &ignored_policy_proof,
+            };
+            let mut hasher = Sha256::new();
+            hasher.update(b"aethyme-cleanup-resolve-v5\0");
+            hasher.update(
+                serde_json::to_vec(&input).map_err(|error| refuse(error.to_string()))?,
+            );
+            format!("{:x}", hasher.finalize())
+        };
 
         Ok(CleanupResolvePlan {
             schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
             apply_command: format!(
-                "aethyme broker finish cleanup resolve {session_id} --archive --confirm {digest}"
+                "aethyme broker finish cleanup resolve {session_id} --archive{} --confirm {digest}",
+                if eligibility.owner_authorized_adopted {
+                    " --owner-authorized-adopted"
+                } else {
+                    ""
+                }
             ),
-            discard_command: item.force_cleanup_command.clone(),
+            discard_command,
             digest,
             session_id,
             repository_path,
             worktree_path: session.worktree_path.clone(),
-            branch_ref: item.branch_ref,
+            branch_ref,
             branch_tip,
-            disposition: item.disposition,
-            reason: item.reason,
+            disposition,
+            reason,
             head,
             delivery_targets,
             landing,
@@ -1044,7 +1630,9 @@ impl Broker {
             ignored_bytes,
             ignored_policy_sha256,
             untracked_bytes,
-            archive_root: self.recovery_archive_root()?,
+            archive_root,
+            adopted_checkout,
+            owner_authorized_adopted: eligibility.owner_authorized_adopted,
         })
     }
 
@@ -1056,6 +1644,31 @@ impl Broker {
         confirm: &str,
     ) -> Result<CleanupResolveOutcome, BrokerOpError> {
         self.cleanup_resolve_apply_with_post_archive_hook(session_id, confirm, || {})
+    }
+
+    /// Apply an adopted-checkout archive only with the same explicit
+    /// operator attestation used to create its plan.
+    pub fn cleanup_resolve_apply_owner_authorized_adopted(
+        &mut self,
+        session_id: i64,
+        confirm: &str,
+    ) -> Result<CleanupResolveOutcome, BrokerOpError> {
+        self.cleanup_resolve_apply_with_bundle_writer_mode(
+            session_id,
+            confirm,
+            || {},
+            sync_archive_directory,
+            |main_root, archive_root| {
+                crate::disk_headroom::available_headroom_at_or_above_for(main_root, archive_root)
+            },
+            RecoveryArchiveApplyMode {
+                owner_authorized_adopted: true,
+                bundle: RecoveryBundleWriter {
+                    max_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+                    write_to: write_recovery_bundle_to_file,
+                },
+            },
+        )
     }
 
     fn cleanup_resolve_apply_with_post_archive_hook<F>(
@@ -1119,10 +1732,45 @@ impl Broker {
         H: FnOnce(&Path, &Path) -> Option<crate::disk_headroom::DiskHeadroom>,
         B: Fn(&GitRepo, &[String], u64, Instant, &mut std::fs::File) -> Result<u64, String>,
     {
+        self.cleanup_resolve_apply_with_bundle_writer_mode(
+            session_id,
+            confirm,
+            after_archive_verified,
+            sync_directory,
+            headroom_for,
+            RecoveryArchiveApplyMode {
+                owner_authorized_adopted: false,
+                bundle,
+            },
+        )
+    }
+
+    fn cleanup_resolve_apply_with_bundle_writer_mode<F, S, H, B>(
+        &mut self,
+        session_id: i64,
+        confirm: &str,
+        after_archive_verified: F,
+        sync_directory: S,
+        headroom_for: H,
+        mode: RecoveryArchiveApplyMode<B>,
+    ) -> Result<CleanupResolveOutcome, BrokerOpError>
+    where
+        F: FnOnce(),
+        S: Fn(&Path) -> std::io::Result<()>,
+        H: FnOnce(&Path, &Path) -> Option<crate::disk_headroom::DiskHeadroom>,
+        B: Fn(&GitRepo, &[String], u64, Instant, &mut std::fs::File) -> Result<u64, String>,
+    {
+        let RecoveryArchiveApplyMode {
+            owner_authorized_adopted,
+            bundle,
+        } = mode;
         if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BrokerOpError::CleanupResolveConfirmationNotSha256);
         }
-        let plan = self.cleanup_resolve_revalidation_plan(session_id)?;
+        let plan = self.cleanup_resolve_revalidation_plan_with_owner_authorized_adopted(
+            session_id,
+            owner_authorized_adopted,
+        )?;
         if plan.digest != confirm {
             return Err(BrokerOpError::CleanupResolveConfirmationMismatch {
                 id: session_id,
@@ -1299,6 +1947,10 @@ struct StoredManifest {
     ignored_policy_sha256: Option<String>,
     #[serde(default)]
     plan_digest: Option<String>,
+    #[serde(default)]
+    origin: Option<String>,
+    #[serde(default)]
+    adopted_checkout: Option<AdoptedCheckoutIdentity>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1436,7 +2088,9 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
                 return Err("legacy manifest unexpectedly contains bundle integrity fields".into());
             }
         }
-        PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION | RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+        PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        | RECOVERY_ARCHIVE_SCHEMA_VERSION
+        | ADOPTED_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
             match manifest.bundle.as_deref() {
                 Some(_) => {
                     let Some(bytes) = manifest.bundle_bytes else {
@@ -1459,6 +2113,19 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
         version => return Err(format!("manifest schema {version} is not supported")),
     }
 
+    if manifest.schema_version == ADOPTED_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+        if manifest.origin.as_deref() != Some("adopted") {
+            return Err("schema v5 archive is missing its adopted origin".into());
+        }
+        let identity = manifest
+            .adopted_checkout
+            .as_ref()
+            .ok_or_else(|| "schema v5 archive is missing its adopted checkout identity".to_owned())?;
+        validate_adopted_checkout_identity(identity)?;
+    } else if manifest.origin.is_some() || manifest.adopted_checkout.is_some() {
+        return Err("legacy recovery archive unexpectedly contains adopted identity fields".into());
+    }
+
     if manifest.session_id <= 0
         || manifest.created_at_ms < 0
         || manifest.aethyme_version.is_empty()
@@ -1472,7 +2139,10 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
         || !(matches!(
             manifest.disposition.as_str(),
             "dirty" | "pending_commits" | "unproven_provenance"
-        ) || (manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
+        ) || (matches!(
+            manifest.schema_version,
+            RECOVERY_ARCHIVE_SCHEMA_VERSION | ADOPTED_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        )
             && manifest.disposition == "eligible"))
         || !valid_git_object_id(&manifest.head)
         || manifest
@@ -1484,7 +2154,10 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
             .as_deref()
             .is_some_and(|task| task.contains('\0'))
         || manifest.landing.is_null()
-        || (manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
+        || (matches!(
+            manifest.schema_version,
+            RECOVERY_ARCHIVE_SCHEMA_VERSION | ADOPTED_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        )
             && !matches!(
                 manifest
                     .landing
@@ -1503,6 +2176,32 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
         || manifest.bundle.is_some() == manifest.unlanded_commits.is_empty()
     {
         return Err("manifest has an incomplete or malformed archive identity".into());
+    }
+    Ok(())
+}
+
+fn validate_adopted_checkout_identity(
+    identity: &AdoptedCheckoutIdentity,
+) -> Result<(), String> {
+    if identity.schema_version != ADOPTED_RECOVERY_IDENTITY_SCHEMA_VERSION
+        || !valid_git_object_id(&identity.adoption_base)
+        || !valid_git_object_id(&identity.adopted_head)
+        || !valid_git_object_id(&identity.diff_base)
+        || !Path::new(&identity.canonical_worktree_path).is_absolute()
+        || !Path::new(&identity.git_admin_path).is_absolute()
+        || !Path::new(&identity.git_common_path).is_absolute()
+        || identity.worktree_inode == 0
+        || identity.git_pointer_inode == 0
+        || identity.git_admin_inode == 0
+        || identity.git_common_inode == 0
+        || !valid_sha256(&identity.git_pointer_sha256)
+        || !valid_sha256(&identity.git_backpointer_sha256)
+        || identity
+            .root_generation_sha256
+            .as_deref()
+            .is_some_and(|digest| !valid_sha256(digest))
+    {
+        return Err("adopted checkout identity is incomplete or malformed".into());
     }
     Ok(())
 }
@@ -1555,20 +2254,21 @@ fn validate_archived_file_modes(
         }
         PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION
         | PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
-        | RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+        | RECOVERY_ARCHIVE_SCHEMA_VERSION
+        | ADOPTED_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
             #[cfg(unix)]
             if files
                 .iter()
                 .any(|file| !file.symlink && file.mode.is_none())
             {
                 return Err(format!(
-                    "schema v2/v3/v4 {label} entry is missing its Unix file mode"
+                    "schema v2/v3/v4/v5 {label} entry is missing its Unix file mode"
                 ));
             }
             #[cfg(not(unix))]
             if files.iter().any(|file| file.mode.is_some()) {
                 return Err(format!(
-                    "schema v2/v3/v4 {label} file modes cannot be verified on this platform"
+                    "schema v2/v3/v4/v5 {label} file modes cannot be verified on this platform"
                 ));
             }
         }
@@ -1616,10 +2316,11 @@ fn recovery_archive_expected_files(
         }
         PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION
         | PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
-        | RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+        | RECOVERY_ARCHIVE_SCHEMA_VERSION
+        | ADOPTED_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
             if manifest.ignored_directory.as_deref() != Some(IGNORED_DIRECTORY) {
                 return Err(
-                    "schema v2/v3/v4 manifest is missing its ignored directory identity".into(),
+                    "schema v2/v3/v4/v5 manifest is missing its ignored directory identity".into(),
                 );
             }
             validate_archived_file_modes(
@@ -1630,13 +2331,13 @@ fn recovery_archive_expected_files(
             let files = manifest
                 .ignored_files
                 .as_deref()
-                .ok_or_else(|| "schema v2/v3/v4 manifest is missing ignored_files".to_string())?;
+                .ok_or_else(|| "schema v2/v3/v4/v5 manifest is missing ignored_files".to_string())?;
             validate_archived_files("ignored", files)?;
             validate_archived_file_modes("ignored", files, manifest.schema_version)?;
             let ignored_paths = manifest
                 .ignored_paths
                 .as_deref()
-                .ok_or_else(|| "schema v2/v3/v4 manifest is missing ignored_paths".to_string())?;
+                .ok_or_else(|| "schema v2/v3/v4/v5 manifest is missing ignored_paths".to_string())?;
             if !manifest
                 .ignored_policy_sha256
                 .as_deref()
@@ -1644,7 +2345,7 @@ fn recovery_archive_expected_files(
                 || !manifest.plan_digest.as_deref().is_some_and(valid_sha256)
             {
                 return Err(
-                    "schema v2/v3/v4 manifest has an invalid plan or ignored policy identity"
+                    "schema v2/v3/v4/v5 manifest has an invalid plan or ignored policy identity"
                         .into(),
                 );
             }
@@ -1655,11 +2356,11 @@ fn recovery_archive_expected_files(
                 if !is_contained_relative(trimmed)
                     || previous.is_some_and(|previous| previous >= path.path.as_str())
                 {
-                    return Err("schema v2/v3/v4 ignored roots are invalid or unsorted".into());
+                    return Err("schema v2/v3/v4/v5 ignored roots are invalid or unsorted".into());
                 }
                 if path.classification == IgnoredPathClassification::PreservedFile {
                     if path.path.ends_with('/') {
-                        return Err("schema v2/v3/v4 preserved ignored path is a directory".into());
+                        return Err("schema v2/v3/v4/v5 preserved ignored path is a directory".into());
                     }
                     preserved.push(path.path.as_str());
                 }
@@ -1817,6 +2518,7 @@ fn verify_recovery_archive_tree(root: &Path, manifest: &StoredManifest) -> Resul
                     PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION
                         | PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
                         | RECOVERY_ARCHIVE_SCHEMA_VERSION
+                        | ADOPTED_RECOVERY_ARCHIVE_SCHEMA_VERSION
                 )
                 && permission_mode(&metadata) != file.mode
             {
@@ -1829,7 +2531,9 @@ fn verify_recovery_archive_tree(root: &Path, manifest: &StoredManifest) -> Resul
     }
     if matches!(
         manifest.schema_version,
-        PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION | RECOVERY_ARCHIVE_SCHEMA_VERSION
+        PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
+            | RECOVERY_ARCHIVE_SCHEMA_VERSION
+            | ADOPTED_RECOVERY_ARCHIVE_SCHEMA_VERSION
     ) && let Some(bundle) = manifest.bundle.as_deref()
     {
         let path = root.join(bundle);
@@ -1931,6 +2635,13 @@ fn verify_recovery_archive_payload_for_plan(
             (manifest.plan_digest.as_deref() == Some(plan.digest.as_str()))
                 .then(|| plan.digest.clone())
         }
+        ADOPTED_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+            (plan.owner_authorized_adopted
+                && manifest.origin.as_deref() == Some("adopted")
+                && manifest.adopted_checkout.as_ref() == plan.adopted_checkout.as_ref()
+                && manifest.plan_digest.as_deref() == Some(plan.digest.as_str()))
+            .then(|| plan.digest.clone())
+        }
         _ => None,
     };
     let expected_landing = serde_json::to_value(&plan.landing)
@@ -1938,22 +2649,40 @@ fn verify_recovery_archive_payload_for_plan(
     if expected_plan_digest
         .as_deref()
         .is_none_or(|expected| manifest.plan_digest.as_deref() != Some(expected))
+        || manifest.schema_version
+            != if plan.owner_authorized_adopted {
+                ADOPTED_RECOVERY_ARCHIVE_SCHEMA_VERSION
+            } else {
+                RECOVERY_ARCHIVE_SCHEMA_VERSION
+            }
+        || manifest.origin.as_deref()
+            != plan.owner_authorized_adopted.then_some("adopted")
+        || manifest.adopted_checkout.as_ref() != plan.adopted_checkout.as_ref()
         || manifest.session_id != plan.session_id
         || !same_path(Path::new(&manifest.repository), repository.root())
-        || (manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
+        || (matches!(
+            manifest.schema_version,
+            RECOVERY_ARCHIVE_SCHEMA_VERSION | ADOPTED_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        )
             && !same_path(
                 Path::new(&manifest.repository),
                 Path::new(&plan.repository_path),
             ))
         || manifest.worktree_path != plan.worktree_path
         || manifest.branch_ref != plan.branch_ref
-        || (manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
+        || (matches!(
+            manifest.schema_version,
+            RECOVERY_ARCHIVE_SCHEMA_VERSION | ADOPTED_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        )
             && manifest.branch_tip != plan.branch_tip)
         || manifest.disposition != plan.disposition.as_str()
         || manifest.head != plan.head
         || manifest.delivery_targets != plan.delivery_targets
         || manifest.unlanded_commits != plan.unlanded_commits
-        || (manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
+        || (matches!(
+            manifest.schema_version,
+            RECOVERY_ARCHIVE_SCHEMA_VERSION | ADOPTED_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        )
             && manifest.landing != expected_landing)
         || manifest.staged_patch.bytes != plan.staged_patch_bytes
         || manifest.staged_patch.sha256 != plan.staged_patch_sha256
@@ -2071,6 +2800,7 @@ impl Broker {
                 | PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION
                 | PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
                 | RECOVERY_ARCHIVE_SCHEMA_VERSION
+                | ADOPTED_RECOVERY_ARCHIVE_SCHEMA_VERSION
         ) {
             return Err(format!(
                 "manifest schema {} is not supported",
@@ -3023,7 +3753,11 @@ where
     }
 
     let manifest = RecoveryManifest {
-        schema_version: RECOVERY_ARCHIVE_SCHEMA_VERSION,
+        schema_version: if plan.owner_authorized_adopted {
+            ADOPTED_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        } else {
+            RECOVERY_ARCHIVE_SCHEMA_VERSION
+        },
         plan_digest: &plan.digest,
         created_at_ms: now_ms(),
         aethyme_version: env!("CARGO_PKG_VERSION"),
@@ -3063,6 +3797,8 @@ where
         ignored_paths: &plan.ignored_paths,
         ignored_files: &plan.ignored_files,
         ignored_policy_sha256: &plan.ignored_policy_sha256,
+        origin: plan.owner_authorized_adopted.then_some("adopted"),
+        adopted_checkout: plan.adopted_checkout.as_ref(),
     };
     let manifest = serialize_recovery_manifest(&manifest, MAX_RECOVERY_MANIFEST_BYTES as usize)?;
     create_new_archive_file(&dir, MANIFEST_FILE, &manifest)?;
@@ -3189,6 +3925,8 @@ mod tests {
             archive_root: PathBuf::new(),
             apply_command: String::new(),
             discard_command: String::new(),
+            adopted_checkout: None,
+            owner_authorized_adopted: false,
         };
         (tmp, repo, plan)
     }
@@ -3232,6 +3970,164 @@ mod tests {
         (
             owner, repository, storage, broker, session, worktree, base, head, branch_ref,
         )
+    }
+
+    fn closed_adopted_commit_fixture(
+        task: &str,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        crate::test_storage::TestStorage,
+        Broker,
+        crate::types::Session,
+        PathBuf,
+        String,
+        String,
+        String,
+    ) {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+        let base = GitRepo::discover(&repository)
+            .unwrap()
+            .head_commit()
+            .unwrap();
+
+        let worktree = owner.path().join("adopted-worktree");
+        let worktree_arg = worktree.to_string_lossy().into_owned();
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "adopted-fixture",
+                &worktree_arg,
+                &base,
+            ],
+        );
+        std::fs::write(worktree.join("adopted.txt"), "session commit\n").unwrap();
+        git(&worktree, &["add", "adopted.txt"]);
+        git(&worktree, &["commit", "-qm", "adopted session content"]);
+        let head = GitRepo::discover(&worktree)
+            .unwrap()
+            .head_commit()
+            .unwrap();
+        let branch_ref = "refs/heads/adopted-fixture".to_owned();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker.adopt(&worktree, Some(task)).unwrap();
+        broker.close(session.id).unwrap();
+        (
+            owner,
+            repository,
+            storage,
+            broker,
+            session,
+            worktree,
+            base,
+            head,
+            branch_ref,
+        )
+    }
+
+    fn apply_adopted_with_hook<F>(
+        broker: &mut Broker,
+        session_id: i64,
+        digest: &str,
+        after_archive_verified: F,
+    ) -> CleanupResolveOutcome
+    where
+        F: FnOnce(),
+    {
+        broker
+            .cleanup_resolve_apply_with_bundle_writer_mode(
+                session_id,
+                digest,
+                after_archive_verified,
+                sync_archive_directory,
+                |main_root, archive_root| {
+                    crate::disk_headroom::available_headroom_at_or_above_for(
+                        main_root,
+                        archive_root,
+                    )
+                },
+                RecoveryArchiveApplyMode {
+                    owner_authorized_adopted: true,
+                    bundle: RecoveryBundleWriter {
+                        max_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+                        write_to: write_recovery_bundle_to_file,
+                    },
+                },
+            )
+            .unwrap()
+    }
+
+    fn insert_live_association(db_path: &Path, worktree_path: &Path) -> i64 {
+        let connection = rusqlite::Connection::open(db_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (
+                     worktree_path, branch, origin, status,
+                     created_at, updated_at, last_activity_at
+                 ) VALUES (?1, 'agent/nested-live', 'adopted', 'active', 1, 1, 1)",
+                [worktree_path.to_string_lossy().into_owned()],
+            )
+            .unwrap();
+        connection.last_insert_rowid()
+    }
+
+    fn insert_closed_association(db_path: &Path, worktree_path: &Path) -> i64 {
+        let connection = rusqlite::Connection::open(db_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (
+                     worktree_path, branch, origin, status,
+                     created_at, updated_at, last_activity_at
+                 ) VALUES (?1, 'agent/closed-gate-owner', 'adopted', 'closed', 1, 1, 1)",
+                [worktree_path.to_string_lossy().into_owned()],
+            )
+            .unwrap();
+        connection.last_insert_rowid()
+    }
+
+    fn hold_gate_owner_lock(
+        broker: &Broker,
+        name: &str,
+        holder: &str,
+    ) -> crate::file_lock::ExclusiveFileLock {
+        let owners = crate::gates::running_dir(broker.main_root()).join("owners");
+        std::fs::create_dir_all(&owners).unwrap();
+        let file = crate::file_lock::open_lock_file(&owners.join(name)).unwrap();
+        let lock = crate::file_lock::ExclusiveFileLock::try_acquire(file)
+            .unwrap()
+            .unwrap();
+        lock.record_holder(holder).unwrap();
+        lock
+    }
+
+    fn write_gate_owner_lock_waiter(broker: &Broker, session_id: Option<i64>) {
+        let waits = broker.main_root().join(".aethyme/run/waits");
+        std::fs::create_dir_all(&waits).unwrap();
+        let pid = i64::from(std::process::id());
+        let record = crate::waiters::WaitRecord {
+            pid,
+            session_id,
+            kind: crate::waiters::WAIT_GATE_OWNER_LOCK.into(),
+            resource: "unit (unit-all-0000000000000001)".into(),
+            holder: "held by session 999".into(),
+            started_at_ms: crate::clock::epoch_ms(),
+        };
+        std::fs::write(
+            waits.join(format!("{pid}-1.json")),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -3483,7 +4379,7 @@ mod tests {
         std::fs::write(&second, "keep two\n").unwrap();
 
         let error = broker
-            .cleanup_resolve_plan_with_limits(session.id, 1024 * 1024, 16, 1024 * 1024, 1)
+            .cleanup_resolve_plan_with_limits(session.id, 1024 * 1024, 16, 1024 * 1024, 1, false)
             .unwrap_err();
         assert!(
             error
@@ -3568,6 +4464,8 @@ mod tests {
             archive_root: PathBuf::new(),
             apply_command: String::new(),
             discard_command: String::new(),
+            adopted_checkout: None,
+            owner_authorized_adopted: false,
         };
         let regenerable = vec!["dist/".to_owned(), "target/".to_owned()];
         let policy = IgnoredPolicyProof {
@@ -3636,6 +4534,8 @@ mod tests {
             archive_root: PathBuf::new(),
             apply_command: String::new(),
             discard_command: String::new(),
+            adopted_checkout: None,
+            owner_authorized_adopted: false,
         };
         let dir = tempfile::tempdir().unwrap();
         write_verified_archive(&repo, &repo, &plan, None, dir.path()).unwrap();
@@ -4905,6 +5805,479 @@ mod tests {
         assert_eq!(
             known_recovery_archive_payload_bytes(&plan).unwrap(),
             expected
+        );
+    }
+
+    #[test]
+    fn adopted_archive_requires_explicit_opt_in_and_a_matching_confirmation() {
+        let (_owner, _repository, _storage, mut broker, session, worktree, _base, head, _branch) =
+            closed_adopted_commit_fixture("adopted opt-in recovery");
+        assert!(broker.cleanup_resolve_plan(session.id).is_err());
+
+        let plan = broker
+            .cleanup_resolve_plan_owner_authorized_adopted(session.id)
+            .unwrap();
+        assert!(plan.owner_authorized_adopted);
+        assert!(plan.adopted_checkout.is_some());
+        assert!(broker.cleanup_resolve_apply(session.id, &plan.digest).is_err());
+        assert!(broker
+            .cleanup_resolve_apply_owner_authorized_adopted(session.id, &"0".repeat(64))
+            .is_err());
+        assert!(worktree.is_dir());
+        assert_eq!(
+            GitRepo::discover(&worktree)
+                .unwrap()
+                .head_commit()
+                .unwrap(),
+            head
+        );
+        assert!(!broker.recovery_archive_root().unwrap().exists());
+    }
+
+    #[test]
+    fn adopted_opt_in_is_rejected_for_spawned_sessions() {
+        let (_owner, _repository, _storage, broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("spawned opt-in recovery");
+        let error = broker
+            .cleanup_resolve_plan_owner_authorized_adopted(session.id)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("applies only to adopted sessions"), "{error}");
+        assert!(worktree.is_dir());
+    }
+
+    #[test]
+    fn adopted_archive_destination_must_remain_outside_checkout_and_git_metadata() {
+        let (_owner, _repository, _storage, broker, session, _worktree, _base, _head, _branch) =
+            closed_adopted_commit_fixture("adopted archive destination");
+        let plan = broker
+            .cleanup_resolve_plan_owner_authorized_adopted(session.id)
+            .unwrap();
+        let identity = plan.adopted_checkout.as_ref().unwrap();
+        let planned_root = canonicalize_planned_archive_root(&plan.archive_root).unwrap();
+        assert_eq!(planned_root, plan.archive_root);
+        ensure_adopted_archive_root_is_external(&planned_root, identity).unwrap();
+
+        for protected in [
+            &identity.canonical_worktree_path,
+            &identity.git_admin_path,
+            &identity.git_common_path,
+        ] {
+            let nested = Path::new(protected).join("recovery-archives");
+            let canonical = canonicalize_planned_archive_root(&nested).unwrap();
+            assert!(
+                ensure_adopted_archive_root_is_external(&canonical, identity).is_err(),
+                "accepted archive destination inside {}",
+                protected
+            );
+        }
+    }
+
+    #[test]
+    fn adopted_content_changed_after_archive_verification_keeps_checkout_and_branch() {
+        let (_owner, repository, _storage, mut broker, session, worktree, _base, head, branch_ref) =
+            closed_adopted_commit_fixture("adopted recovery content race");
+        let plan = broker
+            .cleanup_resolve_plan_owner_authorized_adopted(session.id)
+            .unwrap();
+        let late_file = worktree.join("late.txt");
+        let outcome = apply_adopted_with_hook(&mut broker, session.id, &plan.digest, move || {
+            std::fs::write(late_file, "new recovery content\n").unwrap();
+        });
+
+        assert!(!outcome.worktree_removed, "{outcome:?}");
+        assert!(outcome.cleanup_error.is_some(), "{outcome:?}");
+        assert!(outcome.archive.join(MANIFEST_FILE).is_file());
+        assert!(worktree.is_dir());
+        assert_eq!(
+            GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref(&branch_ref)
+                .as_deref(),
+            Some(head.as_str())
+        );
+        assert_eq!(std::fs::read(worktree.join("late.txt")).unwrap(), b"new recovery content\n");
+    }
+
+    #[test]
+    fn adopted_boundary_change_after_archive_verification_keeps_checkout_and_branch() {
+        let (_owner, repository, _storage, mut broker, session, worktree, _base, head, branch_ref) =
+            closed_adopted_commit_fixture("adopted recovery boundary race");
+        let plan = broker
+            .cleanup_resolve_plan_owner_authorized_adopted(session.id)
+            .unwrap();
+        let database = broker.store().db_path().to_path_buf();
+        let changed_diff_base = head.clone();
+        let session_id = session.id;
+        let outcome = apply_adopted_with_hook(&mut broker, session.id, &plan.digest, move || {
+            let connection = rusqlite::Connection::open(database).unwrap();
+            assert_eq!(
+                connection
+                    .execute(
+                        "UPDATE sessions SET diff_base = ?1 WHERE id = ?2",
+                        (&changed_diff_base, session_id),
+                    )
+                    .unwrap(),
+                1
+            );
+        });
+
+        assert!(!outcome.worktree_removed, "{outcome:?}");
+        assert!(outcome.cleanup_error.is_some(), "{outcome:?}");
+        assert!(worktree.is_dir());
+        assert_eq!(
+            GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref(&branch_ref)
+                .as_deref(),
+            Some(head.as_str())
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn adopted_generation_change_after_archive_verification_keeps_checkout() {
+        let (_owner, _repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_adopted_commit_fixture("adopted recovery generation race");
+        let probe = tempfile::tempdir().unwrap();
+        if crate::root_generation::initialize(probe.path()).is_none() {
+            return;
+        }
+        let plan = broker
+            .cleanup_resolve_plan_owner_authorized_adopted(session.id)
+            .unwrap();
+        let root_after_archive = worktree.clone();
+        let outcome = apply_adopted_with_hook(&mut broker, session.id, &plan.digest, move || {
+            assert!(crate::root_generation::initialize(&root_after_archive).is_some());
+        });
+
+        assert!(!outcome.worktree_removed, "{outcome:?}");
+        assert!(outcome.cleanup_error.is_some(), "{outcome:?}");
+        assert!(worktree.is_dir());
+    }
+
+    #[test]
+    fn adopted_branch_ref_change_after_archive_verification_keeps_checkout() {
+        let (_owner, repository, _storage, mut broker, session, worktree, base, head, branch_ref) =
+            closed_adopted_commit_fixture("adopted recovery branch race");
+        let plan = broker
+            .cleanup_resolve_plan_owner_authorized_adopted(session.id)
+            .unwrap();
+        let repository_after_archive = repository.clone();
+        let branch_after_archive = branch_ref.clone();
+        let moved_to = base.clone();
+        let outcome = apply_adopted_with_hook(&mut broker, session.id, &plan.digest, move || {
+            git(
+                &repository_after_archive,
+                &["update-ref", &branch_after_archive, &moved_to],
+            );
+        });
+
+        assert!(!outcome.worktree_removed, "{outcome:?}");
+        assert!(outcome.cleanup_error.is_some(), "{outcome:?}");
+        assert!(worktree.is_dir());
+        assert_eq!(
+            GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref(&branch_ref)
+                .as_deref(),
+            Some(base.as_str())
+        );
+        assert_eq!(
+            GitRepo::discover(&worktree)
+                .unwrap()
+                .head_commit()
+                .unwrap(),
+            head
+        );
+    }
+
+    #[test]
+    fn adopted_head_change_after_archive_verification_keeps_checkout_and_new_branch_tip() {
+        let (_owner, repository, _storage, mut broker, session, worktree, _base, _head, branch_ref) =
+            closed_adopted_commit_fixture("adopted recovery head race");
+        let plan = broker
+            .cleanup_resolve_plan_owner_authorized_adopted(session.id)
+            .unwrap();
+        let changed_worktree = worktree.clone();
+        let outcome = apply_adopted_with_hook(&mut broker, session.id, &plan.digest, move || {
+            std::fs::write(changed_worktree.join("later.txt"), "later commit\n").unwrap();
+            git(&changed_worktree, &["add", "later.txt"]);
+            git(&changed_worktree, &["commit", "-qm", "change after archive"]);
+        });
+
+        assert!(!outcome.worktree_removed, "{outcome:?}");
+        assert!(outcome.cleanup_error.is_some(), "{outcome:?}");
+        assert!(worktree.is_dir());
+        let later_head = GitRepo::discover(&worktree).unwrap().head_commit().unwrap();
+        assert_eq!(
+            GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref(&branch_ref)
+                .as_deref(),
+            Some(later_head.as_str())
+        );
+        assert_eq!(
+            std::fs::read(worktree.join("later.txt")).unwrap(),
+            b"later commit\n"
+        );
+    }
+
+    #[test]
+    fn adopted_checkout_is_not_removed_when_another_live_session_associates_with_it() {
+        let (_owner, _repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_adopted_commit_fixture("adopted recovery live association");
+        let plan = broker
+            .cleanup_resolve_plan_owner_authorized_adopted(session.id)
+            .unwrap();
+        let database = broker.store().db_path().to_path_buf();
+        let nested_association = worktree.join("nested-live-session");
+        let outcome = apply_adopted_with_hook(&mut broker, session.id, &plan.digest, move || {
+            insert_live_association(&database, &nested_association);
+        });
+
+        assert!(!outcome.worktree_removed, "{outcome:?}");
+        assert!(outcome.cleanup_error.is_some(), "{outcome:?}");
+        assert!(outcome.archive.join(MANIFEST_FILE).is_file());
+        assert!(worktree.is_dir());
+    }
+
+    #[test]
+    fn adopted_checkout_is_not_removed_when_nested_inside_another_live_session_root() {
+        let (owner, repository, _storage, mut broker, session, worktree, _base, head, branch_ref) =
+            closed_adopted_commit_fixture("adopted recovery parent live association");
+        let database = broker.store().db_path().to_path_buf();
+        let live_parent = owner.path().to_path_buf();
+        insert_live_association(&database, &live_parent);
+        assert!(broker
+            .cleanup_resolve_plan_owner_authorized_adopted(session.id)
+            .is_err());
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute("DELETE FROM sessions WHERE branch = 'agent/nested-live'", [])
+            .unwrap();
+        let plan = broker
+            .cleanup_resolve_plan_owner_authorized_adopted(session.id)
+            .unwrap();
+        let outcome = apply_adopted_with_hook(&mut broker, session.id, &plan.digest, move || {
+            insert_live_association(&database, &live_parent);
+        });
+
+        assert!(!outcome.worktree_removed, "{outcome:?}");
+        assert!(outcome.cleanup_error.is_some(), "{outcome:?}");
+        assert!(outcome.archive.join(MANIFEST_FILE).is_file());
+        assert!(worktree.is_dir());
+        assert_eq!(
+            GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref(&branch_ref)
+                .as_deref(),
+            Some(head.as_str())
+        );
+        assert_eq!(
+            broker.store().session(session.id).unwrap().status,
+            crate::SessionStatus::Closed
+        );
+    }
+
+    #[test]
+    fn adopted_recovery_allows_a_gate_owner_with_a_canonical_disjoint_session_path() {
+        let (owner, repository, _storage, mut broker, session, worktree, _base, head, branch_ref) =
+            closed_adopted_commit_fixture("adopted recovery unrelated gate owner");
+        let other_path = owner.path().join("other-live-session");
+        std::fs::create_dir(&other_path).unwrap();
+        let database = broker.store().db_path().to_path_buf();
+        let other_session_id = insert_live_association(&database, &other_path);
+        let _owner_lock = hold_gate_owner_lock(
+            &broker,
+            "unrelated-owner.lock",
+            &format!("s{other_session_id}-unit since=1"),
+        );
+        write_gate_owner_lock_waiter(&broker, Some(other_session_id));
+
+        let plan = broker
+            .cleanup_resolve_plan_owner_authorized_adopted(session.id)
+            .unwrap();
+        let outcome = apply_adopted_with_hook(&mut broker, session.id, &plan.digest, || {});
+
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        assert!(!worktree.exists());
+        assert_eq!(
+            GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref(&branch_ref)
+                .as_deref(),
+            Some(head.as_str())
+        );
+    }
+
+    #[test]
+    fn adopted_recovery_refuses_a_live_target_session_waiting_for_a_gate_owner_lock() {
+        let (_owner, _repository, _storage, broker, session, worktree, _base, _head, _branch) =
+            closed_adopted_commit_fixture("adopted recovery gate owner waiter");
+        write_gate_owner_lock_waiter(&broker, Some(session.id));
+
+        assert!(broker
+            .cleanup_resolve_plan_owner_authorized_adopted(session.id)
+            .is_err());
+        assert!(worktree.is_dir());
+    }
+
+    #[test]
+    fn adopted_recovery_refuses_gate_owners_with_missing_or_unresolved_session_paths() {
+        let (_owner, _repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_adopted_commit_fixture("adopted recovery unresolved gate owner");
+        let missing_session_id = i64::MAX;
+        let _owner_lock = hold_gate_owner_lock(
+            &broker,
+            "missing-owner.lock",
+            &format!("s{missing_session_id}-unit since=1"),
+        );
+        assert!(broker
+            .cleanup_resolve_plan_owner_authorized_adopted(session.id)
+            .is_err());
+        assert!(worktree.is_dir());
+
+        let (_owner, _repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_adopted_commit_fixture("adopted recovery unresolved closed gate owner path");
+        let database = broker.store().db_path().to_path_buf();
+        let missing_path = worktree.parent().unwrap().join("missing-live-session");
+        let other_session_id = insert_closed_association(&database, &missing_path);
+        let _owner_lock = hold_gate_owner_lock(
+            &broker,
+            "unresolved-owner.lock",
+            &format!("s{other_session_id}-unit since=1"),
+        );
+        assert!(broker
+            .cleanup_resolve_plan_owner_authorized_adopted(session.id)
+            .is_err());
+        assert!(worktree.is_dir());
+    }
+
+    #[test]
+    fn adopted_checkout_removed_after_archive_keeps_branch_and_closed_session_state() {
+        let (_owner, repository, _storage, mut broker, session, worktree, _base, head, branch_ref) =
+            closed_adopted_commit_fixture("adopted recovery missing checkout");
+        let plan = broker
+            .cleanup_resolve_plan_owner_authorized_adopted(session.id)
+            .unwrap();
+        let checkout_after_archive = worktree.clone();
+        let outcome = apply_adopted_with_hook(&mut broker, session.id, &plan.digest, move || {
+            std::fs::remove_dir_all(checkout_after_archive).unwrap();
+        });
+
+        assert!(!outcome.worktree_removed, "{outcome:?}");
+        assert!(outcome.cleanup_error.is_some(), "{outcome:?}");
+        assert!(outcome.archive.join(MANIFEST_FILE).is_file());
+        assert!(!worktree.exists());
+        assert_eq!(
+            GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref(&branch_ref)
+                .as_deref(),
+            Some(head.as_str())
+        );
+        assert_eq!(
+            broker.store().session(session.id).unwrap().status,
+            crate::SessionStatus::Closed
+        );
+    }
+
+    #[test]
+    fn adopted_checkout_moved_after_archive_keeps_new_path_and_branch() {
+        let (_owner, repository, _storage, mut broker, session, worktree, _base, head, branch_ref) =
+            closed_adopted_commit_fixture("adopted recovery moved checkout");
+        let plan = broker
+            .cleanup_resolve_plan_owner_authorized_adopted(session.id)
+            .unwrap();
+        let moved_worktree = worktree.with_file_name("adopted-worktree-moved");
+        let old_path = worktree.to_string_lossy().into_owned();
+        let new_path = moved_worktree.to_string_lossy().into_owned();
+        let repository_after_archive = repository.clone();
+        let outcome = apply_adopted_with_hook(&mut broker, session.id, &plan.digest, move || {
+            git(
+                &repository_after_archive,
+                &["worktree", "move", &old_path, &new_path],
+            );
+        });
+
+        assert!(!outcome.worktree_removed, "{outcome:?}");
+        assert!(outcome.cleanup_error.is_some(), "{outcome:?}");
+        assert!(!worktree.exists(), "the old checkout path was moved");
+        assert!(moved_worktree.is_dir());
+        assert_eq!(
+            GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref(&branch_ref)
+                .as_deref(),
+            Some(head.as_str())
+        );
+        assert_eq!(
+            broker.store().session(session.id).unwrap().status,
+            crate::SessionStatus::Closed
+        );
+    }
+
+    #[test]
+    fn adopted_archive_corruption_after_readback_keeps_checkout_and_branch() {
+        let (_owner, repository, _storage, mut broker, session, worktree, _base, head, branch_ref) =
+            closed_adopted_commit_fixture("adopted recovery archive corruption");
+        let plan = broker
+            .cleanup_resolve_plan_owner_authorized_adopted(session.id)
+            .unwrap();
+        let archive_root = plan.archive_root.clone();
+        let outcome = apply_adopted_with_hook(&mut broker, session.id, &plan.digest, move || {
+            let archive = std::fs::read_dir(&archive_root)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.extension() != Some(std::ffi::OsStr::new("partial")))
+                .unwrap();
+            std::fs::write(archive.join(README_FILE), "corrupt after verified readback\n").unwrap();
+        });
+
+        assert!(!outcome.worktree_removed, "{outcome:?}");
+        assert!(outcome.cleanup_error.is_some(), "{outcome:?}");
+        assert!(worktree.is_dir());
+        assert_eq!(
+            GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref(&branch_ref)
+                .as_deref(),
+            Some(head.as_str())
+        );
+    }
+
+    #[test]
+    fn adopted_archive_with_a_spawned_origin_label_keeps_checkout_and_branch() {
+        let (_owner, repository, _storage, mut broker, session, worktree, _base, head, branch_ref) =
+            closed_adopted_commit_fixture("adopted recovery wrong origin");
+        let plan = broker
+            .cleanup_resolve_plan_owner_authorized_adopted(session.id)
+            .unwrap();
+        let archive_root = plan.archive_root.clone();
+        let outcome = apply_adopted_with_hook(&mut broker, session.id, &plan.digest, move || {
+            let archive = std::fs::read_dir(&archive_root)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.extension() != Some(std::ffi::OsStr::new("partial")))
+                .unwrap();
+            let manifest_path = archive.join(MANIFEST_FILE);
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+            manifest["origin"] = serde_json::Value::String("spawned".into());
+            std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        });
+
+        assert!(!outcome.worktree_removed, "{outcome:?}");
+        assert!(outcome.cleanup_error.is_some(), "{outcome:?}");
+        assert!(worktree.is_dir());
+        assert_eq!(
+            GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref(&branch_ref)
+                .as_deref(),
+            Some(head.as_str())
         );
     }
 }

@@ -1028,6 +1028,282 @@ pub(crate) fn running_session_gates(main_root: &Path, session_id: i64) -> Vec<St
     running
 }
 
+/// One session-scoped gate witness. Owner locks expose their session ID so the
+/// broker can prove the recorded session's checkout is canonically disjoint
+/// before treating that lock as unrelated.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum SessionGateEvidence {
+    RunningPidfile { name: String, pid: i32 },
+    OwnerLockForSession { name: String, session_id: i64 },
+    GateOwnerLockWaiter {
+        name: String,
+        pid: i64,
+        session_id: i64,
+    },
+    Unknown { name: String, reason: String },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GateWaitRecord {
+    pid: i64,
+    #[serde(default)]
+    session_id: Option<i64>,
+    kind: String,
+    resource: String,
+    holder: String,
+    started_at_ms: i64,
+}
+
+/// Bounded, fail-closed evidence for gates associated with one session.
+/// Session pidfiles cover dispatched gates, owner locks cover the interval
+/// after admission and before a pidfile is published, and wait records cover
+/// the interval before an owner lock can be acquired. The broker resolves
+/// other-session checkout paths before treating their activity as unrelated.
+pub(crate) fn running_session_gate_evidence_until(
+    main_root: &Path,
+    session_id: i64,
+    mut expired: impl FnMut() -> bool,
+    entry_budget: usize,
+) -> Option<Vec<SessionGateEvidence>> {
+    fn confirmed_absent_until(path: &Path, expired: &mut impl FnMut() -> bool) -> Option<bool> {
+        if expired() {
+            return None;
+        }
+        let absent = matches!(
+            std::fs::symlink_metadata(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        );
+        (!expired()).then_some(absent)
+    }
+
+    let run_dir = running_dir(main_root);
+    let owners_dir = run_dir.join("owners");
+    let waits_dir = run_dir.join("waits");
+    let pid_prefix = format!("{session_id}-");
+    let mut evidence = Vec::new();
+    let mut entries_seen = 0_usize;
+
+    for (path, label) in [
+        (&run_dir, "gate run"),
+        (&owners_dir, "gate owner-lock"),
+        (&waits_dir, "gate wait"),
+    ] {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                evidence.push(SessionGateEvidence::Unknown {
+                    name: label.to_owned(),
+                    reason: "directory is not a real directory".into(),
+                });
+                return Some(evidence);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                evidence.push(SessionGateEvidence::Unknown {
+                    name: label.to_owned(),
+                    reason: format!("directory cannot be inspected: {error}"),
+                });
+                return Some(evidence);
+            }
+        }
+    }
+
+    if expired() {
+        return None;
+    }
+    match std::fs::read_dir(&run_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                if expired() || entries_seen >= entry_budget {
+                    return None;
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => return None,
+                };
+                entries_seen = entries_seen.saturating_add(1);
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name
+                    .strip_prefix(&pid_prefix)
+                    .is_some_and(|suffix| suffix.ends_with(".pid"))
+                {
+                    continue;
+                }
+                match read_gate_pidfile_until(&entry.path(), &mut expired) {
+                    Ok(Some(record)) if record.names_running_process() => {
+                        let pid = record.pid.unwrap_or(record.pgid);
+                        evidence.push(SessionGateEvidence::RunningPidfile { name, pid });
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => evidence.push(SessionGateEvidence::Unknown {
+                        name,
+                        reason: format!(
+                            "pidfile is unreadable or changed for session {session_id}"
+                        ),
+                    }),
+                    Err(()) => return None,
+                }
+                if expired() {
+                    return None;
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match confirmed_absent_until(&run_dir, &mut expired) {
+                Some(true) => {}
+                Some(false) => return None,
+                None => return None,
+            }
+        }
+        Err(_) => return None,
+    }
+
+    if expired() {
+        return None;
+    }
+    match std::fs::read_dir(&owners_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                if expired() || entries_seen >= entry_budget {
+                    return None;
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => return None,
+                };
+                entries_seen = entries_seen.saturating_add(1);
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.ends_with(".lock") {
+                    continue;
+                }
+                let mut file = match open_gate_owner_lock_probe(&entry.path()) {
+                    Ok(file) => file,
+                    Err(error) => {
+                        evidence.push(SessionGateEvidence::Unknown {
+                            name,
+                            reason: format!("owner lock cannot be probed: {error}"),
+                        });
+                        continue;
+                    }
+                };
+                match file.try_lock() {
+                    Ok(()) => {
+                        if let Err(error) = file.unlock() {
+                            evidence.push(SessionGateEvidence::Unknown {
+                                name,
+                                reason: format!("owner lock probe cannot be released: {error}"),
+                            });
+                        }
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        match locked_gate_owner_session(&mut file) {
+                            Ok(GateLockOwner::Session(owner)) => evidence.push(
+                                SessionGateEvidence::OwnerLockForSession {
+                                    name,
+                                    session_id: owner,
+                                },
+                            ),
+                            Ok(GateLockOwner::Process) => evidence.push(
+                                SessionGateEvidence::Unknown {
+                                    name,
+                                    reason: "owner lock is held by an unattributed process gate"
+                                        .into(),
+                                },
+                            ),
+                            Err(()) => evidence.push(SessionGateEvidence::Unknown {
+                                name,
+                                reason: "owner lock has unknown or unreadable ownership".into(),
+                            }),
+                        }
+                    }
+                    Err(std::fs::TryLockError::Error(error)) => evidence.push(
+                        SessionGateEvidence::Unknown {
+                            name,
+                            reason: format!("owner lock cannot be checked: {error}"),
+                        },
+                    ),
+                }
+                if expired() {
+                    return None;
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match confirmed_absent_until(&owners_dir, &mut expired) {
+                Some(true) => {}
+                Some(false) => return None,
+                None => return None,
+            }
+        }
+        Err(_) => return None,
+    }
+
+    if expired() {
+        return None;
+    }
+    match std::fs::read_dir(&waits_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                if expired() || entries_seen >= entry_budget {
+                    return None;
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => return None,
+                };
+                entries_seen = entries_seen.saturating_add(1);
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if entry.path().extension().is_none_or(|extension| extension != "json") {
+                    continue;
+                }
+                match read_gate_wait_record_until(&entry.path(), &mut expired) {
+                    Ok(Some(record))
+                        if record.kind == crate::waiters::WAIT_GATE_OWNER_LOCK =>
+                    {
+                        if !crate::broker::pid_alive(record.pid) {
+                            continue;
+                        }
+                        match record.session_id {
+                            Some(owner) if owner > 0 => {
+                                evidence.push(SessionGateEvidence::GateOwnerLockWaiter {
+                                    name,
+                                    pid: record.pid,
+                                    session_id: owner,
+                                });
+                            }
+                            _ => evidence.push(SessionGateEvidence::Unknown {
+                                name,
+                                reason: "gate owner-lock waiter has no valid session owner".into(),
+                            }),
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => evidence.push(SessionGateEvidence::Unknown {
+                        name,
+                        reason: "wait record is unreadable, malformed, or changed".into(),
+                    }),
+                    Err(()) => return None,
+                }
+                if expired() {
+                    return None;
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match confirmed_absent_until(&waits_dir, &mut expired) {
+                Some(true) => {}
+                Some(false) => return None,
+                None => return None,
+            }
+        }
+        Err(_) => return None,
+    }
+    evidence.sort();
+    evidence.dedup();
+    (!expired()).then_some(evidence)
+}
+
 /// Evidence that a gate of the repository rooted at `main_root` is running
 /// right now, one human-readable line per witness. Empty means none was found.
 ///
@@ -1229,11 +1505,15 @@ fn same_gate_file_version(left: &std::fs::Metadata, right: &std::fs::Metadata) -
 }
 
 fn open_gate_owner_lock_probe(path: &Path) -> std::io::Result<std::fs::File> {
+    open_gate_evidence_file(path, "owner lock")
+}
+
+fn open_gate_evidence_file(path: &Path, label: &str) -> std::io::Result<std::fs::File> {
     let before_path = std::fs::symlink_metadata(path)?;
     if before_path.file_type().is_symlink() || !before_path.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "owner lock is not a regular file",
+            format!("{label} is not a regular file"),
         ));
     }
     let mut options = std::fs::OpenOptions::new();
@@ -1251,10 +1531,117 @@ fn open_gate_owner_lock_probe(path: &Path) -> std::io::Result<std::fs::File> {
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "owner lock changed while it was opened",
+            format!("{label} changed while it was opened"),
         ));
     }
     Ok(file)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateLockOwner {
+    Session(i64),
+    Process,
+}
+
+/// Read the owner marker from the same opened inode whose lock is busy.
+/// An unscoped process owner is distinct from a session owner but cannot be
+/// proven unrelated to a checkout, so callers must treat it as unknown.
+fn locked_gate_owner_session(file: &mut std::fs::File) -> Result<GateLockOwner, ()> {
+    const MAX_OWNER_RECORD_BYTES: u64 = 4096;
+
+    let before = file.metadata().map_err(|_| ())?;
+    if !before.is_file() || before.len() == 0 || before.len() > MAX_OWNER_RECORD_BYTES {
+        return Err(());
+    }
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    file.by_ref()
+        .take(MAX_OWNER_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() as u64 > MAX_OWNER_RECORD_BYTES {
+        return Err(());
+    }
+    let after = file.metadata().map_err(|_| ())?;
+    if !same_gate_file_version(&before, &after) || bytes.len() as u64 != after.len() {
+        return Err(());
+    }
+    let content = std::str::from_utf8(&bytes).map_err(|_| ())?;
+    let mut fields = content.split_whitespace();
+    let worker = fields.next().ok_or(())?;
+    let since_text = fields
+        .next()
+        .and_then(|field| field.strip_prefix("since="))
+        .ok_or(())?;
+    let since = since_text.parse::<i64>().map_err(|_| ())?;
+    if since < 0 || fields.next().is_some() {
+        return Err(());
+    }
+    let (owner, gate) = worker.split_once('-').ok_or(())?;
+    if gate.is_empty() || lock_segment(gate).as_str() != gate {
+        return Err(());
+    }
+    let canonical_since = since.to_string();
+    let canonical_record = format!("{worker} since={since}");
+    if since_text != canonical_since.as_str() || content != canonical_record.as_str() {
+        return Err(());
+    }
+    if let Some(session_text) = owner.strip_prefix('s') {
+        let session = session_text.parse::<i64>().map_err(|_| ())?;
+        let canonical_owner = format!("s{session}");
+        return (session > 0 && owner == canonical_owner.as_str())
+            .then_some(GateLockOwner::Session(session))
+            .ok_or(());
+    }
+    if let Some(process_text) = owner.strip_prefix('p') {
+        let process = process_text.parse::<u32>().map_err(|_| ())?;
+        let canonical_owner = format!("p{process}");
+        return (process > 0 && owner == canonical_owner.as_str())
+            .then_some(GateLockOwner::Process)
+            .ok_or(());
+    }
+    Err(())
+}
+
+fn read_gate_wait_record_until(
+    path: &Path,
+    expired: &mut impl FnMut() -> bool,
+) -> Result<Option<GateWaitRecord>, ()> {
+    const MAX_WAIT_RECORD_BYTES: u64 = 16 * 1024;
+
+    if expired() {
+        return Err(());
+    }
+    let mut file = open_gate_evidence_file(path, "gate wait record").map_err(|_| ())?;
+    let before = file.metadata().map_err(|_| ())?;
+    if !before.is_file() || before.len() == 0 || before.len() > MAX_WAIT_RECORD_BYTES {
+        return Ok(None);
+    }
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    file.by_ref()
+        .take(MAX_WAIT_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    let after = file.metadata().map_err(|_| ())?;
+    if bytes.len() as u64 > MAX_WAIT_RECORD_BYTES
+        || bytes.len() as u64 != after.len()
+        || !same_gate_file_version(&before, &after)
+        || expired()
+    {
+        return Ok(None);
+    }
+    let Ok(record) = serde_json::from_slice::<GateWaitRecord>(&bytes) else {
+        return Ok(None);
+    };
+    if record.pid <= 0
+        || record.session_id.is_some_and(|session_id| session_id <= 0)
+        || record.kind.is_empty()
+        || record.resource.is_empty()
+        || record.holder.is_empty()
+        || record.started_at_ms < 0
+    {
+        return Ok(None);
+    }
+    Ok(Some(record))
 }
 
 fn read_gate_pidfile_until(
@@ -6432,6 +6819,242 @@ mod tests {
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
+    fn held_gate_owner_lock(
+        root: &Path,
+        name: &str,
+        holder: &str,
+    ) -> crate::file_lock::ExclusiveFileLock {
+        let owners = running_dir(root).join("owners");
+        std::fs::create_dir_all(&owners).unwrap();
+        let file = crate::file_lock::open_lock_file(&owners.join(name)).unwrap();
+        let lock = crate::file_lock::ExclusiveFileLock::try_acquire(file)
+            .unwrap()
+            .unwrap();
+        lock.record_holder(holder).unwrap();
+        lock
+    }
+
+    #[test]
+    fn session_gate_evidence_finds_owner_lock_before_pidfile_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let _lock = held_gate_owner_lock(
+            root.path(),
+            "unit-all-0000000000000001.lock",
+            "s812-unit since=1",
+        );
+
+        assert!(running_session_gates(root.path(), 812).is_empty());
+        let evidence = running_session_gate_evidence_until(root.path(), 812, || false, 32)
+            .expect("the bounded session scan should complete");
+        assert!(evidence.contains(&SessionGateEvidence::OwnerLockForSession {
+            name: "unit-all-0000000000000001.lock".into(),
+            session_id: 812,
+        }));
+    }
+
+    #[test]
+    fn session_gate_evidence_finds_a_waiter_before_owner_lock_acquisition() {
+        let root = tempfile::tempdir().unwrap();
+        let waits = running_dir(root.path()).join("waits");
+        std::fs::create_dir_all(&waits).unwrap();
+        let pid = i64::from(std::process::id());
+        let record = crate::waiters::WaitRecord {
+            pid,
+            session_id: Some(812),
+            kind: crate::waiters::WAIT_GATE_OWNER_LOCK.into(),
+            resource: "unit (unit-all-0000000000000001)".into(),
+            holder: "held by session 999".into(),
+            started_at_ms: crate::clock::epoch_ms(),
+        };
+        std::fs::write(
+            waits.join(format!("{pid}-1.json")),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+
+        let evidence = running_session_gate_evidence_until(root.path(), 812, || false, 32)
+            .expect("the bounded session scan should complete");
+        assert!(evidence.contains(&SessionGateEvidence::GateOwnerLockWaiter {
+            name: format!("{pid}-1.json"),
+            pid,
+            session_id: 812,
+        }));
+    }
+
+    #[test]
+    fn session_gate_evidence_finds_matching_live_pidfile() {
+        let root = tempfile::tempdir().unwrap();
+        let run_dir = running_dir(root.path());
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let pid = i32::try_from(std::process::id()).unwrap();
+        let record = GatePidRecord {
+            pgid: pid,
+            tree: "fixture-tree".into(),
+            pid: Some(pid),
+            start: Some(
+                process_start_time(pid).expect("the current process start time is readable"),
+            ),
+            run: None,
+        };
+        write_gate_pidfile(&run_dir.join("812-unit.pid"), &record).unwrap();
+
+        let evidence = running_session_gate_evidence_until(root.path(), 812, || false, 32)
+            .expect("the bounded session scan should complete");
+        assert!(evidence.contains(&SessionGateEvidence::RunningPidfile {
+            name: "812-unit.pid".into(),
+            pid,
+        }));
+    }
+
+    #[test]
+    fn session_gate_evidence_fails_closed_on_unknown_or_malformed_owners() {
+        let malformed = tempfile::tempdir().unwrap();
+        let _lock = held_gate_owner_lock(
+            malformed.path(),
+            "malformed.lock",
+            "unknown-holder since=1",
+        );
+        let evidence = running_session_gate_evidence_until(
+            malformed.path(),
+            812,
+            || false,
+            32,
+        )
+        .expect("the malformed owner is evidence, not an incomplete scan");
+        assert!(evidence.iter().any(|item| matches!(
+            item,
+            SessionGateEvidence::Unknown { name, .. } if name == "malformed.lock"
+        )));
+
+        let malformed_wait = tempfile::tempdir().unwrap();
+        let waits = running_dir(malformed_wait.path()).join("waits");
+        std::fs::create_dir_all(&waits).unwrap();
+        std::fs::write(waits.join("812-malformed.json"), b"{malformed").unwrap();
+        let evidence = running_session_gate_evidence_until(
+            malformed_wait.path(),
+            812,
+            || false,
+            32,
+        )
+        .expect("a malformed wait record is evidence, not an incomplete scan");
+        assert!(evidence.iter().any(|item| matches!(
+            item,
+            SessionGateEvidence::Unknown { name, .. } if name == "812-malformed.json"
+        )));
+
+        for (name, holder) in [
+            ("malformed-session-gate.lock", "s812--bad-gate since=1"),
+            ("noncanonical-session-id.lock", "s000812-unit since=1"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let _lock = held_gate_owner_lock(root.path(), name, holder);
+            let evidence = running_session_gate_evidence_until(root.path(), 812, || false, 32)
+                .expect("a malformed session marker is evidence, not an incomplete scan");
+            assert!(evidence.iter().any(|item| matches!(
+                item,
+                SessionGateEvidence::Unknown { name: found, .. } if found == name
+            )));
+        }
+
+        let process_owner = tempfile::tempdir().unwrap();
+        let process_id = std::process::id();
+        let _lock = held_gate_owner_lock(
+            process_owner.path(),
+            "process.lock",
+            &format!("p{process_id}-unit since=1"),
+        );
+        let evidence = running_session_gate_evidence_until(
+            process_owner.path(),
+            812,
+            || false,
+            32,
+        )
+        .expect("unattributed process ownership is evidence");
+        assert!(evidence.iter().any(|item| matches!(
+            item,
+            SessionGateEvidence::Unknown { name, .. } if name == "process.lock"
+        )));
+
+        let unreadable = tempfile::tempdir().unwrap();
+        let run_dir = running_dir(unreadable.path());
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("812-bad.pid"), b"malformed pidfile").unwrap();
+        let evidence = running_session_gate_evidence_until(
+            unreadable.path(),
+            812,
+            || false,
+            32,
+        )
+        .expect("a malformed pidfile is evidence, not absence");
+        assert!(evidence.iter().any(|item| matches!(
+            item,
+            SessionGateEvidence::Unknown { name, .. } if name == "812-bad.pid"
+        )));
+
+        #[cfg(unix)]
+        {
+            let symlinked = tempfile::tempdir().unwrap();
+            let run_dir = running_dir(symlinked.path());
+            std::fs::create_dir_all(&run_dir).unwrap();
+            let target = run_dir.join("target.pid");
+            std::fs::write(&target, b"1 tree").unwrap();
+            std::os::unix::fs::symlink(&target, run_dir.join("812-link.pid")).unwrap();
+            let evidence = running_session_gate_evidence_until(
+                symlinked.path(),
+                812,
+                || false,
+                32,
+            )
+            .expect("a symlink pidfile is evidence, not absence");
+            assert!(evidence.iter().any(|item| matches!(
+                item,
+                SessionGateEvidence::Unknown { name, .. } if name == "812-link.pid"
+            )));
+        }
+    }
+
+    #[test]
+    fn bounded_session_gate_evidence_refuses_incomplete_and_expired_scans() {
+        let root = tempfile::tempdir().unwrap();
+        let run_dir = running_dir(root.path());
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("other-a.pid"), b"irrelevant").unwrap();
+        std::fs::write(run_dir.join("other-b.pid"), b"irrelevant").unwrap();
+
+        assert_eq!(
+            running_session_gate_evidence_until(root.path(), 812, || false, 1),
+            None,
+            "an entry-budget limit leaves activity unknown"
+        );
+        assert_eq!(
+            running_session_gate_evidence_until(root.path(), 812, || true, 32),
+            None,
+            "an expired scan leaves activity unknown"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_gate_evidence_refuses_a_fifo_wait_record_without_waiting() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let waits = running_dir(root.path()).join("waits");
+        std::fs::create_dir_all(&waits).unwrap();
+        let path = waits.join("812-wait.json");
+        let encoded = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `encoded` is a NUL-terminated path inside this live TempDir.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+
+        let started = Instant::now();
+        assert_eq!(
+            running_session_gate_evidence_until(root.path(), 812, || false, 8),
+            None,
+            "an unreadable wait record leaves session activity unknown"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
     #[cfg(unix)]
     #[test]
     fn bounded_gate_evidence_refuses_a_fifo_owner_lock_without_waiting() {
@@ -6448,6 +7071,14 @@ mod tests {
         let encoded_pidfile = std::ffi::CString::new(pidfile.as_os_str().as_bytes()).unwrap();
         // SAFETY: `encoded_pidfile` is a NUL-terminated path inside this live TempDir.
         assert_eq!(unsafe { libc::mkfifo(encoded_pidfile.as_ptr(), 0o600) }, 0);
+        let session_pidfile = running_dir(root.path()).join("812-gate.pid");
+        let encoded_session_pidfile =
+            std::ffi::CString::new(session_pidfile.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `encoded_session_pidfile` is a NUL-terminated path inside this live TempDir.
+        assert_eq!(
+            unsafe { libc::mkfifo(encoded_session_pidfile.as_ptr(), 0o600) },
+            0
+        );
 
         let started = Instant::now();
         assert!(matches!(
@@ -6475,6 +7106,22 @@ mod tests {
                 .iter()
                 .any(|item| item.contains("gate pidfile gate.pid is unreadable"))
         );
+
+        let session_evidence = running_session_gate_evidence_until(
+            root.path(),
+            812,
+            || false,
+            8,
+        )
+        .expect("the bounded session inventory should complete");
+        assert!(session_evidence.iter().any(|item| matches!(
+            item,
+            SessionGateEvidence::Unknown { name, .. } if name == "gate.lock"
+        )));
+        assert!(session_evidence.iter().any(|item| matches!(
+            item,
+            SessionGateEvidence::Unknown { name, .. } if name == "812-gate.pid"
+        )));
     }
 
     #[test]

@@ -94,6 +94,70 @@ fn closed_session(repo: &Path, task: &str) -> (String, PathBuf) {
     (session.id.to_string(), worktree)
 }
 
+/// An adopted linked checkout with one commit outside the repository's main
+/// branch, closed through the broker without moving or deleting its branch.
+fn adopted_closed_session(repo: &Path, task: &str) -> (String, PathBuf, String, String) {
+    let worktree = repo.parent().unwrap().join("adopted-checkout");
+    let worktree_arg = worktree.to_string_lossy().into_owned();
+    git(
+        repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "adopted-fixture",
+            &worktree_arg,
+            "HEAD",
+        ],
+    );
+    std::fs::write(worktree.join("adopted.txt"), "adopted commit\n").unwrap();
+    git(&worktree, &["add", "adopted.txt"]);
+    git(&worktree, &["commit", "-qm", "adopted fixture commit"]);
+    let head = git(&worktree, &["rev-parse", "HEAD"]);
+
+    let mut broker = isolation::open(repo);
+    let session = broker.adopt(&worktree, Some(task)).unwrap();
+    broker.close(session.id).unwrap();
+    (
+        session.id.to_string(),
+        worktree,
+        session.branch,
+        head,
+    )
+}
+
+fn owner_authorized_plan(repo: &Path, id: &str) -> serde_json::Value {
+    json(&run(
+        repo,
+        &[
+            "finish",
+            "cleanup",
+            "resolve",
+            id,
+            "--archive",
+            "--owner-authorized-adopted",
+            "--json",
+        ],
+    ))
+}
+
+fn owner_authorized_apply(repo: &Path, id: &str, digest: &str) -> Output {
+    run(
+        repo,
+        &[
+            "finish",
+            "cleanup",
+            "resolve",
+            id,
+            "--archive",
+            "--owner-authorized-adopted",
+            "--confirm",
+            digest,
+            "--json",
+        ],
+    )
+}
+
 fn plan(repo: &Path, id: &str) -> serde_json::Value {
     json(&run(
         repo,
@@ -727,6 +791,141 @@ fn live_eligible_and_unmarked_requests_are_refused() {
         String::from_utf8_lossy(&refused.stderr).contains("requires --archive"),
         "{}",
         String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
+#[test]
+fn adopted_archive_requires_opt_in_for_plan_and_apply_and_keeps_the_branch() {
+    let tmp = repo();
+    let (id, worktree, branch, head) = adopted_closed_session(tmp.path(), "adopted clean recovery");
+
+    let refused = refused_plan(tmp.path(), &id);
+    assert!(refused.contains("--owner-authorized-adopted"), "{refused}");
+    assert!(worktree.is_dir());
+    assert_eq!(git(tmp.path(), &["rev-parse", &format!("refs/heads/{branch}")]), head);
+
+    let reviewed = owner_authorized_plan(tmp.path(), &id);
+    assert_eq!(reviewed["owner_authorized_adopted"], true);
+    assert_eq!(reviewed["adopted_checkout"]["adoption_base"].is_string(), true);
+    assert_eq!(reviewed["adopted_checkout"]["adopted_head"].is_string(), true);
+    assert_eq!(reviewed["adopted_checkout"]["diff_base"].is_string(), true);
+    assert_eq!(reviewed["disposition"], "pending_commits");
+
+    let missing_apply_opt_in = apply(
+        tmp.path(),
+        &id,
+        reviewed["digest"].as_str().unwrap(),
+    );
+    assert!(!missing_apply_opt_in.status.success());
+    assert!(
+        json_error::message(&missing_apply_opt_in).contains("--owner-authorized-adopted"),
+        "{}",
+        json_error::message(&missing_apply_opt_in)
+    );
+    assert!(worktree.is_dir());
+    assert_eq!(git(tmp.path(), &["rev-parse", &format!("refs/heads/{branch}")]), head);
+    assert!(archive_entries(&archive_root(tmp.path(), &reviewed)).is_empty());
+
+    let outcome = json(&owner_authorized_apply(
+        tmp.path(),
+        &id,
+        reviewed["digest"].as_str().unwrap(),
+    ));
+    assert_eq!(outcome["worktree_removed"], true, "{outcome}");
+    assert!(!worktree.exists());
+    assert_eq!(git(tmp.path(), &["rev-parse", &format!("refs/heads/{branch}")]), head);
+    let archive = PathBuf::from(outcome["archive"].as_str().unwrap());
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(archive.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["schema_version"], 5);
+    assert_eq!(manifest["origin"], "adopted");
+    assert_eq!(manifest["adopted_checkout"], reviewed["adopted_checkout"]);
+}
+
+#[test]
+fn adopted_dirty_archive_round_trips_protected_ignored_files_and_discards_ignored_directories() {
+    let tmp = repo();
+    let (id, worktree, branch, head) = adopted_closed_session(tmp.path(), "adopted dirty recovery");
+    std::fs::write(worktree.join("README.md"), "fixture\nstaged\n").unwrap();
+    git(&worktree, &["add", "README.md"]);
+    std::fs::write(worktree.join("README.md"), "fixture\nstaged\nunstaged\n").unwrap();
+    std::fs::create_dir_all(worktree.join("notes")).unwrap();
+    std::fs::write(worktree.join("notes/todo.txt"), "remember this\n").unwrap();
+    std::fs::write(worktree.join("data.bin"), [0_u8, 255, 1, 7]).unwrap();
+    std::os::unix::fs::symlink("notes/todo.txt", worktree.join("link")).unwrap();
+    std::fs::write(worktree.join("private.txt"), "keep this private file\n").unwrap();
+    std::fs::create_dir_all(worktree.join("opaque-cache")).unwrap();
+    std::fs::write(worktree.join("opaque-cache/cache.bin"), vec![9_u8; 4096]).unwrap();
+
+    let reviewed = owner_authorized_plan(tmp.path(), &id);
+    assert_eq!(reviewed["disposition"], "dirty");
+    assert!(reviewed["ignored_files"].as_array().unwrap().iter().any(|file| {
+        file["path"] == "private.txt"
+    }));
+    assert!(reviewed["ignored_paths"].as_array().unwrap().iter().any(|path| {
+        path["path"].as_str().unwrap().trim_end_matches('/') == "opaque-cache"
+            && path["classification"] == "disposable_directory"
+    }));
+
+    let outcome = json(&owner_authorized_apply(
+        tmp.path(),
+        &id,
+        reviewed["digest"].as_str().unwrap(),
+    ));
+    assert_eq!(outcome["worktree_removed"], true, "{outcome}");
+    assert!(!worktree.exists());
+    assert_eq!(git(tmp.path(), &["rev-parse", &format!("refs/heads/{branch}")]), head);
+
+    let archive = PathBuf::from(outcome["archive"].as_str().unwrap());
+    assert_eq!(std::fs::read(archive.join("untracked/notes/todo.txt")).unwrap(), b"remember this\n");
+    assert_eq!(std::fs::read(archive.join("untracked/data.bin")).unwrap(), [0_u8, 255, 1, 7]);
+    assert_eq!(
+        std::fs::read_link(archive.join("untracked/link")).unwrap(),
+        PathBuf::from("notes/todo.txt")
+    );
+    assert_eq!(
+        std::fs::read(archive.join("ignored/private.txt")).unwrap(),
+        b"keep this private file\n"
+    );
+    assert!(!archive.join("ignored/opaque-cache").exists());
+
+    let restored = tempfile::tempdir().unwrap();
+    git(
+        restored.path(),
+        &["clone", "-q", &tmp.path().to_string_lossy(), "."],
+    );
+    let bundle = archive.join("commits.bundle").to_string_lossy().into_owned();
+    git(restored.path(), &["fetch", "-q", &bundle, "HEAD"]);
+    git(restored.path(), &["switch", "-q", "--detach", "FETCH_HEAD"]);
+    git(
+        restored.path(),
+        &["apply", "--index", &archive.join("staged.patch").to_string_lossy()],
+    );
+    git(
+        restored.path(),
+        &["apply", &archive.join("unstaged.patch").to_string_lossy()],
+    );
+    for directory in ["untracked", "ignored"] {
+        let copied = Command::new("cp")
+            .arg("-pR")
+            .arg(archive.join(directory).join("."))
+            .arg(".")
+            .current_dir(restored.path())
+            .status()
+            .unwrap();
+        assert!(copied.success(), "could not restore {directory}");
+    }
+    assert_eq!(
+        std::fs::read(restored.path().join("README.md")).unwrap(),
+        b"fixture\nstaged\nunstaged\n"
+    );
+    assert_eq!(
+        std::fs::read(restored.path().join("private.txt")).unwrap(),
+        b"keep this private file\n"
+    );
+    assert_eq!(
+        git(restored.path(), &["diff", "--cached", "--name-only"]),
+        "README.md"
     );
 }
 

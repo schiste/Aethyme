@@ -2021,9 +2021,9 @@ pub(super) fn render_cleanup_audit(audit: &crate::CleanupAudit, detail: bool) {
     }
 }
 
-/// `broker cleanup resolve <session-id> --archive [--confirm <sha256>]`.
+/// `broker cleanup resolve <session-id> --archive [--owner-authorized-adopted] [--confirm <sha256>]`.
 fn run_cleanup_resolve(parsed: Parsed) -> Result<(), UsageError> {
-    let usage = "usage: aethyme broker finish cleanup resolve <session-id> --archive [--confirm <sha256>] [--json]";
+    let usage = "usage: aethyme broker finish cleanup resolve <session-id> --archive [--owner-authorized-adopted] [--confirm <sha256>] [--json]";
     let [_, id] = parsed.positional.as_slice() else {
         return Err(UsageError::Message(format!(
             "cleanup resolve takes exactly one session id; {usage}"
@@ -2044,7 +2044,11 @@ fn run_cleanup_resolve(parsed: Parsed) -> Result<(), UsageError> {
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     match parsed.confirm.as_deref() {
         None => {
-            let plan = broker.cleanup_resolve_plan(id)?;
+            let plan = if parsed.owner_authorized_adopted {
+                broker.cleanup_resolve_plan_owner_authorized_adopted(id)?
+            } else {
+                broker.cleanup_resolve_plan(id)?
+            };
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
@@ -2052,7 +2056,11 @@ fn run_cleanup_resolve(parsed: Parsed) -> Result<(), UsageError> {
             }
         }
         Some(confirm) => {
-            let outcome = broker.cleanup_resolve_apply(id, confirm)?;
+            let outcome = if parsed.owner_authorized_adopted {
+                broker.cleanup_resolve_apply_owner_authorized_adopted(id, confirm)?
+            } else {
+                broker.cleanup_resolve_apply(id, confirm)?
+            };
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&outcome)?);
             } else {
@@ -2117,7 +2125,11 @@ fn render_cleanup_resolve_plan(plan: &crate::CleanupResolvePlan) {
         plan.ignored_paths.len()
     );
     out!("  apply: {}", plan.apply_command);
-    out!("  discard instead: {}", plan.discard_command);
+    if plan.discard_command.is_empty() {
+        out!("  discard instead: unavailable for adopted recovery");
+    } else {
+        out!("  discard instead: {}", plan.discard_command);
+    }
 }
 
 /// `broker cleanup`.
