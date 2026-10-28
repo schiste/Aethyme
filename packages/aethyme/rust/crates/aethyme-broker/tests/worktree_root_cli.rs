@@ -1518,7 +1518,8 @@ fn synthetic_downgrade_plan_apply_preserves_existing_sessions_and_allows_start_a
         read_meta(&fixture.database, "schema_version"),
         aethyme_broker::BROKER_STORAGE_CURRENT_SCHEMA.to_string()
     );
-    assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "52");
+    // Migration fences pre-artifact-use writers independently of root binding.
+    assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "58");
     assert_eq!(
         read_meta(&fixture.database, "fixture.legacy-retained"),
         "kept"
@@ -1580,7 +1581,8 @@ fn synthetic_downgrade_plan_apply_preserves_existing_sessions_and_allows_start_a
         read_meta(&fixture.database, "schema_version"),
         aethyme_broker::BROKER_STORAGE_CURRENT_SCHEMA.to_string()
     );
-    assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "52");
+    // Migration fences pre-artifact-use writers independently of root binding.
+    assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "58");
     assert_eq!(session_rows(&fixture.database), session_rows_before);
 
     let apply_args = [
@@ -1604,7 +1606,8 @@ fn synthetic_downgrade_plan_apply_preserves_existing_sessions_and_allows_start_a
         read_meta(&fixture.database, "schema_version"),
         aethyme_broker::BROKER_STORAGE_CURRENT_SCHEMA.to_string()
     );
-    assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "54");
+    // Migration fences pre-artifact-use writers independently of root binding.
+    assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "58");
     assert_eq!(
         read_meta(&fixture.database, "fixture.legacy-retained"),
         "kept"
@@ -1770,7 +1773,8 @@ fn recovery_plan_inspects_incomplete_repository_uuid_marker_without_settling_it(
         "planning must not settle the marker prefix"
     );
     assert_eq!(std::fs::read(&temporary).unwrap(), expected_marker);
-    assert_eq!(read_meta(&database, "min_compatible_schema"), "54");
+    // Fresh staged storage has the protocol floor before recovery planning.
+    assert_eq!(read_meta(&database, "min_compatible_schema"), "58");
     let connection = rusqlite::Connection::open_with_flags(
         &database,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -1854,7 +1858,8 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
         read_meta(&fixture.database, "schema_version"),
         aethyme_broker::BROKER_STORAGE_CURRENT_SCHEMA.to_string()
     );
-    assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "52");
+    // Migration fences pre-artifact-use writers independently of root binding.
+    assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "58");
     assert!(has_table(&fixture.database, "repository_worktree_binding"));
     assert!(!fixture.repository_uuid_marker.exists());
     assert!(!fixture.preparation_cache.exists());
@@ -1893,7 +1898,8 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
         read_meta(&fixture.database, "schema_version"),
         aethyme_broker::BROKER_STORAGE_CURRENT_SCHEMA.to_string()
     );
-    assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "52");
+    // Migration fences pre-artifact-use writers independently of root binding.
+    assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "58");
     assert!(!fixture.repository_uuid_marker.exists());
     assert!(!fixture.preparation_cache.exists());
     assert_eq!(session_rows(&fixture.database), sessions_before);
@@ -1920,7 +1926,8 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
         read_meta(&fixture.database, "schema_version"),
         aethyme_broker::BROKER_STORAGE_CURRENT_SCHEMA.to_string()
     );
-    assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "54");
+    // Migration fences pre-artifact-use writers independently of root binding.
+    assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "58");
     assert!(fixture.repository_uuid_marker.is_file());
     assert!(!fixture.preparation_cache.exists());
     assert_eq!(session_rows(&fixture.database), sessions_before);

@@ -61,6 +61,12 @@ pub enum BrokerError {
     #[error("no session with id {0}")]
     SessionNotFound(i64),
 
+    #[error("session {0} is no longer open")]
+    SessionNotOpen(i64),
+
+    #[error("broker database is busy; session-retirement work was deferred")]
+    SessionRetirementDatabaseBusy,
+
     #[error(
         "GC retention candidate {kind} row {id} changed or is now protected; the pending batch stopped"
     )]

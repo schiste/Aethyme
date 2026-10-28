@@ -247,8 +247,9 @@ fn abandoning_an_adopted_session_releases_the_leases_it_was_holding() {
             .active_leases()
             .unwrap()
             .iter()
-            .any(|lease| lease.session_id == session.id),
-        "fixture must actually hold a lease, or the assertion below is vacuous"
+            .any(|lease| lease.session_id == session.id
+                && lease.kind == aethyme_broker::LeaseKind::Implicit),
+        "fixture must actually hold an implicit lease, or the assertion below is vacuous"
     );
 
     broker.agents(now_ms() + 100 * HOUR_MS).unwrap();
@@ -340,5 +341,44 @@ fn legacy_shared_daemon_binding_is_unknown_not_a_live_task_or_a_dead_holder() {
             .unwrap()
             .pid,
         5000
+    );
+}
+
+#[test]
+fn abandonment_keeps_an_explicit_claim_with_unknown_holder_liveness() {
+    let tmp = isolation::FixtureRepo::new();
+    fixture(tmp.path());
+    let mut broker = isolation::open(tmp.path());
+    let session = broker
+        .start_worktree("explicit claim fixture", None)
+        .unwrap();
+    let lease = broker
+        .store()
+        .claim_lease(session.id, "README.md", None)
+        .unwrap();
+    assert_eq!(lease.kind, aethyme_broker::LeaseKind::Explicit);
+
+    broker.agents(now_ms() + 100 * HOUR_MS).unwrap();
+
+    assert!(
+        !broker
+            .store()
+            .session(session.id)
+            .unwrap()
+            .status
+            .is_closed()
+    );
+    assert!(
+        broker
+            .store()
+            .active_leases()
+            .unwrap()
+            .iter()
+            .any(|current| current.id == lease.id)
+    );
+    assert!(
+        session_events(&mut broker, session.id)
+            .iter()
+            .all(|event| event.kind != "session.abandoned")
     );
 }

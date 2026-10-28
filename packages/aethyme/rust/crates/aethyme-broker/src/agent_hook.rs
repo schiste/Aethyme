@@ -207,7 +207,9 @@ fn decide(
         HookEvent::UserPromptSubmit => on_user_prompt_submit(&mut broker, session.as_ref()),
         HookEvent::PreToolUse => on_pre_tool_use(&mut broker, session.as_ref(), event_json),
         HookEvent::Stop => {
-            touch(&mut broker, session.as_ref());
+            if let Err(error) = touch(&mut broker, session.as_ref()) {
+                crate::warn_unrecorded::<(), _>("record stopped session activity", Err(error));
+            }
             HookOutcome::Silent
         }
         HookEvent::PostToolUse => HookOutcome::Silent,
@@ -284,19 +286,30 @@ fn current_session(broker: &mut Broker, cwd: &std::path::Path) -> Option<Session
 /// on its own: the telemetry tables must never be what makes a live session
 /// look abandoned.
 ///
-/// Failure is warned about and swallowed: a hook that could not record liveness
-/// must not stop the agent from working.
-fn touch(broker: &mut Broker, session: Option<&Session>) {
+/// Ordinary storage failures are warned about and swallowed: activity telemetry
+/// must not stop the agent from working. A missing or closed session is returned
+/// to admission hooks so they can refuse a new turn on a session that retired.
+fn touch(broker: &mut Broker, session: Option<&Session>) -> Result<(), crate::BrokerError> {
     let Some(session) = session else {
-        return;
+        return Ok(());
     };
     let now = now_ms();
-    if let Err(error) = broker.store().record_session_activity(session.id, now) {
-        crate::warn_unrecorded::<(), _>("record the session activity interval", Err(error));
-        crate::warn_unrecorded(
-            "record session activity",
-            broker.store().touch_session_activity(session.id, now),
-        );
+    match broker.store().record_session_activity(session.id, now) {
+        Ok(_) => Ok(()),
+        Err(error @ crate::BrokerError::SessionNotFound(_))
+        | Err(error @ crate::BrokerError::SessionNotOpen(_)) => Err(error),
+        Err(error) => {
+            crate::warn_unrecorded::<(), _>("record the session activity interval", Err(error));
+            match broker.store().touch_session_activity(session.id, now) {
+                Ok(()) => Ok(()),
+                Err(error @ crate::BrokerError::SessionNotFound(_))
+                | Err(error @ crate::BrokerError::SessionNotOpen(_)) => Err(error),
+                Err(error) => {
+                    crate::warn_unrecorded::<(), _>("record session activity", Err(error));
+                    Ok(())
+                }
+            }
+        }
     }
 }
 
@@ -340,8 +353,6 @@ fn on_session_start(
         };
         return HookOutcome::Context(render_start(&facts));
     };
-    touch(broker, Some(session));
-
     if session.status.is_closed() {
         let facts = StartFacts {
             checkout: cwd.display().to_string(),
@@ -354,6 +365,13 @@ fn on_session_start(
             ..StartFacts::default()
         };
         return HookOutcome::Context(render_start(&facts));
+    }
+
+    if touch(broker, Some(session)).is_err() {
+        return HookOutcome::Deny(format!(
+            "Aethyme: session {} was closed before this turn began. Start or adopt a fresh session before editing.",
+            session.id
+        ));
     }
 
     let peers = live_peers(broker, session.id);
@@ -684,7 +702,12 @@ fn on_user_prompt_submit(broker: &mut Broker, session: Option<&Session>) -> Hook
     let Some(session) = session else {
         return HookOutcome::Silent;
     };
-    touch(broker, Some(session));
+    if touch(broker, Some(session)).is_err() {
+        return HookOutcome::Deny(format!(
+            "Aethyme: session {} was closed before this turn began. Start or adopt a fresh session before editing.",
+            session.id
+        ));
+    }
     deliver_notes(broker, session)
 }
 

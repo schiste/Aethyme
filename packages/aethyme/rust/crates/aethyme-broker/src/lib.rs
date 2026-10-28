@@ -255,7 +255,7 @@ pub use aethyme_graph_storage::{
 pub use attribution::{Attribution, Identity};
 pub use auto_cleanup::{
     AutoCleanupPlan, AutoCleanupPolicy, AutoCleanupReport, AutoKeptCheckout, AutoRemovedCheckout,
-    BUILT_IN_REGENERABLE,
+    BUILT_IN_REGENERABLE, SessionRetirementDeferredReason,
 };
 pub use blockers::{
     BLOCKER_CLEARED, Blocker, BlockerKind, BlockerRef, BlockerReport, BlockerScope,

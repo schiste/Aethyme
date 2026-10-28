@@ -20,9 +20,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-const PROCESS_TABLE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const PROCESS_TABLE_TIMEOUT: Duration = Duration::from_secs(2);
 const PROCESS_TABLE_STREAM_LIMIT: usize = 4 * 1024 * 1024;
 
 /// Environment override for the caller's agent process: a pid, or `0`/`none`
@@ -282,6 +282,142 @@ pub enum HolderCheck {
     Unidentified,
 }
 
+/// Whether a PID-less session's recorded task holder is still the same
+/// process. Missing and shared-service holders provide no task-specific
+/// liveness evidence; incomplete observations remain unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordedHolderLiveness {
+    Unbound,
+    Alive,
+    Gone,
+    Unknown,
+}
+
+/// The process snapshot is valid only for the holder event it observed.
+/// Holder events are append-only identities, so a rebind forces a fresh
+/// snapshot instead of reusing a process table captured for another owner.
+#[derive(Default)]
+pub(crate) struct RecordedHolderProcessTable {
+    prefetched_event_ids: HashMap<i64, i64>,
+    observed_event_ids: HashMap<i64, i64>,
+    snapshot: Option<Option<ProcessTable>>,
+}
+
+impl RecordedHolderProcessTable {
+    /// Prime the bounded session IDs before the single process-table
+    /// snapshot. A fresh holder event discovered later is checked with a new
+    /// snapshot, never borrowed from a different binding.
+    pub(crate) fn prime(
+        &mut self,
+        store: &crate::BrokerStore,
+        session_ids: &[i64],
+        deadline: Option<Instant>,
+    ) {
+        for session_id in session_ids {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                break;
+            }
+            if let Ok(Some(event)) = store.latest_session_holder_event(*session_id) {
+                self.prefetched_event_ids.insert(*session_id, event.id);
+            }
+        }
+    }
+
+    fn get_or_snapshot(
+        &mut self,
+        session_id: i64,
+        event_id: i64,
+        allow_snapshot: bool,
+    ) -> Option<&ProcessTable> {
+        if self.snapshot.is_none() {
+            if !allow_snapshot {
+                return None;
+            }
+            self.snapshot = Some(ProcessTable::snapshot());
+            self.observed_event_ids.extend(
+                self.prefetched_event_ids
+                    .iter()
+                    .map(|(id, event)| (*id, *event)),
+            );
+        }
+        if self.observed_event_ids.get(&session_id) != Some(&event_id) {
+            if !allow_snapshot {
+                return None;
+            }
+            self.snapshot = Some(ProcessTable::snapshot());
+            self.observed_event_ids.insert(session_id, event_id);
+        }
+        self.snapshot.as_ref().and_then(Option::as_ref)
+    }
+
+    pub(crate) fn table_for(&self, session_id: i64, event_id: i64) -> Option<&ProcessTable> {
+        (self.observed_event_ids.get(&session_id) == Some(&event_id))
+            .then(|| self.snapshot.as_ref().and_then(Option::as_ref))
+            .flatten()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecordedHolderAssessment {
+    pub binding_event_id: Option<i64>,
+    pub liveness: RecordedHolderLiveness,
+}
+
+/// Observe the latest recorded holder, lazily sharing one bounded process
+/// table snapshot across all sessions in a caller's pass. `allow_snapshot`
+/// lets a deadline-bound caller decline a new 2-second process-table read
+/// when the pass cannot afford it; that session then remains protected.
+pub(crate) fn recorded_holder_liveness(
+    store: &crate::BrokerStore,
+    session_id: i64,
+    process_table: &mut RecordedHolderProcessTable,
+    allow_snapshot: bool,
+) -> RecordedHolderAssessment {
+    let event = match store.latest_session_holder_event(session_id) {
+        Ok(Some(event)) => event,
+        Ok(None) => {
+            return RecordedHolderAssessment {
+                binding_event_id: None,
+                liveness: RecordedHolderLiveness::Unbound,
+            };
+        }
+        Err(_) => {
+            return RecordedHolderAssessment {
+                binding_event_id: None,
+                liveness: RecordedHolderLiveness::Unknown,
+            };
+        }
+    };
+    let binding_event_id = Some(event.id);
+    let Some(payload) = event.payload_json.as_deref() else {
+        return RecordedHolderAssessment {
+            binding_event_id,
+            liveness: RecordedHolderLiveness::Unknown,
+        };
+    };
+    let Ok(holder) = serde_json::from_str::<AgentProcess>(payload) else {
+        return RecordedHolderAssessment {
+            binding_event_id,
+            liveness: RecordedHolderLiveness::Unknown,
+        };
+    };
+    if is_shared_agent_service(&holder.command) {
+        return RecordedHolderAssessment {
+            binding_event_id,
+            liveness: RecordedHolderLiveness::Unbound,
+        };
+    }
+    let liveness = match process_table.get_or_snapshot(session_id, event.id, allow_snapshot) {
+        Some(table) if table.is_alive(&holder) => RecordedHolderLiveness::Alive,
+        Some(_) => RecordedHolderLiveness::Gone,
+        None => RecordedHolderLiveness::Unknown,
+    };
+    RecordedHolderAssessment {
+        binding_event_id,
+        liveness,
+    }
+}
+
 /// A compact process identity for local operation history; never the full command line.
 fn operation_agent_identity(process: &AgentProcess) -> serde_json::Value {
     let program = process
@@ -421,10 +557,10 @@ pub fn admit(
     if &holder == agent {
         return Ok(HolderCheck::Held);
     }
-    let shared_service = is_shared_agent_service(&holder.command);
-    let why = if shared_service && take_over {
-        reason::TAKE_OVER
-    } else if !shared_service && !table.is_alive(&holder) {
+    // Command class does not override process identity: a shared app-server
+    // that is still the recorded process requires explicit takeover, while
+    // one whose PID/start pair is gone may be replaced like any dead holder.
+    let why = if !table.is_alive(&holder) {
         reason::HOLDER_GONE
     } else if take_over {
         reason::TAKE_OVER
@@ -838,6 +974,145 @@ mod tests {
         assert!(is_agent_runtime("claude app-server"));
     }
 
+    fn register_holder_test_session(store: &mut crate::BrokerStore) -> i64 {
+        store
+            .register_session(&crate::NewSession {
+                worktree_path: "/tmp/holder-admission-fixture".into(),
+                branch: "agent/holder-admission-fixture".into(),
+                origin: crate::SessionOrigin::Adopted,
+                task: Some("holder admission fixture".into()),
+                diff_base: None,
+                adoption_base: None,
+                adopted_head: None,
+                repository_contract: None,
+                pid: None,
+                command: None,
+                log_path: None,
+                agent_identity: None,
+            })
+            .unwrap()
+            .id
+    }
+
+    fn bind_test_holder(store: &mut crate::BrokerStore, session_id: i64, holder: &AgentProcess) {
+        store
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session_id),
+                Some(&crate::events::session_holder_bound_payload(
+                    holder,
+                    reason::REGISTERED,
+                    None,
+                )),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn dead_shared_app_server_holder_is_rebound_without_takeover() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = crate::BrokerStore::open(&temporary.path().join("broker.db")).unwrap();
+        let session_id = register_holder_test_session(&mut store);
+        let table = ProcessTable::parse("5000 1 Fri Oct 23 09:01:00 2026 /opt/codex exec task\n");
+        let holder = AgentProcess {
+            pid: 3731,
+            started: "Fri Oct 23 08:42:41 2026".into(),
+            command: "/opt/codex app-server --listen local --managed-daemon".into(),
+        };
+        let caller_process = AgentProcess {
+            pid: 5000,
+            started: "Fri Oct 23 09:01:00 2026".into(),
+            command: "/opt/codex exec task".into(),
+        };
+        let caller = Caller::Agent(caller_process.clone());
+        bind_test_holder(&mut store, session_id, &holder);
+
+        assert_eq!(
+            admit(&mut store, session_id, &caller, &table, false).unwrap(),
+            HolderCheck::Bound {
+                reason: reason::HOLDER_GONE,
+            },
+            "a dead shared service is no longer a live holder"
+        );
+        assert_eq!(
+            recorded_holder(&store, session_id).unwrap(),
+            Some(caller_process)
+        );
+    }
+
+    #[test]
+    fn live_shared_app_server_holder_still_requires_explicit_takeover() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = crate::BrokerStore::open(&temporary.path().join("broker.db")).unwrap();
+        let session_id = register_holder_test_session(&mut store);
+        let table = ProcessTable::parse(
+            "3731 1 Fri Oct 23 08:42:41 2026 /opt/codex app-server --listen local --managed-daemon\n\
+             5000 1 Fri Oct 23 09:01:00 2026 /opt/codex exec task\n",
+        );
+        let holder = table.process(3731).unwrap();
+        let caller = Caller::Agent(table.process(5000).unwrap());
+        bind_test_holder(&mut store, session_id, &holder);
+
+        assert!(matches!(
+            admit(&mut store, session_id, &caller, &table, false),
+            Err(crate::BrokerOpError::SessionHeldByAnotherAgent { .. })
+        ));
+        assert_eq!(recorded_holder(&store, session_id).unwrap(), Some(holder));
+        assert_eq!(
+            admit(&mut store, session_id, &caller, &table, true).unwrap(),
+            HolderCheck::Bound {
+                reason: reason::TAKE_OVER,
+            }
+        );
+    }
+
+    #[test]
+    fn recycled_shared_app_server_pid_is_gone_when_start_time_differs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = crate::BrokerStore::open(&temporary.path().join("broker.db")).unwrap();
+        let session_id = register_holder_test_session(&mut store);
+        let table = ProcessTable::parse(
+            "3731 1 Sat Oct 24 08:42:41 2026 /opt/codex app-server --listen local --managed-daemon\n\
+             5000 1 Fri Oct 23 09:01:00 2026 /opt/codex exec task\n",
+        );
+        let holder = AgentProcess {
+            pid: 3731,
+            started: "Fri Oct 23 08:42:41 2026".into(),
+            command: "/opt/codex app-server --listen local --managed-daemon".into(),
+        };
+        let caller = Caller::Agent(table.process(5000).unwrap());
+        bind_test_holder(&mut store, session_id, &holder);
+
+        assert!(
+            !table.is_alive(&holder),
+            "the PID now names another process"
+        );
+        assert_eq!(
+            admit(&mut store, session_id, &caller, &table, false).unwrap(),
+            HolderCheck::Bound {
+                reason: reason::HOLDER_GONE,
+            }
+        );
+    }
+
+    #[test]
+    fn unidentified_caller_does_not_transfer_a_shared_holder() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = crate::BrokerStore::open(&temporary.path().join("broker.db")).unwrap();
+        let session_id = register_holder_test_session(&mut store);
+        let table = ProcessTable::parse(
+            "3731 1 Fri Oct 23 08:42:41 2026 /opt/codex app-server --listen local --managed-daemon\n",
+        );
+        let holder = table.process(3731).unwrap();
+        bind_test_holder(&mut store, session_id, &holder);
+
+        assert_eq!(
+            admit(&mut store, session_id, &Caller::Unidentified, &table, true).unwrap(),
+            HolderCheck::Unidentified
+        );
+        assert_eq!(recorded_holder(&store, session_id).unwrap(), Some(holder));
+    }
+
     #[test]
     fn only_agents_other_than_the_holder_are_foreign() {
         let table = ProcessTable::parse(TABLE);
@@ -865,5 +1140,120 @@ mod tests {
         assert_eq!(find_foreign(&table, &cwds, &unheld)[0].foreign.len(), 2);
         let alone = vec![(7, "/wt/a".to_string(), None)];
         assert!(find_foreign(&table, &cwds[..1], &alone).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_holder_requires_complete_exact_identity_evidence() {
+        let owner = tempfile::tempdir().unwrap();
+        let root = owner.path().join("repository");
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "Holder test"],
+            vec!["config", "user.email", "holder@example.invalid"],
+            vec!["commit", "--allow-empty", "-qm", "fixture"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let session = broker
+            .start_worktree("recorded holder fixture", None)
+            .unwrap();
+
+        let mut no_holder = RecordedHolderProcessTable::default();
+        let unbound = recorded_holder_liveness(broker.store(), session.id, &mut no_holder, false);
+        assert_eq!(
+            unbound.liveness,
+            RecordedHolderLiveness::Unbound,
+            "sessions without a task-specific holder retain the existing age policy"
+        );
+        assert_eq!(unbound.binding_event_id, None);
+
+        let table = ProcessTable::parse(TABLE);
+        let holder = table.process(1977).unwrap();
+        let holder_json = serde_json::to_string(&holder).unwrap();
+        broker
+            .store()
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session.id),
+                Some(&holder_json),
+            )
+            .unwrap();
+        let holder_event_id = broker
+            .store()
+            .latest_session_holder_event(session.id)
+            .unwrap()
+            .unwrap()
+            .id;
+
+        let mut unavailable = RecordedHolderProcessTable::default();
+        assert_eq!(
+            recorded_holder_liveness(broker.store(), session.id, &mut unavailable, false).liveness,
+            RecordedHolderLiveness::Unknown,
+            "a deadline that cannot afford a complete process snapshot protects the row"
+        );
+        let mut matching = RecordedHolderProcessTable {
+            prefetched_event_ids: HashMap::from([(session.id, holder_event_id)]),
+            observed_event_ids: HashMap::from([(session.id, holder_event_id)]),
+            snapshot: Some(Some(table)),
+        };
+        assert_eq!(
+            recorded_holder_liveness(broker.store(), session.id, &mut matching, true).liveness,
+            RecordedHolderLiveness::Alive
+        );
+        let mut missing = RecordedHolderProcessTable {
+            prefetched_event_ids: HashMap::from([(session.id, holder_event_id)]),
+            observed_event_ids: HashMap::from([(session.id, holder_event_id)]),
+            snapshot: Some(Some(ProcessTable::parse(""))),
+        };
+        assert_eq!(
+            recorded_holder_liveness(broker.store(), session.id, &mut missing, true).liveness,
+            RecordedHolderLiveness::Gone,
+            "a complete snapshot missing the exact pid/start identity proves it gone"
+        );
+
+        let reassigned = AgentProcess {
+            pid: holder.pid + 1,
+            started: holder.started.clone(),
+            command: holder.command.clone(),
+        };
+        broker
+            .store()
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session.id),
+                Some(&serde_json::to_string(&reassigned).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded_holder_liveness(broker.store(), session.id, &mut matching, false).liveness,
+            RecordedHolderLiveness::Unknown,
+            "a process snapshot for a previous holder binding cannot prove a rebound owner gone"
+        );
+
+        broker
+            .store()
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session.id),
+                Some("not-json"),
+            )
+            .unwrap();
+        let mut no_snapshot = RecordedHolderProcessTable::default();
+        assert_eq!(
+            recorded_holder_liveness(broker.store(), session.id, &mut no_snapshot, false).liveness,
+            RecordedHolderLiveness::Unknown,
+            "malformed holder records do not become age-only cleanup authority"
+        );
     }
 }
