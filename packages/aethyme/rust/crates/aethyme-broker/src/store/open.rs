@@ -63,6 +63,18 @@ fn canonical_main_root(repo_root: &Path) -> Result<PathBuf, BrokerError> {
     })
 }
 
+fn session_abandonment_snapshot_matches(expected: &Session, current: &Session) -> bool {
+    expected.id == current.id
+        && expected.cleanup_state == crate::SessionCleanupState::Open
+        && current.cleanup_state == crate::SessionCleanupState::Open
+        && expected.status == current.status
+        && expected.created_at == current.created_at
+        && expected.updated_at == current.updated_at
+        && expected.last_activity_at == current.last_activity_at
+        && expected.pid == current.pid
+        && expected.worktree_path == current.worktree_path
+}
+
 impl BrokerStore {
     /// A controller may outlive a compatible open and then wait behind an
     /// upgrade. Re-read compatibility before changing checkout ownership.
@@ -675,7 +687,8 @@ impl BrokerStore {
                                                  ELSE tab_name END,
                                  ai_provider = COALESCE(?7, ai_provider),
                                  short_name = COALESCE(?8, short_name),
-                                 status = 'active', last_activity_at = ?9, updated_at = ?9
+                                 status = 'active', last_activity_at = ?9,
+                                 updated_at = MAX(updated_at + 1, ?9)
              WHERE id = ?1 AND status != 'cleaned'",
             params![
                 id,
@@ -846,6 +859,43 @@ impl BrokerStore {
         Ok(sessions)
     }
 
+    /// Highest open-session identity for bounded abandonment maintenance.
+    /// The fixed high-water mark lets the caller finish a finite lap even as
+    /// new sessions are inserted.
+    pub(crate) fn open_session_max_id(&self) -> Result<i64, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM sessions WHERE cleanup_state = 'open'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(BrokerError::from)
+    }
+
+    /// Read one bounded open-session page for abandonment maintenance. The
+    /// limit is capped so callers cannot accidentally turn this into a full
+    /// inventory scan.
+    pub(crate) fn open_session_page(
+        &self,
+        after: i64,
+        through: i64,
+        limit: usize,
+    ) -> Result<Vec<Session>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SESSION_SELECT} WHERE cleanup_state = 'open' AND id > ?1 AND id <= ?2
+             ORDER BY id LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(
+            params![after, through, limit.clamp(1, 128) as i64],
+            session_from_row,
+        )?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row??);
+        }
+        Ok(sessions)
+    }
+
     /// All sessions already closed in broker state, oldest first.
     ///
     /// Cleanup planning uses this separate query so normal live-session
@@ -950,11 +1000,22 @@ impl BrokerStore {
 
     pub fn touch_session_activity(&mut self, id: i64, at_ms: i64) -> Result<(), BrokerError> {
         let changed = self.conn.execute(
-            "UPDATE sessions SET last_activity_at = ?2, updated_at = ?3 WHERE id = ?1",
+            "UPDATE sessions SET last_activity_at = ?2,
+                                 updated_at = MAX(updated_at + 1, ?3)
+             WHERE id = ?1 AND cleanup_state = 'open' AND status != 'cleaned'",
             params![id, at_ms, now_ms()],
         )?;
         if changed == 0 {
-            return Err(BrokerError::SessionNotFound(id));
+            let exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+                [id],
+                |row| row.get(0),
+            )?;
+            return Err(if exists {
+                BrokerError::SessionNotOpen(id)
+            } else {
+                BrokerError::SessionNotFound(id)
+            });
         }
         Ok(())
     }
@@ -1030,6 +1091,142 @@ impl BrokerStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Close an abandoned session only if the evidence observed before the
+    /// lifecycle claim is still current. The immediate transaction makes the
+    /// session, holder event, and active lease comparisons atomic with the
+    /// terminal event/status writes.
+    pub(crate) fn abandon_session_if_unchanged(
+        &mut self,
+        expected_session: &Session,
+        expected_holder_event_id: Option<i64>,
+        expected_active_leases: &[Lease],
+        observed_at_ms: i64,
+        abandoned_payload: &str,
+    ) -> Result<bool, BrokerError> {
+        // Do not let a held SQLite writer lock stall an unattended maintenance
+        // pass while it owns the repository lifecycle claim. This short CAS is
+        // attempted once; the caller records a typed deferral and the durable
+        // cursor can retry on its next lap.
+        self.conn.busy_timeout(std::time::Duration::ZERO)?;
+        let transition = (|| {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let Some(current) = tx
+                .query_row(
+                    &format!("{SESSION_SELECT} WHERE id = ?1"),
+                    [expected_session.id],
+                    session_from_row,
+                )
+                .optional()?
+            else {
+                return Ok(false);
+            };
+            if !session_abandonment_snapshot_matches(expected_session, &current) {
+                return Ok(false);
+            }
+
+            let current_holder_event_id: Option<i64> = tx.query_row(
+                "SELECT MAX(id) FROM events WHERE session_id = ?1 AND kind = ?2",
+                params![expected_session.id, crate::events::SESSION_HOLDER_BOUND],
+                |row| row.get(0),
+            )?;
+            if current_holder_event_id != expected_holder_event_id {
+                return Ok(false);
+            }
+
+            let current_active_leases = {
+                let mut stmt = tx.prepare(&format!(
+                    "{LEASE_SELECT} WHERE session_id = ?1
+                       AND released_at IS NULL
+                       AND (expires_at IS NULL OR expires_at > ?2)
+                     ORDER BY id"
+                ))?;
+                let rows = stmt.query_map(
+                    params![expected_session.id, observed_at_ms],
+                    lease_from_row,
+                )?;
+                let mut leases = Vec::new();
+                for row in rows {
+                    leases.push(row??);
+                }
+                leases
+            };
+            if current_active_leases != expected_active_leases {
+                return Ok(false);
+            }
+
+            let closed_at = now_ms();
+            let changed = tx.execute(
+                "UPDATE sessions
+                 SET status = 'cleaned', cleanup_state = 'closed',
+                     closed_at = COALESCE(closed_at, ?2),
+                     cleanup_completed_at = NULL, updated_at = ?2
+                 WHERE id = ?1 AND status = ?3 AND cleanup_state = 'open'
+                   AND created_at = ?4 AND updated_at = ?5 AND last_activity_at = ?6
+                   AND pid IS ?7 AND worktree_path = ?8",
+                params![
+                    expected_session.id,
+                    closed_at,
+                    expected_session.status.as_str(),
+                    expected_session.created_at,
+                    expected_session.updated_at,
+                    expected_session.last_activity_at,
+                    expected_session.pid,
+                    expected_session.worktree_path,
+                ],
+            )?;
+            if changed != 1 {
+                return Ok(false);
+            }
+
+            insert_event(
+                &tx,
+                closed_at,
+                "session.abandoned",
+                Some(expected_session.id),
+                Some(abandoned_payload),
+            )?;
+            close_open_activity_in_tx(&tx, expected_session.id, closed_at)?;
+            delete_session_base_observation(&tx, expected_session.id)?;
+            release_checkpoint_pin_in_tx(&tx, expected_session.id, closed_at)?;
+            tx.execute(
+                "DELETE FROM leases WHERE session_id = ?1",
+                [expected_session.id],
+            )?;
+            tx.execute(
+                "DELETE FROM session_foreign_files WHERE session_id = ?1",
+                [expected_session.id],
+            )?;
+            insert_event(
+                &tx,
+                closed_at,
+                "session.cleaned",
+                Some(expected_session.id),
+                None,
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })();
+        let transition = match transition {
+            Err(BrokerError::Sqlite(error))
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(
+                        rusqlite::ErrorCode::DatabaseBusy
+                            | rusqlite::ErrorCode::DatabaseLocked
+                    )
+                ) =>
+            {
+                Err(BrokerError::SessionRetirementDatabaseBusy)
+            }
+            transition => transition,
+        };
+        self.conn
+            .busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        transition
     }
 
     /// Atomically close a successfully finished session and persist its
@@ -2102,5 +2299,135 @@ mod graph_fence_tests {
         assert!(BrokerStore::open_repository_path(&root, &database).is_err());
         assert!(!database.exists());
         assert!(!database.parent().unwrap().exists());
+    }
+}
+
+#[cfg(test)]
+mod abandoned_close_cas_tests {
+    use super::*;
+
+    fn store_with_session() -> (tempfile::TempDir, BrokerStore, Session) {
+        let owner = tempfile::tempdir().unwrap();
+        let root = owner.path().join("repository");
+        std::fs::create_dir_all(&root).unwrap();
+        let output = std::process::Command::new("git")
+            .args(["init", "--quiet", "-b", "main"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut store = BrokerStore::open_in_repo(&root).unwrap();
+        let session = store
+            .register_session(&NewSession {
+                worktree_path: root.join("missing-worktree").to_string_lossy().into_owned(),
+                branch: "agent/abandonment-cas".into(),
+                origin: SessionOrigin::Adopted,
+                task: Some("abandonment CAS fixture".into()),
+                diff_base: None,
+                adoption_base: None,
+                adopted_head: None,
+                repository_contract: None,
+                pid: None,
+                command: None,
+                log_path: None,
+                agent_identity: None,
+            })
+            .unwrap();
+        (owner, store, session)
+    }
+
+    fn assert_unclosed_without_abandoned_event(store: &BrokerStore, session_id: i64) {
+        assert_eq!(
+            store.session(session_id).unwrap().cleanup_state,
+            SessionCleanupState::Open
+        );
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE session_id = ?1 AND kind = 'session.abandoned'",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn abandoned_close_cas_rejects_same_timestamp_activity_refresh() {
+        let (_owner, mut store, observed) = store_with_session();
+        store
+            .touch_session_activity(observed.id, observed.last_activity_at)
+            .unwrap();
+        let refreshed = store.session(observed.id).unwrap();
+        assert!(refreshed.updated_at > observed.updated_at);
+
+        assert!(!store
+            .abandon_session_if_unchanged(
+                &observed,
+                None,
+                &[],
+                now_ms(),
+                "{}",
+            )
+            .unwrap());
+        assert_unclosed_without_abandoned_event(&store, observed.id);
+    }
+
+    #[test]
+    fn abandoned_close_cas_rejects_intervening_holder_rebind() {
+        let (_owner, mut store, observed) = store_with_session();
+        store
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(observed.id),
+                Some("{}"),
+            )
+            .unwrap();
+
+        assert!(!store
+            .abandon_session_if_unchanged(
+                &observed,
+                None,
+                &[],
+                now_ms(),
+                "{}",
+            )
+            .unwrap());
+        assert_unclosed_without_abandoned_event(&store, observed.id);
+    }
+
+    #[test]
+    fn abandoned_close_cas_defers_without_waiting_on_another_database_writer() {
+        let (_owner, mut store, observed) = store_with_session();
+        let writer = rusqlite::Connection::open(&store.path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        let started = std::time::Instant::now();
+        let result = store.abandon_session_if_unchanged(
+            &observed,
+            None,
+            &[],
+            now_ms(),
+            "{}",
+        );
+        assert!(matches!(
+            result,
+            Err(BrokerError::SessionRetirementDatabaseBusy)
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "a held database writer must defer instead of blocking the maintenance pass"
+        );
+        let restored_timeout_ms: i64 = store
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(restored_timeout_ms, BUSY_TIMEOUT_MS as i64);
+        assert_unclosed_without_abandoned_event(&store, observed.id);
     }
 }

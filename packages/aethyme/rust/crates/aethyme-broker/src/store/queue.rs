@@ -234,6 +234,19 @@ impl BrokerStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session_state: Option<(String, String)> = tx
+            .query_row(
+            "SELECT status, cleanup_state FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+        let Some((status, cleanup_state)) = session_state else {
+            return Err(BrokerError::SessionNotFound(session_id));
+        };
+        if cleanup_state != "open" || status == "cleaned" {
+            return Err(BrokerError::SessionNotOpen(session_id));
+        }
         let open: Option<(i64, i64)> = tx
             .query_row(
                 "SELECT id, last_signal_at FROM session_activity
@@ -285,7 +298,8 @@ impl BrokerStore {
         // them in one transaction is what stops `last_activity_at` from
         // disagreeing with the history it summarizes.
         tx.execute(
-            "UPDATE sessions SET last_activity_at = MAX(last_activity_at, ?2), updated_at = ?3
+            "UPDATE sessions SET last_activity_at = MAX(last_activity_at, ?2),
+                                 updated_at = MAX(updated_at + 1, ?3)
              WHERE id = ?1",
             params![session_id, at_ms, now],
         )?;
@@ -1293,7 +1307,7 @@ impl BrokerStore {
         let updated = tx.execute(
             "UPDATE sessions
              SET accepted_session_head = ?2, diff_base = ?2,
-                 updated_at = ?3, last_activity_at = ?3
+                 updated_at = MAX(updated_at + 1, ?3), last_activity_at = ?3
              WHERE id = ?1 AND accepted_session_head = ?4",
             params![session_id, new_checkpoint, now, expected_old],
         )?;

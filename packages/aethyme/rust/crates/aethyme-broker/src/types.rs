@@ -607,7 +607,7 @@ pub struct SessionScope {
     pub released_at: Option<i64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lease {
     pub id: i64,
     pub session_id: i64,

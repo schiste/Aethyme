@@ -175,6 +175,20 @@ enum WorktreeDirectoryScan {
     DeadlineReached,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AbandonedSessionCloseOutcome {
+    Closed,
+    NotDue,
+    Changed,
+    ActiveProcess,
+    HolderUnavailable,
+    LeaseHeld,
+    LeaseUnavailable,
+    WorktreeActivityUnavailable,
+    LifecycleBusy,
+    DatabaseBusy,
+}
+
 fn collect_worktree_directory_entries<I>(
     entries: I,
     observed: &mut Vec<crate::worktree_reconcile::ObservedDirectory>,
@@ -363,6 +377,27 @@ impl Broker {
         let sessions = self.store.live_sessions()?;
         let abandon_after_ms = self.abandonment_window_ms();
         let mut views = Vec::with_capacity(sessions.len());
+        let mut holder_process_table = crate::session_holder::RecordedHolderProcessTable::default();
+        let retirement_candidates = sessions
+            .iter()
+            .filter(|session| {
+                !session.status.is_closed()
+                    && crate::decide_abandonment(
+                        &SessionActivity {
+                            session_id: session.id,
+                            last_activity_at: session.last_activity_at,
+                            created_at: session.created_at,
+                            agent_alive: None,
+                            closed: false,
+                        },
+                        now_ms,
+                        abandon_after_ms,
+                    )
+                    .is_abandoned()
+            })
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        holder_process_table.prime(self.store_ref(), &retirement_candidates, None);
         for session in sessions {
             let fs_activity = worktree_activity_ms(&self.main_root, &session);
             let activity_at = fs_activity.unwrap_or(0).max(session.last_activity_at);
@@ -403,30 +438,16 @@ impl Broker {
             // worktree a cleanup *candidate*, which `cleanup_item` then judges
             // on its own merits. Candidacy is granted; eligibility is earned.
             if !derived_status.is_closed() {
-                let activity = SessionActivity {
-                    session_id: session.id,
-                    last_activity_at: activity_at,
-                    created_at: session.created_at,
-                    agent_alive: pid_alive,
-                    closed: false,
-                };
-                if let AbandonmentVerdict::Abandoned { idle_ms } =
-                    decide_abandonment(&activity, now_ms, abandon_after_ms)
-                {
-                    self.store.append_event(
-                        "session.abandoned",
-                        Some(session.id),
-                        Some(&format!(
-                            r#"{{"idle_ms":{idle_ms},"abandon_after_ms":{abandon_after_ms},"pid_alive":{}}}"#,
-                            match pid_alive {
-                                Some(true) => "true",
-                                Some(false) => "false",
-                                None => "null",
-                            }
-                        )),
-                    )?;
-                    self.store
-                        .set_session_status(session.id, SessionStatus::Closed, None)?;
+                if matches!(
+                    self.try_close_abandoned_session(
+                        session.id,
+                        now_ms,
+                        abandon_after_ms,
+                        &mut holder_process_table,
+                        true,
+                    )?,
+                    AbandonedSessionCloseOutcome::Closed
+                ) {
                     derived_status = SessionStatus::Closed;
                 }
             }
@@ -558,6 +579,179 @@ impl Broker {
         crate::load_retention_policy(&self.main_root)
             .map(|policy| i64::from(policy.session_abandoned_after_hours) * 3_600_000)
             .unwrap_or(0)
+    }
+
+    /// Close one age-eligible session only after fresh lifecycle, activity,
+    /// owner, and lease checks. The process snapshot is captured before the
+    /// nonblocking lifecycle claim; its holder-event identity is then checked
+    /// again under the claim and in the store transaction.
+    pub(crate) fn try_close_abandoned_session(
+        &mut self,
+        session_id: i64,
+        decision_now_ms: i64,
+        abandon_after_ms: i64,
+        process_table: &mut crate::session_holder::RecordedHolderProcessTable,
+        allow_process_snapshot: bool,
+    ) -> Result<AbandonedSessionCloseOutcome, BrokerOpError> {
+        if abandon_after_ms <= 0 {
+            return Ok(AbandonedSessionCloseOutcome::NotDue);
+        }
+        let candidate = match self.store_ref().session(session_id) {
+            Ok(session) => session,
+            Err(BrokerError::SessionNotFound(_)) => {
+                return Ok(AbandonedSessionCloseOutcome::Changed);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if candidate.cleanup_state != crate::SessionCleanupState::Open
+            || candidate.status.is_closed()
+        {
+            return Ok(AbandonedSessionCloseOutcome::Changed);
+        }
+        if candidate.pid.is_some_and(crate::broker::session_pid_alive) {
+            return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+        }
+        let fs_activity = match checked_worktree_activity_ms(self.main_root(), &candidate) {
+            Ok(activity) => activity.unwrap_or(0),
+            Err(_) => return Ok(AbandonedSessionCloseOutcome::WorktreeActivityUnavailable),
+        };
+        let database_activity = fs_activity.max(candidate.last_activity_at);
+        if !matches!(
+            crate::decide_abandonment(
+            &SessionActivity {
+                session_id,
+                last_activity_at: database_activity,
+                created_at: candidate.created_at,
+                agent_alive: None,
+                closed: false,
+            },
+            decision_now_ms,
+            abandon_after_ms,
+            ),
+            crate::AbandonmentVerdict::Abandoned { .. }
+        ) {
+            return Ok(AbandonedSessionCloseOutcome::NotDue);
+        }
+
+        let holder = crate::session_holder::recorded_holder_liveness(
+            self.store_ref(),
+            session_id,
+            process_table,
+            allow_process_snapshot,
+        );
+        match holder.liveness {
+            crate::session_holder::RecordedHolderLiveness::Unknown => {
+                return Ok(AbandonedSessionCloseOutcome::HolderUnavailable);
+            }
+            crate::session_holder::RecordedHolderLiveness::Alive => {
+                return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+            }
+            crate::session_holder::RecordedHolderLiveness::Gone
+            | crate::session_holder::RecordedHolderLiveness::Unbound => {}
+        }
+        if candidate.pid.is_some_and(crate::broker::session_pid_alive) {
+            return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+        }
+
+        // A maintenance pass must keep moving when another lifecycle operation
+        // is active; status callers also leave the row open and retry later.
+        let Some(_lifecycle_claim) = self.try_claim_worktree_lifecycle()? else {
+            return Ok(AbandonedSessionCloseOutcome::LifecycleBusy);
+        };
+
+        let current = match self.store_ref().session(session_id) {
+            Ok(session) => session,
+            Err(BrokerError::SessionNotFound(_)) => {
+                return Ok(AbandonedSessionCloseOutcome::Changed);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if current.cleanup_state != crate::SessionCleanupState::Open || current.status.is_closed() {
+            return Ok(AbandonedSessionCloseOutcome::Changed);
+        }
+        let fs_activity = match checked_worktree_activity_ms(self.main_root(), &current) {
+            Ok(activity) => activity.unwrap_or(0),
+            Err(_) => return Ok(AbandonedSessionCloseOutcome::WorktreeActivityUnavailable),
+        };
+        let activity_at = fs_activity.max(current.last_activity_at);
+        let observed_at = decision_now_ms;
+        let crate::AbandonmentVerdict::Abandoned { idle_ms } = crate::decide_abandonment(
+            &SessionActivity {
+                session_id,
+                last_activity_at: activity_at,
+                created_at: current.created_at,
+                agent_alive: None,
+                closed: false,
+            },
+            observed_at,
+            abandon_after_ms,
+        )
+        else {
+            return Ok(AbandonedSessionCloseOutcome::NotDue);
+        };
+
+        // Recheck the spawned PID after taking the lifecycle claim. PID reuse
+        // can only make this conservative: any occupant keeps the session open.
+        if current.pid.is_some_and(crate::broker::session_pid_alive) {
+            return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+        }
+        let current_holder_event_id = self
+            .store_ref()
+            .latest_session_holder_event(session_id)?
+            .map(|event| event.id);
+        if current_holder_event_id != holder.binding_event_id {
+            return Ok(AbandonedSessionCloseOutcome::Changed);
+        }
+
+        let leases = self
+            .store_ref()
+            .unreleased_unexpired_leases_for_sessions_at(&[session_id], observed_at)?;
+        if !leases.is_empty() {
+            let lease_table = holder.binding_event_id.and_then(|event_id| {
+                process_table.table_for(session_id, event_id)
+            });
+            let liveness = match crate::lease_liveness::assess(
+                self.store_ref(),
+                &leases,
+                lease_table,
+                observed_at,
+                crate::lease_liveness::LeaseLivenessPolicy::load(self.main_root()),
+            ) {
+                Ok(liveness) => liveness,
+                Err(_) => return Ok(AbandonedSessionCloseOutcome::LeaseUnavailable),
+            };
+            if liveness.iter().any(|lease| lease.liveness_evidence.holds) {
+                return Ok(AbandonedSessionCloseOutcome::LeaseHeld);
+            }
+        }
+        if self
+            .store_ref()
+            .latest_session_holder_event(session_id)?
+            .map(|event| event.id)
+            != holder.binding_event_id
+        {
+            return Ok(AbandonedSessionCloseOutcome::Changed);
+        }
+
+        let abandoned_payload = crate::events::session_abandoned_payload(
+            idle_ms,
+            abandon_after_ms,
+            current.pid.map(crate::broker::session_pid_alive),
+        );
+        match self.store().abandon_session_if_unchanged(
+            &current,
+            holder.binding_event_id,
+            &leases,
+            observed_at,
+            &abandoned_payload,
+        ) {
+            Ok(true) => Ok(AbandonedSessionCloseOutcome::Closed),
+            Ok(false) => Ok(AbandonedSessionCloseOutcome::Changed),
+            Err(BrokerError::SessionRetirementDatabaseBusy) => {
+                Ok(AbandonedSessionCloseOutcome::DatabaseBusy)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Read-only diagnostics for explicit requests and final admission refusal.

@@ -101,6 +101,17 @@ pub fn session_registered_payload(origin: &str, branch: &str, worktree_path: &st
     json!({ "origin": origin, "branch": branch, "worktree_path": worktree_path }).to_string()
 }
 
+/// `session.abandoned`: an unattended session crossed its configured age
+/// window while its recorded owner and lease evidence allowed closure.
+pub fn session_abandoned_payload(idle_ms: i64, abandon_after_ms: i64, pid_alive: Option<bool>) -> String {
+    json!({
+        "idle_ms": idle_ms,
+        "abandon_after_ms": abandon_after_ms,
+        "pid_alive": pid_alive,
+    })
+    .to_string()
+}
+
 pub fn session_reused_payload(task: Option<&str>, diff_base: Option<&str>) -> String {
     json!({ "task": task, "diff_base": diff_base }).to_string()
 }

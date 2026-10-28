@@ -20,9 +20,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-const PROCESS_TABLE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const PROCESS_TABLE_TIMEOUT: Duration = Duration::from_secs(2);
 const PROCESS_TABLE_STREAM_LIMIT: usize = 4 * 1024 * 1024;
 
 /// Environment override for the caller's agent process: a pid, or `0`/`none`
@@ -280,6 +280,139 @@ pub enum HolderCheck {
     Bound { reason: &'static str },
     /// The caller is not an identifiable agent and was let through unbound.
     Unidentified,
+}
+
+/// Whether a PID-less session's recorded task holder is still the same
+/// process. Missing and shared-service holders provide no task-specific
+/// liveness evidence; incomplete observations remain unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordedHolderLiveness {
+    Unbound,
+    Alive,
+    Gone,
+    Unknown,
+}
+
+/// The process snapshot is valid only for the holder event it observed.
+/// Holder events are append-only identities, so a rebind forces a fresh
+/// snapshot instead of reusing a process table captured for another owner.
+#[derive(Default)]
+pub(crate) struct RecordedHolderProcessTable {
+    prefetched_event_ids: HashMap<i64, i64>,
+    observed_event_ids: HashMap<i64, i64>,
+    snapshot: Option<Option<ProcessTable>>,
+}
+
+impl RecordedHolderProcessTable {
+    /// Prime the bounded session IDs before the single process-table
+    /// snapshot. A fresh holder event discovered later is checked with a new
+    /// snapshot, never borrowed from a different binding.
+    pub(crate) fn prime(
+        &mut self,
+        store: &crate::BrokerStore,
+        session_ids: &[i64],
+        deadline: Option<Instant>,
+    ) {
+        for session_id in session_ids {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                break;
+            }
+            if let Ok(Some(event)) = store.latest_session_holder_event(*session_id) {
+                self.prefetched_event_ids.insert(*session_id, event.id);
+            }
+        }
+    }
+
+    fn get_or_snapshot(
+        &mut self,
+        session_id: i64,
+        event_id: i64,
+        allow_snapshot: bool,
+    ) -> Option<&ProcessTable> {
+        if self.snapshot.is_none() {
+            if !allow_snapshot {
+                return None;
+            }
+            self.snapshot = Some(ProcessTable::snapshot());
+            self.observed_event_ids
+                .extend(self.prefetched_event_ids.iter().map(|(id, event)| (*id, *event)));
+        }
+        if self.observed_event_ids.get(&session_id) != Some(&event_id) {
+            if !allow_snapshot {
+                return None;
+            }
+            self.snapshot = Some(ProcessTable::snapshot());
+            self.observed_event_ids.insert(session_id, event_id);
+        }
+        self.snapshot.as_ref().and_then(Option::as_ref)
+    }
+
+    pub(crate) fn table_for(&self, session_id: i64, event_id: i64) -> Option<&ProcessTable> {
+        (self.observed_event_ids.get(&session_id) == Some(&event_id))
+            .then(|| self.snapshot.as_ref().and_then(Option::as_ref))
+            .flatten()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecordedHolderAssessment {
+    pub binding_event_id: Option<i64>,
+    pub liveness: RecordedHolderLiveness,
+}
+
+/// Observe the latest recorded holder, lazily sharing one bounded process
+/// table snapshot across all sessions in a caller's pass. `allow_snapshot`
+/// lets a deadline-bound caller decline a new 2-second process-table read
+/// when the pass cannot afford it; that session then remains protected.
+pub(crate) fn recorded_holder_liveness(
+    store: &crate::BrokerStore,
+    session_id: i64,
+    process_table: &mut RecordedHolderProcessTable,
+    allow_snapshot: bool,
+) -> RecordedHolderAssessment {
+    let event = match store.latest_session_holder_event(session_id) {
+        Ok(Some(event)) => event,
+        Ok(None) => {
+            return RecordedHolderAssessment {
+                binding_event_id: None,
+                liveness: RecordedHolderLiveness::Unbound,
+            };
+        }
+        Err(_) => {
+            return RecordedHolderAssessment {
+                binding_event_id: None,
+                liveness: RecordedHolderLiveness::Unknown,
+            };
+        }
+    };
+    let binding_event_id = Some(event.id);
+    let Some(payload) = event.payload_json.as_deref() else {
+        return RecordedHolderAssessment {
+            binding_event_id,
+            liveness: RecordedHolderLiveness::Unknown,
+        };
+    };
+    let Ok(holder) = serde_json::from_str::<AgentProcess>(payload) else {
+        return RecordedHolderAssessment {
+            binding_event_id,
+            liveness: RecordedHolderLiveness::Unknown,
+        };
+    };
+    if is_shared_agent_service(&holder.command) {
+        return RecordedHolderAssessment {
+            binding_event_id,
+            liveness: RecordedHolderLiveness::Unbound,
+        };
+    }
+    let liveness = match process_table.get_or_snapshot(session_id, event.id, allow_snapshot) {
+        Some(table) if table.is_alive(&holder) => RecordedHolderLiveness::Alive,
+        Some(_) => RecordedHolderLiveness::Gone,
+        None => RecordedHolderLiveness::Unknown,
+    };
+    RecordedHolderAssessment {
+        binding_event_id,
+        liveness,
+    }
 }
 
 /// A compact process identity for local operation history; never the full command line.
@@ -865,5 +998,118 @@ mod tests {
         assert_eq!(find_foreign(&table, &cwds, &unheld)[0].foreign.len(), 2);
         let alone = vec![(7, "/wt/a".to_string(), None)];
         assert!(find_foreign(&table, &cwds[..1], &alone).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_holder_requires_complete_exact_identity_evidence() {
+        let owner = tempfile::tempdir().unwrap();
+        let root = owner.path().join("repository");
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "Holder test"],
+            vec!["config", "user.email", "holder@example.invalid"],
+            vec!["commit", "--allow-empty", "-qm", "fixture"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let session = broker.start_worktree("recorded holder fixture", None).unwrap();
+
+        let mut no_holder = RecordedHolderProcessTable::default();
+        let unbound = recorded_holder_liveness(broker.store(), session.id, &mut no_holder, false);
+        assert_eq!(
+            unbound.liveness,
+            RecordedHolderLiveness::Unbound,
+            "sessions without a task-specific holder retain the existing age policy"
+        );
+        assert_eq!(unbound.binding_event_id, None);
+
+        let table = ProcessTable::parse(TABLE);
+        let holder = table.process(1977).unwrap();
+        let holder_json = serde_json::to_string(&holder).unwrap();
+        broker
+            .store()
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session.id),
+                Some(&holder_json),
+            )
+            .unwrap();
+        let holder_event_id = broker
+            .store()
+            .latest_session_holder_event(session.id)
+            .unwrap()
+            .unwrap()
+            .id;
+
+        let mut unavailable = RecordedHolderProcessTable::default();
+        assert_eq!(
+            recorded_holder_liveness(broker.store(), session.id, &mut unavailable, false).liveness,
+            RecordedHolderLiveness::Unknown,
+            "a deadline that cannot afford a complete process snapshot protects the row"
+        );
+        let mut matching = RecordedHolderProcessTable {
+            prefetched_event_ids: HashMap::from([(session.id, holder_event_id)]),
+            observed_event_ids: HashMap::from([(session.id, holder_event_id)]),
+            snapshot: Some(Some(table)),
+        };
+        assert_eq!(
+            recorded_holder_liveness(broker.store(), session.id, &mut matching, true).liveness,
+            RecordedHolderLiveness::Alive
+        );
+        let mut missing = RecordedHolderProcessTable {
+            prefetched_event_ids: HashMap::from([(session.id, holder_event_id)]),
+            observed_event_ids: HashMap::from([(session.id, holder_event_id)]),
+            snapshot: Some(Some(ProcessTable::parse(""))),
+        };
+        assert_eq!(
+            recorded_holder_liveness(broker.store(), session.id, &mut missing, true).liveness,
+            RecordedHolderLiveness::Gone,
+            "a complete snapshot missing the exact pid/start identity proves it gone"
+        );
+
+        let reassigned = AgentProcess {
+            pid: holder.pid + 1,
+            started: holder.started.clone(),
+            command: holder.command.clone(),
+        };
+        broker
+            .store()
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session.id),
+                Some(&serde_json::to_string(&reassigned).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded_holder_liveness(broker.store(), session.id, &mut matching, false).liveness,
+            RecordedHolderLiveness::Unknown,
+            "a process snapshot for a previous holder binding cannot prove a rebound owner gone"
+        );
+
+        broker
+            .store()
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session.id),
+                Some("not-json"),
+            )
+            .unwrap();
+        let mut no_snapshot = RecordedHolderProcessTable::default();
+        assert_eq!(
+            recorded_holder_liveness(broker.store(), session.id, &mut no_snapshot, false).liveness,
+            RecordedHolderLiveness::Unknown,
+            "malformed holder records do not become age-only cleanup authority"
+        );
     }
 }
