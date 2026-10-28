@@ -61,7 +61,10 @@ operator edits; reconcile those edits first.
 
 The broader sweep checks current Git ignore rules, the complete closed checkout
 cohort, and active artifact-use claims before deletion. It does not follow
-symlinks or remove broker and Git metadata. A queued interrupted deletion is
+symlinks or select protected Git administration and broker metadata roots.
+An otherwise disposable ignored directory remains opaque: nested repositories
+and metadata inside it are disposable along with its other contents.
+A queued interrupted deletion is
 revalidated against current policy before resuming; its queue record alone is
 not permission to delete.
 

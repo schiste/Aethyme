@@ -47,7 +47,9 @@ separately. Closing a session does not prove removal or reclaimed bytes.
 The primary repository's `.aethyme/config.toml` adds
 `[cleanup].ignored_directory_sweep`, default `false`, for in-place reclamation
 of Git-ignored directories in retained closed checkouts. Strict mode, keep pins,
-protected metadata, active use and unresolved ownership continue to retain data.
+protected metadata roots, active use and unresolved ownership continue to retain
+data. Selected ignored directories stay opaque; nested metadata inside them is
+disposable too.
 Standalone ignored files are outside this new directory policy. The separate
 whole-checkout grace remains 360 hours by default.
 

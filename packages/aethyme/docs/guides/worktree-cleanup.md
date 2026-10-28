@@ -163,7 +163,9 @@ symlinks without deleting their external targets.
 ignored folders from retained closed checkouts. It defaults to `false`; setting
 it to `true` can reclaim opaque ignored folders while preserving the checkout,
 tracked work, standalone ignored files, and `keep` pins. This in-place lane also
-excludes protected Git administration and broker metadata roots. It does not shorten
+excludes protected Git administration and broker metadata roots from selection.
+Metadata and nested repositories inside another disposable ignored directory
+remain disposable contents of that directory. It does not shorten
 `closed_worktree_grace_hours`. Enable it only after older Aethyme broker
 processes have exited and the repository is on a release with the durable
 artifact-use protocol. That protocol is available on Unix; unattended ignored
