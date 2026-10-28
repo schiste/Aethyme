@@ -421,10 +421,10 @@ pub fn admit(
     if &holder == agent {
         return Ok(HolderCheck::Held);
     }
-    let shared_service = is_shared_agent_service(&holder.command);
-    let why = if shared_service && take_over {
-        reason::TAKE_OVER
-    } else if !shared_service && !table.is_alive(&holder) {
+    // Command class does not override process identity: a shared app-server
+    // that is still the recorded process requires explicit takeover, while
+    // one whose PID/start pair is gone may be replaced like any dead holder.
+    let why = if !table.is_alive(&holder) {
         reason::HOLDER_GONE
     } else if take_over {
         reason::TAKE_OVER
@@ -836,6 +836,142 @@ mod tests {
         assert!(matches!(caller_in(&table, Some("5000")), Caller::Agent(_)));
         assert!(is_agent_runtime("codex exec app-server"));
         assert!(is_agent_runtime("claude app-server"));
+    }
+
+    fn register_holder_test_session(store: &mut crate::BrokerStore) -> i64 {
+        store
+            .register_session(&crate::NewSession {
+                worktree_path: "/tmp/holder-admission-fixture".into(),
+                branch: "agent/holder-admission-fixture".into(),
+                origin: crate::SessionOrigin::Adopted,
+                task: Some("holder admission fixture".into()),
+                diff_base: None,
+                adoption_base: None,
+                adopted_head: None,
+                repository_contract: None,
+                pid: None,
+                command: None,
+                log_path: None,
+                agent_identity: None,
+            })
+            .unwrap()
+            .id
+    }
+
+    fn bind_test_holder(store: &mut crate::BrokerStore, session_id: i64, holder: &AgentProcess) {
+        store
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session_id),
+                Some(&crate::events::session_holder_bound_payload(
+                    holder,
+                    reason::REGISTERED,
+                    None,
+                )),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn dead_shared_app_server_holder_is_rebound_without_takeover() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = crate::BrokerStore::open(&temporary.path().join("broker.db")).unwrap();
+        let session_id = register_holder_test_session(&mut store);
+        let table = ProcessTable::parse("5000 1 Fri Oct 23 09:01:00 2026 /opt/codex exec task\n");
+        let holder = AgentProcess {
+            pid: 3731,
+            started: "Fri Oct 23 08:42:41 2026".into(),
+            command: "/opt/codex app-server --listen local --managed-daemon".into(),
+        };
+        let caller_process = AgentProcess {
+            pid: 5000,
+            started: "Fri Oct 23 09:01:00 2026".into(),
+            command: "/opt/codex exec task".into(),
+        };
+        let caller = Caller::Agent(caller_process.clone());
+        bind_test_holder(&mut store, session_id, &holder);
+
+        assert_eq!(
+            admit(&mut store, session_id, &caller, &table, false).unwrap(),
+            HolderCheck::Bound {
+                reason: reason::HOLDER_GONE,
+            },
+            "a dead shared service is no longer a live holder"
+        );
+        assert_eq!(
+            recorded_holder(&store, session_id).unwrap(),
+            Some(caller_process)
+        );
+    }
+
+    #[test]
+    fn live_shared_app_server_holder_still_requires_explicit_takeover() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = crate::BrokerStore::open(&temporary.path().join("broker.db")).unwrap();
+        let session_id = register_holder_test_session(&mut store);
+        let table = ProcessTable::parse(
+            "3731 1 Fri Oct 23 08:42:41 2026 /opt/codex app-server --listen local --managed-daemon\n\
+             5000 1 Fri Oct 23 09:01:00 2026 /opt/codex exec task\n",
+        );
+        let holder = table.process(3731).unwrap();
+        let caller = Caller::Agent(table.process(5000).unwrap());
+        bind_test_holder(&mut store, session_id, &holder);
+
+        assert!(matches!(
+            admit(&mut store, session_id, &caller, &table, false),
+            Err(crate::BrokerOpError::SessionHeldByAnotherAgent { .. })
+        ));
+        assert_eq!(recorded_holder(&store, session_id).unwrap(), Some(holder));
+        assert_eq!(
+            admit(&mut store, session_id, &caller, &table, true).unwrap(),
+            HolderCheck::Bound {
+                reason: reason::TAKE_OVER,
+            }
+        );
+    }
+
+    #[test]
+    fn recycled_shared_app_server_pid_is_gone_when_start_time_differs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = crate::BrokerStore::open(&temporary.path().join("broker.db")).unwrap();
+        let session_id = register_holder_test_session(&mut store);
+        let table = ProcessTable::parse(
+            "3731 1 Sat Oct 24 08:42:41 2026 /opt/codex app-server --listen local --managed-daemon\n\
+             5000 1 Fri Oct 23 09:01:00 2026 /opt/codex exec task\n",
+        );
+        let holder = AgentProcess {
+            pid: 3731,
+            started: "Fri Oct 23 08:42:41 2026".into(),
+            command: "/opt/codex app-server --listen local --managed-daemon".into(),
+        };
+        let caller = Caller::Agent(table.process(5000).unwrap());
+        bind_test_holder(&mut store, session_id, &holder);
+
+        assert!(!table.is_alive(&holder), "the PID now names another process");
+        assert_eq!(
+            admit(&mut store, session_id, &caller, &table, false).unwrap(),
+            HolderCheck::Bound {
+                reason: reason::HOLDER_GONE,
+            }
+        );
+    }
+
+    #[test]
+    fn unidentified_caller_does_not_transfer_a_shared_holder() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = crate::BrokerStore::open(&temporary.path().join("broker.db")).unwrap();
+        let session_id = register_holder_test_session(&mut store);
+        let table = ProcessTable::parse(
+            "3731 1 Fri Oct 23 08:42:41 2026 /opt/codex app-server --listen local --managed-daemon\n",
+        );
+        let holder = table.process(3731).unwrap();
+        bind_test_holder(&mut store, session_id, &holder);
+
+        assert_eq!(
+            admit(&mut store, session_id, &Caller::Unidentified, &table, true).unwrap(),
+            HolderCheck::Unidentified
+        );
+        assert_eq!(recorded_holder(&store, session_id).unwrap(), Some(holder));
     }
 
     #[test]
