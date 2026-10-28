@@ -118,6 +118,7 @@ const TOOL_PROBES: &[ToolProbe] = &[
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutionProfile {
     digest: Option<String>,
+    writers_quiescent: bool,
 }
 
 impl ExecutionProfile {
@@ -159,7 +160,10 @@ impl ExecutionProfile {
                     handle.join().unwrap_or_else(|_| {
                         (
                             "probe-panic".to_string(),
-                            Err("version probe panicked".to_string()),
+                            ProbeObservation {
+                                result: Err("version probe panicked".to_string()),
+                                writers_quiescent: false,
+                            },
                         )
                     })
                 })
@@ -168,8 +172,10 @@ impl ExecutionProfile {
 
         let mut tools = BTreeMap::new();
         let mut complete = true;
-        for (name, result) in tool_results {
-            match result {
+        let mut writers_quiescent = true;
+        for (name, observation) in tool_results {
+            writers_quiescent &= observation.writers_quiescent;
+            match observation.result {
                 Ok(version) => {
                     tools.insert(name, version);
                 }
@@ -189,6 +195,7 @@ impl ExecutionProfile {
         };
         Self {
             digest: complete.then(|| digest(&input)),
+            writers_quiescent,
         }
     }
 
@@ -203,11 +210,36 @@ impl ExecutionProfile {
                 environment: BTreeMap::new(),
                 tools: BTreeMap::new(),
             })),
+            writers_quiescent: true,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_incomplete_quiescent() -> Self {
+        Self {
+            digest: None,
+            writers_quiescent: true,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_uncertain() -> Self {
+        Self {
+            digest: None,
+            writers_quiescent: false,
         }
     }
 
     pub(crate) fn digest(&self) -> Option<&str> {
         self.digest.as_deref()
+    }
+
+    /// Whether every profile subprocess either completed its owned-group
+    /// cleanup or was confirmed not to have spawned. An unavailable profile
+    /// may still be quiescent; an uncertain probe retains the checkout marker
+    /// and prevents gate dispatch.
+    pub(crate) fn writers_quiescent(&self) -> bool {
+        self.writers_quiescent
     }
 
     pub(crate) fn provenance(&self) -> GateCacheProvenance {
@@ -241,36 +273,52 @@ enum ToolVersionFingerprint {
     },
 }
 
+struct ProbeObservation {
+    result: Result<ToolVersionFingerprint, String>,
+    writers_quiescent: bool,
+}
+
 fn probe_version(
     probe: &ToolProbe,
     gate_cwd: &Path,
     subprocess_path: Option<&OsStr>,
-) -> Result<ToolVersionFingerprint, String> {
+) -> ProbeObservation {
     let mut command = Command::new(probe.program);
     command.current_dir(gate_cwd).args(probe.args);
     if let Some(path) = subprocess_path {
         command.env("PATH", path);
     }
-    match crate::bounded_output::output_limited_in_owned_group(
+    let (result, writers_quiescent) = match crate::bounded_output::output_limited_in_owned_group(
         &mut command,
         PROBE_BUDGET,
         PROBE_MAX_STREAM_BYTES,
     ) {
-        Ok(crate::bounded_output::LimitedOutput::Deadline) => Err("timed out".into()),
+        Ok(crate::bounded_output::LimitedOutput::Deadline) => (Err("timed out".into()), true),
         Ok(crate::bounded_output::LimitedOutput::OutputLimit) => {
-            Err("output exceeded 16 KiB per stream".into())
+            (Err("output exceeded 16 KiB per stream".into()), true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(ToolVersionFingerprint::Missing)
+            (Ok(ToolVersionFingerprint::Missing), true)
         }
-        Err(error) => Err(format!("spawn {}: {}", error.kind(), error)),
+        #[cfg(not(unix))]
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+            (Err(format!("spawn {}: {}", error.kind(), error)), true)
+        }
+        Err(error) => (Err(format!("spawn {}: {}", error.kind(), error)), false),
         Ok(crate::bounded_output::LimitedOutput::Completed(output)) => {
-            Ok(ToolVersionFingerprint::Present {
-                exit_code: output.status.code().unwrap_or(-1),
-                stdout: output.stdout,
-                stderr: output.stderr,
-            })
+            (
+                Ok(ToolVersionFingerprint::Present {
+                    exit_code: output.status.code().unwrap_or(-1),
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                }),
+                true,
+            )
         }
+    };
+    ProbeObservation {
+        result,
+        writers_quiescent,
     }
 }
 
@@ -362,8 +410,9 @@ mod tests {
         };
 
         let observed =
-            probe_version(&probe, checkout.path(), Some(tools.path().as_os_str())).unwrap();
-        match observed {
+            probe_version(&probe, checkout.path(), Some(tools.path().as_os_str()));
+        assert!(observed.writers_quiescent);
+        match observed.result.unwrap() {
             ToolVersionFingerprint::Present {
                 exit_code, stdout, ..
             } => {
@@ -383,6 +432,20 @@ mod tests {
             program: "sh",
             args: &["-c", "head -c 20000 /dev/zero"],
         };
-        assert!(probe_version(&probe, directory.path(), None).is_err());
+        let observed = probe_version(&probe, directory.path(), None);
+        assert!(observed.writers_quiescent);
+        assert!(observed.result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_optional_tools_are_quiescent_profile_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let profile = ExecutionProfile::capture(
+            directory.path(),
+            Some(directory.path().as_os_str()),
+        );
+        assert!(profile.writers_quiescent());
+        assert!(profile.digest().is_some());
     }
 }
