@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-10-27
+Last Updated: 2026-10-28
 
 When code outside the `packages/aethyme/` Rust source tree invokes an
 Aethyme command, it crosses a process boundary. Static
@@ -35,6 +35,29 @@ consumer. This file exists so that doesn't happen again.
 3. **Suspect something is stale?** Run
    `scripts/eval/verify-playground.sh` against any deployed
    playground; it asserts a subset of the contracts below.
+
+## Automatic checkout maintenance (v0.8.44)
+
+`AutoCleanupReport` adds optional `sessions_retired` and
+`retirement_deferred_reasons` fields. They are omitted when zero or empty, and
+readers must accept saved reports without them. `enabled` continues to describe
+automatic whole-checkout removal; session retirement follows retention policy
+separately. Closing a session does not prove removal or reclaimed bytes.
+
+The primary repository's `.aethyme/config.toml` adds
+`[cleanup].ignored_directory_sweep`, default `false`, for in-place reclamation
+of Git-ignored directories in retained closed checkouts. Strict mode, keep pins,
+protected metadata, active use and unresolved ownership continue to retain data.
+Standalone ignored files are outside this new directory policy. The separate
+whole-checkout grace remains 360 hours by default.
+
+Broker schema 58 raises the compatibility floor to 58 for the gate-use protocol.
+Already-open older clients must drain before enabling destructive automatic
+maintenance; the floor alone does not revoke open connections. Unix targets
+support this protocol; unsupported targets retain the existing explicit cleanup
+contract while protocol-dependent unattended removal stays blocked. See
+[automatic checkout maintenance](../guides/automatic-checkout-maintenance.md)
+for rollout holds, policy restoration and the report field contract.
 
 ## PR-watch service plan (#887)
 
