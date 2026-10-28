@@ -3575,7 +3575,10 @@ mod tests {
             [SessionRetirementDeferredReason::CursorBusy]
         ));
         assert_eq!(
-            broker.store().meta_get(SESSION_RETIREMENT_CURSOR_KEY).unwrap(),
+            broker
+                .store()
+                .meta_get(SESSION_RETIREMENT_CURSOR_KEY)
+                .unwrap(),
             None,
             "failed initialization leaves the durable cursor unchanged"
         );

@@ -259,6 +259,10 @@ const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Batch metadata and patch-id output must stay finite even for an unusually
 /// large repository. Patch bodies themselves are streamed between Git.
 const MAX_GIT_BATCH_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+/// Per-stream cap for private-index tree hashing, whose Git child may invoke
+/// repository-configured clean filters.
+#[cfg(unix)]
+const MAX_WORKING_TREE_HASH_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_GIT_BATCH_INPUT_BYTES: usize = 16 * 1024 * 1024;
 /// A complete ignored-path census stays finite. Hitting any cap makes the
 /// listing unknown; callers must not treat it as an empty or partial result.
@@ -1582,6 +1586,45 @@ fn run_git_with_index(cwd: &Path, index_file: &str, args: &[&str]) -> Result<Str
     run_git_inner(cwd, Some(index_file), args)
 }
 
+fn run_git_with_index_for_tree_hash(
+    cwd: &Path,
+    index_file: &str,
+    args: &[&str],
+) -> Result<String, GitError> {
+    #[cfg(unix)]
+    {
+        run_git_with_index_in_owned_group(cwd, index_file, args)
+    }
+    #[cfg(not(unix))]
+    {
+        run_git_with_index(cwd, index_file, args)
+    }
+}
+
+#[cfg(unix)]
+fn run_git_with_index_in_owned_group(
+    cwd: &Path,
+    index_file: &str,
+    args: &[&str],
+) -> Result<String, GitError> {
+    let mut command = git_command();
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_INDEX_FILE", index_file);
+    let output = run_git_process_output_in_owned_group(command, args, git_timeout())?;
+    if !output.status.success() {
+        return Err(GitError::Git {
+            args: args.join(" "),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
+}
+
 fn run_git_inner(cwd: &Path, index_file: Option<&str>, args: &[&str]) -> Result<String, GitError> {
     let mut command = git_command();
     // No opportunistic index refresh: `git status` and friends otherwise
@@ -2071,6 +2114,63 @@ fn run_git_process_output(
         });
     };
     Ok(output)
+}
+
+#[cfg(unix)]
+fn run_git_process_output_in_owned_group(
+    mut command: Command,
+    args: &[&str],
+    budget: Duration,
+) -> Result<std::process::Output, GitError> {
+    let budget = match active_git_deadline() {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                note_git_timeout();
+                return Err(GitError::TimedOut {
+                    args: args.join(" "),
+                    seconds: 1,
+                });
+            }
+            budget.min(remaining)
+        }
+        None => budget,
+    };
+    let deadline = Instant::now()
+        .checked_add(budget)
+        .ok_or_else(|| GitError::Spawn {
+            args: args.join(" "),
+            source: std::io::Error::other("git process-group deadline overflow"),
+        })?;
+    let output = crate::bounded_output::output_limited_in_owned_group(
+        &mut command,
+        budget,
+        MAX_WORKING_TREE_HASH_OUTPUT_BYTES,
+    )
+    .map_err(|source| GitError::Spawn {
+        args: args.join(" "),
+        source,
+    })?;
+    match output {
+        crate::bounded_output::LimitedOutput::Completed(output) if Instant::now() < deadline => {
+            Ok(output)
+        }
+        crate::bounded_output::LimitedOutput::Completed(_)
+        | crate::bounded_output::LimitedOutput::Deadline => {
+            note_git_timeout();
+            Err(GitError::TimedOut {
+                args: args.join(" "),
+                seconds: budget.as_secs().max(1),
+            })
+        }
+        crate::bounded_output::LimitedOutput::OutputLimit => Err(GitError::UntrustedOutput {
+            detail: format!(
+                "git {} exceeded the private-index hash output cap of {} bytes per stream",
+                args.join(" "),
+                MAX_WORKING_TREE_HASH_OUTPUT_BYTES
+            ),
+        }),
+    }
 }
 
 fn effective_git_deadline(
@@ -4815,6 +4915,8 @@ impl GitRepo {
     /// the real index is never touched; identical content in different
     /// worktrees hashes identically, which is what makes cross-agent gate
     /// dedup work.
+    /// On Unix, each private-index Git child runs in an owned process group;
+    /// completion also proves same-group clean-filter descendants are quiescent.
     pub fn working_tree_hash(&self) -> Result<String, GitError> {
         let index_dir = self.git_common_dir()?.join("aethyme-broker/indexes");
         std::fs::create_dir_all(&index_dir).map_err(|source| GitError::Spawn {
@@ -4834,19 +4936,19 @@ impl GitRepo {
                 .unwrap_or_default()
         ));
         let result = (|| {
-            run_git_with_index(&self.root, &tmp_str, &["read-tree", "HEAD"])?;
+            run_git_with_index_for_tree_hash(&self.root, &tmp_str, &["read-tree", "HEAD"])?;
             // Capture tracked edits and deletions first, including anything
             // intentionally tracked beneath a runtime path. The exclusions
             // on the second pass therefore only omit untracked operational
             // state and cannot hide tracked inputs from the cache key.
-            run_git_with_index(&self.root, &tmp_str, &["add", "-u", "--", "."])?;
+            run_git_with_index_for_tree_hash(&self.root, &tmp_str, &["add", "-u", "--", "."])?;
             let exclusions =
                 crate::runtime_paths::broker_runtime_untracked_git_pathspec_exclusions()
                     .collect::<Vec<_>>();
             let mut add_all_args = vec!["add", "-A", "--", "."];
             add_all_args.extend(exclusions.iter().map(String::as_str));
-            run_git_with_index(&self.root, &tmp_str, &add_all_args)?;
-            run_git_with_index(&self.root, &tmp_str, &["write-tree"])
+            run_git_with_index_for_tree_hash(&self.root, &tmp_str, &add_all_args)?;
+            run_git_with_index_for_tree_hash(&self.root, &tmp_str, &["write-tree"])
         })();
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(lock);
@@ -9788,5 +9890,89 @@ mod working_tree_hash_runtime_path_tests {
         assert_ne!(repo.working_tree_hash().unwrap(), baseline);
         std::fs::remove_file(tracked_policy).unwrap();
         assert_ne!(repo.working_tree_hash().unwrap(), baseline);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod working_tree_hash_process_group_tests {
+    use super::{GitError, GitRepo, run_isolated_graph_git};
+    use std::path::Path;
+    use std::time::Duration;
+
+    fn git(root: &Path, args: &[&str]) {
+        run_isolated_graph_git(root, args)
+            .unwrap_or_else(|error| panic!("git {}: {error}", args.join(" ")));
+    }
+
+    fn repository() -> (tempfile::TempDir, GitRepo) {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q", "-b", "main"]);
+        git(
+            root.path(),
+            &["config", "user.name", "Tree hash group test"],
+        );
+        git(
+            root.path(),
+            &["config", "user.email", "tree-hash-group@example.invalid"],
+        );
+        std::fs::write(root.path().join("tracked.txt"), "baseline\n").unwrap();
+        git(root.path(), &["add", "tracked.txt"]);
+        git(root.path(), &["commit", "-qm", "initial"]);
+        let repo = GitRepo::discover(root.path()).unwrap();
+        (root, repo)
+    }
+
+    fn configure_clean_filter(root: &Path, script: &str) {
+        std::fs::write(root.join(".git/clean-filter.sh"), script).unwrap();
+        git(
+            root,
+            &[
+                "config",
+                "filter.aethyme-test.clean",
+                "sh .git/clean-filter.sh",
+            ],
+        );
+        git(root, &["config", "filter.aethyme-test.required", "true"]);
+        std::fs::write(
+            root.join(".gitattributes"),
+            "tracked.txt filter=aethyme-test\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("tracked.txt"), "changed content\n").unwrap();
+    }
+
+    #[test]
+    fn working_tree_hash_waits_out_a_clean_filter_background_writer() {
+        let (root, repo) = repository();
+        configure_clean_filter(
+            root.path(),
+            "#!/bin/sh\ncat >/dev/null\n(sleep 0.5; printf leaked > .git/clean-filter-descendant-ran) </dev/null >/dev/null 2>&1 &\nprintf normalized\n",
+        );
+
+        assert!(!repo.working_tree_hash().unwrap().is_empty());
+        std::thread::sleep(Duration::from_millis(650));
+        assert!(
+            !root
+                .path()
+                .join(".git/clean-filter-descendant-ran")
+                .exists(),
+            "tree hashing must prove its owned Git process group is quiescent"
+        );
+    }
+
+    #[test]
+    fn working_tree_hash_preserves_a_completed_nonzero_git_error() {
+        let (root, repo) = repository();
+        configure_clean_filter(
+            root.path(),
+            "#!/bin/sh\ncat >/dev/null\nprintf filter-failed >&2\nexit 23\n",
+        );
+
+        let error = repo.working_tree_hash().unwrap_err();
+
+        assert!(
+            matches!(error, GitError::Git { ref args, .. } if args.contains("add")),
+            "a completed nonzero Git child keeps the ordinary Git error: {error:?}"
+        );
     }
 }

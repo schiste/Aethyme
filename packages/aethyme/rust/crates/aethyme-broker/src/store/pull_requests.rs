@@ -1013,10 +1013,7 @@ impl BrokerStore {
             Err(BrokerError::Sqlite(error))
                 if matches!(
                     error.sqlite_error_code(),
-                    Some(
-                        rusqlite::ErrorCode::DatabaseBusy
-                            | rusqlite::ErrorCode::DatabaseLocked
-                    )
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
                 ) =>
             {
                 Err(BrokerError::SessionRetirementDatabaseBusy)
