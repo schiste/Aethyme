@@ -96,17 +96,24 @@ blocked.
    Repeat `--path` for every file or trailing-slash directory known up front.
    The broker validates the whole set first, then creates the session plus
    explicit leases atomically. Omit `--path` only when no target is known yet.
-   If full `status --json` shows another session holding leases on the
-   files you plan to change, prefer working elsewhere first or coordinate
-   with its holder — overlapping edits can conflict at merge time.
-   Coordinate the exact shared hunk with its holder; a sibling session's PR
-   or branch is not automatically your upstream. Sync against the configured
-   upstream when required, and do not import or restack onto another session's
-   branch without separate authorization.
-   When you edit a file another live session is changing, the broker tells you
-   in context who, where and whether Git would conflict, never blocking the
-   edit; `aethyme broker advanced note send --to-session <id>` reaches that
-   agent, and its notes reach you at your next turn.
+   Leases record planned or observed path overlap; they do not lock files
+   across isolated worktrees. A lease or warning alone is not a reason to
+   wait or switch tasks: continue on independent work in your own worktree.
+   Before contacting a holder, inspect their task and claimed paths in full
+   `aethyme broker status --json`; an explicit lease may record intent without
+   any edit. Check the path with `git -C <worktree> status --short -- <path>`
+   and inspect the diff with `git -C <worktree> diff HEAD -- <path>`, or view
+   the open PR diff. Check whether edits touch the same lines or would
+   produce conflicting behavior.
+   If the path is untouched or changes are independent, keep working without
+   waiting or messaging. Coordinate only when edits overlap or interact, or
+   your work depends on unmerged work. If needed, contact the holder with the
+   exact path and dependency using `aethyme broker advanced note send --to-session <id>`;
+   a lease alone is not a reason to request release. A refused claim means the
+   broker did not grant that claim; it does not block unrelated work in your
+   checkout. A sibling session's PR or branch is not automatically your
+   upstream. Sync against the configured upstream when required; do not import
+   or restack onto another session's branch without separate authorization.
 
 2. **Lease additional shared files before the diff exists**. Prefer the
    atomic `start --path` / `start --adopt --path` declaration above for initial intent. If the
@@ -119,10 +126,13 @@ blocked.
 
    Use a trailing `/` for directory leases. Implicit leases refresh from
    changed files, but explicit leases are clearer for planned shared edits.
-   A claim is refused only by another explicit lease whose holder is actively
-   working, and never in a `verify-only` repository; every other overlap comes
-   back as a warning naming the holder, with the `note send` command to
-   coordinate.
+   `leases release` removes an explicit claim; implicit rows describe the
+   current diff and remain until that diff is refreshed or cleared.
+   Outside `verify-only`, another active explicit lease can refuse a claim;
+   that refusal applies to the claim only. In `verify-only`, another session's
+   lease does not refuse a claim. Other overlaps return a warning naming the
+   holder and `note send` command; warnings do not pause work in your own
+   worktree.
 
    Status and blocker listings are repository-wide; stale leases remain in the
    lease/liveness views but do not become global path-lease blockers. These
@@ -166,6 +176,22 @@ blocked.
    its holder and when the holder last acted; a claim is refused only while
    its holder is working, and a quiet holder's claim is taken over.
 
+   For a shared source or generated policy change needed by several sessions,
+   agree on one session to land it. That session claims a short orchestration
+   name with `aethyme broker advanced ownership claim "shared edit <name>"
+   --session <owner> --reason "<shared change and dependent sessions>"` and
+   retains the normal file leases; the named claim does not replace them.
+   Use `broker advanced leases plan <paths...> --session <requester> --json`
+   to inspect current holders, then `broker advanced ownership list --json`
+   to check who agreed to drive the shared change. Do not infer an elected
+   owner from overlap counts or automatically take another session's files.
+   Once the shared commit is available, its owner sends each dependent session
+   `aethyme broker advanced note send --session <owner> --to-session <dependent>
+   --message "Shared change available at <commit>; sync before continuing"`.
+   Dependents inspect their notes and sync their own sessions before editing
+   the shared paths. Release the named claim after the handoff is complete.
+   Lease-plan history marked `loaded: false` is deliberately absent, not empty.
+
 3. **Guard broad rewrite commands**. For formatters, code generators, or any
    command likely to touch many files, run through the broker guard:
 
@@ -188,6 +214,19 @@ blocked.
 4. **While working**: commit early and small. Only committed work can be
    verified and integrated. Never switch branches inside someone else's
    worktree; never edit files outside your own worktree.
+
+   When adding or changing a public broker verb or its JSON report, update the
+   generated CLI help snapshots and `docs/architecture/cross-process-consumers.md`.
+   The help snapshot test derives public verbs from the surface table; keep the
+   no-side-effect help coverage in sync as well.
+
+   For a local commit in your own active session, use
+   `aethyme broker commit --session <your-session-id> -- <git-commit-args>`.
+   It checks the registered worktree and branch, audits complete bounded path
+   inventories before and after the commit, and runs the repository's normal
+   Git hooks. Hook-bypass options and inherited Git routing/config overrides
+   are refused. If post-commit ownership verification is unknown, inspect the
+   worktree and execution receipt before trying another commit.
 
    **If `.aethyme/config.toml`, as committed on the default branch, sets
    `[delivery] push_session_branches = true`, push your session branch as you
@@ -214,6 +253,10 @@ blocked.
    default pull-request template on the fetched base branch. Prepare the
    reviewed body from the repository template, preserving its required
    contract decision and justification fields.
+   Finalize those fields before qualification. Keep validation tied to the
+   exact source head and use the PR checks for its current verdict; avoid
+   status-only body edits that retrigger required checks. After a necessary
+   body edit, verify the newly triggered checks before merging.
    Put any justification on a plain-text line starting exactly
    `Contract justification: ` with at least 24 characters after the prefix.
    For a `none` choice, avoid comment-only bodies containing tracked terms
@@ -380,6 +423,12 @@ blocked.
    A closed or `cleaned` session is not proof of physical removal. Report each
    path's cleanup result or blocker, keeping uninspected and unsupported scopes
    unknown. Preserve complete audit output and disclose incomplete scans.
+   Group session rows by canonical checkout identity before counting or planning
+   removal. Inspect every alias in the group: one closed row does not establish
+   that the checkout is unused. Recheck current ownership and process use before
+   each native cleanup, preserve other aliases' branch refs, and stop an exact
+   sweep on an ambiguous result. Save per-target results and verify path absence;
+   do not count a successful close as a removed checkout.
    Filesystem birth time, descendant modification time, broker activity, and
    source edits are different observations; label the date used. Walk without
    following symlinks and distinguish summed file bytes from unique physical
@@ -443,7 +492,19 @@ blocked.
      --repo <owner/name> --reason "<authorization>" -- <gh-args> ...
    ```
 
-   The broker classifies known commands and fails closed on ambiguity. Add
+   The broker classifies known commands and fails closed on ambiguity.
+
+   For a cross-session PR merge, if the broker reports that the head branch
+   belongs to another session, inspect that session's task and worktree status,
+   including changed paths, then compare those paths and behavior with the PR's
+   diff. If the holder has uncommitted changes to the PR's files or logically
+   overlapping work, coordinate before merging. Independent hunks in the same
+   file do not by themselves require waiting. For an explicitly authorized
+   cross-session merge, include `--effect destructive --destructive
+   --cross-session <owner-id>` before `--`; this override does not bypass draft,
+   review, or check requirements. Never edit another session's worktree.
+
+   Add
    `--effect write|destructive --scope <resource>` before `--` for an
    unrecognized command. Destructive operations also require `--destructive`.
    Every coordinated write requires a concise `--reason` identifying the user

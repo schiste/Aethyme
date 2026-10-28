@@ -2080,15 +2080,24 @@ fn render_cleanup_resolve_plan(plan: &crate::CleanupResolvePlan) {
     out!("  why cleanup refuses it: {}", plan.reason);
     out!("  head: {}", plan.head);
     let landing = match &plan.landing {
-        crate::LandingVerdict::Landed { evidence, .. } => {
+        crate::RecoveryLandingAssessment::Verdict(crate::LandingVerdict::Landed {
+            evidence,
+            ..
+        }) => {
             format!("landed ({})", evidence.as_str())
         }
-        crate::LandingVerdict::NotLanded { truncated, .. } => {
+        crate::RecoveryLandingAssessment::Verdict(crate::LandingVerdict::NotLanded {
+            truncated,
+            ..
+        }) => {
             if *truncated {
                 "not proved landed (search truncated)".to_string()
             } else {
                 "not landed".to_string()
             }
+        }
+        crate::RecoveryLandingAssessment::NotEvaluatedForRecovery { .. } => {
+            "landing not evaluated; recovery preserves target-absent commits".to_string()
         }
     };
     out!("  committed work: {landing}");

@@ -379,6 +379,14 @@ before duplicating work.
 2. When done: `aethyme broker submit --session <id>`, then
    `aethyme broker finish --session <id>`.
 
+For a local commit in your own active session, use
+`aethyme broker commit --session <id> -- <git-commit-args>`. It checks the
+registered worktree and branch, audits complete bounded path inventories
+before and after the commit, and runs the repository's normal Git hooks.
+Hook-bypass options and inherited Git routing/config overrides are refused.
+If post-commit ownership verification is unknown, inspect the worktree and
+execution receipt before trying another commit.
+
 Remote or shared Git and GitHub writes go through `aethyme broker advanced git`
 and `aethyme broker advanced gh`; editing or submitting never authorizes
 publishing. If `.aethyme/broker-action-required.md` appears, read it first.
@@ -1138,6 +1146,8 @@ mod tests {
             "do not assume a fresh worktree has installed dependencies.",
             "`aethyme broker submit --session <id>`",
             "`aethyme broker finish --session <id>`",
+            "`aethyme broker commit --session <id> -- <git-commit-args>`",
+            "Hook-bypass options and inherited Git routing/config overrides are refused.",
             "`aethyme broker advanced git`",
             "`aethyme broker advanced gh`",
             "editing or submitting never authorizes\npublishing",

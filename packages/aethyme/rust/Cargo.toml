@@ -24,6 +24,7 @@ data-encoding = "2"
 dhat = "0.3"
 fastrand = "2"
 globset = "0.4"
+notify = "=8.2.1"
 libc = "0.2"
 noyalib = "0.0.53"
 oxc_allocator = "=0.125"
@@ -57,7 +58,7 @@ unicode-normalization = "0.1"
 walkdir = "2"
 
 [workspace.package]
-version = "0.8.40"
+version = "0.8.43"
 
 # Workspace lint floor. Every crate opts in with `[lints] workspace = true`.
 #

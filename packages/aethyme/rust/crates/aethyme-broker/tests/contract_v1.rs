@@ -48,6 +48,8 @@ const V1_KINDS: &[&str] = &[
     "merge.superseded",
     "merge.verified",
     "operation.failed",
+    "operation.fetch_reconciled",
+    "operation.inspected",
     "operation.outcome_unknown",
     "operation.prepared",
     "operation.reconciled_failed",
@@ -141,6 +143,8 @@ fn v1_kind_catalog_is_frozen() {
         events::MERGE_INTEGRATION_BRANCH_CREATED.into(),
         events::MERGE_INTEGRATION_REFRESHED.into(),
         events::BROKER_CHECKOUT_FAST_FORWARDED.into(),
+        events::OPERATION_FETCH_RECONCILED.into(),
+        events::OPERATION_INSPECTED.into(),
     ];
     for status in [
         SessionStatus::Active,
@@ -504,6 +508,27 @@ fn v1_constructor_payload_field_names_are_frozen() {
             "status",
         ],
         "operation.<status>",
+    );
+    assert_keys(
+        &events::fetch_reconciled_payload(
+            7,
+            "owner/repo",
+            "git-ref/refs/heads/main",
+            OperationEffect::Write,
+            OperationStatus::ReconciledSucceeded,
+            Some(0),
+        ),
+        &[
+            "effect",
+            "exit_code",
+            "operation_id",
+            "provider",
+            "reconciliation_source",
+            "repository",
+            "scope",
+            "status",
+        ],
+        "operation.fetch_reconciled",
     );
     assert_keys(
         &events::integration_branch_created_payload("b", "c"),

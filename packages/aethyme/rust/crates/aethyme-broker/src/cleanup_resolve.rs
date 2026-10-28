@@ -35,10 +35,12 @@ use crate::git::GitRepo;
 use crate::types::SessionOrigin;
 use crate::{Broker, BrokerOpError, CleanupDisposition};
 
-pub const CLEANUP_RESOLVE_SCHEMA_VERSION: u32 = 2;
+pub const CLEANUP_RESOLVE_SCHEMA_VERSION: u32 = 3;
+const LEGACY_CLEANUP_RESOLVE_SCHEMA_VERSION: u32 = 2;
 const LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 1;
 const PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 2;
-const RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 3;
+const PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 3;
+const RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 4;
 const MAX_RECOVERY_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_RECOVERY_BUNDLE_STDERR_BYTES: usize = 64 * 1024;
 const MAX_RECOVERY_BUNDLE_METADATA_OUTPUT_BYTES: usize = 64 * 1024;
@@ -97,22 +99,25 @@ pub struct ArchivedFile {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CleanupResolvePlan {
     pub schema_version: u32,
-    /// Binds the head, delivery targets, patches, untracked files, standalone
-    /// ignored classifications, protected ignored files and cleanup policy.
-    /// Policy-approved disposable directory listings are informational in the
-    /// v4 digest. Standalone ignored paths remain bound. Replan on upgrade.
+    /// Binds repository, branch, checkout and preserved content. Delivery
+    /// targets and landing evidence are snapshots in the archive manifest,
+    /// not part of the stable content confirmation. Replan on upgrade.
     pub digest: String,
     pub session_id: i64,
+    pub repository_path: String,
     pub worktree_path: String,
     pub branch_ref: String,
+    /// The registered session branch tip captured with the worktree HEAD.
+    pub branch_tip: Option<String>,
     pub disposition: CleanupDisposition,
     /// Why cleanup alone refuses this worktree.
     pub reason: String,
     pub head: String,
     /// The commits cleanup judges against; the bundle excludes all of them.
     pub delivery_targets: Vec<String>,
-    /// The shared landed-work verdict for `head` against the primary checkout.
-    pub landing: crate::LandingVerdict,
+    /// A landing verdict, or an explicit note that recovery planning skipped
+    /// the expensive exact-content search.
+    pub landing: RecoveryLandingAssessment,
     /// Commits no delivery target holds, newest first. Empty means no bundle.
     pub unlanded_commits: Vec<String>,
     pub staged_patch_bytes: u64,
@@ -134,6 +139,21 @@ pub struct CleanupResolvePlan {
     pub apply_command: String,
     /// The existing discard path, named so the choice is explicit.
     pub discard_command: String,
+}
+
+/// Recovery's landing-proof assessment. The known verdict keeps its legacy
+/// JSON shape; recovery planning records its intentional omission separately.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(untagged)]
+pub enum RecoveryLandingAssessment {
+    Verdict(crate::LandingVerdict),
+    NotEvaluatedForRecovery { state: RecoveryLandingState },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryLandingState {
+    NotEvaluatedForRecovery,
 }
 
 /// What a confirmed resolve did.
@@ -206,6 +226,29 @@ struct DigestInputV4<'a> {
     ignored_policy: &'a IgnoredPolicyProof<'a>,
 }
 
+/// V5 binds canonical repository identity, preserved content and checkout
+/// identity, while delivery targets, disposition and commit-ancestry results
+/// remain the original evidence snapshot in the manifest. Never add those
+/// evidence fields here.
+#[derive(serde::Serialize)]
+struct DigestInputV5<'a> {
+    schema_version: u32,
+    recovery_archive_schema_version: u32,
+    max_recovery_bundle_bytes: u64,
+    session_id: i64,
+    repository_path: &'a str,
+    worktree_path: &'a str,
+    branch_ref: &'a str,
+    branch_tip: Option<&'a str>,
+    head: &'a str,
+    staged_patch_sha256: &'a str,
+    unstaged_patch_sha256: &'a str,
+    untracked_files: &'a [ArchivedFile],
+    ignored_paths: &'a [IgnoredPath],
+    ignored_files: &'a [ArchivedFile],
+    ignored_policy: &'a IgnoredPolicyProof<'a>,
+}
+
 #[derive(serde::Serialize)]
 struct IgnoredPolicyProof<'a> {
     strict: bool,
@@ -232,12 +275,13 @@ struct RecoveryManifest<'a> {
     task: Option<&'a str>,
     worktree_path: &'a str,
     branch_ref: &'a str,
+    branch_tip: Option<&'a str>,
     disposition: &'a str,
     head: &'a str,
     /// Where `head` diverged from the primary checkout, when Git can say.
     base: Option<String>,
     delivery_targets: &'a [String],
-    landing: &'a crate::LandingVerdict,
+    landing: &'a RecoveryLandingAssessment,
     bundle: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bundle_bytes: Option<u64>,
@@ -282,7 +326,7 @@ fn legacy_v2_cleanup_resolve_digest(
         return Err("cannot compare a legacy archive against an unsupported resolve plan".into());
     }
     let digest_input = DigestInputV2 {
-        schema_version: plan.schema_version,
+        schema_version: LEGACY_CLEANUP_RESOLVE_SCHEMA_VERSION,
         session_id: plan.session_id,
         worktree_path: &plan.worktree_path,
         disposition: plan.disposition.as_str(),
@@ -304,15 +348,14 @@ fn legacy_v2_cleanup_resolve_digest(
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// V3 serialized the same fields as V4, but bound the complete ignored listing.
-/// Retain its exact domain and field order for archives from earlier runtimes.
+/// Frozen schema-v3 digest serialization. Retain its exact domain and field order.
 fn legacy_v3_cleanup_resolve_digest(
     plan: &CleanupResolvePlan,
     ignored_policy: &IgnoredPolicyProof<'_>,
 ) -> Result<String, String> {
     let input = DigestInputV3 {
-        schema_version: plan.schema_version,
-        recovery_archive_schema_version: 3,
+        schema_version: LEGACY_CLEANUP_RESOLVE_SCHEMA_VERSION,
+        recovery_archive_schema_version: PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION,
         max_recovery_bundle_bytes: 1_073_741_824,
         session_id: plan.session_id,
         worktree_path: &plan.worktree_path,
@@ -331,6 +374,38 @@ fn legacy_v3_cleanup_resolve_digest(
         .map_err(|error| format!("cannot encode legacy v3 plan digest: {error}"))?;
     let mut hasher = Sha256::new();
     hasher.update(b"aethyme-cleanup-resolve-v3\0");
+    hasher.update(serialized);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Frozen schema-v4 digest serialization used by some schema-v3 archives.
+/// Keep its evidence snapshot and field order exact.
+fn legacy_v4_cleanup_resolve_digest(
+    plan: &CleanupResolvePlan,
+    ignored_policy: &IgnoredPolicyProof<'_>,
+) -> Result<String, String> {
+    let bound_ignored_paths = authorization_ignored_paths(&plan.ignored_paths);
+    let input = DigestInputV4 {
+        schema_version: LEGACY_CLEANUP_RESOLVE_SCHEMA_VERSION,
+        recovery_archive_schema_version: PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION,
+        max_recovery_bundle_bytes: 1_073_741_824,
+        session_id: plan.session_id,
+        worktree_path: &plan.worktree_path,
+        disposition: plan.disposition.as_str(),
+        head: &plan.head,
+        delivery_targets: &plan.delivery_targets,
+        unlanded_commits: &plan.unlanded_commits,
+        staged_patch_sha256: &plan.staged_patch_sha256,
+        unstaged_patch_sha256: &plan.unstaged_patch_sha256,
+        untracked_files: &plan.untracked_files,
+        ignored_paths: &bound_ignored_paths,
+        ignored_files: &plan.ignored_files,
+        ignored_policy,
+    };
+    let serialized = serde_json::to_vec(&input)
+        .map_err(|error| format!("cannot encode legacy v4 plan digest: {error}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"aethyme-cleanup-resolve-v4\0");
     hasher.update(serialized);
     Ok(format!("{:x}", hasher.finalize()))
 }
@@ -719,6 +794,42 @@ impl Broker {
         inventory_output_bytes: usize,
         inventory_path_fields: usize,
     ) -> Result<CleanupResolvePlan, BrokerOpError> {
+        self.cleanup_resolve_plan_with_limits_and_eligibility(
+            session_id,
+            status_output_bytes,
+            status_path_fields,
+            inventory_output_bytes,
+            inventory_path_fields,
+            false,
+        )
+    }
+
+    /// Rebuild the full recovery inventory under the lifecycle claim even when
+    /// ordinary cleanup can now remove the session. The archive caller still
+    /// verifies the original archive and target-history monotonicity.
+    pub(crate) fn cleanup_resolve_revalidation_plan(
+        &self,
+        session_id: i64,
+    ) -> Result<CleanupResolvePlan, BrokerOpError> {
+        self.cleanup_resolve_plan_with_limits_and_eligibility(
+            session_id,
+            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+            true,
+        )
+    }
+
+    fn cleanup_resolve_plan_with_limits_and_eligibility(
+        &self,
+        session_id: i64,
+        status_output_bytes: usize,
+        status_path_fields: usize,
+        inventory_output_bytes: usize,
+        inventory_path_fields: usize,
+        allow_eligible: bool,
+    ) -> Result<CleanupResolvePlan, BrokerOpError> {
         let refuse = |reason: String| BrokerOpError::CleanupResolveRefused {
             id: session_id,
             reason,
@@ -737,13 +848,17 @@ impl Broker {
                     .into(),
             ));
         }
+        // Pin one delivery-target snapshot before the recovery-specific
+        // eligibility pass. It is the evidence snapshot the archive records.
+        let delivery_targets = self.cleanup_delivery_targets()?;
         let mut records = crate::measurement::SizeRecords::default();
-        let Some(item) = self.cleanup_item_scanned_with_status_limits(
+        let Some(item) = self.cleanup_item_for_recovery_archive_with_status_limits(
             &session,
             crate::SizeScan::Recorded,
             &mut records,
             status_output_bytes,
             status_path_fields,
+            &delivery_targets,
         )?
         else {
             return Err(refuse(
@@ -751,13 +866,7 @@ impl Broker {
             ));
         };
         match item.disposition {
-            CleanupDisposition::Eligible => {
-                return Err(refuse(format!(
-                    "cleanup can already remove it without an archive ({}); run \
-                     `aethyme broker finish cleanup {session_id}`",
-                    item.reason
-                )));
-            }
+            CleanupDisposition::Eligible => {}
             CleanupDisposition::UnsafePath | CleanupDisposition::InspectionFailed => {
                 return Err(refuse(format!(
                     "its worktree is {} ({}), which resolve does not archive",
@@ -791,10 +900,25 @@ impl Broker {
             ));
         }
         let head = checkout.head_commit()?;
-        let delivery_targets = self.cleanup_delivery_targets()?;
+        let branch_tip = item.branch_tip.clone();
+        if branch_tip.as_deref().is_some_and(|tip| tip != head) {
+            return Err(refuse(format!(
+                "the session branch tip {} differs from the worktree HEAD {}; refusing to archive only one of the two commits",
+                branch_tip.as_deref().unwrap_or_default(),
+                head
+            )));
+        }
+        if item.disposition == CleanupDisposition::Eligible && !allow_eligible {
+            return Err(refuse(format!(
+                "cleanup can already remove it without an archive ({}); run \
+                 `aethyme broker finish cleanup {session_id}`",
+                item.reason
+            )));
+        }
         let unlanded_commits = checkout.commits_not_on_any(&head, &delivery_targets)?;
-        let primary = self.repo_handle().head_commit()?;
-        let landing = crate::work_landed(self.repo_handle(), &head, &primary)?;
+        let landing = RecoveryLandingAssessment::NotEvaluatedForRecovery {
+            state: RecoveryLandingState::NotEvaluatedForRecovery,
+        };
         let (staged_patch_bytes, staged_patch_sha256) = {
             let staged = checkout.recovery_patch(true)?;
             let bytes = u64::try_from(staged.len())
@@ -863,16 +987,22 @@ impl Broker {
         let ignored_policy_sha256 = sha256_hex(&ignored_policy_bytes);
 
         let bound_ignored_paths = authorization_ignored_paths(&ignored_paths);
-        let digest_input = DigestInputV4 {
+        let repository_path = self
+            .main_root()
+            .canonicalize()
+            .map_err(|error| refuse(format!("cannot resolve repository identity: {error}")))?
+            .to_string_lossy()
+            .into_owned();
+        let digest_input = DigestInputV5 {
             schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
             recovery_archive_schema_version: RECOVERY_ARCHIVE_SCHEMA_VERSION,
             max_recovery_bundle_bytes: MAX_RECOVERY_BUNDLE_BYTES,
             session_id,
+            repository_path: &repository_path,
             worktree_path: &session.worktree_path,
-            disposition: item.disposition.as_str(),
+            branch_ref: &item.branch_ref,
+            branch_tip: branch_tip.as_deref(),
             head: &head,
-            delivery_targets: &delivery_targets,
-            unlanded_commits: &unlanded_commits,
             staged_patch_sha256: &staged_patch_sha256,
             unstaged_patch_sha256: &unstaged_patch_sha256,
             untracked_files: &untracked_files,
@@ -881,7 +1011,7 @@ impl Broker {
             ignored_policy: &ignored_policy_proof,
         };
         let mut hasher = Sha256::new();
-        hasher.update(b"aethyme-cleanup-resolve-v4\0");
+        hasher.update(b"aethyme-cleanup-resolve-v5\0");
         hasher
             .update(serde_json::to_vec(&digest_input).map_err(|error| refuse(error.to_string()))?);
         let digest = format!("{:x}", hasher.finalize());
@@ -894,8 +1024,10 @@ impl Broker {
             discard_command: item.force_cleanup_command.clone(),
             digest,
             session_id,
+            repository_path,
             worktree_path: session.worktree_path.clone(),
             branch_ref: item.branch_ref,
+            branch_tip,
             disposition: item.disposition,
             reason: item.reason,
             head,
@@ -990,7 +1122,7 @@ impl Broker {
         if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BrokerOpError::CleanupResolveConfirmationNotSha256);
         }
-        let plan = self.cleanup_resolve_plan(session_id)?;
+        let plan = self.cleanup_resolve_revalidation_plan(session_id)?;
         if plan.digest != confirm {
             return Err(BrokerOpError::CleanupResolveConfirmationMismatch {
                 id: session_id,
@@ -1096,7 +1228,7 @@ impl Broker {
         // The archive is complete and verified. Cleanup recomputes the full
         // plan under the lifecycle claim immediately before removing the tree.
         let cleanup_error = self
-            .cleanup_after_recovery_archive(session_id, &plan.digest, &archive)
+            .cleanup_after_recovery_archive(session_id, &plan, &archive)
             .err()
             .map(|e| e.to_string());
         let worktree_removed = cleanup_error.is_none();
@@ -1138,6 +1270,8 @@ struct StoredManifest {
     task: Option<String>,
     worktree_path: String,
     branch_ref: String,
+    #[serde(default)]
+    branch_tip: Option<String>,
     disposition: String,
     head: String,
     base: Option<String>,
@@ -1153,8 +1287,8 @@ struct StoredManifest {
     unstaged_patch: StoredPatch,
     untracked_directory: String,
     untracked_files: Vec<ArchivedFile>,
-    /// Absent only in legacy schema v1. `None` in schema v2/v3 is incomplete and
-    /// therefore cannot establish that an archive holds no ignored data.
+    /// Absent in archive schemas v1 through v3. `None` in schemas v2 through
+    /// v4 is incomplete and therefore cannot establish that ignored data is absent.
     #[serde(default)]
     ignored_directory: Option<String>,
     #[serde(default)]
@@ -1302,26 +1436,26 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
                 return Err("legacy manifest unexpectedly contains bundle integrity fields".into());
             }
         }
-        RECOVERY_ARCHIVE_SCHEMA_VERSION => match manifest.bundle.as_deref() {
-            Some(_) => {
-                let Some(bytes) = manifest.bundle_bytes else {
-                    return Err("schema v3 bundle is missing its byte length".into());
-                };
-                if bytes == 0 || bytes > MAX_RECOVERY_BUNDLE_BYTES {
-                    return Err("schema v3 bundle length is outside its supported bound".into());
+        PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION | RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+            match manifest.bundle.as_deref() {
+                Some(_) => {
+                    let Some(bytes) = manifest.bundle_bytes else {
+                        return Err("bundle archive is missing its byte length".into());
+                    };
+                    if bytes == 0 || bytes > MAX_RECOVERY_BUNDLE_BYTES {
+                        return Err("bundle archive length is outside its supported bound".into());
+                    }
+                    if !manifest.bundle_sha256.as_deref().is_some_and(valid_sha256) {
+                        return Err("bundle archive is missing a valid SHA-256".into());
+                    }
                 }
-                if !manifest.bundle_sha256.as_deref().is_some_and(valid_sha256) {
-                    return Err("schema v3 bundle is missing a valid SHA-256".into());
+                None => {
+                    if manifest.bundle_bytes.is_some() || manifest.bundle_sha256.is_some() {
+                        return Err("bundle archive has integrity fields without a bundle".into());
+                    }
                 }
             }
-            None => {
-                if manifest.bundle_bytes.is_some() || manifest.bundle_sha256.is_some() {
-                    return Err(
-                        "schema v3 manifest has bundle integrity fields without a bundle".into(),
-                    );
-                }
-            }
-        },
+        }
         version => return Err(format!("manifest schema {version} is not supported")),
     }
 
@@ -1331,10 +1465,15 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
         || manifest.worktree_path.is_empty()
         || !Path::new(&manifest.worktree_path).is_absolute()
         || manifest.branch_ref.is_empty()
-        || !matches!(
+        || manifest
+            .branch_tip
+            .as_deref()
+            .is_some_and(|tip| !valid_git_object_id(tip))
+        || !(matches!(
             manifest.disposition.as_str(),
             "dirty" | "pending_commits" | "unproven_provenance"
-        )
+        ) || (manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
+            && manifest.disposition == "eligible"))
         || !valid_git_object_id(&manifest.head)
         || manifest
             .base
@@ -1345,6 +1484,14 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
             .as_deref()
             .is_some_and(|task| task.contains('\0'))
         || manifest.landing.is_null()
+        || (manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
+            && !matches!(
+                manifest
+                    .landing
+                    .get("state")
+                    .and_then(serde_json::Value::as_str),
+                Some("landed" | "not_landed" | "not_evaluated_for_recovery")
+            ))
         || !manifest
             .delivery_targets
             .iter()
@@ -1406,20 +1553,22 @@ fn validate_archived_file_modes(
                 ));
             }
         }
-        PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION | RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+        PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        | PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        | RECOVERY_ARCHIVE_SCHEMA_VERSION => {
             #[cfg(unix)]
             if files
                 .iter()
                 .any(|file| !file.symlink && file.mode.is_none())
             {
                 return Err(format!(
-                    "schema v2/v3 {label} entry is missing its Unix file mode"
+                    "schema v2/v3/v4 {label} entry is missing its Unix file mode"
                 ));
             }
             #[cfg(not(unix))]
             if files.iter().any(|file| file.mode.is_some()) {
                 return Err(format!(
-                    "schema v2/v3 {label} file modes cannot be verified on this platform"
+                    "schema v2/v3/v4 {label} file modes cannot be verified on this platform"
                 ));
             }
         }
@@ -1465,10 +1614,12 @@ fn recovery_archive_expected_files(
             }
             &[][..]
         }
-        PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION | RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+        PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        | PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        | RECOVERY_ARCHIVE_SCHEMA_VERSION => {
             if manifest.ignored_directory.as_deref() != Some(IGNORED_DIRECTORY) {
                 return Err(
-                    "schema v2/v3 manifest is missing its ignored directory identity".into(),
+                    "schema v2/v3/v4 manifest is missing its ignored directory identity".into(),
                 );
             }
             validate_archived_file_modes(
@@ -1479,13 +1630,13 @@ fn recovery_archive_expected_files(
             let files = manifest
                 .ignored_files
                 .as_deref()
-                .ok_or_else(|| "schema v2/v3 manifest is missing ignored_files".to_string())?;
+                .ok_or_else(|| "schema v2/v3/v4 manifest is missing ignored_files".to_string())?;
             validate_archived_files("ignored", files)?;
             validate_archived_file_modes("ignored", files, manifest.schema_version)?;
             let ignored_paths = manifest
                 .ignored_paths
                 .as_deref()
-                .ok_or_else(|| "schema v2/v3 manifest is missing ignored_paths".to_string())?;
+                .ok_or_else(|| "schema v2/v3/v4 manifest is missing ignored_paths".to_string())?;
             if !manifest
                 .ignored_policy_sha256
                 .as_deref()
@@ -1493,7 +1644,8 @@ fn recovery_archive_expected_files(
                 || !manifest.plan_digest.as_deref().is_some_and(valid_sha256)
             {
                 return Err(
-                    "schema v2/v3 manifest has an invalid plan or ignored policy identity".into(),
+                    "schema v2/v3/v4 manifest has an invalid plan or ignored policy identity"
+                        .into(),
                 );
             }
             let mut previous: Option<&str> = None;
@@ -1503,11 +1655,11 @@ fn recovery_archive_expected_files(
                 if !is_contained_relative(trimmed)
                     || previous.is_some_and(|previous| previous >= path.path.as_str())
                 {
-                    return Err("schema v2/v3 ignored roots are invalid or unsorted".into());
+                    return Err("schema v2/v3/v4 ignored roots are invalid or unsorted".into());
                 }
                 if path.classification == IgnoredPathClassification::PreservedFile {
                     if path.path.ends_with('/') {
-                        return Err("schema v2/v3 preserved ignored path is a directory".into());
+                        return Err("schema v2/v3/v4 preserved ignored path is a directory".into());
                     }
                     preserved.push(path.path.as_str());
                 }
@@ -1662,7 +1814,9 @@ fn verify_recovery_archive_tree(root: &Path, manifest: &StoredManifest) -> Resul
             if !file.symlink
                 && matches!(
                     manifest.schema_version,
-                    PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION | RECOVERY_ARCHIVE_SCHEMA_VERSION
+                    PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION
+                        | PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
+                        | RECOVERY_ARCHIVE_SCHEMA_VERSION
                 )
                 && permission_mode(&metadata) != file.mode
             {
@@ -1673,8 +1827,10 @@ fn verify_recovery_archive_tree(root: &Path, manifest: &StoredManifest) -> Resul
             }
         }
     }
-    if manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
-        && let Some(bundle) = manifest.bundle.as_deref()
+    if matches!(
+        manifest.schema_version,
+        PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION | RECOVERY_ARCHIVE_SCHEMA_VERSION
+    ) && let Some(bundle) = manifest.bundle.as_deref()
     {
         let path = root.join(bundle);
         let (bytes, sha256) = hash_regular_file_no_follow(&path, MAX_RECOVERY_BUNDLE_BYTES)
@@ -1731,6 +1887,7 @@ fn verify_recovery_archive_payload_for_plan(
         .map_err(|error| format!("unreadable {MANIFEST_FILE}: {error}"))?;
     validate_manifest_identity(&manifest)?;
     verify_recovery_archive_tree(root, &manifest)?;
+    let mut informational_ignored_directories = false;
     let expected_plan_digest = match manifest.schema_version {
         PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
             let policy = crate::AutoCleanupPolicy::load(repository.root()).map_err(|reason| {
@@ -1747,27 +1904,32 @@ fn verify_recovery_archive_payload_for_plan(
             }
             Some(legacy_v2_cleanup_resolve_digest(plan, &proof)?)
         }
-        RECOVERY_ARCHIVE_SCHEMA_VERSION => {
-            if manifest.plan_digest.as_deref() == Some(plan.digest.as_str()) {
-                Some(plan.digest.clone())
+        PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+            let policy = crate::AutoCleanupPolicy::load(repository.root()).map_err(|reason| {
+                format!("cannot verify legacy ignored cleanup policy: {reason}")
+            })?;
+            let proof = IgnoredPolicyProof {
+                strict: policy.strict,
+                regenerable: &policy.regenerable,
+            };
+            let proof_bytes = serde_json::to_vec(&proof)
+                .map_err(|error| format!("cannot encode legacy ignored policy: {error}"))?;
+            if sha256_hex(&proof_bytes) != plan.ignored_policy_sha256 {
+                return Err("legacy archive ignored policy differs from the current plan".into());
+            }
+            let archived_digest = manifest.plan_digest.as_deref();
+            let v4 = legacy_v4_cleanup_resolve_digest(plan, &proof)?;
+            if archived_digest == Some(v4.as_str()) {
+                informational_ignored_directories = true;
+                Some(v4)
             } else {
-                let policy =
-                    crate::AutoCleanupPolicy::load(repository.root()).map_err(|reason| {
-                        format!("cannot verify legacy ignored cleanup policy: {reason}")
-                    })?;
-                let proof = IgnoredPolicyProof {
-                    strict: policy.strict,
-                    regenerable: &policy.regenerable,
-                };
-                let bytes = serde_json::to_vec(&proof)
-                    .map_err(|error| format!("cannot encode legacy ignored policy: {error}"))?;
-                if sha256_hex(&bytes) != plan.ignored_policy_sha256 {
-                    return Err(
-                        "legacy archive ignored policy differs from the current plan".into(),
-                    );
-                }
                 Some(legacy_v3_cleanup_resolve_digest(plan, &proof)?)
             }
+        }
+        RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+            informational_ignored_directories = true;
+            (manifest.plan_digest.as_deref() == Some(plan.digest.as_str()))
+                .then(|| plan.digest.clone())
         }
         _ => None,
     };
@@ -1778,22 +1940,28 @@ fn verify_recovery_archive_payload_for_plan(
         .is_none_or(|expected| manifest.plan_digest.as_deref() != Some(expected))
         || manifest.session_id != plan.session_id
         || !same_path(Path::new(&manifest.repository), repository.root())
+        || (manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
+            && !same_path(
+                Path::new(&manifest.repository),
+                Path::new(&plan.repository_path),
+            ))
         || manifest.worktree_path != plan.worktree_path
         || manifest.branch_ref != plan.branch_ref
+        || (manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
+            && manifest.branch_tip != plan.branch_tip)
         || manifest.disposition != plan.disposition.as_str()
         || manifest.head != plan.head
         || manifest.delivery_targets != plan.delivery_targets
         || manifest.unlanded_commits != plan.unlanded_commits
-        || manifest.landing != expected_landing
+        || (manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
+            && manifest.landing != expected_landing)
         || manifest.staged_patch.bytes != plan.staged_patch_bytes
         || manifest.staged_patch.sha256 != plan.staged_patch_sha256
         || manifest.unstaged_patch.bytes != plan.unstaged_patch_bytes
         || manifest.unstaged_patch.sha256 != plan.unstaged_patch_sha256
         || manifest.untracked_files != plan.untracked_files
         || !manifest.ignored_paths.as_deref().is_some_and(|paths| {
-            if manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
-                && manifest.plan_digest.as_deref() == Some(plan.digest.as_str())
-            {
+            if informational_ignored_directories {
                 authorization_ignored_paths(paths)
                     == authorization_ignored_paths(&plan.ignored_paths)
             } else {
@@ -1901,6 +2069,7 @@ impl Broker {
             manifest.schema_version,
             LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION
                 | PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION
+                | PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
                 | RECOVERY_ARCHIVE_SCHEMA_VERSION
         ) {
             return Err(format!(
@@ -2863,6 +3032,7 @@ where
         task,
         worktree_path: &plan.worktree_path,
         branch_ref: &plan.branch_ref,
+        branch_tip: plan.branch_tip.as_deref(),
         disposition: plan.disposition.as_str(),
         head: &plan.head,
         base: repository
@@ -2993,16 +3163,18 @@ mod tests {
             schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
             digest: sha256_hex(b"test reviewed plan"),
             session_id: 1,
+            repository_path: repo.root().to_string_lossy().into_owned(),
             worktree_path: tmp.path().to_string_lossy().into_owned(),
             branch_ref: "refs/heads/main".into(),
+            branch_tip: None,
             disposition: CleanupDisposition::Dirty,
             reason: String::new(),
             head: head.clone(),
             delivery_targets: vec![head],
-            landing: crate::LandingVerdict::NotLanded {
+            landing: RecoveryLandingAssessment::Verdict(crate::LandingVerdict::NotLanded {
                 examined: 0,
                 truncated: false,
-            },
+            }),
             unlanded_commits: Vec::new(),
             staged_patch_bytes: staged.len() as u64,
             staged_patch_sha256: sha256_hex(&staged),
@@ -3019,6 +3191,265 @@ mod tests {
             discard_command: String::new(),
         };
         (tmp, repo, plan)
+    }
+
+    fn closed_unique_commit_fixture(
+        task: &str,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        crate::test_storage::TestStorage,
+        Broker,
+        crate::types::Session,
+        PathBuf,
+        String,
+        String,
+        String,
+    ) {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+        let base = GitRepo::discover(&repository)
+            .unwrap()
+            .head_commit()
+            .unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker.start_worktree(task, None).unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        std::fs::write(worktree.join("unique.txt"), "session commit\n").unwrap();
+        git(&worktree, &["add", "unique.txt"]);
+        git(&worktree, &["commit", "-qm", "unique session content"]);
+        std::fs::write(worktree.join("preserve.txt"), "uncommitted recovery data\n").unwrap();
+        let head = GitRepo::discover(&worktree).unwrap().head_commit().unwrap();
+        let branch_ref = format!("refs/heads/{}", session.branch);
+        broker.close(session.id).unwrap();
+        (
+            owner, repository, storage, broker, session, worktree, base, head, branch_ref,
+        )
+    }
+
+    #[test]
+    fn recovery_archive_skips_exact_landing_search_and_records_explicit_state() {
+        let (_owner, _repository, _storage, mut broker, session, worktree, base, head, _branch) =
+            closed_unique_commit_fixture("recovery archive avoids landing scan");
+        std::fs::remove_file(worktree.join("preserve.txt")).unwrap();
+        let control_before = crate::representation::test_landing_search_calls();
+        crate::work_landed(broker.repo_handle(), &head, &base).unwrap();
+        assert!(crate::representation::test_landing_search_calls() > control_before);
+        let calls_before = crate::representation::test_landing_search_calls();
+        let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+        assert_eq!(
+            crate::representation::test_landing_search_calls(),
+            calls_before
+        );
+        assert!(!plan.unlanded_commits.is_empty());
+        assert_eq!(plan.head, head);
+        assert!(matches!(
+            &plan.landing,
+            RecoveryLandingAssessment::NotEvaluatedForRecovery { .. }
+        ));
+        assert_eq!(
+            serde_json::to_value(&plan.landing).unwrap()["state"],
+            "not_evaluated_for_recovery"
+        );
+
+        let outcome = broker
+            .cleanup_resolve_apply(session.id, &plan.digest)
+            .unwrap();
+        assert_eq!(
+            crate::representation::test_landing_search_calls(),
+            calls_before
+        );
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.archive.join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(manifest["landing"]["state"], "not_evaluated_for_recovery");
+        assert!(!worktree.exists());
+    }
+
+    #[test]
+    fn target_fast_forward_before_apply_preserves_content_confirmation() {
+        let (_owner, repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("recovery archive target advances before apply");
+        std::fs::remove_file(worktree.join("preserve.txt")).unwrap();
+        let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+        git(&repository, &["merge", "--ff-only", &session.branch]);
+        assert!(broker.cleanup_resolve_plan(session.id).is_err());
+        let revalidated = broker
+            .cleanup_resolve_revalidation_plan(session.id)
+            .unwrap();
+        assert_eq!(revalidated.disposition, CleanupDisposition::Eligible);
+        assert_eq!(revalidated.digest, plan.digest);
+        let outcome = broker
+            .cleanup_resolve_apply(session.id, &plan.digest)
+            .unwrap();
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        assert!(!worktree.exists());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.archive.join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(manifest["disposition"], "eligible");
+    }
+
+    #[test]
+    fn target_fast_forward_after_archive_keeps_original_evidence_and_allows_removal() {
+        let (_owner, repository, _storage, mut broker, session, worktree, _base, head, _branch) =
+            closed_unique_commit_fixture("recovery archive target fast-forward");
+        std::fs::remove_file(worktree.join("preserve.txt")).unwrap();
+        let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+        assert!(plan.unlanded_commits.contains(&head));
+        let original_targets = plan.delivery_targets.clone();
+        let repository_after_archive = repository.clone();
+        let branch = session.branch.clone();
+        let outcome = broker
+            .cleanup_resolve_apply_with_post_archive_hook(session.id, &plan.digest, move || {
+                git(&repository_after_archive, &["merge", "--ff-only", &branch]);
+            })
+            .unwrap();
+
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        assert!(!worktree.exists());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.archive.join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest["delivery_targets"],
+            serde_json::json!(original_targets)
+        );
+        assert_eq!(
+            manifest["unlanded_commits"],
+            serde_json::json!(plan.unlanded_commits)
+        );
+        assert_eq!(manifest["landing"]["state"], "not_evaluated_for_recovery");
+    }
+
+    #[test]
+    fn rewound_delivery_target_after_archive_refuses_removal() {
+        let (_owner, repository, _storage, mut broker, session, worktree, base, head, branch_ref) =
+            closed_unique_commit_fixture("recovery archive target rewind");
+        std::fs::write(repository.join("main-only.txt"), "later target\n").unwrap();
+        git(&repository, &["add", "main-only.txt"]);
+        git(&repository, &["commit", "-qm", "later delivery target"]);
+        let later_target = GitRepo::discover(&repository)
+            .unwrap()
+            .head_commit()
+            .unwrap();
+        let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+        assert!(plan.delivery_targets.contains(&later_target));
+        assert!(plan.unlanded_commits.contains(&head));
+
+        let repository_after_archive = repository.clone();
+        let reset_to = base.clone();
+        let outcome = broker
+            .cleanup_resolve_apply_with_post_archive_hook(session.id, &plan.digest, move || {
+                git(&repository_after_archive, &["reset", "--hard", &reset_to]);
+            })
+            .unwrap();
+
+        assert!(!outcome.worktree_removed, "{outcome:?}");
+        assert!(outcome.cleanup_error.is_some(), "{outcome:?}");
+        assert!(worktree.is_dir());
+        assert_eq!(
+            GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref(&branch_ref)
+                .as_deref(),
+            Some(head.as_str())
+        );
+        assert_eq!(
+            std::fs::read(worktree.join("preserve.txt")).unwrap(),
+            b"uncommitted recovery data\n"
+        );
+    }
+
+    #[test]
+    fn branch_tip_and_head_change_after_archive_keeps_worktree() {
+        let (_owner, _repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("recovery archive branch-tip change");
+        let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+        let changed_worktree = worktree.clone();
+        let outcome = broker
+            .cleanup_resolve_apply_with_post_archive_hook(session.id, &plan.digest, move || {
+                std::fs::write(changed_worktree.join("later.txt"), "new commit\n").unwrap();
+                git(&changed_worktree, &["add", "later.txt"]);
+                git(
+                    &changed_worktree,
+                    &["commit", "-qm", "change after archive"],
+                );
+            })
+            .unwrap();
+
+        assert!(!outcome.worktree_removed, "{outcome:?}");
+        assert!(outcome.cleanup_error.is_some(), "{outcome:?}");
+        assert!(worktree.is_dir());
+        assert_eq!(
+            std::fs::read(worktree.join("later.txt")).unwrap(),
+            b"new commit\n"
+        );
+    }
+
+    #[test]
+    fn vanished_worktree_does_not_delete_a_moved_session_branch() {
+        let (_owner, repository, _storage, mut broker, session, worktree, base, _head, branch_ref) =
+            closed_unique_commit_fixture("recovery archive vanished checkout");
+        let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+        let repository_after_archive = repository.clone();
+        let branch_ref_after_archive = branch_ref.clone();
+        let worktree_after_archive = worktree.clone();
+        let moved_tip = base.clone();
+        let outcome = broker
+            .cleanup_resolve_apply_with_post_archive_hook(session.id, &plan.digest, move || {
+                git(
+                    &repository_after_archive,
+                    &["update-ref", &branch_ref_after_archive, &moved_tip],
+                );
+                std::fs::remove_dir_all(&worktree_after_archive).unwrap();
+            })
+            .unwrap();
+
+        assert!(!outcome.worktree_removed, "{outcome:?}");
+        assert!(outcome.cleanup_error.is_some(), "{outcome:?}");
+        assert!(outcome.archive.join(MANIFEST_FILE).is_file());
+        assert!(!worktree.exists());
+        assert_eq!(
+            GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref(&branch_ref)
+                .as_deref(),
+            Some(base.as_str())
+        );
+    }
+
+    #[test]
+    fn branch_tip_mismatch_refuses_archive_without_dropping_branch_commit() {
+        let (_owner, repository, _storage, broker, session, worktree, base, head, branch_ref) =
+            closed_unique_commit_fixture("recovery archive mismatched branch tip");
+        git(&worktree, &["checkout", "--detach", &base]);
+        let error = broker
+            .cleanup_resolve_plan(session.id)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("session branch tip")
+                && error.contains("differs from the worktree HEAD"),
+            "{error}"
+        );
+        assert!(worktree.is_dir());
+        assert_eq!(
+            GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref(&branch_ref)
+                .as_deref(),
+            Some(head.as_str())
+        );
     }
 
     #[test]
@@ -3096,16 +3527,18 @@ mod tests {
             schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
             digest: String::new(),
             session_id: 9,
+            repository_path: "/tmp/aethyme-v2-repository".into(),
             worktree_path: "/tmp/aethyme-v2".into(),
             branch_ref: "refs/heads/main".into(),
+            branch_tip: None,
             disposition: CleanupDisposition::Dirty,
             reason: String::new(),
             head: "1".repeat(40),
             delivery_targets: vec!["2".repeat(40)],
-            landing: crate::LandingVerdict::NotLanded {
+            landing: RecoveryLandingAssessment::Verdict(crate::LandingVerdict::NotLanded {
                 examined: 1,
                 truncated: false,
-            },
+            }),
             unlanded_commits: vec!["3".repeat(40)],
             staged_patch_bytes: 0,
             staged_patch_sha256: "4".repeat(40),
@@ -3155,7 +3588,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn schema_v3_bundle_manifest_hashes_the_streamed_bundle() {
+    fn schema_v4_bundle_manifest_hashes_the_streamed_bundle() {
         let tmp = tempfile::tempdir().unwrap();
         git(tmp.path(), &["init", "-q", "-b", "main"]);
         std::fs::write(tmp.path().join("base.txt"), "base\n").unwrap();
@@ -3175,18 +3608,20 @@ mod tests {
         };
         let plan = CleanupResolvePlan {
             schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
-            digest: sha256_hex(b"v3 bundle fixture plan"),
+            digest: sha256_hex(b"v4 bundle fixture plan"),
             session_id: 9,
+            repository_path: repo.root().to_string_lossy().into_owned(),
             worktree_path: tmp.path().to_string_lossy().into_owned(),
             branch_ref: "refs/heads/main".into(),
+            branch_tip: Some(head.clone()),
             disposition: CleanupDisposition::Dirty,
             reason: "fixture".into(),
             head: head.clone(),
             delivery_targets: vec![delivered],
-            landing: crate::LandingVerdict::NotLanded {
+            landing: RecoveryLandingAssessment::Verdict(crate::LandingVerdict::NotLanded {
                 examined: 1,
                 truncated: false,
-            },
+            }),
             unlanded_commits: vec![head],
             staged_patch_bytes: 0,
             staged_patch_sha256: empty_patch.clone(),
@@ -3248,7 +3683,7 @@ mod tests {
                 .contains("outside its supported bound")
         );
 
-        let manifest_v3: StoredManifest = serde_json::from_value(value.clone()).unwrap();
+        let manifest_v4: StoredManifest = serde_json::from_value(value.clone()).unwrap();
         verify_recovery_archive_payload_for_plan(&repo, dir.path(), &plan).unwrap();
 
         let legacy_digest = legacy_v2_cleanup_resolve_digest(&plan, &proof).unwrap();
@@ -3256,6 +3691,7 @@ mod tests {
         legacy_value["schema_version"] =
             serde_json::json!(PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION);
         legacy_value["plan_digest"] = serde_json::json!(legacy_digest);
+        legacy_value.as_object_mut().unwrap().remove("branch_tip");
         legacy_value.as_object_mut().unwrap().remove("bundle_bytes");
         legacy_value
             .as_object_mut()
@@ -3273,7 +3709,7 @@ mod tests {
             .write_all(b"tamper")
             .unwrap();
         assert!(
-            verify_recovery_archive_tree(dir.path(), &manifest_v3)
+            verify_recovery_archive_tree(dir.path(), &manifest_v4)
                 .unwrap_err()
                 .contains("differs from its manifest integrity record")
         );
@@ -3425,6 +3861,7 @@ mod tests {
         );
 
         value["schema_version"] = serde_json::json!(LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION);
+        value.as_object_mut().unwrap().remove("branch_tip");
         for file in value["untracked_files"].as_array_mut().unwrap() {
             file.as_object_mut().unwrap().remove("mode");
         }
@@ -3445,7 +3882,7 @@ mod tests {
         let error = verify_recovery_archive_tree(dir.path(), &legacy).unwrap_err();
         assert!(error.contains("unlisted file"), "{error}");
 
-        value["schema_version"] = serde_json::json!(CLEANUP_RESOLVE_SCHEMA_VERSION);
+        value["schema_version"] = serde_json::json!(PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION);
         let missing_v2_field: StoredManifest = serde_json::from_value(value.clone()).unwrap();
         assert!(
             recovery_archive_expected_files(&missing_v2_field)
@@ -3493,6 +3930,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
         value["schema_version"] = serde_json::json!(PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION);
         value["plan_digest"] = serde_json::json!(legacy_digest);
+        value.as_object_mut().unwrap().remove("branch_tip");
         value.as_object_mut().unwrap().remove("bundle_bytes");
         value.as_object_mut().unwrap().remove("bundle_sha256");
         std::fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -3501,7 +3939,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v3_archive_with_previous_digest_remains_readable() {
+    fn schema_v3_archive_with_frozen_v3_and_v4_digests_remains_readable() {
         let (_tmp, repo, mut plan) = staged_checkout();
         let policy = crate::AutoCleanupPolicy::load(repo.root()).unwrap();
         let proof = IgnoredPolicyProof {
@@ -3509,16 +3947,41 @@ mod tests {
             regenerable: &policy.regenerable,
         };
         plan.ignored_policy_sha256 = sha256_hex(&serde_json::to_vec(&proof).unwrap());
-        let digest = legacy_v3_cleanup_resolve_digest(&plan, &proof).unwrap();
-        assert_ne!(digest, plan.digest);
+        plan.ignored_paths.push(IgnoredPath {
+            path: "old-cache/".into(),
+            classification: IgnoredPathClassification::DisposableDirectory,
+        });
+        let digest_v3 = legacy_v3_cleanup_resolve_digest(&plan, &proof).unwrap();
+        let digest_v4 = legacy_v4_cleanup_resolve_digest(&plan, &proof).unwrap();
+        assert_ne!(digest_v3, digest_v4);
         let dir = tempfile::tempdir().unwrap();
         write_verified_archive(&repo, &repo, &plan, None, dir.path()).unwrap();
         let path = dir.path().join(MANIFEST_FILE);
         let mut value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        value["plan_digest"] = serde_json::json!(digest);
-        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-        verify_recovery_archive_payload_for_plan(&repo, dir.path(), &plan).unwrap();
+        value["schema_version"] =
+            serde_json::json!(PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION);
+        value.as_object_mut().unwrap().remove("branch_tip");
+        for digest in [&digest_v4, &digest_v3] {
+            value["plan_digest"] = serde_json::json!(digest);
+            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            verify_recovery_archive_payload_for_plan(&repo, dir.path(), &plan).unwrap();
+            let mut added_directory = plan.clone();
+            added_directory.ignored_paths.push(IgnoredPath {
+                path: "new-cache/".into(),
+                classification: IgnoredPathClassification::DisposableDirectory,
+            });
+            let result =
+                verify_recovery_archive_payload_for_plan(&repo, dir.path(), &added_directory);
+            if digest == &digest_v4 {
+                result.unwrap();
+            } else {
+                assert!(
+                    result.is_err(),
+                    "the frozen v3 digest binds every ignored root"
+                );
+            }
+        }
 
         let mut changed = plan.clone();
         changed.delivery_targets.push("different-target".into());

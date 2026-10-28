@@ -64,6 +64,11 @@ expect_exact_performance_path() {
 
 expect_exact_performance_path 'performance workflow' '.github/workflows/product-performance.yml'
 expect_exact_performance_path 'performance budget policy' 'packages/aethyme-eval/benchmarks/performance/broker-budgets.json'
+expect_exact_performance_path 'action matrix budget contract' 'packages/aethyme-eval/benchmarks/performance/broker-action-matrix-v2.json'
+expect_exact_performance_path 'action matrix scenario contract' 'packages/aethyme-eval/benchmarks/performance/broker-action-scenarios-v1.json'
+expect_exact_performance_path 'action matrix harness' 'packages/aethyme-eval/benchmarks/performance/broker_action_matrix.py'
+expect_exact_performance_path 'concurrent broker benchmark' 'packages/aethyme-eval/benchmarks/performance/broker_concurrent_submit.py'
+expect_exact_performance_path 'concurrent broker benchmark tests' 'packages/aethyme-eval/benchmarks/performance/test_broker_concurrent_submit.py'
 expect_exact_performance_path 'standalone Python benchmark' 'packages/aethyme-eval/benchmarks/performance/broker_latency.py'
 expect_exact_performance_path 'Python benchmark tests' 'packages/aethyme-eval/benchmarks/performance/test_broker_latency.py'
 expect_exact_performance_path 'performance report guide' 'packages/aethyme/docs/guides/broker-performance.md'

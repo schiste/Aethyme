@@ -159,7 +159,7 @@ impl Default for RetentionPolicy {
             terminal_merge_queue_days: 180,
             command_metrics_days: 30,
             closed_worktrees_days: 7,
-            closed_worktree_grace_hours: 24,
+            closed_worktree_grace_hours: 15 * 24,
             auto_cleanup_worktrees_on_finish: true,
             publication_exposure_days: 30,
             retained_bytes_budget: 1_073_741_824,
@@ -1280,6 +1280,7 @@ mod tests {
         assert!(policy.terminal_events_days >= policy.gate_results_days);
         assert!(policy.terminal_merge_queue_days >= policy.gate_results_days);
         assert!(policy.startup_budget_ms <= 25);
+        assert_eq!(policy.closed_worktree_grace_hours, 360);
         assert_eq!(policy.artifact_reclaim_days, 0);
         assert_eq!(policy.artifact_sweep_budget_ms, 5_000);
         assert_eq!(policy.routine_size_budget_ms, 200);

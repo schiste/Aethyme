@@ -1307,12 +1307,40 @@ impl BrokerStore {
         Ok(ids)
     }
 
+    /// Release every unreleased lease kind held by `session_id` on `path`.
+    /// This path-wide helper is retained for internal lifecycle operations.
     pub fn release_lease(&mut self, session_id: i64, path: &str) -> Result<(), BrokerError> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
         tx.execute(
             "UPDATE leases SET released_at = ?3
              WHERE session_id = ?1 AND path = ?2 AND released_at IS NULL",
+            params![session_id, path, now],
+        )?;
+        insert_event(
+            &tx,
+            now,
+            crate::events::LEASE_RELEASED,
+            Some(session_id),
+            Some(&crate::events::lease_path_payload(path)),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Release only `session_id`'s explicit claim on exactly `path`.
+    /// Implicit diff-derived lease rows are left unchanged.
+    pub(crate) fn release_explicit_lease(
+        &mut self,
+        session_id: i64,
+        path: &str,
+    ) -> Result<(), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE leases SET released_at = ?3
+             WHERE session_id = ?1 AND path = ?2
+               AND kind = 'explicit' AND released_at IS NULL",
             params![session_id, path, now],
         )?;
         insert_event(

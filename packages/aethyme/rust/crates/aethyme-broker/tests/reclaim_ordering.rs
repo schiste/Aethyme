@@ -46,12 +46,13 @@ fn now_ms() -> i64 {
 /// `artifact_sweep_budget_ms = 0` disables the autonomous startup sweep: it
 /// would otherwise reclaim the fixture's build caches on the next
 /// `Broker::open`, and this test needs them to still be there to be ordered.
+/// Disable close grace explicitly: these fixtures test ordering, not eligibility.
 fn write_policy(main_root: &Path, retained_bytes_budget: u64) {
     std::fs::create_dir_all(main_root.join(".aethyme")).unwrap();
     std::fs::write(
         main_root.join(".aethyme/broker.toml"),
         format!(
-            "[retention]\nterminal_events_days = 1\ngate_results_days = 1\nterminal_merge_queue_days = 1\ncommand_metrics_days = 1\nclosed_worktrees_days = 1\nartifact_reclaim_days = 1\nartifact_sweep_budget_ms = 0\nstartup_budget_ms = 5\nretained_bytes_budget = {retained_bytes_budget}\n"
+            "[retention]\nterminal_events_days = 1\ngate_results_days = 1\nterminal_merge_queue_days = 1\ncommand_metrics_days = 1\nclosed_worktrees_days = 1\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 1\nartifact_sweep_budget_ms = 0\nstartup_budget_ms = 5\nretained_bytes_budget = {retained_bytes_budget}\n"
         ),
     )
     .unwrap();

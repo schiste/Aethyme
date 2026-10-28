@@ -3,6 +3,7 @@
 //! Planning is observational: remote Git inspection and proposal generation
 //! happen in a disposable clone, never in the operator's checkout.
 
+use std::fmt::Write as FmtWrite;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -11,9 +12,17 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::repository_upgrade::{RepositoryTreeChange, RepositoryUpgradePlan};
+use crate::repository_upgrade::{
+    RepositoryPathOwnership, RepositoryTreeChange, RepositoryUpgradePlan,
+};
+use crate::terminal_preview::{
+    DIFF_PREVIEW_LIMIT_BYTES, bounded_terminal_text_preview, escape_terminal_field,
+};
 
 const PLAN_SCHEMA_VERSION: u32 = 1;
+const CHANGE_INVENTORY_OUTPUT_LIMIT_BYTES: usize = 512 * 1024;
+const CHANGE_INVENTORY_TRUNCATION_NOTICE: &str =
+    "[rendered preview truncated at a complete line boundary; output byte limit reached]\n";
 const RUNTIME_EXCLUDE_BLOCK: &str = "# BEGIN Aethyme first-enrollment runtime\n/.aethyme/\n# END Aethyme first-enrollment runtime\n";
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -246,15 +255,17 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             if confirm.is_some() {
                 return Err("deploy plan does not accept --confirm".into());
             }
-            let plan = build_plan(&repo)?;
             if diff {
-                render_change_inventory(&plan);
+                let (plan, migration_diff) = build_plan_with_diff(&repo)?;
+                print!("{}", render_change_inventory(&plan, &migration_diff));
             } else if json {
+                let plan = build_plan(&repo)?;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&plan).map_err(|error| error.to_string())?
                 );
             } else {
+                let plan = build_plan(&repo)?;
                 render_plan(&plan);
             }
         }
@@ -298,6 +309,10 @@ fn run_inner(args: &[String]) -> Result<(), String> {
 }
 
 pub fn build_plan(repo_hint: &Path) -> Result<FirstEnrollmentPlan, String> {
+    build_plan_with_diff(repo_hint).map(|(plan, _)| plan)
+}
+
+fn build_plan_with_diff(repo_hint: &Path) -> Result<(FirstEnrollmentPlan, String), String> {
     let repo = aethyme_broker::GitRepo::discover(repo_hint).map_err(|error| error.to_string())?;
     let main_root = repo.main_root().map_err(|error| error.to_string())?;
     let remote = "origin";
@@ -315,8 +330,8 @@ pub fn build_plan(repo_hint: &Path) -> Result<FirstEnrollmentPlan, String> {
     let integration_sha = repo.resolve_ref(&integration_ref);
 
     let disposable = DisposableRemoteTree::new(&main_root, remote, &remote_default)?;
-    let generated_tree =
-        crate::repository_upgrade::initial_enrollment_plan(&disposable.root, None)?;
+    let (generated_tree, generated_diff) =
+        crate::repository_upgrade::initial_enrollment_plan_with_diff(&disposable.root, None)?;
     let planned_paths = generated_tree.planned_paths.clone();
     let generated_changes = generated_tree.changes.clone();
     let dirty_paths = repo.dirty_paths().map_err(|error| error.to_string())?;
@@ -481,7 +496,7 @@ pub fn build_plan(repo_hint: &Path) -> Result<FirstEnrollmentPlan, String> {
     } else {
         "resolve every blocker, then regenerate `aethyme deploy plan --repo .`".into()
     };
-    Ok(FirstEnrollmentPlan {
+    let plan = FirstEnrollmentPlan {
         schema_version: PLAN_SCHEMA_VERSION,
         remote_base,
         local_default,
@@ -509,7 +524,8 @@ pub fn build_plan(repo_hint: &Path) -> Result<FirstEnrollmentPlan, String> {
         warnings,
         plan_digest,
         next_action,
-    })
+    };
+    Ok((plan, generated_diff))
 }
 
 pub fn execute(repo_hint: &Path, confirmation: &str) -> Result<FirstEnrollmentExecution, String> {
@@ -1416,26 +1432,303 @@ fn render_plan(plan: &FirstEnrollmentPlan) {
     println!("Next: {}", plan.next_action);
 }
 
-fn render_change_inventory(plan: &FirstEnrollmentPlan) {
-    println!(
-        "First-enrollment change inventory for {}:",
-        plan.remote_base.exact_sha
+fn render_change_inventory(plan: &FirstEnrollmentPlan, migration_diff: &str) -> String {
+    let mut rendered = String::new();
+    let remote = escape_terminal_field(&plan.remote_base.remote);
+    let default_branch_ref = escape_terminal_field(&plan.remote_base.default_branch_ref);
+    let _ = writeln!(
+        rendered,
+        "First-enrollment generated output preview for {}:",
+        remote
     );
-    for change in &plan.generated_changes {
-        println!(
-            "  {:?} {} {} -> {} ({:?})",
-            change.action,
-            change.path,
-            change.before_sha256.as_deref().unwrap_or("missing"),
-            change.after_sha256.as_deref().unwrap_or("missing"),
-            change.ownership,
+    let _ = writeln!(
+        rendered,
+        "Configured origin/default ref: {}/{} @ {}",
+        remote, default_branch_ref, plan.remote_base.exact_sha
+    );
+    let _ = writeln!(
+        rendered,
+        "Generated outputs grouped by ownership; per-file generator-source mapping is unavailable."
+    );
+    let _ = writeln!(rendered, "Plan digest: {}", plan.plan_digest);
+    let _ = writeln!(
+        rendered,
+        "Raw generated diff: {} bytes; SHA-256 (raw) {}",
+        migration_diff.len(),
+        plan.generated_tree.diff_sha256
+    );
+    for (ownership, title) in [
+        (
+            RepositoryPathOwnership::AethymeOwned,
+            "  Aethyme-owned outputs:",
+        ),
+        (
+            RepositoryPathOwnership::ManagedBlock,
+            "  Managed-block outputs:",
+        ),
+        (
+            RepositoryPathOwnership::RepositoryOwned,
+            "  Repository-owned policy/config outputs:",
+        ),
+    ] {
+        let _ = writeln!(rendered, "{title}");
+        let mut found = false;
+        for change in &plan.generated_changes {
+            if change.ownership != ownership {
+                continue;
+            }
+            found = true;
+            let _ = writeln!(
+                rendered,
+                "    {:?} {} {} -> {}",
+                change.action,
+                escape_terminal_field(&change.path),
+                change.before_sha256.as_deref().unwrap_or("missing"),
+                change.after_sha256.as_deref().unwrap_or("missing")
+            );
+        }
+        if !found {
+            let _ = writeln!(rendered, "    (none)");
+        }
+    }
+    rendered.push_str("Migration diff:\n");
+    if migration_diff.is_empty() {
+        rendered.push_str("(no changes)\n");
+        return bound_change_inventory_output(rendered);
+    }
+
+    let (preview, truncated) =
+        bounded_terminal_text_preview(migration_diff, DIFF_PREVIEW_LIMIT_BYTES);
+    rendered.push_str(&preview);
+    if !preview.ends_with('\n') {
+        rendered.push('\n');
+    }
+    if truncated {
+        let _ = writeln!(
+            rendered,
+            "[terminal-safe diff preview truncated at a complete line boundary: showing {} escaped bytes from {} raw diff bytes; raw SHA-256 covers the complete proposal]",
+            preview.len(),
+            migration_diff.len()
         );
     }
-    println!("Plan digest: {}", plan.plan_digest);
+    bound_change_inventory_output(rendered)
+}
+
+fn bound_change_inventory_output(rendered: String) -> String {
+    let preview_limit = CHANGE_INVENTORY_OUTPUT_LIMIT_BYTES
+        .saturating_sub(CHANGE_INVENTORY_TRUNCATION_NOTICE.len());
+    let (mut preview, truncated) = bounded_terminal_text_preview(&rendered, preview_limit);
+    if truncated {
+        preview.push_str(CHANGE_INVENTORY_TRUNCATION_NOTICE);
+    }
+    preview
 }
 
 fn print_usage() {
     println!("Usage:");
     println!("  aethyme deploy plan [--repo <path>] [--diff|--json]");
     println!("  aethyme deploy execute [--repo <path>] --confirm <plan-sha256> [--json]");
+}
+
+#[cfg(test)]
+mod diff_preview_tests {
+    use super::{
+        CHANGE_INVENTORY_OUTPUT_LIMIT_BYTES, CHANGE_INVENTORY_TRUNCATION_NOTICE,
+        EnrollmentLocalRef, EnrollmentRemoteBase, FirstEnrollmentPlan, HookManagerKind,
+        HookManagerState, bound_change_inventory_output, bounded_terminal_text_preview,
+        escape_terminal_field, render_change_inventory,
+    };
+    use crate::repository_upgrade::{
+        CommandCapability, CompatibilityDecision, CompatibilityExecution, CompatibilitySeverity,
+        InvocationSurface, RepositoryCompatibility, RepositoryMode, RepositoryPathOwnership,
+        RepositoryTreeAction, RepositoryTreeChange, RepositoryUpgradePlan,
+    };
+
+    fn renderer_test_plan(path: &str) -> FirstEnrollmentPlan {
+        let change = RepositoryTreeChange {
+            path: path.into(),
+            action: RepositoryTreeAction::Update,
+            before_sha256: Some("a".repeat(64)),
+            after_sha256: Some("b".repeat(64)),
+            file_mode: Some("100644".into()),
+            ownership: RepositoryPathOwnership::AethymeOwned,
+            requires_resolution: false,
+        };
+        let generated_tree = RepositoryUpgradePlan {
+            schema_version: 1,
+            mode: RepositoryMode::Canonical,
+            from_schema: 0,
+            to_schema: 1,
+            repository_head: "c".repeat(40),
+            existing_managed_state_digest: "d".repeat(64),
+            compatibility: CompatibilityDecision {
+                repository: RepositoryCompatibility::Current,
+                repository_schema: Some(1),
+                capability: CommandCapability::Upgrade,
+                surface: InvocationSurface::UpgradeCommand,
+                allowed: true,
+                severity: CompatibilitySeverity::Info,
+                execution: CompatibilityExecution::Normal,
+                reason: "test".into(),
+                remediation: None,
+            },
+            active_sessions: vec![],
+            dirty_paths: vec![],
+            overlapping_dirty_paths: vec![],
+            disjoint_dirty_paths: vec![],
+            relevant_leases: vec![],
+            shared_policy_or_gate_migration: false,
+            warnings: vec![],
+            migrations: vec![],
+            changes: vec![change.clone()],
+            customizations: vec![],
+            resolution_choices: vec![],
+            planned_paths: vec![path.into()],
+            examined_paths: vec![path.into()],
+            diff_sha256: "e".repeat(64),
+            applied: false,
+            safe: true,
+            blockers: vec![],
+            plan_digest: "f".repeat(64),
+            next_action: "test".into(),
+        };
+
+        FirstEnrollmentPlan {
+            schema_version: 1,
+            remote_base: EnrollmentRemoteBase {
+                remote: "origin".into(),
+                default_branch_ref: "refs/heads/main".into(),
+                exact_sha: "c".repeat(40),
+            },
+            local_default: EnrollmentLocalRef {
+                ref_name: "refs/heads/main".into(),
+                exact_sha: Some("c".repeat(40)),
+            },
+            integration: EnrollmentLocalRef {
+                ref_name: "refs/heads/aethyme/integration".into(),
+                exact_sha: None,
+            },
+            local_ahead_upstream_commits: 0,
+            local_behind_upstream_commits: 0,
+            integration_can_rebase_to_upstream: true,
+            generated_tree,
+            generated_changes: vec![change],
+            planned_paths: vec![path.into()],
+            dirty_paths: vec![],
+            overlapping_dirty_paths: vec![],
+            disjoint_dirty_paths: vec![],
+            live_session_ids: vec![],
+            nonterminal_queue_entry_ids: vec![],
+            hook_manager: HookManagerState {
+                kind: HookManagerKind::Absent,
+                configured_value_sha256: None,
+            },
+            shared_activation_present: false,
+            shared_activation_sha256: None,
+            local_exclude_before_sha256: "0".repeat(64),
+            local_exclude_after_sha256: "0".repeat(64),
+            local_exclude_update_required: false,
+            preservation_refs: vec![],
+            safe: true,
+            blockers: vec![],
+            warnings: vec![],
+            plan_digest: "f".repeat(64),
+            next_action: "test".into(),
+        }
+    }
+
+    #[test]
+    fn bounded_preview_keeps_utf8_complete_lines_and_reports_truncation() {
+        let diff = "header\nλ content beyond the limit\nnext\n";
+        let (preview, truncated) = bounded_terminal_text_preview(diff, 10);
+
+        assert!(truncated);
+        assert_eq!(preview, "header\n");
+        assert!(preview.len() <= 10);
+        assert!(std::str::from_utf8(preview.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn bounded_preview_does_not_split_a_very_long_first_line() {
+        let diff = "λ".repeat(32);
+        let (preview, truncated) = bounded_terminal_text_preview(&diff, 7);
+
+        assert!(truncated);
+        assert!(preview.is_empty());
+    }
+
+    #[test]
+    fn bounded_preview_keeps_complete_diff_when_within_limit() {
+        let diff = "diff --git a/file b/file\n";
+        let (preview, truncated) = bounded_terminal_text_preview(diff, diff.len());
+
+        assert!(!truncated);
+        assert_eq!(preview, diff);
+    }
+
+    #[test]
+    fn procfile_preview_escapes_terminal_controls_before_bounding() {
+        let diff = "diff --git a/Procfile b/Procfile\n@@ -1 +1 @@\n-echo old\n+printf '\u{1b}[31mowned\u{1b}[0m'\n";
+        let (preview, truncated) = bounded_terminal_text_preview(diff, 256);
+
+        assert!(!truncated);
+        assert!(preview.contains(r"\u{1b}[31mowned\u{1b}[0m"));
+        assert!(preview.contains('\n'));
+        assert!(
+            !preview
+                .chars()
+                .any(|character| { character.is_control() && !matches!(character, '\n' | '\t') })
+        );
+    }
+
+    #[test]
+    fn enrollment_renderer_escapes_procfile_and_path_controls() {
+        let path = "Procfile\u{1b}\nname";
+        let plan = renderer_test_plan(path);
+        let diff = "diff --git a/Procfile b/Procfile\n@@ -1 +1 @@\n-echo old\n+printf '\u{1b}[31mowned\u{1b}[0m'\n";
+        let rendered = render_change_inventory(&plan, diff);
+
+        assert!(rendered.contains("Configured origin/default ref: origin/refs/heads/main"));
+        assert!(rendered.contains(r"Procfile\u{1b}\nname"));
+        assert!(rendered.contains(r"\u{1b}[31mowned\u{1b}[0m"));
+        assert!(rendered.contains("SHA-256 (raw)"));
+        assert!(!rendered.contains("Canonical source:"));
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(rendered.len() <= CHANGE_INVENTORY_OUTPUT_LIMIT_BYTES);
+    }
+
+    #[test]
+    fn preview_limit_applies_after_control_escape_expansion() {
+        let diff = format!("header\n+{}\nnext\n", "\u{1b}".repeat(24));
+        let (preview, truncated) = bounded_terminal_text_preview(&diff, 20);
+
+        assert!(truncated);
+        assert_eq!(preview, "header\n");
+        assert!(preview.len() <= 20);
+    }
+
+    #[test]
+    fn single_line_inventory_fields_escape_all_terminal_controls() {
+        assert_eq!(
+            escape_terminal_field("Procfile\u{1b}\n\tname"),
+            r"Procfile\u{1b}\n\tname"
+        );
+    }
+
+    #[test]
+    fn complete_inventory_output_stays_bounded_after_escaping() {
+        let rendered = format!(
+            "header\n{}\n",
+            "\u{1b}".repeat(CHANGE_INVENTORY_OUTPUT_LIMIT_BYTES)
+        );
+        let output = bound_change_inventory_output(rendered);
+
+        assert!(output.len() <= CHANGE_INVENTORY_OUTPUT_LIMIT_BYTES);
+        assert!(output.ends_with(CHANGE_INVENTORY_TRUNCATION_NOTICE));
+        assert!(
+            !output
+                .chars()
+                .any(|character| character.is_control() && character != '\n')
+        );
+    }
 }

@@ -1,9 +1,13 @@
 """Fast, dependency-free controls for the warning policy; no builds or broker calls."""
 import copy
+import hashlib
 import json
+import os
 from pathlib import Path
-import unittest
+import subprocess
+import sys
 import tempfile
+import unittest
 from unittest.mock import patch
 
 from broker_latency import (
@@ -16,6 +20,22 @@ from broker_latency import (
     validate_aged_released_resource_lease_count,
     validate_session_count,
     validate_resource_inventory,
+)
+from broker_action_matrix import (
+    _commit_argv,
+    _commit_git_isolation_context,
+    _create_commit_git_proxy,
+    _baseline_unsupported_fetch_option,
+    FETCH_FLAGS,
+    _classify_deploy_preview,
+    _compare_action,
+    _fetch_profile_witness,
+    _missing_fetch_witness_semantic,
+    _parse_deploy_preview,
+    compare_samples,
+    load_contracts,
+    load_v41_context,
+    paired_order,
 )
 
 
@@ -90,6 +110,495 @@ class BudgetPolicyTests(unittest.TestCase):
                              ('statistic', 'minimum'), ('unit', 'seconds')):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 assess({**self.budgets, field: value}, self.samples)
+
+
+class PairedActionMatrixTests(unittest.TestCase):
+    def setUp(self):
+        self.contracts = load_contracts()
+        self.paired = dict(self.contracts['matrix']['paired_comparison'])
+
+    def test_action_contract_references_v1_budgets_without_changing_them(self):
+        self.assertEqual(self.contracts['absolute_budgets']['schema_version'], 1)
+        self.assertEqual(
+            self.contracts['matrix']['absolute_budget_reference'],
+            {'path': 'broker-budgets.json', 'schema_version': 1})
+        scenarios = {row['id']: row for row in self.contracts['scenario_manifest']['scenarios']}
+        self.assertEqual(scenarios['status_aged_history']['history_rows'],
+                         self.contracts['matrix']['runner']['history_rows'])
+        self.assertEqual(scenarios['fetch_unprovable']['kind'], 'semantic_control')
+
+    def test_malformed_action_contract_types_fail_with_value_error(self):
+        for field, value in (('kind', []), ('absolute_budget', [])):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                matrix_path = directory / 'broker-action-matrix-v2.json'
+                scenarios_path = directory / 'broker-action-scenarios-v1.json'
+                absolute_path = directory / 'broker-budgets.json'
+                matrix_path.write_bytes(self.contracts['matrix_bytes'])
+                absolute_path.write_bytes(self.contracts['absolute_bytes'])
+                manifest = copy.deepcopy(self.contracts['scenario_manifest'])
+                target = next(row for row in manifest['scenarios']
+                              if row['id'] == 'status_summary')
+                target[field] = value
+                scenarios_path.write_text(json.dumps(manifest), encoding='utf-8')
+                with self.assertRaises(ValueError):
+                    load_contracts(matrix_path, scenarios_path, absolute_path)
+
+    def test_pair_order_alternates_and_rejects_invalid_indices(self):
+        self.assertEqual(paired_order(0), ('baseline', 'candidate'))
+        self.assertEqual(paired_order(1), ('candidate', 'baseline'))
+        self.assertEqual(paired_order(2), ('baseline', 'candidate'))
+        for value in (-1, True, 1.5):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                paired_order(value)
+
+    def test_comparison_warns_only_above_percent_or_jitter_floor(self):
+        values = {'repetitions': 5, 'max_regression_percent': 10,
+                  'absolute_jitter_floor_ms': 100}
+        at_threshold = compare_samples([1_000] * 5, [1_100] * 5, values)
+        above_threshold = compare_samples([1_000] * 5, [1_101] * 5, values)
+        zero_baseline = compare_samples([0] * 5, [100] * 5, values)
+        self.assertEqual(at_threshold['verdict'], 'within_warning_band')
+        self.assertEqual(above_threshold['verdict'], 'warning')
+        self.assertEqual(zero_baseline['verdict'], 'within_warning_band')
+        self.assertEqual(above_threshold['enforcement'], 'warning')
+        self.assertEqual(above_threshold['sample_count'], 5)
+
+    def test_missing_strict_fetch_witness_is_not_a_timing_sample(self):
+        baseline = [{'status': 'complete', 'semantic': {
+            'fetch_provable': {'status': 'unsupported', 'comparison_eligible': False,
+                               'reason': 'baseline has no durable provider witness'}}}]
+        candidate = [{'status': 'complete', 'timings_ms': {'fetch_provable': 5.0},
+                      'semantic': {'fetch_provable': {'status': 'verified',
+                                                     'comparison_eligible': True}}}]
+        result = _compare_action(baseline, candidate, 'fetch_provable',
+                                 {**self.paired, 'repetitions': 1})
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertIn('baseline has no durable provider witness', result['reason'])
+        self.assertNotIn('baseline_median_ms', result)
+
+    @staticmethod
+    def deploy_preview(source='a' * 40, plan_digest='b' * 64, full_bytes=0,
+                       full_sha=('e3b0c44298fc1c149afbf4c8996fb924'
+                                 '27ae41e4649b934ca495991b7852b855'),
+                       migration_body='(no changes)\n', notices=''):
+        header = '\n'.join((
+            'First-enrollment generated output preview for origin:',
+            f'Configured origin/default ref: origin/refs/heads/main @ {source}',
+            'Generated outputs grouped by ownership; per-file generator-source mapping is unavailable.',
+            f'Plan digest: {plan_digest}',
+            f'Raw generated diff: {full_bytes} bytes; SHA-256 (raw) {full_sha}',
+            'Aethyme-owned outputs:',
+            'Managed-block outputs:',
+            'Repository-owned policy/config outputs:',
+        ))
+        return f'{header}\nMigration diff:\n{migration_body}{notices}'
+
+    def test_generator_inventory_can_be_supported_without_generated_content(self):
+        diff = 'diff --git a/a b/a\n' * 20
+        shown = 'diff --git a/a b/a\n'
+        notice = (
+            '[terminal-safe diff preview truncated at a complete line boundary: '
+            f'showing {len(shown.encode())} escaped bytes from {len(diff.encode())} raw diff bytes; '
+            'raw SHA-256 covers the complete proposal]\n')
+        preview = self.deploy_preview(
+            full_bytes=len(diff.encode()), full_sha='c' * 64,
+            migration_body=shown, notices=notice)
+        result = _parse_deploy_preview(preview, 'a' * 40)
+        self.assertTrue(result['inventory_supported'])
+        self.assertFalse(result['generated_content_available'])
+        self.assertTrue(result['source_matches_seed'])
+        self.assertTrue(result['truncation_explicit'])
+
+    def test_zero_byte_generated_diff_is_still_available_content(self):
+        result = _parse_deploy_preview(self.deploy_preview(), 'a' * 40)
+        self.assertTrue(result['inventory_supported'])
+        self.assertTrue(result['generated_content_available'])
+        self.assertEqual(result['content_identity']['raw_diff_bytes'], 0)
+
+    def test_actual_untruncated_enrollment_diff_format_is_comparable_content(self):
+        diff = 'diff --git a/file b/file\n'
+        preview = self.deploy_preview(
+            plan_digest='b' * 64, full_bytes=len(diff.encode()), full_sha='c' * 64,
+            migration_body=diff)
+        result = _parse_deploy_preview(preview, 'a' * 40)
+        self.assertTrue(result['inventory_supported'])
+        self.assertTrue(result['generated_content_available'])
+        self.assertEqual(result['content_identity']['raw_diff_sha256'], 'c' * 64)
+
+    def test_word_truncated_in_generated_diff_is_not_a_renderer_notice(self):
+        diff = 'diff --git a/file b/file\n+This text was truncated earlier\n'
+        result = _parse_deploy_preview(
+            self.deploy_preview(full_bytes=len(diff.encode()), full_sha='c' * 64,
+                                migration_body=diff), 'a' * 40)
+        self.assertFalse(result['truncation_explicit'])
+        self.assertTrue(result['generated_content_available'])
+
+    def test_outer_inventory_truncation_keeps_content_unavailable(self):
+        notice = '[rendered preview truncated at a complete line boundary; output byte limit reached]\n'
+        diff = 'diff --git a/file b/file\n'
+        preview = self.deploy_preview(
+            full_bytes=len(diff.encode()), full_sha='c' * 64,
+            migration_body=diff, notices=notice)
+        result = _parse_deploy_preview(preview, 'a' * 40)
+        self.assertTrue(result['inventory_supported'])
+        self.assertFalse(result['generated_content_available'])
+        self.assertTrue(result['truncation_explicit'])
+
+    def test_diff_truncation_notice_must_match_the_raw_diff_header(self):
+        notice = (
+            '[terminal-safe diff preview truncated at a complete line boundary: '
+            'showing 1 escaped bytes from 7 raw diff bytes; '
+            'raw SHA-256 covers the complete proposal]\n')
+        result = _parse_deploy_preview(
+            self.deploy_preview(full_bytes=8, full_sha='c' * 64,
+                                migration_body='x\n', notices=notice), 'a' * 40)
+        self.assertTrue(result['truncation_explicit'])
+        self.assertFalse(result['truncation_evidence_matches'])
+        self.assertFalse(result['generated_content_available'])
+
+    def test_empty_diff_requires_the_actual_empty_sha256(self):
+        preview = self.deploy_preview(full_sha='c' * 64)
+        result = _parse_deploy_preview(preview, 'a' * 40)
+        self.assertTrue(result['inventory_supported'])
+        self.assertFalse(result['generated_content_available'])
+        self.assertIsNone(result['content_identity'])
+
+    def test_deploy_timing_requires_complete_valid_utf8_preview(self):
+        text = self.deploy_preview()
+        row = {'stdout_complete': True, 'stdout_utf8_valid': False}
+        result = _classify_deploy_preview(text, row, 'a' * 40)
+        self.assertEqual(result['status'], 'output_incomplete')
+        self.assertFalse(result['comparison_eligible'])
+
+    def test_ineligible_timing_and_different_preview_content_are_not_compared(self):
+        paired = {**self.paired, 'repetitions': 1}
+        baseline_preview = _parse_deploy_preview(
+            self.deploy_preview(plan_digest='b' * 64, full_bytes=5,
+                                full_sha='a' * 64,
+                                migration_body='diff\n'), 'a' * 40)
+        candidate_preview = _parse_deploy_preview(
+            self.deploy_preview(plan_digest='d' * 64, full_bytes=5,
+                                full_sha='a' * 64,
+                                migration_body='diff\n'), 'a' * 40)
+        baseline = [{'status': 'complete', 'timings_ms': {'deploy_plan_diff': 10.0},
+                     'semantic': {'deploy_plan_diff': {
+                         'status': 'supported_content_available',
+                         'comparison_eligible': False,
+                         'comparison_ineligibility_reason': 'invalid stdout evidence',
+                         'content_identity': baseline_preview['content_identity'],
+                     }}}]
+        candidate = [{'status': 'complete', 'timings_ms': {'deploy_plan_diff': 10.0},
+                      'semantic': {'deploy_plan_diff': {
+                          'status': 'supported_content_available',
+                          'comparison_eligible': True,
+                          'content_identity': candidate_preview['content_identity'],
+                      }}}]
+        result = _compare_action(baseline, candidate, 'deploy_plan_diff', paired)
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertIn('invalid stdout evidence', result['reason'])
+
+        baseline[0]['semantic']['deploy_plan_diff']['comparison_eligible'] = True
+        self.assertEqual(
+            baseline[0]['semantic']['deploy_plan_diff']['content_identity'],
+            candidate[0]['semantic']['deploy_plan_diff']['content_identity'],
+            'fixture-specific plan digests should not make identical generated content incomparable')
+        result = _compare_action(baseline, candidate, 'deploy_plan_diff', paired)
+        self.assertEqual(result['status'], 'compared')
+
+        different_preview = _parse_deploy_preview(
+            self.deploy_preview(plan_digest='e' * 64, full_bytes=5,
+                                full_sha='b' * 64,
+                                migration_body='other\n'), 'a' * 40)
+        candidate[0]['semantic']['deploy_plan_diff']['content_identity'] = (
+            different_preview['content_identity'])
+        result = _compare_action(baseline, candidate, 'deploy_plan_diff', paired)
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertIn('content contracts differ', result['reason'])
+
+    def test_fetch_comparison_requires_schema_one_provider_completion_witness(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            common = Path(temporary) / '.git'
+            common.mkdir()
+            common_stat = common.stat()
+            repository = 'github.com/playground/latency'
+            repository_path = 'playground/latency'
+            expected_args = ['fetch', *FETCH_FLAGS, '--', 'perf-local',
+                             'refs/heads/perf-proven:refs/remotes/perf-local/perf-proven']
+            expected = {
+                'session_id': 7,
+                'repository': repository,
+                'remote_host': 'github.com',
+                'remote_path': repository_path,
+                'caller_assertion': 'playground/latency',
+                'remote_name': 'perf-local',
+                'source_ref': 'refs/heads/perf-proven',
+                'destination_ref': 'refs/remotes/perf-local/perf-proven',
+                'common_directory': common.resolve(),
+                'common_device': common_stat.st_dev,
+                'common_inode': common_stat.st_ino,
+                'expected_args': expected_args,
+            }
+            payload = {
+                'resolved_target': {
+                    'remote_name': 'perf-local',
+                    'normalized_host': 'github.com',
+                    'repository_path': repository_path,
+                    'coordination_key': repository,
+                    'caller_assertion': 'playground/latency',
+                    'evidence': {
+                        'caller_assertion': 'matched_repository_path',
+                        'identity': 'fetch_and_push_matched',
+                        'fetch': {'syntax': 'scp'},
+                        'push': {'syntax': 'scp'},
+                    },
+                },
+                'operation': {
+                    'id': 11,
+                    'provider': 'git',
+                    'session_id': 7,
+                    'status': 'succeeded',
+                    'repository': repository,
+                    'command_json': json.dumps(['git', *expected_args]),
+                    'details_json': json.dumps({'fetch_reconciliation': {
+                        'schema_version': 1,
+                        'operation_id': 11,
+                        'repository': repository,
+                        'footprint': {
+                            'remote': 'perf-local',
+                            'source_ref': 'refs/heads/perf-proven',
+                            'destination_ref': 'refs/remotes/perf-local/perf-proven',
+                        },
+                        'common_directory': str(common.resolve()),
+                        'common_device': common_stat.st_dev,
+                        'common_inode': common_stat.st_ino,
+                        'pre_destination': None,
+                        'provider': {
+                            'pid': 2000, 'process_group': 2000, 'start_time': 3000,
+                            'start_time_clock': 'fixture-clock',
+                        },
+                        'completion': {
+                            'pid': 2000, 'success': True, 'exit_code': 0,
+                            'observed_at': 4000,
+                        },
+                    }}),
+                },
+            }
+            witness = _fetch_profile_witness(payload, expected)
+            self.assertEqual(witness['schema_version'], 1)
+            self.assertEqual(witness['provider_pid'], 2000)
+            wrong_repository_journal = json.loads(payload['operation']['details_json'])
+            wrong_repository_journal['fetch_reconciliation']['repository'] = (
+                'github.com/playground/other')
+
+            for keys, invalid_value in (
+                    (('resolved_target', 'normalized_host'), 'local'),
+                    (('resolved_target', 'repository_path'), 'playground/other'),
+                    (('resolved_target', 'coordination_key'), 'github.com/playground/other'),
+                    (('resolved_target', 'caller_assertion'), None),
+                    (('resolved_target', 'evidence', 'caller_assertion'), 'not_supplied'),
+                    (('resolved_target', 'evidence', 'fetch', 'syntax'), 'local_path'),
+                    (('resolved_target', 'evidence', 'push', 'syntax'), 'local_path'),
+                    (('operation', 'repository'), 'playground/latency'),
+                    (('operation', 'details_json'), json.dumps(wrong_repository_journal))):
+                invalid_identity = copy.deepcopy(payload)
+                target = invalid_identity
+                for key in keys[:-1]:
+                    target = target[key]
+                target[keys[-1]] = invalid_value
+                with self.subTest(keys=keys), self.assertRaisesRegex(
+                        RuntimeError, 'expected SSH-shaped repository identity|operation identity|'
+                                      'exact completed profile'):
+                    _fetch_profile_witness(invalid_identity, expected)
+
+            valid_completion = copy.deepcopy(payload)
+            payload['operation']['details_json'] = '{}'
+            self.assertIsNone(_fetch_profile_witness(payload, expected))
+            invalid_completion = valid_completion
+            invalid_journal = json.loads(invalid_completion['operation']['details_json'])
+            invalid_journal['fetch_reconciliation']['completion'].update(
+                {'success': False, 'exit_code': 1})
+            invalid_completion['operation']['details_json'] = json.dumps(invalid_journal)
+            with self.assertRaisesRegex(RuntimeError, 'exact completed profile'):
+                _fetch_profile_witness(invalid_completion, expected)
+
+    def test_missing_fetch_witness_is_only_an_unsupported_baseline_control(self):
+        baseline = _missing_fetch_witness_semantic('baseline', 11, 12.5)
+        self.assertEqual(baseline['status'], 'unsupported')
+        self.assertFalse(baseline['comparison_eligible'])
+        self.assertEqual(baseline['observed_command_duration_ms'], 12.5)
+        with self.assertRaisesRegex(RuntimeError, 'candidate omitted durable'):
+            _missing_fetch_witness_semantic('candidate', 11, 12.5)
+
+    def test_baseline_fetch_downgrade_decodes_only_exact_typed_refusal_receipt(self):
+        expected_argv = ['/fixture/aethyme', 'broker', 'advanced', 'git', '--session',
+                         '7', '--repo', 'playground/latency', '--effect', 'write',
+                         '--scope', 'fetch', '--reason',
+                         'synthetic paired action measurement', '--json', '--', 'fetch',
+                         *FETCH_FLAGS, '--', 'perf-local',
+                         'refs/heads/perf-proven:refs/remotes/perf-local/perf-proven']
+        message = (
+            'unsupported fetch option "--no-auto-maintenance" prevents '
+            'deterministic remote resolution')
+
+        def receipt_for(stdout, argv=expected_argv, exit_code=1):
+            raw = stdout.encode('utf-8')
+            return {
+                'label': 'action:fetch_provable',
+                'argv': argv,
+                'exit_code': exit_code,
+                'failure': f'command exited with status {exit_code}',
+                'stdout_complete': False,
+                'stdout_utf8_valid': True,
+                'stdout': stdout,
+                'stderr': '',
+                'stdout_bytes': len(raw),
+                'stderr_bytes': 0,
+                'stdout_sha256': hashlib.sha256(raw).hexdigest(),
+                'stderr_sha256': hashlib.sha256(b'').hexdigest(),
+                'duration_ms': 12.5,
+            }
+
+        def broker_error(error_message, code=1, schema='aethyme.broker-error/v1', **extra):
+            return json.dumps({
+                'error': {'code': code, 'message': error_message},
+                'schema': schema,
+                **extra,
+            })
+
+        receipt = receipt_for(broker_error(message))
+        self.assertEqual(
+            _baseline_unsupported_fetch_option('baseline', receipt, expected_argv),
+            '--no-auto-maintenance')
+        self.assertIsNone(
+            _baseline_unsupported_fetch_option('candidate', receipt, expected_argv))
+
+        for changed in (
+                {'failure': 'command exceeded 60 seconds'},
+                {'failure': 'command exited with status 1', 'exit_code': 0},
+                {'failure': 'command exited with status 2', 'exit_code': 2},
+                {'argv': expected_argv[:-1]},
+                {'stdout_complete': True},
+                {'stderr_sha256': None}):
+            with self.subTest(changed=changed):
+                self.assertIsNone(_baseline_unsupported_fetch_option(
+                    'baseline', {**receipt, **changed}, expected_argv))
+
+        invalid_receipts = (
+            receipt_for(broker_error('fetch network connection failed')),
+            receipt_for(broker_error(message + '; unrelated trailing detail')),
+            receipt_for(broker_error(message, code=2)),
+            receipt_for(broker_error(message, schema='other-error/v1')),
+            receipt_for(broker_error(
+                'invalid coordinated operation: remote Git operation requires --repo owner/name',
+                code=3)),
+            receipt_for(broker_error(message, operation={'id': 12})),
+            receipt_for('Error: unsupported fetch option "--no-auto-maintenance" prevents '
+                        'deterministic remote resolution'),
+            receipt_for('{"schema":"aethyme.broker-error/v1","error":{"code":3,"message":'
+                        '"unsupported fetch option \\"--no-auto-maintenance\\" prevents '
+                        'deterministic remote resolution"'),
+            receipt_for(broker_error(message), argv=expected_argv[:-2]),
+        )
+        for invalid in invalid_receipts:
+            with self.subTest(stdout=invalid['stdout']):
+                self.assertIsNone(_baseline_unsupported_fetch_option(
+                    'baseline', invalid, expected_argv))
+
+    def test_v41_live_receipt_is_context_only_and_pins_both_executables(self):
+        cli_hash = 'a' * 64
+        engine_hash = 'b' * 64
+        receipt = {
+            'version': '0.8.41',
+            'source_commit': 'c' * 40,
+            'release': 'https://example.invalid/releases/tag/v0.8.41',
+            'hosted_workspace_passed': 1,
+            'local_native_builds_or_tests': False,
+            'roots': {'install-root': {
+                'aethyme': {'sha256': cli_hash},
+                'aethyme-engine-cli': {'sha256': engine_hash},
+            }},
+            'repos': {'mockup': {'seconds': {'start': 2.5}}},
+        }
+        identity = {'cli_sha256': cli_hash, 'engine_sha256': engine_hash}
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'v41.json'
+            path.write_text(json.dumps(receipt))
+            context = load_v41_context(path, identity)
+            self.assertFalse(context['comparison_eligible'])
+            self.assertEqual(context['uncontrolled_real_rollout_seconds']['mockup']['start'],
+                             2.5)
+            with self.assertRaisesRegex(ValueError, 'does not match'):
+                load_v41_context(path, {**identity, 'engine_sha256': 'd' * 64})
+
+
+class CommitGitProxyTests(unittest.TestCase):
+    def test_commit_git_proxy_is_child_scoped_and_quotes_pinned_executable(self):
+        with tempfile.TemporaryDirectory(prefix="broker proxy's ") as temporary:
+            root = Path(temporary)
+            pinned_git = root / "real git's executable"
+            pinned_git.write_text(
+                '#!' + sys.executable + '\n'
+                'import json, os, sys\n'
+                "print(json.dumps({'global': os.environ.get('GIT_CONFIG_GLOBAL'), "
+                "'nosystem': os.environ.get('GIT_CONFIG_NOSYSTEM'), "
+                "'argv': sys.argv[1:]}))\n")
+            pinned_git.chmod(0o700)
+            proxy_dir = _create_commit_git_proxy(root, pinned_git)
+            fake_cli = root / 'fake broker cli'
+            fake_cli.write_text(
+                '#!' + sys.executable + '\n'
+                'import json, os, subprocess, sys\n'
+                "provider = subprocess.run(['git', 'argument with spaces', \"apostrophe's\", ''], "
+                'check=True, capture_output=True, text=True, timeout=5)\n'
+                "print(json.dumps({'global_present': 'GIT_CONFIG_GLOBAL' in os.environ, "
+                "'nosystem_present': 'GIT_CONFIG_NOSYSTEM' in os.environ, "
+                "'path': os.environ['PATH'], 'cli_args': sys.argv[1:], "
+                "'provider': json.loads(provider.stdout)}))\n")
+            fake_cli.chmod(0o700)
+
+            class Runner:
+                pass
+
+            runner = Runner()
+            runner.env = {
+                'PATH': os.pathsep.join(('/usr/bin', '/bin')),
+                'HOME': str(root),
+                'GIT_CONFIG_GLOBAL': str(root / 'empty-global'),
+                'GIT_CONFIG_NOSYSTEM': '1',
+            }
+            playground = {
+                'runner': runner, 'commit_git_proxy': proxy_dir, 'binary': fake_cli,
+                'git': pinned_git,
+            }
+            runner_env_before = runner.env.copy()
+            first = _commit_argv(playground, ['broker', 'commit', '--session', '1'])
+            second = _commit_argv(playground, ['broker', 'commit', '--session', '2'])
+            self.assertEqual(first[:5], ['/usr/bin/env', '-u', 'GIT_CONFIG_GLOBAL',
+                                         '-u', 'GIT_CONFIG_NOSYSTEM'])
+            self.assertEqual(first[5], second[5])
+            self.assertEqual(first[6], str(fake_cli))
+            self.assertEqual(runner.env, runner_env_before)
+            context = _commit_git_isolation_context(playground)
+            self.assertEqual(context['real_git_sha256'],
+                             hashlib.sha256(pinned_git.read_bytes()).hexdigest())
+            self.assertEqual(context['proxy_sha256'],
+                             hashlib.sha256((proxy_dir / 'git').read_bytes()).hexdigest())
+            self.assertEqual(context['commit_child_path_sha256'],
+                             hashlib.sha256(first[5][len('PATH='):].encode('utf-8')).hexdigest())
+
+            result = subprocess.run(first, env=runner.env, capture_output=True, text=True,
+                                    check=True, timeout=10)
+            payload = json.loads(result.stdout)
+            self.assertFalse(payload['global_present'])
+            self.assertFalse(payload['nosystem_present'])
+            self.assertEqual(payload['path'].split(os.pathsep)[0], str(proxy_dir))
+            self.assertEqual(payload['cli_args'], ['broker', 'commit', '--session', '1'])
+            self.assertEqual(payload['provider']['global'], os.devnull)
+            self.assertEqual(payload['provider']['nosystem'], '1')
+            self.assertEqual(payload['provider']['argv'],
+                             ['argument with spaces', "apostrophe's", ''])
+            self.assertEqual(runner.env, runner_env_before)
 
 
 class AgedHistoryTests(unittest.TestCase):

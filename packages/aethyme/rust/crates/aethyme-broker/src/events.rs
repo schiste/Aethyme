@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 // ── kind constants ───────────────────────────────────────────────────
+pub const OPERATION_FETCH_RECONCILED: &str = "operation.fetch_reconciled";
+pub const OPERATION_INSPECTED: &str = "operation.inspected";
 pub const SESSION_REGISTERED: &str = "session.registered";
 pub const SESSION_REUSED: &str = "session.reused";
 pub const SESSION_CONTEXT_UPDATED: &str = "session.context_updated";
@@ -558,6 +560,30 @@ pub fn operation_payload(
         "exit_code": exit_code,
     })
     .to_string()
+}
+
+/// Automatic evidence-based fetch reconciliation is distinct from an
+/// operator's attestation, whose event kinds retain their frozen meaning.
+pub fn fetch_reconciled_payload(
+    operation_id: i64,
+    repository: &str,
+    scope: &str,
+    effect: crate::types::OperationEffect,
+    status: crate::types::OperationStatus,
+    exit_code: Option<i64>,
+) -> String {
+    let mut payload: serde_json::Value = serde_json::from_str(&operation_payload(
+        operation_id,
+        crate::types::OperationProvider::Git,
+        repository,
+        scope,
+        effect,
+        status,
+        exit_code,
+    ))
+    .expect("operation payload is JSON");
+    payload["reconciliation_source"] = json!("observed_fetch_completion");
+    payload.to_string()
 }
 
 pub fn merge_promoted_payload(branch: &str, commit: &str) -> String {

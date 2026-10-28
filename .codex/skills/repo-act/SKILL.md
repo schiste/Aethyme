@@ -33,6 +33,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- When changing a retention default, inspect fixtures that inherit the default
+  as well as tests with explicit overrides. Update their age assumptions and
+  reference documentation; exercise retention and expiry on both sides of the
+  new window. Distinguish automatic grace from explicit reviewed cleanup, and
+  report live policy overrides separately from an unreleased code default.
 - For graph consumer changes, include a real producer-to-materialization-to-query
   fixture alongside hand-built store tests. Verify relationship endpoints resolve
   to the expected typed nodes, and move persisted fragments to a differently
@@ -62,6 +67,14 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   before adding regressions. Integration tests cannot call crate-private APIs.
   Preserve optional-value types in assertions; a compile failure supplies no
   runtime test evidence and needlessly repeats the remote validation cycle.
+- For Rust compile review, trace the actual `mod` declarations, including
+  `#[path]`, and item visibility from each use site; filenames alone do not
+  establish module namespaces or sibling access.
+- Check newly emitted next-action commands against the public CLI resolver,
+  including product diagnostics, harness argv, and mirrored skills. Internal
+  broker help can contain legacy spellings that are rewritten at the public
+  boundary. Audit the whole changed batch after a spelling failure; fixing
+  the first reported caller does not establish that other scan groups pass.
 - Validate a command's complete action, arity, and required confirmation before
   opening broker state or scanning host or worktree inventories. Add a CLI
   regression that checks the structured refusal and confirms no repository or
@@ -90,6 +103,20 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   wall time, workload and binary identity, and raw samples. Do not equate an
   internal phase or coordinated-operation interval with end-to-end or network
   time. Use the existing non-gating performance workflow before adding builds.
+- When adding non-Rust controls to a fast lane, verify that mixed and full
+  changes also execute them. Test positive fast-lane and negative/full-lane
+  classification cases; a green Rust suite does not establish that the
+  non-Rust controls ran. Keep the lane conditions exclusive so the full path
+  does not repeat the fast validator and its extra tooling. When changing CI
+  workflow steps, inspect the Rust CI-contract tests alongside the shell
+  classifier tests and keep both aligned.
+- For broker performance fixtures, command success is not enough: assert the
+  intended production profile with its recorded operation/profile witness and
+  verify the exact expected effects. A successful broad fallback is a
+  different scenario, not evidence for a narrow-path optimization. Validate
+  semantic results and source, binary, and fixture provenance before comparing
+  timings; unsupported or mismatched profiles, incomplete output, and missing
+  witnesses are unavailable samples, never eligible timings.
 - When investigating Git worktreeConfig migration, stage config.worktree files
   with explicit config --file paths before enabling the extension. Before enable,
   config --worktree can write shared local config in a single checkout; installed
@@ -299,11 +326,15 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   isolated Git subprocesses, call `env_remove` for inherited `GIT_*` names,
   preserve unrelated variables such as `PATH`, then set the fixture's intended
   author/committer values. For Git-backed fixtures that generate managed files
-  before staging, also set a fixture-owned `HOME`, an empty
-  `GIT_CONFIG_GLOBAL`, and `GIT_CONFIG_NOSYSTEM=1` on every CLI and Git child
-  before initial deployment and `git add`; a host `core.excludesFile` can hide
-  generated files from `git add -A`. Keep isolation on each child command and
-  do not compensate with fixture ignore rules or force-adds. For byte-for-byte
+  before staging, set fixture-owned `HOME`, empty `GIT_CONFIG_GLOBAL` and
+  `GIT_CONFIG_NOSYSTEM=1` on setup children that access Git before initial
+  deployment and `git add`; a host `core.excludesFile` can hide generated files
+  from `git add -A`. If a broker CLI rejects fixture-owned `GIT_CONFIG_*`
+  selectors during preflight, remove them only from that CLI invocation and
+  restore the same isolation inside a fixture-owned PATH `git` proxy that
+  executes the pinned Git binary. Keep the proxy and PATH scoped to that
+  invocation; never mutate a shared runner environment in concurrent tests.
+  Do not compensate with fixture ignore rules or force-adds. For byte-for-byte
   Git fixture snapshots, disable automatic maintenance during setup with
   command-local `maintenance.auto=false` and `gc.auto=0`; an asynchronously
   removed maintenance lock can otherwise look like a product write. Preserve
@@ -493,6 +524,17 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   and mutant byte lengths plus one byte. Before touching source, exercise the
   actual mutation and restoration on scratch files seeded with pinned source bytes;
   equal-sized toy replacements cannot validate a size-changing mutation.
+- Treat recovery archive verification and checkout removal as separate outcomes.
+  A successful command can return `worktree_removed: false`; inspect its
+  `cleanup_error`, preserve the archive path, and verify the exact checkout is
+  absent before counting a removal. A stale-plan refusal requires fresh review,
+  never a forced retry.
+- For recovery-plan adapters, derive comparison rules from the pinned producer's
+  authorization contract. Require the digest, preserved content, repository and
+  checkout identity, policy, and reviewed archive destination to remain exact.
+  Allow only explicitly documented mutable evidence fields to advance; keep
+  complete original and fresh snapshots. Exercise evidence advancement and
+  refusal of changed protected fields in both preflight and outcome checks.
 - When recording cleanup results, validate the pinned progress record and exact
   removed set before updating progress. Hold the progress lock through an atomic
   replacement, directory sync, and readback; publish the verification proof only
@@ -517,11 +559,22 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   rewrite telemetry history, exclude that plan's own metric even when output
   measurement is opted in.
 - For runtime rollout and dogfooding, resolve the executable actually selected
-  by PATH and compare its version with the repository runtime pointer. Pin the
-  verified executable for subsequent commands; the pointer alone does not prove
-  that the shell is using the deployed build. Pass the same absolute executable
-  and required sibling identity to delegated agents; selecting a repository
-  runtime does not rewrite their inherited PATH.
+  by the agent's inherited PATH and compare its version with the repository
+  runtime pointer. Pin the verified executable for later commands and pass the
+  same absolute executable plus sibling identity to delegated agents; selecting
+  a repository runtime does not rewrite their PATH. Separately verify the actual
+  running process image path/build and inspect only a fixed set of known roots
+  (CARGO_INSTALL_ROOT/bin, CARGO_HOME/bin, HOME/.cargo/bin, HOME/.local/bin)
+  plus the PATH-selected bin directory. Do not recursively scan roots or run
+  arbitrary binaries found in alternate roots. A selector change affects future
+  opens; a process already running keeps its loaded build. An explicit candidate
+  smoke proves that candidate runs; separately verify PATH and running-process
+  selection before calling rollout complete.
+- After a broker start call returns truncated or ambiguous output, inspect that
+  invocation before retrying. Wait on its original tool handle when available,
+  then query structured broker status by task or short name. An empty filtered
+  result or truncated response is not proof that no session was created; retry
+  only after a complete status confirms there is no registered session.
 - When resolving stacked merges, preserve the stronger assertions from both
   parents. Adapt tests to the merged API; do not replace explicit failure or
   completeness checks with weaker count-only assertions.
@@ -633,6 +686,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   waiter/holder relationships, pending operations and help snapshots in the
   focused selection. Test bounded output with explicit omission counts; a
   smaller display must still surface the coordination state callers need.
+- For human-facing previews containing repository-derived text, escape terminal
+  control characters, including ESC, in content, paths and metadata. Preserve
+  newline or tab only when it is intentional display structure, not in data
+  fields. Apply byte caps after escaping and label raw-source hashes separately
+  from the transformed preview.
 - For CLI JSON stream tests, parse complete stdout as one JSON value and
   check child output on the intended stream separately. Include both stdout
   and stderr in subprocess failure assertions: a structured refusal can be

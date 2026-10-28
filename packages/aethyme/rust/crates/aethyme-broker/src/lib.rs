@@ -300,7 +300,7 @@ pub use cleanup_audit::{
 };
 pub use cleanup_resolve::{
     ArchivedFile, CLEANUP_RESOLVE_SCHEMA_VERSION, CleanupResolveOutcome, CleanupResolvePlan,
-    IgnoredPath, IgnoredPathClassification,
+    IgnoredPath, IgnoredPathClassification, RecoveryLandingAssessment, RecoveryLandingState,
 };
 pub use console::{
     CONSOLE_EXCLUSIVE_KEY, CONSOLE_INTEGRATION_REF, CONSOLE_MARKER_DIGEST_ENV, CONSOLE_MARKER_ENV,
@@ -440,7 +440,10 @@ pub use pr::{
     PrDispatchReport, PrDispatchStatus, PrError, PrMarker, PrSummary,
 };
 pub(crate) use pr_overlap::PlannedPathPrOverlapCheck;
-pub use pr_overlap::{PrOverlap, PrOverlapCheck};
+pub use pr_overlap::{
+    PrOverlap, PrOverlapCheck, PrOverlapLineDetails, PrOverlapLineRange, PrOverlapPathRanges,
+    PrOverlapRangeBasis,
+};
 pub use pr_projection::{
     COMMENT_MARKER, OwnedComment, PR_PROJECTION_SCHEMA_VERSION, PrProjectionAction,
     PrProjectionError, PrProjectionFacts, PrProjectionPolicy, ProjectedReview,

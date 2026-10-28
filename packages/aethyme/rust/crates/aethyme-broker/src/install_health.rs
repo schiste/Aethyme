@@ -1,6 +1,6 @@
 //! Whether this machine's Aethyme installation is coherent and current.
 //!
-//! Three failures motivated this module, and none announced itself.
+//! Four failures motivated this module, and none announced itself.
 //!
 //! **The pair split.** `aethyme` and `aethyme-engine-cli` are one product in
 //! two binaries and must be installed together. On a machine that develops
@@ -8,6 +8,10 @@
 //! whichever worktree that session happens to own — so two sessions installing
 //! on the same afternoon leave a router from one branch beside an engine from
 //! another. Both report a plausible version. Nothing anywhere compares them.
+//!
+//! **The old process.** A new installation selector affects future launches,
+//! not an agent or supervisor that already loaded an older CLI. Its build is
+//! compared with the router selected by this process's PATH.
 //!
 //! **The stale release.** `aethyme update check` has always computed the right
 //! answer, and nothing ever ran it.
@@ -30,7 +34,7 @@
 //! confirmed; this only ever prints a sentence and names the command a person
 //! may choose to run.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::update::{self, UpdateAction, UpdateChannel};
@@ -152,7 +156,11 @@ pub fn pair_warning(state: &PairState) -> Option<String> {
 
 /// The first line of `<binary> --version`, when the binary is on PATH.
 pub(crate) fn version_banner(binary: &str) -> Option<String> {
-    first_line_of(&resolve_on_path(binary)?.to_string_lossy(), &["--version"])
+    version_banner_at(&resolve_on_path(binary)?)
+}
+
+fn version_banner_at(path: &Path) -> Option<String> {
+    first_line_of(&path.to_string_lossy(), &["--version"])
 }
 
 /// The pair as installed, read by asking both binaries on PATH.
@@ -160,13 +168,155 @@ pub(crate) fn version_banner(binary: &str) -> Option<String> {
 /// The router is read from PATH rather than from this process: the shim, the
 /// hooks and the next shell command all reach whatever PATH resolves, which on
 /// a machine with more than one copy is not necessarily this one.
-pub fn resolve_pair() -> PairState {
-    let router = version_banner(ROUTER_BINARY);
+fn resolve_pair_with_router_identity() -> (PairState, Option<String>, Option<PathBuf>) {
+    let router_path = resolve_on_path(ROUTER_BINARY);
+    let router = router_path
+        .as_deref()
+        .and_then(version_banner_at)
+        .and_then(|banner| build_identity(&banner).map(str::to_owned));
     let engine = version_banner(ENGINE_BINARY);
-    pair_state(
-        router.as_deref().and_then(build_identity),
-        engine.as_deref().and_then(build_identity),
+    let engine = engine.as_deref().and_then(build_identity);
+    (pair_state(router.as_deref(), engine), router, router_path)
+}
+
+pub fn resolve_pair() -> PairState {
+    resolve_pair_with_router_identity().0
+}
+
+const MAX_KNOWN_INSTALL_ROOTS: usize = 5;
+const MAX_ROOT_DISPLAY_CHARS: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KnownInstallRoot {
+    path: PathBuf,
+    selected_by_path: bool,
+    has_router_entry: bool,
+    has_engine_entry: bool,
+}
+
+fn known_install_root_paths(
+    cargo_install_root: Option<&Path>,
+    cargo_home: Option<&Path>,
+    home: Option<&Path>,
+    path_router: Option<&Path>,
+) -> Vec<PathBuf> {
+    let candidates = [
+        cargo_install_root.map(|root| root.join("bin")),
+        cargo_home.map(|root| root.join("bin")),
+        home.map(|root| root.join(".cargo/bin")),
+        home.map(|root| root.join(".local/bin")),
+        path_router.and_then(|router| router.parent().map(Path::to_path_buf)),
+    ];
+    let mut roots = Vec::with_capacity(MAX_KNOWN_INSTALL_ROOTS);
+    for path in candidates.into_iter().flatten() {
+        if !roots.contains(&path) {
+            roots.push(path);
+        }
+    }
+    roots
+}
+
+fn direct_binary_entry_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() || metadata.file_type().is_symlink())
+}
+
+fn known_install_roots(path_router: Option<&Path>) -> Vec<KnownInstallRoot> {
+    let cargo_install_root = std::env::var_os("CARGO_INSTALL_ROOT").map(PathBuf::from);
+    let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let path_root = path_router.and_then(Path::parent);
+    known_install_root_paths(
+        cargo_install_root.as_deref(),
+        cargo_home.as_deref(),
+        home.as_deref(),
+        path_router,
     )
+    .into_iter()
+    .filter_map(|path| {
+        let has_router_entry = direct_binary_entry_exists(&path.join(ROUTER_BINARY));
+        let has_engine_entry = direct_binary_entry_exists(&path.join(ENGINE_BINARY));
+        (has_router_entry || has_engine_entry).then_some(KnownInstallRoot {
+            selected_by_path: path_root == Some(path.as_path()),
+            path,
+            has_router_entry,
+            has_engine_entry,
+        })
+    })
+    .collect()
+}
+
+fn display_path_bounded(path: &Path) -> String {
+    let rendered = path.to_string_lossy();
+    let mut characters = rendered.chars();
+    let prefix = characters
+        .by_ref()
+        .take(MAX_ROOT_DISPLAY_CHARS)
+        .collect::<String>();
+    if characters.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
+fn known_install_roots_summary(path_router: Option<&Path>) -> String {
+    let roots = known_install_roots(path_router);
+    if roots.is_empty() {
+        return "none of the known roots has an Aethyme binary entry".into();
+    }
+    roots
+        .iter()
+        .map(|root| {
+            let mut binaries = Vec::with_capacity(2);
+            if root.has_router_entry {
+                binaries.push(ROUTER_BINARY);
+            }
+            if root.has_engine_entry {
+                binaries.push(ENGINE_BINARY);
+            }
+            let selection = if root.selected_by_path {
+                "PATH-selected"
+            } else {
+                "not selected by this PATH"
+            };
+            format!(
+                "{} [{}; {selection}]",
+                display_path_bounded(&root.path),
+                binaries.join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn running_process_warning(
+    running_build_banner: Option<&str>,
+    path_router_identity: Option<&str>,
+    path_router: Option<&Path>,
+) -> Option<String> {
+    let running_identity = build_identity(running_build_banner?)?;
+    let path_identity = path_router_identity?;
+    if running_identity == path_identity {
+        return None;
+    }
+    let running_executable = std::env::current_exe()
+        .ok()
+        .map(|path| display_path_bounded(&path))
+        .unwrap_or_else(|| "unavailable".into());
+    let roots = known_install_roots_summary(path_router);
+    let path_router_display = path_router
+        .map(display_path_bounded)
+        .unwrap_or_else(|| "unavailable".into());
+    Some(format!(
+        "the running Aethyme process uses build {running_identity} at {running_executable}, \
+         while PATH selects build {path_identity} at {path_router_display}. A running process keeps \
+         its loaded build when PATH or install selectors change; restart the \
+         owning agent or supervisor after choosing the intended runtime. Known \
+         install roots (direct entries only; \
+         alternate binaries are not run): {}",
+        roots
+    ))
 }
 
 /// What to say about a newer release, from the cache only.
@@ -196,13 +346,28 @@ pub fn cached_release_warning(now_unix_ms: i64) -> Option<String> {
 /// Empty is the expected result on a healthy machine, and empty means the hook
 /// prints nothing, which is what a turn boundary should normally cost.
 pub fn session_start_warnings(now_unix_ms: i64) -> Vec<String> {
+    session_start_warnings_with_build(now_unix_ms, None)
+}
+
+pub(crate) fn session_start_warnings_with_build(
+    now_unix_ms: i64,
+    running_build_banner: Option<&str>,
+) -> Vec<String> {
     if disabled() {
         return Vec::new();
     }
     let mut warnings = Vec::new();
     // The local half first: it needs no network, it is always accurate, and a
     // split pair is a worse problem than being one release behind.
-    if let Some(warning) = pair_warning(&resolve_pair()) {
+    let (pair, path_router_identity, path_router) = resolve_pair_with_router_identity();
+    if let Some(warning) = pair_warning(&pair) {
+        warnings.push(format!("Aethyme: {warning}"));
+    }
+    if let Some(warning) = running_process_warning(
+        running_build_banner,
+        path_router_identity.as_deref(),
+        path_router.as_deref(),
+    ) {
         warnings.push(format!("Aethyme: {warning}"));
     }
     if let Some(warning) =
@@ -341,6 +506,32 @@ pub(crate) fn first_line_of(command: &str, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_install_root_candidates_are_fixed_and_deduplicated() {
+        let home = PathBuf::from("/home/example");
+        let cargo_home = home.join(".cargo");
+        let cargo_install_root = PathBuf::from("/opt/aethyme-cargo-root");
+        let path_router = PathBuf::from("/opt/selected-bin/aethyme");
+
+        let roots = known_install_root_paths(
+            Some(&cargo_install_root),
+            Some(&cargo_home),
+            Some(&home),
+            Some(&path_router),
+        );
+
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/opt/aethyme-cargo-root/bin"),
+                PathBuf::from("/home/example/.cargo/bin"),
+                PathBuf::from("/home/example/.local/bin"),
+                PathBuf::from("/opt/selected-bin"),
+            ]
+        );
+        assert!(roots.len() <= MAX_KNOWN_INSTALL_ROOTS);
+    }
 
     fn write_bundled_plugin_hooks(root: &std::path::Path) {
         for (relative_path, bundled) in CLAUDE_PLUGIN_HOOK_FILES {

@@ -74,6 +74,11 @@ while :; do
       ;;
     .github/workflows/product-performance.yml|\
     packages/aethyme-eval/benchmarks/performance/broker-budgets.json|\
+    packages/aethyme-eval/benchmarks/performance/broker-action-matrix-v2.json|\
+    packages/aethyme-eval/benchmarks/performance/broker-action-scenarios-v1.json|\
+    packages/aethyme-eval/benchmarks/performance/broker_action_matrix.py|\
+    packages/aethyme-eval/benchmarks/performance/broker_concurrent_submit.py|\
+    packages/aethyme-eval/benchmarks/performance/test_broker_concurrent_submit.py|\
     packages/aethyme-eval/benchmarks/performance/broker_latency.py|\
     packages/aethyme-eval/benchmarks/performance/test_broker_latency.py|\
     packages/aethyme-eval/benchmarks/performance/git_worktree_config.py|\

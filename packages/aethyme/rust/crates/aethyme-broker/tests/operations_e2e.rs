@@ -138,6 +138,19 @@ fn exact_push_request(session_id: i64, worktree: &Path, refspecs: &[&str]) -> Co
 }
 
 #[cfg(unix)]
+fn shell_path(path: &Path) -> String {
+    format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
+}
+
+#[cfg(unix)]
+fn shell_fixture_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("broker operations ' shell paths ")
+        .tempdir()
+        .unwrap()
+}
+
+#[cfg(unix)]
 fn write_executable(path: &Path, contents: &str) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -878,7 +891,7 @@ fn local_pre_push_rejection_records_that_the_remote_was_not_contacted() {
 #[cfg(unix)]
 #[test]
 fn exact_push_is_succeeded_when_transport_exits_nonzero_after_every_update() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = shell_fixture_tempdir();
     let mut fixture = push_fixture(tmp.path(), "push-succeeded");
     let proposed = commit_push_fixture(&fixture, "landed\n");
     let git_exec_path = git_output(&fixture.worktree, &["--exec-path"]);
@@ -894,7 +907,7 @@ fn exact_push_is_succeeded_when_transport_exits_nonzero_after_every_update() {
         &[
             "config",
             "remote.origin.receivepack",
-            receive_pack.to_str().unwrap(),
+            &shell_path(&receive_pack),
         ],
     );
 
@@ -1151,7 +1164,7 @@ fn exact_push_inspection_proposes_success_without_clearing_the_write_barrier() {
 #[cfg(unix)]
 #[test]
 fn missing_post_push_evidence_keeps_an_exact_push_unknown() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = shell_fixture_tempdir();
     let mut fixture = push_fixture(tmp.path(), "push-missing");
     commit_push_fixture(&fixture, "missing evidence\n");
     let receive_pack = tmp.path().join("remove-remote-then-fail");
@@ -1164,7 +1177,7 @@ fn missing_post_push_evidence_keeps_an_exact_push_unknown() {
         &[
             "config",
             "remote.origin.receivepack",
-            receive_pack.to_str().unwrap(),
+            &shell_path(&receive_pack),
         ],
     );
 
@@ -1201,19 +1214,96 @@ fn missing_post_push_evidence_keeps_an_exact_push_unknown() {
 #[cfg(unix)]
 #[test]
 fn bounded_remote_write_timeout_is_journaled_unknown_and_blocks_retry() {
-    let tmp = tempfile::tempdir().unwrap();
+    const CHILD_ENV: &str = "AETHYME_TEST_BOUNDED_REMOTE_TIMEOUT_CHILD";
+    const ARM_ENV: &str = "AETHYME_TEST_BOUNDED_REMOTE_TIMEOUT_ARM";
+    const HIT_ENV: &str = "AETHYME_TEST_BOUNDED_REMOTE_TIMEOUT_HIT";
+
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let control = shell_fixture_tempdir();
+        let bin = control.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let arm = control.path().join("armed");
+        let hit = control.path().join("provider-pid");
+        let sleeper = control.path().join("broker-timeout-sleeper");
+        std::os::unix::fs::symlink("/bin/sleep", &sleeper).unwrap();
+
+        let real_git = real_git_executable();
+        let proxy = bin.join("git");
+        write_executable(
+            &proxy,
+            &format!(
+                r#"#!/bin/sh
+if [ "${{1-}}" = "push" ] && [ -f {} ]; then
+    for arg do
+        if [ "$arg" = "--dry-run" ]; then
+            exec {} "$@"
+        fi
+    done
+    if ! (set -C; printf '%s\n' "$$" > {}); then
+        exit 125
+    fi
+    exec {} 60
+fi
+exec {} "$@"
+"#,
+                shell_path(&arm),
+                shell_path(&real_git),
+                shell_path(&hit),
+                shell_path(&sleeper),
+                shell_path(&real_git),
+            ),
+        );
+
+        let mut search_path = vec![bin];
+        search_path.extend(std::env::split_paths(
+            &std::env::var_os("PATH").expect("test runner provides PATH"),
+        ));
+        let child_path = std::env::join_paths(search_path).unwrap();
+        let stdout_path = control.path().join("child.stdout");
+        let stderr_path = control.path().join("child.stderr");
+        let stdout = std::fs::File::create(&stdout_path).unwrap();
+        let stderr = std::fs::File::create(&stderr_path).unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "bounded_remote_write_timeout_is_journaled_unknown_and_blocks_retry",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env(ARM_ENV, &arm)
+            .env(HIT_ENV, &hit)
+            .env("PATH", child_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(stdout))
+            .stderr(std::process::Stdio::from(stderr));
+        let mut child = NestedTimeoutTestChild::new(command.spawn().unwrap());
+        let (status, provider_seen_at) = wait_for_nested_timeout_test(&mut child, &hit);
+        let child_stdout = std::fs::read(&stdout_path).unwrap_or_default();
+        let child_stderr = std::fs::read(&stderr_path).unwrap_or_default();
+        let provider_check = proxy_sleep_stopped(&hit, &sleeper, provider_seen_at);
+        let status_ok = status.as_ref().is_some_and(|status| status.success());
+        let status =
+            status.map_or_else(|| "did not exit within its bound".into(), |s| s.to_string());
+        assert!(
+            status_ok && provider_check.is_ok(),
+            "nested timeout test status: {status}; provider cleanup: {}\nstdout:\n{}\nstderr:\n{}",
+            provider_check.err().unwrap_or_else(|| "clean".into()),
+            String::from_utf8_lossy(&child_stdout),
+            String::from_utf8_lossy(&child_stderr),
+        );
+        return;
+    }
+
+    let tmp = shell_fixture_tempdir();
     let mut fixture = push_fixture(tmp.path(), "push-timeout");
     commit_push_fixture(&fixture, "timeout\n");
-    let receive_pack = tmp.path().join("sleeping-receive-pack");
-    write_executable(&receive_pack, "#!/bin/sh\nsleep 60\n");
-    git(
-        &fixture.worktree,
-        &[
-            "config",
-            "remote.origin.receivepack",
-            receive_pack.to_str().unwrap(),
-        ],
-    );
+    let arm = std::path::PathBuf::from(std::env::var_os(ARM_ENV).unwrap());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(arm)
+        .unwrap();
 
     let started = Instant::now();
     let error = fixture
@@ -1250,6 +1340,194 @@ fn bounded_remote_write_timeout_is_journaled_unknown_and_blocks_retry() {
         serde_json::from_str(operation.details_json.as_deref().unwrap()).unwrap();
     assert_eq!(details["failure_class"], "coordinated_operation_timeout");
     assert_eq!(details["remote_outcome"], "unknown");
+
+    let shown = fixture
+        .broker
+        .show_coordinated_operation(operation_id)
+        .unwrap();
+    assert_eq!(
+        shown.reconciliation.state,
+        OperationReconciliationState::Required
+    );
+    assert!(!shown.reconciliation.automatic_retry_allowed);
+    let retry = fixture
+        .broker
+        .run_coordinated_operation_with_wait(
+            exact_push_request(
+                fixture.session_id,
+                &fixture.worktree,
+                &["HEAD:refs/heads/main"],
+            ),
+            QueueWait::Seconds(5),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        retry,
+        BrokerOpError::CoordinatedOperationBlocked {
+            operation_id: blocked_id,
+            ..
+        } if blocked_id == operation_id
+    ));
+}
+
+#[cfg(unix)]
+fn real_git_executable() -> std::path::PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").expect("test runner provides PATH"))
+        .map(|directory| directory.join("git"))
+        .find(|candidate| {
+            candidate.is_file()
+                && Command::new(candidate)
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+        })
+        .expect("test runner PATH contains a working Git")
+        .canonicalize()
+        .unwrap()
+}
+
+#[cfg(unix)]
+struct NestedTimeoutTestChild(Option<std::process::Child>);
+
+#[cfg(unix)]
+impl NestedTimeoutTestChild {
+    fn new(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let status = self
+            .0
+            .as_mut()
+            .expect("nested test child remains owned until observed")
+            .try_wait()?;
+        if status.is_some() {
+            self.0.take();
+        }
+        Ok(status)
+    }
+
+    fn stop_and_wait(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for NestedTimeoutTestChild {
+    fn drop(&mut self) {
+        self.stop_and_wait();
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_nested_timeout_test(
+    child: &mut NestedTimeoutTestChild,
+    provider_pid_file: &Path,
+) -> (Option<std::process::ExitStatus>, Option<Instant>) {
+    let started = Instant::now();
+    let mut provider_seen_at = None;
+    let mut provider_deadline = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return (Some(status), provider_seen_at),
+            Ok(None) => {}
+            Err(error) => panic!("polling nested timeout test: {error}"),
+        }
+        let now = Instant::now();
+        let deadline = if provider_pid_file.exists() {
+            let seen_at = *provider_seen_at.get_or_insert(now);
+            *provider_deadline.get_or_insert(seen_at + Duration::from_secs(65))
+        } else {
+            started + Duration::from_secs(60)
+        };
+        if now >= deadline {
+            child.stop_and_wait();
+            return (None, provider_seen_at);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn proxy_sleep_stopped(
+    provider_pid_file: &Path,
+    sleeper: &Path,
+    provider_seen_at: Option<Instant>,
+) -> Result<(), String> {
+    let pid_text = std::fs::read_to_string(provider_pid_file)
+        .map_err(|error| format!("armed proxy did not record its provider PID: {error}"))?;
+    let pid: i32 = pid_text
+        .trim()
+        .parse()
+        .map_err(|error| format!("proxy recorded an invalid provider PID: {error}"))?;
+    if pid <= 0 {
+        return Err(format!("proxy recorded an invalid provider PID: {pid}"));
+    }
+    let pid_arg = pid.to_string();
+    let sleeper_name = sleeper.file_name().unwrap().to_string_lossy();
+    let probe = || -> Result<Option<(String, String)>, String> {
+        let output = Command::new("/bin/ps")
+            .args(["-p", &pid_arg, "-o", "stat=,command="])
+            .output()
+            .map_err(|error| format!("inspect fixture-owned provider PID {pid}: {error}"))?;
+        let row = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !output.status.success() {
+            if output.status.code() == Some(1) && row.is_empty() && output.stderr.is_empty() {
+                return Ok(None);
+            }
+            return Err(format!(
+                "ps failed while checking fixture-owned provider PID {pid}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        if row.is_empty() {
+            return Ok(None);
+        }
+        let mut fields = row.split_whitespace();
+        let state = fields.next().unwrap_or_default().to_string();
+        let command = fields.collect::<Vec<_>>().join(" ");
+        Ok(Some((state, command)))
+    };
+    let Some((state, command)) = probe()? else {
+        return Ok(());
+    };
+    if state.starts_with('Z') {
+        return Ok(());
+    }
+    if !command.contains(sleeper_name.as_ref()) {
+        return Err(format!(
+            "fixture provider PID {pid} is alive but cannot be identified safely; expected sleeper name {sleeper_name:?}, observed state {state:?} and command {command:?}"
+        ));
+    }
+    let natural_exit_deadline =
+        provider_seen_at.unwrap_or_else(Instant::now) + Duration::from_secs(62);
+    while Instant::now() < natural_exit_deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        match probe()? {
+            None => {
+                return Err(format!(
+                    "broker returned while fixture sleeper PID {pid} was live; it exited only after its natural 60-second lifetime"
+                ));
+            }
+            Some((state, _)) if state.starts_with('Z') => {
+                return Err(format!(
+                    "broker returned while fixture sleeper PID {pid} was live; it became a zombie only after its natural 60-second lifetime"
+                ));
+            }
+            Some((_state, command)) if command.contains(sleeper_name.as_ref()) => {}
+            Some((state, command)) => {
+                return Err(format!(
+                    "fixture provider PID {pid} became ambiguous while waiting; observed state {state:?} and command {command:?}"
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "fixture provider PID {pid} outlived its natural 60-second lifetime"
+    ))
 }
 
 #[test]
@@ -1292,7 +1570,7 @@ fn bounded_local_write_timeout_is_failed_without_remote_recovery() {
 #[cfg(unix)]
 #[test]
 fn a_read_that_times_out_reports_the_phase_and_needs_no_reconciliation() {
-    let tmp = common::FixtureRepository::new();
+    let tmp = common::FixtureRepository::from_tempdir(shell_fixture_tempdir());
     init_repo(tmp.path());
     let worktree = add_worktree(tmp.path(), "read-timeout");
     let mut broker = common::open_fixture_repository_broker(&tmp)
@@ -1306,7 +1584,7 @@ fn a_read_that_times_out_reports_the_phase_and_needs_no_reconciliation() {
     std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     git(
         tmp.path(),
-        &["config", "core.fsmonitor", hook.to_str().unwrap()],
+        &["config", "core.fsmonitor", &shell_path(&hook)],
     );
     let command = request(session.id, &["status"]);
 
@@ -1978,14 +2256,17 @@ fn a_slow_pre_lock_hook_exhausts_the_queue_timeout_and_settles_the_row() {
 #[cfg(unix)]
 #[test]
 fn an_opted_in_push_runs_its_hook_once_and_succeeds() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = shell_fixture_tempdir();
     let mut fixture = push_fixture(tmp.path(), "hooks-once");
     let repo = fixture.broker.main_root().to_path_buf();
     enable_hooks_outside_lock(&repo);
     let counter = tmp.path().join("hook-runs");
     install_pre_push_hook(
         &repo,
-        &format!("#!/bin/sh\nprintf 'x' >> {}\nexit 0\n", counter.display()),
+        &format!(
+            "#!/bin/sh\nprintf 'x' >> {}\nexit 0\n",
+            shell_path(&counter)
+        ),
     );
     let head = commit_push_fixture(&fixture, "work\n");
 
@@ -2015,13 +2296,16 @@ fn an_opted_in_push_runs_its_hook_once_and_succeeds() {
 #[cfg(unix)]
 #[test]
 fn without_opting_in_the_hook_still_runs_inside_the_push() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = shell_fixture_tempdir();
     let mut fixture = push_fixture(tmp.path(), "hooks-default");
     let repo = fixture.broker.main_root().to_path_buf();
     let counter = tmp.path().join("hook-runs");
     install_pre_push_hook(
         &repo,
-        &format!("#!/bin/sh\nprintf 'x' >> {}\nexit 0\n", counter.display()),
+        &format!(
+            "#!/bin/sh\nprintf 'x' >> {}\nexit 0\n",
+            shell_path(&counter)
+        ),
     );
     commit_push_fixture(&fixture, "work\n");
 
@@ -2049,7 +2333,7 @@ fn install_push_kind_recording_hook(repo: &Path, log: &Path) {
         repo,
         &format!(
             "#!/bin/sh\nprintf '%s|%s\\n' \"${{AETHYME_PUSH_KIND-unset}}\" \"$(printf '%s' \"${{AETHYME_PUSH_REFS-}}\" | tr '\\n' ',')\" >> {}\nexit 0\n",
-            log.display()
+            shell_path(log)
         ),
     );
 }
@@ -2062,7 +2346,7 @@ fn install_push_kind_recording_hook(repo: &Path, log: &Path) {
 #[cfg(unix)]
 #[test]
 fn a_delete_only_push_skips_the_dry_run_and_tells_the_hook() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = shell_fixture_tempdir();
     let mut fixture = push_fixture(tmp.path(), "delete-only");
     let repo = fixture.broker.main_root().to_path_buf();
     git(&repo, &["push", "-q", "origin", "main:refs/heads/feature"]);
@@ -2099,7 +2383,7 @@ fn a_delete_only_push_skips_the_dry_run_and_tells_the_hook() {
 #[cfg(unix)]
 #[test]
 fn an_update_push_tells_the_hook_it_is_an_update() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = shell_fixture_tempdir();
     let mut fixture = push_fixture(tmp.path(), "update-kind");
     let repo = fixture.broker.main_root().to_path_buf();
     let log = tmp.path().join("hook-env");
@@ -2126,7 +2410,7 @@ fn an_update_push_tells_the_hook_it_is_an_update() {
 #[cfg(unix)]
 #[test]
 fn a_mixed_push_is_verified_and_tells_the_hook_it_is_mixed() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = shell_fixture_tempdir();
     let mut fixture = push_fixture(tmp.path(), "mixed-kind");
     let repo = fixture.broker.main_root().to_path_buf();
     git(&repo, &["push", "-q", "origin", "main:refs/heads/old"]);
@@ -2625,4 +2909,161 @@ fn exact_push_inspection_refuses_a_changed_remote_repository() {
         serde_json::to_value(current).unwrap(),
         serde_json::to_value(original).unwrap()
     );
+}
+/// The opt-in hook decision and the provider write must stay bound to the same
+/// source object. A hook moves the source ref after the dry run selected it;
+/// the broker must refuse the now-stale named ref instead of pushing its new
+/// value with the hook skipped.
+#[cfg(unix)]
+#[test]
+fn opted_in_pre_push_refuses_source_ref_moved_during_dry_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "hooks-pin");
+    let repo = fixture.broker.main_root().to_path_buf();
+    enable_hooks_outside_lock(&repo);
+
+    let source_ref = "refs/heads/agent/hooks-pin";
+    let inspected = commit_push_fixture(&fixture, "hook inspected commit\n");
+    let tree = git_output(
+        &fixture.worktree,
+        &["rev-parse", &format!("{inspected}^{{tree}}")],
+    );
+    let later = git_output(
+        &fixture.worktree,
+        &["commit-tree", &tree, "-p", &inspected, "-m", "later commit"],
+    );
+    git(
+        &fixture.worktree,
+        &["update-ref", "refs/heads/other", &later],
+    );
+    let remote_before = git_output(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+
+    // From this worktree, ../../../ is the repository root. The hook records
+    // Git's actual local SHA and then moves the branch using an expected-old
+    // value, so the race point is deterministic and cannot overwrite another
+    // writer's unrelated branch update.
+    let hook = format!(
+        "#!/bin/sh\nset -eu\nwhile read local_ref local_sha remote_ref remote_sha; do\n  printf '%s\\n' \"$local_sha\" > ../../../hook-seen\ndone\ngit update-ref refs/heads/agent/hooks-pin {later} {inspected}\n"
+    );
+    install_pre_push_hook(&repo, &hook);
+
+    let refspec = format!("{source_ref}:refs/heads/main");
+    let error = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &[&refspec],
+        ))
+        .expect_err("the stale source ref must refuse before the provider push");
+    assert!(
+        error
+            .to_string()
+            .contains("a local ref moved between the pre-push hook and acquiring the lock"),
+        "expected the final original-ref revalidation to refuse: {error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("hook-seen"))
+            .unwrap()
+            .trim(),
+        inspected,
+        "the hook must have received the same source object captured before it ran"
+    );
+    assert_eq!(
+        git_output(&fixture.worktree, &["rev-parse", source_ref]),
+        later,
+        "the hook's expected-old update moved the source ref"
+    );
+    assert_eq!(
+        git_output(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        remote_before,
+        "the provider must not publish the post-hook ref value"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ambiguous_remote_identity_refuses_wide_and_scoped_writes_before_journaling() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "reserved-identity");
+    let renamed_remote = tmp.path().join("remote::git-ref/refs/heads/main.git");
+    std::fs::create_dir_all(renamed_remote.parent().unwrap()).unwrap();
+    std::fs::rename(&fixture.remote, &renamed_remote).unwrap();
+    git(
+        &fixture.worktree,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            renamed_remote.to_str().unwrap(),
+        ],
+    );
+    let target = GitRepo::discover(&fixture.worktree)
+        .unwrap()
+        .resolve_remote_target("origin", None)
+        .unwrap();
+    assert!(target.coordination_key.contains("::git-ref/"));
+    let operations_before = fixture
+        .broker
+        .store()
+        .coordinated_operations()
+        .unwrap()
+        .len();
+    let host_database = common::fixture_host_state_dir(tmp.path()).join("host-operations.db");
+    let host_rows = || {
+        if !host_database.exists() {
+            return 0_i64;
+        }
+        rusqlite::Connection::open(&host_database)
+            .unwrap()
+            .query_row("SELECT count(*) FROM host_operations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    let host_rows_before = host_rows();
+    let wide = exact_push_request(
+        fixture.session_id,
+        &fixture.worktree,
+        &["HEAD:refs/heads/main"],
+    );
+    let mut scoped = request(
+        fixture.session_id,
+        &[
+            "fetch",
+            "--atomic",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+            "--no-write-commit-graph",
+            "--no-prune",
+            "--no-prune-tags",
+            "--refmap=",
+            "--",
+            "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+        ],
+    );
+    scoped.resolved_target = Some(target);
+    for command in [wide, scoped] {
+        let error = fixture
+            .broker
+            .run_coordinated_operation(command)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("reserved coordination marker"),
+            "{error}"
+        );
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .coordinated_operations()
+                .unwrap()
+                .len(),
+            operations_before
+        );
+        assert_eq!(host_rows(), host_rows_before);
+    }
 }
