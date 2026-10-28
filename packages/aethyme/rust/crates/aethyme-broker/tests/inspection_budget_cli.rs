@@ -60,7 +60,9 @@ fn run_timed(
     let elapsed = started.elapsed();
     assert!(
         output.status.success(),
-        "{}",
+        "CLI {args:?} exited {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     (serde_json::from_slice(&output.stdout).unwrap(), elapsed)

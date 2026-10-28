@@ -2877,12 +2877,20 @@ impl Broker {
         // One listing instead of one `rev-parse` per session ever recorded:
         // this plan is on `broker status`'s path through `cleanup_retention`.
         let branch_tips = self.repo.local_branch_tips();
-        let live_checkouts = self.cleanup_live_checkout_snapshot(deadline)?;
+        // An incomplete ownership index cannot authorize any candidate. A
+        // bounded health report must defer inspection, rather than fail the
+        // entire status command. Unbounded removal plans remain strict.
+        let live_checkouts = if budget.is_some() {
+            self.cleanup_live_checkout_snapshot_until(deadline)?
+        } else {
+            Some(self.cleanup_live_checkout_snapshot(deadline)?)
+        };
         for session in self.store.cleaned_sessions()? {
             if session.origin != SessionOrigin::Spawned {
                 continue;
             }
-            let mut over_budget = budget.is_some_and(|budget| started.elapsed() >= budget);
+            let mut over_budget = live_checkouts.is_none()
+                || budget.is_some_and(|budget| started.elapsed() >= budget);
             let item = if over_budget {
                 self.cleanup_item_not_inspected(
                     &session,
@@ -2900,7 +2908,9 @@ impl Broker {
                     &mut records,
                     CleanupInspectionContext {
                         branch_tips: branch_tips.as_ref(),
-                        live_checkouts: &live_checkouts,
+                        live_checkouts: live_checkouts
+                            .as_deref()
+                            .expect("an inspected candidate requires a complete ownership index"),
                         delivery_targets: target_snapshot
                             .delivery_targets
                             .as_deref()
@@ -4428,6 +4438,16 @@ impl Broker {
         &self,
         deadline: Option<std::time::Instant>,
     ) -> Result<Vec<(i64, crate::auto_cleanup::ResolvedWorktreePath)>, BrokerOpError> {
+        self.cleanup_live_checkout_snapshot_until(deadline)?
+            .ok_or_else(|| BrokerOpError::RepresentationUnavailable {
+                reason: "live checkout ownership observation exceeded its deadline".into(),
+            })
+    }
+
+    fn cleanup_live_checkout_snapshot_until(
+        &self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Option<Vec<(i64, crate::auto_cleanup::ResolvedWorktreePath)>>, BrokerOpError> {
         let deadline = CleanupStatusLimits::new(
             deadline,
             crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
@@ -4435,15 +4455,18 @@ impl Broker {
         )
         .deadline;
         let sessions = self.store.live_sessions()?;
-        let paths = crate::auto_cleanup::resolve_live_worktree_paths(&sessions, Some(deadline))
-            .ok_or_else(|| BrokerOpError::RepresentationUnavailable {
-                reason: "live checkout ownership observation exceeded its deadline".into(),
-            })?;
-        Ok(sessions
-            .into_iter()
-            .map(|session| session.id)
-            .zip(paths)
-            .collect())
+        let Some(paths) =
+            crate::auto_cleanup::resolve_live_worktree_paths(&sessions, Some(deadline))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            sessions
+                .into_iter()
+                .map(|session| session.id)
+                .zip(paths)
+                .collect(),
+        ))
     }
 
     /// Refuse to remove a checkout any other live session works in.

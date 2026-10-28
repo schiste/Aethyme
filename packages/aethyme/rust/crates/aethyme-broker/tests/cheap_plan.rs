@@ -281,12 +281,26 @@ fn a_health_check_lists_worktrees_it_had_no_budget_to_judge() {
     assert_eq!(judged.eligibility_not_inspected_count, 0);
     assert_eq!(judged.eligible_worktree_count, 2, "{judged:#?}");
 
+    // A live checkout makes ownership indexing consume the same deadline.
+    // Expiry must defer every closed candidate, never fail the health report
+    // or turn a missing ownership observation into deletion authority.
+    let live = broker
+        .start_worktree("live ownership witness", None)
+        .unwrap();
+    let live_path = PathBuf::from(&live.worktree_path);
+    std::fs::write(live_path.join("draft.txt"), "keep live work\n").unwrap();
+
     let bounded = broker
         .cleanup_plan_recorded_within(std::time::Duration::ZERO)
         .unwrap();
     assert_eq!(bounded.eligibility_not_inspected_count, 2, "{bounded:#?}");
     assert_eq!(bounded.retained_worktree_count, 2, "both are still listed");
     assert_eq!(bounded.eligible_worktree_count, 0);
+    assert_eq!(bounded.eligible_branch_count, 0);
+    assert_eq!(
+        std::fs::read_to_string(live_path.join("draft.txt")).unwrap(),
+        "keep live work\n"
+    );
     let mut listed: Vec<_> = bounded
         .worktrees
         .iter()
