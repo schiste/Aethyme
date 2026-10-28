@@ -1299,7 +1299,7 @@ fn automatic_cleanup_honors_default_close_grace() {
 
     let report = run(&mut broker);
     assert!(report.removed.is_empty(), "{report:#?}");
-    assert!(kept_reason(&report, &worktree).contains("24 hour closed-worktree grace"));
+    assert!(kept_reason(&report, &worktree).contains("360 hour closed-worktree grace"));
     assert!(worktree.is_dir());
     // The same checkout is still eligible for the operator's explicit cleanup.
     assert!(
