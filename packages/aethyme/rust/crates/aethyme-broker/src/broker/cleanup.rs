@@ -2957,14 +2957,14 @@ impl Broker {
             };
             let item = if over_budget {
                 self.cleanup_item_not_inspected(
-                    &session,
+                    session,
                     &records,
                     branch_tips.as_ref(),
                     deferred_reason.clone(),
                 )
             } else {
                 let item = self.cleanup_item_scanned_with_tips(
-                    &session,
+                    session,
                     scan,
                     &mut records,
                     CleanupInspectionContext {
@@ -3003,7 +3003,7 @@ impl Broker {
                 {
                     over_budget = true;
                     self.cleanup_item_not_inspected(
-                        &session,
+                        session,
                         &records,
                         branch_tips.as_ref(),
                         deferred_reason,
