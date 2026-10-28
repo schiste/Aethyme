@@ -13,14 +13,33 @@ Depth, read, mount, special-node and lease failures still refuse. The cache
 rotation remover independently refuses special nodes and leaves durable debt
 for recovery.
 
-For an existing-repository runtime upgrade, take consistent database backups
-before opening live state with the new binary. A schema migration does not
-adopt a legacy worktree root: if start requires a binding, review
-`broker advanced worktree-root binding plan <exact-root> <layout> --json`
-and apply only its reviewed digest. Binding can raise the compatibility floor,
-so verify which executable resumed agents will use; the repo-local selector
-does not change their PATH. Preserve concurrent work and never automatically
-restore a pre-upgrade database over newer activity.
+For an existing-repository runtime upgrade that crosses a schema or
+destructive-maintenance protocol boundary, take consistent database backups
+before the new runtime's first normal open. When destructive-maintenance
+behavior changes, apply these holds before that open in every enrolled
+repository affected by the shared router/engine pair. In `.aethyme/broker.toml`,
+set `[retention] session_abandoned_after_hours = 0`,
+`auto_cleanup_worktrees_on_finish = false`, and `artifact_sweep_budget_ms = 0`.
+In `.aethyme/config.toml`, set `[cleanup] strict = true`,
+`ignored_directory_sweep = false`, and `auto_remove = false`. Together, these
+hold abandoned-session retirement, finish-time checkout removal, automatic
+artifact sweeps, ignored-directory sweeps, and automatic whole-checkout removal.
+The finish-time hold is independent of `auto_remove`. Before the first normal
+open, inspect `.aethyme/gc-journal.json`; startup can resume an
+already-confirmed plan independently of these automatic-maintenance settings,
+so review and resolve any pending journal through the reviewed GC recovery path
+first.
+A raised schema floor
+blocks fresh opens by older binaries only; it cannot revoke existing database
+connections. Drain older clients and verify process identity plus database,
+WAL, and SHM handles in every affected repository before restoring reviewed
+policies. Ordinary runtime patches do not require these holds. A schema
+migration does not adopt a legacy worktree root: if start requires a binding,
+review `broker advanced worktree-root binding plan <exact-root> <layout>
+--json` and apply only its reviewed digest. Binding can raise the compatibility
+floor, so verify which executable resumed agents will use; the repo-local
+selector does not change their PATH. Preserve concurrent work and never
+automatically restore a pre-upgrade database over newer activity.
 
 Checkout capacity is configured with `[worktrees] max_checkouts = <count>` in
 `.aethyme/config.toml` on the fetched default branch. A working-copy edit alone
