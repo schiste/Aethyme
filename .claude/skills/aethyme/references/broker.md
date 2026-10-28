@@ -96,17 +96,24 @@ blocked.
    Repeat `--path` for every file or trailing-slash directory known up front.
    The broker validates the whole set first, then creates the session plus
    explicit leases atomically. Omit `--path` only when no target is known yet.
-   If full `status --json` shows another session holding leases on the
-   files you plan to change, prefer working elsewhere first or coordinate
-   with its holder — overlapping edits can conflict at merge time.
-   Coordinate the exact shared hunk with its holder; a sibling session's PR
-   or branch is not automatically your upstream. Sync against the configured
-   upstream when required, and do not import or restack onto another session's
-   branch without separate authorization.
-   When you edit a file another live session is changing, the broker tells you
-   in context who, where and whether Git would conflict, never blocking the
-   edit; `aethyme broker advanced note send --to-session <id>` reaches that
-   agent, and its notes reach you at your next turn.
+   Leases record planned or observed path overlap; they do not lock files
+   across isolated worktrees. A lease or warning alone is not a reason to
+   wait or switch tasks: continue on independent work in your own worktree.
+   Before contacting a holder, inspect their task and claimed paths in full
+   `aethyme broker status --json`; an explicit lease may record intent without
+   any edit. Check the path with `git -C <worktree> status --short -- <path>`
+   and inspect the diff with `git -C <worktree> diff HEAD -- <path>`, or view
+   the open PR diff. Check whether edits touch the same lines or would
+   produce conflicting behavior.
+   If the path is untouched or changes are independent, keep working without
+   waiting or messaging. Coordinate only when edits overlap or interact, or
+   your work depends on unmerged work. If needed, contact the holder with the
+   exact path and dependency using `aethyme broker advanced note send --to-session <id>`;
+   a lease alone is not a reason to request release. A refused claim means the
+   broker did not grant that claim; it does not block unrelated work in your
+   checkout. A sibling session's PR or branch is not automatically your
+   upstream. Sync against the configured upstream when required; do not import
+   or restack onto another session's branch without separate authorization.
 
 2. **Lease additional shared files before the diff exists**. Prefer the
    atomic `start --path` / `start --adopt --path` declaration above for initial intent. If the
@@ -121,10 +128,11 @@ blocked.
    changed files, but explicit leases are clearer for planned shared edits.
    `leases release` removes an explicit claim; implicit rows describe the
    current diff and remain until that diff is refreshed or cleared.
-   A claim is refused only by another explicit lease whose holder is actively
-   working, and never in a `verify-only` repository; every other overlap comes
-   back as a warning naming the holder, with the `note send` command to
-   coordinate.
+   Outside `verify-only`, another active explicit lease can refuse a claim;
+   that refusal applies to the claim only. In `verify-only`, another session's
+   lease does not refuse a claim. Other overlaps return a warning naming the
+   holder and `note send` command; warnings do not pause work in your own
+   worktree.
 
    Status and blocker listings are repository-wide; stale leases remain in the
    lease/liveness views but do not become global path-lease blockers. These
