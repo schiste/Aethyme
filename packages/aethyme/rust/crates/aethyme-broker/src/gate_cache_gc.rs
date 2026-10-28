@@ -364,6 +364,7 @@ pub(crate) fn inspect(
             scan,
             records,
             entry_budget: None,
+            deadline: None,
         },
         || false,
     );
@@ -396,6 +397,7 @@ pub(crate) fn inspect_until(
             scan,
             records,
             entry_budget: Some(HEALTH_GATE_CACHE_ENTRY_BUDGET),
+            deadline: Some(deadline),
         },
         || Instant::now() >= deadline,
     )
@@ -407,6 +409,7 @@ struct InspectParameters<'a> {
     scan: crate::SizeScan,
     records: &'a mut crate::measurement::SizeRecords,
     entry_budget: Option<usize>,
+    deadline: Option<Instant>,
 }
 
 fn inspect_with_expiration(
@@ -425,6 +428,7 @@ fn inspect_with_expiration(
         scan,
         records,
         entry_budget,
+        deadline,
     } = parameters;
     let KeepRule {
         budget_bytes,
@@ -504,8 +508,15 @@ fn inspect_with_expiration(
                     .map_or_else(|| entry.clone(), |(key, _)| key.clone());
                 let key = path.to_string_lossy().into_owned();
                 let (estimated_bytes, estimated_inodes) = if scan.measures() {
-                    let measured =
-                        crate::disk_headroom::directory_usage_without_following_links(&path).ok();
+                    let measured = match deadline {
+                        Some(deadline) => {
+                            crate::disk_headroom::directory_usage_bounded(&path, deadline)
+                        }
+                        None => {
+                            crate::disk_headroom::directory_usage_without_following_links(&path)
+                                .ok()
+                        }
+                    };
                     if let Some(usage) = measured {
                         records.record_usage(
                             &key,

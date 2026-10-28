@@ -4,6 +4,17 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.45] - 2026-10-28
+
+### Changed
+
+- The default `broker gc plan` and fresh-plan `broker gc apply` now share a
+  cooperative 10-second inspection budget. Incomplete plans have no apply
+  digest. `--full-scan` skips that default budget and discovery entry cap while
+  retaining the existing six-level artifact-discovery depth; the generated
+  apply command preserves the selected mode. Default planning defers a
+  nonempty recovery-archive inventory.
+
 ## [0.8.44] - 2026-10-28
 
 **Breaking:** see [UPGRADING.md](UPGRADING.md#v0844).
