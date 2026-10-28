@@ -38,6 +38,29 @@ pub(crate) fn acquire_repository_lifecycle_lock(main_root: &Path) -> io::Result<
     acquire_repository_lifecycle_lock_with_wait(main_root, LIFECYCLE_LOCK_WAIT)
 }
 
+/// Make a nonblocking claim for a checkout lifecycle operation.
+///
+/// Admission paths use this when queueing behind a remover could outlive the
+/// caller's bounded maintenance window. `None` means another lifecycle claim
+/// is active; path and inode changes remain errors.
+pub(crate) fn try_acquire_repository_lifecycle_lock(
+    main_root: &Path,
+) -> io::Result<Option<ExclusiveFileLock>> {
+    let path = repository_lifecycle_lock_path(main_root)?;
+    let file = open_lock_file_nofollow(&path)?;
+    let Some(lock) = ExclusiveFileLock::try_acquire(file)? else {
+        return Ok(None);
+    };
+    if repository_lifecycle_lock_path(main_root)? != path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "broker lifecycle lock path changed while it was acquired",
+        ));
+    }
+    verify_named_lock_file(&path, &lock.file)?;
+    Ok(Some(lock))
+}
+
 fn repository_lifecycle_lock_path(main_root: &Path) -> io::Result<std::path::PathBuf> {
     repository_runtime_lock_path(main_root, "worktree-lifecycle.lock")
 }
@@ -310,6 +333,19 @@ pub(crate) mod artifact_use;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn try_lifecycle_claim_returns_none_without_waiting_when_busy() {
+        let repository = tempfile::tempdir().unwrap();
+        let held = acquire_repository_lifecycle_lock(repository.path()).unwrap();
+        assert!(try_acquire_repository_lifecycle_lock(repository.path())
+            .unwrap()
+            .is_none());
+        drop(held);
+        assert!(try_acquire_repository_lifecycle_lock(repository.path())
+            .unwrap()
+            .is_some());
+    }
 
     #[test]
     fn pr_watch_claim_excludes_another_tick_and_releases_on_drop() {

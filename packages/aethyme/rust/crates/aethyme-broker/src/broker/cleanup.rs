@@ -1636,6 +1636,56 @@ impl Broker {
         Ok(claim)
     }
 
+    /// Try to claim repository-wide checkout lifecycle mutation without
+    /// waiting. Bounded maintenance uses this to skip a checkout rather than
+    /// exceed its deadline while another creation, adoption, or removal runs.
+    pub(crate) fn try_claim_worktree_lifecycle(
+        &self,
+    ) -> Result<Option<crate::file_lock::ExclusiveFileLock>, BrokerOpError> {
+        self.store.require_live_schema_compatible()?;
+        let main_root = self
+            .main_root
+            .canonicalize()
+            .map_err(|source| BrokerError::Io {
+                path: self.main_root.clone(),
+                source,
+            })?;
+        let broker_root = self
+            .repo
+            .root()
+            .canonicalize()
+            .map_err(|source| BrokerError::Io {
+                path: self.repo.root().to_path_buf(),
+                source,
+            })?;
+        let common_dir = self
+            .main_git_common_dir()?
+            .canonicalize()
+            .map_err(|source| BrokerError::Io {
+                path: self.main_root.join(".git"),
+                source,
+            })?;
+        if broker_root != main_root || common_dir.parent() != Some(main_root.as_path()) {
+            return Err(GitError::UntrustedOutput {
+                detail:
+                    "worktree lifecycle claim could not confirm the primary repository identity"
+                        .into(),
+            }
+            .into());
+        }
+        let claim = crate::file_lock::try_acquire_repository_lifecycle_lock(&main_root)
+            .map_err(|source| BrokerError::Io {
+                path: main_root.join(".aethyme/run"),
+                source,
+            })?;
+        if claim.is_some() {
+            // The floor may have advanced while the nonblocking claim was
+            // acquired. Keep it only if current committed markers permit us.
+            self.store.require_live_schema_compatible()?;
+        }
+        Ok(claim)
+    }
+
     /// Whether a directory is the remains of a worktree of *this* repository
     /// whose registration is already gone.
     ///
@@ -4131,6 +4181,62 @@ impl Broker {
                     ),
                 })?;
         let worktree_path = PathBuf::from(&session.worktree_path);
+        let artifact_use_reclaimer = if worktree_path_is_real_directory(&worktree_path, session_id)? {
+            match crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                self.main_root(),
+                &worktree_path,
+            ) {
+                Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(
+                    reclaimer,
+                )) => Some(reclaimer),
+                Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(
+                    crate::file_lock::artifact_use::ArtifactUseReclaimBlock::ProtocolUnavailable,
+                )) => {
+                    #[cfg(not(unix))]
+                    {
+                        // Keep the pre-existing explicit cleanup contract on
+                        // targets that cannot run the artifact-use protocol.
+                        // The unattended consumers remain fail-closed there.
+                        None
+                    }
+                    #[cfg(unix)]
+                    {
+                        return Err(BrokerOpError::DirtyWorktree {
+                            id: session_id,
+                            reason: "artifact-use protection is unavailable; preserved the worktree".into(),
+                        });
+                    }
+                }
+                Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(block)) => {
+                    let reason = match block {
+                        crate::file_lock::artifact_use::ArtifactUseReclaimBlock::Contended => {
+                            "an artifact producer is active; preserved the worktree"
+                        }
+                        crate::file_lock::artifact_use::ArtifactUseReclaimBlock::UnknownProducer {
+                            ..
+                        } => "artifact-use markers are unresolved; preserved the worktree",
+                        crate::file_lock::artifact_use::ArtifactUseReclaimBlock::ProtocolUnavailable => {
+                            unreachable!("unavailable protocol is handled above")
+                        }
+                    };
+                    return Err(BrokerOpError::DirtyWorktree {
+                        id: session_id,
+                        reason: reason.into(),
+                    });
+                }
+                Err(source) => {
+                    return Err(BrokerOpError::DirtyWorktree {
+                        id: session_id,
+                        reason: format!(
+                            "artifact-use state could not be verified; preserved the worktree: {source}"
+                        ),
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        let _artifact_use_reclaimer = artifact_use_reclaimer;
         if archive_guard.is_some() && session.origin != SessionOrigin::Spawned {
             return Err(BrokerOpError::CleanupResolveRefused {
                 id: session_id,
@@ -4344,7 +4450,34 @@ impl Broker {
         session_id: i64,
         worktree: &Path,
     ) -> Result<(), BrokerOpError> {
-        let live_checkouts = self.cleanup_live_checkout_snapshot(self.landing_deadline.get())?;
+        self.refuse_live_checkout_with_deadline(
+            session_id,
+            worktree,
+            self.landing_deadline.get(),
+        )
+    }
+
+    /// Refuse a live checkout using the caller's remaining maintenance budget.
+    ///
+    /// Artifact reclamation calls this while holding its GC and artifact-use
+    /// claims, so a live-path observation cannot extend an inline sweep past
+    /// its smaller deadline.
+    pub(crate) fn refuse_live_checkout_until(
+        &self,
+        session_id: i64,
+        worktree: &Path,
+        deadline: std::time::Instant,
+    ) -> Result<(), BrokerOpError> {
+        self.refuse_live_checkout_with_deadline(session_id, worktree, Some(deadline))
+    }
+
+    fn refuse_live_checkout_with_deadline(
+        &self,
+        session_id: i64,
+        worktree: &Path,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(), BrokerOpError> {
+        let live_checkouts = self.cleanup_live_checkout_snapshot(deadline)?;
         let live_owner = overlapping_live_checkout(session_id, worktree, &live_checkouts)
             .map_err(|reason| BrokerOpError::DirtyWorktree {
                 id: session_id,
@@ -5818,6 +5951,29 @@ mod registered_removal_failure_tests {
 
         assert!(!worktree.exists());
         assert!(broker.repo.resolve_ref(&proof.branch_ref).is_none());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn explicit_cleanup_keeps_legacy_behavior_when_artifact_protocol_is_unavailable() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "unsupported protocol cleanup");
+        broker.close(session.id).unwrap();
+
+        assert!(matches!(
+            crate::file_lock::artifact_use::try_artifact_use_reclaimer(&repository, &worktree)
+                .unwrap(),
+            crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(
+                crate::file_lock::artifact_use::ArtifactUseReclaimBlock::ProtocolUnavailable
+            )
+        ));
+
+        broker.cleanup(session.id, false).unwrap();
+        assert!(!worktree.exists());
     }
 
     #[test]

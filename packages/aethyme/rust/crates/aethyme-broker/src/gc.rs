@@ -125,6 +125,11 @@ const ARTIFACT_SWEEP_PROGRESS_KEY: &str = "gc.artifact_sweep.last_partial_ms";
 const ARTIFACT_SWEEP_INTERRUPTED_KEY: &str = "gc.artifact_sweep.interrupted_path";
 const ARTIFACT_SWEEP_INTERRUPTED_PATHS_MAX: usize = 32;
 const ARTIFACT_SWEEP_INTERRUPTED_VALUE_MAX_BYTES: usize = 64 * 1024;
+/// Typed recovery queue for arbitrary ignored directory roots. The legacy
+/// interrupted-path queue remains catalog-only for older brokers.
+const ARTIFACT_SWEEP_IGNORED_DIR_INTERRUPTED_KEY: &str =
+    "gc.artifact_sweep.interrupted_ignored_directory";
+const IGNORED_DIRECTORY_QUEUE_SCHEMA_VERSION: u32 = 1;
 const ARTIFACT_SWEEP_DIAGNOSTIC_PATH_MAX_CHARS: usize = 128;
 const ARTIFACT_SWEEP_BLOCKED_DIAGNOSTICS_MAX: usize = 32;
 /// Last diagnosed unavailable marker set; replaced or cleared to avoid an
@@ -322,6 +327,26 @@ enum InterruptedTreeState {
     Unavailable(&'static str),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum InterruptedIgnoredDirectoryKind {
+    IgnoredDirectoryRoot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct InterruptedIgnoredDirectory {
+    kind: InterruptedIgnoredDirectoryKind,
+    path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct InterruptedIgnoredDirectoryQueue {
+    version: u32,
+    paths: Vec<InterruptedIgnoredDirectory>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RevokedInterruptedPath {
     path: String,
@@ -494,6 +519,98 @@ fn decode_interrupted_paths(value: Option<&str>) -> Result<Vec<String>, ()> {
         }
     }
     Ok(unique)
+}
+
+fn decode_interrupted_ignored_directories(value: Option<&str>) -> Result<Vec<String>, ()> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    if value.len() > ARTIFACT_SWEEP_INTERRUPTED_VALUE_MAX_BYTES {
+        return Err(());
+    }
+    let queue: InterruptedIgnoredDirectoryQueue = serde_json::from_str(value).map_err(|_| ())?;
+    if queue.version != IGNORED_DIRECTORY_QUEUE_SCHEMA_VERSION
+        || queue.paths.len() > ARTIFACT_SWEEP_INTERRUPTED_PATHS_MAX
+    {
+        return Err(());
+    }
+    let mut paths = Vec::with_capacity(queue.paths.len());
+    let mut seen = BTreeSet::new();
+    for entry in queue.paths {
+        let path = Path::new(&entry.path);
+        if !path.is_absolute()
+            || has_parent_dir_component(path)
+            || !seen.insert(entry.path.clone())
+        {
+            return Err(());
+        }
+        paths.push(entry.path);
+    }
+    Ok(paths)
+}
+
+fn encode_interrupted_ignored_directories(paths: &[String]) -> Option<String> {
+    if paths.len() > ARTIFACT_SWEEP_INTERRUPTED_PATHS_MAX {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(paths.len());
+    let mut seen = BTreeSet::new();
+    for path in paths {
+        let candidate = Path::new(path);
+        if !candidate.is_absolute()
+            || has_parent_dir_component(candidate)
+            || !seen.insert(path.clone())
+        {
+            return None;
+        }
+        entries.push(InterruptedIgnoredDirectory {
+            kind: InterruptedIgnoredDirectoryKind::IgnoredDirectoryRoot,
+            path: path.clone(),
+        });
+    }
+    let value = if entries.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(&InterruptedIgnoredDirectoryQueue {
+            version: IGNORED_DIRECTORY_QUEUE_SCHEMA_VERSION,
+            paths: entries,
+        })
+        .ok()?
+    };
+    (value.len() <= ARTIFACT_SWEEP_INTERRUPTED_VALUE_MAX_BYTES).then_some(value)
+}
+
+fn persist_interrupted_ignored_directories(
+    store: &mut crate::BrokerStore,
+    namespace: &str,
+    paths: &[String],
+) -> Result<bool, BrokerOpError> {
+    let Some(value) = encode_interrupted_ignored_directories(paths) else {
+        return Ok(false);
+    };
+    store.meta_set(
+        &scoped_artifact_sweep_key(namespace, ARTIFACT_SWEEP_IGNORED_DIR_INTERRUPTED_KEY),
+        &value,
+    )?;
+    Ok(true)
+}
+
+fn ignored_directory_sweep_policy_allows_checkout(
+    policy: &crate::AutoCleanupPolicy,
+    worktree: &Path,
+) -> bool {
+    policy.ignored_directory_sweep && !policy.strict && !policy.is_pinned(worktree)
+}
+
+fn ignored_listing_has_directory_root(
+    entries: &[crate::git::GitIgnoredPathEntry],
+    relative: &str,
+) -> bool {
+    entries.iter().any(|entry| {
+        entry.relative == relative
+            && entry.directory_marker
+            && entry.kind == crate::git::GitIgnoredPathKind::DirectoryRoot
+    })
 }
 
 fn has_parent_dir_component(path: &Path) -> bool {
@@ -710,6 +827,83 @@ struct BoundedArtifactDiscovery {
     entries_examined: usize,
 }
 
+struct IgnoredDirectoryDiscovery {
+    entries: Vec<crate::git::GitIgnoredPathEntry>,
+    generic_roots: BTreeSet<PathBuf>,
+    opaque_roots: BTreeSet<PathBuf>,
+    complete: bool,
+    entries_examined: usize,
+}
+
+fn discover_ignored_directory_roots_bounded(
+    root: &Path,
+    checkout: &GitRepo,
+    extras: &[String],
+    deadline: Instant,
+    entry_budget: usize,
+) -> Result<IgnoredDirectoryDiscovery, ()> {
+    let _git_deadline = crate::git::limit_git_until(deadline);
+    let entries = checkout
+        .ignored_paths_readonly_until(deadline)
+        .map_err(|_| ())?;
+    let mut discovery = IgnoredDirectoryDiscovery {
+        entries,
+        generic_roots: BTreeSet::new(),
+        opaque_roots: BTreeSet::new(),
+        complete: true,
+        entries_examined: 0,
+    };
+    if discovery.entries.len() > entry_budget {
+        discovery.complete = false;
+    }
+    let admitted = discovery.entries.len().min(entry_budget);
+    let mut candidates = Vec::new();
+    for entry in discovery.entries.iter().take(admitted) {
+        if Instant::now() >= deadline {
+            discovery.complete = false;
+            break;
+        }
+        discovery.entries_examined = discovery.entries_examined.saturating_add(1);
+        match entry.kind {
+            crate::git::GitIgnoredPathKind::DirectoryRoot
+            | crate::git::GitIgnoredPathKind::Protected => {
+                let path = root.join(&entry.relative);
+                discovery.opaque_roots.insert(path.clone());
+                if entry.kind == crate::git::GitIgnoredPathKind::DirectoryRoot {
+                    let depth = Path::new(&entry.relative).components().count();
+                    if depth > ARTIFACT_SCAN_DEPTH {
+                        discovery.complete = false;
+                    } else if artifact_witness_for_with_extras(&path, extras).is_none() {
+                        candidates.push(path);
+                    }
+                }
+            }
+            crate::git::GitIgnoredPathKind::Other => {}
+        }
+    }
+    if Instant::now() >= deadline {
+        discovery.complete = false;
+    }
+    // Prefer an outer opaque ignored folder so descendants are never scanned
+    // or queued as a second removal target.
+    candidates.sort_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    for candidate in candidates {
+        if !discovery
+            .generic_roots
+            .iter()
+            .any(|parent| candidate.starts_with(parent))
+        {
+            discovery.generic_roots.insert(candidate);
+        }
+    }
+    Ok(discovery)
+}
+
 impl BoundedArtifactDiscovery {
     fn new() -> Self {
         Self {
@@ -726,10 +920,27 @@ fn collect_artifact_dirs_bounded(
     deadline: Instant,
     entry_budget: usize,
 ) -> BoundedArtifactDiscovery {
+    collect_artifact_dirs_bounded_with_opaque_ignored_roots(
+        root,
+        extras,
+        &BTreeSet::new(),
+        deadline,
+        entry_budget,
+    )
+}
+
+fn collect_artifact_dirs_bounded_with_opaque_ignored_roots(
+    root: &Path,
+    extras: &[String],
+    opaque_ignored_roots: &BTreeSet<PathBuf>,
+    deadline: Instant,
+    entry_budget: usize,
+) -> BoundedArtifactDiscovery {
     fn visit(
         current: &Path,
         depth: usize,
         extras: &[String],
+        opaque_ignored_roots: &BTreeSet<PathBuf>,
         deadline: Instant,
         entry_budget: usize,
         discovery: &mut BoundedArtifactDiscovery,
@@ -779,7 +990,21 @@ fn collect_artifact_dirs_bounded(
                 discovery.classified.push(path);
                 continue;
             }
-            visit(&path, depth + 1, extras, deadline, entry_budget, discovery);
+            if opaque_ignored_roots.contains(&path) {
+                // A complete Git listing already classified this ignored root.
+                // Do not descend into its opaque contents looking for nested
+                // cache names; the opt-in lane handles the root as one unit.
+                continue;
+            }
+            visit(
+                &path,
+                depth + 1,
+                extras,
+                opaque_ignored_roots,
+                deadline,
+                entry_budget,
+                discovery,
+            );
             if !discovery.complete {
                 return;
             }
@@ -787,7 +1012,15 @@ fn collect_artifact_dirs_bounded(
     }
 
     let mut discovery = BoundedArtifactDiscovery::new();
-    visit(root, 0, extras, deadline, entry_budget, &mut discovery);
+    visit(
+        root,
+        0,
+        extras,
+        opaque_ignored_roots,
+        deadline,
+        entry_budget,
+        &mut discovery,
+    );
     discovery
 }
 
@@ -5401,6 +5634,361 @@ impl Broker {
     /// path before unlinking. Later passes resume those exact paths and rotate
     /// the session cursor past incomplete worktrees so a wide or blocked
     /// checkout cannot starve the rest of the backlog (#222).
+    fn reclaim_ignored_directory_roots_under_claims(
+        &mut self,
+        root: &Path,
+        expected_cohort: Option<&crate::auto_cleanup::ClosedArtifactCheckoutCohort>,
+        candidates: &BTreeSet<PathBuf>,
+        namespace: &str,
+        queued_paths: &mut Vec<String>,
+        queue_valid: &mut bool,
+        cleanup_policy: &crate::AutoCleanupPolicy,
+        deadline: Instant,
+        blocked: &mut Vec<BlockedInterruptedPath>,
+        removed: &mut Vec<String>,
+    ) -> Result<(usize, bool), BrokerOpError> {
+        if candidates.is_empty() {
+            return Ok((0, true));
+        }
+        let Some(expected_cohort) = expected_cohort else {
+            for path in candidates {
+                blocked.push(BlockedInterruptedPath {
+                    path: Some(path.to_string_lossy().into_owned()),
+                    reason: "closed_checkout_cohort_unavailable",
+                });
+            }
+            return Ok((0, false));
+        };
+        let owner_session_id = expected_cohort.owner_session_id();
+        let _lifecycle_claim = match self.try_claim_worktree_lifecycle() {
+            Ok(Some(claim)) => claim,
+            Ok(None) => {
+                for path in candidates {
+                    blocked.push(BlockedInterruptedPath {
+                        path: Some(path.to_string_lossy().into_owned()),
+                        reason: "worktree_lifecycle_contended",
+                    });
+                }
+                return Ok((0, false));
+            }
+            Err(_) => {
+                for path in candidates {
+                    blocked.push(BlockedInterruptedPath {
+                        path: Some(path.to_string_lossy().into_owned()),
+                        reason: "worktree_lifecycle_unavailable",
+                    });
+                }
+                return Ok((0, false));
+            }
+        };
+        if check_deadline(Some(deadline)) {
+            return Ok((0, false));
+        }
+        if crate::AutoCleanupPolicy::load(self.main_root()).ok().as_ref() != Some(cleanup_policy)
+            || !ignored_directory_sweep_policy_allows_checkout(cleanup_policy, root)
+        {
+            for path in candidates {
+                blocked.push(BlockedInterruptedPath {
+                    path: Some(path.to_string_lossy().into_owned()),
+                    reason: "ignored_directory_policy_changed",
+                });
+            }
+            return Ok((0, false));
+        }
+
+        let artifact_use_reclaimer =
+            match crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                self.main_root(),
+                root,
+            ) {
+                Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(
+                    reclaimer,
+                )) => reclaimer,
+                Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(block)) => {
+                    let reason = match block {
+                        crate::file_lock::artifact_use::ArtifactUseReclaimBlock::Contended => {
+                            "artifact_use_contended"
+                        }
+                        crate::file_lock::artifact_use::ArtifactUseReclaimBlock::UnknownProducer {
+                            ..
+                        } => "artifact_use_unknown_producer",
+                        crate::file_lock::artifact_use::ArtifactUseReclaimBlock::ProtocolUnavailable => {
+                            "artifact_use_protocol_unavailable"
+                        }
+                    };
+                    for path in candidates {
+                        blocked.push(BlockedInterruptedPath {
+                            path: Some(path.to_string_lossy().into_owned()),
+                            reason,
+                        });
+                    }
+                    return Ok((0, false));
+                }
+                Err(_) => {
+                    for path in candidates {
+                        blocked.push(BlockedInterruptedPath {
+                            path: Some(path.to_string_lossy().into_owned()),
+                            reason: "artifact_use_inventory_unavailable",
+                        });
+                    }
+                    return Ok((0, false));
+                }
+            };
+        if check_deadline(Some(deadline)) {
+            return Ok((0, false));
+        }
+        let current_cohort = self.closed_artifact_checkout_cohort_snapshot(
+            owner_session_id,
+            root,
+            Some(deadline),
+        )?;
+        if current_cohort.as_ref() != Some(expected_cohort) {
+            for path in candidates {
+                blocked.push(BlockedInterruptedPath {
+                    path: Some(path.to_string_lossy().into_owned()),
+                    reason: "closed_checkout_cohort_changed",
+                });
+            }
+            return Ok((0, false));
+        }
+        if self
+            .refuse_live_checkout_until(owner_session_id, root, deadline)
+            .is_err()
+        {
+            for path in candidates {
+                blocked.push(BlockedInterruptedPath {
+                    path: Some(path.to_string_lossy().into_owned()),
+                    reason: "live_checkout_or_alias_detected",
+                });
+            }
+            return Ok((0, false));
+        }
+        let checkout_result = {
+            let _git_deadline = crate::git::limit_git_until(deadline);
+            GitRepo::discover(root)
+        };
+        let checkout = match checkout_result {
+            Ok(checkout) => checkout,
+            Err(_) => {
+                for path in candidates {
+                    blocked.push(BlockedInterruptedPath {
+                        path: Some(path.to_string_lossy().into_owned()),
+                        reason: "ignored_directory_git_discovery_unavailable",
+                    });
+                }
+                return Ok((0, false));
+            }
+        };
+
+        let _artifact_use_reclaimer = artifact_use_reclaimer;
+        let mut entries_reclaimed = 0usize;
+        let mut complete = true;
+        for path in candidates {
+            if check_deadline(Some(deadline)) {
+                blocked.push(BlockedInterruptedPath {
+                    path: Some(path.to_string_lossy().into_owned()),
+                    reason: "removal_budget_expired_before_admission",
+                });
+                complete = false;
+                break;
+            }
+            let Some(relative) = repo_relative(root, path) else {
+                blocked.push(BlockedInterruptedPath {
+                    path: Some(path.to_string_lossy().into_owned()),
+                    reason: "path_not_repository_relative",
+                });
+                complete = false;
+                continue;
+            };
+            let current_policy = crate::AutoCleanupPolicy::load(self.main_root()).ok();
+            if current_policy.as_ref() != Some(cleanup_policy)
+                || !ignored_directory_sweep_policy_allows_checkout(cleanup_policy, root)
+            {
+                blocked.push(BlockedInterruptedPath {
+                    path: Some(path.to_string_lossy().into_owned()),
+                    reason: "ignored_directory_policy_changed",
+                });
+                complete = false;
+                continue;
+            }
+            let current_entries = {
+                let _git_deadline = crate::git::limit_git_until(deadline);
+                checkout.ignored_paths_readonly_until(deadline)
+            };
+            let current_entries = match current_entries {
+                Ok(entries) => entries,
+                Err(_) => {
+                    blocked.push(BlockedInterruptedPath {
+                        path: Some(path.to_string_lossy().into_owned()),
+                        reason: "ignored_directory_listing_unavailable",
+                    });
+                    complete = false;
+                    continue;
+                }
+            };
+            if !ignored_listing_has_directory_root(&current_entries, &relative) {
+                // A lost ignore match, protected path, symlink, or changed
+                // root shape revokes this plan. Keep both data and a typed
+                // queue witness for later review/revalidation.
+                blocked.push(BlockedInterruptedPath {
+                    path: Some(path.to_string_lossy().into_owned()),
+                    reason: "ignored_directory_not_currently_opaque",
+                });
+                complete = false;
+                continue;
+            }
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => {
+                    blocked.push(BlockedInterruptedPath {
+                        path: Some(path.to_string_lossy().into_owned()),
+                        reason: "ignored_directory_root_replaced",
+                    });
+                    complete = false;
+                    continue;
+                }
+                Err(_) => {
+                    blocked.push(BlockedInterruptedPath {
+                        path: Some(path.to_string_lossy().into_owned()),
+                        reason: "ignored_directory_metadata_unavailable",
+                    });
+                    complete = false;
+                    continue;
+                }
+            }
+            if !*queue_valid {
+                blocked.push(BlockedInterruptedPath {
+                    path: Some(path.to_string_lossy().into_owned()),
+                    reason: "ignored_directory_queue_unavailable",
+                });
+                complete = false;
+                continue;
+            }
+            let path_key = path.to_string_lossy().into_owned();
+            let resuming = queued_paths.iter().any(|queued| queued == &path_key);
+            if !resuming {
+                let mut updated_paths = queued_paths.clone();
+                updated_paths.push(path_key.clone());
+                if encode_interrupted_ignored_directories(&updated_paths).is_none()
+                    || !persist_interrupted_ignored_directories(
+                        self.store(),
+                        namespace,
+                        &updated_paths,
+                    )?
+                {
+                    *queue_valid = false;
+                    blocked.push(BlockedInterruptedPath {
+                        path: Some(path_key),
+                        reason: "ignored_directory_queue_update_unavailable",
+                    });
+                    complete = false;
+                    continue;
+                }
+                *queued_paths = updated_paths;
+            }
+            let removal_result = {
+                let mut final_revalidation_complete = false;
+                let mut before_mutation = || {
+                    #[cfg(test)]
+                    tests::before_gc_artifact_removal_mutation(path)?;
+                    if final_revalidation_complete {
+                        return Ok(());
+                    }
+                    let policy_current = crate::AutoCleanupPolicy::load(self.main_root())
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    if &policy_current != cleanup_policy
+                        || !ignored_directory_sweep_policy_allows_checkout(
+                            &policy_current,
+                            root,
+                        )
+                    {
+                        return Err(std::io::Error::other(
+                            "ignored-directory cleanup policy changed before unlink",
+                        ));
+                    }
+                    let current_checkout = {
+                        let _git_deadline = crate::git::limit_git_until(deadline);
+                        GitRepo::discover(root)
+                    }
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    if !expected_cohort.matches_checkout_instance(&current_checkout) {
+                        return Err(std::io::Error::other(
+                            "closed checkout root identity changed before unlink",
+                        ));
+                    }
+                    let current_entries = {
+                        let _git_deadline = crate::git::limit_git_until(deadline);
+                        current_checkout.ignored_paths_readonly_until(deadline)
+                    }
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    if !ignored_listing_has_directory_root(&current_entries, &relative) {
+                        return Err(std::io::Error::other(
+                            "ignored directory is no longer a current opaque Git directory",
+                        ));
+                    }
+                    match std::fs::symlink_metadata(path) {
+                        Ok(metadata)
+                            if metadata.file_type().is_dir()
+                                && !metadata.file_type().is_symlink() => {}
+                        _ => {
+                            return Err(std::io::Error::other(
+                                "ignored directory root changed before unlink",
+                            ));
+                        }
+                    }
+                    final_revalidation_complete = true;
+                    Ok(())
+                };
+                remove_condemned_tree_with_progress_and_guard(
+                    path,
+                    None,
+                    Some(deadline),
+                    &mut before_mutation,
+                )
+            };
+            match removal_result {
+                Ok((TreeRemoval::Complete, count)) => {
+                    entries_reclaimed = entries_reclaimed.saturating_add(count);
+                    let mut updated_paths = queued_paths.clone();
+                    updated_paths.retain(|queued| queued != &path_key);
+                    match persist_interrupted_ignored_directories(
+                        self.store(),
+                        namespace,
+                        &updated_paths,
+                    ) {
+                        Ok(true) => {
+                            *queued_paths = updated_paths;
+                            removed.push(path_key);
+                        }
+                        Ok(false) => {
+                            *queue_valid = false;
+                            blocked.push(BlockedInterruptedPath {
+                                path: Some(path_key),
+                                reason: "ignored_directory_queue_update_unavailable",
+                            });
+                            complete = false;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok((TreeRemoval::Interrupted, count)) => {
+                    entries_reclaimed = entries_reclaimed.saturating_add(count);
+                    complete = false;
+                }
+                Err(error) => {
+                    entries_reclaimed =
+                        entries_reclaimed.saturating_add(error.entries_reclaimed);
+                    blocked.push(BlockedInterruptedPath {
+                        path: Some(path_key),
+                        reason: "ignored_directory_removal_unavailable",
+                    });
+                    complete = false;
+                }
+            }
+        }
+        Ok((entries_reclaimed, complete))
+    }
+
     fn sweep_artifacts_autonomously(
         &mut self,
         policy: &RetentionPolicy,
@@ -5541,10 +6129,15 @@ impl Broker {
         }
         // Avoid reading cleanup policy on broker opens whose inline pass is
         // already spaced out. The original start still anchors the total cap.
+        let cleanup_policy_snapshot = crate::AutoCleanupPolicy::load(self.main_root()).ok();
         let auto_remove_enabled = scope_runs_checkout_cleanup(scope)
-            && crate::AutoCleanupPolicy::load(self.main_root())
-                .map(|policy| policy.auto_remove)
-                .unwrap_or(false);
+            && cleanup_policy_snapshot
+                .as_ref()
+                .is_some_and(|policy| policy.auto_remove);
+        let ignored_directory_policy = cleanup_policy_snapshot
+            .as_ref()
+            .filter(|policy| policy.ignored_directory_sweep && !policy.strict)
+            .cloned();
         let checkout_cleanup_reserve =
             foreground_checkout_cleanup_reserve(budget_ms, scope, auto_remove_enabled);
         let deadlines = artifact_sweep_deadlines(
@@ -5602,14 +6195,31 @@ impl Broker {
                 0,
             ));
         };
-        let live_sessions = self.store().live_session_worktrees()?;
-        let live = live_sessions.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let live_sessions = self.store().live_sessions()?;
+        let live = live_sessions.iter().map(|session| session.id).collect::<Vec<_>>();
         let live_worktrees = live_sessions
             .iter()
-            .map(|(_, path)| PathBuf::from(path))
+            .map(|session| PathBuf::from(&session.worktree_path))
             .collect::<Vec<_>>();
+        let mut closed_cohort_index_failed = false;
+        let closed_cohort_index = if ignored_directory_policy.is_some() {
+            let closed_sessions = self.store().cleaned_sessions()?;
+            match self.closed_artifact_checkout_cohort_index(
+                closed_sessions,
+                &live_sessions,
+                Some(discovery_deadline),
+            ) {
+                Ok(Some(index)) => Some(index),
+                Ok(None) | Err(_) => {
+                    closed_cohort_index_failed = true;
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut preparation_entries_reclaimed = 0usize;
-        let mut scan_completed = true;
+        let mut scan_completed = !closed_cohort_index_failed;
         if closed_session_id.is_none() {
             // Cache roots are shared across repositories and clones, while the
             // selected worktree roots belong to this repository. Recover
@@ -5649,7 +6259,7 @@ impl Broker {
                 },
             };
             preparation_entries_reclaimed = preparation_sweep.filesystem_entries_reclaimed;
-            scan_completed = preparation_sweep.complete;
+            scan_completed &= preparation_sweep.complete;
             if preparation_sweep.entries_removed > 0 {
                 let payload = serde_json::json!({
                     "entries": preparation_sweep.entries_removed,
@@ -5678,6 +6288,12 @@ impl Broker {
         let interrupted_value = self.artifact_sweep_meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)?;
         let mut interrupted_paths_valid = true;
         let mut blocked_interrupted_paths = Vec::<BlockedInterruptedPath>::new();
+        if closed_cohort_index_failed {
+            blocked_interrupted_paths.push(BlockedInterruptedPath {
+                path: None,
+                reason: "closed_checkout_cohort_index_unavailable",
+            });
+        }
         let mut interrupted_paths = match decode_interrupted_paths(interrupted_value.as_deref()) {
             Ok(paths) => paths,
             Err(()) => {
@@ -5693,6 +6309,59 @@ impl Broker {
                 Vec::new()
             }
         };
+        let ignored_directory_queue_value = self
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_IGNORED_DIR_INTERRUPTED_KEY)?;
+        let mut ignored_directory_queue_valid = true;
+        let mut ignored_directory_paths = match decode_interrupted_ignored_directories(
+            ignored_directory_queue_value.as_deref(),
+        ) {
+            Ok(paths) => paths,
+            Err(()) => {
+                ignored_directory_queue_valid = false;
+                scan_completed = false;
+                blocked_interrupted_paths.push(BlockedInterruptedPath {
+                    path: None,
+                    reason: "ignored_directory_queue_invalid_or_oversized",
+                });
+                Vec::new()
+            }
+        };
+        if ignored_directory_queue_valid {
+            let previous_paths = ignored_directory_paths.clone();
+            let unavailable = prune_absent_interrupted_paths(&mut ignored_directory_paths);
+            if !unavailable.is_empty() {
+                scan_completed = false;
+                blocked_interrupted_paths.extend(unavailable.into_iter().map(|path| {
+                    BlockedInterruptedPath {
+                        path: Some(path),
+                        reason: "ignored_directory_metadata_unavailable",
+                    }
+                }));
+            }
+            if ignored_directory_paths != previous_paths
+                && !persist_interrupted_ignored_directories(
+                    self.store(),
+                    &namespace,
+                    &ignored_directory_paths,
+                )?
+            {
+                ignored_directory_queue_valid = false;
+                scan_completed = false;
+                blocked_interrupted_paths.push(BlockedInterruptedPath {
+                    path: None,
+                    reason: "ignored_directory_queue_update_unavailable",
+                });
+            }
+        }
+        if !ignored_directory_paths.is_empty() && ignored_directory_policy.is_none() {
+            scan_completed = false;
+            blocked_interrupted_paths.extend(ignored_directory_paths.iter().map(|path| {
+                BlockedInterruptedPath {
+                    path: Some(path.clone()),
+                    reason: "ignored_directory_sweep_disabled",
+                }
+            }));
+        }
         let mut revoked_interrupted_paths = Vec::<RevokedInterruptedPath>::new();
         if interrupted_paths_valid {
             // A queued path containing `..` can never be a deletion witness.
@@ -5794,6 +6463,20 @@ impl Broker {
             if sheltered {
                 continue;
             }
+            let expected_ignored_cohort = if ignored_directory_policy.is_some() {
+                let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+                let cohort = closed_cohort_index
+                    .as_ref()
+                    .and_then(|index| index.get(&canonical_root));
+                if cohort.is_some_and(|cohort| cohort.owner_session_id() != session.id) {
+                    // The canonical group is processed once at its spawned
+                    // owner row, regardless of how many closed aliases name it.
+                    continue;
+                }
+                cohort.cloned()
+            } else {
+                None
+            };
             match std::fs::symlink_metadata(&root) {
                 Ok(metadata) if metadata.file_type().is_dir() => {}
                 Ok(_) => {
@@ -5889,13 +6572,93 @@ impl Broker {
                 }
             };
             eligible_worktree_seen = true;
-            let discovery = collect_artifact_dirs_bounded(
-                &root,
-                &policy.artefact_directories,
-                discovery_deadline,
-                discovery_entry_budget,
-            );
-            let discovery_complete = discovery.complete;
+            let mut ignored_directory_discovery = None;
+            let mut ignored_directory_candidates = BTreeSet::new();
+            let mut ignored_directory_discovery_complete = true;
+            if ignored_directory_policy.is_some() {
+                match discover_ignored_directory_roots_bounded(
+                    &root,
+                    &checkout,
+                    &policy.artefact_directories,
+                    discovery_deadline,
+                    discovery_entry_budget,
+                ) {
+                    Ok(discovery) => {
+                        ignored_directory_discovery_complete = discovery.complete;
+                        if expected_ignored_cohort.is_some()
+                            && ignored_directory_sweep_policy_allows_checkout(
+                                cleanup_policy,
+                                &root,
+                            )
+                        {
+                            ignored_directory_candidates.extend(
+                                discovery.generic_roots.iter().cloned(),
+                            );
+                            for queued in &ignored_directory_paths {
+                                let queued_path = PathBuf::from(queued);
+                                if !queued_path.starts_with(&root) {
+                                    continue;
+                                }
+                                let relative = repo_relative(&root, &queued_path);
+                                if relative.as_deref().is_some_and(|relative| {
+                                    ignored_listing_has_directory_root(&discovery.entries, relative)
+                                }) {
+                                    ignored_directory_candidates.insert(queued_path);
+                                } else if std::fs::symlink_metadata(&queued_path).is_ok() {
+                                    blocked_interrupted_paths.push(BlockedInterruptedPath {
+                                        path: Some(queued.clone()),
+                                        reason: "ignored_directory_not_currently_opaque",
+                                    });
+                                    ignored_directory_discovery_complete = false;
+                                }
+                            }
+                        } else if !discovery.generic_roots.is_empty() {
+                            let reason = if expected_ignored_cohort.is_some() {
+                                "checkout_pinned_by_cleanup_policy"
+                            } else {
+                                "closed_checkout_cohort_unavailable"
+                            };
+                            for path in &discovery.generic_roots {
+                                blocked_interrupted_paths.push(BlockedInterruptedPath {
+                                    path: Some(path.to_string_lossy().into_owned()),
+                                    reason,
+                                });
+                            }
+                            ignored_directory_discovery_complete = false;
+                        }
+                        ignored_directory_discovery = Some(discovery);
+                    }
+                    Err(()) => {
+                        blocked_interrupted_paths.push(BlockedInterruptedPath {
+                            path: Some(root.to_string_lossy().into_owned()),
+                            reason: "ignored_directory_listing_unavailable",
+                        });
+                        ignored_directory_discovery_complete = false;
+                        session_scan_complete = false;
+                    }
+                }
+            }
+            let discovery = match ignored_directory_discovery.as_ref() {
+                Some(ignored) => collect_artifact_dirs_bounded_with_opaque_ignored_roots(
+                    &root,
+                    &policy.artefact_directories,
+                    &ignored.opaque_roots,
+                    discovery_deadline,
+                    discovery_entry_budget.saturating_sub(ignored.entries_examined),
+                ),
+                None if ignored_directory_policy.is_some() => BoundedArtifactDiscovery {
+                    classified: Vec::new(),
+                    complete: false,
+                    entries_examined: 0,
+                },
+                None => collect_artifact_dirs_bounded(
+                    &root,
+                    &policy.artefact_directories,
+                    discovery_deadline,
+                    discovery_entry_budget,
+                ),
+            };
+            let discovery_complete = discovery.complete && ignored_directory_discovery_complete;
             let mut found = discovery.classified;
             // Interrupted trees are injected ahead of newly discovered caches:
             // after partial removal their original witness may be gone, but
@@ -5981,7 +6744,33 @@ impl Broker {
                     .is_none_or(|canonical| !revoked_targets.contains(&canonical))
             });
             pending_in_worktree.extend(found);
-            let found = pending_in_worktree;
+            let mut found = pending_in_worktree;
+            if !ignored_directory_candidates.is_empty() {
+                found.retain(|dir| {
+                    !ignored_directory_candidates
+                        .iter()
+                        .any(|ignored_root| dir.starts_with(ignored_root))
+                });
+                if let Some(cleanup_policy) = ignored_directory_policy.as_ref() {
+                    let (reclaimed, ignored_complete) =
+                        self.reclaim_ignored_directory_roots_under_claims(
+                            &root,
+                            expected_ignored_cohort.as_ref(),
+                            &ignored_directory_candidates,
+                            &namespace,
+                            &mut ignored_directory_paths,
+                            &mut ignored_directory_queue_valid,
+                            cleanup_policy,
+                            removal_deadline,
+                            &mut blocked_interrupted_paths,
+                            &mut removed,
+                        )?;
+                    entries_reclaimed = entries_reclaimed.saturating_add(reclaimed);
+                    if !ignored_complete {
+                        session_scan_complete = false;
+                    }
+                }
+            }
             for dir in found {
                 let Some(relative) = repo_relative(&root, &dir) else {
                     blocked_interrupted_paths.push(BlockedInterruptedPath {
@@ -6061,6 +6850,56 @@ impl Broker {
                     blocked_interrupted_paths.push(BlockedInterruptedPath {
                         path: Some(dir_key),
                         reason: "removal_budget_expired_before_admission",
+                    });
+                    session_scan_complete = false;
+                    continue;
+                }
+                let _lifecycle_claim = match self.try_claim_worktree_lifecycle() {
+                    Ok(Some(claim)) => claim,
+                    Ok(None) => {
+                        blocked_interrupted_paths.push(BlockedInterruptedPath {
+                            path: Some(dir_key),
+                            reason: "worktree_lifecycle_contended",
+                        });
+                        session_scan_complete = false;
+                        continue;
+                    }
+                    Err(_) => {
+                        blocked_interrupted_paths.push(BlockedInterruptedPath {
+                            path: Some(dir_key),
+                            reason: "worktree_lifecycle_unavailable",
+                        });
+                        session_scan_complete = false;
+                        continue;
+                    }
+                };
+                let current_session = self.store().session(session.id)?;
+                if current_session.status != crate::SessionStatus::Cleaned
+                    || current_session.cleanup_state != SessionCleanupState::Closed
+                    || current_session.worktree_path != session.worktree_path
+                    || current_session.branch != session.branch
+                    || current_session.origin != session.origin
+                    || current_session.updated_at != session.updated_at
+                {
+                    blocked_interrupted_paths.push(BlockedInterruptedPath {
+                        path: Some(dir_key),
+                        reason: "closed_checkout_session_changed",
+                    });
+                    session_scan_complete = false;
+                    continue;
+                }
+                let owned = {
+                    let _git_deadline = crate::git::limit_git_until(removal_deadline);
+                    self.is_broker_owned_worktree_checked(&current_session, &root)
+                };
+                if !matches!(owned, Ok(true))
+                    || self
+                        .refuse_live_checkout_until(session.id, &root, removal_deadline)
+                        .is_err()
+                {
+                    blocked_interrupted_paths.push(BlockedInterruptedPath {
+                        path: Some(dir_key),
+                        reason: "closed_checkout_ownership_or_live_alias_changed",
                     });
                     session_scan_complete = false;
                     continue;
@@ -6254,6 +7093,61 @@ impl Broker {
                     ));
                 }
             }
+        }
+        if ignored_directory_queue_valid && !ignored_directory_paths.is_empty() {
+            let known_worktrees = self
+                .store()
+                .session_worktree_paths()?
+                .into_iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            let outside_managed_worktrees = ignored_directory_paths
+                .iter()
+                .filter(|path| {
+                    let path = Path::new(path);
+                    !known_worktrees.iter().any(|root| path.starts_with(root))
+                })
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if !outside_managed_worktrees.is_empty() {
+                let mut updated_paths = ignored_directory_paths.clone();
+                updated_paths.retain(|path| !outside_managed_worktrees.contains(path));
+                if persist_interrupted_ignored_directories(
+                    self.store(),
+                    &namespace,
+                    &updated_paths,
+                )? {
+                    ignored_directory_paths = updated_paths;
+                    revoked_interrupted_paths.extend(outside_managed_worktrees.into_iter().map(
+                        |path| RevokedInterruptedPath {
+                            path,
+                            reason: "outside_managed_worktrees",
+                            canonical_path: None,
+                        },
+                    ));
+                } else {
+                    ignored_directory_queue_valid = false;
+                    scan_completed = false;
+                    blocked_interrupted_paths.extend(outside_managed_worktrees.iter().map(
+                        |path| BlockedInterruptedPath {
+                            path: Some(path.clone()),
+                            reason: "ignored_directory_queue_update_unavailable",
+                        },
+                    ));
+                }
+            }
+        }
+        if !ignored_directory_paths.is_empty() {
+            scan_completed = false;
+        }
+        if ignored_directory_queue_valid
+            && !persist_interrupted_ignored_directories(
+                self.store(),
+                &namespace,
+                &ignored_directory_paths,
+            )?
+        {
+            scan_completed = false;
         }
         if !interrupted_paths.is_empty() {
             // A full directory lap is not complete while a path remains
@@ -6813,6 +7707,109 @@ impl Broker {
                 write_journal(&journal_path, &journal)?;
                 continue;
             };
+            // The operator confirmed this artifact at plan time. On Unix,
+            // serialize with gate admission and hold its per-checkout use
+            // exclusion through every unlink; confirmation alone cannot
+            // authorize removal after a gate has started using the checkout.
+            // Keep the established explicit-cleanup behavior on platforms
+            // where the artifact-use protocol is unavailable.
+            #[cfg(unix)]
+            let (_lifecycle_claim, _artifact_use_reclaimer) = {
+                let lifecycle_claim = match self.try_claim_worktree_lifecycle() {
+                    Ok(Some(claim)) => claim,
+                    Ok(None) => {
+                        failures.push(format!(
+                            "{}: checkout lifecycle is contended; artifact was retained",
+                            candidate.relative_dir
+                        ));
+                        break;
+                    }
+                    Err(error) => {
+                        failures.push(format!(
+                            "{}: checkout lifecycle is unavailable ({error}); artifact was retained",
+                            candidate.relative_dir
+                        ));
+                        break;
+                    }
+                };
+                let current_session = self.store().session(candidate.session_id)?;
+                if !current_session.status.is_closed()
+                    || current_session.cleanup_state != SessionCleanupState::Closed
+                    || current_session.worktree_path != candidate.worktree_path
+                {
+                    failures.push(format!(
+                        "{}: checkout session changed; review a new GC plan",
+                        candidate.relative_dir
+                    ));
+                    journal.remaining_artifacts.remove(0);
+                    write_journal(&journal_path, &journal)?;
+                    continue;
+                }
+                let live_checkout = match deadline {
+                    Some(deadline) => self.refuse_live_checkout_until(
+                        candidate.session_id,
+                        &root,
+                        deadline,
+                    ),
+                    None => self.refuse_live_checkout(candidate.session_id, &root),
+                };
+                match live_checkout {
+                    Ok(()) => {}
+                    Err(BrokerOpError::WorktreeInUseByLiveSession { .. }) => {
+                        failures.push(format!(
+                            "{}: a live checkout now uses this worktree; review a new GC plan",
+                            candidate.relative_dir
+                        ));
+                        journal.remaining_artifacts.remove(0);
+                        write_journal(&journal_path, &journal)?;
+                        continue;
+                    }
+                    Err(error) => {
+                        failures.push(format!(
+                            "{}: live checkout state is unavailable ({error}); artifact was retained",
+                            candidate.relative_dir
+                        ));
+                        break;
+                    }
+                }
+                let artifact_use_reclaimer =
+                    match crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                        &main_root,
+                        &root,
+                    ) {
+                        Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(
+                            reclaimer,
+                        )) => reclaimer,
+                        Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(
+                            block,
+                        )) => {
+                            let reason = match block {
+                                crate::file_lock::artifact_use::ArtifactUseReclaimBlock::Contended => {
+                                    "artifact-use claim is contended"
+                                }
+                                crate::file_lock::artifact_use::ArtifactUseReclaimBlock::UnknownProducer {
+                                    ..
+                                } => "an active or unknown gate use was found",
+                                crate::file_lock::artifact_use::ArtifactUseReclaimBlock::ProtocolUnavailable => {
+                                    "artifact-use protocol is unavailable"
+                                }
+                            };
+                            failures.push(format!(
+                                "{}: {reason}; artifact was retained",
+                                candidate.relative_dir
+                            ));
+                            break;
+                        }
+                        Err(error) => {
+                            failures.push(format!(
+                                "{}: artifact-use inventory failed ({error}); artifact was retained",
+                                candidate.relative_dir
+                            ));
+                            break;
+                        }
+                    };
+                (lifecycle_claim, artifact_use_reclaimer)
+            };
             match remove_condemned_tree(&dir, witness.deferrable_entry(), deadline) {
                 Ok(TreeRemoval::Complete) => {}
                 // Still present and still classified, so the resume that
@@ -7084,19 +8081,75 @@ mod tests {
     use crate::disk_headroom::SweepUrgency;
     use std::cell::RefCell;
 
+    enum ArtifactSweepTestMutation {
+        InterruptAfterFirstUnlink { path: PathBuf, attempts: usize },
+        RewriteFileBeforeRemoval {
+            path: PathBuf,
+            file: PathBuf,
+            contents: String,
+            fired: bool,
+        },
+        #[cfg(unix)]
+        ReplaceDirectoryWithSymlink {
+            trigger_path: PathBuf,
+            replaced_path: PathBuf,
+            moved_to: PathBuf,
+            referent: PathBuf,
+            fired: bool,
+        },
+    }
+
     std::thread_local! {
-        static ARTIFACT_SWEEP_TEST_MUTATION_INTERRUPT: RefCell<Option<(PathBuf, usize)>> =
+        static ARTIFACT_SWEEP_TEST_MUTATION_INTERRUPT: RefCell<Option<ArtifactSweepTestMutation>> =
             const { RefCell::new(None) };
     }
 
     struct ArtifactSweepTestMutationInterrupt {
-        previous: Option<(PathBuf, usize)>,
+        previous: Option<ArtifactSweepTestMutation>,
     }
 
     impl ArtifactSweepTestMutationInterrupt {
         fn after_first_unlink(path: &Path) -> Self {
             let previous = ARTIFACT_SWEEP_TEST_MUTATION_INTERRUPT
-                .with(|state| state.replace(Some((path.to_path_buf(), 0))));
+                .with(|state| {
+                    state.replace(Some(ArtifactSweepTestMutation::InterruptAfterFirstUnlink {
+                        path: path.to_path_buf(),
+                        attempts: 0,
+                    }))
+                });
+            Self { previous }
+        }
+
+        fn rewrite_file_before_removal(path: &Path, file: &Path, contents: &str) -> Self {
+            let previous = ARTIFACT_SWEEP_TEST_MUTATION_INTERRUPT.with(|state| {
+                state.replace(Some(ArtifactSweepTestMutation::RewriteFileBeforeRemoval {
+                    path: path.to_path_buf(),
+                    file: file.to_path_buf(),
+                    contents: contents.to_owned(),
+                    fired: false,
+                }))
+            });
+            Self { previous }
+        }
+
+        #[cfg(unix)]
+        fn replace_directory_with_symlink(
+            trigger_path: &Path,
+            replaced_path: &Path,
+            moved_to: &Path,
+            referent: &Path,
+        ) -> Self {
+            let previous = ARTIFACT_SWEEP_TEST_MUTATION_INTERRUPT.with(|state| {
+                state.replace(Some(
+                    ArtifactSweepTestMutation::ReplaceDirectoryWithSymlink {
+                        trigger_path: trigger_path.to_path_buf(),
+                        replaced_path: replaced_path.to_path_buf(),
+                        moved_to: moved_to.to_path_buf(),
+                        referent: referent.to_path_buf(),
+                        fired: false,
+                    },
+                ))
+            });
             Self { previous }
         }
     }
@@ -7113,20 +8166,47 @@ mod tests {
     pub(super) fn before_gc_artifact_removal_mutation(path: &Path) -> std::io::Result<()> {
         ARTIFACT_SWEEP_TEST_MUTATION_INTERRUPT.with(|state| {
             let mut state = state.borrow_mut();
-            let Some((target, attempts)) = state.as_mut() else {
+            let Some(mutation) = state.as_mut() else {
                 return Ok(());
             };
-            if target.as_path() != path {
-                return Ok(());
+            match mutation {
+                ArtifactSweepTestMutation::InterruptAfterFirstUnlink {
+                    path: target,
+                    attempts,
+                } if target.as_path() == path => {
+                    *attempts += 1;
+                    if *attempts >= 2 {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "test hook stopped after the first cache unlink",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+                ArtifactSweepTestMutation::RewriteFileBeforeRemoval {
+                    path: target,
+                    file,
+                    contents,
+                    fired,
+                } if target.as_path() == path && !*fired => {
+                    *fired = true;
+                    std::fs::write(file, contents.as_bytes())
+                }
+                #[cfg(unix)]
+                ArtifactSweepTestMutation::ReplaceDirectoryWithSymlink {
+                    trigger_path: target,
+                    replaced_path,
+                    moved_to,
+                    referent,
+                    fired,
+                } if target.as_path() == path && !*fired => {
+                    *fired = true;
+                    std::fs::rename(replaced_path.as_path(), moved_to.as_path())?;
+                    std::os::unix::fs::symlink(referent.as_path(), replaced_path.as_path())
+                }
+                _ => Ok(()),
             }
-            *attempts += 1;
-            if *attempts >= 2 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "test hook stopped after the first cache unlink",
-                ));
-            }
-            Ok(())
         })
     }
 
@@ -8692,7 +9772,11 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         git(&root, &["init", "-q", "-b", "main"]);
         std::fs::write(root.join("README.md"), "fixture\n").unwrap();
-        std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
+        std::fs::write(
+            root.join(".gitignore"),
+            "/.aethyme/\n/target/\n/ignored-data/\n/ignored-root.txt\n",
+        )
+        .unwrap();
         git(&root, &["add", "README.md", ".gitignore"]);
         git(&root, &["commit", "-qm", "fixture"]);
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
@@ -8733,6 +9817,40 @@ mod tests {
             "[retention]\nclosed_worktrees_days = 1\nclosed_worktree_grace_hours = 0\nauto_cleanup_worktrees_on_finish = false\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 1\n",
         )
         .unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn enable_ignored_directory_sweep(root: &Path) {
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[cleanup]\nauto_remove = false\nstrict = false\nignored_directory_sweep = true\n",
+        )
+        .unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn set_closed_worktree_grace(root: &Path, hours: u32) {
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            format!(
+                "[retention]\nclosed_worktrees_days = 1\nclosed_worktree_grace_hours = {hours}\nauto_cleanup_worktrees_on_finish = false\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 1\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn unknown_ignored_directory(worktree: &Path) -> (PathBuf, PathBuf) {
+        let ignored_directory = worktree.join("ignored-data");
+        std::fs::create_dir_all(&ignored_directory).unwrap();
+        std::fs::write(
+            ignored_directory.join("unique-dataset.sqlite"),
+            b"opaque ignored payload",
+        )
+        .unwrap();
+        let standalone_ignored_file = worktree.join("ignored-root.txt");
+        std::fs::write(&standalone_ignored_file, b"standalone ignored file").unwrap();
+        (ignored_directory, standalone_ignored_file)
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -9033,6 +10151,337 @@ mod tests {
             .unwrap()
             .expect("the replacement root is recorded as blocked");
         assert!(blocked.contains("worktree_root_replaced"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn opted_in_sweep_reclaims_opaque_ignored_roots_but_keeps_files_and_checkout_grace() {
+        let (_temporary, _storage, mut broker, root) = closed_artifact_sweep_fixture();
+        let (session_id, worktree, cache) = closed_artifact_cache(&mut broker, "ignored data");
+        let (ignored_directory, standalone_file) = unknown_ignored_directory(&worktree);
+        let protected_record = worktree.join(".aethyme/qualification/manifest.json");
+        std::fs::create_dir_all(protected_record.parent().unwrap()).unwrap();
+        std::fs::write(&protected_record, b"broker-owned qualification record").unwrap();
+        enable_closed_artifact_sweep(&root);
+        enable_ignored_directory_sweep(&root);
+        set_closed_worktree_grace(&root, 360);
+
+        let (complete, removed) = run_closed_artifact_sweep(&mut broker, &root, session_id);
+
+        assert!(complete);
+        assert!(removed > 0);
+        assert!(!ignored_directory.exists(), "the opt-in ignored folder is disposable");
+        assert!(!cache.exists(), "the existing artifact catalog still applies");
+        assert_eq!(std::fs::read(&standalone_file).unwrap(), b"standalone ignored file");
+        assert_eq!(
+            std::fs::read(&protected_record).unwrap(),
+            b"broker-owned qualification record",
+            "broker qualification metadata remains protected even when Git ignores its parent"
+        );
+        assert!(worktree.is_dir(), "artifact cleanup preserves the checkout");
+        assert_eq!(
+            broker.store().session(session_id).unwrap().status,
+            crate::SessionStatus::Closed
+        );
+        assert_eq!(load_retention_policy(&root).unwrap().closed_worktree_grace_hours, 360);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ignored_directory_sweep_is_off_by_default_and_strict_mode_keeps_it_off() {
+        let (_temporary, _storage, mut broker, root) = closed_artifact_sweep_fixture();
+        let (session_id, worktree, cache) = closed_artifact_cache(&mut broker, "opt in required");
+        let (ignored_directory, standalone_file) = unknown_ignored_directory(&worktree);
+        enable_closed_artifact_sweep(&root);
+
+        assert!(!crate::AutoCleanupPolicy::load(&root)
+            .unwrap()
+            .ignored_directory_sweep);
+        let (_, _) = run_closed_artifact_sweep(&mut broker, &root, session_id);
+        assert!(ignored_directory.is_dir());
+        assert!(standalone_file.is_file());
+        assert!(!cache.exists());
+
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[cleanup]\nauto_remove = false\nstrict = true\nignored_directory_sweep = true\n",
+        )
+        .unwrap();
+        let (complete, _) = run_closed_artifact_sweep(&mut broker, &root, session_id);
+        assert!(!complete, "strict mode pauses unattended artifact cleanup");
+        assert!(ignored_directory.is_dir());
+        assert!(standalone_file.is_file());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ignored_directory_recovery_queue_is_typed_and_legacy_paths_stay_catalog_only() {
+        let path = std::env::temp_dir()
+            .join("closed-checkout/ignored-data")
+            .to_string_lossy()
+            .into_owned();
+        let encoded = encode_interrupted_ignored_directories(std::slice::from_ref(&path)).unwrap();
+
+        assert_eq!(
+            decode_interrupted_ignored_directories(Some(&encoded)).unwrap(),
+            vec![path.clone()]
+        );
+        assert_eq!(decode_interrupted_paths(Some(&path)).unwrap(), vec![path.clone()]);
+        assert!(decode_interrupted_ignored_directories(Some(&path)).is_err());
+        assert!(decode_interrupted_ignored_directories(Some(
+            r#"{"version":2,"paths":[{"kind":"ignored_directory_root","path":"/tmp/closed-checkout/ignored-data"}]}"#
+        ))
+        .is_err());
+        assert!(decode_interrupted_ignored_directories(Some(
+            r#"{"version":1,"paths":[{"kind":"future_kind","path":"/tmp/closed-checkout/ignored-data"}]}"#
+        ))
+        .is_err());
+        assert!(decode_interrupted_ignored_directories(Some(
+            r#"{"version":1,"paths":[{"kind":"ignored_directory_root","path":"relative/ignored-data"}]}"#
+        ))
+        .is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ignored_directory_policy_drift_after_plan_blocks_before_unlink() {
+        let (_temporary, _storage, mut broker, root) = closed_artifact_sweep_fixture();
+        let (session_id, worktree, _) = closed_artifact_cache(&mut broker, "policy drift");
+        let (ignored_directory, _) = unknown_ignored_directory(&worktree);
+        enable_closed_artifact_sweep(&root);
+        enable_ignored_directory_sweep(&root);
+
+        let _change_policy_after_plan = ArtifactSweepTestMutationInterrupt::rewrite_file_before_removal(
+            &ignored_directory,
+            &root.join(".aethyme/config.toml"),
+            "[cleanup]\nauto_remove = false\nstrict = true\nignored_directory_sweep = true\n",
+        );
+        let (complete, _) = run_closed_artifact_sweep(&mut broker, &root, session_id);
+
+        assert!(!complete);
+        assert!(ignored_directory.is_dir());
+        assert!(ignored_directory.join("unique-dataset.sqlite").is_file());
+        assert_eq!(
+            decode_interrupted_ignored_directories(
+                broker
+                    .artifact_sweep_meta_get(ARTIFACT_SWEEP_IGNORED_DIR_INTERRUPTED_KEY)
+                    .unwrap()
+                    .as_deref()
+            )
+            .unwrap(),
+            vec![ignored_directory.to_string_lossy().into_owned()],
+            "the typed resume witness is retained after policy drift"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ignored_directory_status_drift_after_plan_blocks_before_unlink() {
+        let (_temporary, _storage, mut broker, root) = closed_artifact_sweep_fixture();
+        let (session_id, worktree, _) = closed_artifact_cache(&mut broker, "ignore drift");
+        let (ignored_directory, _) = unknown_ignored_directory(&worktree);
+        enable_closed_artifact_sweep(&root);
+        enable_ignored_directory_sweep(&root);
+
+        let _remove_ignore_after_plan = ArtifactSweepTestMutationInterrupt::rewrite_file_before_removal(
+            &ignored_directory,
+            &worktree.join(".gitignore"),
+            "/.aethyme/\n/target/\n/ignored-root.txt\n",
+        );
+        let (complete, _) = run_closed_artifact_sweep(&mut broker, &root, session_id);
+
+        assert!(!complete);
+        assert!(ignored_directory.is_dir());
+        assert!(ignored_directory.join("unique-dataset.sqlite").is_file());
+        assert_eq!(
+            decode_interrupted_ignored_directories(
+                broker
+                    .artifact_sweep_meta_get(ARTIFACT_SWEEP_IGNORED_DIR_INTERRUPTED_KEY)
+                    .unwrap()
+                    .as_deref()
+            )
+            .unwrap(),
+            vec![ignored_directory.to_string_lossy().into_owned()]
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ignored_directory_partial_removal_waits_for_opt_in_before_resuming() {
+        let (_temporary, _storage, mut broker, root) = closed_artifact_sweep_fixture();
+        let (session_id, worktree, cache) =
+            closed_artifact_cache(&mut broker, "partial ignored data");
+        std::fs::remove_dir_all(cache).unwrap();
+        let ignored_directory = worktree.join("ignored-data");
+        std::fs::create_dir_all(&ignored_directory).unwrap();
+        std::fs::write(ignored_directory.join("first"), b"first").unwrap();
+        std::fs::write(ignored_directory.join("second"), b"second").unwrap();
+        enable_closed_artifact_sweep(&root);
+        enable_ignored_directory_sweep(&root);
+
+        let _interrupt_after_first_unlink =
+            ArtifactSweepTestMutationInterrupt::after_first_unlink(&ignored_directory);
+        let (partial, removed) = run_closed_artifact_sweep(&mut broker, &root, session_id);
+        assert!(!partial);
+        assert_eq!(removed, 1);
+        assert!(ignored_directory.is_dir());
+        let typed_queue = broker
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_IGNORED_DIR_INTERRUPTED_KEY)
+            .unwrap()
+            .expect("partial generic removal persists its typed path witness");
+        assert_eq!(
+            decode_interrupted_ignored_directories(Some(&typed_queue)).unwrap(),
+            vec![ignored_directory.to_string_lossy().into_owned()]
+        );
+        drop(_interrupt_after_first_unlink);
+
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[cleanup]\nauto_remove = false\nstrict = false\nignored_directory_sweep = false\n",
+        )
+        .unwrap();
+        let (disabled_complete, _) = run_closed_artifact_sweep(&mut broker, &root, session_id);
+        assert!(!disabled_complete);
+        assert!(ignored_directory.is_dir());
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_IGNORED_DIR_INTERRUPTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(typed_queue.as_str()),
+            "opt-out does not weaken the persisted witness or continue deletion"
+        );
+
+        enable_ignored_directory_sweep(&root);
+        let (complete, _) = run_closed_artifact_sweep(&mut broker, &root, session_id);
+        assert!(complete);
+        assert!(!ignored_directory.exists());
+        assert!(decode_interrupted_ignored_directories(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_IGNORED_DIR_INTERRUPTED_KEY)
+                .unwrap()
+                .as_deref()
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ignored_directory_replacement_with_symlink_is_retained() {
+        let (temporary, _storage, mut broker, root) = closed_artifact_sweep_fixture();
+        let (session_id, worktree, _) = closed_artifact_cache(&mut broker, "symlink replacement");
+        let (ignored_directory, _) = unknown_ignored_directory(&worktree);
+        let moved_directory = temporary.path().join("moved-ignored-directory");
+        let replacement = temporary.path().join("replacement-target");
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::write(replacement.join("keep"), b"outside target").unwrap();
+        enable_closed_artifact_sweep(&root);
+        enable_ignored_directory_sweep(&root);
+
+        let _replace_after_plan = ArtifactSweepTestMutationInterrupt::replace_directory_with_symlink(
+            &ignored_directory,
+            &ignored_directory,
+            &moved_directory,
+            &replacement,
+        );
+        let (complete, _) = run_closed_artifact_sweep(&mut broker, &root, session_id);
+
+        assert!(!complete);
+        assert!(ignored_directory.is_symlink());
+        assert!(moved_directory.join("unique-dataset.sqlite").is_file());
+        assert_eq!(std::fs::read(replacement.join("keep")).unwrap(), b"outside target");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn replaced_checkout_root_after_plan_is_retained() {
+        let (temporary, _storage, mut broker, root) = closed_artifact_sweep_fixture();
+        let (session_id, worktree, _) = closed_artifact_cache(&mut broker, "checkout root drift");
+        let (ignored_directory, _) = unknown_ignored_directory(&worktree);
+        let moved_checkout = temporary.path().join("moved-checkout-root");
+        let replacement = temporary.path().join("replacement-checkout-root");
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::create_dir(replacement.join("ignored-data")).unwrap();
+        std::fs::write(
+            replacement.join("ignored-data/keep"),
+            b"replacement checkout contents",
+        )
+        .unwrap();
+        enable_closed_artifact_sweep(&root);
+        enable_ignored_directory_sweep(&root);
+
+        let _replace_checkout_after_plan =
+            ArtifactSweepTestMutationInterrupt::replace_directory_with_symlink(
+                &ignored_directory,
+                &worktree,
+                &moved_checkout,
+                &replacement,
+            );
+        let (complete, _) = run_closed_artifact_sweep(&mut broker, &root, session_id);
+
+        assert!(!complete);
+        assert!(worktree.is_symlink());
+        assert!(moved_checkout.join("ignored-data/unique-dataset.sqlite").is_file());
+        assert_eq!(
+            std::fs::read(replacement.join("ignored-data/keep")).unwrap(),
+            b"replacement checkout contents"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn live_checkout_alias_blocks_ignored_directory_reclamation() {
+        use std::os::unix::fs::symlink;
+
+        let (temporary, _storage, mut broker, root) = closed_artifact_sweep_fixture();
+        let (session_id, worktree, _) = closed_artifact_cache(&mut broker, "live alias");
+        let (ignored_directory, _) = unknown_ignored_directory(&worktree);
+        let live_alias = temporary.path().join("live-checkout-alias");
+        symlink(&worktree, &live_alias).unwrap();
+        broker
+            .store()
+            .register_session(&crate::types::NewSession {
+                worktree_path: live_alias.to_string_lossy().into_owned(),
+                branch: "live-checkout-alias".into(),
+                origin: crate::types::SessionOrigin::Adopted,
+                task: Some("live checkout alias blocker".into()),
+                diff_base: None,
+                adoption_base: None,
+                adopted_head: None,
+                repository_contract: None,
+                pid: None,
+                command: None,
+                log_path: None,
+                agent_identity: None,
+            })
+            .unwrap();
+        enable_closed_artifact_sweep(&root);
+        enable_ignored_directory_sweep(&root);
+
+        let (complete, _) = run_closed_artifact_sweep(&mut broker, &root, session_id);
+
+        assert!(!complete);
+        assert!(ignored_directory.is_dir());
+        assert!(ignored_directory.join("unique-dataset.sqlite").is_file());
+    }
+
+    #[test]
+    fn ignored_directory_policy_honors_keep_globs() {
+        let policy = crate::AutoCleanupPolicy {
+            ignored_directory_sweep: true,
+            keep: vec!["*-pinned".into()],
+            ..Default::default()
+        };
+
+        assert!(!ignored_directory_sweep_policy_allows_checkout(
+            &policy,
+            Path::new("/worktrees/agent-pinned")
+        ));
+        assert!(ignored_directory_sweep_policy_allows_checkout(
+            &policy,
+            Path::new("/worktrees/agent-disposable")
+        ));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

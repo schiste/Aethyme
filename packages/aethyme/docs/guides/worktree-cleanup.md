@@ -139,6 +139,7 @@ Anything the sweep cannot decide keeps the checkout, with the reason in
 [cleanup]
 auto_remove = true             # the default; false turns checkout removal off
 strict = false                 # the default; all Git-ignored directories disposable
+ignored_directory_sweep = false # opt in to reclaim ignored folders in retained checkouts
 regenerable = [".gradle/**"]    # extra artifact-file/link classification
 keep = ["*-investigation"]     # worktrees never removed automatically
 ```
@@ -156,6 +157,16 @@ them. Ignoring a directory therefore opts its contents into disposal. Move
 irreplaceable records outside disposable checkouts, or enable `strict = true`.
 Standalone ignored files such as a root `.env` remain protected. Removal unlinks
 symlinks without deleting their external targets.
+
+`ignored_directory_sweep` controls a separate in-place lane for reclaiming
+ignored folders from retained closed checkouts. It defaults to `false`; setting
+it to `true` can reclaim opaque ignored folders while preserving the checkout,
+tracked work, standalone ignored files, and `keep` pins. It does not shorten
+`closed_worktree_grace_hours`. Enable it only after older Aethyme broker
+processes have exited and the repository is on a release with the durable
+artifact-use protocol. That protocol is available on Unix; unattended ignored
+folder and whole-checkout cleanup remain blocked on unsupported targets. Explicit
+normal cleanup keeps its existing platform checks there.
 
 Strict mode also disables automatic artifact sweeps, including already queued
 background removals. Remove the leftovers manually, or inspect an explicit
