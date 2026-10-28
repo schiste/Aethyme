@@ -3429,7 +3429,7 @@ mod tests {
 
     #[test]
     fn branch_tip_mismatch_refuses_archive_without_dropping_branch_commit() {
-        let (_owner, repository, _storage, mut broker, session, worktree, base, head, branch_ref) =
+        let (_owner, repository, _storage, broker, session, worktree, base, head, branch_ref) =
             closed_unique_commit_fixture("recovery archive mismatched branch tip");
         git(&worktree, &["checkout", "--detach", &base]);
         let error = broker

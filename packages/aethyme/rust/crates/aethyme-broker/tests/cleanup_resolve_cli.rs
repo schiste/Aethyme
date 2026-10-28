@@ -155,6 +155,22 @@ fn a_dirty_worktree_is_archived_restored_and_then_removed() {
     std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
     std::fs::write(worktree.join("target/debug/cache.bin"), vec![9_u8; 4096]).unwrap();
 
+    let human = run(
+        tmp.path(),
+        &["finish", "cleanup", "resolve", &id, "--archive"],
+    );
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let human_text = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        human_text.contains(
+            "committed work: landing not evaluated; recovery preserves target-absent commits"
+        ),
+        "{human_text}"
+    );
     let reviewed = plan(tmp.path(), &id);
     assert_eq!(reviewed["disposition"], "dirty");
     assert_eq!(reviewed["unlanded_commits"].as_array().unwrap().len(), 1);
