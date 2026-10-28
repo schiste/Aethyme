@@ -647,6 +647,8 @@ pub enum SessionRetirementDeferredReason {
     LifecycleBusy { session_id: i64 },
     /// A concurrent SQLite writer prevented the atomic abandonment transition.
     DatabaseBusy { session_id: i64 },
+    /// A concurrent SQLite writer prevented retirement cursor progress.
+    CursorBusy,
     /// Lease liveness evidence was unavailable or an active lease still held.
     LeaseLivenessUnavailable { session_id: i64 },
     /// More open sessions remain in the current fixed-high-water lap.
@@ -1980,18 +1982,23 @@ impl Broker {
         &mut self,
         cursor: &SessionRetirementCursor,
         expected_raw: &mut Option<String>,
-    ) -> Result<(), BrokerOpError> {
+    ) -> Result<bool, BrokerOpError> {
         let value = serde_json::to_string(cursor)
             .expect("serializing the session-retirement cursor is infallible");
-        if !self.store().meta_compare_and_set(
+        let changed = match self.store().meta_compare_and_set_for_session_retirement(
             SESSION_RETIREMENT_CURSOR_KEY,
             expected_raw.as_deref(),
             &value,
-        )? {
+        ) {
+            Ok(changed) => changed,
+            Err(crate::BrokerError::SessionRetirementDatabaseBusy) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if !changed {
             return Err(BrokerOpError::AutoCleanupCursorChanged);
         }
         *expected_raw = Some(value);
-        Ok(())
+        Ok(true)
     }
 
     /// Retire a bounded keyset page of sessions whose existing abandonment
@@ -2054,7 +2061,13 @@ impl Broker {
         {
             cursor.after_session_id = 0;
             cursor.high_water_session_id = current_high_water;
-            self.persist_session_retirement_cursor(&cursor, &mut expected_raw)?;
+            if !self.persist_session_retirement_cursor(&cursor, &mut expected_raw)? {
+                summary.deferred = 1;
+                summary
+                    .reasons
+                    .push(SessionRetirementDeferredReason::CursorBusy);
+                return Ok(summary);
+            }
         }
         if cursor.high_water_session_id == 0 {
             return Ok(summary);
@@ -2076,7 +2089,12 @@ impl Broker {
         }
         if sessions.is_empty() {
             cursor.after_session_id = cursor.high_water_session_id;
-            self.persist_session_retirement_cursor(&cursor, &mut expected_raw)?;
+            if !self.persist_session_retirement_cursor(&cursor, &mut expected_raw)? {
+                summary.deferred = 1;
+                summary
+                    .reasons
+                    .push(SessionRetirementDeferredReason::CursorBusy);
+            }
             return Ok(summary);
         }
 
@@ -2176,7 +2194,13 @@ impl Broker {
                 | crate::broker::AbandonedSessionCloseOutcome::ActiveProcess => {}
             }
             cursor.after_session_id = session.id;
-            self.persist_session_retirement_cursor(&cursor, &mut expected_raw)?;
+            if !self.persist_session_retirement_cursor(&cursor, &mut expected_raw)? {
+                summary.deferred += 1;
+                summary
+                    .reasons
+                    .push(SessionRetirementDeferredReason::CursorBusy);
+                return Ok(summary);
+            }
         }
 
         if deadline_expired(deadline) {
@@ -2195,7 +2219,12 @@ impl Broker {
         )?;
         if more.is_empty() {
             cursor.after_session_id = cursor.high_water_session_id;
-            self.persist_session_retirement_cursor(&cursor, &mut expected_raw)?;
+            if !self.persist_session_retirement_cursor(&cursor, &mut expected_raw)? {
+                summary.deferred += 1;
+                summary
+                    .reasons
+                    .push(SessionRetirementDeferredReason::CursorBusy);
+            }
         } else {
             summary.deferred += 1;
             summary
@@ -2215,14 +2244,16 @@ impl Broker {
         deadline: Option<Instant>,
     ) -> Result<AutoCleanupReport, BrokerOpError> {
         let retirement = self.retire_abandoned_sessions(deadline)?;
-        if retirement
-            .reasons
-            .iter()
-            .any(|reason| matches!(reason, SessionRetirementDeferredReason::DatabaseBusy { .. }))
-        {
-            // A busy abandonment CAS is a reason to defer this pass as a
-            // whole. In particular, skip checkout planning and its cursor
-            // writes while the other database writer may still be active.
+        if retirement.reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                SessionRetirementDeferredReason::DatabaseBusy { .. }
+                    | SessionRetirementDeferredReason::CursorBusy
+            )
+        }) {
+            // Database contention is a reason to defer this pass as a whole.
+            // Skip checkout planning and its cursor writes while the other
+            // database writer may still be active.
             let (enabled, config_error) = match AutoCleanupPolicy::load(self.main_root()) {
                 Ok(policy) => (policy.auto_remove, None),
                 Err(error) => (false, Some(error.to_string())),
@@ -3516,6 +3547,37 @@ mod tests {
                 .meta_get(SESSION_RETIREMENT_CURSOR_KEY)
                 .unwrap(),
             Some(raw_cursor)
+        );
+        assert_eq!(
+            broker.store().session(session.id).unwrap().cleanup_state,
+            SessionCleanupState::Open
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn busy_first_retirement_pass_defers_without_creating_its_cursor() {
+        let (_owner, _storage, mut broker, session) = retirement_fixture();
+        age_open_session(&mut broker, &session);
+        let writer = rusqlite::Connection::open(broker.store().db_path()).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let started = Instant::now();
+
+        let report = broker.auto_remove_disposable_checkouts(None).unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "first-run cursor creation must defer instead of waiting on a writer"
+        );
+        assert_eq!(report.deferred, 1);
+        assert!(matches!(
+            report.retirement_deferred_reasons.as_slice(),
+            [SessionRetirementDeferredReason::CursorBusy]
+        ));
+        assert_eq!(
+            broker.store().meta_get(SESSION_RETIREMENT_CURSOR_KEY).unwrap(),
+            None,
+            "failed initialization leaves the durable cursor unchanged"
         );
         assert_eq!(
             broker.store().session(session.id).unwrap().cleanup_state,

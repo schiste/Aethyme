@@ -64,7 +64,7 @@ pub enum BrokerError {
     #[error("session {0} is no longer open")]
     SessionNotOpen(i64),
 
-    #[error("broker database is busy; abandoned-session closure was deferred")]
+    #[error("broker database is busy; session-retirement work was deferred")]
     SessionRetirementDatabaseBusy,
 
     #[error(
