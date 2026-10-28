@@ -16,12 +16,28 @@ version and the target, oldest first. Each schema migration runs on first open
 and is one-way, so rollback is limited to the oldest binary that still reads
 the newest schema you have opened.
 
-Breaking releases: [v0.8.42](#v0842), [v0.8.41](#v0841), [v0.8.40](#v0840), [v0.8.38](#v0838), [v0.8.37](#v0837), [v0.8.33](#v0833), [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
+Breaking releases: [v0.8.43](#v0843), [v0.8.42](#v0842), [v0.8.41](#v0841), [v0.8.40](#v0840), [v0.8.38](#v0838), [v0.8.37](#v0837), [v0.8.33](#v0833), [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
 [v0.7.25](#v0725), [v0.7.23](#v0723), [v0.7.22](#v0722), [v0.7.19](#v0719),
 [v0.7.18](#v0718), [v0.7.16](#v0716), [v0.7.9](#v079), [v0.7.8](#v078),
 [v0.7.4](#v074), [v0.7.2](#v072),
 [v0.7.1](#v071), [v0.5.0](#v050), [v0.3.0](#v030),
 [v0.2.2](#v022), [v0.2.0](#v020).
+
+## v0.8.43
+
+### Compatibility
+
+Recovery plan JSON advances to schema 3, with canonical `repository_path`, nullable `branch_tip` and `landing.state: not_evaluated_for_recovery`. The latter is not a delivery verdict. Clean recovery plans without direct ancestry proof report `unproven_provenance`, including potentially squash/replay-delivered work, rather than asserting that it is pending or landed. Its versioned content digest excludes mutable delivery observations; regenerate previously saved confirmations after upgrading. Recovery archives advance to schema 4. Older readers retain unsupported archives as unowned; current readers preserve support for archive schemas 1, 2 and 3 and their frozen digest encodings. No repository broker database migration is added by this release.
+
+The default grace period for state-only closed checkouts is now 360 hours (15 days). The separate age-retention setting is unchanged. Explicit overrides remain effective. Age alone never authorizes deletion of unique or unverified content, and adopted checkout ownership remains protected.
+
+### Migrate and verify
+
+Install the matching router and engine pair and verify both released identities. Follow the v0.8.42 host operations ledger migration requirements when upgrading from an older runtime. Replan recovery actions with the new binary, inspect preserved content and archive location, and check `worktree_removed` plus `cleanup_error` before reporting a removal.
+
+### Rollback
+
+Earlier binaries do not understand schema-4 archives or the new confirmation digest. Preserve those archives and use a compatible runtime for verification and recovery; do not rewrite schema markers. The v0.8.42 host operations ledger rollback constraints continue to apply.
 
 ## v0.8.42
 

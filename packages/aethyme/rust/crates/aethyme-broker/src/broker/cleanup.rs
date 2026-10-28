@@ -42,9 +42,17 @@ enum CleanupDeliveryTargets<'a> {
     Fresh,
     /// Reuse the targets bound into a cleanup plan.
     Snapshot(&'a [String]),
+    /// Recovery preserves every commit absent from these targets. It needs
+    /// complete checkout inspection, not an exact-content landing search.
+    ArchivePreservation(&'a [String]),
     /// The plan's initial primary HEAD lookup failed, so its target set is not
     /// suitable for proving that any session's work is represented.
     SnapshotUnavailable,
+}
+
+enum CleanupProvenanceAssessment {
+    Checked(Box<CleanupProvenance>, String),
+    ArchivePreservation { ancestry_proven: bool },
 }
 
 #[derive(Clone, Copy)]
@@ -1764,6 +1772,33 @@ impl Broker {
         landing_cache: &mut crate::representation::LandingVerdictCache,
         status_limits: CleanupStatusLimits,
     ) -> Result<(CleanupDisposition, String, Option<CleanupProvenance>), BrokerOpError> {
+        self.cleanup_eligibility_with_provenance(worktree_path, status_limits, |session_head| {
+            let session = self.store.session(session_id)?;
+            self.cleanup_provenance_with_cache(
+                &session,
+                session_head,
+                delivery_targets,
+                landing_cache,
+            )
+            .map(|(provenance, reason)| {
+                CleanupProvenanceAssessment::Checked(Box::new(provenance), reason)
+            })
+        })
+    }
+
+    /// Run the complete checkout/status preflight before classifying a missing
+    /// landing proof. Recovery archives can preserve unproven commits; an
+    /// incomplete inventory must never be treated as only unavailable proof.
+    fn cleanup_eligibility_with_provenance<F>(
+        &self,
+        worktree_path: &Path,
+        status_limits: CleanupStatusLimits,
+        inspect_provenance: F,
+    ) -> Result<(CleanupDisposition, String, Option<CleanupProvenance>), BrokerOpError>
+    where
+        F: FnOnce(&str) -> Result<CleanupProvenanceAssessment, BrokerOpError>,
+    {
+        let _inspection_deadline = crate::git::limit_git_until(status_limits.deadline);
         if worktree_path == self.main_root.as_path() {
             return Ok((
                 CleanupDisposition::UnsafePath,
@@ -1830,13 +1865,33 @@ impl Broker {
         }
 
         let session_head = checkout.head_commit()?;
-        let session = self.store.session(session_id)?;
-        let (provenance, reason) = self.cleanup_provenance_with_cache(
-            &session,
-            &session_head,
-            delivery_targets,
-            landing_cache,
-        )?;
+        let (provenance, reason) = match inspect_provenance(&session_head) {
+            Ok(CleanupProvenanceAssessment::Checked(provenance, reason)) => (*provenance, reason),
+            Ok(CleanupProvenanceAssessment::ArchivePreservation { ancestry_proven }) => {
+                return Ok(if ancestry_proven {
+                    (
+                        CleanupDisposition::Eligible,
+                        "session HEAD is reachable from a delivery target".into(),
+                        None,
+                    )
+                } else {
+                    (
+                        CleanupDisposition::UnprovenProvenance,
+                        "recovery preserves commits without evaluating exact-content landing proof"
+                            .into(),
+                        None,
+                    )
+                });
+            }
+            Err(BrokerOpError::RepresentationUnavailable { reason }) => {
+                return Ok((
+                    CleanupDisposition::UnprovenProvenance,
+                    format!("landing proof unavailable; preserved the checkout: {reason}"),
+                    None,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         let disposition = match provenance.representation {
             CleanupRepresentation::Represented => CleanupDisposition::Eligible,
             CleanupRepresentation::Pending => CleanupDisposition::PendingCommits,
@@ -2251,6 +2306,13 @@ impl Broker {
     ) -> Result<(CleanupDisposition, String, Option<CleanupProvenance>), BrokerOpError> {
         let owned_delivery_targets;
         let delivery_targets = match delivery_targets {
+            CleanupDeliveryTargets::ArchivePreservation(_) => {
+                return Ok((
+                    CleanupDisposition::UnprovenProvenance,
+                    "recovery requires a complete readable checkout inventory".into(),
+                    None,
+                ));
+            }
             CleanupDeliveryTargets::Snapshot(targets) => targets,
             CleanupDeliveryTargets::Fresh => {
                 owned_delivery_targets = self.cleanup_delivery_targets()?;
@@ -2335,6 +2397,79 @@ impl Broker {
                 status_path_fields,
             ),
         )
+    }
+
+    pub(crate) fn cleanup_item_for_recovery_archive_with_status_limits(
+        &self,
+        session: &Session,
+        scan: crate::SizeScan,
+        records: &mut crate::measurement::SizeRecords,
+        status_output_bytes: usize,
+        status_path_fields: usize,
+        delivery_targets: &[String],
+    ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
+        self.cleanup_item_for_recovery_archive_with_limits(
+            session,
+            scan,
+            records,
+            CleanupStatusLimits::new(
+                self.landing_deadline.get(),
+                status_output_bytes,
+                status_path_fields,
+            ),
+            delivery_targets,
+        )
+    }
+
+    fn cleanup_item_for_recovery_archive_with_limits(
+        &self,
+        session: &Session,
+        scan: crate::SizeScan,
+        records: &mut crate::measurement::SizeRecords,
+        status_limits: CleanupStatusLimits,
+        delivery_targets: &[String],
+    ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
+        let mut landing_cache = crate::representation::LandingVerdictCache::default();
+        self.cleanup_item_scanned_with_tips(
+            session,
+            scan,
+            records,
+            CleanupInspectionContext {
+                branch_tips: None,
+                delivery_targets: CleanupDeliveryTargets::ArchivePreservation(delivery_targets),
+                landing_cache: &mut landing_cache,
+                status_limits,
+            },
+        )
+    }
+
+    fn archive_preservation_ancestry(
+        &self,
+        head: &str,
+        delivery_targets: &[String],
+        deadline: std::time::Instant,
+    ) -> Result<CleanupProvenanceAssessment, BrokerOpError> {
+        let _deadline = crate::git::limit_git_until(deadline);
+        let mut unavailable = None;
+        for target in delivery_targets {
+            match self.repo_handle().is_ancestor_checked(head, target) {
+                Ok(true) => {
+                    return Ok(CleanupProvenanceAssessment::ArchivePreservation {
+                        ancestry_proven: true,
+                    });
+                }
+                Ok(false) => {}
+                Err(error) => unavailable = Some(error.to_string()),
+            }
+        }
+        if let Some(reason) = unavailable {
+            // The caller classifies unavailable proof as unproven only after
+            // complete checkout inspection. No negative landing claim is made.
+            return Err(BrokerOpError::RepresentationUnavailable { reason });
+        }
+        Ok(CleanupProvenanceAssessment::ArchivePreservation {
+            ancestry_proven: false,
+        })
     }
 
     fn cleanup_item_scanned_with_limits(
@@ -2442,6 +2577,12 @@ impl Broker {
                     ),
                     Ok(false) => {
                         let eligibility = match delivery_targets {
+                            CleanupDeliveryTargets::ArchivePreservation(targets) => self
+                                .cleanup_eligibility_with_provenance(
+                                    &worktree_path,
+                                    status_limits,
+                                    |head| self.archive_preservation_ancestry(head, targets, status_limits.deadline),
+                                ),
                             CleanupDeliveryTargets::Snapshot(targets) => self
                                 .cleanup_eligibility_with_status_limits(
                                     session.id,
@@ -3921,14 +4062,14 @@ impl Broker {
     pub(crate) fn cleanup_after_recovery_archive(
         &mut self,
         session_id: i64,
-        expected_digest: &str,
+        archived_plan: &crate::CleanupResolvePlan,
         archive_path: &Path,
     ) -> Result<(), BrokerOpError> {
         let initial_session = self.store.session(session_id)?;
         let _lifecycle_claim = self.claim_worktree_lifecycle()?;
         let session = self.store.session(session_id)?;
         ensure_lifecycle_session_unchanged(session_id, &initial_session, &session)?;
-        self.cleanup_under_lifecycle_claim(&session, true, Some((expected_digest, archive_path)))
+        self.cleanup_under_lifecycle_claim(&session, true, Some((archived_plan, archive_path)))
     }
 
     /// Perform cleanup while the caller holds the repository lifecycle claim.
@@ -3938,7 +4079,7 @@ impl Broker {
         &mut self,
         session: &Session,
         force: bool,
-        archive_guard: Option<(&str, &Path)>,
+        archive_guard: Option<(&crate::CleanupResolvePlan, &Path)>,
     ) -> Result<(), BrokerOpError> {
         self.cleanup_under_lifecycle_claim_with_status_limits(
             session,
@@ -3956,7 +4097,7 @@ impl Broker {
         &mut self,
         session: &Session,
         force: bool,
-        archive_guard: Option<(&str, &Path)>,
+        archive_guard: Option<(&crate::CleanupResolvePlan, &Path)>,
         status_limits: CleanupStatusLimits,
     ) -> Result<(), BrokerOpError> {
         let session_id = session.id;
@@ -4017,12 +4158,22 @@ impl Broker {
         // not the byte count, and a walk here only widens the window between
         // the live-checkout check below and the removal.
         let mut records = crate::measurement::SizeRecords::default();
-        let item = self.cleanup_item_scanned_with_limits(
-            session,
-            crate::SizeScan::Recorded,
-            &mut records,
-            status_limits,
-        )?;
+        let item = if let Some((archived_plan, _)) = archive_guard {
+            self.cleanup_item_for_recovery_archive_with_limits(
+                session,
+                crate::SizeScan::Recorded,
+                &mut records,
+                status_limits,
+                &archived_plan.delivery_targets,
+            )?
+        } else {
+            self.cleanup_item_scanned_with_limits(
+                session,
+                crate::SizeScan::Recorded,
+                &mut records,
+                status_limits,
+            )?
+        };
         if !force
             && let Some(item) = item.as_ref()
             && !item.eligible()
@@ -4045,20 +4196,58 @@ impl Broker {
         }
 
         let mut removed_orphan_branch = None;
-        if worktree_path_is_real_directory(&worktree_path, session_id)? {
+        let retained_checkout_present =
+            worktree_path_is_real_directory(&worktree_path, session_id)?;
+        if archive_guard.is_some() && !retained_checkout_present {
+            return Err(BrokerOpError::CleanupResolveRefused {
+                id: session_id,
+                reason: "the archived checkout is no longer present for content revalidation; preserved the session branch and archive".into(),
+            });
+        }
+        if retained_checkout_present {
             self.refuse_live_checkout(session_id, &worktree_path)?;
-            if let Some((expected_digest, archive_path)) = archive_guard {
-                let current = self.cleanup_resolve_plan(session_id)?;
-                if current.digest != expected_digest {
+            if let Some((archived_plan, archive_path)) = archive_guard {
+                let _archive_deadline = crate::git::limit_git_until(status_limits.deadline);
+                let current = self.cleanup_resolve_revalidation_plan(session_id)?;
+                if current.digest != archived_plan.digest {
                     return Err(BrokerOpError::CleanupResolveRefused {
                         id: session_id,
                         reason: "worktree contents or ignored cleanup policy changed after archive verification; the archive was kept and the worktree remains in place; review a new resolve plan before retrying".into(),
                     });
                 }
+                // A bundle omits commits reachable from its reviewed delivery
+                // targets. Each prerequisite must remain rooted in current
+                // delivery history; local object existence alone is insufficient.
+                {
+                    let _deadline = crate::git::limit_git_until(status_limits.deadline);
+                    for prerequisite in &archived_plan.delivery_targets {
+                        let mut retained = false;
+                        let mut unavailable = None;
+                        for target in &current.delivery_targets {
+                            match self.repo_handle().is_ancestor_checked(prerequisite, target) {
+                                Ok(true) => {
+                                    retained = true;
+                                    break;
+                                }
+                                Ok(false) => {}
+                                Err(error) => unavailable = Some(error.to_string()),
+                            }
+                        }
+                        if !retained {
+                            return Err(BrokerOpError::CleanupResolveRefused {
+                                id: session_id,
+                                reason: match unavailable {
+                                    Some(error) => format!("archive prerequisite reachability could not be verified; the archive and checkout were preserved: {error}"),
+                                    None => "archive prerequisites are no longer retained by current delivery history; the archive and checkout were preserved".into(),
+                                },
+                            });
+                        }
+                    }
+                }
                 crate::cleanup_resolve::verify_recovery_archive_for_plan(
                     self.repo_handle(),
                     archive_path,
-                    &current,
+                    archived_plan,
                 )
                 .map_err(|reason| BrokerOpError::CleanupResolveRefused {
                     id: session_id,
@@ -4497,6 +4686,68 @@ mod registered_removal_failure_tests {
         )
         .unwrap();
         repository
+    }
+
+    #[test]
+    fn unavailable_landing_proof_does_not_mask_checkout_inspection_failure() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("unavailable proof preflight", None)
+            .unwrap();
+        let worktree = Path::new(&session.worktree_path);
+        let limits = || {
+            CleanupStatusLimits::new(
+                None,
+                crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+                crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+            )
+        };
+        let (disposition, reason, provenance) = broker
+            .cleanup_eligibility_with_provenance(worktree, limits(), |_| {
+                Err(crate::BrokerOpError::RepresentationUnavailable {
+                    reason: "deterministic exhausted landing budget".into(),
+                })
+            })
+            .unwrap();
+        assert_eq!(disposition, crate::CleanupDisposition::UnprovenProvenance);
+        assert!(reason.contains("deterministic exhausted landing budget"));
+        assert!(provenance.is_none());
+        assert!(worktree.exists());
+
+        let error = broker.cleanup_eligibility_with_provenance(worktree, limits(), |_| {
+            Err(crate::BrokerOpError::CleanupResolveRefused {
+                id: session.id,
+                reason: "non-representation failure".into(),
+            })
+        });
+        assert!(matches!(
+            error,
+            Err(crate::BrokerOpError::CleanupResolveRefused { .. })
+        ));
+
+        std::fs::write(worktree.join("retained-untracked.txt"), "unique work").unwrap();
+        let (disposition, _, _) = broker
+            .cleanup_eligibility_with_provenance(worktree, limits(), |_| {
+                panic!("dirty preflight must precede landing inspection")
+            })
+            .unwrap();
+        assert_eq!(disposition, crate::CleanupDisposition::Dirty);
+
+        let (disposition, _, _) = broker
+            .cleanup_eligibility_with_provenance(
+                worktree,
+                CleanupStatusLimits::new(None, 1, 1),
+                |_| panic!("incomplete status must not become unavailable landing proof"),
+            )
+            .unwrap();
+        assert_eq!(disposition, crate::CleanupDisposition::InspectionFailed);
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("retained-untracked.txt")).unwrap(),
+            "unique work"
+        );
     }
 
     fn start_represented_cleanup_session(

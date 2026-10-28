@@ -341,6 +341,17 @@ pub fn find_landing(
     find_landing_within(repo, content, branch_tip, cap, None)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_LANDING_SEARCH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Per-thread observation of actual search entry, independent of its verdict.
+#[cfg(test)]
+pub(crate) fn test_landing_search_calls() -> usize {
+    TEST_LANDING_SEARCH_CALLS.with(std::cell::Cell::get)
+}
+
 fn find_landing_within(
     repo: &GitRepo,
     content: &SessionContent,
@@ -348,6 +359,8 @@ fn find_landing_within(
     cap: usize,
     deadline: Option<std::time::Instant>,
 ) -> Result<LandingSearch, BrokerOpError> {
+    #[cfg(test)]
+    TEST_LANDING_SEARCH_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     let started = Instant::now();
     let budget = crate::git::git_timeout().min(MAX_LANDING_SEARCH_BUDGET);
     let requested_deadline =

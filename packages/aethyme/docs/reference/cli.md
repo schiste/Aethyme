@@ -1635,26 +1635,40 @@ that command if the plan would remove an item the audit retains. `--repo
 <path>` audits the repository at `<path>` instead of the current directory.
 
 `broker finish cleanup resolve <session-id> --archive` handles one closed,
-broker-spawned session whose worktree cleanup refuses because it is `dirty`,
-holds `pending_commits`, or is `unproven_provenance`. Without `--confirm` it is
-read-only: it prints the landed-work verdict for the head, the commits no
-delivery target holds, the sizes of the staged and unstaged patches, every
-untracked file Git does not ignore (with its SHA-256), the archive location and
-a digest. The digest binds the head, the delivery targets and the exact content
-of every patch and untracked file, so any change after review refuses the
-apply. `--confirm <sha256>` writes a recovery archive under
-`<host state>/recovery-archives/<repository-key>/` (a repository under the
-system temp directory uses `.aethyme/recovery-archives/` instead): a Git bundle
-of the unlanded commits, `staged.patch`, `unstaged.patch`, an `untracked/` copy,
-`manifest.json` and a `README.md` with restore steps. Every part is read back
-before anything is removed -- the bundle is verified and must carry the head,
-the patches must apply to the head in a private index, and every copied file is
-re-hashed -- and only a verified archive is renamed into place, after which the
-worktree is removed through the ordinary cleanup path and a
-`broker.cleanup.archived` event records the archive path. Any failure before
-that point leaves the worktree untouched. Ignored files (build output, caches)
-are never archived. Eligible, live, adopted, unsafe-path and inspection-failed
-sessions are refused; discarding stays `cleanup <session-id> --force`.
+broker-spawned session retained for authored or unproven work. Without
+`--confirm` it prints a read-only plan: HEAD and session branch tip, delivery
+targets, target-absent commits, patch sizes and hashes, preserved files and the
+archive location. Plan schema `3` binds the checkout's exact content and cleanup
+policy; delivery evidence is recorded separately. Its `landing.state` is
+`not_evaluated_for_recovery`: archive preservation does not run a historical
+exact-content landing search or claim that the work landed. `repository_path`
+is always the canonical primary checkout path. `branch_tip` is always present:
+it is the registered branch commit, or JSON `null` when that ref is absent.
+A present tip must match `head`. `delivery_targets` and `unlanded_commits` are
+always arrays; an empty `unlanded_commits` means no Git bundle is needed.
+
+`--confirm <sha256>` writes a schema `4` recovery archive under
+`<host state>/recovery-archives/<repository-key>/` (temporary repositories use
+`.aethyme/recovery-archives/`). It preserves a verified Git bundle of commits
+absent from delivery targets, staged and unstaged patches, untracked files,
+protected standalone ignored files and links, the manifest and restore steps.
+Disposable ignored directories follow cleanup policy. Before removing the
+checkout, the broker rereads and verifies the payload, rechecks the content
+proof, and proves omitted Git prerequisites remain reachable from current
+delivery targets. Advancing delivery refs alone need not invalidate the
+confirmation. Changed content or branch state, lost prerequisites, unavailable
+proof, live use, unsafe paths and incomplete inventories retain the checkout.
+Older archive schemas remain readable and verifiable.
+
+A successful command can still return `worktree_removed: false`; inspect
+`cleanup_error` and preserve the reported archive path. The event
+`broker.cleanup.archived` records archive creation, independently of removal.
+Clean sessions whose HEAD is ancestry-proven in a delivery target, live sessions
+and adopted sessions are refused by the public planner. Other clean sessions
+are reported as `unproven_provenance`: recovery does not distinguish pending
+work from squash or replay delivery by searching content history. They can be
+preserved without making a delivery claim. Explicit discard remains `cleanup <session-id> --force`. See the
+[cleanup guide](../guides/worktree-cleanup.md) for the complete recovery contract.
 
 Archives never expire on their own. `broker gc plan` proposes one as a reviewed,
 digest-bound candidate (`recovery_archives[]`) only when this repository's
