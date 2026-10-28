@@ -73,6 +73,13 @@ impl Host {
         command.output().unwrap()
     }
 
+    fn cli_from(&self, repository: &Path, container: Option<&Path>, args: &[&str]) -> Output {
+        let mut command = common::broker_cli(CLI, args);
+        self.env(&mut command, container);
+        command.current_dir(repository);
+        command.output().unwrap()
+    }
+
     fn json(&self, container: Option<&Path>, args: &[&str]) -> serde_json::Value {
         let output = self.cli(container, args);
         assert!(
@@ -167,8 +174,8 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, u32)> {
     entries
 }
 
-/// A worktree root whose repository no longer exists: the orphan sweep's
-/// target, and proof that the sweep really ran.
+/// A handwritten root marker without the host-origin fingerprint. It must
+/// defer orphan removal rather than authorize deleting the marked directory.
 fn orphan_root(container: &Path) -> PathBuf {
     let root = container.join("gone-0123456789abcdef");
     std::fs::create_dir_all(root.join("old-session")).unwrap();
@@ -186,11 +193,54 @@ fn orphan_root(container: &Path) -> PathBuf {
     root
 }
 
+/// Obtain a genuine host-registered orphan: admit a real repository, then
+/// remove its origin while retaining the broker-created worktree root.
+fn registered_orphan(host: &Host, container: Option<&Path>) -> PathBuf {
+    let origin = tempfile::tempdir().unwrap();
+    git(origin.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(origin.path().join("README.md"), "registered fixture\n").unwrap();
+    std::fs::write(origin.path().join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
+    git(origin.path(), &["add", "-A"]);
+    git(origin.path(), &["commit", "-qm", "init"]);
+    std::fs::create_dir(origin.path().join(".aethyme")).unwrap();
+    std::fs::write(
+        origin.path().join(".aethyme/broker.toml"),
+        "[retention]\norphan_worktree_roots_days = 0\nartifact_reclaim_days = 0\n\
+         artifact_sweep_budget_ms = 0\n",
+    )
+    .unwrap();
+
+    let started = host.cli_from(
+        origin.path(),
+        container,
+        &["start", "--task", "registered orphan", "--json"],
+    );
+    assert!(
+        started.status.success(),
+        "start: {}{}",
+        String::from_utf8_lossy(&started.stdout),
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let session: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    let worktree = PathBuf::from(session["worktree_path"].as_str().unwrap());
+    let root = worktree.parent().unwrap().to_path_buf();
+    let expected_container = container
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| host.state.path().join("worktrees"));
+    assert!(root.starts_with(expected_container.canonicalize().unwrap()));
+    assert!(root.join(".aethyme-worktree-root.json").is_file());
+    std::fs::create_dir(root.join("old-session")).unwrap();
+    std::fs::write(root.join("old-session/leftover"), "registered bytes\n").unwrap();
+
+    drop(origin);
+    root
+}
+
 /// Every deleter in L0 slice C §2 that acts on host storage, through the
 /// CLI: a session finished with its checkout kept, the startup sweep and
 /// auto-removal, gc plan/apply with the orphan sweep, storage plan/apply and
 /// attribution, and reclaim.
-fn run_every_deleter(host: &Host, container: Option<&Path>) {
+fn run_every_deleter(host: &Host, container: Option<&Path>, refused_gc_root: Option<&Path>) {
     let started = host.json(container, &["start", "--task", "cleanup reach", "--json"]);
     let id = started["id"].as_i64().unwrap().to_string();
     let finished = host.cli(container, &["finish", "--session", &id, "--keep-worktree"]);
@@ -201,27 +251,71 @@ fn run_every_deleter(host: &Host, container: Option<&Path>) {
     );
     host.json(container, &["gc", "sweep", "--json"]);
     let plan = host.json(container, &["gc", "plan", "--full-scan", "--json"]);
-    let applied = host.cli(
-        container,
-        &[
-            "gc",
-            "apply",
-            "--confirm",
-            plan["digest"].as_str().unwrap(),
-            "--full-scan",
-        ],
-    );
-    assert!(
-        applied.status.success(),
-        "gc apply: {}",
-        String::from_utf8_lossy(&applied.stderr)
-    );
+    if let Some(refused_gc_root) = refused_gc_root {
+        assert_eq!(plan["digest"].as_str(), Some(""), "{plan:#}");
+        assert!(
+            plan["deferred_checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check == "orphan_scan"),
+            "untrusted root provenance must defer orphan discovery: {plan:#}"
+        );
+        assert!(
+            plan["blockers"].as_array().unwrap().iter().any(|blocker| {
+                blocker["kind"] == "unmarked_worktree_root"
+                    && blocker.to_string().contains("collaboration")
+            }),
+            "the overlapping collaboration root must be reported: {plan:#}"
+        );
+        let root_before_apply = snapshot(refused_gc_root);
+        let unissued_confirmation = "a".repeat(64);
+        let refused = host.cli(
+            container,
+            &[
+                "gc",
+                "apply",
+                "--confirm",
+                &unissued_confirmation,
+                "--full-scan",
+            ],
+        );
+        assert!(
+            !refused.status.success(),
+            "GC must refuse apply when orphan discovery is incomplete"
+        );
+        assert!(
+            refused_gc_root.exists(),
+            "the refused GC apply removed its root"
+        );
+        assert_eq!(
+            snapshot(refused_gc_root),
+            root_before_apply,
+            "the refused GC apply changed the root subtree"
+        );
+    } else {
+        let digest = plan["digest"].as_str().unwrap();
+        assert_eq!(
+            digest.len(),
+            64,
+            "complete plan must be applicable: {plan:#}"
+        );
+        let applied = host.cli(
+            container,
+            &["gc", "apply", "--confirm", digest, "--full-scan"],
+        );
+        assert!(
+            applied.status.success(),
+            "gc apply: {}",
+            String::from_utf8_lossy(&applied.stderr)
+        );
+    }
     host.json(
         container,
         &["gc", "storage", "attribute", "--apply", "--json"],
     );
     let storage = host.json(container, &["gc", "storage", "plan", "--json"]);
-    host.json(
+    let storage_apply = host.json(
         container,
         &[
             "gc",
@@ -232,6 +326,20 @@ fn run_every_deleter(host: &Host, container: Option<&Path>) {
             "--json",
         ],
     );
+    if let Some(refused_gc_root) = refused_gc_root {
+        let expected_path = refused_gc_root.to_string_lossy().into_owned();
+        assert!(
+            storage_apply["applied"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| {
+                    item["kind"].as_str() == Some("orphan_root")
+                        && item["path"].as_str() == Some(expected_path.as_str())
+                }),
+            "the later storage plan/apply lane should account for its orphan removal: {storage_apply:#}"
+        );
+    }
     let reclaim = host.json(container, &["gc", "reclaim", "plan", "--json"]);
     let reclaimed = host.cli(
         container,
@@ -270,9 +378,9 @@ fn retained_state_survives_every_legacy_deleter() {
     let host = Host::new();
     let project = host.seed();
     let before = snapshot(&host.collaboration());
-    let orphan = orphan_root(&host.state.path().join("worktrees"));
+    let orphan = registered_orphan(&host, None);
 
-    run_every_deleter(&host, None);
+    run_every_deleter(&host, None, None);
 
     assert!(!orphan.exists(), "the orphan sweep did not run");
     assert_eq!(snapshot(&host.collaboration()), before);
@@ -296,7 +404,7 @@ fn a_container_over_the_host_state_is_refused_and_still_cannot_remove_it() {
         host.open(Some(&container)).unwrap_err(),
         "overlaps_cleanup_root"
     );
-    let plan = host.json(Some(&container), &["gc", "plan", "--json"]);
+    let plan = host.json(Some(&container), &["gc", "plan", "--full-scan", "--json"]);
     assert!(
         plan["blockers"].as_array().unwrap().iter().any(|blocker| {
             blocker["kind"] == "unmarked_worktree_root"
@@ -304,9 +412,12 @@ fn a_container_over_the_host_state_is_refused_and_still_cannot_remove_it() {
         }),
         "{plan:#}"
     );
-    run_every_deleter(&host, Some(&container));
+    run_every_deleter(&host, Some(&container), Some(&orphan));
 
-    assert!(!orphan.exists(), "the orphan sweep did not run");
+    assert!(
+        !orphan.exists(),
+        "the separately reviewed storage lane should reclaim its orphan"
+    );
     assert_eq!(snapshot(&host.collaboration()), before);
     assert!(
         !host
