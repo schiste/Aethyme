@@ -998,6 +998,36 @@ impl BrokerStore {
         Ok(changed == 1)
     }
 
+    /// Compare and update the bounded retirement cursor without waiting for a
+    /// competing SQLite writer. A busy result is a deferral; restore the
+    /// connection's normal timeout on both success and error.
+    pub(crate) fn meta_compare_and_set_for_session_retirement(
+        &mut self,
+        key: &str,
+        expected: Option<&str>,
+        value: &str,
+    ) -> Result<bool, BrokerError> {
+        self.conn.busy_timeout(std::time::Duration::ZERO)?;
+        let result = self.meta_compare_and_set(key, expected, value);
+        let result = match result {
+            Err(BrokerError::Sqlite(error))
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(
+                        rusqlite::ErrorCode::DatabaseBusy
+                            | rusqlite::ErrorCode::DatabaseLocked
+                    )
+                ) =>
+            {
+                Err(BrokerError::SessionRetirementDatabaseBusy)
+            }
+            result => result,
+        };
+        self.conn
+            .busy_timeout(std::time::Duration::from_millis(super::BUSY_TIMEOUT_MS))?;
+        result
+    }
+
     pub fn append_event(
         &mut self,
         kind: &str,

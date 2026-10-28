@@ -3200,6 +3200,9 @@ fn push_auto_cleanup_advice(view: &mut StatusView, report: Option<crate::AutoCle
                 crate::SessionRetirementDeferredReason::DatabaseBusy { session_id } => format!(
                     "session {session_id} retirement will retry after the broker database writer releases its lock"
                 ),
+                crate::SessionRetirementDeferredReason::CursorBusy => {
+                    "session retirement will resume after the broker database writer releases its lock".into()
+                }
                 crate::SessionRetirementDeferredReason::LeaseLivenessUnavailable {
                     session_id,
                 } => format!(
