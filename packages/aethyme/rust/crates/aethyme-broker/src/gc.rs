@@ -9130,10 +9130,14 @@ mod tests {
 
         std::fs::write(&cleanup_config, "[cleanup]\nauto_remove = false\n").unwrap();
         let (disabled_report, disabled_completed) = broker
-            .auto_checkout_cleanup_recovery_pass(first_generation, Instant::now())
+            .auto_checkout_cleanup_recovery_pass(
+                first_generation,
+                Instant::now() + Duration::from_secs(60),
+            )
             .unwrap()
             .expect("the disabled-policy pass acquires the cleanup lock");
         assert!(!disabled_report.enabled);
+        assert_eq!(disabled_report.deferred, 0);
         assert!(disabled_completed);
         assert!(worktree.is_dir(), "disabled policy keeps the checkout");
         broker
@@ -10344,8 +10348,13 @@ mod tests {
             ArtifactSweepTestMutationInterrupt::after_first_unlink(&ignored_directory);
         let (partial, removed) = run_closed_artifact_sweep(&mut broker, &root, session_id);
         assert!(!partial);
-        assert_eq!(removed, 1);
+        assert_eq!(removed, 0, "a partially removed directory is not reclaimed");
         assert!(ignored_directory.is_dir());
+        assert_eq!(
+            std::fs::read_dir(&ignored_directory).unwrap().count(),
+            1,
+            "exactly one payload was removed before interruption"
+        );
         let typed_queue = broker
             .artifact_sweep_meta_get(ARTIFACT_SWEEP_IGNORED_DIR_INTERRUPTED_KEY)
             .unwrap()
