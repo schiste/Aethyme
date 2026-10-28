@@ -1111,6 +1111,7 @@ fn collect_artifact_scan_until(
 ) -> (ArtifactScan, bool) {
     let _git_deadline = crate::git::limit_git_until(deadline);
 
+    #[allow(clippy::too_many_arguments)]
     fn visit(
         root: &Path,
         current: &Path,
