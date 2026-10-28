@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::broker::Broker;
 use crate::cli_output::out;
 
+mod event_watch;
 mod flags;
 mod gates;
 mod gc_storage;
@@ -776,7 +777,7 @@ Usage:
   aethyme broker events [--since <id>] [--kind <prefix>] [--follow] [--json]
       Show the append-only event log (see docs/events-contract.md).
       --kind filters by prefix (e.g. merge. or lease.overlap); --follow
-      polls for new events and survives transient read errors.
+      waits for database file notifications and retries transient read errors.
   aethyme broker events prune --keep-days <n> [--json]
       Retention: delete events older than <n> days. Event ids stay
       strictly increasing, so existing --since cursors remain valid.
