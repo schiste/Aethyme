@@ -45,16 +45,30 @@ ignored_directory_sweep = true
 ```
 
 Keep this setting off during a runtime transition until old broker clients have
-exited and the new gate-use protocol is active. Raising a database compatibility
-floor prevents fresh old clients from opening it; it does not stop a process
-that already has an open connection. Do not infer a completed drain from the
-absence of a gate PID file: a gate may still be waiting for admission.
+exited and the new gate-use protocol is active. During an upgrade, also suspend
+retirement with `session_abandoned_after_hours = 0` and hold automatic removal
+with `strict = true` and `auto_remove = false` before the new binary first opens
+the live database. Back up the database consistently and preserve the original
+configuration. Raise the compatibility floor, verify that old clients with
+open database connections have exited, then restore the reviewed retention and
+cleanup settings and enable the broader sweep.
+
+A compatibility floor prevents fresh old clients from opening the database; it
+does not stop a process that already has an open connection. Do not infer a
+completed drain from the absence of a gate PID file: a gate may still be
+waiting for admission. Do not restore saved configuration over concurrent
+operator edits; reconcile those edits first.
 
 The broader sweep checks current Git ignore rules, the complete closed checkout
 cohort, and active artifact-use claims before deletion. It does not follow
 symlinks or remove broker and Git metadata. A queued interrupted deletion is
 revalidated against current policy before resuming; its queue record alone is
 not permission to delete.
+
+The artifact-use protocol is available on Unix targets. On unsupported targets,
+the broader sweep and protocol-dependent unattended checkout removal remain
+blocked. Explicit operator-requested normal cleanup retains its existing
+platform guards; enabling the new sweep setting does not bypass that boundary.
 
 To retain ignored leftovers and pause automatic artifact sweeps:
 
@@ -85,3 +99,20 @@ reporting it removed. Keep recovery archives until their preservation purpose
 has been fulfilled. Estimated file sizes are not measured physical reclaimed
 space, because clones, hard links, snapshots, and concurrent writers affect
 volume usage.
+
+## Maintenance report fields
+
+`AutoCleanupReport` retains the existing `enabled`, `config_error`,
+`evaluated_at_ms`, `removed`, `kept`, and `deferred` fields. `enabled` describes
+whole-checkout automatic removal; session retirement follows the retention
+policy separately.
+
+| Optional field | Meaning |
+| --- | --- |
+| `sessions_retired` | Number of sessions closed by this maintenance pass; omitted when zero. |
+| `retirement_deferred_reasons` | Typed reasons why retirement could not finish; omitted when empty. |
+
+Readers must accept these fields being absent in older saved reports. A deferred
+session remains protected; `sessions_retired` counts session state transitions,
+not removed directories or reclaimed bytes. The checkout grace begins from
+closure, and content/ownership checks still decide whether removal is allowed.
