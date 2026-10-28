@@ -963,10 +963,23 @@ fn run_child_with_input(
         Ok(reader) => reader,
         Err(error) => {
             let cleanup = child.terminate();
-            if cleanup.is_ok() {
-                let _ = writer.join();
+            let child_reaped = cleanup.is_ok();
+            let error = add_error_context(error, "reap check-attr child", cleanup);
+            if child_reaped {
+                return Err(add_error_context(
+                    error,
+                    "finish check-attr input writer",
+                    join_writer(writer),
+                ));
             }
-            return Err(add_cleanup_context(error, cleanup));
+            crate::warn_unrecorded(
+                "join check-attr input writer after child cleanup failed",
+                Err::<(), _>(std::io::Error::other(
+                    "writer left detached while ChildReaper retries cleanup",
+                )),
+            );
+            drop(writer);
+            return Err(error);
         }
     };
 
@@ -974,25 +987,51 @@ fn run_child_with_input(
         Ok(status) => status,
         Err(error) => {
             let cleanup = child.terminate();
-            if cleanup.is_ok() {
-                let _ = writer.join();
-                let _ = reader.join();
+            let child_reaped = cleanup.is_ok();
+            let error = add_error_context(error, "reap check-attr child", cleanup);
+            if child_reaped {
+                let error =
+                    add_error_context(error, "finish check-attr input writer", join_writer(writer));
+                return Err(add_error_context(
+                    error,
+                    "finish check-attr output reader",
+                    join_reader(reader).map(|_| ()),
+                ));
             }
-            return Err(add_cleanup_context(error, cleanup));
+            crate::warn_unrecorded(
+                "join check-attr input writer after child cleanup failed",
+                Err::<(), _>(std::io::Error::other(
+                    "writer left detached while ChildReaper retries cleanup",
+                )),
+            );
+            crate::warn_unrecorded(
+                "join check-attr output reader after child cleanup failed",
+                Err::<(), _>(std::io::Error::other(
+                    "reader left detached while ChildReaper retries cleanup",
+                )),
+            );
+            drop(writer);
+            drop(reader);
+            return Err(error);
         }
     };
-    let written = writer
-        .join()
-        .unwrap_or_else(|_| Err(std::io::Error::other("child stdin writer panicked")));
-    let stdout = reader
-        .join()
-        .unwrap_or_else(|_| Err(std::io::Error::other("child stdout reader panicked")))?;
+    let written = join_writer(writer);
+    let stdout = join_reader(reader);
+    let stdout = match (written, stdout) {
+        (Ok(()), Ok(stdout)) => stdout,
+        (Err(write_error), Ok(_)) => return Err(write_error),
+        (Ok(()), Err(read_error)) => return Err(read_error),
+        (Err(write_error), Err(read_error)) => {
+            return Err(std::io::Error::other(format!(
+                "check-attr stdin failed: {write_error}; stdout failed: {read_error}"
+            )));
+        }
+    };
     if stdout.len() > max_output_bytes {
         return Err(std::io::Error::other(
             "git check-attr output exceeded the expected bound",
         ));
     }
-    written?;
     Ok(std::process::Output {
         status,
         stdout,
@@ -1020,31 +1059,78 @@ impl ChildReaper {
     }
 
     fn terminate(&mut self) -> std::io::Result<()> {
-        let _ = self.child.kill();
-        self.child.wait()?;
-        self.reaped = true;
-        Ok(())
+        match self.child.try_wait() {
+            Ok(Some(_)) => {
+                self.reaped = true;
+                Ok(())
+            }
+            Ok(None) => self.kill_and_reap(),
+            Err(inspect_error) => match self.kill_and_reap() {
+                Ok(()) => Ok(()),
+                Err(cleanup_error) => Err(std::io::Error::other(format!(
+                    "could not inspect check-attr child: {inspect_error}; cleanup failed: {cleanup_error}"
+                ))),
+            },
+        }
+    }
+
+    fn kill_and_reap(&mut self) -> std::io::Result<()> {
+        match self.child.kill() {
+            Ok(()) => {
+                self.child.wait()?;
+                self.reaped = true;
+                Ok(())
+            }
+            Err(kill_error) => match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    // The child exited between the first poll and kill(); the
+                    // successful status poll has reaped it already.
+                    self.reaped = true;
+                    Ok(())
+                }
+                Ok(None) => Err(kill_error),
+                Err(inspect_error) => Err(std::io::Error::other(format!(
+                    "could not stop check-attr child: {kill_error}; could not confirm its exit: {inspect_error}"
+                ))),
+            },
+        }
     }
 }
 
 impl Drop for ChildReaper {
     fn drop(&mut self) {
         if !self.reaped {
-            let _ = self.terminate();
+            crate::warn_unrecorded("stop and reap check-attr child", self.terminate());
         }
     }
 }
 
 fn terminate_after_error(child: &mut ChildReaper, error: std::io::Error) -> std::io::Error {
-    add_cleanup_context(error, child.terminate())
+    add_error_context(error, "reap check-attr child", child.terminate())
 }
 
-fn add_cleanup_context(error: std::io::Error, cleanup: std::io::Result<()>) -> std::io::Error {
+fn join_writer(writer: std::thread::JoinHandle<std::io::Result<()>>) -> std::io::Result<()> {
+    writer
+        .join()
+        .map_err(|_| std::io::Error::other("child stdin writer panicked"))?
+}
+
+fn join_reader(
+    reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> std::io::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| std::io::Error::other("child stdout reader panicked"))?
+}
+
+fn add_error_context(
+    error: std::io::Error,
+    action: &str,
+    cleanup: std::io::Result<()>,
+) -> std::io::Error {
     match cleanup {
         Ok(()) => error,
-        Err(cleanup) => std::io::Error::other(format!(
-            "{error}; could not reap check-attr child: {cleanup}"
-        )),
+        Err(cleanup) => std::io::Error::other(format!("{error}; could not {action}: {cleanup}")),
     }
 }
 
