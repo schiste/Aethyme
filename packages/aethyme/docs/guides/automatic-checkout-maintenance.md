@@ -49,13 +49,23 @@ ignored_directory_sweep = true
 ```
 
 Keep this setting off during a runtime transition until old broker clients have
-exited and the new gate-use protocol is active. During an upgrade, also suspend
-retirement with `session_abandoned_after_hours = 0` and hold automatic removal
-with `strict = true` and `auto_remove = false` before the new binary first opens
-the live database. Back up the database consistently and preserve the original
-configuration. Raise the compatibility floor, verify that old clients with
-open database connections have exited, then restore the reviewed retention and
-cleanup settings and enable the broader sweep.
+exited and the new gate-use protocol is active. Before the new binary first
+opens live state, back up the database consistently and preserve configuration.
+In `.aethyme/broker.toml`, hold retirement with
+`session_abandoned_after_hours = 0`, finish-time checkout removal with
+`auto_cleanup_worktrees_on_finish = false`, and automatic artifact work with
+`artifact_sweep_budget_ms = 0`. In `.aethyme/config.toml`, set `strict = true`,
+`auto_remove = false`, and `ignored_directory_sweep = false`. Finish-time
+cleanup is independent of `auto_remove`.
+
+Inspect `.aethyme/gc-journal.json` before the first normal open: startup can
+resume a previously confirmed plan independently of these automatic-maintenance
+holds. Resolve any pending journal through the reviewed GC recovery workflow
+before proceeding. A shared router/engine update affects multiple enrolled
+repositories; apply the holds and verify the drain for every affected database.
+Raise the compatibility floor, verify that old clients with open database
+connections have exited, then restore the reviewed retention and cleanup
+settings and enable the broader sweep.
 
 A compatibility floor prevents fresh old clients from opening the database; it
 does not stop a process that already has an open connection. Do not infer a
