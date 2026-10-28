@@ -859,7 +859,6 @@ pub fn linguist_generated_paths(
     base: &str,
     paths: &[String],
 ) -> Option<BTreeSet<String>> {
-    use std::io::Write;
     let mut found = BTreeSet::new();
     if paths.is_empty() {
         return Some(found);
@@ -877,7 +876,8 @@ pub fn linguist_generated_paths(
     if !read_tree.success() {
         return None;
     }
-    let mut child = crate::git::git_command()
+    let mut command = crate::git::git_command();
+    command
         .current_dir(root)
         .env("GIT_INDEX_FILE", &index)
         .args([
@@ -886,22 +886,14 @@ pub fn linguist_generated_paths(
             "-z",
             "--stdin",
             "linguist-generated",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    {
-        let mut stdin = child.stdin.take()?;
-        let mut input = Vec::new();
-        for path in paths {
-            input.extend_from_slice(path.as_bytes());
-            input.push(0);
-        }
-        stdin.write_all(&input).ok()?;
+        ]);
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
     }
-    let output = child.wait_with_output().ok()?;
+    let max_output_bytes = input.len().checked_add(paths.len().checked_mul(64)?)?;
+    let output = run_child_with_input(command, input, max_output_bytes).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -918,9 +910,149 @@ pub fn linguist_generated_paths(
     Some(found)
 }
 
+/// Own the child while stdin and stdout make progress concurrently. Writing
+/// first can deadlock when the child fills stdout before it has read all of
+/// stdin. Keep the Child available until `wait` succeeds so every error path
+/// can kill and reap it before joining workers.
+fn run_child_with_input(
+    mut command: std::process::Command,
+    input: Vec<u8>,
+    max_output_bytes: usize,
+) -> std::io::Result<std::process::Output> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+
+    let output_limit = max_output_bytes
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("check-attr output limit overflow"))?;
+    let mut child = ChildReaper::new(
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let Some(mut stdin) = child.child.stdin.take() else {
+        let error = std::io::Error::other("child stdin was not piped");
+        return Err(terminate_after_error(&mut child, error));
+    };
+    let Some(stdout) = child.child.stdout.take() else {
+        drop(stdin);
+        let error = std::io::Error::other("child stdout was not piped");
+        return Err(terminate_after_error(&mut child, error));
+    };
+    let writer = match std::thread::Builder::new()
+        .name("git check-attr stdin".into())
+        .spawn(move || stdin.write_all(&input))
+    {
+        Ok(writer) => writer,
+        Err(error) => {
+            drop(stdout);
+            return Err(terminate_after_error(&mut child, error));
+        }
+    };
+    let reader = match std::thread::Builder::new()
+        .name("git check-attr stdout".into())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            stdout
+                .take(output_limit as u64)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes)
+        }) {
+        Ok(reader) => reader,
+        Err(error) => {
+            let cleanup = child.terminate();
+            if cleanup.is_ok() {
+                let _ = writer.join();
+            }
+            return Err(add_cleanup_context(error, cleanup));
+        }
+    };
+
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            let cleanup = child.terminate();
+            if cleanup.is_ok() {
+                let _ = writer.join();
+                let _ = reader.join();
+            }
+            return Err(add_cleanup_context(error, cleanup));
+        }
+    };
+    let written = writer
+        .join()
+        .unwrap_or_else(|_| Err(std::io::Error::other("child stdin writer panicked")));
+    let stdout = reader
+        .join()
+        .unwrap_or_else(|_| Err(std::io::Error::other("child stdout reader panicked")))?;
+    if stdout.len() > max_output_bytes {
+        return Err(std::io::Error::other(
+            "git check-attr output exceeded the expected bound",
+        ));
+    }
+    written?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    })
+}
+
+struct ChildReaper {
+    child: std::process::Child,
+    reaped: bool,
+}
+
+impl ChildReaper {
+    fn new(child: std::process::Child) -> Self {
+        Self {
+            child,
+            reaped: false,
+        }
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait()?;
+        self.reaped = true;
+        Ok(status)
+    }
+
+    fn terminate(&mut self) -> std::io::Result<()> {
+        let _ = self.child.kill();
+        self.child.wait()?;
+        self.reaped = true;
+        Ok(())
+    }
+}
+
+impl Drop for ChildReaper {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.terminate();
+        }
+    }
+}
+
+fn terminate_after_error(child: &mut ChildReaper, error: std::io::Error) -> std::io::Error {
+    add_cleanup_context(error, child.terminate())
+}
+
+fn add_cleanup_context(error: std::io::Error, cleanup: std::io::Result<()>) -> std::io::Error {
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup) => std::io::Error::other(format!(
+            "{error}; could not reap check-attr child: {cleanup}"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LARGE_IO_CHILD: &str = "AETHYME_CHECK_ATTR_LARGE_IO_CHILD";
 
     fn file(path: &str, added: u64, deleted: u64) -> ChangedFile {
         ChangedFile {
@@ -1147,5 +1279,94 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn linguist_generated_paths_handles_large_input_and_output_with_a_watchdog() {
+        if std::env::var_os(LARGE_IO_CHILD).is_some() {
+            assert_large_check_attr_round_trip();
+            return;
+        }
+
+        // Run the real probe in an owned child so a regression to sequential
+        // pipe writes cannot wedge the whole test process. The bounded runner
+        // kills and reaps only this child; closing its input also lets Git
+        // observe EOF if the child expires during the probe.
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "change_classification::tests::linguist_generated_paths_handles_large_input_and_output_with_a_watchdog",
+            ])
+            .env(LARGE_IO_CHILD, "1");
+        let result = crate::bounded_output::output_limited(
+            &mut command,
+            std::time::Duration::from_secs(15),
+            64 * 1024,
+        )
+        .expect("run bounded large check-attr test child");
+        match result {
+            crate::bounded_output::LimitedOutput::Completed(output) => assert!(
+                output.status.success(),
+                "large check-attr test child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            crate::bounded_output::LimitedOutput::Deadline => {
+                panic!("large check-attr test child exceeded its 15-second watchdog")
+            }
+            crate::bounded_output::LimitedOutput::OutputLimit => {
+                panic!("large check-attr test child exceeded its output cap")
+            }
+        }
+    }
+
+    fn assert_large_check_attr_round_trip() {
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path();
+        let run_git = |args: &[&str]| {
+            let output = crate::git::git_command()
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "Aethyme test")
+                .env("GIT_AUTHOR_EMAIL", "aethyme-test@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Aethyme test")
+                .env("GIT_COMMITTER_EMAIL", "aethyme-test@example.invalid")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        run_git(&["init", "-q"]);
+        std::fs::write(root.join(".gitattributes"), "*.rs linguist-generated\n").unwrap();
+        run_git(&["add", ".gitattributes"]);
+        run_git(&["commit", "-qm", "fixture"]);
+        let base = String::from_utf8(run_git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+
+        // Both directions exceed common pipe capacities: stdin carries over
+        // 100 KiB of paths, and check-attr returns several hundred KiB.
+        let paths: Vec<String> = (0..4096)
+            .map(|index| format!("generated/file-{index:05}.rs"))
+            .collect();
+        let generated = linguist_generated_paths(root, &base, &paths)
+            .expect("base attributes should be readable");
+        assert_eq!(generated.len(), paths.len());
+        assert!(paths.iter().all(|path| generated.contains(path)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_attr_input_writer_errors_are_propagated_after_child_exit() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        let error = run_child_with_input(command, vec![b'x'; 1024 * 1024], 1024)
+            .expect_err("a child that exits without reading must fail the input write");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "{error}");
     }
 }
