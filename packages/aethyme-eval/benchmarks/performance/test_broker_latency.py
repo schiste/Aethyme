@@ -321,13 +321,16 @@ class PairedActionMatrixTests(unittest.TestCase):
             common = Path(temporary) / '.git'
             common.mkdir()
             common_stat = common.stat()
-            repository = f'local:{Path(temporary).as_posix()}'
+            repository = 'github.com/playground/latency'
+            repository_path = 'playground/latency'
             expected_args = ['fetch', *FETCH_FLAGS, '--', 'perf-local',
                              'refs/heads/perf-proven:refs/remotes/perf-local/perf-proven']
             expected = {
                 'session_id': 7,
                 'repository': repository,
-                'remote_path': Path(temporary).as_posix(),
+                'remote_host': 'github.com',
+                'remote_path': repository_path,
+                'caller_assertion': 'playground/latency',
                 'remote_name': 'perf-local',
                 'source_ref': 'refs/heads/perf-proven',
                 'destination_ref': 'refs/remotes/perf-local/perf-proven',
@@ -339,15 +342,15 @@ class PairedActionMatrixTests(unittest.TestCase):
             payload = {
                 'resolved_target': {
                     'remote_name': 'perf-local',
-                    'normalized_host': 'local',
-                    'repository_path': Path(temporary).as_posix(),
+                    'normalized_host': 'github.com',
+                    'repository_path': repository_path,
                     'coordination_key': repository,
-                    'caller_assertion': None,
+                    'caller_assertion': 'playground/latency',
                     'evidence': {
-                        'caller_assertion': 'not_supplied',
+                        'caller_assertion': 'matched_repository_path',
                         'identity': 'fetch_and_push_matched',
-                        'fetch': {'syntax': 'local_path'},
-                        'push': {'syntax': 'local_path'},
+                        'fetch': {'syntax': 'scp'},
+                        'push': {'syntax': 'scp'},
                     },
                 },
                 'operation': {
@@ -384,6 +387,29 @@ class PairedActionMatrixTests(unittest.TestCase):
             witness = _fetch_profile_witness(payload, expected)
             self.assertEqual(witness['schema_version'], 1)
             self.assertEqual(witness['provider_pid'], 2000)
+            wrong_repository_journal = json.loads(payload['operation']['details_json'])
+            wrong_repository_journal['fetch_reconciliation']['repository'] = (
+                'github.com/playground/other')
+
+            for keys, invalid_value in (
+                    (('resolved_target', 'normalized_host'), 'local'),
+                    (('resolved_target', 'repository_path'), 'playground/other'),
+                    (('resolved_target', 'coordination_key'), 'github.com/playground/other'),
+                    (('resolved_target', 'caller_assertion'), None),
+                    (('resolved_target', 'evidence', 'caller_assertion'), 'not_supplied'),
+                    (('resolved_target', 'evidence', 'fetch', 'syntax'), 'local_path'),
+                    (('resolved_target', 'evidence', 'push', 'syntax'), 'local_path'),
+                    (('operation', 'repository'), 'playground/latency'),
+                    (('operation', 'details_json'), json.dumps(wrong_repository_journal))):
+                invalid_identity = copy.deepcopy(payload)
+                target = invalid_identity
+                for key in keys[:-1]:
+                    target = target[key]
+                target[keys[-1]] = invalid_value
+                with self.subTest(keys=keys), self.assertRaisesRegex(
+                        RuntimeError, 'expected SSH-shaped repository identity|operation identity|'
+                                      'exact completed profile'):
+                    _fetch_profile_witness(invalid_identity, expected)
 
             valid_completion = copy.deepcopy(payload)
             payload['operation']['details_json'] = '{}'
@@ -404,30 +430,43 @@ class PairedActionMatrixTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'candidate omitted durable'):
             _missing_fetch_witness_semantic('candidate', 11, 12.5)
 
-    def test_baseline_fetch_downgrade_requires_exact_complete_refusal_receipt(self):
+    def test_baseline_fetch_downgrade_decodes_only_exact_typed_refusal_receipt(self):
         expected_argv = ['/fixture/aethyme', 'broker', 'advanced', 'git', '--session',
-                         '7', '--effect', 'write', '--scope', 'fetch', '--reason',
+                         '7', '--repo', 'playground/latency', '--effect', 'write',
+                         '--scope', 'fetch', '--reason',
                          'synthetic paired action measurement', '--json', '--', 'fetch',
                          *FETCH_FLAGS, '--', 'perf-local',
                          'refs/heads/perf-proven:refs/remotes/perf-local/perf-proven']
         message = (
-            'Error: unsupported fetch option "--no-auto-maintenance" prevents '
+            'unsupported fetch option "--no-auto-maintenance" prevents '
             'deterministic remote resolution')
-        receipt = {
-            'label': 'action:fetch_provable',
-            'argv': expected_argv,
-            'exit_code': 2,
-            'failure': 'command exited with status 2',
-            'stdout_complete': False,
-            'stdout_utf8_valid': True,
-            'stdout': message,
-            'stderr': '',
-            'stdout_bytes': len(message.encode()),
-            'stderr_bytes': 0,
-            'stdout_sha256': 'a' * 64,
-            'stderr_sha256': 'b' * 64,
-            'duration_ms': 12.5,
-        }
+
+        def receipt_for(stdout, argv=expected_argv, exit_code=1):
+            raw = stdout.encode('utf-8')
+            return {
+                'label': 'action:fetch_provable',
+                'argv': argv,
+                'exit_code': exit_code,
+                'failure': f'command exited with status {exit_code}',
+                'stdout_complete': False,
+                'stdout_utf8_valid': True,
+                'stdout': stdout,
+                'stderr': '',
+                'stdout_bytes': len(raw),
+                'stderr_bytes': 0,
+                'stdout_sha256': hashlib.sha256(raw).hexdigest(),
+                'stderr_sha256': hashlib.sha256(b'').hexdigest(),
+                'duration_ms': 12.5,
+            }
+
+        def broker_error(error_message, code=3, schema='aethyme.broker-error/v1', **extra):
+            return json.dumps({
+                'error': {'code': code, 'message': error_message},
+                'schema': schema,
+                **extra,
+            })
+
+        receipt = receipt_for(broker_error(message))
         self.assertEqual(
             _baseline_unsupported_fetch_option('baseline', receipt, expected_argv),
             '--no-auto-maintenance')
@@ -436,14 +475,35 @@ class PairedActionMatrixTests(unittest.TestCase):
 
         for changed in (
                 {'failure': 'command exceeded 60 seconds'},
-                {'failure': 'command exited with status 2', 'exit_code': 0},
-                {'stdout': 'Error: fetch network connection failed'},
+                {'failure': 'command exited with status 1', 'exit_code': 0},
+                {'failure': 'command exited with status 2', 'exit_code': 2},
                 {'argv': expected_argv[:-1]},
                 {'stdout_complete': True},
                 {'stderr_sha256': None}):
             with self.subTest(changed=changed):
                 self.assertIsNone(_baseline_unsupported_fetch_option(
                     'baseline', {**receipt, **changed}, expected_argv))
+
+        invalid_receipts = (
+            receipt_for(broker_error('fetch network connection failed')),
+            receipt_for(broker_error(message + '; unrelated trailing detail')),
+            receipt_for(broker_error(message, code=2)),
+            receipt_for(broker_error(message, schema='other-error/v1')),
+            receipt_for(broker_error(
+                'invalid coordinated operation: remote Git operation requires --repo owner/name',
+                code=3)),
+            receipt_for(broker_error(message, operation={'id': 12})),
+            receipt_for('Error: unsupported fetch option "--no-auto-maintenance" prevents '
+                        'deterministic remote resolution'),
+            receipt_for('{"schema":"aethyme.broker-error/v1","error":{"code":3,"message":'
+                        '"unsupported fetch option \\"--no-auto-maintenance\\" prevents '
+                        'deterministic remote resolution"'),
+            receipt_for(broker_error(message), argv=expected_argv[:-2]),
+        )
+        for invalid in invalid_receipts:
+            with self.subTest(stdout=invalid['stdout']):
+                self.assertIsNone(_baseline_unsupported_fetch_option(
+                    'baseline', invalid, expected_argv))
 
     def test_v41_live_receipt_is_context_only_and_pins_both_executables(self):
         cli_hash = 'a' * 64
