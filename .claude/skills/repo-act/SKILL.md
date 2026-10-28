@@ -529,6 +529,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   `cleanup_error`, preserve the archive path, and verify the exact checkout is
   absent before counting a removal. A stale-plan refusal requires fresh review,
   never a forced retry.
+- For recovery-plan adapters, derive comparison rules from the pinned producer's
+  authorization contract. Require the digest, preserved content, repository and
+  checkout identity, policy, and reviewed archive destination to remain exact.
+  Allow only explicitly documented mutable evidence fields to advance; keep
+  complete original and fresh snapshots. Exercise evidence advancement and
+  refusal of changed protected fields in both preflight and outcome checks.
 - When recording cleanup results, validate the pinned progress record and exact
   removed set before updating progress. Hold the progress lock through an atomic
   replacement, directory sync, and readback; publish the verification proof only
