@@ -3481,84 +3481,150 @@ impl GitRepo {
     /// [`Self::config_at_commit`] for policy reads. A missing tree entry is
     /// distinct from a Git read failure, so callers cannot silently fall back
     /// to working-copy policy when the committed tree could not be inspected.
-    pub(crate) fn config_at_commit_checked(
+    /// Read configuration from a commit OID that was already resolved and
+    /// verified by the caller. All format twins are checked in one tree
+    /// inspection so a strict policy read does not launch one Git process per
+    /// extension.
+    pub(crate) fn config_at_resolved_commit_checked(
         &self,
         commit: &str,
         stem: &str,
     ) -> Result<Option<aethyme_config::ConfigText>, GitError> {
-        let exact_commit = self.resolve_commit_checked(commit)?;
+        let candidate_paths = aethyme_config::candidate_relpaths(stem);
+        let mut loaded: Option<BTreeMap<String, String>> = None;
         aethyme_config::read_config_text_with(aethyme_config::CONFIG_DIR, stem, |relpath| {
-            self.file_at_commit_checked(&exact_commit, relpath)
+            if loaded.is_none() {
+                let objects =
+                    self.config_tree_entries_at_commit_checked(commit, &candidate_paths)?;
+                let present_paths = candidate_paths
+                    .iter()
+                    .filter(|path| objects.contains_key(*path))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if present_paths.len() > 1 {
+                    return Err(aethyme_config::ConfigSourceError::Ambiguous {
+                        stem: stem.to_string(),
+                        paths: present_paths.into_iter().map(PathBuf::from).collect(),
+                    }
+                    .into());
+                }
+                let files = if let Some(path) = present_paths.first() {
+                    let object = objects.get(path).ok_or_else(|| GitError::UntrustedOutput {
+                        detail: format!(
+                            "git ls-tree omitted the selected configuration path {path:?}"
+                        ),
+                    })?;
+                    BTreeMap::from([(path.clone(), self.config_blob_checked(object, path)?)])
+                } else {
+                    BTreeMap::new()
+                };
+                loaded = Some(files);
+            }
+            Ok(loaded
+                .as_ref()
+                .and_then(|files| files.get(relpath))
+                .cloned())
         })
     }
 
-    fn file_at_commit_checked(&self, commit: &str, path: &str) -> Result<Option<String>, GitError> {
-        let path_value = Path::new(path);
-        if path_value.is_absolute()
-            || path_value.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::ParentDir | std::path::Component::Prefix(_)
-                )
-            })
-            || path.contains(':')
-        {
-            return Err(GitError::Git {
-                args: "ls-tree <commit> -- <path>".into(),
-                stderr: "file path must be repository-relative and cannot contain ':'".into(),
-            });
+    fn config_tree_entries_at_commit_checked(
+        &self,
+        commit: &str,
+        paths: &[String],
+    ) -> Result<BTreeMap<String, String>, GitError> {
+        let mut owned_args = vec![
+            "ls-tree".to_string(),
+            "-z".to_string(),
+            "--full-tree".to_string(),
+            commit.to_string(),
+            "--".to_string(),
+        ];
+        for path in paths {
+            let path_value = Path::new(path);
+            if path_value.is_absolute()
+                || path_value.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                    )
+                })
+                || path.contains(':')
+                || path.contains('\\')
+            {
+                return Err(GitError::Git {
+                    args: "ls-tree <commit> -- <path>".into(),
+                    stderr:
+                        "file path must be repository-relative and cannot contain pathspec magic"
+                            .into(),
+                });
+            }
+            // Config stems may contain portable glob characters such as
+            // brackets. Keep each candidate literal so the tree query cannot
+            // match a neighboring path by Git pathspec rules.
+            owned_args.push(format!(":(literal){path}"));
         }
-
-        let args = ["ls-tree", "-z", "--full-tree", commit, "--", path];
+        let args = owned_args.iter().map(String::as_str).collect::<Vec<_>>();
         let output = self.run_git_output_limited(&args, 64 * 1024)?;
-        if output.stdout.is_empty() {
-            return Ok(None);
-        }
-        if output.stdout.last() != Some(&0) {
+        if !output.stdout.is_empty() && output.stdout.last() != Some(&0) {
             return Err(GitError::UntrustedOutput {
                 detail: format!("git {} returned an unterminated tree entry", args.join(" ")),
             });
         }
-        let mut records = output.stdout.split(|byte| *byte == 0);
-        let Some(record) = records.next().filter(|record| !record.is_empty()) else {
-            return Err(GitError::UntrustedOutput {
-                detail: format!("git {} returned an empty tree entry", args.join(" ")),
-            });
-        };
-        if records.any(|record| !record.is_empty()) {
-            return Err(GitError::UntrustedOutput {
-                detail: format!("git {} returned multiple matching paths", args.join(" ")),
-            });
+
+        let mut objects = BTreeMap::new();
+        for record in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+        {
+            let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+                return Err(GitError::UntrustedOutput {
+                    detail: format!("git {} returned a malformed tree entry", args.join(" ")),
+                });
+            };
+            let metadata = &record[..tab];
+            let recorded_path = &record[tab + 1..];
+            let fields = metadata.split(|byte| *byte == b' ').collect::<Vec<_>>();
+            if fields.len() != 3 {
+                return Err(GitError::UntrustedOutput {
+                    detail: format!("git {} returned an unexpected tree entry", args.join(" ")),
+                });
+            }
+            let Some(path) = paths.iter().find(|path| path.as_bytes() == recorded_path) else {
+                return Err(GitError::UntrustedOutput {
+                    detail: format!(
+                        "git {} returned an unexpected configuration path",
+                        args.join(" ")
+                    ),
+                });
+            };
+            let regular_mode = fields[0] == b"100644" || fields[0] == b"100755";
+            if !regular_mode || fields[1] != b"blob" {
+                return Err(GitError::UntrustedOutput {
+                    detail: format!("committed configuration path {path:?} is not a regular file"),
+                });
+            }
+            let object = std::str::from_utf8(fields[2]).map_err(|_| GitError::UntrustedOutput {
+                detail: "git ls-tree returned a non-UTF-8 object id".into(),
+            })?;
+            if objects.insert(path.clone(), object.to_string()).is_some() {
+                return Err(GitError::UntrustedOutput {
+                    detail: format!(
+                        "git {} returned a duplicate configuration path",
+                        args.join(" ")
+                    ),
+                });
+            }
         }
-        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
-            return Err(GitError::UntrustedOutput {
-                detail: format!("git {} returned a malformed tree entry", args.join(" ")),
-            });
-        };
-        let metadata = &record[..tab];
-        let recorded_path = &record[tab + 1..];
-        let fields: Vec<&[u8]> = metadata.split(|byte| *byte == b' ').collect();
-        if fields.len() != 3 || recorded_path != path.as_bytes() {
-            return Err(GitError::UntrustedOutput {
-                detail: format!("git {} returned an unexpected tree entry", args.join(" ")),
-            });
-        }
-        let regular_mode = fields[0] == b"100644" || fields[0] == b"100755";
-        if !regular_mode || fields[1] != b"blob" {
-            return Err(GitError::UntrustedOutput {
-                detail: format!("committed configuration path {path:?} is not a regular file"),
-            });
-        }
-        let object = std::str::from_utf8(fields[2]).map_err(|_| GitError::UntrustedOutput {
-            detail: "git ls-tree returned a non-UTF-8 object id".into(),
-        })?;
+        Ok(objects)
+    }
+
+    fn config_blob_checked(&self, object: &str, path: &str) -> Result<String, GitError> {
         let args = ["cat-file", "blob", object];
         let output = self.run_git_output_limited(&args, 4 * 1024 * 1024)?;
-        String::from_utf8(output.stdout)
-            .map(Some)
-            .map_err(|_| GitError::UntrustedOutput {
-                detail: format!("committed configuration {path:?} is not UTF-8"),
-            })
+        String::from_utf8(output.stdout).map_err(|_| GitError::UntrustedOutput {
+            detail: format!("committed configuration {path:?} is not UTF-8"),
+        })
     }
 
     fn run_git_output_limited(

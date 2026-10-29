@@ -297,6 +297,13 @@ impl Broker {
     /// does not render them, and recording a delivery that never happened
     /// would corrupt the shown-to-action correlation.
     pub fn status_brief(&mut self, now_ms: i64) -> Result<StatusBrief, BrokerOpError> {
+        crate::status_reads::with_context(|| self.status_brief_with_read_context(now_ms))
+    }
+
+    fn status_brief_with_read_context(
+        &mut self,
+        now_ms: i64,
+    ) -> Result<StatusBrief, BrokerOpError> {
         let total_started = std::time::Instant::now();
         let agents_started = std::time::Instant::now();
         let agents = self.agents(now_ms)?;
@@ -316,6 +323,13 @@ impl Broker {
     }
 
     pub fn status_brief_snapshot(&self, now_ms: i64) -> Result<StatusBrief, BrokerOpError> {
+        crate::status_reads::with_context(|| self.status_brief_snapshot_with_read_context(now_ms))
+    }
+
+    fn status_brief_snapshot_with_read_context(
+        &self,
+        now_ms: i64,
+    ) -> Result<StatusBrief, BrokerOpError> {
         let total_started = std::time::Instant::now();
         let agents_started = std::time::Instant::now();
         let agents = self.agents_snapshot(now_ms)?;
@@ -375,9 +389,13 @@ impl Broker {
             phase_started.elapsed().as_millis() as u64,
         );
         let phase_started = std::time::Instant::now();
-        let (promote_config, promote_config_warning) =
-            PromoteConfig::load_with_warning(&self.main_root);
-        let fence = self.collaboration_fence_state(FenceTrigger::Open);
+        let (promote_config, promote_config_warning, fence) =
+            crate::status_reads::with_context(|| {
+                let (promote_config, promote_config_warning) =
+                    PromoteConfig::load_with_warning(&self.main_root);
+                let fence = self.collaboration_fence_state(FenceTrigger::Open);
+                (promote_config, promote_config_warning, fence)
+            });
         let promotes = promote_config.mode.promotes_at_all();
         let summary = status_summary(
             &agents,
@@ -514,6 +532,10 @@ impl Broker {
     /// filesystem observations, but never reconcile that state as a side
     /// effect. Used while repository deployment compatibility is degraded.
     pub fn status_snapshot(&self, now_ms: i64) -> Result<StatusView, BrokerOpError> {
+        crate::status_reads::with_context(|| self.status_snapshot_with_read_context(now_ms))
+    }
+
+    fn status_snapshot_with_read_context(&self, now_ms: i64) -> Result<StatusView, BrokerOpError> {
         let started = std::time::Instant::now();
         let deadline = crate::git::active_git_deadline()
             .unwrap_or_else(|| started + status_inspection_budget());
@@ -534,6 +556,13 @@ impl Broker {
 
     /// Routine, read-only variant for degraded CLI reporting.
     pub fn status_current_snapshot(&self, now_ms: i64) -> Result<StatusView, BrokerOpError> {
+        crate::status_reads::with_context(|| self.status_current_snapshot_with_read_context(now_ms))
+    }
+
+    fn status_current_snapshot_with_read_context(
+        &self,
+        now_ms: i64,
+    ) -> Result<StatusView, BrokerOpError> {
         let started = std::time::Instant::now();
         let deadline = crate::git::active_git_deadline()
             .unwrap_or_else(|| started + status_inspection_budget());
@@ -606,10 +635,14 @@ impl Broker {
         // the mode is read once and gates all of them.
         // The policy reader and compatibility fence both use committed
         // configuration and fail closed when that source cannot be resolved.
-        let (promote_config, promote_config_warning) =
-            PromoteConfig::load_with_warning(&self.main_root);
+        let (promote_config, promote_config_warning, collaboration_fence) =
+            crate::status_reads::with_context(|| {
+                let (promote_config, promote_config_warning) =
+                    PromoteConfig::load_with_warning(&self.main_root);
+                let collaboration_fence = self.collaboration_fence_state(FenceTrigger::Open);
+                (promote_config, promote_config_warning, collaboration_fence)
+            });
         let promotes = promote_config.mode.promotes_at_all();
-        let collaboration_fence = self.collaboration_fence_state(FenceTrigger::Open);
         // One deadline for every phase below whose cost grows with sessions
         // and history; each phase that runs out names what it skipped.
         let budget = status_inspection_budget();

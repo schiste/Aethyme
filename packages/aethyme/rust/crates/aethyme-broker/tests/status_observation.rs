@@ -200,6 +200,17 @@ fn summary_status_has_bounded_git_processes_and_no_checkout_scan() {
         starts.len() <= 12,
         "routine status repeated setup subprocesses: {starts:?}"
     );
+    let committed_config_tree_reads = starts
+        .iter()
+        .filter(|args| {
+            args.get(1).is_some_and(|arg| arg == "ls-tree")
+                && args.iter().any(|arg| arg.ends_with("config.toml"))
+        })
+        .count();
+    assert_eq!(
+        committed_config_tree_reads, 1,
+        "routine status performs one checked lookup for all committed config twins: {starts:?}"
+    );
     for args in &starts {
         assert!(
             !args

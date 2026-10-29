@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 struct Context {
     identities: BTreeMap<(PathBuf, Vec<String>), String>,
     configurations: BTreeMap<PathBuf, ConfigurationRead>,
+    committed_configurations: BTreeMap<PathBuf, CommittedConfigurationRead>,
 }
 thread_local! {
     static CONTEXT: RefCell<Option<Context>> = const { RefCell::new(None) };
@@ -76,6 +77,38 @@ pub(crate) fn git_identity(
 /// not be resolved (for example both `config.toml` and `config.yaml`).
 pub(crate) type ConfigurationRead =
     Result<Option<(String, &'static str)>, aethyme_config::ConfigSourceError>;
+
+pub(crate) type CommittedConfigurationRead =
+    Result<Option<String>, aethyme_config::ConfigSourceError>;
+
+/// The committed default-branch config observed during this invocation.
+///
+/// Absence and failures are cached too: every consumer in one command uses
+/// the same observation, while the next invocation resolves the ref again.
+pub(crate) fn committed_configuration(
+    root: &Path,
+    read: impl FnOnce() -> CommittedConfigurationRead,
+) -> CommittedConfigurationRead {
+    if let Some(value) = CONTEXT.with(|context| {
+        context
+            .borrow()
+            .as_ref()
+            .and_then(|context| context.committed_configurations.get(root).cloned())
+    }) {
+        return value;
+    }
+    let value = read();
+    CONTEXT.with(|context| {
+        if let Some(context) = context.borrow_mut().as_mut()
+            && context.committed_configurations.len() < 64
+        {
+            context
+                .committed_configurations
+                .insert(root.to_path_buf(), value.clone());
+        }
+    });
+    value
+}
 
 pub(crate) fn configuration(
     root: &Path,
