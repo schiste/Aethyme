@@ -475,12 +475,11 @@ fn enroll_graph(repo: &Path, repository: &str) -> Result<(), String> {
     use toml_edit::{DocumentMut, Item, Table, value};
 
     use aethyme_broker::config_source;
-    let config_path = config_source::config_path_or_default(
-        &repo.join(config_source::CONFIG_DIR),
-        "config",
-    )
-    .map_err(|error| error.to_string())?;
-    if config_source::ConfigFormat::from_path(&config_path) == Some(config_source::ConfigFormat::Yaml)
+    let config_path =
+        config_source::config_path_or_default(&repo.join(config_source::CONFIG_DIR), "config")
+            .map_err(|error| error.to_string())?;
+    if config_source::ConfigFormat::from_path(&config_path)
+        == Some(config_source::ConfigFormat::Yaml)
     {
         // Comment-preserving YAML edits are not reliable, so YAML is never
         // rewritten (#1223): print the exact patch and refuse.

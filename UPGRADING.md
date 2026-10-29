@@ -33,6 +33,8 @@ Compact retirement introduces recovery archive schema 5. Its receipt binds the p
 
 `[retention] compact_closed_worktrees` is default-off. When enabled, it permits background compaction of a closed, witnessed broker-created checkout during its normal grace period. It preserves verified recovery for at least the larger of fifteen days and the configured closed-checkout grace, measured from archive creation. Full-checkout removal due time and compact retry scheduling remain separate. Explicit keep, live owners, pins, incomplete inspections and unknown ownership remain protected. Manual legacy/adopted retirement requires exact reviewed targets; adopted retirement also requires `--allow-adopted` and keeps branches.
 
+Supported configuration stems accept one of TOML, YAML or YML. Keep only one format for a stem; ambiguous twins and invalid policy documents are errors, not permission to use defaults. Environment profiles continue to use `.aethyme/environments.toml` and the documented host TOML profile. The new environment state is separate from the repository broker database.
+
 ### Migrate and verify
 
 Preserve repository configuration and take a consistent broker database backup before opening the new runtime. Install the matching signed router/engine pair, confirm both version/build identities, and inspect maintenance diagnostics. Leave the existing cleanup and retention settings in place until the paired runtime is verified.

@@ -13,6 +13,9 @@ artifacts and their exact source revision are recorded in each signed
 - Exact-ID recovery batches preserve verified archives before retiring closed checkouts, continue independent targets, and report the exact remaining IDs. Replanning the original set safely skips completed targets; adopted retirement requires explicit opt-in and preserves branches.
 - Default-off background compact recovery keeps the minimum recovery interval without retaining a full prepared checkout throughout that interval. Archives preserve the registered and actual checkout branch identities and all required commit roots.
 - Transactional post-close cleanup requests keep compact retries separate from the normal full-checkout grace and survive a missed process wake.
+- YAML configuration is accepted alongside TOML for supported policy files, with one selected format per file stem and explicit validation errors. Environment profiles remain TOML-only.
+- Declarative environment profiles add validation, planning, supervised component state and process/container drivers. Container-engine conformance requires an explicitly enabled engine.
+- Supervised resource runs report phase timings, including finalization after preparation, spawn or child-observation failures.
 
 ### Fixed
 
@@ -20,6 +23,8 @@ artifacts and their exact source revision are recorded in each signed
 - Cleanup eligibility and final ownership checks preserve protected lifecycle states and report retained targets without blocking unrelated progress.
 - Recovery GC respects each archive's recorded minimum age and every preserved root, including after configuration changes or partial delivery.
 - Interrupted recovery reuses verified archives and bounds incomplete staging to one deterministic per-session location.
+- Lease release-request resolution uses durable event order, preserving an acknowledged result when sibling leases expire.
+- The recorded composition diff-engine version matches the locked dependency.
 
 ## [0.8.46] - 2026-10-29
 

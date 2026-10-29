@@ -1159,7 +1159,7 @@ fn migrate_gates_text(text: &str) -> Result<String, String> {
 /// The gates file when it is written in YAML. Upgrade never rewrites YAML
 /// (#1223): comment-preserving YAML edits are not reliable.
 fn yaml_gates_path(repo: &Path) -> Option<std::path::PathBuf> {
-    use aethyme_broker::config_source::{ConfigFormat, CONFIG_DIR, resolve_config_path};
+    use aethyme_broker::config_source::{CONFIG_DIR, ConfigFormat, resolve_config_path};
     resolve_config_path(&repo.join(CONFIG_DIR), "gates")
         .ok()
         .flatten()
@@ -1188,7 +1188,11 @@ fn yaml_config_blockers(repo: &Path) -> Vec<String> {
         Ok(None) => return Vec::new(),
         Err(error) => return vec![error.to_string()],
     };
-    match document.value.get("schema").map(|schema| schema.as_integer()) {
+    match document
+        .value
+        .get("schema")
+        .map(|schema| schema.as_integer())
+    {
         Some(Some(GATES_SCHEMA_VERSION)) => Vec::new(),
         Some(_) => vec![format!(
             "{relative}: gates schema must be {GATES_SCHEMA_VERSION}"
