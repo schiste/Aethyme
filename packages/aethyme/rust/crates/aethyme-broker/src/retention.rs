@@ -21,6 +21,7 @@ const RETENTION_POLICY_FIELDS: &[&str] = &[
     "closed_worktrees_days",
     "closed_worktree_grace_hours",
     "auto_cleanup_worktrees_on_finish",
+    "compact_closed_worktrees",
     "publication_exposure_days",
     "retained_bytes_budget",
     "artifact_reclaim_days",
@@ -90,6 +91,11 @@ pub struct RetentionPolicy {
     /// a session. Set false to retain them for inspection or reuse; manual
     /// cleanup remains available, and unsafe or unproven work is never removed.
     pub auto_cleanup_worktrees_on_finish: bool,
+    /// When enabled, the automatic cleaner may replace a full, safely owned
+    /// closed checkout with a verified compact recovery archive before the
+    /// ordinary checkout grace expires. The archive carries its own immutable
+    /// minimum retention floor; this is off by default.
+    pub compact_closed_worktrees: bool,
     /// Idle days before a closed session's build caches are reclaimed without
     /// confirmation. This does not affect committed work or the worktree
     /// itself; a maintainer may raise it to trade disk space for faster reuse.
@@ -161,6 +167,7 @@ impl Default for RetentionPolicy {
             closed_worktrees_days: 7,
             closed_worktree_grace_hours: 15 * 24,
             auto_cleanup_worktrees_on_finish: true,
+            compact_closed_worktrees: false,
             publication_exposure_days: 30,
             retained_bytes_budget: 1_073_741_824,
             artifact_reclaim_days: 0,
@@ -188,6 +195,16 @@ impl RetentionPolicy {
     /// and unattended removal must honor that same window; explicit cleanup
     /// remains an operator decision. Missing close times use the row update
     /// time, and future timestamps conservatively remain within the window.
+    /// Compact archives preserve recovery for at least 15 days and never
+    /// for less than the configured full-checkout grace. The duration is
+    /// copied into each archive so a later policy reduction cannot shorten
+    /// already-promised recovery.
+    pub(crate) fn compact_archive_minimum_retention_ms(&self) -> u64 {
+        const FIFTEEN_DAYS_MS: u64 = 15 * 24 * 60 * 60 * 1_000;
+        FIFTEEN_DAYS_MS
+            .max(u64::from(self.closed_worktree_grace_hours).saturating_mul(60 * 60 * 1_000))
+    }
+
     pub(crate) fn closed_worktree_in_grace(
         &self,
         session: &crate::Session,
@@ -1281,6 +1298,11 @@ mod tests {
         assert!(policy.terminal_merge_queue_days >= policy.gate_results_days);
         assert!(policy.startup_budget_ms <= 25);
         assert_eq!(policy.closed_worktree_grace_hours, 360);
+        assert!(!policy.compact_closed_worktrees);
+        assert_eq!(
+            policy.compact_archive_minimum_retention_ms(),
+            15 * 24 * 60 * 60 * 1_000
+        );
         assert_eq!(policy.artifact_reclaim_days, 0);
         assert_eq!(policy.artifact_sweep_budget_ms, 5_000);
         assert_eq!(policy.routine_size_budget_ms, 200);

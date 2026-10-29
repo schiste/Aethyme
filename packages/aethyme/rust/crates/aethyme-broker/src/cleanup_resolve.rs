@@ -41,6 +41,11 @@ const LEGACY_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 1;
 const PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 2;
 const PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 3;
 const RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 4;
+const RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 5;
+const RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION: u32 = 1;
+const RETIREMENT_ARCHIVE_RECORD_FILE: &str = "retirement.json";
+const MAX_RETIREMENT_ARCHIVE_RECORD_BYTES: u64 = 64 * 1024;
+const MIN_RECOVERY_ARCHIVE_RETENTION_MS: u64 = 15 * 24 * 60 * 60 * 1_000;
 const MAX_RECOVERY_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_RECOVERY_BUNDLE_STDERR_BYTES: usize = 64 * 1024;
 const MAX_RECOVERY_BUNDLE_METADATA_OUTPUT_BYTES: usize = 64 * 1024;
@@ -97,6 +102,12 @@ pub struct ArchivedFile {
 
 /// What a confirmed resolve would preserve, and the digest that authorizes it.
 #[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct CleanupResolveRetirementContext {
+    delivery_targets: Vec<String>,
+    live_checkouts: Vec<(i64, crate::auto_cleanup::ResolvedWorktreePath)>,
+    deadline: Option<Instant>,
+}
+
 pub struct CleanupResolvePlan {
     pub schema_version: u32,
     /// Binds repository, branch, checkout and preserved content. Delivery
@@ -104,11 +115,35 @@ pub struct CleanupResolvePlan {
     /// not part of the stable content confirmation. Replan on upgrade.
     pub digest: String,
     pub session_id: i64,
+    /// Current recorded origin of this exact cleanup target. Batch retirement
+    /// confirmations bind it alongside the path and per-item content digest.
+    pub target_origin: SessionOrigin,
+    /// Archive format selected by the reviewed operation. Retirement uses a
+    /// new schema so older binaries refuse it rather than ignore its retention
+    /// promise.
+    pub recovery_archive_schema_version: u32,
+    /// Immutable minimum age before GC may propose this archive, in ms.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum_archive_retention_ms: Option<u64>,
+    /// The exact explicit mode captured by a retirement plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retirement_allow_adopted: Option<bool>,
+    /// Present for automatic retirement and binds the persisted checkout-owner
+    /// witness into the durable archive receipt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retirement_witness_sha256: Option<String>,
     pub repository_path: String,
     pub worktree_path: String,
     pub branch_ref: String,
     /// The registered session branch tip captured with the worktree HEAD.
     pub branch_tip: Option<String>,
+    /// The symbolic branch currently checked out in the worktree. `None`
+    /// means HEAD is detached; when present, its captured tip equals `head`.
+    pub checkout_branch_ref: Option<String>,
+    pub checkout_branch_tip: Option<String>,
+    /// Root refs and the delivery snapshot's proof of whether each needs a
+    /// recovery bundle. Landed roots remain recorded without bloating bundles.
+    pub recovery_root_proofs: Vec<RecoveryRootProof>,
     pub disposition: CleanupDisposition,
     /// Why cleanup alone refuses this worktree.
     pub reason: String,
@@ -249,6 +284,51 @@ struct DigestInputV5<'a> {
     ignored_policy: &'a IgnoredPolicyProof<'a>,
 }
 
+/// A commit root that must survive checkout removal, and whether the reviewed
+/// delivery snapshot already makes that exact object recoverable.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryRootProof {
+    pub ref_name: String,
+    pub object_id: String,
+    pub available_from_delivery: bool,
+}
+
+/// Retirement confirmations wrap the existing content digest with the
+/// archive schema, immutable retention floor, origin, explicit opt-in and
+/// exact delivery-availability classification for every recovery root.
+#[derive(serde::Serialize)]
+struct RetirementDigestInputV1<'a> {
+    content_digest: &'a str,
+    recovery_archive_schema_version: u32,
+    minimum_archive_retention_ms: u64,
+    target_origin: &'a str,
+    allow_adopted: bool,
+    owner_witness_sha256: Option<&'a str>,
+    delivery_targets_sha256: &'a str,
+    recovery_root_proofs_sha256: &'a str,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetirementArchiveRecord {
+    schema_version: u32,
+    session_id: i64,
+    plan_digest: String,
+    target_origin: String,
+    allow_adopted: bool,
+    minimum_archive_retention_ms: u64,
+    owner_witness_sha256: Option<String>,
+    delivery_targets_sha256: String,
+    worktree_path: String,
+    branch_ref: String,
+    branch_tip: Option<String>,
+    checkout_branch_ref: Option<String>,
+    checkout_branch_tip: Option<String>,
+    recovery_root_proofs_sha256: String,
+    head: String,
+}
+
 #[derive(serde::Serialize)]
 struct IgnoredPolicyProof<'a> {
     strict: bool,
@@ -269,6 +349,10 @@ struct RecoveryManifest<'a> {
     schema_version: u32,
     plan_digest: &'a str,
     created_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    minimum_archive_retention_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retirement_record_sha256: Option<&'a str>,
     aethyme_version: &'static str,
     repository: String,
     session_id: i64,
@@ -276,6 +360,14 @@ struct RecoveryManifest<'a> {
     worktree_path: &'a str,
     branch_ref: &'a str,
     branch_tip: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkout_branch_ref: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkout_branch_tip: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_root_proofs_sha256: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery_targets_sha256: Option<&'a str>,
     disposition: &'a str,
     head: &'a str,
     /// Where `head` diverged from the primary checkout, when Git can say.
@@ -786,6 +878,78 @@ impl Broker {
         )
     }
 
+    /// Plan compact recovery followed by retirement of one closed session's
+    /// checkout, including one ordinary cleanup can already remove. Adopted
+    /// rows require the explicit opt-in again when applying this plan.
+    pub fn cleanup_resolve_retirement_plan(
+        &self,
+        session_id: i64,
+        allow_adopted: bool,
+    ) -> Result<CleanupResolvePlan, BrokerOpError> {
+        let context = self.cleanup_resolve_retirement_context()?;
+        self.cleanup_resolve_retirement_plan_with_context(session_id, allow_adopted, &context)
+    }
+
+    /// Capture shared immutable inputs once for an exact-target batch.
+    pub(crate) fn cleanup_resolve_retirement_context(
+        &self,
+    ) -> Result<CleanupResolveRetirementContext, BrokerOpError> {
+        self.cleanup_resolve_retirement_context_until(None)
+    }
+
+    pub(crate) fn cleanup_resolve_retirement_context_until(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<CleanupResolveRetirementContext, BrokerOpError> {
+        let _git_deadline = deadline.map(crate::git::limit_git_until);
+        let delivery_targets = self.cleanup_delivery_targets()?;
+        let live_checkouts = self.cleanup_live_checkout_snapshot(deadline)?;
+        Ok(CleanupResolveRetirementContext {
+            delivery_targets,
+            live_checkouts,
+            deadline,
+        })
+    }
+
+    pub(crate) fn cleanup_resolve_retirement_plan_with_context(
+        &self,
+        session_id: i64,
+        allow_adopted: bool,
+        context: &CleanupResolveRetirementContext,
+    ) -> Result<CleanupResolvePlan, BrokerOpError> {
+        self.cleanup_resolve_plan_with_limits_and_eligibility(
+            session_id,
+            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+            true,
+            allow_adopted,
+            true,
+            None,
+            Some(context),
+        )
+    }
+
+    pub(crate) fn cleanup_resolve_retirement_plan_with_witness(
+        &self,
+        session_id: i64,
+        witness_sha256: &str,
+    ) -> Result<CleanupResolvePlan, BrokerOpError> {
+        self.cleanup_resolve_plan_with_limits_and_eligibility(
+            session_id,
+            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+            true,
+            false,
+            true,
+            Some(witness_sha256),
+            None,
+        )
+    }
+
     fn cleanup_resolve_plan_with_limits(
         &self,
         session_id: i64,
@@ -801,6 +965,10 @@ impl Broker {
             inventory_output_bytes,
             inventory_path_fields,
             false,
+            false,
+            false,
+            None,
+            None,
         )
     }
 
@@ -818,6 +986,50 @@ impl Broker {
             crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
             crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
             true,
+            false,
+            false,
+            None,
+            None,
+        )
+    }
+
+    /// Rebuild a retirement plan under the lifecycle claim with the same
+    /// explicit adopted-origin and retention-mode inputs used at review.
+    pub(crate) fn cleanup_resolve_retirement_revalidation_plan(
+        &self,
+        session_id: i64,
+        allow_adopted: bool,
+    ) -> Result<CleanupResolvePlan, BrokerOpError> {
+        self.cleanup_resolve_plan_with_limits_and_eligibility(
+            session_id,
+            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+            true,
+            allow_adopted,
+            true,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn cleanup_resolve_retirement_revalidation_plan_with_witness(
+        &self,
+        session_id: i64,
+        witness_sha256: &str,
+    ) -> Result<CleanupResolvePlan, BrokerOpError> {
+        self.cleanup_resolve_plan_with_limits_and_eligibility(
+            session_id,
+            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+            true,
+            false,
+            true,
+            Some(witness_sha256),
+            None,
         )
     }
 
@@ -829,6 +1041,10 @@ impl Broker {
         inventory_output_bytes: usize,
         inventory_path_fields: usize,
         allow_eligible: bool,
+        allow_adopted: bool,
+        retirement_mode: bool,
+        retirement_witness_sha256: Option<&str>,
+        planning_context: Option<&CleanupResolveRetirementContext>,
     ) -> Result<CleanupResolvePlan, BrokerOpError> {
         let refuse = |reason: String| BrokerOpError::CleanupResolveRefused {
             id: session_id,
@@ -841,25 +1057,39 @@ impl Broker {
                 session.status.as_str()
             )));
         }
-        if session.origin != SessionOrigin::Spawned {
+        if session.origin != SessionOrigin::Spawned
+            && !(allow_adopted && session.origin == SessionOrigin::Adopted)
+        {
             return Err(refuse(
                 "only broker-spawned worktrees are archived and removed; an adopted checkout \
                  belongs to whoever adopted it"
                     .into(),
             ));
         }
-        // Pin one delivery-target snapshot before the recovery-specific
-        // eligibility pass. It is the evidence snapshot the archive records.
-        let delivery_targets = self.cleanup_delivery_targets()?;
+        // Pin one delivery-target and live-checkout snapshot before the
+        // recovery-specific eligibility pass. Batches share both read-only
+        // snapshots; standalone plans build them once here.
+        let owned_context;
+        let context = if let Some(context) = planning_context {
+            context
+        } else {
+            owned_context = self.cleanup_resolve_retirement_context()?;
+            &owned_context
+        };
+        let _git_deadline = context.deadline.map(crate::git::limit_git_until);
+        let delivery_targets = &context.delivery_targets;
         let mut records = crate::measurement::SizeRecords::default();
-        let Some(item) = self.cleanup_item_for_recovery_archive_with_status_limits(
-            &session,
-            crate::SizeScan::Recorded,
-            &mut records,
-            status_output_bytes,
-            status_path_fields,
-            &delivery_targets,
-        )?
+        let Some(item) = self
+            .cleanup_item_for_recovery_archive_with_status_limits_and_live_checkouts(
+                &session,
+                crate::SizeScan::Recorded,
+                &mut records,
+                status_output_bytes,
+                status_path_fields,
+                delivery_targets,
+                allow_adopted && session.origin == SessionOrigin::Adopted,
+                &context.live_checkouts,
+            )?
         else {
             return Err(refuse(
                 "nothing is retained: its worktree and branch are already gone".into(),
@@ -886,7 +1116,6 @@ impl Broker {
                     .into(),
             ));
         }
-        self.refuse_live_checkout(session_id, &worktree)?;
         let checkout = GitRepo::discover(&worktree)?;
         let tracked_submodules = checkout.tracked_submodule_paths()?;
         if !tracked_submodules.is_empty() {
@@ -901,12 +1130,48 @@ impl Broker {
         }
         let head = checkout.head_commit()?;
         let branch_tip = item.branch_tip.clone();
-        if branch_tip.as_deref().is_some_and(|tip| tip != head) {
+        let checkout_branch_ref = checkout.symbolic_ref("HEAD");
+        if checkout_branch_ref
+            .as_deref()
+            .is_some_and(|branch| !branch.starts_with("refs/heads/"))
+        {
+            return Err(refuse(
+                "the worktree HEAD is attached to a non-branch symbolic ref; preserving this checkout is required".into(),
+            ));
+        }
+        let checkout_branch_tip = checkout_branch_ref
+            .as_deref()
+            .map(|branch| {
+                checkout.resolve_ref(branch).ok_or_else(|| {
+                    refuse("the checked-out branch no longer resolves to a commit".into())
+                })
+            })
+            .transpose()?;
+        if checkout_branch_tip
+            .as_deref()
+            .is_some_and(|tip| tip != head)
+        {
+            return Err(refuse(
+                "the checked-out branch no longer points to the exact worktree HEAD".into(),
+            ));
+        }
+        let branch_tip_mismatch = branch_tip.as_deref().is_some_and(|tip| tip != head);
+        let checkout_branch_mismatch = checkout_branch_ref
+            .as_deref()
+            .is_some_and(|branch| branch != item.branch_ref);
+        if (branch_tip_mismatch || checkout_branch_mismatch) && !retirement_mode {
             return Err(refuse(format!(
-                "the session branch tip {} differs from the worktree HEAD {}; refusing to archive only one of the two commits",
-                branch_tip.as_deref().unwrap_or_default(),
+                "the registered session branch ({}, {}) differs from the current worktree branch/HEAD ({}, {}); refusing to archive only one identity",
+                item.branch_ref,
+                branch_tip.as_deref().unwrap_or("(missing)"),
+                checkout_branch_ref.as_deref().unwrap_or("(detached)"),
                 head
             )));
+        }
+        if checkout.resolve_ref(&item.branch_ref).as_deref() != branch_tip.as_deref() {
+            return Err(refuse(
+                "the registered session branch no longer resolves to its reviewed tip".into(),
+            ));
         }
         if item.disposition == CleanupDisposition::Eligible && !allow_eligible {
             return Err(refuse(format!(
@@ -915,7 +1180,21 @@ impl Broker {
                 item.reason
             )));
         }
-        let unlanded_commits = checkout.commits_not_on_any(&head, &delivery_targets)?;
+        let mut unlanded_commits = checkout.commits_not_on_any(&head, &delivery_targets)?;
+        if retirement_mode
+            && let Some(branch_tip) = branch_tip.as_deref()
+            && (branch_tip != head || checkout_branch_mismatch)
+        {
+            unlanded_commits.extend(checkout.commits_not_on_any(branch_tip, &delivery_targets)?);
+        }
+        if retirement_mode
+            && let Some(checkout_tip) = checkout_branch_tip.as_deref()
+            && checkout_branch_ref.as_deref() != Some(item.branch_ref.as_str())
+        {
+            unlanded_commits.extend(checkout.commits_not_on_any(checkout_tip, &delivery_targets)?);
+        }
+        unlanded_commits.sort();
+        unlanded_commits.dedup();
         let landing = RecoveryLandingAssessment::NotEvaluatedForRecovery {
             state: RecoveryLandingState::NotEvaluatedForRecovery,
         };
@@ -932,7 +1211,10 @@ impl Broker {
             (bytes, sha256_hex(&unstaged))
         };
 
-        let inventory_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let inventory_deadline = context.deadline.map_or_else(
+            || std::time::Instant::now() + std::time::Duration::from_secs(15),
+            |deadline| deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(15)),
+        );
         let untracked_paths = checkout
             .untracked_paths_until_with_limits(
                 inventory_deadline,
@@ -1014,20 +1296,99 @@ impl Broker {
         hasher.update(b"aethyme-cleanup-resolve-v5\0");
         hasher
             .update(serde_json::to_vec(&digest_input).map_err(|error| refuse(error.to_string()))?);
-        let digest = format!("{:x}", hasher.finalize());
+        let content_digest = format!("{:x}", hasher.finalize());
+        let recovery_root_proofs = if retirement_mode {
+            recovery_root_proofs_for_plan_parts(
+                &head,
+                &item.branch_ref,
+                branch_tip.as_deref(),
+                checkout_branch_ref.as_deref(),
+                checkout_branch_tip.as_deref(),
+                &unlanded_commits,
+            )?
+        } else {
+            Vec::new()
+        };
+        let recovery_root_proofs_sha256 = if retirement_mode {
+            Some(recovery_root_proofs_sha256(&recovery_root_proofs)?)
+        } else {
+            None
+        };
+        let delivery_targets_sha256 = if retirement_mode {
+            Some(delivery_targets_sha256(delivery_targets)?)
+        } else {
+            None
+        };
+        let minimum_archive_retention_ms = if retirement_mode {
+            let retention = crate::load_retention_policy(self.main_root())
+                .map_err(|error| refuse(format!("cannot read archive retention floor: {error}")))?;
+            Some(retention.compact_archive_minimum_retention_ms())
+        } else {
+            None
+        };
+        let recovery_archive_schema_version = if retirement_mode {
+            RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        } else {
+            RECOVERY_ARCHIVE_SCHEMA_VERSION
+        };
+        let digest = if retirement_mode {
+            let retirement_input = RetirementDigestInputV1 {
+                content_digest: &content_digest,
+                recovery_archive_schema_version,
+                minimum_archive_retention_ms: minimum_archive_retention_ms
+                    .expect("retirement plans have a minimum archive retention"),
+                target_origin: session.origin.as_str(),
+                allow_adopted,
+                owner_witness_sha256: retirement_witness_sha256,
+                delivery_targets_sha256: delivery_targets_sha256
+                    .as_deref()
+                    .expect("retirement plans bind delivery roots"),
+                recovery_root_proofs_sha256: recovery_root_proofs_sha256
+                    .as_deref()
+                    .expect("retirement plans have root proof identity"),
+            };
+            let mut hasher = Sha256::new();
+            hasher.update(b"aethyme-cleanup-retirement-v1\0");
+            hasher.update(
+                serde_json::to_vec(&retirement_input).map_err(|error| refuse(error.to_string()))?,
+            );
+            format!("{:x}", hasher.finalize())
+        } else {
+            content_digest
+        };
+        let apply_command = if retirement_mode {
+            let adopted_opt_in = if allow_adopted {
+                " --allow-adopted"
+            } else {
+                ""
+            };
+            format!(
+                "aethyme broker finish cleanup resolve {session_id} --archive --retire{adopted_opt_in} --confirm {digest}"
+            )
+        } else {
+            format!(
+                "aethyme broker finish cleanup resolve {session_id} --archive --confirm {digest}"
+            )
+        };
 
         Ok(CleanupResolvePlan {
             schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
-            apply_command: format!(
-                "aethyme broker finish cleanup resolve {session_id} --archive --confirm {digest}"
-            ),
+            apply_command,
             discard_command: item.force_cleanup_command.clone(),
             digest,
             session_id,
+            target_origin: session.origin,
+            recovery_archive_schema_version,
+            minimum_archive_retention_ms,
+            retirement_allow_adopted: retirement_mode.then_some(allow_adopted),
+            retirement_witness_sha256: retirement_witness_sha256.map(str::to_owned),
             repository_path,
             worktree_path: session.worktree_path.clone(),
             branch_ref: item.branch_ref,
             branch_tip,
+            checkout_branch_ref,
+            checkout_branch_tip,
+            recovery_root_proofs,
             disposition: item.disposition,
             reason: item.reason,
             head,
@@ -1056,6 +1417,97 @@ impl Broker {
         confirm: &str,
     ) -> Result<CleanupResolveOutcome, BrokerOpError> {
         self.cleanup_resolve_apply_with_post_archive_hook(session_id, confirm, || {})
+    }
+
+    /// Apply an explicitly reviewed compact-retirement plan. This uses archive
+    /// schema 5, which carries an immutable retention floor; older readers
+    /// refuse the archive instead of silently ignoring that promise.
+    pub fn cleanup_resolve_retirement_apply(
+        &mut self,
+        session_id: i64,
+        confirm: &str,
+        allow_adopted: bool,
+    ) -> Result<CleanupResolveOutcome, BrokerOpError> {
+        self.cleanup_resolve_apply_with_bundle_writer_mode(
+            session_id,
+            confirm,
+            || {},
+            sync_archive_directory,
+            |main_root, archive_root| {
+                crate::disk_headroom::available_headroom_at_or_above_for(main_root, archive_root)
+            },
+            true,
+            allow_adopted,
+            None,
+            None,
+            RecoveryBundleWriter {
+                max_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+                write_to: write_recovery_bundle_to_file,
+            },
+        )
+    }
+
+    /// Compact a complete, safely owned closed checkout under the opt-in
+    /// automatic policy. The cohort is checked before writing and again under
+    /// the final lifecycle claim; the persisted owner witness is part of the
+    /// deterministic retirement digest.
+    pub(crate) fn compact_closed_checkout(
+        &mut self,
+        expected_cohort: &crate::auto_cleanup::ClosedArtifactCheckoutCohort,
+        deadline: Instant,
+    ) -> Result<Option<CleanupResolveOutcome>, BrokerOpError> {
+        let policy = crate::load_retention_policy(self.main_root())?;
+        if !policy.compact_closed_worktrees || Instant::now() >= deadline {
+            return Ok(None);
+        }
+        let session_id = expected_cohort.owner_session_id();
+        let worktree = expected_cohort.worktree();
+        if deadline.saturating_duration_since(Instant::now())
+            < crate::auto_cleanup::AUTO_COMPACTION_MIN_BUDGET
+        {
+            return Ok(None);
+        }
+        let current =
+            self.closed_artifact_checkout_cohort_for_session(session_id, worktree, Some(deadline))?;
+        if current.as_ref() != Some(expected_cohort) {
+            return Ok(None);
+        }
+        let Some(witness) = expected_cohort.owner_witness() else {
+            return Ok(None);
+        };
+        let witness_bytes =
+            serde_json::to_vec(witness).map_err(|error| BrokerOpError::CleanupResolveRefused {
+                id: session_id,
+                reason: format!("cannot encode checkout owner witness: {error}"),
+            })?;
+        let witness_sha256 = sha256_hex(&witness_bytes);
+        let _git_deadline = crate::git::limit_git_until(deadline);
+        let plan =
+            self.cleanup_resolve_retirement_plan_with_witness(session_id, &witness_sha256)?;
+        if plan.target_origin != SessionOrigin::Spawned
+            || Path::new(&plan.worktree_path) != worktree
+            || plan.retirement_witness_sha256.as_deref() != Some(witness_sha256.as_str())
+        {
+            return Ok(None);
+        }
+        let outcome = self.cleanup_resolve_apply_with_bundle_writer_mode(
+            session_id,
+            &plan.digest,
+            || {},
+            sync_archive_directory,
+            |main_root, archive_root| {
+                crate::disk_headroom::available_headroom_at_or_above_for(main_root, archive_root)
+            },
+            true,
+            false,
+            Some(&witness_sha256),
+            Some(expected_cohort),
+            RecoveryBundleWriter {
+                max_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+                write_to: write_recovery_bundle_to_file,
+            },
+        )?;
+        Ok(Some(outcome))
     }
 
     fn cleanup_resolve_apply_with_post_archive_hook<F>(
@@ -1117,12 +1569,85 @@ impl Broker {
         F: FnOnce(),
         S: Fn(&Path) -> std::io::Result<()>,
         H: FnOnce(&Path, &Path) -> Option<crate::disk_headroom::DiskHeadroom>,
-        B: Fn(&GitRepo, &[String], u64, Instant, &mut std::fs::File) -> Result<u64, String>,
+        B: Fn(
+            &GitRepo,
+            &[String],
+            &[String],
+            u64,
+            Instant,
+            &mut std::fs::File,
+        ) -> Result<u64, String>,
     {
+        self.cleanup_resolve_apply_with_bundle_writer_mode(
+            session_id,
+            confirm,
+            after_archive_verified,
+            sync_directory,
+            headroom_for,
+            false,
+            false,
+            None,
+            None,
+            bundle,
+        )
+    }
+
+    fn cleanup_resolve_apply_with_bundle_writer_mode<F, S, H, B>(
+        &mut self,
+        session_id: i64,
+        confirm: &str,
+        after_archive_verified: F,
+        sync_directory: S,
+        headroom_for: H,
+        retirement_mode: bool,
+        allow_adopted: bool,
+        retirement_witness_sha256: Option<&str>,
+        expected_cohort: Option<&crate::auto_cleanup::ClosedArtifactCheckoutCohort>,
+        bundle: RecoveryBundleWriter<B>,
+    ) -> Result<CleanupResolveOutcome, BrokerOpError>
+    where
+        F: FnOnce(),
+        S: Fn(&Path) -> std::io::Result<()>,
+        H: FnOnce(&Path, &Path) -> Option<crate::disk_headroom::DiskHeadroom>,
+        B: Fn(
+            &GitRepo,
+            &[String],
+            &[String],
+            u64,
+            Instant,
+            &mut std::fs::File,
+        ) -> Result<u64, String>,
+    {
+        let _retirement_lock = if retirement_mode {
+            Some(
+                crate::file_lock::try_acquire_retirement_archive_lock(self.main_root(), session_id)
+                    .map_err(|error| BrokerOpError::CleanupResolveRefused {
+                        id: session_id,
+                        reason: format!("cannot acquire the per-session retirement archive lock: {error}"),
+                    })?
+                    .ok_or_else(|| BrokerOpError::CleanupResolveRefused {
+                        id: session_id,
+                        reason: "another process is handling this session's retirement archive; retry after it finishes".into(),
+                    })?,
+            )
+        } else {
+            None
+        };
         if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BrokerOpError::CleanupResolveConfirmationNotSha256);
         }
-        let plan = self.cleanup_resolve_revalidation_plan(session_id)?;
+        let plan = if retirement_mode {
+            if let Some(witness_sha256) = retirement_witness_sha256 {
+                self.cleanup_resolve_retirement_revalidation_plan_with_witness(
+                    session_id,
+                    witness_sha256,
+                )?
+            } else {
+                self.cleanup_resolve_retirement_revalidation_plan(session_id, allow_adopted)?
+            }
+        } else {
+            self.cleanup_resolve_revalidation_plan(session_id)?
+        };
         if plan.digest != confirm {
             return Err(BrokerOpError::CleanupResolveConfirmationMismatch {
                 id: session_id,
@@ -1137,65 +1662,214 @@ impl Broker {
                 reason,
             }
         })?;
-        let known_payload_bytes =
-            known_recovery_archive_payload_bytes(&plan).map_err(|reason| {
-                BrokerOpError::CleanupResolveRefused {
-                    id: session_id,
-                    reason: format!("archive capacity preflight failed: {reason}"),
-                }
-            })?;
-        let destination_headroom =
-            headroom_for(self.main_root(), &archive_root).map(|headroom| headroom.bytes);
-        require_recovery_archive_headroom(destination_headroom, known_payload_bytes).map_err(
-            |reason| BrokerOpError::CleanupResolveRefused {
-                id: session_id,
-                reason: format!("archive capacity preflight failed: {reason}"),
-            },
-        )?;
-        let name = format!(
-            "{session_id}-{}-{}",
-            &plan.head[..12],
-            archive_staging_nonce()
-        );
-        let partial_name = format!("{name}.partial");
+        let name = if retirement_mode {
+            format!("{session_id}-{}-{}", &plan.head[..12], plan.digest)
+        } else {
+            format!(
+                "{session_id}-{}-{}",
+                &plan.head[..12],
+                archive_staging_nonce()
+            )
+        };
+        let partial_name = if retirement_mode {
+            format!("{session_id}.retirement.partial")
+        } else {
+            format!("{name}.partial")
+        };
         let partial_path = archive_root.join(&partial_name);
-        let partial =
-            create_exclusive_archive_directory(&archive_root, &partial_name).map_err(|reason| {
-                BrokerOpError::RecoveryArchiveUnverified {
-                    id: session_id,
-                    path: partial_path.to_string_lossy().into_owned(),
-                    reason,
-                }
-            })?;
         let archive = archive_root.join(&name);
         let checkout = GitRepo::discover(Path::new(&plan.worktree_path))?;
-        if let Err(reason) = write_verified_archive_with_bundle_writer(
-            self.repo_handle(),
-            &checkout,
-            &plan,
-            session.task.as_deref(),
-            &partial,
-            &bundle,
-            &sync_directory,
-        ) {
-            return Err(BrokerOpError::RecoveryArchiveUnverified {
-                id: session_id,
-                path: partial.to_string_lossy().into_owned(),
-                reason,
-            });
-        }
+        let mut archive_reused = false;
         match std::fs::symlink_metadata(&archive) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(metadata)
+                if retirement_mode && metadata.is_dir() && !metadata.file_type().is_symlink() =>
+            {
+                verify_recovery_archive_for_plan(self.repo_handle(), &archive, &plan).map_err(
+                    |reason| BrokerOpError::RecoveryArchiveUnverified {
+                        id: session_id,
+                        path: archive.to_string_lossy().into_owned(),
+                        reason: format!(
+                            "existing retirement receipt failed verification: {reason}"
+                        ),
+                    },
+                )?;
+                archive_reused = true;
+            }
             Ok(_) => {
                 return Err(BrokerOpError::RecoveryArchiveUnverified {
                     id: session_id,
                     path: archive.to_string_lossy().into_owned(),
-                    reason: "archive destination already exists".into(),
+                    reason: "archive destination already exists and cannot be reused".into(),
                 });
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(io_error(&archive, error)),
         }
-        std::fs::rename(&partial, &archive).map_err(|error| io_error(&archive, error))?;
+
+        if !archive_reused {
+            match std::fs::symlink_metadata(&partial_path) {
+                Ok(metadata)
+                    if retirement_mode
+                        && metadata.is_dir()
+                        && !metadata.file_type().is_symlink() =>
+                {
+                    match verify_recovery_archive_payload_for_plan(
+                        self.repo_handle(),
+                        &partial_path,
+                        &plan,
+                    ) {
+                        Ok(()) => {
+                            sync_archive_directories_bottom_up(&partial_path, &sync_directory)
+                                .map_err(|reason| BrokerOpError::RecoveryArchiveUnverified {
+                                    id: session_id,
+                                    path: partial_path.to_string_lossy().into_owned(),
+                                    reason,
+                                })?;
+                            std::fs::rename(&partial_path, &archive)
+                                .map_err(|error| io_error(&archive, error))?;
+                        }
+                        Err(verification_error) => {
+                            verify_retirement_archive_record_for_plan(&partial_path, &plan)
+                                .map_err(|marker_error| BrokerOpError::RecoveryArchiveUnverified {
+                                    id: session_id,
+                                    path: partial_path.to_string_lossy().into_owned(),
+                                    reason: format!(
+                                        "incomplete retirement staging is not proven to belong to the current plan; it was retained: {verification_error}; {marker_error}"
+                                    ),
+                                })?;
+                            let current_plan =
+                                if let Some(witness_sha256) = retirement_witness_sha256 {
+                                    self.cleanup_resolve_retirement_revalidation_plan_with_witness(
+                                        session_id,
+                                        witness_sha256,
+                                    )?
+                                } else {
+                                    self.cleanup_resolve_retirement_revalidation_plan(
+                                        session_id,
+                                        allow_adopted,
+                                    )?
+                                };
+                            if current_plan.digest != plan.digest {
+                                return Err(BrokerOpError::CleanupResolveConfirmationMismatch {
+                                    id: session_id,
+                                    actual: confirm.to_owned(),
+                                });
+                            }
+                            std::fs::remove_dir_all(&partial_path).map_err(|error| {
+                                BrokerOpError::RecoveryArchiveUnverified {
+                                    id: session_id,
+                                    path: partial_path.to_string_lossy().into_owned(),
+                                    reason: format!(
+                                        "could not safely restart the verified incomplete staging attempt: {error}"
+                                    ),
+                                }
+                            })?;
+                            let partial =
+                                create_exclusive_archive_directory(&archive_root, &partial_name)
+                                    .map_err(|reason| BrokerOpError::RecoveryArchiveUnverified {
+                                        id: session_id,
+                                        path: partial_path.to_string_lossy().into_owned(),
+                                        reason,
+                                    })?;
+                            if let Err(reason) = create_retirement_archive_record(&partial, &plan) {
+                                let cleanup_error = std::fs::remove_dir_all(&partial).err();
+                                let reason = match cleanup_error {
+                                    Some(error) => format!(
+                                        "{reason}; could not remove empty retirement staging directory: {error}"
+                                    ),
+                                    None => reason,
+                                };
+                                return Err(BrokerOpError::RecoveryArchiveUnverified {
+                                    id: session_id,
+                                    path: partial.to_string_lossy().into_owned(),
+                                    reason,
+                                });
+                            }
+                            if let Err(reason) = write_verified_archive_with_bundle_writer(
+                                self.repo_handle(),
+                                &checkout,
+                                &plan,
+                                session.task.as_deref(),
+                                &partial,
+                                &bundle,
+                                &sync_directory,
+                            ) {
+                                return Err(BrokerOpError::RecoveryArchiveUnverified {
+                                    id: session_id,
+                                    path: partial.to_string_lossy().into_owned(),
+                                    reason,
+                                });
+                            }
+                            std::fs::rename(&partial, &archive)
+                                .map_err(|error| io_error(&archive, error))?;
+                        }
+                    }
+                }
+                Ok(_) => {
+                    return Err(BrokerOpError::RecoveryArchiveUnverified {
+                        id: session_id,
+                        path: partial_path.to_string_lossy().into_owned(),
+                        reason: "retirement staging path exists but is not a real directory".into(),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let known_payload_bytes =
+                        known_recovery_archive_payload_bytes(&plan).map_err(|reason| {
+                            BrokerOpError::CleanupResolveRefused {
+                                id: session_id,
+                                reason: format!("archive capacity preflight failed: {reason}"),
+                            }
+                        })?;
+                    let destination_headroom = headroom_for(self.main_root(), &archive_root)
+                        .map(|headroom| headroom.bytes);
+                    require_recovery_archive_headroom(destination_headroom, known_payload_bytes)
+                        .map_err(|reason| BrokerOpError::CleanupResolveRefused {
+                            id: session_id,
+                            reason: format!("archive capacity preflight failed: {reason}"),
+                        })?;
+                    let partial = create_exclusive_archive_directory(&archive_root, &partial_name)
+                        .map_err(|reason| BrokerOpError::RecoveryArchiveUnverified {
+                            id: session_id,
+                            path: partial_path.to_string_lossy().into_owned(),
+                            reason,
+                        })?;
+                    if retirement_mode
+                        && let Err(reason) = create_retirement_archive_record(&partial, &plan)
+                    {
+                        let cleanup_error = std::fs::remove_dir_all(&partial).err();
+                        let reason = match cleanup_error {
+                            Some(error) => format!(
+                                "{reason}; could not remove empty retirement staging directory: {error}"
+                            ),
+                            None => reason,
+                        };
+                        return Err(BrokerOpError::RecoveryArchiveUnverified {
+                            id: session_id,
+                            path: partial.to_string_lossy().into_owned(),
+                            reason,
+                        });
+                    }
+                    if let Err(reason) = write_verified_archive_with_bundle_writer(
+                        self.repo_handle(),
+                        &checkout,
+                        &plan,
+                        session.task.as_deref(),
+                        &partial,
+                        &bundle,
+                        &sync_directory,
+                    ) {
+                        return Err(BrokerOpError::RecoveryArchiveUnverified {
+                            id: session_id,
+                            path: partial.to_string_lossy().into_owned(),
+                            reason,
+                        });
+                    }
+                    std::fs::rename(&partial, &archive)
+                        .map_err(|error| io_error(&archive, error))?;
+                }
+                Err(error) => return Err(io_error(&partial_path, error)),
+            }
+        }
         let archive_parent =
             archive_root
                 .parent()
@@ -1227,10 +1901,18 @@ impl Broker {
 
         // The archive is complete and verified. Cleanup recomputes the full
         // plan under the lifecycle claim immediately before removing the tree.
-        let cleanup_error = self
-            .cleanup_after_recovery_archive(session_id, &plan, &archive)
-            .err()
-            .map(|e| e.to_string());
+        let cleanup_result = if retirement_mode {
+            self.cleanup_after_recovery_archive_for_retirement(
+                session_id,
+                &plan,
+                &archive,
+                allow_adopted,
+                expected_cohort,
+            )
+        } else {
+            self.cleanup_after_recovery_archive(session_id, &plan, &archive)
+        };
+        let cleanup_error = cleanup_result.err().map(|error| error.to_string());
         let worktree_removed = cleanup_error.is_none();
         let payload = serde_json::json!({
             "session_id": session_id,
@@ -1264,6 +1946,10 @@ impl Broker {
 struct StoredManifest {
     schema_version: u32,
     created_at_ms: i64,
+    #[serde(default)]
+    minimum_archive_retention_ms: Option<u64>,
+    #[serde(default)]
+    retirement_record_sha256: Option<String>,
     aethyme_version: String,
     repository: String,
     session_id: i64,
@@ -1272,6 +1958,14 @@ struct StoredManifest {
     branch_ref: String,
     #[serde(default)]
     branch_tip: Option<String>,
+    #[serde(default)]
+    checkout_branch_ref: Option<String>,
+    #[serde(default)]
+    checkout_branch_tip: Option<String>,
+    #[serde(default)]
+    recovery_root_proofs_sha256: Option<String>,
+    #[serde(default)]
+    delivery_targets_sha256: Option<String>,
     disposition: String,
     head: String,
     base: Option<String>,
@@ -1316,6 +2010,8 @@ pub(crate) struct OwnedRecoveryArchive {
     pub session_id: i64,
     pub head: String,
     pub created_at_ms: i64,
+    /// Immutable minimum archive age copied from the reviewed retirement plan.
+    pub minimum_archive_retention_ms: Option<u64>,
     /// Staged, unstaged, untracked or protected ignored changes -- work no
     /// commit carries, so no delivery target can ever hold it.
     pub holds_uncommitted: bool,
@@ -1374,7 +2070,7 @@ fn known_recovery_archive_payload_bytes(plan: &CleanupResolvePlan) -> Result<u64
     let mut total = 0_u64;
     add_archive_size(&mut total, plan.staged_patch_bytes, STAGED_PATCH_FILE)?;
     add_archive_size(&mut total, plan.unstaged_patch_bytes, UNSTAGED_PATCH_FILE)?;
-    if !plan.unlanded_commits.is_empty() {
+    if recovery_bundle_required(plan) {
         add_archive_size(&mut total, MAX_RECOVERY_BUNDLE_BYTES, BUNDLE_FILE)?;
     }
 
@@ -1397,6 +2093,243 @@ fn known_recovery_archive_payload_bytes(plan: &CleanupResolvePlan) -> Result<u64
     add_archive_size(&mut total, MAX_RECOVERY_MANIFEST_BYTES, MANIFEST_FILE)?;
     add_archive_size(&mut total, MAX_RECOVERY_README_BYTES, README_FILE)?;
     Ok(total)
+}
+
+fn retirement_archive_record_for_plan(
+    plan: &CleanupResolvePlan,
+) -> Result<RetirementArchiveRecord, String> {
+    let minimum_archive_retention_ms = plan
+        .minimum_archive_retention_ms
+        .ok_or_else(|| "retirement plan has no immutable archive retention floor".to_owned())?;
+    let allow_adopted = plan
+        .retirement_allow_adopted
+        .ok_or_else(|| "retirement plan has no explicit adopted-origin mode".to_owned())?;
+    let record = RetirementArchiveRecord {
+        schema_version: RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION,
+        session_id: plan.session_id,
+        plan_digest: plan.digest.clone(),
+        target_origin: plan.target_origin.as_str().to_owned(),
+        allow_adopted,
+        minimum_archive_retention_ms,
+        owner_witness_sha256: plan.retirement_witness_sha256.clone(),
+        delivery_targets_sha256: delivery_targets_sha256(&plan.delivery_targets)?,
+        worktree_path: plan.worktree_path.clone(),
+        branch_ref: plan.branch_ref.clone(),
+        branch_tip: plan.branch_tip.clone(),
+        checkout_branch_ref: plan.checkout_branch_ref.clone(),
+        checkout_branch_tip: plan.checkout_branch_tip.clone(),
+        recovery_root_proofs_sha256: recovery_root_proofs_sha256(&plan.recovery_root_proofs)?,
+        head: plan.head.clone(),
+    };
+    validate_retirement_archive_record_fields(&record)?;
+    Ok(record)
+}
+
+fn retirement_archive_record_bytes(plan: &CleanupResolvePlan) -> Result<Vec<u8>, String> {
+    let record = retirement_archive_record_for_plan(plan)?;
+    serde_json::to_vec(&record).map_err(|error| format!("cannot encode retirement record: {error}"))
+}
+
+fn retirement_archive_record_sha256(plan: &CleanupResolvePlan) -> Result<String, String> {
+    Ok(sha256_hex(&retirement_archive_record_bytes(plan)?))
+}
+
+fn create_retirement_archive_record(root: &Path, plan: &CleanupResolvePlan) -> Result<(), String> {
+    let bytes = retirement_archive_record_bytes(plan)?;
+    create_new_archive_file(root, RETIREMENT_ARCHIVE_RECORD_FILE, &bytes).map(|_| ())
+}
+
+fn validate_retirement_archive_record_fields(
+    record: &RetirementArchiveRecord,
+) -> Result<(), String> {
+    if record.schema_version != RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION
+        || record.session_id <= 0
+        || !valid_sha256(&record.plan_digest)
+        || !matches!(record.target_origin.as_str(), "spawned" | "adopted")
+        || (record.target_origin == "adopted" && !record.allow_adopted)
+        || record.minimum_archive_retention_ms < MIN_RECOVERY_ARCHIVE_RETENTION_MS
+        || record
+            .owner_witness_sha256
+            .as_deref()
+            .is_some_and(|value| !valid_sha256(value))
+        || record.worktree_path.is_empty()
+        || !Path::new(&record.worktree_path).is_absolute()
+        || !record.branch_ref.starts_with("refs/heads/")
+        || record
+            .branch_tip
+            .as_deref()
+            .is_some_and(|tip| !valid_git_object_id(tip))
+        || record
+            .checkout_branch_ref
+            .as_deref()
+            .is_some_and(|branch| !branch.starts_with("refs/heads/") || branch == "HEAD")
+        || record
+            .checkout_branch_tip
+            .as_deref()
+            .is_some_and(|tip| !valid_git_object_id(tip) || tip != record.head)
+        || record.checkout_branch_ref.is_some() != record.checkout_branch_tip.is_some()
+        || !valid_sha256(&record.delivery_targets_sha256)
+        || !valid_sha256(&record.recovery_root_proofs_sha256)
+        || !valid_git_object_id(&record.head)
+    {
+        return Err("retirement record is incomplete or malformed".into());
+    }
+    Ok(())
+}
+
+fn read_retirement_archive_record(
+    root: &Path,
+) -> Result<(RetirementArchiveRecord, Vec<u8>), String> {
+    let path = root.join(RETIREMENT_ARCHIVE_RECORD_FILE);
+    let bytes = read_regular_file_no_follow(&path, MAX_RETIREMENT_ARCHIVE_RECORD_BYTES)
+        .map_err(|error| format!("cannot safely read retirement record: {error}"))?;
+    let record: RetirementArchiveRecord = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("unreadable retirement record: {error}"))?;
+    validate_retirement_archive_record_fields(&record)?;
+    Ok((record, bytes))
+}
+
+fn verify_retirement_archive_record_for_plan(
+    root: &Path,
+    plan: &CleanupResolvePlan,
+) -> Result<(), String> {
+    let expected = retirement_archive_record_for_plan(plan)?;
+    let (actual, _) = read_retirement_archive_record(root)?;
+    if actual != expected {
+        return Err("retirement record does not match the reviewed plan".into());
+    }
+    Ok(())
+}
+
+fn verify_retirement_archive_record_for_manifest(
+    root: &Path,
+    manifest: &StoredManifest,
+) -> Result<(), String> {
+    let (record, bytes) = read_retirement_archive_record(root)?;
+    let record_sha256 = sha256_hex(&bytes);
+    if Some(record_sha256.as_str()) != manifest.retirement_record_sha256.as_deref()
+        || Some(record.session_id) != Some(manifest.session_id)
+        || Some(record.plan_digest.as_str()) != manifest.plan_digest.as_deref()
+        || Some(record.minimum_archive_retention_ms) != manifest.minimum_archive_retention_ms
+        || record.worktree_path != manifest.worktree_path
+        || record.branch_ref != manifest.branch_ref
+        || record.branch_tip != manifest.branch_tip
+        || record.checkout_branch_ref != manifest.checkout_branch_ref
+        || record.checkout_branch_tip != manifest.checkout_branch_tip
+        || Some(record.recovery_root_proofs_sha256.as_str())
+            != manifest.recovery_root_proofs_sha256.as_deref()
+        || Some(record.delivery_targets_sha256.as_str())
+            != manifest.delivery_targets_sha256.as_deref()
+        || record.head != manifest.head
+    {
+        return Err("retirement record does not match its archive manifest".into());
+    }
+    Ok(())
+}
+
+fn recovery_bundle_required(plan: &CleanupResolvePlan) -> bool {
+    !recovery_bundle_roots(plan).is_empty()
+}
+
+fn recovery_root_proofs_for_plan_parts(
+    head: &str,
+    branch_ref: &str,
+    branch_tip: Option<&str>,
+    checkout_branch_ref: Option<&str>,
+    checkout_branch_tip: Option<&str>,
+    unlanded_commits: &[String],
+) -> Result<Vec<RecoveryRootProof>, String> {
+    let mut roots = std::collections::BTreeMap::from([("HEAD".to_owned(), head.to_owned())]);
+    if let Some(tip) = branch_tip {
+        match roots.insert(branch_ref.to_owned(), tip.to_owned()) {
+            Some(previous) if previous != tip => {
+                return Err("one branch ref resolved to two different archive roots".into());
+            }
+            _ => {}
+        }
+    }
+    if let (Some(reference), Some(tip)) = (checkout_branch_ref, checkout_branch_tip) {
+        match roots.insert(reference.to_owned(), tip.to_owned()) {
+            Some(previous) if previous != tip => {
+                return Err("one branch ref resolved to two different archive roots".into());
+            }
+            _ => {}
+        }
+    }
+    Ok(roots
+        .into_iter()
+        .map(|(ref_name, object_id)| RecoveryRootProof {
+            available_from_delivery: !unlanded_commits.contains(&object_id),
+            ref_name,
+            object_id,
+        })
+        .collect())
+}
+
+fn recovery_root_proofs_sha256(proofs: &[RecoveryRootProof]) -> Result<String, String> {
+    let bytes = serde_json::to_vec(proofs)
+        .map_err(|error| format!("cannot encode recovery root proof: {error}"))?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn delivery_targets_sha256(targets: &[String]) -> Result<String, String> {
+    let bytes = serde_json::to_vec(targets)
+        .map_err(|error| format!("cannot encode delivery roots: {error}"))?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn recovery_bundle_roots(plan: &CleanupResolvePlan) -> Vec<(String, String)> {
+    if plan.recovery_archive_schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+        return plan
+            .recovery_root_proofs
+            .iter()
+            .filter(|proof| !proof.available_from_delivery)
+            .map(|proof| (proof.ref_name.clone(), proof.object_id.clone()))
+            .collect();
+    }
+    if plan.unlanded_commits.is_empty() {
+        Vec::new()
+    } else {
+        vec![("HEAD".to_owned(), plan.head.clone())]
+    }
+}
+
+fn recovery_bundle_refs(plan: &CleanupResolvePlan) -> Vec<String> {
+    recovery_bundle_roots(plan)
+        .into_iter()
+        .filter_map(|(name, _)| (name != "HEAD").then_some(name))
+        .collect()
+}
+
+fn recovery_bundle_roots_from_manifest(
+    manifest: &StoredManifest,
+) -> Result<Vec<(String, String)>, String> {
+    if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+        let proofs = recovery_root_proofs_for_plan_parts(
+            &manifest.head,
+            &manifest.branch_ref,
+            manifest.branch_tip.as_deref(),
+            manifest.checkout_branch_ref.as_deref(),
+            manifest.checkout_branch_tip.as_deref(),
+            &manifest.unlanded_commits,
+        )?;
+        let digest = recovery_root_proofs_sha256(&proofs)?;
+        if Some(digest.as_str()) != manifest.recovery_root_proofs_sha256.as_deref() {
+            return Err(
+                "recovery roots or their delivery availability changed in the manifest".into(),
+            );
+        }
+        return Ok(proofs
+            .into_iter()
+            .filter(|proof| !proof.available_from_delivery)
+            .map(|proof| (proof.ref_name, proof.object_id))
+            .collect());
+    }
+    if manifest.unlanded_commits.is_empty() {
+        Ok(Vec::new())
+    } else {
+        Ok(vec![("HEAD".to_owned(), manifest.head.clone())])
+    }
 }
 
 fn checked_archived_file_bytes(files: &[ArchivedFile]) -> Option<u64> {
@@ -1436,27 +2369,95 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
                 return Err("legacy manifest unexpectedly contains bundle integrity fields".into());
             }
         }
-        PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION | RECOVERY_ARCHIVE_SCHEMA_VERSION => {
-            match manifest.bundle.as_deref() {
-                Some(_) => {
-                    let Some(bytes) = manifest.bundle_bytes else {
-                        return Err("bundle archive is missing its byte length".into());
-                    };
-                    if bytes == 0 || bytes > MAX_RECOVERY_BUNDLE_BYTES {
-                        return Err("bundle archive length is outside its supported bound".into());
-                    }
-                    if !manifest.bundle_sha256.as_deref().is_some_and(valid_sha256) {
-                        return Err("bundle archive is missing a valid SHA-256".into());
-                    }
+        PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        | RECOVERY_ARCHIVE_SCHEMA_VERSION
+        | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION => match manifest.bundle.as_deref() {
+            Some(_) => {
+                let Some(bytes) = manifest.bundle_bytes else {
+                    return Err("bundle archive is missing its byte length".into());
+                };
+                if bytes == 0 || bytes > MAX_RECOVERY_BUNDLE_BYTES {
+                    return Err("bundle archive length is outside its supported bound".into());
                 }
-                None => {
-                    if manifest.bundle_bytes.is_some() || manifest.bundle_sha256.is_some() {
-                        return Err("bundle archive has integrity fields without a bundle".into());
-                    }
+                if !manifest.bundle_sha256.as_deref().is_some_and(valid_sha256) {
+                    return Err("bundle archive is missing a valid SHA-256".into());
                 }
             }
-        }
+            None => {
+                if manifest.bundle_bytes.is_some() || manifest.bundle_sha256.is_some() {
+                    return Err("bundle archive has integrity fields without a bundle".into());
+                }
+            }
+        },
         version => return Err(format!("manifest schema {version} is not supported")),
+    }
+
+    if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+        if manifest
+            .minimum_archive_retention_ms
+            .is_none_or(|floor| floor < MIN_RECOVERY_ARCHIVE_RETENTION_MS)
+        {
+            return Err(
+                "schema v5 manifest is missing a valid minimum archive retention floor".into(),
+            );
+        }
+        if !manifest
+            .retirement_record_sha256
+            .as_deref()
+            .is_some_and(valid_sha256)
+            || !manifest
+                .recovery_root_proofs_sha256
+                .as_deref()
+                .is_some_and(valid_sha256)
+            || !manifest
+                .delivery_targets_sha256
+                .as_deref()
+                .is_some_and(valid_sha256)
+        {
+            return Err(
+                "schema v5 manifest is missing its retirement or root-proof identity".into(),
+            );
+        }
+        if manifest
+            .checkout_branch_ref
+            .as_deref()
+            .is_some_and(|branch| !branch.starts_with("refs/heads/"))
+            || manifest
+                .checkout_branch_tip
+                .as_deref()
+                .is_some_and(|tip| !valid_git_object_id(tip) || tip != manifest.head)
+            || manifest.checkout_branch_ref.is_some() != manifest.checkout_branch_tip.is_some()
+        {
+            return Err("schema v5 manifest has an invalid checked-out branch identity".into());
+        }
+        let delivery_hash = delivery_targets_sha256(&manifest.delivery_targets)?;
+        if Some(delivery_hash.as_str()) != manifest.delivery_targets_sha256.as_deref() {
+            return Err(
+                "schema v5 delivery target roots do not match their recorded identity".into(),
+            );
+        }
+        let proofs = recovery_root_proofs_for_plan_parts(
+            &manifest.head,
+            &manifest.branch_ref,
+            manifest.branch_tip.as_deref(),
+            manifest.checkout_branch_ref.as_deref(),
+            manifest.checkout_branch_tip.as_deref(),
+            &manifest.unlanded_commits,
+        )?;
+        let root_proofs_hash = recovery_root_proofs_sha256(&proofs)?;
+        if Some(root_proofs_hash.as_str()) != manifest.recovery_root_proofs_sha256.as_deref() {
+            return Err(
+                "schema v5 manifest root proof does not match its branch identities".into(),
+            );
+        }
+    } else if manifest.minimum_archive_retention_ms.is_some()
+        || manifest.retirement_record_sha256.is_some()
+        || manifest.checkout_branch_ref.is_some()
+        || manifest.checkout_branch_tip.is_some()
+        || manifest.recovery_root_proofs_sha256.is_some()
+        || manifest.delivery_targets_sha256.is_some()
+    {
+        return Err("only schema v5 archives may declare retirement metadata".into());
     }
 
     if manifest.session_id <= 0
@@ -1472,8 +2473,10 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
         || !(matches!(
             manifest.disposition.as_str(),
             "dirty" | "pending_commits" | "unproven_provenance"
-        ) || (manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
-            && manifest.disposition == "eligible"))
+        ) || (matches!(
+            manifest.schema_version,
+            RECOVERY_ARCHIVE_SCHEMA_VERSION | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        ) && manifest.disposition == "eligible"))
         || !valid_git_object_id(&manifest.head)
         || manifest
             .base
@@ -1484,14 +2487,16 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
             .as_deref()
             .is_some_and(|task| task.contains('\0'))
         || manifest.landing.is_null()
-        || (manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
-            && !matches!(
-                manifest
-                    .landing
-                    .get("state")
-                    .and_then(serde_json::Value::as_str),
-                Some("landed" | "not_landed" | "not_evaluated_for_recovery")
-            ))
+        || (matches!(
+            manifest.schema_version,
+            RECOVERY_ARCHIVE_SCHEMA_VERSION | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        ) && !matches!(
+            manifest
+                .landing
+                .get("state")
+                .and_then(serde_json::Value::as_str),
+            Some("landed" | "not_landed" | "not_evaluated_for_recovery")
+        ))
         || !manifest
             .delivery_targets
             .iter()
@@ -1500,7 +2505,11 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
             .unlanded_commits
             .iter()
             .all(|commit| valid_git_object_id(commit))
-        || manifest.bundle.is_some() == manifest.unlanded_commits.is_empty()
+        || (if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+            manifest.bundle.is_some() != !recovery_bundle_roots_from_manifest(manifest)?.is_empty()
+        } else {
+            manifest.bundle.is_some() == manifest.unlanded_commits.is_empty()
+        })
     {
         return Err("manifest has an incomplete or malformed archive identity".into());
     }
@@ -1555,20 +2564,21 @@ fn validate_archived_file_modes(
         }
         PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION
         | PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
-        | RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+        | RECOVERY_ARCHIVE_SCHEMA_VERSION
+        | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
             #[cfg(unix)]
             if files
                 .iter()
                 .any(|file| !file.symlink && file.mode.is_none())
             {
                 return Err(format!(
-                    "schema v2/v3/v4 {label} entry is missing its Unix file mode"
+                    "schema v2/v3/v4/v5 {label} entry is missing its Unix file mode"
                 ));
             }
             #[cfg(not(unix))]
             if files.iter().any(|file| file.mode.is_some()) {
                 return Err(format!(
-                    "schema v2/v3/v4 {label} file modes cannot be verified on this platform"
+                    "schema v2/v3/v4/v5 {label} file modes cannot be verified on this platform"
                 ));
             }
         }
@@ -1616,10 +2626,11 @@ fn recovery_archive_expected_files(
         }
         PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION
         | PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
-        | RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+        | RECOVERY_ARCHIVE_SCHEMA_VERSION
+        | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
             if manifest.ignored_directory.as_deref() != Some(IGNORED_DIRECTORY) {
                 return Err(
-                    "schema v2/v3/v4 manifest is missing its ignored directory identity".into(),
+                    "schema v2/v3/v4/v5 manifest is missing its ignored directory identity".into(),
                 );
             }
             validate_archived_file_modes(
@@ -1627,16 +2638,14 @@ fn recovery_archive_expected_files(
                 &manifest.untracked_files,
                 manifest.schema_version,
             )?;
-            let files = manifest
-                .ignored_files
-                .as_deref()
-                .ok_or_else(|| "schema v2/v3/v4 manifest is missing ignored_files".to_string())?;
+            let files = manifest.ignored_files.as_deref().ok_or_else(|| {
+                "schema v2/v3/v4/v5 manifest is missing ignored_files".to_string()
+            })?;
             validate_archived_files("ignored", files)?;
             validate_archived_file_modes("ignored", files, manifest.schema_version)?;
-            let ignored_paths = manifest
-                .ignored_paths
-                .as_deref()
-                .ok_or_else(|| "schema v2/v3/v4 manifest is missing ignored_paths".to_string())?;
+            let ignored_paths = manifest.ignored_paths.as_deref().ok_or_else(|| {
+                "schema v2/v3/v4/v5 manifest is missing ignored_paths".to_string()
+            })?;
             if !manifest
                 .ignored_policy_sha256
                 .as_deref()
@@ -1644,7 +2653,7 @@ fn recovery_archive_expected_files(
                 || !manifest.plan_digest.as_deref().is_some_and(valid_sha256)
             {
                 return Err(
-                    "schema v2/v3/v4 manifest has an invalid plan or ignored policy identity"
+                    "schema v2/v3/v4/v5 manifest has an invalid plan or ignored policy identity"
                         .into(),
                 );
             }
@@ -1655,11 +2664,13 @@ fn recovery_archive_expected_files(
                 if !is_contained_relative(trimmed)
                     || previous.is_some_and(|previous| previous >= path.path.as_str())
                 {
-                    return Err("schema v2/v3/v4 ignored roots are invalid or unsorted".into());
+                    return Err("schema v2/v3/v4/v5 ignored roots are invalid or unsorted".into());
                 }
                 if path.classification == IgnoredPathClassification::PreservedFile {
                     if path.path.ends_with('/') {
-                        return Err("schema v2/v3/v4 preserved ignored path is a directory".into());
+                        return Err(
+                            "schema v2/v3/v4/v5 preserved ignored path is a directory".into()
+                        );
                     }
                     preserved.push(path.path.as_str());
                 }
@@ -1688,6 +2699,9 @@ fn recovery_archive_expected_files(
     ]);
     if manifest.bundle.is_some() {
         expected.insert(PathBuf::from(BUNDLE_FILE));
+    }
+    if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+        expected.insert(PathBuf::from(RETIREMENT_ARCHIVE_RECORD_FILE));
     }
     expected.extend(
         manifest
@@ -1817,6 +2831,7 @@ fn verify_recovery_archive_tree(root: &Path, manifest: &StoredManifest) -> Resul
                     PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION
                         | PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
                         | RECOVERY_ARCHIVE_SCHEMA_VERSION
+                        | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
                 )
                 && permission_mode(&metadata) != file.mode
             {
@@ -1829,7 +2844,9 @@ fn verify_recovery_archive_tree(root: &Path, manifest: &StoredManifest) -> Resul
     }
     if matches!(
         manifest.schema_version,
-        PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION | RECOVERY_ARCHIVE_SCHEMA_VERSION
+        PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
+            | RECOVERY_ARCHIVE_SCHEMA_VERSION
+            | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
     ) && let Some(bundle) = manifest.bundle.as_deref()
     {
         let path = root.join(bundle);
@@ -1887,6 +2904,9 @@ fn verify_recovery_archive_payload_for_plan(
         .map_err(|error| format!("unreadable {MANIFEST_FILE}: {error}"))?;
     validate_manifest_identity(&manifest)?;
     verify_recovery_archive_tree(root, &manifest)?;
+    if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+        verify_retirement_archive_record_for_manifest(root, &manifest)?;
+    }
     let mut informational_ignored_directories = false;
     let expected_plan_digest = match manifest.schema_version {
         PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
@@ -1931,30 +2951,70 @@ fn verify_recovery_archive_payload_for_plan(
             (manifest.plan_digest.as_deref() == Some(plan.digest.as_str()))
                 .then(|| plan.digest.clone())
         }
+        RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+            informational_ignored_directories = true;
+            (manifest.plan_digest.as_deref() == Some(plan.digest.as_str()))
+                .then(|| plan.digest.clone())
+        }
         _ => None,
     };
     let expected_landing = serde_json::to_value(&plan.landing)
         .map_err(|error| format!("cannot encode reviewed landing verdict: {error}"))?;
+    let expected_retirement_record_sha256 =
+        if plan.recovery_archive_schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+            Some(retirement_archive_record_sha256(plan)?)
+        } else {
+            None
+        };
+    let expected_root_proofs_sha256 =
+        if plan.recovery_archive_schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+            Some(recovery_root_proofs_sha256(&plan.recovery_root_proofs)?)
+        } else {
+            None
+        };
+    let expected_delivery_targets_sha256 =
+        if plan.recovery_archive_schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+            Some(delivery_targets_sha256(&plan.delivery_targets)?)
+        } else {
+            None
+        };
     if expected_plan_digest
         .as_deref()
         .is_none_or(|expected| manifest.plan_digest.as_deref() != Some(expected))
+        || (plan.recovery_archive_schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+            && (manifest.schema_version != RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+                || manifest.minimum_archive_retention_ms != plan.minimum_archive_retention_ms
+                || manifest.retirement_record_sha256.as_deref()
+                    != expected_retirement_record_sha256.as_deref()
+                || manifest.checkout_branch_ref != plan.checkout_branch_ref
+                || manifest.checkout_branch_tip != plan.checkout_branch_tip
+                || manifest.recovery_root_proofs_sha256.as_deref()
+                    != expected_root_proofs_sha256.as_deref()
+                || manifest.delivery_targets_sha256.as_deref()
+                    != expected_delivery_targets_sha256.as_deref()))
         || manifest.session_id != plan.session_id
         || !same_path(Path::new(&manifest.repository), repository.root())
-        || (manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
-            && !same_path(
-                Path::new(&manifest.repository),
-                Path::new(&plan.repository_path),
-            ))
+        || (matches!(
+            manifest.schema_version,
+            RECOVERY_ARCHIVE_SCHEMA_VERSION | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        ) && !same_path(
+            Path::new(&manifest.repository),
+            Path::new(&plan.repository_path),
+        ))
         || manifest.worktree_path != plan.worktree_path
         || manifest.branch_ref != plan.branch_ref
-        || (manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
-            && manifest.branch_tip != plan.branch_tip)
+        || (matches!(
+            manifest.schema_version,
+            RECOVERY_ARCHIVE_SCHEMA_VERSION | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        ) && manifest.branch_tip != plan.branch_tip)
         || manifest.disposition != plan.disposition.as_str()
         || manifest.head != plan.head
         || manifest.delivery_targets != plan.delivery_targets
         || manifest.unlanded_commits != plan.unlanded_commits
-        || (manifest.schema_version == RECOVERY_ARCHIVE_SCHEMA_VERSION
-            && manifest.landing != expected_landing)
+        || (matches!(
+            manifest.schema_version,
+            RECOVERY_ARCHIVE_SCHEMA_VERSION | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        ) && manifest.landing != expected_landing)
         || manifest.staged_patch.bytes != plan.staged_patch_bytes
         || manifest.staged_patch.sha256 != plan.staged_patch_sha256
         || manifest.unstaged_patch.bytes != plan.unstaged_patch_bytes
@@ -2011,7 +3071,12 @@ fn verify_recovery_archive_payload_for_plan(
     if manifest.bundle.is_some() {
         let bundle = root.join(BUNDLE_FILE);
         let deadline = recovery_bundle_deadline()?;
-        verify_recovery_bundle(repository, &bundle, &plan.head, deadline)?;
+        verify_recovery_bundle(
+            repository,
+            &bundle,
+            &recovery_bundle_roots_from_manifest(&manifest)?,
+            deadline,
+        )?;
     }
     let expected_readme = restore_readme(plan, manifest.bundle.is_some());
     let readme_path = root.join(README_FILE);
@@ -2071,6 +3136,7 @@ impl Broker {
                 | PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION
                 | PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
                 | RECOVERY_ARCHIVE_SCHEMA_VERSION
+                | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
         ) {
             return Err(format!(
                 "manifest schema {} is not supported",
@@ -2079,6 +3145,9 @@ impl Broker {
         }
         validate_manifest_identity(&manifest)?;
         verify_recovery_archive_tree(dir, &manifest)?;
+        if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+            verify_retirement_archive_record_for_manifest(dir, &manifest)?;
+        }
         if !same_path(Path::new(&manifest.repository), self.main_root()) {
             return Err(format!(
                 "manifest names another repository: {}",
@@ -2101,6 +3170,7 @@ impl Broker {
             session_id: manifest.session_id,
             head: manifest.head,
             created_at_ms: manifest.created_at_ms,
+            minimum_archive_retention_ms: manifest.minimum_archive_retention_ms,
             holds_uncommitted: manifest.staged_patch.bytes > 0
                 || manifest.unstaged_patch.bytes > 0
                 || !manifest.untracked_files.is_empty()
@@ -2498,13 +3568,16 @@ fn stream_recovery_command_stdout(
 fn write_recovery_bundle_to_file(
     checkout: &GitRepo,
     excluded: &[String],
+    additional_roots: &[String],
     max_bundle_bytes: u64,
     deadline: Instant,
     file: &mut std::fs::File,
 ) -> Result<u64, String> {
     let mut command = crate::git::git_command();
     command
-        .args(["bundle", "create", "-", "HEAD", "--not"])
+        .args(["bundle", "create", "-", "HEAD"])
+        .args(additional_roots.iter().map(String::as_str))
+        .arg("--not")
         .args(excluded.iter().map(String::as_str))
         .current_dir(checkout.root())
         .env("GIT_OPTIONAL_LOCKS", "0");
@@ -2549,7 +3622,7 @@ fn run_recovery_git_output_limited(
 fn verify_recovery_bundle(
     repository: &GitRepo,
     bundle: &Path,
-    expected_head: &str,
+    expected_roots: &[(String, String)],
     deadline: Instant,
 ) -> Result<(), String> {
     let mut verify = crate::git::git_command();
@@ -2570,8 +3643,7 @@ fn verify_recovery_bundle(
         run_recovery_git_output_limited(&mut list_heads, deadline, "Git bundle list-heads")?;
     let text = std::str::from_utf8(&output.stdout)
         .map_err(|_| "Git bundle list-heads returned non-UTF-8 output".to_owned())?;
-    let mut contains_head = false;
-    let mut saw_entry = false;
+    let mut advertised_roots = std::collections::BTreeSet::new();
     for line in text.lines() {
         if line.is_empty() {
             return Err("Git bundle list-heads returned an empty entry".into());
@@ -2582,11 +3654,15 @@ fn verify_recovery_bundle(
         if !valid_git_object_id(object) || name.is_empty() || fields.next().is_some() {
             return Err("Git bundle list-heads returned a malformed entry".into());
         }
-        saw_entry = true;
-        contains_head |= object == expected_head;
+        advertised_roots.insert((name.to_owned(), object.to_owned()));
     }
-    if !saw_entry || !contains_head {
-        return Err(format!("{BUNDLE_FILE} does not hold {expected_head}"));
+    for (name, object) in expected_roots {
+        if !advertised_roots.contains(&(name.clone(), object.clone())) {
+            return Err(format!("{BUNDLE_FILE} does not hold {name} at {object}"));
+        }
+    }
+    if expected_roots.is_empty() {
+        return Err(format!("{BUNDLE_FILE} has no reviewed roots"));
     }
     Ok(())
 }
@@ -2880,13 +3956,28 @@ fn write_verified_archive_with_bundle_writer<S, B>(
 ) -> Result<(), String>
 where
     S: Fn(&Path) -> std::io::Result<()>,
-    B: Fn(&GitRepo, &[String], u64, Instant, &mut std::fs::File) -> Result<u64, String>,
+    B: Fn(&GitRepo, &[String], &[String], u64, Instant, &mut std::fs::File) -> Result<u64, String>,
 {
     require_real_directory(dir)?;
     let dir = dir
         .canonicalize()
         .map_err(|error| format!("cannot resolve archive staging directory: {error}"))?;
     require_real_directory(&dir)?;
+    let retirement_record_sha256 =
+        if plan.recovery_archive_schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+            let record = retirement_archive_record_for_plan(plan)?;
+            let bytes = serde_json::to_vec(&record)
+                .map_err(|error| format!("cannot encode retirement record: {error}"))?;
+            let path = dir.join(RETIREMENT_ARCHIVE_RECORD_FILE);
+            let stored = read_regular_file_no_follow(&path, MAX_RETIREMENT_ARCHIVE_RECORD_BYTES)
+                .map_err(|error| format!("cannot read retirement staging record: {error}"))?;
+            if stored != bytes {
+                return Err("retirement staging record does not match the reviewed plan".into());
+            }
+            Some(sha256_hex(&bytes))
+        } else {
+            None
+        };
 
     // Patches are taken again rather than trusted from the plan: the digest
     // check just passed, and a patch that no longer hashes the same means the
@@ -2909,14 +4000,16 @@ where
         patches.push((written.bytes != 0).then_some(path));
     }
 
-    let bundle_integrity = if plan.unlanded_commits.is_empty() {
+    let bundle_integrity = if !recovery_bundle_required(plan) {
         None
     } else {
         let deadline = recovery_bundle_deadline()?;
         let (path, mut bundle_file) = create_new_archive_file_handle(&dir, BUNDLE_FILE)?;
+        let additional_roots = recovery_bundle_refs(plan);
         let streamed_bytes = match (bundle.write_to)(
             checkout,
             &plan.delivery_targets,
+            &additional_roots,
             bundle.max_bytes,
             deadline,
             &mut bundle_file,
@@ -2940,7 +4033,7 @@ where
         if bytes != streamed_bytes {
             return Err(format!("{BUNDLE_FILE} byte count changed after streaming"));
         }
-        verify_recovery_bundle(repository, &path, &plan.head, deadline)?;
+        verify_recovery_bundle(repository, &path, &recovery_bundle_roots(plan), deadline)?;
         Some(RecoveryBundleIntegrity { bytes, sha256 })
     };
     let bundle = bundle_integrity.as_ref().map(|_| BUNDLE_FILE);
@@ -3022,10 +4115,24 @@ where
         }
     }
 
+    let manifest_root_proofs_sha256 =
+        if plan.recovery_archive_schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+            Some(recovery_root_proofs_sha256(&plan.recovery_root_proofs)?)
+        } else {
+            None
+        };
+    let manifest_delivery_targets_sha256 =
+        if plan.recovery_archive_schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+            Some(delivery_targets_sha256(&plan.delivery_targets)?)
+        } else {
+            None
+        };
     let manifest = RecoveryManifest {
-        schema_version: RECOVERY_ARCHIVE_SCHEMA_VERSION,
+        schema_version: plan.recovery_archive_schema_version,
         plan_digest: &plan.digest,
         created_at_ms: now_ms(),
+        minimum_archive_retention_ms: plan.minimum_archive_retention_ms,
+        retirement_record_sha256: retirement_record_sha256.as_deref(),
         aethyme_version: env!("CARGO_PKG_VERSION"),
         repository: repository.root().to_string_lossy().into_owned(),
         session_id: plan.session_id,
@@ -3033,6 +4140,10 @@ where
         worktree_path: &plan.worktree_path,
         branch_ref: &plan.branch_ref,
         branch_tip: plan.branch_tip.as_deref(),
+        checkout_branch_ref: plan.checkout_branch_ref.as_deref(),
+        checkout_branch_tip: plan.checkout_branch_tip.as_deref(),
+        recovery_root_proofs_sha256: manifest_root_proofs_sha256.as_deref(),
+        delivery_targets_sha256: manifest_delivery_targets_sha256.as_deref(),
         disposition: plan.disposition.as_str(),
         head: &plan.head,
         base: repository
@@ -3119,6 +4230,7 @@ mod tests {
     fn write_over_cap_bundle(
         _checkout: &GitRepo,
         _delivery_targets: &[String],
+        _additional_roots: &[String],
         max_bytes: u64,
         deadline: Instant,
         file: &mut std::fs::File,
@@ -3163,10 +4275,18 @@ mod tests {
             schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
             digest: sha256_hex(b"test reviewed plan"),
             session_id: 1,
+            target_origin: SessionOrigin::Spawned,
+            recovery_archive_schema_version: RECOVERY_ARCHIVE_SCHEMA_VERSION,
+            minimum_archive_retention_ms: None,
+            retirement_allow_adopted: None,
+            retirement_witness_sha256: None,
             repository_path: repo.root().to_string_lossy().into_owned(),
             worktree_path: tmp.path().to_string_lossy().into_owned(),
             branch_ref: "refs/heads/main".into(),
             branch_tip: None,
+            checkout_branch_ref: None,
+            checkout_branch_tip: None,
+            recovery_root_proofs: Vec::new(),
             disposition: CleanupDisposition::Dirty,
             reason: String::new(),
             head: head.clone(),
@@ -3527,10 +4647,18 @@ mod tests {
             schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
             digest: String::new(),
             session_id: 9,
+            target_origin: SessionOrigin::Spawned,
+            recovery_archive_schema_version: RECOVERY_ARCHIVE_SCHEMA_VERSION,
+            minimum_archive_retention_ms: None,
+            retirement_allow_adopted: None,
+            retirement_witness_sha256: None,
             repository_path: "/tmp/aethyme-v2-repository".into(),
             worktree_path: "/tmp/aethyme-v2".into(),
             branch_ref: "refs/heads/main".into(),
             branch_tip: None,
+            checkout_branch_ref: None,
+            checkout_branch_tip: None,
+            recovery_root_proofs: Vec::new(),
             disposition: CleanupDisposition::Dirty,
             reason: String::new(),
             head: "1".repeat(40),
@@ -3610,10 +4738,18 @@ mod tests {
             schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
             digest: sha256_hex(b"v4 bundle fixture plan"),
             session_id: 9,
+            target_origin: SessionOrigin::Spawned,
+            recovery_archive_schema_version: RECOVERY_ARCHIVE_SCHEMA_VERSION,
+            minimum_archive_retention_ms: None,
+            retirement_allow_adopted: None,
+            retirement_witness_sha256: None,
             repository_path: repo.root().to_string_lossy().into_owned(),
             worktree_path: tmp.path().to_string_lossy().into_owned(),
             branch_ref: "refs/heads/main".into(),
             branch_tip: Some(head.clone()),
+            checkout_branch_ref: None,
+            checkout_branch_tip: None,
+            recovery_root_proofs: Vec::new(),
             disposition: CleanupDisposition::Dirty,
             reason: "fixture".into(),
             head: head.clone(),
