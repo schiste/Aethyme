@@ -1171,10 +1171,7 @@ impl Broker {
         &mut self,
         commit: &str,
     ) -> Result<Option<Vec<crate::gates::Gate>>, BrokerOpError> {
-        let Some(text) = self
-            .repo_handle()
-            .file_at_commit(commit, crate::gates::GATES_CONFIG_RELPATH)?
-        else {
+        let Some(text) = self.repo_handle().config_toml_at_commit(commit, "gates")? else {
             return Ok(None);
         };
         let gates = crate::gates::parse_gates(&text)?;

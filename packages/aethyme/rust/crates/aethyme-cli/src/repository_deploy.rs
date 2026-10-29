@@ -474,7 +474,22 @@ fn validate_graph_repository(value: &str) -> Result<String, String> {
 fn enroll_graph(repo: &Path, repository: &str) -> Result<(), String> {
     use toml_edit::{DocumentMut, Item, Table, value};
 
-    let config_path = repo.join(".aethyme/config.toml");
+    use aethyme_broker::config_source;
+    let config_path =
+        config_source::config_path_or_default(&repo.join(config_source::CONFIG_DIR), "config")
+            .map_err(|error| error.to_string())?;
+    if config_source::ConfigFormat::from_path(&config_path)
+        == Some(config_source::ConfigFormat::Yaml)
+    {
+        // Comment-preserving YAML edits are not reliable, so YAML is never
+        // rewritten (#1223): print the exact patch and refuse.
+        return Err(format!(
+            "manual_yaml_edit_required: {} is YAML, which aethyme does not rewrite. \
+             Add this, commit it, and rerun:\n\ngraph:\n  authority: committed_fragments\n  \
+             repository: {repository}\n",
+            config_path.display()
+        ));
+    }
     let text = std::fs::read_to_string(&config_path)
         .map_err(|error| format!("read {}: {error}", config_path.display()))?;
     let mut document = text

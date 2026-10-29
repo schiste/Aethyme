@@ -158,7 +158,7 @@ pub fn ensure_running(root: &Path, executable: &Path) -> io::Result<SupervisorSt
             // Reap the child if it ever exits so it never lingers as a zombie
             // of this short-lived command; the supervisor is in its own group.
             std::thread::spawn(move || {
-                crate::warn_unrecorded("reap the environment supervisor", child.wait());
+                crate::warn_unrecorded("reap environment supervisor process", child.wait());
             });
             return Ok(observed);
         }
@@ -276,13 +276,30 @@ fn publish(root: &Path, record: &SupervisorRecord) -> io::Result<()> {
 /// Remove the record only if it is still ours.
 fn withdraw(root: &Path, pid: i32) {
     let path = root.join(SUPERVISOR_STATE);
-    let ours = fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<SupervisorRecord>(&text).ok())
-        .is_some_and(|record| record.identity.pid == pid);
-    if ours {
-        crate::warn_unrecorded("remove the supervisor record", fs::remove_file(path));
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            crate::warn_unrecorded("read supervisor state before removal", Err::<(), _>(error));
+            return;
+        }
+    };
+    let record = match serde_json::from_str::<SupervisorRecord>(&text) {
+        Ok(record) => record,
+        Err(error) => {
+            crate::warn_unrecorded("parse supervisor state before removal", Err::<(), _>(error));
+            return;
+        }
+    };
+    if record.identity.pid != pid {
+        return;
     }
+    let result = match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    };
+    crate::warn_unrecorded("remove supervisor state file", result);
 }
 
 fn now_ms() -> i64 {

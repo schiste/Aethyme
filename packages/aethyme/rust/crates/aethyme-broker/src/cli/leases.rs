@@ -572,9 +572,9 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                         request.state.as_str()
                     );
                 }
+                out!("These requests are advisory; they do not block edits in separate worktrees.");
                 out!(
-                    "Wait: aethyme broker advanced leases wait {} --session {session}",
-                    crate::broker::shell_quote(path)
+                    "Before following up or waiting, inspect the holder's task and relevant worktree diff. Use `leases wait` only when this exact path is needed."
                 );
             }
         }
@@ -663,6 +663,9 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                 }
                 if latest_is(crate::lease_requests::RequestState::Declined) {
                     break ("declined", crate::exit_status::LEASE_WAIT_DECLINED, mine);
+                }
+                if latest_is(crate::lease_requests::RequestState::Cancelled) {
+                    break ("cancelled", crate::exit_status::LEASE_WAIT_CANCELLED, mine);
                 }
                 let elapsed = started.elapsed();
                 if elapsed >= next_progress {

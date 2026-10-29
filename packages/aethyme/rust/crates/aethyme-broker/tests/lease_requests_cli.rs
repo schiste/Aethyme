@@ -247,9 +247,9 @@ fn the_holder_sees_the_request_and_an_ack_releases_the_path() {
     let human = String::from_utf8_lossy(&human.stdout);
     assert!(
         human.contains(&format!(
-            "session {asking} waiting for {PATH} held by session {holding}"
+            "session {asking} asked session {holding} to release {PATH}"
         )),
-        "status must show the current lease waiter and holder; got:\n{human}"
+        "status must show the advisory release request and holder; got:\n{human}"
     );
 
     let acked = fx.json_as(

@@ -371,11 +371,9 @@ pub fn static_gate_diagnostics(gates: &[Gate]) -> Vec<GateDiagnostic> {
 /// HEAD. Dirty and untracked files are deliberately not inputs.
 pub fn inspect_gate_quality(repo: &crate::GitRepo) -> Result<GateDoctorReport, GateDoctorError> {
     let head = repo.head_commit()?;
-    let text = repo
-        .file_at_commit(&head, crate::GATES_CONFIG_RELPATH)?
-        .ok_or_else(|| {
-            crate::GateConfigError::Missing(repo.root().join(crate::GATES_CONFIG_RELPATH))
-        })?;
+    let text = repo.config_toml_at_commit(&head, "gates")?.ok_or_else(|| {
+        crate::GateConfigError::Missing(repo.root().join(crate::GATES_CONFIG_RELPATH))
+    })?;
     let (gates, mut findings) = parse_doctor_gates(&head, &text)?;
 
     // #170: with no `origin` the coordination key falls back to the main

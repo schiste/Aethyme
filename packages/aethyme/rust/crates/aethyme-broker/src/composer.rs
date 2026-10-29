@@ -191,7 +191,7 @@ const MOVE_WINDOW: usize = 3;
 
 /// The line diff the profile's own rules use. A test keeps the version in
 /// step with Cargo.lock.
-const DIFF_ENGINE: &str = "similar 3.2.0 (Myers, lines)";
+const DIFF_ENGINE: &str = "similar 3.2.1 (Myers, lines)";
 
 const fn field(name: &'static str, kind: FieldKind, required: bool) -> FieldSpec {
     FieldSpec {

@@ -1411,9 +1411,7 @@ pub enum HostResourceRunError {
     },
     #[error("cannot supervise process signals: {0}")]
     Signals(std::io::Error),
-    #[error(
-        "cannot confirm supervised child exit after authority loss: {detail}; lease {lease_id:?} {lease_state}"
-    )]
+    #[error("cannot confirm supervised child exit: {detail}; lease {lease_id:?} {lease_state}")]
     TerminationUnconfirmed {
         lease_id: String,
         lease_state: String,
@@ -3274,12 +3272,43 @@ impl HostResourceCoordinator {
         command: &[String],
         cleanup_command: Option<&str>,
         cwd: &Path,
-        mut prepare_environment: P,
-        mut event: F,
+        prepare_environment: P,
+        event: F,
     ) -> Result<HostResourceRunReport, HostResourceRunError>
     where
         F: FnMut(&str),
         P: FnMut(&HostResourceGrant) -> Result<BTreeMap<String, String>, std::io::Error>,
+    {
+        self.run_supervised_with_environment_observed(
+            request,
+            wait,
+            command,
+            cleanup_command,
+            cwd,
+            prepare_environment,
+            event,
+            |_, _| {},
+        )
+    }
+
+    /// CLI-facing execution path that reports completed wall-clock phases
+    /// without changing the public `HostResourceRunReport` Rust API.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_supervised_with_environment_observed<F, P, O>(
+        &mut self,
+        request: &HostResourceRequest,
+        wait: std::time::Duration,
+        command: &[String],
+        cleanup_command: Option<&str>,
+        cwd: &Path,
+        mut prepare_environment: P,
+        mut event: F,
+        mut observe_phase: O,
+    ) -> Result<HostResourceRunReport, HostResourceRunError>
+    where
+        F: FnMut(&str),
+        P: FnMut(&HostResourceGrant) -> Result<BTreeMap<String, String>, std::io::Error>,
+        O: FnMut(&'static str, u128),
     {
         if command.is_empty() {
             return Err(HostResourceRunError::Resource(
@@ -3288,7 +3317,7 @@ impl HostResourceCoordinator {
         }
         let acquire_started = std::time::Instant::now();
         let mut last_wait_notice = None;
-        let mut grant = self.acquire_with_wait_inner(request, wait, true, |message| {
+        let grant_result = self.acquire_with_wait_inner(request, wait, true, |message| {
             let emit = last_wait_notice.is_none_or(|last: std::time::Instant| {
                 last.elapsed() >= std::time::Duration::from_secs(10)
             });
@@ -3296,55 +3325,65 @@ impl HostResourceCoordinator {
                 event(&format!("waiting: {message}"));
                 last_wait_notice = Some(std::time::Instant::now());
             }
-        })?;
+        });
         let waited_ms = acquire_started.elapsed().as_millis();
+        observe_phase("resource_acquisition", waited_ms);
+        let mut grant = grant_result?;
         event(&format!(
             "granted lease {} generation {} after {}ms",
             grant.lease.lease_id, grant.lease.generation, waited_ms
         ));
 
-        let environment = match prepare_environment(&grant) {
+        let environment_started = std::time::Instant::now();
+        let environment_result = prepare_environment(&grant);
+        observe_phase(
+            "environment_preparation",
+            environment_started.elapsed().as_millis(),
+        );
+        let environment = match environment_result {
             Ok(environment) => environment,
             Err(source) => {
                 crate::warn_unrecorded(
                     "quarantine the host resource lease",
-                    self.quarantine(
-                        &grant.lease.lease_id,
-                        grant.lease.generation,
-                        &grant.ownership_token,
-                    ),
+                    quarantine_run_lease_observed(self, &grant, &mut observe_phase),
                 );
                 return Err(HostResourceRunError::Environment(source));
             }
         };
 
-        let child = spawn_resource_process(command, cwd, &grant, &environment).map_err(|source| {
-            HostResourceRunError::Spawn {
-                program: command[0].clone(),
-                source,
-            }
-        });
-        let mut child = match child {
+        let child_spawn_started = std::time::Instant::now();
+        let child_result =
+            spawn_resource_process(command, cwd, &grant, &environment).map_err(|source| {
+                HostResourceRunError::Spawn {
+                    program: command[0].clone(),
+                    source,
+                }
+            });
+        observe_phase("child_spawn", child_spawn_started.elapsed().as_millis());
+        let mut child = match child_result {
             Ok(child) => child,
             Err(error) => {
                 crate::warn_unrecorded(
                     "quarantine the host resource lease",
-                    self.quarantine(
-                        &grant.lease.lease_id,
-                        grant.lease.generation,
-                        &grant.ownership_token,
-                    ),
+                    quarantine_run_lease_observed(self, &grant, &mut observe_phase),
                 );
                 return Err(error);
             }
         };
-        let child_completion = supervise_process(
+        let child_execution_started = std::time::Instant::now();
+        let child_completion_result = supervise_process(
             self,
             &mut grant,
             request.ttl_seconds,
             &mut child,
             &mut event,
-        )?;
+            &mut observe_phase,
+        );
+        observe_phase(
+            "child_execution",
+            child_execution_started.elapsed().as_millis(),
+        );
+        let child_completion = child_completion_result?;
         let child_signal = exit_signal(&child_completion.status);
         let child_exit_code = portable_exit_code(&child_completion.status);
 
@@ -3359,6 +3398,7 @@ impl HostResourceCoordinator {
         }
         if let Some(cleanup) = cleanup_command {
             if child_group_absent {
+                let cleanup_started = std::time::Instant::now();
                 event("running exact cleanup command");
                 let cleanup_argv = vec!["sh".to_string(), "-c".to_string(), cleanup.to_string()];
                 let cleanup_child =
@@ -3371,24 +3411,24 @@ impl HostResourceCoordinator {
                 let mut cleanup_child = match cleanup_child {
                     Ok(child) => child,
                     Err(error) => {
+                        observe_phase("cleanup_execution", cleanup_started.elapsed().as_millis());
                         crate::warn_unrecorded(
                             "quarantine the host resource lease",
-                            self.quarantine(
-                                &grant.lease.lease_id,
-                                grant.lease.generation,
-                                &grant.ownership_token,
-                            ),
+                            quarantine_run_lease_observed(self, &grant, &mut observe_phase),
                         );
                         return Err(error);
                     }
                 };
-                let cleanup_completion = supervise_process(
+                let cleanup_completion_result = supervise_process(
                     self,
                     &mut grant,
                     request.ttl_seconds,
                     &mut cleanup_child,
                     &mut event,
-                )?;
+                    &mut observe_phase,
+                );
+                observe_phase("cleanup_execution", cleanup_started.elapsed().as_millis());
+                let cleanup_completion = cleanup_completion_result?;
                 cleanup_exit_code = Some(portable_exit_code(&cleanup_completion.status));
                 let cleanup_group_absent =
                     cleanup_completion.process_group == ProcessGroupObservation::Absent;
@@ -3407,19 +3447,25 @@ impl HostResourceCoordinator {
         }
 
         let authority_lost = grant.lease.state != HostLeaseState::Active;
-        let final_lease = if lifecycle_safe && !authority_lost {
+        let finalization_started = std::time::Instant::now();
+        let final_lease_result = if lifecycle_safe && !authority_lost {
             self.release_supervised_verified(
                 &grant.lease.lease_id,
                 grant.lease.generation,
                 &grant.ownership_token,
-            )?
+            )
         } else {
             self.quarantine(
                 &grant.lease.lease_id,
                 grant.lease.generation,
                 &grant.ownership_token,
-            )?
+            )
         };
+        observe_phase(
+            "lease_finalization",
+            finalization_started.elapsed().as_millis(),
+        );
+        let final_lease = final_lease_result?;
         event(match final_lease.state {
             HostLeaseState::Released => "released resource bundle",
             HostLeaseState::Quarantined => "quarantined resource bundle; reconciliation required",
@@ -3760,22 +3806,38 @@ where
     }
 }
 
-fn quarantine_unconfirmed_termination<F>(
+fn quarantine_run_lease_observed<O>(
+    coordinator: &mut HostResourceCoordinator,
+    grant: &HostResourceGrant,
+    observe_phase: &mut O,
+) -> Result<HostResourceLease, HostResourceError>
+where
+    O: FnMut(&'static str, u128),
+{
+    let started = std::time::Instant::now();
+    let result = coordinator.quarantine(
+        &grant.lease.lease_id,
+        grant.lease.generation,
+        &grant.ownership_token,
+    );
+    observe_phase("lease_finalization", started.elapsed().as_millis());
+    result
+}
+
+fn quarantine_unconfirmed_termination<F, O>(
     coordinator: &mut HostResourceCoordinator,
     grant: &mut HostResourceGrant,
     detail: String,
     event: &mut F,
+    observe_phase: &mut O,
 ) -> HostResourceRunError
 where
     F: FnMut(&str),
+    O: FnMut(&'static str, u128),
 {
     let lease_id = grant.lease.lease_id.clone();
     grant.lease.state = HostLeaseState::Quarantined;
-    let lease_state = match coordinator.quarantine(
-        &grant.lease.lease_id,
-        grant.lease.generation,
-        &grant.ownership_token,
-    ) {
+    let lease_state = match quarantine_run_lease_observed(coordinator, grant, observe_phase) {
         Ok(lease) => {
             grant.lease = lease;
             grant.lease.state.as_str().to_string()
@@ -3783,7 +3845,7 @@ where
         Err(error) => format!("quarantine could not be confirmed: {error}"),
     };
     event(&format!(
-        "supervised child status unavailable after authority loss; lease {lease_id} {lease_state}"
+        "supervised child status unavailable; lease {lease_id} {lease_state}"
     ));
     HostResourceRunError::TerminationUnconfirmed {
         lease_id,
@@ -3916,28 +3978,36 @@ fn spawn_resource_process(
     })
 }
 
-fn supervise_process<F>(
+fn supervise_process<F, O>(
     coordinator: &mut HostResourceCoordinator,
     grant: &mut HostResourceGrant,
     ttl_seconds: u64,
     process: &mut ResourceChild,
     event: &mut F,
+    observe_phase: &mut O,
 ) -> Result<SupervisedProcessCompletion, HostResourceRunError>
 where
     F: FnMut(&str),
+    O: FnMut(&'static str, u128),
 {
     let renewal_interval = std::time::Duration::from_secs((ttl_seconds / 3).max(1));
     let mut next_renewal = std::time::Instant::now() + renewal_interval;
     loop {
-        if let Some(status) =
-            process
-                .child
-                .try_wait()
-                .map_err(|source| HostResourceRunError::Spawn {
-                    program: "supervised child".into(),
-                    source,
-                })?
-        {
+        let status = match process.child.try_wait() {
+            Ok(status) => status,
+            Err(source) => {
+                return Err(quarantine_unconfirmed_termination(
+                    coordinator,
+                    grant,
+                    format!(
+                        "failed to observe child exit; the child may still be running: {source}"
+                    ),
+                    event,
+                    observe_phase,
+                ));
+            }
+        };
+        if let Some(status) = status {
             return Ok(process_completion(process, status));
         }
         #[cfg(unix)]
@@ -3986,6 +4056,7 @@ where
                                     AUTHORITY_LOSS_KILL_GRACE.as_millis()
                                 ),
                                 event,
+                                observe_phase,
                             ));
                         }
                         Err(source) => {
@@ -3994,6 +4065,7 @@ where
                                 grant,
                                 format!("failed to observe child exit: {source}"),
                                 event,
+                                observe_phase,
                             ));
                         }
                     };
@@ -8098,6 +8170,79 @@ mod tests {
     }
 
     #[test]
+    fn environment_failure_records_finalization_and_keeps_capacity_quarantined() {
+        let t = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let request = req("environment-failure-phases", vec![exclusive("environment")]);
+        let mut phases = Vec::new();
+        let error = coordinator
+            .run_supervised_with_environment_observed(
+                &request,
+                std::time::Duration::ZERO,
+                &[t.path()
+                    .join("nonexistent-child")
+                    .to_string_lossy()
+                    .into_owned()],
+                None,
+                t.path(),
+                |_| Err(std::io::Error::other("deliberate environment failure")),
+                |_| {},
+                |phase, _| phases.push(phase),
+            )
+            .unwrap_err();
+        assert!(matches!(error, HostResourceRunError::Environment(_)));
+        assert_eq!(
+            phases,
+            [
+                "resource_acquisition",
+                "environment_preparation",
+                "lease_finalization"
+            ]
+        );
+        assert_eq!(
+            coordinator.list(false).unwrap()[0].state,
+            HostLeaseState::Quarantined
+        );
+    }
+
+    #[test]
+    fn spawn_failure_records_finalization_and_keeps_capacity_quarantined() {
+        let t = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let request = req("spawn-failure-phases", vec![exclusive("spawn")]);
+        let mut phases = Vec::new();
+        let error = coordinator
+            .run_supervised_with_environment_observed(
+                &request,
+                std::time::Duration::ZERO,
+                &[t.path()
+                    .join("nonexistent-child")
+                    .to_string_lossy()
+                    .into_owned()],
+                None,
+                t.path(),
+                |_| Ok(BTreeMap::new()),
+                |_| {},
+                |phase, _| phases.push(phase),
+            )
+            .unwrap_err();
+        assert!(matches!(error, HostResourceRunError::Spawn { .. }));
+        assert_eq!(
+            phases,
+            [
+                "resource_acquisition",
+                "environment_preparation",
+                "child_spawn",
+                "lease_finalization"
+            ]
+        );
+        assert_eq!(
+            coordinator.list(false).unwrap()[0].state,
+            HostLeaseState::Quarantined
+        );
+    }
+
+    #[test]
     fn unconfirmed_authority_loss_termination_quarantines_without_a_status() {
         let t = tempfile::tempdir().unwrap();
         let mut coordinator = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
@@ -8108,12 +8253,15 @@ mod tests {
         let mut grant = coordinator.acquire(&request).unwrap();
         let mut events = Vec::new();
 
+        let mut phases = Vec::new();
         let error = quarantine_unconfirmed_termination(
             &mut coordinator,
             &mut grant,
             "the child status remained unavailable after bounded TERM/KILL waits".into(),
             &mut |message| events.push(message.to_string()),
+            &mut |phase, _| phases.push(phase),
         );
+        assert_eq!(phases, ["lease_finalization"]);
 
         assert!(matches!(
             error,

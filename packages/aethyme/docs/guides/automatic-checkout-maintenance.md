@@ -1,6 +1,6 @@
 # Automatic checkout maintenance
 
-Last Updated: 2026-10-28
+Last Updated: 2026-10-29
 
 A session becoming closed and its checkout being removed are separate steps.
 Idle-session retirement makes a checkout eligible for later inspection; it does
@@ -31,6 +31,33 @@ Retirement runs in bounded pages with a durable cursor, so an old backlog does
 not require one unbounded foreground pass. Unreadable retention configuration
 keeps sessions open and reports a deferral. Recent activity and active holders
 remain protected regardless of a session's position in the page.
+
+## Compact closed checkouts
+
+Compacting a closed checkout writes and verifies a recovery archive before
+removing the checkout. It is a separate opt-in from ordinary grace-based
+removal and is disabled by default:
+
+```toml
+[retention]
+compact_closed_worktrees = true
+```
+
+The background lane only considers a closed, broker-spawned checkout with a
+current ownership witness and a complete, unchanged checkout cohort. Live
+session records, explicit keep markers, active use, or incomplete inventory
+defer the attempt. Adopted and legacy rows without an original ownership
+witness require an explicit reviewed retirement plan; the broker does not
+invent a witness for an existing directory.
+
+This opt-in can compact a checkout during its ordinary 15-day grace period.
+Every retirement archive records a minimum retention floor of at least 15 days
+and at least the configured `closed_worktree_grace_hours`, measured from the
+archive's recorded creation time. The floor is stored in the archive receipt
+and manifest, so lowering policy later or landing the commits does not shorten
+an existing archive's protection. Keep archives until their recovery purpose
+has been fulfilled. A bounded background attempt may defer when it lacks enough
+remaining time; an incomplete archive is never permission to remove a checkout.
 
 ## Ignored folders
 

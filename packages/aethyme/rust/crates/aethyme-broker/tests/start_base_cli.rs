@@ -74,11 +74,34 @@ fn commit_file(repo: &Path, name: &str, message: &str) -> String {
     git_output(repo, &["rev-parse", "HEAD"])
 }
 
-/// Point `origin/main` at `commit` and make `main` track it, without a real
-/// remote, so the fetched default branch resolves.
+/// Point a real local bare origin at `commit` and make `main` track it.
+/// Fetch freshness is independent of movement of the primary checkout.
 fn track_origin_main(repo: &Path, commit: &str) {
     git(repo, &["update-ref", "refs/remotes/origin/main", commit]);
-    git(repo, &["config", "remote.origin.url", "."]);
+    // A separate local remote makes a successful fetch independent of any
+    // automatic movement of the primary checkout. The old self-remote fixture
+    // made those unrelated operations accidentally depend on one another.
+    let remote = repo.join(".git/test-origin.git");
+    if !remote.exists() {
+        git(
+            repo,
+            &["clone", "--bare", "--shared", ".", remote.to_str().unwrap()],
+        );
+    }
+    git(
+        repo,
+        &[
+            "--git-dir",
+            remote.to_str().unwrap(),
+            "update-ref",
+            "refs/heads/main",
+            commit,
+        ],
+    );
+    git(
+        repo,
+        &["config", "remote.origin.url", remote.to_str().unwrap()],
+    );
     git(
         repo,
         &[
@@ -239,6 +262,128 @@ fn without_integration_the_fetched_default_beats_a_stale_local_main() {
     ));
     assert_eq!(value["start_base"]["commit"], upstream, "{value:#}");
     assert_eq!(value["start_base"]["evidence"], "fetched_default_branch");
+    assert_eq!(git_output(tmp.path(), &["rev-parse", "HEAD"]), local);
+    assert!(
+        !tmp.path().join("upstream.txt").exists(),
+        "starting a new worktree must not update the primary checkout"
+    );
+}
+
+#[test]
+fn start_preserves_dirty_primary_and_reports_observed_phases() {
+    let tmp = fixture();
+    let head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    track_origin_main(tmp.path(), &head);
+    std::fs::write(tmp.path().join("README.md"), "operator changes\n").unwrap();
+    std::fs::write(tmp.path().join("operator-notes.txt"), "keep me\n").unwrap();
+    let output = run(
+        tmp.path(),
+        &["start", "--task", "isolated fresh startup", "--json"],
+    );
+    let value = json(&output);
+    assert_eq!(value["start_base"]["fetched"], true);
+    assert_eq!(
+        std::fs::read(tmp.path().join("README.md")).unwrap(),
+        b"operator changes\n"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("operator-notes.txt")).unwrap(),
+        b"keep me\n"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("left the main checkout unchanged"),
+        "new session startup must not scan or reconcile the unrelated primary checkout"
+    );
+    let phases = &value["phase_timings_ms"];
+    for name in [
+        "broker_open",
+        "upstream_fetch",
+        "base_selection",
+        "lifecycle_lock_wait",
+        "checkout_count",
+        "worktree_root",
+        "storage_admission",
+        "git_worktree_add",
+        "session_registration",
+        "preparation_status",
+        "session_allocation",
+        "response_preparation",
+        "total_before_output",
+    ] {
+        assert!(
+            phases[name].as_u64().is_some(),
+            "missing numeric phase {name}: {value:#}"
+        );
+    }
+    assert!(
+        phases["total_before_output"].as_u64().unwrap()
+            >= phases["session_allocation"].as_u64().unwrap()
+    );
+}
+
+#[test]
+fn reuse_flag_as_task_text_still_creates_an_independent_checkout() {
+    let tmp = fixture();
+    std::fs::write(tmp.path().join("README.md"), "operator changes\n").unwrap();
+    let output = run(tmp.path(), &["start", "--task", "--reuse", "--json"]);
+    let value = json(&output);
+    assert!(value["phase_timings_ms"].is_object());
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("left the main checkout unchanged"),
+        "an option consumed as task text is not an adoption flag"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("README.md")).unwrap(),
+        b"operator changes\n"
+    );
+}
+
+#[test]
+fn adopt_reuse_and_replace_stale_keep_primary_maintenance() {
+    for flag in ["--adopt", "--reuse", "--replace-stale"] {
+        let tmp = fixture();
+        std::fs::write(tmp.path().join("README.md"), "operator changes\n").unwrap();
+        let output = run(
+            tmp.path(),
+            &["start", flag, "--task", "existing checkout", "--json"],
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("left the main checkout unchanged"),
+            "existing-checkout flag {flag} must retain primary maintenance: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("README.md")).unwrap(),
+            b"operator changes\n"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn start_attributes_post_checkout_hook_delay_to_git_worktree_add() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = fixture();
+    let hooks = tmp.path().join(".git/hooks");
+    git(
+        tmp.path(),
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
+    let hook = tmp.path().join(".git/hooks/post-checkout");
+    std::fs::write(&hook, "#!/bin/sh\nsleep 0.2\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let value = json(&run(
+        tmp.path(),
+        &["start", "--task", "observe checkout work", "--json"],
+    ));
+    assert!(
+        value["phase_timings_ms"]["git_worktree_add"]
+            .as_u64()
+            .unwrap()
+            >= 100,
+        "checkout hook work must be attributed to checkout, not omitted: {value:#}"
+    );
 }
 
 /// The committed policy on the default branch outranks the working-tree file,

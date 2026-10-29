@@ -456,13 +456,39 @@ fn doctor_inspects_version_before_retention_inventory() {
                 Some(event["argv"].as_array().expect("start has argv").clone())
             })
             .collect::<Vec<_>>();
+        let config_tree_reads = starts
+            .iter()
+            .filter(|argv| {
+                argv.iter().any(|arg| arg == "ls-tree")
+                    && argv
+                        .iter()
+                        .any(|arg| arg.as_str().is_some_and(|arg| arg.ends_with("config.toml")))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !config_tree_reads.is_empty(),
+            "doctor must inspect committed configuration before reporting version: {starts:?}"
+        );
+        for argv in &config_tree_reads {
+            for extension in ["toml", "yaml", "yml"] {
+                let expected = format!(":(literal).aethyme/config.{extension}");
+                assert!(
+                    argv.iter()
+                        .any(|arg| arg.as_str() == Some(expected.as_str())),
+                    "each checked tree read must batch the {expected} candidate: {starts:?}"
+                );
+            }
+        }
         let version = starts
             .iter()
             .position(|argv| argv.iter().any(|arg| arg == "describe"))
             .expect("version inspection describes integration");
         let inventory = starts
             .iter()
-            .position(|argv| argv.iter().any(|arg| arg == "for-each-ref"))
+            .position(|argv| {
+                argv.iter().any(|arg| arg == "for-each-ref")
+                    && argv.iter().any(|arg| arg == "refs/heads/")
+            })
             .expect("retention inventories local branch tips");
         assert!(
             version < inventory,

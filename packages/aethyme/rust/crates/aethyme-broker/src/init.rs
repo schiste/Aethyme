@@ -165,17 +165,26 @@ pub fn certification_facts(repo_hint: &Path) -> Result<CertificationFacts, Broke
     checks.push(check_binary_shadowing());
     checks.push(check_binary_version(&main_root));
 
-    checks.push(if checkout_root.join(".aethyme/gates.toml").exists() {
-        validate_gates(&checkout_root)
-    } else {
-        Check {
-            id: "certify.gates",
-            status: CheckStatus::Warn,
-            detail: "no gates.toml — broker runs conflict-only (no verification); \
+    checks.push(
+        match aethyme_config::resolve_config_path(
+            &checkout_root.join(aethyme_config::CONFIG_DIR),
+            "gates",
+        ) {
+            Ok(Some(_)) => validate_gates(&checkout_root),
+            Ok(None) => Check {
+                id: "certify.gates",
+                status: CheckStatus::Warn,
+                detail: "no gates.toml — broker runs conflict-only (no verification); \
                      `aethyme broker advanced gates draft` can draft one"
-                .into(),
-        }
-    });
+                    .into(),
+            },
+            Err(error) => Check {
+                id: "certify.gates",
+                status: CheckStatus::Fail,
+                detail: format!("cannot safely resolve gates configuration: {error}"),
+            },
+        },
+    );
     checks.push(check_config_valid(&checkout_root));
     checks.push(check_retention_policy(&checkout_root));
     checks.extend(check_enrollment_visibility(&repo, &checkout_root));
@@ -443,11 +452,17 @@ pub fn draft_gates(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
             "gates.draft",
             || draft,
         ),
-        None if checkout_root.join(".aethyme/gates.toml").exists() => Check {
-            id: "gates.draft",
-            status: CheckStatus::Pass,
-            detail: ".aethyme/gates.toml present (never overwritten)".into(),
-        },
+        None if aethyme_config::config_exists(
+            &checkout_root.join(aethyme_config::CONFIG_DIR),
+            "gates",
+        ) =>
+        {
+            Check {
+                id: "gates.draft",
+                status: CheckStatus::Pass,
+                detail: ".aethyme/gates.toml present (never overwritten)".into(),
+            }
+        }
         None => Check {
             id: "gates.draft",
             status: CheckStatus::Warn,
@@ -523,8 +538,10 @@ pub fn guided_init(repo_hint: &Path) -> Result<GuidedInitReport, BrokerOpError> 
     }
     let repo = crate::GitRepo::discover(repo_hint).map_err(BrokerOpError::Git)?;
     let main_root = repo.main_root()?;
-    let had_gates = main_root.join(".aethyme/gates.toml").exists();
-    let had_prepare = main_root.join(".aethyme/prepare.toml").exists();
+    let had_gates =
+        aethyme_config::config_exists(&main_root.join(aethyme_config::CONFIG_DIR), "gates");
+    let had_prepare =
+        aethyme_config::config_exists(&main_root.join(aethyme_config::CONFIG_DIR), "prepare");
     let scaffold = scaffold(repo_hint)?;
     let gates = if had_gates {
         None
@@ -595,21 +612,34 @@ fn check_enrollment_visibility(repo: &crate::GitRepo, checkout_root: &Path) -> V
         },
     };
     let activated = activation.status == CheckStatus::Pass;
-    let checkout = Check {
-        id: "certify.checkout-enrollment",
-        status: if !activated || checkout_root.join(".aethyme/config.toml").exists() {
-            CheckStatus::Pass
-        } else {
-            CheckStatus::Warn
-        },
-        detail: if !activated {
-            "repository is not activated in shared Git metadata".into()
-        } else if checkout_root.join(".aethyme/config.toml").exists() {
-            "this checkout contains the enrollment configuration".into()
-        } else {
-            "repository is enrolled locally, but this checkout does not contain the enrollment commit; do not commit or publish from this checkout"
-                .into()
-        },
+    let checkout = if !activated {
+        Check {
+            id: "certify.checkout-enrollment",
+            status: CheckStatus::Pass,
+            detail: "repository is not activated in shared Git metadata".into(),
+        }
+    } else {
+        match aethyme_config::resolve_config_path(
+            &checkout_root.join(aethyme_config::CONFIG_DIR),
+            "config",
+        ) {
+            Ok(Some(_)) => Check {
+                id: "certify.checkout-enrollment",
+                status: CheckStatus::Pass,
+                detail: "this checkout contains the enrollment configuration".into(),
+            },
+            Ok(None) => Check {
+                id: "certify.checkout-enrollment",
+                status: CheckStatus::Warn,
+                detail: "repository is enrolled locally, but this checkout does not contain the enrollment commit; do not commit or publish from this checkout"
+                    .into(),
+            },
+            Err(error) => Check {
+                id: "certify.checkout-enrollment",
+                status: CheckStatus::Fail,
+                detail: format!("cannot safely resolve enrollment configuration: {error}"),
+            },
+        }
     };
 
     let upstream_ref = repo
@@ -626,7 +656,11 @@ fn check_enrollment_visibility(repo: &crate::GitRepo, checkout_root: &Path) -> V
             status: CheckStatus::Warn,
             detail: "no local remote-default ref is available; fetch and certify again before first publication".into(),
         },
-        (true, Some(reference)) => match repo.path_exists_at(&reference, ".aethyme/config.toml") {
+        (true, Some(reference)) => match aethyme_config::candidate_relpaths("config")
+            .iter()
+            .try_fold(false, |found, relpath| {
+                Ok::<_, crate::GitError>(found || repo.path_exists_at(&reference, relpath)?)
+            }) {
             Ok(true) => Check {
                 id: "certify.upstream-enrollment",
                 status: CheckStatus::Pass,
@@ -650,13 +684,27 @@ fn check_enrollment_visibility(repo: &crate::GitRepo, checkout_root: &Path) -> V
 }
 
 fn check_config_valid(main_root: &Path) -> Check {
-    let path = main_root.join(".aethyme/config.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Check {
-            id: "certify.config",
-            status: CheckStatus::Warn,
-            detail: "no config.toml — defaults apply (auto-promote, aethyme/integration)".into(),
-        };
+    // `.aethyme/config.toml`, `.yaml` or `.yml` (#1223), as TOML text.
+    let text = match aethyme_config::read_config_toml(
+        &main_root.join(aethyme_config::CONFIG_DIR),
+        "config",
+    ) {
+        Ok(Some((_, text))) => text,
+        Ok(None) => {
+            return Check {
+                id: "certify.config",
+                status: CheckStatus::Warn,
+                detail: "no config.toml — defaults apply (auto-promote, aethyme/integration)"
+                    .into(),
+            };
+        }
+        Err(error) => {
+            return Check {
+                id: "certify.config",
+                status: CheckStatus::Fail,
+                detail: format!("config invalid: {error}"),
+            };
+        }
     };
     let value = match text.parse::<toml::Value>() {
         Ok(value) => value,
@@ -1017,12 +1065,46 @@ fn is_executable_file(path: &Path) -> bool {
 
 // ── regulate helpers ─────────────────────────────────────────────────
 
+/// The file already standing in for `path`: itself, or for a `.aethyme`
+/// configuration file any format twin (#1223), so scaffolding a TOML default
+/// never creates a second, ambiguous twin beside a YAML file.
+fn existing_counterpart(
+    path: &Path,
+) -> Result<Option<std::path::PathBuf>, aethyme_config::ConfigSourceError> {
+    let Some(dir) = path.parent() else {
+        return Ok(path.exists().then(|| path.to_path_buf()));
+    };
+    let is_config_dir = dir
+        .file_name()
+        .is_some_and(|name| name == aethyme_config::CONFIG_DIR);
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(path.exists().then(|| path.to_path_buf()));
+    };
+    if is_config_dir
+        && aethyme_config::ConfigFormat::from_path(path).is_some()
+        && aethyme_config::CONFIG_STEMS.contains(&stem)
+    {
+        return aethyme_config::resolve_config_path(dir, stem);
+    }
+    Ok(path.exists().then(|| path.to_path_buf()))
+}
+
 fn ensure_file(path: &Path, id: &'static str, generate: impl FnOnce() -> String) -> Check {
-    if path.exists() {
+    let existing = match existing_counterpart(path) {
+        Ok(existing) => existing,
+        Err(error) => {
+            return Check {
+                id,
+                status: CheckStatus::Fail,
+                detail: format!("cannot safely inspect {} ({})", rel(path), error.code()),
+            };
+        }
+    };
+    if let Some(existing) = existing {
         return Check {
             id,
             status: CheckStatus::Pass,
-            detail: format!("{} present (never overwritten)", rel(path)),
+            detail: format!("{} present (never overwritten)", rel(&existing)),
         };
     }
     if let Some(parent) = path.parent() {
@@ -1614,11 +1696,17 @@ pub fn draft_prepare(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
             "prepare.draft",
             || draft,
         ),
-        None if checkout_root.join(".aethyme/prepare.toml").exists() => Check {
-            id: "prepare.draft",
-            status: CheckStatus::Pass,
-            detail: ".aethyme/prepare.toml present (never overwritten)".into(),
-        },
+        None if aethyme_config::config_exists(
+            &checkout_root.join(aethyme_config::CONFIG_DIR),
+            "prepare",
+        ) =>
+        {
+            Check {
+                id: "prepare.draft",
+                status: CheckStatus::Pass,
+                detail: ".aethyme/prepare.toml present (never overwritten)".into(),
+            }
+        }
         None if detects_any_manifest(checkout_root) => {
             let guidance = prepare_guidance(checkout_root);
             Check {
@@ -1721,8 +1809,10 @@ fn protocol_status(main_root: &Path) -> CheckStatus {
 }
 
 fn broker_is_configured(main_root: &Path) -> bool {
-    main_root.join(".aethyme/config.toml").is_file()
-        || main_root.join(".aethyme/gates.toml").is_file()
+    let dir = main_root.join(aethyme_config::CONFIG_DIR);
+    ["config", "gates"]
+        .iter()
+        .any(|stem| !matches!(aethyme_config::resolve_config_path(&dir, stem), Ok(None)))
 }
 
 fn protocol_detail(main_root: &Path) -> String {
@@ -1745,26 +1835,55 @@ fn protocol_detail(main_root: &Path) -> String {
 
 fn validate_gates(main_root: &Path) -> Check {
     match crate::gates::load_gates(main_root) {
-        Ok(gates) => match crate::GitRepo::discover(main_root)
-            .and_then(|repository| repository.is_tracked(".aethyme/gates.toml"))
-        {
-            Ok(true) => Check {
+        Ok(gates) => match aethyme_config::resolve_config_path(
+            &main_root.join(aethyme_config::CONFIG_DIR),
+            "gates",
+        ) {
+            Ok(Some(path)) => {
+                let Some(name) = path.file_name() else {
+                    return Check {
+                        id: "certify.gates",
+                        status: CheckStatus::Fail,
+                        detail: "cannot determine the resolved gates configuration path".into(),
+                    };
+                };
+                let relpath = format!(
+                    "{}/{name}",
+                    aethyme_config::CONFIG_DIR,
+                    name = name.to_string_lossy()
+                );
+                match crate::GitRepo::discover(main_root)
+                    .and_then(|repository| repository.is_tracked(&relpath))
+                {
+                    Ok(true) => Check {
+                        id: "certify.gates",
+                        status: CheckStatus::Pass,
+                        detail: format!("gates.toml valid — {} gate(s), cheap-first", gates.len()),
+                    },
+                    Ok(false) => Check {
+                        id: "certify.gates",
+                        status: CheckStatus::Warn,
+                        detail: format!(
+                            "gates.toml valid — {} gate(s), but .aethyme/gates.toml is untracked and will be absent from spawned worktrees and submitted trees; review and commit it",
+                            gates.len()
+                        ),
+                    },
+                    Err(error) => Check {
+                        id: "certify.gates",
+                        status: CheckStatus::Fail,
+                        detail: format!("cannot determine whether gates.toml is tracked: {error}"),
+                    },
+                }
+            }
+            Ok(None) => Check {
                 id: "certify.gates",
-                status: CheckStatus::Pass,
-                detail: format!("gates.toml valid — {} gate(s), cheap-first", gates.len()),
-            },
-            Ok(false) => Check {
-                id: "certify.gates",
-                status: CheckStatus::Warn,
-                detail: format!(
-                    "gates.toml valid — {} gate(s), but .aethyme/gates.toml is untracked and will be absent from spawned worktrees and submitted trees; review and commit it",
-                    gates.len()
-                ),
+                status: CheckStatus::Fail,
+                detail: "gates configuration disappeared during validation".into(),
             },
             Err(error) => Check {
                 id: "certify.gates",
                 status: CheckStatus::Fail,
-                detail: format!("cannot determine whether gates.toml is tracked: {error}"),
+                detail: format!("cannot resolve gates configuration for tracking check: {error}"),
             },
         },
         Err(crate::gates::GateConfigError::Missing(_)) => Check {
@@ -1870,5 +1989,43 @@ mod config_key_tests {
             unknown("[worktree_freshness]\nmax_age = 900\n"),
             ["worktree_freshness.max_age"]
         );
+    }
+}
+
+#[cfg(test)]
+mod config_counterpart_tests {
+    use super::{CheckStatus, ensure_file};
+
+    #[test]
+    fn scaffolding_keeps_an_existing_format_twin_without_writing_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join(".aethyme");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let yaml = config_dir.join("config.yaml");
+        let toml = config_dir.join("config.toml");
+        std::fs::write(&yaml, "schema: 1").unwrap();
+
+        let check = ensure_file(&toml, "test.config", || "schema = 2".into());
+
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(std::fs::read(&yaml).unwrap(), b"schema: 1");
+        assert!(!toml.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scaffolding_refuses_an_unresolved_twin_without_writing_toml() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path().join(".aethyme");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        symlink("missing-target", config_dir.join("config.yaml")).unwrap();
+        let toml = config_dir.join("config.toml");
+
+        let check = ensure_file(&toml, "test.config", || "schema = 2".into());
+
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(!toml.exists());
     }
 }

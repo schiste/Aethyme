@@ -262,7 +262,7 @@ fn load_routing_configuration(
     repo: &GitRepo,
     source_commit: &str,
 ) -> Result<RoutingConfiguration, LeaseRoutingExportError> {
-    let Some(text) = repo.file_at_commit(source_commit, ".aethyme/config.toml")? else {
+    let Some(text) = repo.config_toml_at_commit(source_commit, "config")? else {
         return Ok(RoutingConfiguration::default());
     };
     let value = text.parse::<toml::Value>().map_err(|error| {

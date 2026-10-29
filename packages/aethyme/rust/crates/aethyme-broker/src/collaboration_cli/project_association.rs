@@ -30,7 +30,6 @@ use crate::collaboration_state::{
 use super::project::{committed_enrollment, committed_regular_file, is_ancestor};
 use super::{Failure, Output};
 
-const CONFIG_PATH: &str = ".aethyme/config.toml";
 const MAX_POLICY_BYTES: usize = 1024 * 1024;
 const CONFIRM_NEXT: &str = "review the exact association RecordId, then run `aethyme collab project association confirm --peer-repo <path> --confirm <record-id>`";
 const REPROPOSE_NEXT: &str = "move or remove the old `.aethyme/project-association.json`, run `aethyme collab project association propose --peer-repo <path> --write`, then review and confirm the new exact RecordId";
@@ -329,16 +328,9 @@ pub(crate) fn inspect_project(
         .map_err(|error| Failure::domain("git", error.to_string()))?;
     let snapshot = archive::snapshot_of_commit(worktree, &head)
         .map_err(|error| Failure::domain("archive", error.to_string()))?;
-    let config_bytes =
-        committed_regular_file(worktree, &head, &snapshot, CONFIG_PATH, MAX_POLICY_BYTES)?;
-    let config_text = std::str::from_utf8(&config_bytes).map_err(|_| {
-        Failure::refused(
-            "config_unreadable",
-            "committed config is not UTF-8",
-            CONFIRM_NEXT,
-        )
-    })?;
-    let (key, pointer) = committed_enrollment(config_text)?;
+    let config_text =
+        super::project::committed_config_toml(worktree, &head, &snapshot, MAX_POLICY_BYTES)?;
+    let (key, pointer) = committed_enrollment(&config_text)?;
     if pointer != PROJECT_DESCRIPTOR_PATH {
         return Err(Failure::refused(
             "descriptor_pointer_mismatch",
