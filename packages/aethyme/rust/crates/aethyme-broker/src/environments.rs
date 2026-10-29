@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+pub mod activity;
 pub mod cli;
 pub mod compile;
 pub mod drivers;
@@ -34,6 +35,8 @@ pub mod store;
 pub mod supervisor;
 pub mod validate;
 
+#[cfg(test)]
+mod activity_tests;
 #[cfg(test)]
 mod drivers_tests;
 #[cfg(test)]

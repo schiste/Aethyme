@@ -34,6 +34,8 @@ pub const DOWN_SCHEMA: &str = "aethyme.env-down/v1";
 pub const SWEEP_SCHEMA: &str = "aethyme.env-sweep/v1";
 pub const PARK_SCHEMA: &str = "aethyme.env-park/v1";
 pub const WAKE_SCHEMA: &str = "aethyme.env-wake/v1";
+pub const TOUCH_SCHEMA: &str = "aethyme.env-touch/v1";
+pub const PIN_SCHEMA: &str = "aethyme.env-pin/v1";
 
 pub const USAGE: &str = "\
 aethyme env — declared runnable environments per worktree
@@ -89,6 +91,16 @@ Usage:
       component and wait for health. Without capacity it stays parked with
       capacity_timeout; a failed start rolls back to parked. `env up` on a
       parked environment wakes it.
+  aethyme env exec <id> -- <command> [args...]
+      Run a command against the environment: it wakes a parked environment,
+      sets the AETHYME_ENV_* variables (namespace, ports, URLs, receipts),
+      and marks the environment busy for the command's whole life, so it is
+      never parked under a running test. Exits with the command's status.
+  aethyme env touch <id> [--json]
+      Record activity now (an mtime update; no database lock).
+  aethyme env pin <id> --for <seconds> --reason <text> [--json]
+      Keep the environment awake (up to 24 h). `env unpin <id>` ends it.
+      Pins are recorded in the environment's history.
   aethyme env sweep [--json]
       Destroy environments whose worktree no longer exists (from a
       temporary export of their recorded commit) and retry failed destroys
@@ -122,6 +134,7 @@ pub(super) struct Options {
     pub(super) retry: bool,
     pub(super) abandon: bool,
     pub(super) reason: Option<String>,
+    pub(super) pin_seconds: Option<u64>,
 }
 
 pub fn run(args: &[String]) -> u8 {
@@ -131,9 +144,17 @@ pub fn run(args: &[String]) -> u8 {
     };
     // Help anywhere answers help and does nothing else, so the router can
     // pass any `env ... --help` line through unchanged.
-    if command == "help" || args.iter().any(|arg| arg == "-h" || arg == "--help") {
+    if command == "help"
+        || args
+            .iter()
+            .take_while(|arg| *arg != "--")
+            .any(|arg| arg == "-h" || arg == "--help")
+    {
         print!("{USAGE}");
         return exit_status::SUCCESS;
+    }
+    if command == "exec" {
+        return super::operate::run_exec(rest);
     }
     let options = match parse_options(command, rest) {
         Ok(options) => options,
@@ -154,6 +175,9 @@ pub fn run(args: &[String]) -> u8 {
         "sweep" => super::operate::run_sweep(&options),
         "park" => super::operate::run_park(&options),
         "wake" => super::operate::run_wake(&options),
+        "touch" => super::operate::run_touch(&options),
+        "pin" => super::operate::run_pin(&options),
+        "unpin" => super::operate::run_unpin(&options),
         other => Err(Failure {
             code: "unknown_subcommand",
             message: format!("unknown env subcommand {other:?}"),
@@ -198,6 +222,7 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
         retry: false,
         abandon: false,
         reason: None,
+        pin_seconds: None,
     };
     let number = |value: Option<&String>, flag: &str| -> Result<usize, Failure> {
         value
@@ -221,7 +246,15 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
             "--reconfigure" if command == "up" => options.reconfigure = true,
             "--retry" if command == "destroy" => options.retry = true,
             "--abandon" if command == "destroy" => options.abandon = true,
-            "--reason" if command == "destroy" => {
+            "--for" if command == "pin" => {
+                options.pin_seconds = Some(
+                    args.next()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|n| (60..=86_400).contains(n))
+                        .ok_or_else(|| usage("--for needs seconds from 60 to 86400".into()))?,
+                )
+            }
+            "--reason" if matches!(command, "destroy" | "pin") => {
                 options.reason = Some(
                     args.next()
                         .ok_or_else(|| usage("--reason needs text".into()))?
@@ -243,7 +276,16 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
                 if !positional.starts_with('-')
                     && matches!(
                         command,
-                        "status" | "history" | "logs" | "down" | "destroy" | "park" | "wake"
+                        "status"
+                            | "history"
+                            | "logs"
+                            | "down"
+                            | "destroy"
+                            | "park"
+                            | "wake"
+                            | "touch"
+                            | "pin"
+                            | "unpin"
                     )
                     && options.positional.len() < if command == "logs" { 2 } else { 1 } =>
             {

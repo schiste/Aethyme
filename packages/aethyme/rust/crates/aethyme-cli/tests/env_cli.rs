@@ -293,3 +293,51 @@ health = { command = "true", timeout_seconds = 10, interval_ms = 50 }
     let (code, _) = fixture.json(&["env", "down", &env_id]);
     assert_eq!(code, 0);
 }
+
+/// #1213 through the router: `env exec` passes the environment's variables
+/// to the command, propagates its exit status and keeps stdout clean.
+#[test]
+fn exec_runs_a_command_with_the_environment_and_its_status() {
+    let environments = r#"
+schema = 1
+[[profiles]]
+name = "backend"
+[[profiles.components]]
+name = "api"
+runtime = "process"
+listen = true
+start = "exec sleep 300"
+health = { command = "true", timeout_seconds = 10, interval_ms = 50 }
+"#;
+    let fixture = Fixture::new(Some(environments));
+    let (code, up) = fixture.json(&["env", "up", "--wait", "5"]);
+    assert_eq!(code, 0, "{up}");
+    let env_id = up["env_id"].as_str().unwrap().to_string();
+    let port = up["ports"]["api"].as_str().unwrap().to_string();
+    let output = fixture.run(&[
+        "env",
+        "exec",
+        &env_id,
+        "--",
+        "sh",
+        "-c",
+        "printf %s \"$AETHYME_ENV_PORT_API\"",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), port);
+    let failing = fixture.run(&["env", "exec", &env_id, "--", "sh", "-c", "exit 7"]);
+    assert_eq!(
+        failing.status.code(),
+        Some(7),
+        "the command's status is the exit status"
+    );
+    let usage = fixture.run(&["env", "exec", &env_id, "sh"]);
+    assert_eq!(usage.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&usage.stderr).contains("aethyme.env-error/v1"));
+    let (code, _) = fixture.json(&["env", "down", &env_id]);
+    assert_eq!(code, 0);
+}

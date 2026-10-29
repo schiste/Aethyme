@@ -1,4 +1,5 @@
-//! `env up | down | destroy | sweep` (#1211).
+//! `env up | down | destroy | sweep` (#1211), `park | wake` (#1212),
+//! `exec | touch | pin | unpin` (#1213).
 
 use std::time::Duration;
 
@@ -6,8 +7,8 @@ use serde_json::{Value, json};
 
 use super::ENVIRONMENTS_FILE;
 use super::cli::{
-    DOWN_SCHEMA, Failure, Options, Output, PARK_SCHEMA, SWEEP_SCHEMA, UP_SCHEMA, WAKE_SCHEMA,
-    check, compile_context, environment_failure, workspace,
+    DOWN_SCHEMA, Failure, Options, Output, PARK_SCHEMA, PIN_SCHEMA, SWEEP_SCHEMA, TOUCH_SCHEMA,
+    UP_SCHEMA, WAKE_SCHEMA, check, compile_context, environment_failure, workspace,
 };
 use super::compile::{compile, default_profile_name};
 use super::lifecycle::{Lifecycle, LifecycleError, RESERVATION_GRANT, UpOptions, read_grant};
@@ -251,6 +252,170 @@ pub(super) fn run_wake(options: &Options) -> Result<Output, Failure> {
     Ok((value, text, exit_status::SUCCESS))
 }
 
+pub(super) fn run_touch(options: &Options) -> Result<Output, Failure> {
+    let id = required_id(options)?;
+    let (lifecycle, _) = open("env touch", false)?;
+    let record = lifecycle
+        .store
+        .resolve(&id)
+        .map_err(|error| lifecycle_failure(error.into()))?;
+    super::activity::touch(&lifecycle.root, &record.env_id)
+        .map_err(|error| environment_failure(format!("touch {}: {error}", record.env_id)))?;
+    let at = super::activity::now_ms();
+    Ok((
+        json!({ "schema": TOUCH_SCHEMA, "env_id": record.env_id, "at": at }),
+        format!("touched {}\n", record.env_id),
+        exit_status::SUCCESS,
+    ))
+}
+
+pub(super) fn run_pin(options: &Options) -> Result<Output, Failure> {
+    let id = required_id(options)?;
+    let (Some(seconds), Some(reason)) = (options.pin_seconds, options.reason.as_deref()) else {
+        return Err(Failure {
+            code: "usage",
+            message: "env pin needs --for <seconds> and --reason <text>".into(),
+            next_action: "e.g. aethyme env pin <id> --for 3600 --reason \"demo\"".into(),
+            exit: exit_status::USAGE,
+        });
+    };
+    let (mut lifecycle, _) = open("env pin", false)?;
+    let record = lifecycle
+        .pin(&id, Duration::from_secs(seconds), reason)
+        .map_err(lifecycle_failure)?;
+    Ok((
+        json!({
+            "schema": PIN_SCHEMA,
+            "env_id": record.env_id,
+            "pinned_until": record.pinned_until,
+            "reason": record.pin_reason,
+        }),
+        format!("{} pinned until {:?}\n", record.env_id, record.pinned_until),
+        exit_status::SUCCESS,
+    ))
+}
+
+pub(super) fn run_unpin(options: &Options) -> Result<Output, Failure> {
+    let id = required_id(options)?;
+    let (mut lifecycle, _) = open("env unpin", false)?;
+    let record = lifecycle.unpin(&id).map_err(lifecycle_failure)?;
+    Ok((
+        json!({ "schema": PIN_SCHEMA, "env_id": record.env_id, "pinned_until": null }),
+        format!("{} unpinned\n", record.env_id),
+        exit_status::SUCCESS,
+    ))
+}
+
+fn refuse(failure: &Failure) -> u8 {
+    eprintln!(
+        "{}",
+        json!({
+            "schema": super::cli::ERROR_SCHEMA,
+            "code": failure.code,
+            "message": failure.message,
+            "next_action": failure.next_action,
+        })
+    );
+    failure.exit
+}
+
+/// `env exec <id> -- <command...>`: run an agent's command against the
+/// environment. Its stdio is passed through and the exit status is the
+/// command's. A refusal is one `aethyme.env-error/v1` line on stderr, so it
+/// never mixes with the command's own stdout.
+pub(super) fn run_exec(rest: &[String]) -> u8 {
+    let usage = Failure {
+        code: "usage",
+        message: "env exec needs exactly one id, then `--`, then a command".into(),
+        next_action: "e.g. aethyme env exec <id> -- cargo test".into(),
+        exit: exit_status::USAGE,
+    };
+    let Some(split) = rest.iter().position(|arg| arg == "--") else {
+        return refuse(&usage);
+    };
+    let (head, command) = (&rest[..split], &rest[split + 1..]);
+    let (Some(id), Some((program, arguments))) = (head.first(), command.split_first()) else {
+        return refuse(&usage);
+    };
+    if head.len() != 1 {
+        return refuse(&usage);
+    }
+    let (mut lifecycle, _) = match open("env exec", true) {
+        Ok(opened) => opened,
+        Err(failure) => return refuse(&failure),
+    };
+    let record = match lifecycle.store.resolve(id) {
+        Ok(record) if record.phase == super::store::EnvironmentPhase::Parked => {
+            match lifecycle.wake(&record.env_id, Duration::from_secs(300)) {
+                Ok(record) => record,
+                Err(error) => return refuse(&lifecycle_failure(error)),
+            }
+        }
+        Ok(record) if record.phase == super::store::EnvironmentPhase::Active => record,
+        Ok(record) => {
+            return refuse(&Failure {
+                code: "wrong_phase",
+                message: format!("environment {} is {}", record.env_id, record.phase.as_str()),
+                next_action: "run `aethyme env up` first".into(),
+                exit: exit_status::REFUSED,
+            });
+        }
+        Err(error) => return refuse(&lifecycle_failure(error.into())),
+    };
+    let (described, _) = describe(&lifecycle, &record);
+    let mut child = std::process::Command::new(program);
+    child.args(arguments);
+    if let Some(variables) = described["variables"].as_object() {
+        for (key, value) in variables {
+            if let Some(value) = value.as_str() {
+                child.env(key, value);
+            }
+        }
+    }
+    let mut child = match child.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return refuse(&Failure {
+                code: "spawn_failed",
+                message: format!("{program}: {error}"),
+                next_action: "check the command and PATH".into(),
+                exit: exit_status::ENVIRONMENT,
+            });
+        }
+    };
+    // Busy for the command's whole life: never parked under a running test.
+    let marker =
+        super::activity::BusyMarker::register(&lifecycle.root, &record.env_id, child.id() as i32);
+    if let Err(error) = &marker {
+        eprintln!(
+            "warning: aethyme could not mark {} busy: {error}",
+            record.env_id
+        );
+    }
+    crate::warn_unrecorded(
+        "record activity",
+        super::activity::touch(&lifecycle.root, &record.env_id),
+    );
+    let status = child.wait();
+    crate::warn_unrecorded(
+        "record activity",
+        super::activity::touch(&lifecycle.root, &record.env_id),
+    );
+    drop(marker);
+    match status {
+        Ok(status) => status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .unwrap_or(exit_status::FAILED),
+        Err(error) => refuse(&Failure {
+            code: "wait_failed",
+            message: error.to_string(),
+            next_action: "rerun the command".into(),
+            exit: exit_status::ENVIRONMENT,
+        }),
+    }
+}
+
 pub(super) fn run_sweep(_: &Options) -> Result<Output, Failure> {
     let (mut lifecycle, _) = open("env sweep", false)?;
     lifecycle.renew_leases().map_err(lifecycle_failure)?;
@@ -278,6 +443,10 @@ impl super::supervisor::SupervisorWork for LifecycleWork {
         if let Ok((mut lifecycle, _)) = open("supervisor", false) {
             crate::warn_unrecorded("renew environment leases", lifecycle.renew_leases());
             crate::warn_unrecorded("sweep orphaned environments", lifecycle.sweep_orphans());
+            crate::warn_unrecorded(
+                "park idle environments",
+                lifecycle.park_idle(super::activity::now_ms()),
+            );
             // Live environments need renewal even when nothing is moving.
             let live = lifecycle
                 .store

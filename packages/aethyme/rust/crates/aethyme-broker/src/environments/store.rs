@@ -768,6 +768,48 @@ impl EnvironmentStore {
         Ok(())
     }
 
+    pub fn set_pin(
+        &mut self,
+        env_id: &str,
+        until: Option<i64>,
+        reason: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE environments SET pinned_until = ?2, pin_reason = ?3, updated_at = ?4
+             WHERE env_id = ?1",
+            params![env_id, until, reason, now_ms()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(env_id.into()));
+        }
+        Ok(())
+    }
+
+    /// Record an event that is not a phase change (a pin, an idle park's
+    /// reason) in the same history, as a transition from the current phase
+    /// to itself.
+    pub fn note(
+        &mut self,
+        env_id: &str,
+        reason: &str,
+        actor: &str,
+        detail: Option<&serde_json::Value>,
+    ) -> Result<(), StoreError> {
+        let record = self
+            .get(env_id)?
+            .ok_or_else(|| StoreError::NotFound(env_id.into()))?;
+        insert_transition(
+            &self.conn,
+            env_id,
+            Some(record.phase),
+            record.phase,
+            reason,
+            actor,
+            now_ms(),
+            detail,
+        )
+    }
+
     pub fn set_main_root(&mut self, env_id: &str, main_root: &Path) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE environments SET main_root = ?2 WHERE env_id = ?1",

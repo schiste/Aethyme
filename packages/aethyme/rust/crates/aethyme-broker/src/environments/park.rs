@@ -47,7 +47,10 @@ impl Lifecycle {
             .ok_or_else(|| StoreError::NotFound(env_id.into()))?)
     }
 
-    fn bindings_for(&self, record: &EnvironmentRecord) -> Result<Bindings, LifecycleError> {
+    pub(super) fn bindings_for(
+        &self,
+        record: &EnvironmentRecord,
+    ) -> Result<Bindings, LifecycleError> {
         let worktree = record
             .worktree_root
             .clone()
