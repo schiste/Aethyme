@@ -25,6 +25,7 @@ artifacts and their exact source revision are recorded in each signed
 - Interrupted recovery reuses verified archives and bounds incomplete staging to one deterministic per-session location.
 - Lease release-request resolution uses durable event order, preserving an acknowledged result when sibling leases expire.
 - Lease release auditing reserves the SQLite writer before reading its snapshot, avoiding read-to-write upgrade failures between concurrent sessions.
+- Configuration loading, scaffolding and resolution protection preserve policy read errors.
 - The recorded composition diff-engine version matches the locked dependency.
 
 ## [0.8.46] - 2026-10-29
