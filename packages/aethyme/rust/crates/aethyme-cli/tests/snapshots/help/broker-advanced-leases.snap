@@ -18,7 +18,9 @@ exit: 0
       Ask every other session holding a lease on <path> to release it. The
       holder sees the request in broker status with ack/decline commands. A
       holder gone past [leases] stale_grace_minutes is granted against at
-      once; one whose liveness is unknown never is.
+      once; one whose liveness is unknown never is. This is advisory and does
+      not block edits in separate worktrees; inspect the holder's task and
+      relevant diff before requesting coordination.
   aethyme broker advanced leases ack <request-id> --session <holder> [--json]
       Acknowledge a release request: the holder's leases on the path are
       released.

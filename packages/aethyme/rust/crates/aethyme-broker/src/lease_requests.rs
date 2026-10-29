@@ -97,6 +97,8 @@ struct RequestResolution {
     reason: Option<String>,
 }
 
+// Event IDs are the durable event-log order. Timestamps can be backdated to
+// a lease's expires_at, so they must not decide which terminal outcome wins.
 fn record_resolution(
     resolutions: &mut HashMap<i64, RequestResolution>,
     request_id: i64,
@@ -104,9 +106,7 @@ fn record_resolution(
 ) {
     let is_earlier = resolutions
         .get(&request_id)
-        .map(|current| {
-            (candidate.resolved_at, candidate.event_id) < (current.resolved_at, current.event_id)
-        })
+        .map(|current| candidate.event_id < current.event_id)
         .unwrap_or(true);
     if is_earlier {
         resolutions.insert(request_id, candidate);
@@ -267,8 +267,7 @@ pub fn requests(
                         entry.insert(candidate);
                     }
                     std::collections::hash_map::Entry::Occupied(mut entry)
-                        if (candidate.resolved_at, candidate.event_id)
-                            > (entry.get().resolved_at, entry.get().event_id) =>
+                        if candidate.event_id > entry.get().event_id =>
                     {
                         entry.insert(candidate);
                     }
