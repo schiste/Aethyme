@@ -6260,8 +6260,67 @@ mod tests {
     }
 
     #[test]
+    fn retirement_confirmation_survives_forward_delivery_move_before_apply() {
+        let (_owner, repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("retirement forward delivery before apply");
+        let reviewed_plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+
+        let merge = isolated_git_output(
+            &repository,
+            &["merge", "--ff-only", session.branch.as_str()],
+        );
+        assert!(
+            merge.status.success(),
+            "could not advance delivery target: {}",
+            String::from_utf8_lossy(&merge.stderr)
+        );
+        let current_plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        assert_eq!(reviewed_plan.digest, current_plan.digest);
+        assert_ne!(
+            reviewed_plan.delivery_targets,
+            current_plan.delivery_targets
+        );
+        assert!(
+            current_plan
+                .recovery_root_proofs
+                .iter()
+                .all(|proof| proof.available_from_delivery)
+        );
+
+        let outcome = broker
+            .cleanup_resolve_retirement_apply(session.id, &reviewed_plan.digest, false)
+            .unwrap();
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        assert!(!worktree.exists());
+        assert!(!outcome.archive.join(BUNDLE_FILE).exists());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.archive.join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest["schema_version"],
+            PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            manifest["delivery_targets"],
+            serde_json::json!(current_plan.delivery_targets)
+        );
+        for pin in manifest["prerequisite_refs"].as_array().unwrap() {
+            let ref_name = pin["ref_name"].as_str().unwrap();
+            let object_id = pin["object_id"].as_str().unwrap();
+            assert_eq!(
+                git_output(&repository, &["rev-parse", "--verify", ref_name]),
+                object_id
+            );
+        }
+    }
+
+    #[test]
     fn retirement_archive_refuses_backward_delivery_move_and_keeps_prerequisite_pins() {
-        let (_owner, repository, _storage, mut broker, session, worktree, base, _head, _branch) =
+        let (_owner, repository, _storage, mut broker, session, worktree, base, head, branch_ref) =
             closed_unique_commit_fixture("retirement archive backward delivery move");
         let plan = broker
             .cleanup_resolve_retirement_plan(session.id, false)
@@ -6290,9 +6349,14 @@ mod tests {
                 session.id,
                 &plan.digest,
                 move || {
-                    git(
+                    let moved = isolated_git_output(
                         &repository_after_archive,
                         &["update-ref", "refs/heads/main", moved_target.as_str()],
+                    );
+                    assert!(
+                        moved.status.success(),
+                        "could not move the delivery ref: {}",
+                        String::from_utf8_lossy(&moved.stderr)
                     );
                 },
                 sync_archive_directory,
@@ -6326,6 +6390,13 @@ mod tests {
         assert_eq!(
             std::fs::read(worktree.join("preserve.txt")).unwrap(),
             b"uncommitted recovery data\n"
+        );
+        assert_eq!(
+            GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref(&branch_ref)
+                .as_deref(),
+            Some(head.as_str())
         );
         assert!(outcome.archive.is_dir());
 
@@ -6373,6 +6444,201 @@ mod tests {
                 object_id
             );
         }
+    }
+
+    #[test]
+    fn retirement_pins_keep_bundle_prerequisites_after_checkout_removal_and_git_prune() {
+        let (_owner, repository, _storage, mut broker, session, worktree, base, head, branch_ref) =
+            closed_unique_commit_fixture("retirement pinned bundle survives prune");
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        assert!(plan.delivery_targets.contains(&base));
+        assert!(recovery_bundle_required(&plan));
+
+        let outcome = broker
+            .cleanup_resolve_retirement_apply(session.id, &plan.digest, false)
+            .unwrap();
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        assert!(!worktree.exists());
+        assert!(
+            !isolated_git_output(
+                &repository,
+                &["show-ref", "--verify", "--quiet", &branch_ref]
+            )
+            .status
+            .success(),
+            "ordinary spawned cleanup should remove its matching branch"
+        );
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.archive.join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        assert!(outcome.archive.join(BUNDLE_FILE).is_file());
+        let prerequisite_refs = manifest["prerequisite_refs"].as_array().unwrap();
+        assert!(
+            prerequisite_refs
+                .iter()
+                .any(|pin| { pin["object_id"].as_str() == Some(base.as_str()) })
+        );
+
+        let tree = format!("{base}^{{tree}}");
+        let unrelated_root = isolated_git_output(
+            &repository,
+            &["commit-tree", &tree, "-m", "unrelated delivery root"],
+        );
+        assert!(
+            unrelated_root.status.success(),
+            "could not create unrelated delivery root: {}",
+            String::from_utf8_lossy(&unrelated_root.stderr)
+        );
+        let unrelated_root = String::from_utf8(unrelated_root.stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        let moved = isolated_git_output(
+            &repository,
+            &["update-ref", "refs/heads/main", &unrelated_root],
+        );
+        assert!(
+            moved.status.success(),
+            "could not move the delivery ref: {}",
+            String::from_utf8_lossy(&moved.stderr)
+        );
+        let reflogs =
+            isolated_git_output(&repository, &["reflog", "expire", "--expire=now", "--all"]);
+        assert!(
+            reflogs.status.success(),
+            "could not expire old reflogs: {}",
+            String::from_utf8_lossy(&reflogs.stderr)
+        );
+        let pruned = isolated_git_output(&repository, &["gc", "--prune=now"]);
+        assert!(
+            pruned.status.success(),
+            "could not prune unreachable Git objects: {}",
+            String::from_utf8_lossy(&pruned.stderr)
+        );
+        assert!(
+            isolated_git_output(
+                &repository,
+                &["cat-file", "-e", &format!("{base}^{{commit}}")]
+            )
+            .status
+            .success(),
+            "the exact captured prerequisite object must remain reachable through its pin"
+        );
+        assert!(
+            !isolated_git_output(
+                &repository,
+                &["cat-file", "-e", &format!("{head}^{{commit}}")]
+            )
+            .status
+            .success(),
+            "the removed checkout's unlanded commit should be absent from the repository after prune"
+        );
+
+        let owned = broker.owned_recovery_archive(&outcome.archive).unwrap();
+        let captured_targets: Vec<String> =
+            serde_json::from_value(manifest["delivery_targets"].clone()).unwrap();
+        assert_eq!(owned.prerequisite_targets, captured_targets);
+        assert_eq!(
+            owned.prerequisite_refs,
+            serde_json::from_value(manifest["prerequisite_refs"].clone()).unwrap()
+        );
+        assert!(
+            recovery_bundle_required(&plan),
+            "the archived session root still requires the verified bundle"
+        );
+    }
+
+    #[test]
+    fn retirement_missing_or_conflicting_prerequisite_pin_blocks_archive_ownership() {
+        let (_owner, repository, _storage, mut broker, session, _worktree, base, head, _branch) =
+            closed_unique_commit_fixture("retirement pin ownership tampering");
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        let outcome = broker
+            .cleanup_resolve_retirement_apply(session.id, &plan.digest, false)
+            .unwrap();
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        let owned = broker.owned_recovery_archive(&outcome.archive).unwrap();
+        let pin = owned
+            .prerequisite_refs
+            .first()
+            .expect("schema v6 archive has at least one prerequisite pin");
+
+        let removed = isolated_git_output(
+            &repository,
+            &[
+                "update-ref",
+                "-d",
+                pin.ref_name.as_str(),
+                pin.object_id.as_str(),
+            ],
+        );
+        assert!(
+            removed.status.success(),
+            "could not remove the fixture prerequisite ref: {}",
+            String::from_utf8_lossy(&removed.stderr)
+        );
+        assert!(
+            broker.owned_recovery_archive(&outcome.archive).is_err(),
+            "an archive with a missing pin must not be treated as broker-owned"
+        );
+        let scan = broker.recovery_archives().unwrap();
+        assert!(
+            scan.owned
+                .iter()
+                .all(|archive| archive.path != outcome.archive)
+                && scan
+                    .unowned
+                    .iter()
+                    .any(|(path, _)| path == &outcome.archive),
+            "the missing-pin archive must be excluded from GC's owned deletion candidates"
+        );
+
+        let conflicting_oid = if pin.object_id != head { head } else { base };
+        let installed = isolated_git_output(
+            &repository,
+            &[
+                "update-ref",
+                pin.ref_name.as_str(),
+                conflicting_oid.as_str(),
+            ],
+        );
+        assert!(
+            installed.status.success(),
+            "could not install the foreign conflicting ref: {}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let deadline = recovery_bundle_deadline().unwrap();
+        assert!(
+            ensure_recovery_prerequisite_refs_installed(
+                &GitRepo::discover(&repository).unwrap(),
+                &owned.prerequisite_refs,
+                deadline,
+            )
+            .is_err(),
+            "retry must refuse a conflicting pin rather than overwrite it"
+        );
+        assert_eq!(
+            git_output(&repository, &["rev-parse", "--verify", &pin.ref_name]),
+            conflicting_oid
+        );
+        assert!(broker.owned_recovery_archive(&outcome.archive).is_err());
+        let scan = broker.recovery_archives().unwrap();
+        assert!(
+            scan.owned
+                .iter()
+                .all(|archive| archive.path != outcome.archive)
+                && scan
+                    .unowned
+                    .iter()
+                    .any(|(path, _)| path == &outcome.archive),
+            "a conflicting-pin archive must remain outside owned GC deletion candidates"
+        );
+        assert!(outcome.archive.is_dir());
     }
 
     #[test]
