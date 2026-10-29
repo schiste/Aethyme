@@ -209,7 +209,14 @@ fn convert_value(
                     .document
                     .span_at(query)
                     .map(|(start, end)| strip_node_properties(&context.text[start..end]));
-                if source.is_some_and(is_core_integer) {
+                // Without source text (a node reached only through an alias,
+                // whose anchor site was checked), fail closed on any integral
+                // float beyond i64: that is what an out-of-range integer becomes.
+                let widened_integer = match source {
+                    Some(source) => is_core_integer(source),
+                    None => float.fract() == 0.0 && float.abs() >= 9.223_372_036_854_776e18,
+                };
+                if widened_integer {
                     return Err(context.error(
                         location,
                         display,

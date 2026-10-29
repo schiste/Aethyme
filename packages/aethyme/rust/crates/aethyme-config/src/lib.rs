@@ -199,7 +199,7 @@ impl ConfigText {
     pub fn toml_text(&self) -> Result<std::borrow::Cow<'_, str>, ConfigSourceError> {
         match self.format {
             ConfigFormat::Toml => Ok(std::borrow::Cow::Borrowed(&self.text)),
-            ConfigFormat::Yaml => Ok(std::borrow::Cow::Owned(self.parse()?.to_toml_string())),
+            ConfigFormat::Yaml => Ok(std::borrow::Cow::Owned(self.parse()?.to_toml_string()?)),
         }
     }
 
@@ -534,9 +534,16 @@ impl ConfigDocument {
 
     /// The document rendered as TOML text (for consumers that still take
     /// text). Comments and formatting are not preserved.
-    #[must_use]
-    pub fn to_toml_string(&self) -> String {
-        toml::to_string(&self.value).unwrap_or_default()
+    pub fn to_toml_string(&self) -> Result<String, ConfigSourceError> {
+        // Fail closed: a value TOML cannot represent is refused, never
+        // rendered as an empty (policy-free) document.
+        toml::to_string(&self.value).map_err(|error| ConfigSourceError::Invalid {
+            path: self.path.clone(),
+            location: None,
+            key_path: None,
+            code: "config_unrepresentable",
+            message: format!("the configuration cannot be represented as TOML: {error}"),
+        })
     }
 }
 

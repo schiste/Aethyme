@@ -381,3 +381,19 @@ fn stems_and_twins_are_recognised() {
         ]
     );
 }
+
+#[test]
+fn a_value_toml_cannot_serialize_is_refused_not_rendered_empty() {
+    let document = ConfigDocument {
+        format: ConfigFormat::Yaml,
+        path: PathBuf::from("gates.yaml"),
+        value: toml::Value::String("not a table".into()),
+        spans: ConfigSpans::default(),
+    };
+    let error = document.to_toml_string().unwrap_err();
+    assert_eq!(error.code(), "config_unrepresentable");
+    assert!(error.to_string().starts_with("gates.yaml: "), "{error}");
+    // A real document still renders and round-trips.
+    let rendered = yaml("schema: 1\n").unwrap().to_toml_string().unwrap();
+    assert_eq!(rendered.trim(), "schema = 1");
+}
