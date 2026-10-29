@@ -1105,9 +1105,22 @@ impl Broker {
         &self,
         session_id: i64,
         allow_adopted: bool,
+        witness_sha256: Option<&str>,
+        deadline: Instant,
     ) -> Result<CleanupResolvePlan, BrokerOpError> {
-        let context = self.cleanup_resolve_retirement_context()?;
-        self.cleanup_resolve_retirement_plan_with_context(session_id, allow_adopted, &context)
+        let context = self.cleanup_resolve_retirement_context_until(Some(deadline))?;
+        match witness_sha256 {
+            Some(witness_sha256) => self.cleanup_resolve_retirement_plan_with_witness_and_context(
+                session_id,
+                witness_sha256,
+                &context,
+            ),
+            None => self.cleanup_resolve_retirement_plan_with_context(
+                session_id,
+                allow_adopted,
+                &context,
+            ),
+        }
     }
 
     fn cleanup_resolve_plan_with_limits_and_eligibility(
