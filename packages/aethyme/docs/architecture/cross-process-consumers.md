@@ -1087,7 +1087,8 @@ CLI reports also record `broker_open`, `session_allocation`,
 `response_preparation` and `total_before_output`, captured before the success
 response is serialized or printed. Earlier warnings may already have been
 emitted. Human output additionally records `human_render_and_advisories` for
-rendering and advisories after that boundary, then prints the map.
+rendering, declared-scope capture and advisories after that boundary, then
+prints the map.
 The same map is included in the existing command-metric details. Failed
 allocation records only the observed coarse open/allocation phases; missing
 internal phases are unknown, not zero. Sub-millisecond observed phases round
@@ -1102,7 +1103,9 @@ also include router/process launch and teardown. Do not label whole-command
 latency as Git worktree-creation time.
 
 New-session creation no longer scans or fast-forwards the primary checkout.
-It still requires a successful bounded upstream fetch for an implicit base,
-reads committed policy, and checks root identity, storage and path leases.
+When a remote default is configured, an implicit base still requires a
+successful bounded upstream fetch. Repositories without a remote default
+retain their existing local-base behavior. Startup still reads committed
+policy and checks root identity, storage and path leases.
 Adopt/reuse behavior and explicit session sync remain unchanged. Regression
 coverage lives in `aethyme-broker/tests/start_base_cli.rs`.

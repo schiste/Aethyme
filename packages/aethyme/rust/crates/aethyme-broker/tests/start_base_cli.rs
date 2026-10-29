@@ -326,6 +326,11 @@ fn start_preserves_dirty_primary_and_reports_observed_phases() {
 fn start_attributes_post_checkout_hook_delay_to_git_worktree_add() {
     use std::os::unix::fs::PermissionsExt;
     let tmp = fixture();
+    let hooks = tmp.path().join(".git/hooks");
+    git(
+        tmp.path(),
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    );
     let hook = tmp.path().join(".git/hooks/post-checkout");
     std::fs::write(&hook, "#!/bin/sh\nsleep 0.2\n").unwrap();
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
