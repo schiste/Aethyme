@@ -11341,6 +11341,13 @@ mod tests {
         broker
             .close_abandoning_unpushed(session.id, "closed artifact sweep fixture")
             .unwrap();
+        let alias_snapshot = broker.refresh_cleanup_cohort_aliases(None).unwrap();
+        assert!(
+            alias_snapshot.is_some_and(|state| {
+                state.complete && state.pending_dirty_rows == 0 && state.unresolved_rows == 0
+            }),
+            "fixture must finish the bounded closed-checkout alias inventory before the sweep"
+        );
         let cache = worktree.join("target");
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::write(cache.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
