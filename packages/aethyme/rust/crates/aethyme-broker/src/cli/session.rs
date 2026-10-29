@@ -2210,6 +2210,13 @@ fn run_cleanup_resolve_batch(
                     plan.targets.len()
                 );
                 for target in &plan.targets {
+                    if target.already_removed {
+                        out!(
+                            "  session {}: already removed; no new removal",
+                            target.session_id
+                        );
+                        continue;
+                    }
                     match &target.blocker {
                         Some(blocker) => out!(
                             "  session {}: kept — {}",

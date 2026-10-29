@@ -1040,6 +1040,18 @@ fn recovery_batch_resume_skips_removed_targets_but_keeps_recreated_paths() {
         "--archive",
         "--json",
     ];
+    let human_args: Vec<_> = original_set
+        .iter()
+        .copied()
+        .filter(|arg| *arg != "--json")
+        .collect();
+    let human = run(tmp.path(), &human_args);
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        human.contains(&format!("session {first}: already removed; no new removal")),
+        "{human}"
+    );
     let reviewed = json(&run(tmp.path(), &original_set));
     assert_eq!(reviewed["targets"][0]["already_removed"], true);
     assert!(reviewed["targets"][0]["confirmation"].is_null());
