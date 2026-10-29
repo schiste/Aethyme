@@ -21,7 +21,6 @@
 //!   sessions, stress-tested at 20 (see `tests/stress.rs`).
 
 mod advisories;
-pub mod service;
 pub mod agent_hook;
 pub mod analysis_view;
 mod archive_cleanup;
@@ -40,6 +39,7 @@ mod cleanup_audit;
 mod cleanup_batch;
 mod cleanup_resolve;
 mod clock;
+pub mod service;
 /// The shared `.aethyme` configuration loader (#1223): `<stem>.toml`,
 /// `<stem>.yaml` or `<stem>.yml`, exactly one, as one `toml::Value`.
 pub mod config_source {
