@@ -486,30 +486,6 @@ impl BrokerStore {
             .map_err(BrokerError::from)
     }
 
-    pub(crate) fn request_pending_checkout_compactions(
-        &mut self,
-        requested_at_ms: i64,
-    ) -> Result<usize, BrokerError> {
-        Ok(self.conn.execute(
-            "UPDATE closed_checkout_cleanup_requests
-             SET compact_requested_at_ms = requested_at_ms,
-                 compact_retry_after_ms = NULL,
-                 last_progress_at_ms = MAX(last_progress_at_ms, ?1)
-             WHERE compact_requested_at_ms IS NULL
-               AND compact_completed_at_ms IS NULL
-               AND session_id IN (
-                   SELECT id FROM sessions
-                   WHERE origin = 'spawned' AND cleanup_state = 'closed'
-                     AND status IN ('closed', 'cleaned')
-                     AND EXISTS (
-                         SELECT 1 FROM spawned_worktree_instances w
-                         WHERE w.session_id = sessions.id
-                     )
-               )",
-            [requested_at_ms],
-        )?)
-    }
-
     /// Add compact requests for a bounded set of currently retained Spawned
     /// rows. The caller supplies IDs from the keyset path index; this method
     /// rechecks the authoritative session rows in the same write transaction.
