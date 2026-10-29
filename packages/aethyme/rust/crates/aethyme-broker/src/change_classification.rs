@@ -90,6 +90,8 @@ const DEPENDENCY_MANIFESTS: &[&str] = &[
 /// Broker policy: a change here alters what gates run or how reviews route.
 /// Every format twin is listed (#1223): a policy change written in YAML must
 /// route exactly like the TOML one, or YAML support would be a review bypass.
+/// `environments.toml` belongs here: its commands run automatically on park,
+/// wake and destroy, so changing it is changing executable policy (#1209).
 const GATE_POLICY: &[&str] = &[
     ".aethyme/gates.toml",
     ".aethyme/gates.yaml",
@@ -97,6 +99,7 @@ const GATE_POLICY: &[&str] = &[
     ".aethyme/config.toml",
     ".aethyme/config.yaml",
     ".aethyme/config.yml",
+    ".aethyme/environments.toml",
 ];
 
 const WORKFLOWS: &[&str] = &[".github/workflows/**"];
@@ -1219,6 +1222,7 @@ mod tests {
         for path in [
             ".github/workflows/ci.yml",
             ".aethyme/gates.toml",
+            ".aethyme/environments.toml",
             "src/auth/token.rs",
             "db/migrations/001.sql",
         ] {

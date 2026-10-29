@@ -20,6 +20,7 @@ fn main() -> ExitCode {
 
     match command {
         "collab" => collab_unavailable(&args[1..]),
+        "env" => env_unavailable(&args[1..]),
         "broker" | "certify" | "init" | "hook" | "plugin" | "update" | "self-update"
         | "upgrade" => broker_unavailable(),
         "explore" => run_explore(&args[1..]),
@@ -76,6 +77,21 @@ fn collab_unavailable(args: &[String]) -> ExitCode {
     } else {
         eprintln!("Error: {message}");
         eprintln!("next: run aethyme collab on macOS or Linux");
+    }
+    ExitCode::from(3)
+}
+
+/// `aethyme env` keeps its JSON contract on Windows: an
+/// `aethyme.env-error/v1` refusal, exit 3, as on Unix.
+fn env_unavailable(args: &[String]) -> ExitCode {
+    let message = "aethyme env needs the broker, which is not yet supported on Windows";
+    if args.iter().any(|arg| arg == "--json") {
+        println!(
+            "{{\n  \"code\": \"unsupported_platform\",\n  \"message\": \"{message}\",\n  \"next_action\": \"run aethyme env on macOS or Linux\",\n  \"schema\": \"aethyme.env-error/v1\"\n}}"
+        );
+    } else {
+        eprintln!("Error: {message}");
+        eprintln!("next: run aethyme env on macOS or Linux");
     }
     ExitCode::from(3)
 }
