@@ -305,6 +305,8 @@ impl Lifecycle {
         };
         let capacity = match snapshot.capacity_request(self.holder_pid, instance) {
             Some(request) => {
+                // A full `park_lru` pool parks idle victims first (#1215).
+                self.make_room(&snapshot, now_ms())?;
                 let grant = self
                     .coordinator
                     .acquire_with_wait(&request, options.wait, |_| {})?;

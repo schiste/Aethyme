@@ -148,6 +148,7 @@ impl Lifecycle {
         if let Some(request) =
             snapshot.capacity_request(self.holder_pid, record.phase_generation as u64)
         {
+            self.make_room(&snapshot, now_ms())?;
             match self.coordinator.acquire_with_wait(&request, wait, |_| {}) {
                 Ok(grant) => {
                     write_grant(&self.root, &env_id, CAPACITY_GRANT, &grant)?;
