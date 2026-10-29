@@ -99,6 +99,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   validation: formatting only the new file misses reordered `mod` declarations.
   For scoped checks, use `--config skip_children=true` on the parent; retain
   the repository's required formatting check before publishing.
+- New broker modules also affect repository-wide checks beyond their feature
+  tests. Include the testkit's `broker_discarded_results` and `docs_hygiene`
+  targets; report or propagate failures rather than raising discard baselines,
+  and date new maintained docs. Added CLI verbs need reviewed help snapshots
+  and the CLI's `help_snapshots` target, even when command-specific tests pass.
 - Keep latency budgets in versioned machine-readable data. Validate the warning
   policy with deterministic tests; assess elapsed time in dedicated performance
   runs rather than wall-clock assertions in ordinary tests. Match the recorded
