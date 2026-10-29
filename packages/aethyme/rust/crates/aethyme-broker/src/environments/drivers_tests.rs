@@ -112,6 +112,17 @@ fn python_available() -> bool {
 }
 
 #[test]
+fn http_probe_reports_socket_timeout_configuration_errors() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let mut stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+
+    match super::drivers::probe_http(&mut stream, "/", Duration::ZERO) {
+        Health::NotYet(reason) => assert!(reason.contains("read timeout"), "{reason}"),
+        Health::Healthy => panic!("an invalid socket timeout must not pass the probe"),
+    }
+}
+
+#[test]
 fn process_conformance_start_health_stop_start_destroy_leaves_nothing() {
     if !python_available() {
         eprintln!("SKIP process conformance: python3 not available");
@@ -387,6 +398,33 @@ args = ["sleep", "300"]
     driver.stop(&ctx, &first).unwrap();
     driver.destroy(&ctx, Some(&first)).unwrap();
     assert_eq!(driver.observe(&ctx, &first), Observation::Gone);
+}
+
+#[test]
+fn container_destroy_reports_secret_file_removal_failure() {
+    let text = r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "box"
+runtime = "container"
+image = "alpine:3.20"
+"#;
+    let harness = Harness::new(text, "p");
+    let ctx = harness.ctx("box");
+    std::fs::create_dir_all(&ctx.directory).unwrap();
+    let secret_path = ctx.directory.join("box.env");
+    std::fs::create_dir(&secret_path).unwrap();
+
+    let error = driver_for(ctx.component.runtime)
+        .destroy(&ctx, None)
+        .expect_err("failed secret cleanup must be reported");
+    assert!(matches!(error, DriverError::Io { .. }), "{error:?}");
+    assert!(
+        secret_path.is_dir(),
+        "the blocked secret path remains visible"
+    );
 }
 
 #[test]

@@ -200,14 +200,25 @@ fn probe_spec(ctx: &DriverContext<'_>, spec: &HealthSpec) -> Health {
     let Some(path) = &spec.http else {
         return Health::Healthy;
     };
-    let _ = stream.set_read_timeout(Some(PROBE_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(PROBE_TIMEOUT));
+    probe_http(&mut stream, path, PROBE_TIMEOUT)
+}
+
+pub(super) fn probe_http(stream: &mut TcpStream, path: &str, timeout: Duration) -> Health {
+    if let Err(error) = stream.set_read_timeout(Some(timeout)) {
+        return Health::NotYet(format!("set read timeout: {error}"));
+    }
+    if let Err(error) = stream.set_write_timeout(Some(timeout)) {
+        return Health::NotYet(format!("set write timeout: {error}"));
+    }
     let request = format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
     if let Err(error) = stream.write_all(request.as_bytes()) {
         return Health::NotYet(format!("send: {error}"));
     }
     let mut head = [0u8; 64];
-    let read = stream.read(&mut head).unwrap_or(0);
+    let read = match stream.read(&mut head) {
+        Ok(read) => read,
+        Err(error) => return Health::NotYet(format!("read: {error}")),
+    };
     let line = String::from_utf8_lossy(&head[..read]);
     match line
         .split_whitespace()
@@ -293,7 +304,7 @@ impl Driver for ProcessDriver {
         // Reap the child whenever it exits so it never lingers as a zombie of
         // a long-lived parent (the supervisor). Identity outlives the handle.
         std::thread::spawn(move || {
-            let _ = child.wait();
+            crate::warn_unrecorded("reap environment component process", child.wait());
         });
         match identity {
             Some(identity) => Ok(ComponentIdentity::Process(identity)),
@@ -393,6 +404,14 @@ fn mismatched(ctx: &DriverContext<'_>, identity: &ComponentIdentity) -> DriverEr
     DriverError::Unproven {
         component: ctx.component.name.clone(),
         detail: format!("recorded identity {identity:?} does not belong to this runtime"),
+    }
+}
+
+fn remove_file_if_present(path: &Path, what: impl Into<String>) -> Result<(), DriverError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io(what)(error)),
     }
 }
 
@@ -651,10 +670,11 @@ impl Driver for ComposeDriver {
         if let Some(text) = &ctx.component.commands.destroy {
             ctx.hook("destroy", text)?;
         }
-        let _ = std::fs::remove_file(
-            ctx.directory
+        remove_file_if_present(
+            &ctx.directory
                 .join(format!("{}.compose-labels.yml", ctx.component.name)),
-        );
+            format!("remove generated compose labels for {}", ctx.component.name),
+        )?;
         Ok(())
     }
 
@@ -783,7 +803,10 @@ impl Driver for ContainerDriver {
                 }
             }
         }
-        let _ = std::fs::remove_file(ctx.directory.join(format!("{}.env", ctx.component.name)));
+        remove_file_if_present(
+            &ctx.directory.join(format!("{}.env", ctx.component.name)),
+            format!("remove environment secrets for {}", ctx.component.name),
+        )?;
         if let Some(text) = &ctx.component.commands.destroy {
             ctx.hook("destroy", text)?;
         }

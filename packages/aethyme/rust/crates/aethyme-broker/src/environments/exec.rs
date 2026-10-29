@@ -258,9 +258,9 @@ pub fn parse_receipt(stdout: &str) -> Result<Option<Value>, String> {
 }
 
 pub(crate) fn append_log(log: &Path, text: &str) {
-    if let Ok(mut file) = open_for_append(log, LOG_CAP_BYTES) {
-        let _ = file.write_all(text.as_bytes());
-    }
+    let result =
+        open_for_append(log, LOG_CAP_BYTES).and_then(|mut file| file.write_all(text.as_bytes()));
+    crate::warn_unrecorded("append environment log", result);
 }
 
 pub(crate) fn log_tail(log: &Path) -> String {
