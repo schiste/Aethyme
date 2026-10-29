@@ -410,3 +410,60 @@ fn a_retirement_archive_with_an_inconsistent_creation_time_stays_protected() {
     assert!(rejected[0].contains("retirement"), "{rejected:?}");
     assert!(archive.exists());
 }
+
+#[test]
+fn landed_retirement_head_does_not_hide_an_unlanded_recorded_branch_root() {
+    let tmp = repo();
+    let mut broker = common::open_fixture_repository_path_broker(tmp.path()).unwrap();
+    let session = broker.start_worktree("two archive roots", None).unwrap();
+    let worktree = PathBuf::from(&session.worktree_path);
+    std::fs::write(
+        worktree.join("unique-recorded-root.txt"),
+        b"unlanded recorded work\n",
+    )
+    .unwrap();
+    git(&worktree, &["add", "unique-recorded-root.txt"]);
+    git(&worktree, &["commit", "-qm", "unique recorded root"]);
+    let recorded_tip = git(&worktree, &["rev-parse", "HEAD"]);
+    git(
+        &worktree,
+        &["switch", "-c", "already-delivered-checkout", "main"],
+    );
+    assert_ne!(git(&worktree, &["rev-parse", "HEAD"]), recorded_tip);
+    assert_eq!(
+        git(&worktree, &["rev-parse", "HEAD"]),
+        git(tmp.path(), &["rev-parse", "main"])
+    );
+    broker.close(session.id).unwrap();
+    drop(broker);
+    let id = session.id.to_string();
+    let mut args = vec![
+        "finish",
+        "cleanup",
+        "resolve",
+        &id,
+        "--retire",
+        "--archive",
+        "--json",
+    ];
+    let reviewed = json(&run(tmp.path(), &args));
+    let digest = reviewed["digest"].as_str().unwrap();
+    args.extend(["--confirm", digest]);
+    let outcome = json(&run(tmp.path(), &args));
+    assert_eq!(outcome["worktree_removed"], true);
+    let archive = PathBuf::from(outcome["archive"].as_str().unwrap());
+    age(&archive, 16);
+    let protected = plan(tmp.path());
+    assert!(
+        proposed(&protected).is_empty(),
+        "the recorded root remains unique under the default 30-day archive policy: {protected}"
+    );
+    assert!(unowned(&protected).is_empty(), "{protected}");
+    assert!(archive.exists());
+
+    git(tmp.path(), &["merge", "-q", "--ff-only", &recorded_tip]);
+    let landed = plan(tmp.path());
+    let candidates = proposed(&landed);
+    assert_eq!(candidates.len(), 1, "{landed}");
+    assert_eq!(candidates[0]["landed"], true);
+}

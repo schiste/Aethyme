@@ -1276,6 +1276,11 @@ mod recovery_archive_minimum_age_tests {
             path: "/fixture/archive".into(),
             session_id: 1,
             head: "a".repeat(40),
+            recovery_roots: vec![crate::cleanup_resolve::RecoveryRootProof {
+                ref_name: "HEAD".into(),
+                object_id: "a".repeat(40),
+                available_from_delivery: false,
+            }],
             created_at_ms: 100,
             minimum_archive_retention_ms: Some(1_296_000_000),
             holds_uncommitted: false,
