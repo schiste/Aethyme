@@ -4307,3 +4307,65 @@ mod proposed_tree_tests {
         assert!(!changes[3].requires_resolution);
     }
 }
+
+#[cfg(test)]
+mod yaml_config_tests {
+    use super::{
+        RepositoryCustomizationClassification, classify_gates, migrate_gates_file,
+        yaml_config_blockers,
+    };
+
+    fn repo_with(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".aethyme")).unwrap();
+        for (name, text) in files {
+            std::fs::write(repo.path().join(".aethyme").join(name), text).unwrap();
+        }
+        repo
+    }
+
+    #[test]
+    fn a_yaml_gates_migration_prints_the_patch_and_never_rewrites_the_file() {
+        let original = "# operator comment\ngate:\n  - name: test\n    command: cargo test\n";
+        let repo = repo_with(&[("gates.yaml", original)]);
+        let blockers = yaml_config_blockers(repo.path());
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert!(
+            blockers[0].starts_with("manual_yaml_edit_required: .aethyme/gates.yaml"),
+            "{}",
+            blockers[0]
+        );
+        assert!(blockers[0].contains("+schema: 1"), "{}", blockers[0]);
+
+        // Whatever apply would do, the YAML file is untouched and no TOML
+        // twin is drafted beside it.
+        let classification = classify_gates(repo.path()).unwrap();
+        migrate_gates_file(repo.path(), classification, None).unwrap();
+        migrate_gates_file(
+            repo.path(),
+            RepositoryCustomizationClassification::Missing,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join(".aethyme/gates.yaml")).unwrap(),
+            original
+        );
+        assert!(!repo.path().join(".aethyme/gates.toml").exists());
+    }
+
+    #[test]
+    fn current_yaml_gates_need_no_edit_and_twins_block() {
+        let repo = repo_with(&[(
+            "gates.yml",
+            "schema: 1\ngate:\n  - name: test\n    command: cargo test\n",
+        )]);
+        assert!(yaml_config_blockers(repo.path()).is_empty());
+        std::fs::write(repo.path().join(".aethyme/gates.toml"), "schema = 1\n").unwrap();
+        let blockers = yaml_config_blockers(repo.path());
+        assert!(
+            blockers[0].contains("gates.toml") && blockers[0].contains("gates.yml"),
+            "{blockers:?}"
+        );
+    }
+}
