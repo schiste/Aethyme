@@ -564,10 +564,12 @@ fn refreshing_unchanged_implicit_leases_does_not_emit_release_events() {
     assert_eq!(refreshed.len(), 1);
     assert_eq!(refreshed[0].id, first[0].id);
     assert!(refreshed[0].released_at.is_none());
-    assert!(store
-        .events_after_filtered(0, 100, Some("lease.released"))
-        .unwrap()
-        .is_empty());
+    assert!(
+        store
+            .events_after_filtered(0, 100, Some("lease.released"))
+            .unwrap()
+            .is_empty()
+    );
 
     store.set_implicit_leases(session.id, &[]).unwrap();
     let releases = store

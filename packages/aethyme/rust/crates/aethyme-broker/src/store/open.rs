@@ -1452,8 +1452,7 @@ impl BrokerStore {
             })?
             .collect::<Result<_, _>>()?
         };
-        let desired: std::collections::BTreeSet<&str> =
-            paths.iter().map(String::as_str).collect();
+        let desired: std::collections::BTreeSet<&str> = paths.iter().map(String::as_str).collect();
         let retained: std::collections::BTreeSet<String> = existing
             .iter()
             .filter(|(_, path, released_at)| {
