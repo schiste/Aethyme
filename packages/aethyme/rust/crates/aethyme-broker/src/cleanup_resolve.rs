@@ -4049,6 +4049,16 @@ fn write_recovery_bundle_to_file(
 ) -> Result<u64, String> {
     let mut command = crate::git::git_command();
     command
+        // Recovery runs alongside live agents; avoid Git's automatic packing
+        // parallelism and bound its delta search/cache memory.
+        .args([
+            "-c",
+            "pack.threads=1",
+            "-c",
+            "pack.windowMemory=32m",
+            "-c",
+            "pack.deltaCacheSize=16m",
+        ])
         .args(["bundle", "create", "-", "HEAD"])
         .args(additional_roots.iter().map(String::as_str))
         .arg("--not")
