@@ -960,6 +960,17 @@ fn a_retained_spawn_record_does_not_own_a_same_repo_checkout_replacement() {
         spawn_generation,
         "the retained witness must not be rebound to the replacement instance"
     );
+    let refreshed = run(&mut broker);
+    assert!(refreshed.removed.is_empty(), "{refreshed:#?}");
+    assert!(
+        kept_reason(&refreshed, &worktree)
+            .contains("worktree instance no longer matches its spawn record")
+    );
+    assert_eq!(
+        persisted_spawn_witness_root_generation(&mut broker, spawned_id),
+        spawn_generation,
+        "a fresh inventory pass must not rebind the original spawn witness"
+    );
     assert!(worktree.join("shared.txt").exists());
     assert!(worktree.exists());
     assert_eq!(
