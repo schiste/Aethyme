@@ -157,6 +157,9 @@ pub enum ReviewReportingError {
         path: String,
         source: toml::de::Error,
     },
+    /// The configuration is ambiguous (two format twins) or invalid YAML.
+    #[error("{0}")]
+    Config(Box<aethyme_config::ConfigSourceError>),
     #[error(
         "{path}: review.reporting schema_version {found} is newer than this broker understands \
          ({supported}); upgrade aethyme or pin the policy"
@@ -190,20 +193,13 @@ impl ReviewReportingPolicy {
     /// dispatching. A repository that wants no reviewers turns off
     /// `[review.routing]`.
     pub fn load(root: &Path) -> Result<Self, ReviewReportingError> {
-        let path = root.join(".aethyme/config.toml");
-        let display = path.display().to_string();
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
-            Err(source) => {
-                return Err(ReviewReportingError::Read {
-                    path: display,
-                    source,
-                });
-            }
+        // `.aethyme/config.toml`, `.yaml` or `.yml` (#1223), as TOML text.
+        let Some((path, text)) =
+            aethyme_config::read_config_toml(&root.join(aethyme_config::CONFIG_DIR), "config")?
+        else {
+            return Ok(Self::default());
         };
+        let display = path.display().to_string();
         let value: toml::Value = text.parse().map_err(|source| ReviewReportingError::Parse {
             path: display.clone(),
             source,
@@ -422,6 +418,12 @@ fn join_with_or(labels: &[&str]) -> String {
         [] => String::new(),
         [only] => (*only).to_string(),
         [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
+impl From<aethyme_config::ConfigSourceError> for ReviewReportingError {
+    fn from(error: aethyme_config::ConfigSourceError) -> Self {
+        Self::Config(Box::new(error))
     }
 }
 

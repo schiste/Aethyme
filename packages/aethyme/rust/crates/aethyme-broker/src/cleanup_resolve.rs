@@ -340,7 +340,7 @@ struct RetirementDigestInputV1<'a> {
     recovery_root_proofs_sha256: &'a str,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RetirementArchiveRecord {
     schema_version: u32,
@@ -1101,6 +1101,28 @@ impl Broker {
         )
     }
 
+    pub(crate) fn cleanup_resolve_retirement_revalidation_plan(
+        &self,
+        session_id: i64,
+        allow_adopted: bool,
+        witness_sha256: Option<&str>,
+        deadline: Instant,
+    ) -> Result<CleanupResolvePlan, BrokerOpError> {
+        let context = self.cleanup_resolve_retirement_context_until(Some(deadline))?;
+        match witness_sha256 {
+            Some(witness_sha256) => self.cleanup_resolve_retirement_plan_with_witness_and_context(
+                session_id,
+                witness_sha256,
+                &context,
+            ),
+            None => self.cleanup_resolve_retirement_plan_with_context(
+                session_id,
+                allow_adopted,
+                &context,
+            ),
+        }
+    }
+
     fn cleanup_resolve_plan_with_limits_and_eligibility(
         &self,
         session_id: i64,
@@ -1381,17 +1403,18 @@ impl Broker {
                 checkout_branch_ref.as_deref(),
                 checkout_branch_tip.as_deref(),
                 delivery_targets,
-            )?
+            )
+            .map_err(refuse)?
         } else {
             Vec::new()
         };
         let recovery_root_proofs_sha256 = if retirement_mode {
-            Some(recovery_root_proofs_sha256(&recovery_root_proofs)?)
+            Some(recovery_root_proofs_sha256(&recovery_root_proofs).map_err(refuse)?)
         } else {
             None
         };
         let delivery_targets_sha256 = if retirement_mode {
-            Some(delivery_targets_sha256(delivery_targets)?)
+            Some(delivery_targets_sha256(delivery_targets).map_err(refuse)?)
         } else {
             None
         };
@@ -1468,7 +1491,7 @@ impl Broker {
             disposition: item.disposition,
             reason: item.reason,
             head,
-            delivery_targets,
+            delivery_targets: delivery_targets.to_vec(),
             landing,
             unlanded_commits,
             staged_patch_bytes,
@@ -2143,6 +2166,7 @@ struct StoredPatch {
 
 /// An archive the broker can vouch for: this repository wrote it, for a
 /// session this repository records.
+#[derive(Debug)]
 pub(crate) struct OwnedRecoveryArchive {
     pub path: PathBuf,
     pub session_id: i64,
@@ -2158,6 +2182,7 @@ pub(crate) struct OwnedRecoveryArchive {
 }
 
 /// This repository's archive directory and what is in it.
+#[derive(Debug)]
 pub(crate) struct RecoveryArchiveScan {
     pub root: PathBuf,
     pub owned: Vec<OwnedRecoveryArchive>,
@@ -5299,7 +5324,7 @@ mod tests {
 
         let legacy_archive = archive(vec![RecoveryRootProof {
             ref_name: "HEAD".into(),
-            object_id: delivered_head,
+            object_id: delivered_head.clone(),
             available_from_delivery: true,
         }]);
         assert!(broker.recovery_archive_landed(&legacy_archive));
@@ -5419,7 +5444,7 @@ mod tests {
 
     #[test]
     fn retirement_content_identity_ignores_disposable_directory_churn_but_binds_files() {
-        let (_owner, _repository, _storage, mut broker, session, _worktree, _base, _head, _branch) =
+        let (_owner, _repository, _storage, broker, session, _worktree, _base, _head, _branch) =
             closed_unique_commit_fixture("retirement source identity classification");
         let plan = broker
             .cleanup_resolve_retirement_plan(session.id, false)
@@ -6915,7 +6940,8 @@ mod tests {
 
         let checkout = GitRepo::discover(repository).unwrap();
         let default_policy = crate::AutoCleanupPolicy::default();
-        let (roots, files) = ignored_inventory(&checkout, repository, &default_policy, 1).unwrap();
+        let (roots, files) =
+            ignored_inventory(&checkout, repository, &default_policy, 1, None).unwrap();
         assert!(roots.iter().any(|root| {
             root.path == "opaque-cache/"
                 && root.classification == IgnoredPathClassification::DisposableDirectory
@@ -6932,7 +6958,7 @@ mod tests {
             strict: true,
             ..Default::default()
         };
-        assert!(ignored_inventory(&checkout, repository, &strict, 1).is_err());
+        assert!(ignored_inventory(&checkout, repository, &strict, 1, None).is_err());
     }
 
     #[cfg(unix)]
@@ -6957,6 +6983,7 @@ mod tests {
             repository,
             &crate::AutoCleanupPolicy::default(),
             1,
+            None,
         )
         .unwrap_err()
         .to_string();

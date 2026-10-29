@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 #[derive(Default)]
 struct Context {
     identities: BTreeMap<(PathBuf, Vec<String>), String>,
-    configurations: BTreeMap<PathBuf, (String, &'static str)>,
+    configurations: BTreeMap<PathBuf, ConfigurationRead>,
 }
 thread_local! {
     static CONTEXT: RefCell<Option<Context>> = const { RefCell::new(None) };
@@ -72,19 +72,27 @@ pub(crate) fn git_identity(
     Ok(value)
 }
 
+/// The repository configuration as TOML text with its source, or why it could
+/// not be resolved (for example both `config.toml` and `config.yaml`).
+pub(crate) type ConfigurationRead =
+    Result<Option<(String, &'static str)>, aethyme_config::ConfigSourceError>;
+
 pub(crate) fn configuration(
     root: &Path,
-    read: impl FnOnce() -> Option<(String, &'static str)>,
-) -> Option<(String, &'static str)> {
+    read: impl FnOnce() -> ConfigurationRead,
+) -> ConfigurationRead {
     if let Some(value) = CONTEXT.with(|context| {
         context
             .borrow()
             .as_ref()
             .and_then(|context| context.configurations.get(root).cloned())
     }) {
-        return Some(value);
+        return value;
     }
-    let value = read()?;
+    let value = read();
+    if matches!(value, Ok(None)) {
+        return value;
+    }
     CONTEXT.with(|context| {
         if let Some(context) = context.borrow_mut().as_mut()
             && context.configurations.len() < 64
@@ -94,7 +102,7 @@ pub(crate) fn configuration(
                 .insert(root.to_path_buf(), value.clone());
         }
     });
-    Some(value)
+    value
 }
 
 #[cfg(test)]
@@ -161,13 +169,15 @@ mod tests {
         let _ = std::panic::catch_unwind(|| {
             with_context(|| {
                 assert_eq!(
-                    configuration(root, || Some(("first".into(), "committed")))
+                    configuration(root, || Ok(Some(("first".into(), "committed"))))
+                        .unwrap()
                         .unwrap()
                         .0,
                     "first"
                 );
                 assert_eq!(
                     configuration(root, || panic!("duplicate config read"))
+                        .unwrap()
                         .unwrap()
                         .0,
                     "first"
@@ -177,7 +187,8 @@ mod tests {
         });
         with_context(|| {
             assert_eq!(
-                configuration(root, || Some(("second".into(), "committed")))
+                configuration(root, || Ok(Some(("second".into(), "committed"))))
+                    .unwrap()
                     .unwrap()
                     .0,
                 "second"

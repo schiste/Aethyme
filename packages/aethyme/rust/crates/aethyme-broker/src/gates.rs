@@ -56,6 +56,9 @@ pub enum GateConfigError {
     Missing(PathBuf),
     #[error("gates.toml: {0}")]
     Parse(String),
+    /// Two format twins, or a YAML file outside the strict subset (#1223).
+    #[error("{0}")]
+    Config(Box<aethyme_config::ConfigSourceError>),
     #[error("gate {gate:?}: invalid trigger glob {glob:?}: {message}")]
     BadGlob {
         gate: String,
@@ -206,10 +209,18 @@ impl Gate {
 
 /// Load and validate `.aethyme/gates.toml`, sorted cheap-first.
 pub fn load_gates(main_root: &Path) -> Result<Vec<Gate>, GateConfigError> {
-    let path = main_root.join(GATES_CONFIG_RELPATH);
-    let text =
-        std::fs::read_to_string(&path).map_err(|_| GateConfigError::Missing(path.clone()))?;
-    parse_gates(&text)
+    // `.aethyme/gates.toml`, `.yaml` or `.yml` (#1223); two twins is an error
+    // naming both, from every command that loads gates.
+    match aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "gates") {
+        Ok(Some((_, text))) => parse_gates(&text),
+        Ok(None) => Err(GateConfigError::Missing(
+            main_root.join(GATES_CONFIG_RELPATH),
+        )),
+        Err(aethyme_config::ConfigSourceError::Read { path, .. }) => {
+            Err(GateConfigError::Missing(path))
+        }
+        Err(error) => Err(GateConfigError::Config(Box::new(error))),
+    }
 }
 
 /// Parse and normalize gate configuration already read from an exact source
@@ -397,7 +408,7 @@ pub fn load_gates_at_commit(
             reference: head.into(),
         })?;
     let text = repo
-        .file_at_commit(&head_sha, GATES_CONFIG_RELPATH)?
+        .config_toml_at_commit(&head_sha, "gates")?
         .ok_or_else(|| GateScopeError::MissingConfiguration {
             head_sha: head_sha.clone(),
             path: GATES_CONFIG_RELPATH.into(),

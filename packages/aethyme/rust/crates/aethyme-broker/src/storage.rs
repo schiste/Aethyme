@@ -4194,7 +4194,7 @@ fn validate_preparation_candidate_shape<'a>(
 }
 
 fn is_enrolled_primary_checkout(path: &Path) -> bool {
-    path.join(".aethyme/config.toml").is_file()
+    aethyme_config::config_exists(&path.join(aethyme_config::CONFIG_DIR), "config")
 }
 
 fn inspect_primary_checkout(

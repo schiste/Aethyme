@@ -2663,7 +2663,7 @@ impl Broker {
             return Ok(false);
         }
 
-        let _deadline = crate::git::limit_git_until(Some(deadline));
+        let _deadline = crate::git::limit_git_until(deadline);
         let checkout = match GitRepo::discover(&canonical_path) {
             Ok(checkout) => checkout,
             Err(_) => return Ok(false),
@@ -4764,6 +4764,8 @@ impl Broker {
                     self.cleanup_resolve_retirement_revalidation_plan(
                         session_id,
                         archive_guard.permits_adopted(),
+                        archived_plan.retirement_witness_sha256.as_deref(),
+                        status_limits.deadline,
                     )?
                 } else {
                     self.cleanup_resolve_revalidation_plan(session_id)?
@@ -5380,7 +5382,7 @@ mod registered_removal_failure_tests {
         collect_orphan_residue, open_directory_at, remove_orphan_residue_pass,
         tracked_tree_contains_directory,
     };
-    use crate::{SessionCleanupState, SessionOrigin, git::with_git_deadline};
+    use crate::{SessionCleanupState, SessionOrigin, SessionStatus, git::with_git_deadline};
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::ffi::CString;
     #[cfg(any(target_os = "linux", target_os = "macos"))]

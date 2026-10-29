@@ -3274,12 +3274,43 @@ impl HostResourceCoordinator {
         command: &[String],
         cleanup_command: Option<&str>,
         cwd: &Path,
-        mut prepare_environment: P,
-        mut event: F,
+        prepare_environment: P,
+        event: F,
     ) -> Result<HostResourceRunReport, HostResourceRunError>
     where
         F: FnMut(&str),
         P: FnMut(&HostResourceGrant) -> Result<BTreeMap<String, String>, std::io::Error>,
+    {
+        self.run_supervised_with_environment_observed(
+            request,
+            wait,
+            command,
+            cleanup_command,
+            cwd,
+            prepare_environment,
+            event,
+            |_, _| {},
+        )
+    }
+
+    /// CLI-facing execution path that reports completed wall-clock phases
+    /// without changing the public `HostResourceRunReport` Rust API.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_supervised_with_environment_observed<F, P, O>(
+        &mut self,
+        request: &HostResourceRequest,
+        wait: std::time::Duration,
+        command: &[String],
+        cleanup_command: Option<&str>,
+        cwd: &Path,
+        mut prepare_environment: P,
+        mut event: F,
+        mut observe_phase: O,
+    ) -> Result<HostResourceRunReport, HostResourceRunError>
+    where
+        F: FnMut(&str),
+        P: FnMut(&HostResourceGrant) -> Result<BTreeMap<String, String>, std::io::Error>,
+        O: FnMut(&'static str, u128),
     {
         if command.is_empty() {
             return Err(HostResourceRunError::Resource(
@@ -3288,7 +3319,7 @@ impl HostResourceCoordinator {
         }
         let acquire_started = std::time::Instant::now();
         let mut last_wait_notice = None;
-        let mut grant = self.acquire_with_wait_inner(request, wait, true, |message| {
+        let grant_result = self.acquire_with_wait_inner(request, wait, true, |message| {
             let emit = last_wait_notice.is_none_or(|last: std::time::Instant| {
                 last.elapsed() >= std::time::Duration::from_secs(10)
             });
@@ -3296,14 +3327,22 @@ impl HostResourceCoordinator {
                 event(&format!("waiting: {message}"));
                 last_wait_notice = Some(std::time::Instant::now());
             }
-        })?;
+        });
         let waited_ms = acquire_started.elapsed().as_millis();
+        observe_phase("resource_acquisition", waited_ms);
+        let mut grant = grant_result?;
         event(&format!(
             "granted lease {} generation {} after {}ms",
             grant.lease.lease_id, grant.lease.generation, waited_ms
         ));
 
-        let environment = match prepare_environment(&grant) {
+        let environment_started = std::time::Instant::now();
+        let environment_result = prepare_environment(&grant);
+        observe_phase(
+            "environment_preparation",
+            environment_started.elapsed().as_millis(),
+        );
+        let environment = match environment_result {
             Ok(environment) => environment,
             Err(source) => {
                 crate::warn_unrecorded(
@@ -3318,13 +3357,16 @@ impl HostResourceCoordinator {
             }
         };
 
-        let child = spawn_resource_process(command, cwd, &grant, &environment).map_err(|source| {
-            HostResourceRunError::Spawn {
-                program: command[0].clone(),
-                source,
-            }
-        });
-        let mut child = match child {
+        let child_spawn_started = std::time::Instant::now();
+        let child_result =
+            spawn_resource_process(command, cwd, &grant, &environment).map_err(|source| {
+                HostResourceRunError::Spawn {
+                    program: command[0].clone(),
+                    source,
+                }
+            });
+        observe_phase("child_spawn", child_spawn_started.elapsed().as_millis());
+        let mut child = match child_result {
             Ok(child) => child,
             Err(error) => {
                 crate::warn_unrecorded(
@@ -3338,13 +3380,19 @@ impl HostResourceCoordinator {
                 return Err(error);
             }
         };
-        let child_completion = supervise_process(
+        let child_execution_started = std::time::Instant::now();
+        let child_completion_result = supervise_process(
             self,
             &mut grant,
             request.ttl_seconds,
             &mut child,
             &mut event,
-        )?;
+        );
+        observe_phase(
+            "child_execution",
+            child_execution_started.elapsed().as_millis(),
+        );
+        let child_completion = child_completion_result?;
         let child_signal = exit_signal(&child_completion.status);
         let child_exit_code = portable_exit_code(&child_completion.status);
 
@@ -3359,6 +3407,7 @@ impl HostResourceCoordinator {
         }
         if let Some(cleanup) = cleanup_command {
             if child_group_absent {
+                let cleanup_started = std::time::Instant::now();
                 event("running exact cleanup command");
                 let cleanup_argv = vec!["sh".to_string(), "-c".to_string(), cleanup.to_string()];
                 let cleanup_child =
@@ -3371,6 +3420,7 @@ impl HostResourceCoordinator {
                 let mut cleanup_child = match cleanup_child {
                     Ok(child) => child,
                     Err(error) => {
+                        observe_phase("cleanup_execution", cleanup_started.elapsed().as_millis());
                         crate::warn_unrecorded(
                             "quarantine the host resource lease",
                             self.quarantine(
@@ -3382,13 +3432,15 @@ impl HostResourceCoordinator {
                         return Err(error);
                     }
                 };
-                let cleanup_completion = supervise_process(
+                let cleanup_completion_result = supervise_process(
                     self,
                     &mut grant,
                     request.ttl_seconds,
                     &mut cleanup_child,
                     &mut event,
-                )?;
+                );
+                observe_phase("cleanup_execution", cleanup_started.elapsed().as_millis());
+                let cleanup_completion = cleanup_completion_result?;
                 cleanup_exit_code = Some(portable_exit_code(&cleanup_completion.status));
                 let cleanup_group_absent =
                     cleanup_completion.process_group == ProcessGroupObservation::Absent;
@@ -3407,19 +3459,25 @@ impl HostResourceCoordinator {
         }
 
         let authority_lost = grant.lease.state != HostLeaseState::Active;
-        let final_lease = if lifecycle_safe && !authority_lost {
+        let finalization_started = std::time::Instant::now();
+        let final_lease_result = if lifecycle_safe && !authority_lost {
             self.release_supervised_verified(
                 &grant.lease.lease_id,
                 grant.lease.generation,
                 &grant.ownership_token,
-            )?
+            )
         } else {
             self.quarantine(
                 &grant.lease.lease_id,
                 grant.lease.generation,
                 &grant.ownership_token,
-            )?
+            )
         };
+        observe_phase(
+            "lease_finalization",
+            finalization_started.elapsed().as_millis(),
+        );
+        let final_lease = final_lease_result?;
         event(match final_lease.state {
             HostLeaseState::Released => "released resource bundle",
             HostLeaseState::Quarantined => "quarantined resource bundle; reconciliation required",

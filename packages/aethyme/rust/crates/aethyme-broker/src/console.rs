@@ -209,7 +209,9 @@ impl ConsoleConfig {
     /// is the common case rather than an error.
     pub fn load(main_root: &Path) -> Self {
         let mut config = Self::default();
-        let Ok(text) = std::fs::read_to_string(main_root.join(".aethyme/config.toml")) else {
+        let Ok(Some((_, text))) =
+            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
+        else {
             return config;
         };
         let Ok(value) = text.parse::<toml::Value>() else {

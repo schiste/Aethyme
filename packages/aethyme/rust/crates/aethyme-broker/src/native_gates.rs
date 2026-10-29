@@ -404,10 +404,25 @@ fn raw_text(repo: &Path, base: &CommitOid, path: &str) -> Result<Option<String>,
 fn optional_sha(text: &Option<String>) -> Option<String> {
     text.as_ref().map(|s| ObjectDigest::of(s.as_bytes()).hex())
 }
+/// A committed `.aethyme/<stem>` in either format (#1223), as TOML text.
+fn config_text(
+    repo: &Path,
+    base: &CommitOid,
+    stem: &str,
+) -> Result<Option<String>, NativeGateError> {
+    aethyme_config::try_read_config_text_with(aethyme_config::CONFIG_DIR, stem, |relpath| {
+        raw_text(repo, base, relpath)
+    })?
+    .and_then(|text| {
+        text.map(|text| text.toml_text().map(|toml| toml.into_owned()))
+            .transpose()
+    })
+    .map_err(|error| NativeGateError::Unsupported(error.to_string()))
+}
 fn policy(repo: &Path, base: &CommitOid) -> Result<Policy, NativeGateError> {
-    let gate = raw_text(repo, base, crate::gates::GATES_CONFIG_RELPATH)?;
-    let graph = raw_text(repo, base, aethyme_graph_storage::GRAPH_CONFIG_RELPATH)?;
-    let prepare = raw_text(repo, base, crate::preparation::PREPARATION_CONFIG_RELPATH)?;
+    let gate = config_text(repo, base, "gates")?;
+    let graph = config_text(repo, base, "config")?;
+    let prepare = config_text(repo, base, "prepare")?;
     let gates = gate
         .as_ref()
         .map(|s| crate::gates::parse_gates(s))

@@ -71,9 +71,17 @@ pub(crate) enum Setting {
 
 /// The setting and where the config came from (`None` without a config).
 pub(crate) fn setting(main_root: &Path) -> (Setting, Option<&'static str>) {
-    match crate::merge::repository_config_with_source(main_root) {
-        Some((text, source)) => (setting_from_text(Some(&text)), Some(source)),
-        None => (Setting::Off, None),
+    match crate::merge::repository_config_checked(main_root) {
+        Ok(Some((text, source))) => (setting_from_text(Some(&text)), Some(source)),
+        Ok(None) => (Setting::Off, None),
+        // An ambiguous or invalid configuration cannot say capture is off.
+        Err(error) => (
+            Setting::Unsupported {
+                code: "config_unresolved",
+                detail: error.to_string(),
+            },
+            None,
+        ),
     }
 }
 

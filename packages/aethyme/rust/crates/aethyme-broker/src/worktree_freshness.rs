@@ -32,8 +32,10 @@ impl Default for WorktreeFreshnessPolicy {
 
 impl WorktreeFreshnessPolicy {
     pub(crate) fn load(main_root: &Path) -> Result<Self, String> {
-        match crate::merge::repository_config_text(main_root) {
-            Some(text) => Self::from_config_text(&text),
+        match crate::merge::repository_config_checked(main_root)
+            .map_err(|error| error.to_string())?
+        {
+            Some((text, _)) => Self::from_config_text(&text),
             None => Ok(Self::default()),
         }
     }

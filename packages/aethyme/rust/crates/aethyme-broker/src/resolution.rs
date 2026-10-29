@@ -1447,7 +1447,19 @@ impl Protection {
             }
         };
         let mut gate_files = BTreeSet::new();
-        if let Some(gates) = read(".aethyme/gates.toml")?
+        // Either format (#1223); an ambiguous or invalid file contributes nothing,
+        // exactly like an unparseable one.
+        let config_toml = |stem: &str| -> Result<Option<String>, ResolutionError> {
+            Ok(aethyme_config::try_read_config_text_with(
+                aethyme_config::CONFIG_DIR,
+                stem,
+                |relpath| read(relpath),
+            )?
+            .ok()
+            .flatten()
+            .and_then(|text| text.toml_text().ok().map(|toml| toml.into_owned())))
+        };
+        if let Some(gates) = config_toml("gates")?
             && let Ok(gates) = crate::gates::parse_gates(&gates)
         {
             for gate in gates {
@@ -1463,7 +1475,7 @@ impl Protection {
             }
         }
         let mut security_patterns = Vec::new();
-        if let Some(config) = read(".aethyme/config.toml")?
+        if let Some(config) = config_toml("config")?
             && let Ok(config) = config.parse::<toml::Table>()
             && let Some(rules) = config
                 .get("review")

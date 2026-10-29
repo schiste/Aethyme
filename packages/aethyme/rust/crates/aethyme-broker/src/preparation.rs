@@ -1129,13 +1129,22 @@ impl Broker {
 }
 
 pub(crate) fn load_config(root: &Path) -> Result<Option<PreparationConfig>, PreparationError> {
-    let path = root.join(PREPARATION_CONFIG_RELPATH);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(PreparationError::Io { path, source }),
-    };
-    parse_config(&text).map(Some)
+    // `.aethyme/prepare.toml`, `.yaml` or `.yml` (#1223), as TOML text.
+    match aethyme_config::read_config_toml(&root.join(aethyme_config::CONFIG_DIR), "prepare") {
+        Ok(Some((_, text))) => parse_config(&text).map(Some),
+        Ok(None) => Ok(None),
+        Err(error) => Err(config_source_error(error)),
+    }
+}
+
+fn config_source_error(error: aethyme_config::ConfigSourceError) -> PreparationError {
+    PreparationError::InvalidConfig {
+        path: error.path().map_or_else(
+            || PREPARATION_CONFIG_RELPATH.into(),
+            |path| path.display().to_string(),
+        ),
+        reason: error.to_string(),
+    }
 }
 
 /// Parse and validate preparation configuration already read from an exact
@@ -1839,7 +1848,14 @@ fn load_config_for_cache_liveness(
         });
     }
     check_liveness_deadline(Some(deadline))?;
-    let path = root.join(PREPARATION_CONFIG_RELPATH);
+    let path = match aethyme_config::resolve_config_path(
+        &root.join(aethyme_config::CONFIG_DIR),
+        "prepare",
+    ) {
+        Ok(Some(path)) => path,
+        Ok(None) => root.join(PREPARATION_CONFIG_RELPATH),
+        Err(error) => return Err(config_source_error(error)),
+    };
     let Some(bytes) = read_bounded_regular_file_for_liveness(
         &path,
         PREPARATION_CACHE_CONFIG_MAX_BYTES,
@@ -1849,7 +1865,10 @@ fn load_config_for_cache_liveness(
         return Ok(None);
     };
     let text = String::from_utf8(bytes).map_err(|error| invalid_config(error.to_string()))?;
-    let config = parse_config(&text)?;
+    let format = aethyme_config::ConfigFormat::from_path(&path)
+        .unwrap_or(aethyme_config::ConfigFormat::Toml);
+    let text = aethyme_config::ConfigText { path, format, text };
+    let config = parse_config(&text.toml_text().map_err(config_source_error)?)?;
     check_liveness_deadline(Some(deadline))?;
     Ok(Some(config))
 }
@@ -5245,6 +5264,27 @@ mod tests {
         assert_eq!(
             preparation_source_digest(root.path(), &config, 1).unwrap(),
             expected
+        );
+    }
+
+    #[test]
+    fn converting_prepare_toml_to_yaml_keeps_the_source_digest() {
+        let text = "schema_version = 1\n\n[[steps]]\nname = \"deps\"\ncommand = [\"sh\", \"-c\", \"true\"]\ninputs = [\"lock.file\"]\noutputs = [\"out/\"]\ncache = \"repository_shared\"\nrequired_for_hooks = false\n";
+        let yaml = "schema_version: 1\nsteps:\n  - name: deps\n    command: [sh, -c, 'true']\n    inputs: [lock.file]\n    outputs: [out/]\n    cache: repository_shared\n    required_for_hooks: false\n";
+        let digest = |name: &str, body: &str| {
+            let root = tempfile::tempdir().unwrap();
+            fs::create_dir_all(root.path().join(".aethyme")).unwrap();
+            fs::write(root.path().join(".aethyme").join(name), body).unwrap();
+            fs::write(root.path().join("lock.file"), b"locked").unwrap();
+            let config = load_config(root.path()).unwrap().unwrap();
+            preparation_source_digest(root.path(), &config, 1).unwrap()
+        };
+        assert_eq!(digest("prepare.toml", text), digest("prepare.yaml", yaml));
+        assert_eq!(digest("prepare.toml", text), digest("prepare.yml", yaml));
+        assert_ne!(
+            digest("prepare.toml", text),
+            digest("prepare.yaml", &yaml.replace("deps", "other")),
+            "content changes still change the digest"
         );
     }
 

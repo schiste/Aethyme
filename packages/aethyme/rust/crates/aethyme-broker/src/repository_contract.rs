@@ -59,10 +59,7 @@ impl RepositoryContract {
             repository_schema: read_repository_schema(repo, mode)?,
             deployment_state_digest: repository_state_digest(repo, mode)?,
             aethyme_version: env!("CARGO_PKG_VERSION").to_string(),
-            gate_definition_digest: file_digest_if_present(
-                repo,
-                crate::gates::GATES_CONFIG_RELPATH,
-            )?,
+            gate_definition_digest: gate_definition_digest(repo)?,
             backfilled,
         })
     }
@@ -159,6 +156,22 @@ fn read_repository_schema(
     let marker: RepositoryMarker = serde_json::from_slice(&bytes)
         .map_err(|error| format!("{relative} is not a valid repository marker: {error}"))?;
     Ok(Some(marker.schema_version))
+}
+
+/// Digest of the gate definitions in whichever format they are written
+/// (#1223): the TOML file's bytes as before, or a YAML file's bytes.
+fn gate_definition_digest(repo: &Path) -> Result<Option<String>, String> {
+    match aethyme_config::resolve_config_path(&repo.join(aethyme_config::CONFIG_DIR), "gates") {
+        Ok(Some(path)) => {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            file_digest_if_present(repo, &format!("{}/{name}", aethyme_config::CONFIG_DIR))
+        }
+        Ok(None) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn file_digest_if_present(repo: &Path, relative: &str) -> Result<Option<String>, String> {

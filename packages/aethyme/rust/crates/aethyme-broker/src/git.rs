@@ -247,6 +247,17 @@ pub enum GitError {
 
     #[error("could not parse git worktree list --porcelain -z: {reason}")]
     WorktreeListParse { reason: String },
+
+    /// A committed `.aethyme` configuration file is ambiguous or invalid.
+    /// Boxed so the error enum stays small.
+    #[error("{0}")]
+    Config(Box<aethyme_config::ConfigSourceError>),
+}
+
+impl From<aethyme_config::ConfigSourceError> for GitError {
+    fn from(error: aethyme_config::ConfigSourceError) -> Self {
+        Self::Config(Box::new(error))
+    }
 }
 
 /// Overrides [`DEFAULT_GIT_TIMEOUT`], in whole seconds.
@@ -3342,6 +3353,32 @@ impl GitRepo {
 
     /// Read one repository-relative UTF-8 file from an exact commit without
     /// checking it out or mutating refs, indexes, or worktree state.
+    /// The `.aethyme/<stem>` configuration committed at `commit`, in whichever
+    /// format it was written (#1223). Two format twins committed together is
+    /// [`GitError::Config`], never a silent preference.
+    pub fn config_at_commit(
+        &self,
+        commit: &str,
+        stem: &str,
+    ) -> Result<Option<aethyme_config::ConfigText>, GitError> {
+        aethyme_config::read_config_text_with(aethyme_config::CONFIG_DIR, stem, |relpath| {
+            self.file_at_commit(commit, relpath)
+        })
+    }
+
+    /// [`Self::config_at_commit`] as TOML text: a TOML file byte-for-byte, a
+    /// YAML file validated and rendered from the same value.
+    pub fn config_toml_at_commit(
+        &self,
+        commit: &str,
+        stem: &str,
+    ) -> Result<Option<String>, GitError> {
+        match self.config_at_commit(commit, stem)? {
+            Some(text) => Ok(Some(text.toml_text()?.into_owned())),
+            None => Ok(None),
+        }
+    }
+
     pub fn file_at_commit(&self, commit: &str, path: &str) -> Result<Option<String>, GitError> {
         let path_value = Path::new(path);
         if path_value.is_absolute()

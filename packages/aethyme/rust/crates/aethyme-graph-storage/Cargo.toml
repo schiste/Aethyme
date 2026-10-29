@@ -10,6 +10,8 @@ name = "aethyme_graph_storage"
 path = "src/lib.rs"
 
 [dependencies]
+# Shared .aethyme config loader: <stem>.toml, .yaml or .yml (#1223).
+aethyme-config = { path = "../aethyme-config" }
 # The schema types we serialize/deserialize. This crate owns the
 # on-disk format; aethyme-graph-schema owns the in-memory types.
 # Strict layering: schema knows nothing about storage; storage

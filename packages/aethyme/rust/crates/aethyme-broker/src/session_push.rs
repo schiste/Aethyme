@@ -421,7 +421,7 @@ pub(crate) fn session_push_enabled(repo: &GitRepo) -> bool {
 }
 
 fn push_authorized(repo: &GitRepo, default: &TrackedDefault) -> Result<bool, BrokerOpError> {
-    let Some(text) = repo.file_at_commit(&default.commit, ".aethyme/config.toml")? else {
+    let Some(text) = repo.config_toml_at_commit(&default.commit, "config")? else {
         return Ok(false);
     };
     let config = RepositoryDeliveryConfig::from_config_text(&text).map_err(refused)?;
@@ -434,7 +434,7 @@ fn pull_request_policy(
     repo: &GitRepo,
     default: &TrackedDefault,
 ) -> Result<SessionPullRequestPolicy, BrokerOpError> {
-    let Some(text) = repo.file_at_commit(&default.commit, ".aethyme/config.toml")? else {
+    let Some(text) = repo.config_toml_at_commit(&default.commit, "config")? else {
         return Ok(SessionPullRequestPolicy::default());
     };
     SessionPullRequestPolicy::from_config_text(&text).map_err(refused)
