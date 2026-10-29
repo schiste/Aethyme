@@ -168,6 +168,8 @@ struct CompactLeaseRequest {
     requester_session_id: i64,
     holder_session_id: i64,
     path: String,
+    #[serde(skip_serializing)]
+    requested_at: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -241,6 +243,7 @@ impl CompactStatus {
                     requester_session_id: request.requester_session_id,
                     holder_session_id: request.holder_session_id,
                     path: request.path,
+                    requested_at: request.requested_at,
                 })
                 .collect(),
         );
@@ -394,23 +397,24 @@ impl CompactStatus {
         }
         if self.lease_release_requests.count > 0 {
             line!(
-                "Lease waiters: {} pending release requests",
+                "Lease release requests: {} pending (they do not block edits in separate worktrees)",
                 self.lease_release_requests.count
             );
             for request in &self.lease_release_requests.records {
+                let waited = crate::clock::epoch_ms()
+                    .saturating_sub(request.requested_at)
+                    .max(0) as u64
+                    / 1_000;
                 line!(
-                    "  request {}: session {} waiting for {} held by session {}",
+                    "  request {}: session {} asked session {} to release {} ({} ago)",
                     request.request_id,
                     request.requester_session_id,
+                    request.holder_session_id,
                     request.path,
-                    request.holder_session_id
-                );
-                line!(
-                    "  run: aethyme broker advanced leases ack {} --session {}",
-                    request.request_id,
-                    request.holder_session_id
+                    crate::operations::humanize_duration(waited)
                 );
             }
+            line!("  Inspect the holder's task and relevant diff before following up or waiting.");
             if self.lease_release_requests.omitted_count > 0 {
                 line!(
                     "  {} additional pending lease requests omitted; inspect full status.",

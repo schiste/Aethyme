@@ -572,9 +572,9 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                         request.state.as_str()
                     );
                 }
+                out!("These requests are advisory; they do not block edits in separate worktrees.");
                 out!(
-                    "Wait: aethyme broker advanced leases wait {} --session {session}",
-                    crate::broker::shell_quote(path)
+                    "Before following up or waiting, inspect the holder's task and relevant worktree diff. Use `leases wait` only when this exact path is needed."
                 );
             }
         }

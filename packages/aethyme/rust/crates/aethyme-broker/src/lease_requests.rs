@@ -9,7 +9,11 @@
 //!
 //! Requests live in the event log, not a table of their own: a request is its
 //! `lease.release_requested` event, and its outcome is the later event that
-//! names it. Nothing here changes the broker schema.
+//! names it. A request also resolves when its requester closes or its holder
+//! releases the path through another lifecycle operation. Nothing here changes
+//! the broker schema.
+
+use std::collections::HashMap;
 
 use crate::BrokerStore;
 
@@ -30,6 +34,8 @@ pub enum RequestState {
     /// The holder no longer holds the path for some other reason (finish,
     /// an explicit release, expiry).
     Released,
+    /// The requester session closed while the holder still held the path.
+    Cancelled,
 }
 
 impl RequestState {
@@ -40,6 +46,7 @@ impl RequestState {
             Self::Declined => "declined",
             Self::Granted => "granted",
             Self::Released => "released",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -55,7 +62,7 @@ pub struct LeaseReleaseRequest {
     pub state: RequestState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_at: Option<i64>,
-    /// Why it was declined, or `holder_stale` for a grant.
+    /// Why it was declined, granted, released, or cancelled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution_reason: Option<String>,
 }
@@ -71,6 +78,13 @@ struct RequestedPayload {
 #[derive(serde::Deserialize)]
 struct OutcomePayload {
     request_id: i64,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ReleasedPayload {
+    path: String,
     #[serde(default)]
     reason: Option<String>,
 }
@@ -124,11 +138,74 @@ pub fn requests(
             request.resolution_reason = outcome.reason;
         }
     }
-    for request in &mut requests {
-        if request.state == RequestState::Pending
-            && !holds(request.holder_session_id, &request.path)
+    let mut held_by_request = HashMap::<i64, bool>::new();
+    let mut release_scan_after = HashMap::<i64, i64>::new();
+    for request in requests
+        .iter()
+        .filter(|request| request.state == RequestState::Pending)
+    {
+        let held = holds(request.holder_session_id, &request.path);
+        held_by_request.insert(request.request_id, held);
+        if !held {
+            release_scan_after
+                .entry(request.holder_session_id)
+                .and_modify(|first_id| *first_id = (*first_id).min(request.request_id))
+                .or_insert(request.request_id);
+        }
+    }
+    let mut release_resolutions = HashMap::<i64, (i64, Option<String>)>::new();
+    for (holder_session_id, first_request_id) in release_scan_after {
+        for event in
+            store.lease_release_events_for_holder_since(holder_session_id, first_request_id)?
         {
+            let Some(payload) = event.payload_json.as_deref() else {
+                continue;
+            };
+            let Ok(released) = serde_json::from_str::<ReleasedPayload>(payload) else {
+                continue;
+            };
+            for request in requests.iter().filter(|request| {
+                request.state == RequestState::Pending
+                    && held_by_request.get(&request.request_id) == Some(&false)
+                    && request.request_id < event.id
+                    && request.holder_session_id == holder_session_id
+                    && crate::leases::paths_overlap(&request.path, &released.path)
+            }) {
+                release_resolutions.insert(request.request_id, (event.ts, released.reason.clone()));
+            }
+        }
+    }
+    let mut requester_closed_at = HashMap::<i64, Option<i64>>::new();
+    for request in &mut requests {
+        if request.state != RequestState::Pending {
+            continue;
+        }
+        if held_by_request.get(&request.request_id) == Some(&false) {
             request.state = RequestState::Released;
+            if let Some((resolved_at, reason)) = release_resolutions.get(&request.request_id) {
+                request.resolved_at = Some(*resolved_at);
+                request.resolution_reason = Some(
+                    reason
+                        .clone()
+                        .unwrap_or_else(|| "lease_released".to_string()),
+                );
+            }
+            continue;
+        }
+        if !requester_closed_at.contains_key(&request.requester_session_id) {
+            let closed_at = match store.session(request.requester_session_id) {
+                Ok(session) if session.status.is_closed() => {
+                    Some(session.closed_at.unwrap_or(session.updated_at))
+                }
+                Ok(_) | Err(crate::BrokerError::SessionNotFound(_)) => None,
+                Err(error) => return Err(error.into()),
+            };
+            requester_closed_at.insert(request.requester_session_id, closed_at);
+        }
+        if let Some(Some(closed_at)) = requester_closed_at.get(&request.requester_session_id) {
+            request.state = RequestState::Cancelled;
+            request.resolved_at = Some(*closed_at);
+            request.resolution_reason = Some("requester_closed".into());
         }
     }
     Ok(requests)

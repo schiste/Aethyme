@@ -787,6 +787,7 @@ impl BrokerStore {
         if changed == 0 {
             return Err(BrokerError::SessionNotFound(replaced_id));
         }
+        record_lease_releases_in_tx(&tx, replaced_id, None, now, "session_replaced")?;
         delete_session_base_observation(&tx, replaced_id)?;
         release_checkpoint_pin_in_tx(&tx, replaced_id, now)?;
         tx.execute("DELETE FROM leases WHERE session_id = ?1", [replaced_id])?;
@@ -1073,6 +1074,7 @@ impl BrokerStore {
         // implicit-lease snapshot behind forever (722 orphaned rows for
         // ~25 sessions observed in the 2026-07-17 dogfood database).
         if status.is_closed() {
+            record_lease_releases_in_tx(&tx, id, None, now, "session_closed")?;
             delete_session_base_observation(&tx, id)?;
             release_checkpoint_pin_in_tx(&tx, id, now)?;
             tx.execute("DELETE FROM leases WHERE session_id = ?1", [id])?;
@@ -1190,6 +1192,13 @@ impl BrokerStore {
                 Some(abandoned_payload),
             )?;
             close_open_activity_in_tx(&tx, expected_session.id, closed_at)?;
+            record_lease_releases_in_tx(
+                &tx,
+                expected_session.id,
+                None,
+                closed_at,
+                "session_abandoned",
+            )?;
             delete_session_base_observation(&tx, expected_session.id)?;
             release_checkpoint_pin_in_tx(&tx, expected_session.id, closed_at)?;
             tx.execute(
