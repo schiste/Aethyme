@@ -787,7 +787,7 @@ impl BrokerStore {
         if changed == 0 {
             return Err(BrokerError::SessionNotFound(replaced_id));
         }
-        record_lease_releases_in_tx(&tx, replaced_id, None, now, "session_replaced")?;
+        record_lease_releases_in_tx(&tx, replaced_id, None, None, now, "session_replaced")?;
         delete_session_base_observation(&tx, replaced_id)?;
         release_checkpoint_pin_in_tx(&tx, replaced_id, now)?;
         tx.execute("DELETE FROM leases WHERE session_id = ?1", [replaced_id])?;
@@ -1074,7 +1074,7 @@ impl BrokerStore {
         // implicit-lease snapshot behind forever (722 orphaned rows for
         // ~25 sessions observed in the 2026-07-17 dogfood database).
         if status.is_closed() {
-            record_lease_releases_in_tx(&tx, id, None, now, "session_closed")?;
+            record_lease_releases_in_tx(&tx, id, None, None, now, "session_closed")?;
             delete_session_base_observation(&tx, id)?;
             release_checkpoint_pin_in_tx(&tx, id, now)?;
             tx.execute("DELETE FROM leases WHERE session_id = ?1", [id])?;
@@ -1195,6 +1195,7 @@ impl BrokerStore {
             record_lease_releases_in_tx(
                 &tx,
                 expected_session.id,
+                None,
                 None,
                 closed_at,
                 "session_abandoned",
@@ -1437,6 +1438,14 @@ impl BrokerStore {
     ) -> Result<(), BrokerError> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
+        record_lease_releases_in_tx(
+            &tx,
+            session_id,
+            None,
+            Some("implicit"),
+            now,
+            "implicit_lease_replaced",
+        )?;
         tx.execute(
             "DELETE FROM leases WHERE session_id = ?1 AND kind = 'implicit'",
             [session_id],
@@ -1500,7 +1509,7 @@ impl BrokerStore {
     ) -> Result<Vec<i64>, BrokerError> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
-        let ids = record_lease_releases_in_tx(&tx, session_id, Some(path), now, reason)?;
+        let ids = record_lease_releases_in_tx(&tx, session_id, Some(path), None, now, reason)?;
         tx.execute(
             "UPDATE leases SET released_at = ?3
              WHERE session_id = ?1 AND path = ?2 AND released_at IS NULL",
@@ -1515,17 +1524,11 @@ impl BrokerStore {
     pub fn release_lease(&mut self, session_id: i64, path: &str) -> Result<(), BrokerError> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
+        record_lease_releases_in_tx(&tx, session_id, Some(path), None, now, "lease_released")?;
         tx.execute(
             "UPDATE leases SET released_at = ?3
              WHERE session_id = ?1 AND path = ?2 AND released_at IS NULL",
             params![session_id, path, now],
-        )?;
-        insert_event(
-            &tx,
-            now,
-            crate::events::LEASE_RELEASED,
-            Some(session_id),
-            Some(&crate::events::lease_path_payload(path)),
         )?;
         tx.commit()?;
         Ok(())
@@ -1540,18 +1543,19 @@ impl BrokerStore {
     ) -> Result<(), BrokerError> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
+        record_lease_releases_in_tx(
+            &tx,
+            session_id,
+            Some(path),
+            Some("explicit"),
+            now,
+            "lease_released",
+        )?;
         tx.execute(
             "UPDATE leases SET released_at = ?3
              WHERE session_id = ?1 AND path = ?2
                AND kind = 'explicit' AND released_at IS NULL",
             params![session_id, path, now],
-        )?;
-        insert_event(
-            &tx,
-            now,
-            crate::events::LEASE_RELEASED,
-            Some(session_id),
-            Some(&crate::events::lease_path_payload(path)),
         )?;
         tx.commit()?;
         Ok(())

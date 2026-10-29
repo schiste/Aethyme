@@ -1158,21 +1158,24 @@ impl BrokerStore {
         &self,
         holder_session_id: i64,
         after_event_id: i64,
-        before_event_id: Option<i64>,
+        before: Option<(i64, i64)>,
     ) -> Result<Vec<Event>, BrokerError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, schema_version, ts, kind, session_id, payload_json
              FROM events
              WHERE kind = ?1 AND session_id = ?2 AND id > ?3
-               AND (?4 IS NULL OR id < ?4)
+               AND (?4 IS NULL OR id < ?4 OR ts <= ?5)
              ORDER BY id",
         )?;
+        let before_event_id = before.map(|(event_id, _)| event_id);
+        let before_ts = before.map(|(_, ts)| ts);
         let rows = stmt.query_map(
             params![
                 crate::events::LEASE_RELEASED,
                 holder_session_id,
                 after_event_id,
-                before_event_id
+                before_event_id,
+                before_ts
             ],
             |row| {
                 Ok(Event {
@@ -1186,6 +1189,178 @@ impl BrokerStore {
             },
         )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Atomically release the holder's currently active overlapping leases
+    /// and record an acknowledgement or stale-holder grant. Rechecking the
+    /// request and requester inside the write transaction orders this against
+    /// requester closure and competing outcomes.
+    pub(crate) fn resolve_lease_release_request(
+        &mut self,
+        request_id: i64,
+        holder_session_id: i64,
+        outcome_kind: &str,
+        outcome_reason: Option<&str>,
+    ) -> Result<bool, BrokerError> {
+        if !matches!(
+            outcome_kind,
+            crate::events::LEASE_RELEASE_ACKED | crate::events::LEASE_RELEASE_GRANTED
+        ) {
+            return Ok(false);
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let request = tx
+            .query_row(
+                "SELECT ts, session_id, payload_json FROM events
+                 WHERE id = ?1 AND kind = ?2",
+                params![request_id, crate::events::LEASE_RELEASE_REQUESTED],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((requested_at, requester_event_session_id, Some(payload))) = request else {
+            return Ok(false);
+        };
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload) else {
+            return Ok(false);
+        };
+        let Some(path) = payload.get("path").and_then(serde_json::Value::as_str) else {
+            return Ok(false);
+        };
+        let Some(requester_session_id) = payload
+            .get("requester_session_id")
+            .and_then(serde_json::Value::as_i64)
+        else {
+            return Ok(false);
+        };
+        let Some(requested_holder_id) = payload
+            .get("holder_session_id")
+            .and_then(serde_json::Value::as_i64)
+        else {
+            return Ok(false);
+        };
+        if requester_event_session_id != Some(requester_session_id)
+            || requested_holder_id != holder_session_id
+        {
+            return Ok(false);
+        }
+
+        let has_outcome = {
+            let mut stmt = tx.prepare(
+                "SELECT payload_json FROM events
+                 WHERE id > ?1 AND kind IN (?2, ?3, ?4)
+                 ORDER BY id",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    request_id,
+                    crate::events::LEASE_RELEASE_ACKED,
+                    crate::events::LEASE_RELEASE_DECLINED,
+                    crate::events::LEASE_RELEASE_GRANTED,
+                ],
+                |row| row.get::<_, Option<String>>(0),
+            )?;
+            let mut found = false;
+            for row in rows {
+                if row?
+                    .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
+                    .and_then(|payload| payload.get("request_id").and_then(|id| id.as_i64()))
+                    == Some(request_id)
+                {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if has_outcome {
+            return Ok(false);
+        }
+
+        let requester_state = tx
+            .query_row(
+                "SELECT status, closed_at, updated_at FROM sessions WHERE id = ?1",
+                [requester_session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((status, closed_at, updated_at)) = requester_state else {
+            return Ok(false);
+        };
+        if matches!(status.as_str(), "closed" | "cleaned")
+            && closed_at.unwrap_or(updated_at) >= requested_at
+        {
+            return Ok(false);
+        }
+
+        let now = now_ms();
+        let active_paths = {
+            let mut stmt = tx.prepare(
+                "SELECT l.path FROM leases l
+                 JOIN sessions s ON s.id = l.session_id
+                 WHERE l.session_id = ?1 AND l.released_at IS NULL
+                   AND (l.expires_at IS NULL OR l.expires_at > ?2)
+                   AND s.status IN ('active', 'idle', 'stale')
+                 ORDER BY l.id",
+            )?;
+            let rows = stmt.query_map(params![holder_session_id, now], |row| {
+                row.get::<_, String>(0)
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let active_paths = active_paths
+            .into_iter()
+            .filter(|lease_path| crate::leases::paths_overlap(path, lease_path))
+            .collect::<std::collections::BTreeSet<_>>();
+        if active_paths.is_empty() {
+            return Ok(false);
+        }
+
+        let release_reason = if outcome_kind == crate::events::LEASE_RELEASE_GRANTED {
+            "request_granted"
+        } else {
+            "request_acked"
+        };
+        for lease_path in active_paths {
+            record_lease_releases_in_tx(
+                &tx,
+                holder_session_id,
+                Some(&lease_path),
+                None,
+                now,
+                release_reason,
+            )?;
+            tx.execute(
+                "UPDATE leases SET released_at = ?3
+                 WHERE session_id = ?1 AND path = ?2 AND released_at IS NULL",
+                params![holder_session_id, lease_path, now],
+            )?;
+        }
+        let outcome_payload =
+            crate::lease_requests::outcome_payload(request_id, path, outcome_reason);
+        insert_event(
+            &tx,
+            now,
+            outcome_kind,
+            Some(holder_session_id),
+            Some(&outcome_payload),
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Session terminal events after a release request. These resolve

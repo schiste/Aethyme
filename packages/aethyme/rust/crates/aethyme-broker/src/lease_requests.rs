@@ -104,7 +104,9 @@ fn record_resolution(
 ) {
     let is_earlier = resolutions
         .get(&request_id)
-        .map(|current| candidate.event_id < current.event_id)
+        .map(|current| {
+            (candidate.resolved_at, candidate.event_id) < (current.resolved_at, current.event_id)
+        })
         .unwrap_or(true);
     if is_earlier {
         resolutions.insert(request_id, candidate);
@@ -172,27 +174,29 @@ pub fn requests(
     let mut held_by_request = HashMap::<i64, bool>::new();
     let mut release_resolutions = HashMap::<i64, RequestResolution>::new();
     let mut release_scan_after = HashMap::<i64, i64>::new();
-    let mut release_scan_before = HashMap::<i64, Option<i64>>::new();
+    let mut release_scan_before = HashMap::<i64, Option<(i64, i64)>>::new();
     let mut closure_scan_after = HashMap::<i64, i64>::new();
     for request in &requests {
         held_by_request.insert(
             request.request_id,
             holds(request.holder_session_id, &request.path),
         );
-        let outcome_event_id = outcome_resolutions
+        let outcome_boundary = outcome_resolutions
             .get(&request.request_id)
-            .map(|outcome| outcome.event_id);
+            .map(|outcome| (outcome.event_id, outcome.resolved_at));
         release_scan_after
             .entry(request.holder_session_id)
             .and_modify(|first_id| *first_id = (*first_id).min(request.request_id))
             .or_insert(request.request_id);
         match release_scan_before.entry(request.holder_session_id) {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(outcome_event_id);
+                entry.insert(outcome_boundary);
             }
             std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let before = match (*entry.get(), outcome_event_id) {
-                    (Some(current), Some(next)) => Some(current.max(next)),
+                let before = match (*entry.get(), outcome_boundary) {
+                    (Some(current), Some(next)) => {
+                        Some((current.0.max(next.0), current.1.max(next.1)))
+                    }
                     (None, _) | (_, None) => None,
                 };
                 entry.insert(before);
@@ -205,14 +209,14 @@ pub fn requests(
     }
 
     for (holder_session_id, first_request_id) in release_scan_after {
-        let before_event_id = release_scan_before
+        let before = release_scan_before
             .get(&holder_session_id)
             .copied()
             .flatten();
         for event in store.lease_release_events_for_holder_since(
             holder_session_id,
             first_request_id,
-            before_event_id,
+            before,
         )? {
             let Some(payload) = event.payload_json.as_deref() else {
                 continue;
@@ -263,7 +267,8 @@ pub fn requests(
                         entry.insert(candidate);
                     }
                     std::collections::hash_map::Entry::Occupied(mut entry)
-                        if candidate.event_id > entry.get().event_id =>
+                        if (candidate.resolved_at, candidate.event_id)
+                            > (entry.get().resolved_at, entry.get().event_id) =>
                     {
                         entry.insert(candidate);
                     }

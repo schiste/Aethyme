@@ -1527,38 +1527,13 @@ impl Broker {
         request: &crate::lease_requests::LeaseReleaseRequest,
         kind: &str,
         reason: Option<&str>,
-    ) -> Result<(), BrokerOpError> {
-        let held: Vec<String> = self
-            .store
-            .active_leases()?
-            .into_iter()
-            .filter(|lease| {
-                lease.session_id == request.holder_session_id
-                    && crate::leases::paths_overlap(&request.path, &lease.path)
-            })
-            .map(|lease| lease.path)
-            .collect();
-        // The same audited release a finish records (#358), with the reason
-        // `request_acked` or `request_granted`.
-        let release_reason = if kind == crate::lease_requests::GRANTED {
-            "request_granted"
-        } else {
-            "request_acked"
-        };
-        for path in held {
-            self.store
-                .release_lease_for(request.holder_session_id, &path, release_reason)?;
-        }
-        self.store.append_event(
+    ) -> Result<bool, BrokerOpError> {
+        Ok(self.store.resolve_lease_release_request(
+            request.request_id,
+            request.holder_session_id,
             kind,
-            Some(request.holder_session_id),
-            Some(&crate::lease_requests::outcome_payload(
-                request.request_id,
-                &request.path,
-                reason,
-            )),
-        )?;
-        Ok(())
+            reason,
+        )?)
     }
 
     /// The holder acknowledges a request: its leases on the path are released.
@@ -1636,12 +1611,13 @@ impl Broker {
                     view.liveness == crate::lease_liveness::LeaseLiveness::Stale
                         && !view.liveness_evidence.holds
                 });
-            if gone_past_grace {
-                self.release_for_request(
+            if gone_past_grace
+                && self.release_for_request(
                     &request,
                     crate::lease_requests::GRANTED,
                     Some("holder_stale"),
-                )?;
+                )?
+            {
                 granted.push(request.request_id);
             }
         }
