@@ -24,6 +24,11 @@ use crate::exit_status;
 pub const VALIDATE_SCHEMA: &str = "aethyme.env-validate/v1";
 pub const PLAN_SCHEMA: &str = "aethyme.env-plan/v1";
 pub const ERROR_SCHEMA: &str = "aethyme.env-error/v1";
+pub const STATUS_SCHEMA: &str = "aethyme.env-status/v1";
+pub const LIST_SCHEMA: &str = "aethyme.env-list/v1";
+pub const HISTORY_SCHEMA: &str = "aethyme.env-history/v1";
+pub const LOGS_SCHEMA: &str = "aethyme.env-logs/v1";
+pub const SUPERVISE_SCHEMA: &str = "aethyme.env-supervise/v1";
 
 pub const USAGE: &str = "\
 aethyme env — declared runnable environments per worktree
@@ -44,19 +49,40 @@ Usage:
       its component order, the pinned snapshot digest, and the reservation
       and capacity requests with the host-resource coordinator's advisory
       plan for each. Read-only; a later acquire may race and is authoritative.
+  aethyme env status [<id>] [--json]
+      This worktree's environments (or one, by id or 8+ character prefix):
+      phase, components with their identities, last error, recent
+      transitions, and whether the host supervisor is running. Read-only.
+  aethyme env list [--all] [--json]
+      Environments of this repository (--all: every repository on this host).
+  aethyme env history <id> [--limit N] [--json]
+      The environment's recorded phase transitions, oldest first.
+  aethyme env logs <id> [<component>] [--tail N] [--json]
+      The last N (default 50) lines of each component log, or of one.
+  aethyme env supervise [--ensure] [--json]
+      Run the host supervisor in the foreground (one per host user; a second
+      exits at once). --ensure instead starts one in the background if none
+      runs and returns when it is up. It exits by itself after
+      AETHYME_ENV_SUPERVISOR_LINGER_SECONDS (default 300) with nothing to
+      supervise.
 ";
 
-struct Failure {
-    code: &'static str,
-    message: String,
-    next_action: String,
-    exit: u8,
+pub(super) struct Failure {
+    pub(super) code: &'static str,
+    pub(super) message: String,
+    pub(super) next_action: String,
+    pub(super) exit: u8,
 }
 
-struct Options {
-    json: bool,
-    repo: Option<PathBuf>,
-    profile: Option<String>,
+pub(super) struct Options {
+    pub(super) json: bool,
+    pub(super) repo: Option<PathBuf>,
+    pub(super) profile: Option<String>,
+    pub(super) positional: Vec<String>,
+    pub(super) all: bool,
+    pub(super) ensure: bool,
+    pub(super) tail: usize,
+    pub(super) limit: usize,
 }
 
 pub fn run(args: &[String]) -> u8 {
@@ -78,6 +104,11 @@ pub fn run(args: &[String]) -> u8 {
     let result = match command.as_str() {
         "validate" => run_validate(&options),
         "plan" => run_plan(&options),
+        "status" => super::inspect::run_status(&options),
+        "list" => super::inspect::run_list(&options),
+        "history" => super::inspect::run_history(&options),
+        "logs" => super::inspect::run_logs(&options),
+        "supervise" => super::inspect::run_supervise(&options),
         other => Err(Failure {
             code: "unknown_subcommand",
             message: format!("unknown env subcommand {other:?}"),
@@ -109,6 +140,17 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
         json: false,
         repo: None,
         profile: None,
+        positional: Vec::new(),
+        all: false,
+        ensure: false,
+        tail: 50,
+        limit: 200,
+    };
+    let number = |value: Option<&String>, flag: &str| -> Result<usize, Failure> {
+        value
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| (1..=10_000).contains(n))
+            .ok_or_else(|| usage(format!("{flag} needs a number from 1 to 10000")))
     };
     let mut args = rest.iter();
     while let Some(arg) = args.next() {
@@ -126,6 +168,17 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
                         .ok_or_else(|| usage("--profile needs a name".into()))?
                         .clone(),
                 )
+            }
+            "--all" if command == "list" => options.all = true,
+            "--ensure" if command == "supervise" => options.ensure = true,
+            "--tail" if command == "logs" => options.tail = number(args.next(), "--tail")?,
+            "--limit" if command == "history" => options.limit = number(args.next(), "--limit")?,
+            positional
+                if !positional.starts_with('-')
+                    && matches!(command, "status" | "history" | "logs")
+                    && options.positional.len() < if command == "logs" { 2 } else { 1 } =>
+            {
+                options.positional.push(positional.to_string())
             }
             other => return Err(usage(format!("unexpected argument {other:?} for env {command}"))),
         }
@@ -152,12 +205,12 @@ fn report(json: bool, failure: Failure) -> u8 {
     failure.exit
 }
 
-struct Workspace {
-    worktree_root: PathBuf,
-    repo: crate::GitRepo,
+pub(super) struct Workspace {
+    pub(super) worktree_root: PathBuf,
+    pub(super) repo: crate::GitRepo,
 }
 
-fn workspace(options: &Options) -> Result<Workspace, Failure> {
+pub(super) fn workspace(options: &Options) -> Result<Workspace, Failure> {
     let start = match &options.repo {
         Some(path) => path.clone(),
         None => std::env::current_dir().map_err(|error| environment_failure(error.to_string()))?,
@@ -174,7 +227,7 @@ fn workspace(options: &Options) -> Result<Workspace, Failure> {
     })
 }
 
-fn environment_failure(message: String) -> Failure {
+pub(super) fn environment_failure(message: String) -> Failure {
     Failure {
         code: "io_error",
         message,
@@ -232,7 +285,7 @@ fn check(workspace: &Workspace) -> Result<Checked, Failure> {
     })
 }
 
-type Output = (Value, String, u8);
+pub(super) type Output = (Value, String, u8);
 
 fn run_validate(options: &Options) -> Result<Output, Failure> {
     let workspace = workspace(options)?;

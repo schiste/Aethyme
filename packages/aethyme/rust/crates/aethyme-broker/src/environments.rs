@@ -4,6 +4,10 @@
 //! a profile into a pinned snapshot plus the host-resource requests that
 //! reserve it.
 //!
+//! It also holds the durable layer every lifecycle step builds on (#1222):
+//! the environment store (`environments.db`), process identities, component
+//! logs and the host supervisor.
+//!
 //! Aethyme supplies lifecycle, admission and routing; the repository supplies
 //! commands. Nothing here knows any stack: a profile is components with
 //! commands, and those commands are opaque strings run with `sh -c`.
@@ -15,9 +19,16 @@ use sha2::{Digest, Sha256};
 
 pub mod cli;
 pub mod compile;
+pub mod identity;
+mod inspect;
+pub mod logs;
 pub mod spec;
+pub mod store;
+pub mod supervisor;
 pub mod validate;
 
+#[cfg(test)]
+mod store_tests;
 #[cfg(test)]
 mod tests;
 
