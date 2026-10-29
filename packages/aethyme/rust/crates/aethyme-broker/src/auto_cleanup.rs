@@ -1572,12 +1572,12 @@ impl Broker {
         if !resolved.resolution_errors.is_empty() || deadline_expired(deadline) {
             return Ok(None);
         }
-        let Some(canonical_path) = resolved.canonical_or_raw.to_str() else {
+        let Some(canonical_path) = resolved.canonical_or_raw.to_str().map(str::to_owned) else {
             return Ok(None);
         };
         let (sessions, group_truncated) = self.store().cleanup_cohort_sessions_for_path(
             crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
-            canonical_path,
+            &canonical_path,
         )?;
         if group_truncated
             || !sessions.iter().any(|session| session.id == session_id)
