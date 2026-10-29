@@ -664,6 +664,9 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                 if latest_is(crate::lease_requests::RequestState::Declined) {
                     break ("declined", crate::exit_status::LEASE_WAIT_DECLINED, mine);
                 }
+                if latest_is(crate::lease_requests::RequestState::Cancelled) {
+                    break ("cancelled", crate::exit_status::LEASE_WAIT_CANCELLED, mine);
+                }
                 let elapsed = started.elapsed();
                 if elapsed >= next_progress {
                     let mut holders = Vec::with_capacity(held.len());

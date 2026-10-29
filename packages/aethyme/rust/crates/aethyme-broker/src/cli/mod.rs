@@ -268,7 +268,8 @@ Usage:
   aethyme broker leases wait <path> --session <id> [--timeout <seconds>] [--json]
       Explicitly block this command until no other session holds <path> (exit 0, released), the
       broker granted it from a stale holder (exit 10), a request was declined
-      (exit 11), or --timeout (default 300) ran out (exit 12).
+      (exit 11), the requester session closed and cancelled the request while
+      the path remains held (exit 13), or --timeout (default 300) ran out (exit 12).
   aethyme broker leases export (--session <id> | --entry <id>) [--limit <n>] [--json]
       Export bounded, redacted lease ownership and deterministic routing
       categories from committed [leases.routing] configuration. Includes

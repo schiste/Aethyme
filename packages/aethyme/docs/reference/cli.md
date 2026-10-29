@@ -1570,8 +1570,9 @@ construction. The broker names that, from local facts only, and never blocks:
   `stale_grace_minutes` is granted against automatically; one whose liveness
   is unknown never is. `leases wait <path> --session <id> [--timeout
   <seconds>]` explicitly blocks until the path is free: exit 0 released, 10
-  granted, 11 declined, 12 timeout. Use it only when the task needs that exact
-  path now.
+  granted, 11 declined, 12 timeout, or 13 cancelled when the requester session
+  closes while a holder still holds the path. Use it only when the task needs
+  that exact path now.
 
 Work that reaches the default branch through a reviewed pull request is
 delivered, but leaves no promoted queue entry, and a squash merge rewrites the

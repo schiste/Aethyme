@@ -192,7 +192,9 @@ pub fn requests(
             }
             continue;
         }
-        if !requester_closed_at.contains_key(&request.requester_session_id) {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            requester_closed_at.entry(request.requester_session_id)
+        {
             let closed_at = match store.session(request.requester_session_id) {
                 Ok(session) if session.status.is_closed() => {
                     Some(session.closed_at.unwrap_or(session.updated_at))
@@ -200,7 +202,7 @@ pub fn requests(
                 Ok(_) | Err(crate::BrokerError::SessionNotFound(_)) => None,
                 Err(error) => return Err(error.into()),
             };
-            requester_closed_at.insert(request.requester_session_id, closed_at);
+            entry.insert(closed_at);
         }
         if let Some(Some(closed_at)) = requester_closed_at.get(&request.requester_session_id) {
             request.state = RequestState::Cancelled;

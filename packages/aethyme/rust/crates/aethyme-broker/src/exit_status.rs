@@ -33,6 +33,9 @@ pub const LEASE_WAIT_GRANTED: u8 = 10;
 pub const LEASE_WAIT_DECLINED: u8 = 11;
 /// `leases wait`: the path was still held when `--timeout` ran out.
 pub const LEASE_WAIT_TIMED_OUT: u8 = 12;
+/// `leases wait`: the requester session closed while the holder still held
+/// the path, cancelling the release request.
+pub const LEASE_WAIT_CANCELLED: u8 = 13;
 
 /// The exit code for a broker error, by what the caller should do next.
 pub fn for_broker_error(error: &BrokerOpError) -> u8 {
