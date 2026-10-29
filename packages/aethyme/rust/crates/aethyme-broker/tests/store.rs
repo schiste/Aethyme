@@ -549,6 +549,34 @@ fn lease_round_trip_expiry_and_activity_filter() {
 }
 
 #[test]
+fn refreshing_unchanged_implicit_leases_does_not_emit_release_events() {
+    let (_tmp, mut store) = open_temp();
+    let session = sample_session(&mut store);
+    let paths = ["src/auth.py".to_owned()];
+
+    store.set_implicit_leases(session.id, &paths).unwrap();
+    let first = store.session_leases(session.id).unwrap();
+    assert_eq!(first.len(), 1);
+    assert!(first[0].released_at.is_none());
+
+    store.set_implicit_leases(session.id, &paths).unwrap();
+    let refreshed = store.session_leases(session.id).unwrap();
+    assert_eq!(refreshed.len(), 1);
+    assert_eq!(refreshed[0].id, first[0].id);
+    assert!(refreshed[0].released_at.is_none());
+    assert!(store
+        .events_after_filtered(0, 100, Some("lease.released"))
+        .unwrap()
+        .is_empty());
+
+    store.set_implicit_leases(session.id, &[]).unwrap();
+    let releases = store
+        .events_after_filtered(0, 100, Some("lease.released"))
+        .unwrap();
+    assert_eq!(releases.len(), 1);
+}
+
+#[test]
 fn cleaning_a_session_purges_its_lease_rows() {
     let (_tmp, mut store) = open_temp();
     let session = sample_session(&mut store);
