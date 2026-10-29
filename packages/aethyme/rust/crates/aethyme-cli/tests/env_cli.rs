@@ -204,3 +204,55 @@ fn concurrent_ensure_calls_start_exactly_one_supervisor_that_lingers_out() {
         std::thread::sleep(Duration::from_millis(200));
     }
 }
+
+/// #1211 through the router: `up` reports ports and variables and runs under
+/// a supervisor; `down` destroys and releases; a second `down` is a no-op.
+#[test]
+fn up_then_down_round_trips_through_the_cli() {
+    let environments = r#"
+schema = 1
+[[profiles]]
+name = "backend"
+[[profiles.components]]
+name = "db"
+runtime = "hooks"
+provision = "touch provisioned.marker"
+destroy = "rm -f provisioned.marker"
+[[profiles.components]]
+name = "api"
+runtime = "process"
+depends_on = ["db"]
+listen = true
+start = "exec sleep 300"
+health = { command = "true", timeout_seconds = 10, interval_ms = 50 }
+"#;
+    let fixture = Fixture::new(Some(environments));
+    let (code, up) = fixture.json(&["env", "up", "--wait", "5"]);
+    assert_eq!(code, 0, "{up}");
+    assert_eq!(up["schema"], "aethyme.env-up/v1");
+    assert_eq!(up["phase"], "active");
+    let env_id = up["env_id"].as_str().unwrap().to_string();
+    assert!(up["variables"]["AETHYME_ENV_PORT_API"].is_string(), "{up}");
+    assert!(fixture.repo.path().join("provisioned.marker").exists());
+    let (_, status) = fixture.json(&["env", "status", &env_id]);
+    assert_eq!(status["supervisor"]["state"], "running", "{status}");
+
+    let (code, again) = fixture.json(&["env", "up"]);
+    assert_eq!(code, 0, "{again}");
+    assert_eq!(
+        again["env_id"],
+        env_id.as_str(),
+        "a second up is the same environment"
+    );
+
+    let (code, down) = fixture.json(&["env", "down", &env_id]);
+    assert_eq!(code, 0, "{down}");
+    assert_eq!(down["phase"], "destroyed");
+    assert!(!fixture.repo.path().join("provisioned.marker").exists());
+    let (code, _) = fixture.json(&["env", "down", &env_id]);
+    assert_eq!(code, 0, "down is idempotent");
+
+    let (code, refused) = fixture.json(&["env", "destroy", &env_id]);
+    assert_eq!(code, 2, "{refused}");
+    assert_eq!(refused["code"], "usage");
+}

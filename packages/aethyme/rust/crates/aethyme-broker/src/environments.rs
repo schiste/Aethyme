@@ -25,7 +25,9 @@ pub mod engine;
 pub mod exec;
 pub mod identity;
 mod inspect;
+pub mod lifecycle;
 pub mod logs;
+mod operate;
 pub mod spec;
 pub mod store;
 pub mod supervisor;
@@ -33,6 +35,8 @@ pub mod validate;
 
 #[cfg(test)]
 mod drivers_tests;
+#[cfg(test)]
+mod lifecycle_tests;
 #[cfg(test)]
 mod store_tests;
 #[cfg(test)]

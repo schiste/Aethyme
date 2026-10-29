@@ -6115,6 +6115,15 @@ impl GitRepo {
         worktree: &Path,
         force: bool,
     ) -> Result<(), GitError> {
+        // Environments are destroyed before their worktree goes: their
+        // destroy hooks usually live in it (#1211). A worktree whose
+        // environments could not be destroyed is kept, with the reason.
+        if let Err(reason) = crate::environments::lifecycle::destroy_for_worktree(worktree) {
+            return Err(GitError::Git {
+                args: format!("worktree remove {}", worktree.display()),
+                stderr: reason,
+            });
+        }
         // A locked worktree refuses removal. Release only the lock the broker
         // itself placed on a removable root; a lock someone else set is their
         // protection, and the removal must keep failing on it.

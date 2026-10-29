@@ -300,7 +300,9 @@ pub(super) fn run_supervise(options: &Options) -> Result<Output, Failure> {
     }
     let store_path = default_store_path().map_err(store_failure)?;
     let config = SupervisorConfig::new(root);
-    let mut work = StoreWatch { store_path };
+    let mut work = super::operate::LifecycleWork {
+        watch: StoreWatch { store_path },
+    };
     let reason = supervisor::run(&config, &mut work, &|| false)
         .map_err(|error| environment_failure(format!("supervisor: {error}")))?;
     let value = json!({ "schema": SUPERVISE_SCHEMA, "exit_reason": reason });
