@@ -207,6 +207,22 @@ pub fn present_config_paths_checked(
     stem: &str,
 ) -> Result<Vec<PathBuf>, ConfigSourceError> {
     validate_stem(stem)?;
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(ConfigSourceError::Read {
+                path: dir.to_path_buf(),
+                message: "configuration directory is not a real directory".into(),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(ConfigSourceError::Read {
+                path: dir.to_path_buf(),
+                message: error.to_string(),
+            });
+        }
+    }
     let mut present = Vec::new();
     for name in candidate_file_names(stem) {
         let path = dir.join(name);

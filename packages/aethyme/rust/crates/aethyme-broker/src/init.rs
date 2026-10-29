@@ -1810,12 +1810,9 @@ fn protocol_status(main_root: &Path) -> CheckStatus {
 
 fn broker_is_configured(main_root: &Path) -> bool {
     let dir = main_root.join(aethyme_config::CONFIG_DIR);
-    ["config", "gates"].iter().any(
-        |stem| match aethyme_config::resolve_config_path(&dir, stem) {
-            Ok(None) => false,
-            Ok(Some(_)) | Err(_) => true,
-        },
-    )
+    ["config", "gates"]
+        .iter()
+        .any(|stem| !matches!(aethyme_config::resolve_config_path(&dir, stem), Ok(None)))
 }
 
 fn protocol_detail(main_root: &Path) -> String {
@@ -1838,41 +1835,55 @@ fn protocol_detail(main_root: &Path) -> String {
 
 fn validate_gates(main_root: &Path) -> Check {
     match crate::gates::load_gates(main_root) {
-        Ok(gates) => match crate::GitRepo::discover(main_root).and_then(|repository| {
-            // The twin load_gates resolved (#1223); it succeeded, so one exists.
-            let relpath = aethyme_config::resolve_config_path(
-                &main_root.join(aethyme_config::CONFIG_DIR),
-                "gates",
-            )
-            .ok()
-            .flatten()
-            .and_then(|path| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            })
-            .map_or_else(
-                || crate::gates::GATES_CONFIG_RELPATH.to_string(),
-                |name| format!("{}/{name}", aethyme_config::CONFIG_DIR),
-            );
-            repository.is_tracked(&relpath)
-        }) {
-            Ok(true) => Check {
+        Ok(gates) => match aethyme_config::resolve_config_path(
+            &main_root.join(aethyme_config::CONFIG_DIR),
+            "gates",
+        ) {
+            Ok(Some(path)) => {
+                let Some(name) = path.file_name() else {
+                    return Check {
+                        id: "certify.gates",
+                        status: CheckStatus::Fail,
+                        detail: "cannot determine the resolved gates configuration path".into(),
+                    };
+                };
+                let relpath = format!(
+                    "{}/{name}",
+                    aethyme_config::CONFIG_DIR,
+                    name = name.to_string_lossy()
+                );
+                match crate::GitRepo::discover(main_root)
+                    .and_then(|repository| repository.is_tracked(&relpath))
+                {
+                    Ok(true) => Check {
+                        id: "certify.gates",
+                        status: CheckStatus::Pass,
+                        detail: format!("gates.toml valid — {} gate(s), cheap-first", gates.len()),
+                    },
+                    Ok(false) => Check {
+                        id: "certify.gates",
+                        status: CheckStatus::Warn,
+                        detail: format!(
+                            "gates.toml valid — {} gate(s), but .aethyme/gates.toml is untracked and will be absent from spawned worktrees and submitted trees; review and commit it",
+                            gates.len()
+                        ),
+                    },
+                    Err(error) => Check {
+                        id: "certify.gates",
+                        status: CheckStatus::Fail,
+                        detail: format!("cannot determine whether gates.toml is tracked: {error}"),
+                    },
+                }
+            }
+            Ok(None) => Check {
                 id: "certify.gates",
-                status: CheckStatus::Pass,
-                detail: format!("gates.toml valid — {} gate(s), cheap-first", gates.len()),
-            },
-            Ok(false) => Check {
-                id: "certify.gates",
-                status: CheckStatus::Warn,
-                detail: format!(
-                    "gates.toml valid — {} gate(s), but .aethyme/gates.toml is untracked and will be absent from spawned worktrees and submitted trees; review and commit it",
-                    gates.len()
-                ),
+                status: CheckStatus::Fail,
+                detail: "gates configuration disappeared during validation".into(),
             },
             Err(error) => Check {
                 id: "certify.gates",
                 status: CheckStatus::Fail,
-                detail: format!("cannot determine whether gates.toml is tracked: {error}"),
+                detail: format!("cannot resolve gates configuration for tracking check: {error}"),
             },
         },
         Err(crate::gates::GateConfigError::Missing(_)) => Check {

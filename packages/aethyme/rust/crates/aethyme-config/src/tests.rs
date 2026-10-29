@@ -364,6 +364,29 @@ fn dangling_config_twin_is_not_treated_as_missing_or_fallback() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn config_directory_symlinks_are_not_treated_as_missing_directories() {
+    use std::os::unix::fs::symlink;
+
+    let root = scratch();
+    let config_dir = root.join(".aethyme");
+    symlink("missing-config-dir", &config_dir).unwrap();
+    let error = resolve_config_path(&config_dir, "gates").unwrap_err();
+    assert_eq!(error.code(), "config_read_failed");
+    assert_eq!(error.path(), Some(config_dir.as_path()));
+
+    std::fs::remove_file(&config_dir).unwrap();
+    let external_dir = root.join("external-config");
+    std::fs::create_dir(&external_dir).unwrap();
+    symlink(&external_dir, &config_dir).unwrap();
+    let error = resolve_config_path(&config_dir, "gates").unwrap_err();
+    assert_eq!(error.code(), "config_read_failed");
+    assert_eq!(error.path(), Some(config_dir.as_path()));
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn reader_based_loading_serves_commit_reads() {
     let files = [
