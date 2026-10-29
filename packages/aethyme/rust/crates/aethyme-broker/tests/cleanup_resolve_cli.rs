@@ -888,3 +888,124 @@ fn recovery_batch_rejects_duplicate_ids_before_checkout_inspection() {
     assert!(diagnostic.contains("duplicate session ID"), "{diagnostic}");
     assert!(worktree.exists());
 }
+
+#[test]
+fn retirement_of_an_adopted_checkout_requires_opt_in_and_keeps_its_branch() {
+    let tmp = repo();
+    let worktree = tmp.path().parent().unwrap().join("operator-adopted");
+    git(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "operator-owned",
+            worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let mut broker = isolation::open(tmp.path());
+    let session = broker
+        .adopt(&worktree, Some("explicit adopted recovery"))
+        .unwrap();
+    std::fs::write(worktree.join("recovery-note.txt"), b"preserve this note\n").unwrap();
+    broker.close(session.id).unwrap();
+    drop(broker);
+    let id = session.id.to_string();
+    let args = [
+        "finish",
+        "cleanup",
+        "resolve",
+        &id,
+        "--retire",
+        "--archive",
+        "--json",
+    ];
+    assert!(!run(tmp.path(), &args).status.success());
+    assert!(worktree.exists());
+    let mut opted_in = args.to_vec();
+    opted_in.push("--allow-adopted");
+    let reviewed = json(&run(tmp.path(), &opted_in));
+    let digest = reviewed["digest"].as_str().unwrap();
+    let mut unapproved_apply = args.to_vec();
+    unapproved_apply.extend(["--confirm", digest]);
+    assert!(!run(tmp.path(), &unapproved_apply).status.success());
+    assert!(worktree.exists());
+    opted_in.extend(["--confirm", digest]);
+    let outcome = json(&run(tmp.path(), &opted_in));
+    assert_eq!(outcome["worktree_removed"], true);
+    assert!(!worktree.exists());
+    assert_eq!(
+        git(tmp.path(), &["rev-parse", "refs/heads/operator-owned"]),
+        git(tmp.path(), &["rev-parse", "refs/heads/main"])
+    );
+    let archive = Path::new(outcome["archive"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read(archive.join("untracked/recovery-note.txt")).unwrap(),
+        b"preserve this note\n"
+    );
+}
+
+#[test]
+fn retirement_preserves_recorded_and_switched_checkout_branch_roots() {
+    for recorded_branch_is_delivered in [true, false] {
+        let tmp = repo();
+        let mut broker = isolation::open(tmp.path());
+        let session = broker
+            .start_worktree("switched legacy checkout", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        if !recorded_branch_is_delivered {
+            std::fs::write(worktree.join("recorded.txt"), b"recorded branch only\n").unwrap();
+            git(&worktree, &["add", "recorded.txt"]);
+            git(&worktree, &["commit", "-qm", "recorded branch root"]);
+        }
+        let recorded_ref = format!("refs/heads/{}", session.branch);
+        let recorded_tip = git(&worktree, &["rev-parse", &recorded_ref]);
+        git(&worktree, &["switch", "-c", "actual-checkout", "main"]);
+        std::fs::write(worktree.join("actual.txt"), b"actual checkout only\n").unwrap();
+        git(&worktree, &["add", "actual.txt"]);
+        git(&worktree, &["commit", "-qm", "actual checkout root"]);
+        let actual_tip = git(&worktree, &["rev-parse", "HEAD"]);
+        assert_ne!(actual_tip, recorded_tip);
+        broker.close(session.id).unwrap();
+        drop(broker);
+        let id = session.id.to_string();
+        let args = [
+            "finish",
+            "cleanup",
+            "resolve",
+            &id,
+            "--retire",
+            "--archive",
+            "--json",
+        ];
+        let reviewed = json(&run(tmp.path(), &args));
+        let mut apply_args = args.to_vec();
+        apply_args.extend(["--confirm", reviewed["digest"].as_str().unwrap()]);
+        let outcome = json(&run(tmp.path(), &apply_args));
+        assert_eq!(outcome["worktree_removed"], true);
+        assert!(!worktree.exists());
+        assert_eq!(git(tmp.path(), &["rev-parse", &recorded_ref]), recorded_tip);
+        assert_eq!(
+            git(tmp.path(), &["rev-parse", "refs/heads/actual-checkout"]),
+            actual_tip
+        );
+        let archive = Path::new(outcome["archive"].as_str().unwrap());
+        let bundle = archive.join("commits.bundle");
+        let heads = git(
+            tmp.path(),
+            &["bundle", "list-heads", bundle.to_str().unwrap()],
+        );
+        assert!(
+            heads.lines().any(|line| line.starts_with(&actual_tip)),
+            "{heads}"
+        );
+        if !recorded_branch_is_delivered {
+            assert!(
+                heads.lines().any(|line| line.starts_with(&recorded_tip)),
+                "{heads}"
+            );
+        }
+    }
+}
