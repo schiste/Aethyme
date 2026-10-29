@@ -2879,12 +2879,29 @@ fn recovery_root_identities_for_plan_parts(
     Ok(roots.into_iter().collect())
 }
 
+/// Prefer an exact captured commit before walking unrelated delivery histories.
+/// This only orders witnesses: callers still ask Git to validate ancestry, even
+/// for identical strings, so malformed or missing objects remain refusals.
+pub(crate) fn delivery_targets_prefer_exact<'a>(
+    object_id: &'a str,
+    delivery_targets: &'a [String],
+) -> impl Iterator<Item = &'a String> {
+    delivery_targets
+        .iter()
+        .filter(move |target| target.as_str() == object_id)
+        .chain(
+            delivery_targets
+                .iter()
+                .filter(move |target| target.as_str() != object_id),
+        )
+}
+
 fn root_available_from_delivery(
     repository: &GitRepo,
     object_id: &str,
     delivery_targets: &[String],
 ) -> Result<bool, String> {
-    for target in delivery_targets {
+    for target in delivery_targets_prefer_exact(object_id, delivery_targets) {
         match repository.is_ancestor_checked(object_id, target) {
             Ok(true) => return Ok(true),
             Ok(false) => {}
@@ -2937,7 +2954,7 @@ fn root_available_from_delivery_during_plan(
     delivery_targets: &[String],
     ancestry_memo: &PlanAncestryMemo,
 ) -> Result<bool, String> {
-    for target in delivery_targets {
+    for target in delivery_targets_prefer_exact(object_id, delivery_targets) {
         match ancestry_memo.check(repository, object_id, target) {
             Ok(true) => return Ok(true),
             Ok(false) => {}
@@ -3012,7 +3029,7 @@ fn validate_delivery_prerequisites_remain_current(
     for prerequisite in captured_targets {
         let mut retained = false;
         let mut error_detail = None;
-        for target in current_targets {
+        for target in delivery_targets_prefer_exact(prerequisite, current_targets) {
             match repository.is_ancestor_checked(prerequisite, target) {
                 Ok(true) => {
                     retained = true;
@@ -6066,6 +6083,48 @@ mod tests {
             recovery_bundle_roots(&plan),
             vec![("refs/heads/recorded-session".into(), unique_branch_tip)]
         );
+    }
+
+    #[test]
+    fn exact_delivery_root_is_checked_before_unrelated_failed_history() {
+        let (_tmp, repo, plan) = staged_checkout();
+        let mut targets = vec!["missing-delivery-ref".to_owned(); 1_000];
+        targets.push(plan.head.clone());
+        assert!(root_available_from_delivery(&repo, &plan.head, &targets).unwrap());
+    }
+
+    #[test]
+    fn exact_delivery_root_is_preferred_by_plan_ancestry_memo() {
+        let (_tmp, repo, plan) = staged_checkout();
+        let targets = vec!["missing-delivery-ref".to_owned(), plan.head.clone()];
+        let memo = PlanAncestryMemo::for_delivery_targets(&targets, None);
+        assert!(
+            root_available_from_delivery_during_plan(&repo, &plan.head, &targets, &memo).unwrap()
+        );
+        let results = memo.results.borrow();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results.get(&(plan.head.clone(), plan.head.clone())),
+            Some(&true)
+        );
+    }
+
+    #[test]
+    fn exact_delivery_match_still_requires_a_real_git_object() {
+        let (_tmp, repo, _plan) = staged_checkout();
+        let absent = "0".repeat(40);
+        let targets = vec![absent.clone()];
+        assert!(root_available_from_delivery(&repo, &absent, &targets).is_err());
+        assert!(
+            root_available_from_delivery_during_plan(
+                &repo,
+                &absent,
+                &targets,
+                &PlanAncestryMemo::default(),
+            )
+            .is_err()
+        );
+        assert!(validate_delivery_prerequisites_remain_current(&repo, &targets, &targets).is_err());
     }
 
     /// A checkout with one staged edit and one untracked file, and the plan

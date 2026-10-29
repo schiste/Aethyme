@@ -4806,7 +4806,10 @@ impl Broker {
                     for prerequisite in &archived_plan.delivery_targets {
                         let mut retained = false;
                         let mut unavailable = None;
-                        for target in &current.delivery_targets {
+                        for target in crate::cleanup_resolve::delivery_targets_prefer_exact(
+                            prerequisite,
+                            &current.delivery_targets,
+                        ) {
                             match self.repo_handle().is_ancestor_checked(prerequisite, target) {
                                 Ok(true) => {
                                     retained = true;
