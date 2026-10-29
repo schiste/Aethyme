@@ -1,16 +1,11 @@
 //! One loader for the human-authored `.aethyme` configuration files (#1223).
 //!
-//! Every configuration stem (`config`, `gates`, `prepare`, `broker`,
-//! `environments`, and host config) may be written as `<stem>.toml`,
-//! `<stem>.yaml` or `<stem>.yml`. Exactly one may exist: two present is an
+//! The shared loader can resolve a human-authored configuration file for a
+//! stem under .aethyme as TOML, YAML or YML. Individual workflows may
+//! intentionally accept a narrower format; the environment-profile CLI
+//! currently remains TOML-only. Exactly one twin may exist: two present is an
 //! error naming both, because a stale twin silently shadowing the real policy
 //! is exactly the confusion the broker exists to prevent.
-//!
-//! YAML is parsed with a strict YAML 1.2 subset and converted into the same
-//! [`toml::Value`] the subsystems already consume, so no subsystem's
-//! extraction logic changes with the format. Both formats keep a key path to
-//! `line:col` map, so an error a subsystem raises against a key path is
-//! reported as `file:line:col (key.path)` either way.
 //!
 //! The strict YAML subset:
 //!
@@ -42,6 +37,50 @@ pub const CONFIG_STEMS: &[&str] = &["config", "gates", "prepare", "broker", "env
 
 /// Accepted file extensions, in the order candidates are reported.
 pub const CONFIG_EXTENSIONS: [&str; 3] = ["toml", "yaml", "yml"];
+
+fn validate_stem(stem: &str) -> Result<(), ConfigSourceError> {
+    let path = Path::new(stem);
+    let mut components = path.components();
+    let one_normal_component = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    let portable_component = !stem.is_empty()
+        && stem != "."
+        && stem != ".."
+        && !stem.ends_with([' ', '.'])
+        && !is_reserved_windows_device_name(stem)
+        && !stem.chars().any(|ch| {
+            ch.is_control() || matches!(ch, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*')
+        });
+    if one_normal_component && portable_component {
+        return Ok(());
+    }
+    Err(ConfigSourceError::Invalid {
+        path: Path::new(CONFIG_DIR).join("<invalid-stem>"),
+        location: None,
+        key_path: None,
+        code: "config_invalid_stem",
+        message: format!("configuration stem {stem:?} must be a safe single path component"),
+    })
+}
+
+fn is_reserved_windows_device_name(stem: &str) -> bool {
+    let basename = stem
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    matches!(
+        basename.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+    ) || ["COM", "LPT"].iter().any(|prefix| {
+        basename.strip_prefix(*prefix).is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    })
+}
 
 /// Cap on how many times one YAML anchor may be expanded. Profiles that share
 /// fragments stay far below it; an alias bomb trips it in milliseconds.
@@ -133,23 +172,28 @@ pub fn config_stem_of(relpath: &str) -> Option<&'static str> {
 /// Whether `relpath` is any twin of `stem`.
 #[must_use]
 pub fn is_config_twin(relpath: &str, stem: &str) -> bool {
-    config_stem_of(relpath) == Some(stem)
-        || candidate_relpaths(stem)
-            .iter()
-            .any(|candidate| candidate == relpath)
+    validate_stem(stem).is_ok()
+        && (config_stem_of(relpath) == Some(stem)
+            || candidate_relpaths(stem)
+                .iter()
+                .any(|candidate| candidate == relpath))
 }
 
 /// Whether any twin of `stem` exists as a file in `dir`.
 #[must_use]
 pub fn config_exists(dir: &Path, stem: &str) -> bool {
-    candidate_file_names(stem)
-        .iter()
-        .any(|name| dir.join(name).is_file())
+    validate_stem(stem).is_ok()
+        && candidate_file_names(stem)
+            .iter()
+            .any(|name| dir.join(name).is_file())
 }
 
 /// The twins of `stem` present as files in `dir`.
 #[must_use]
 pub fn present_config_paths(dir: &Path, stem: &str) -> Vec<PathBuf> {
+    if validate_stem(stem).is_err() {
+        return Vec::new();
+    }
     candidate_file_names(stem)
         .iter()
         .map(|name| dir.join(name))
@@ -160,6 +204,7 @@ pub fn present_config_paths(dir: &Path, stem: &str) -> Vec<PathBuf> {
 /// The single configuration file for `stem` in `dir`, if any. Two twins
 /// present is [`ConfigSourceError::Ambiguous`].
 pub fn resolve_config_path(dir: &Path, stem: &str) -> Result<Option<PathBuf>, ConfigSourceError> {
+    validate_stem(stem)?;
     let mut present = present_config_paths(dir, stem);
     match present.len() {
         0 => Ok(None),
@@ -275,6 +320,9 @@ pub fn try_read_config_text_with<E, F>(
 where
     F: FnMut(&str) -> Result<Option<String>, E>,
 {
+    if let Err(error) = validate_stem(stem) {
+        return Ok(Err(error));
+    }
     let mut found = Vec::new();
     for name in candidate_file_names(stem) {
         let relpath = if dir_label.is_empty() {

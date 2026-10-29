@@ -4975,30 +4975,25 @@ impl Broker {
         }
         let loaded;
         let config = match trigger {
-            // Opens run on every hook call: reach Git only when the working
-            // copy says required, then confirm against the committed copy.
-            FenceTrigger::Open => {
-                // Either format (#1223); an unresolvable working copy goes on
-                // to the committed copy rather than being read as "off".
-                let text = match aethyme_config::read_config_text(
-                    &self.main_root.join(aethyme_config::CONFIG_DIR),
-                    "config",
-                ) {
+            FenceTrigger::Open | FenceTrigger::Config(None) => {
+                loaded = match crate::merge::committed_repository_config_checked(&self.main_root) {
+                    Ok(Some(text)) => Some((text, "committed")),
                     Ok(None) => return None,
-                    Ok(Some(text)) => text.toml_text().ok().map(|toml| toml.into_owned()),
-                    Err(_) => None,
+                    Err(error) => {
+                        crate::warn_unrecorded(
+                            "resolve the committed configuration for the collaboration fence",
+                            Err::<(), _>(error),
+                        );
+                        // An unresolved policy is not evidence that the
+                        // repository requires capture. Keep it visible as a
+                        // pending read without persisting a one-way floor;
+                        // the next open must recheck repaired committed text.
+                        return Some(crate::CollaborationFence::pending_unresolved_config());
+                    }
                 };
-                if let Some(text) = text
-                    && !crate::collaboration_submit::requires_capture(
-                        &crate::collaboration_submit::setting_from_text(Some(&text)),
-                    )
-                {
-                    return None;
-                }
-                loaded = crate::merge::repository_config_with_source(&self.main_root);
                 loaded.as_ref()
             }
-            FenceTrigger::Config(config) => config,
+            FenceTrigger::Config(Some(config)) => Some(config),
         };
         let (text, "committed") = config.map(|(text, source)| (text.as_str(), *source))? else {
             return None;

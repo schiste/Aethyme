@@ -89,7 +89,17 @@ pub(crate) fn parse_yaml(
     };
     check_syntax(&context, &context.document.syntax().clone(), 0)?;
     let table = match value {
-        noyalib::Value::Null => toml::Table::new(),
+        noyalib::Value::Null => {
+            if let Some(location) = root_value_location(&context) {
+                return Err(context.error(
+                    Some(location),
+                    "",
+                    "yaml_null",
+                    "null is not accepted at the top level; use an empty document for an empty configuration",
+                ));
+            }
+            toml::Table::new()
+        }
         noyalib::Value::Mapping(mapping) => convert_mapping(&mut context, mapping, "", "")?,
         _ => {
             return Err(context.error(
@@ -101,6 +111,26 @@ pub(crate) fn parse_yaml(
         }
     };
     Ok((toml::Value::Table(table), context.spans))
+}
+
+fn root_value_location(context: &Context<'_>) -> Option<Location> {
+    let mut offset = 0;
+    for child in context.document.syntax().children() {
+        let kind = match child {
+            GreenChild::Token { kind, .. } => *kind,
+            GreenChild::Node(node) => node.kind(),
+        };
+        if !is_trivia(kind)
+            && !matches!(
+                kind,
+                SyntaxKind::Directive | SyntaxKind::DocStart | SyntaxKind::DocEnd
+            )
+        {
+            return Some(context.index.locate(offset));
+        }
+        offset += child.text_len();
+    }
+    None
 }
 
 fn loader_error(path: &Path, error: &noyalib::Error) -> ConfigSourceError {
@@ -201,22 +231,15 @@ fn convert_value(
             ));
         }
         noyalib::Value::Bool(flag) => toml::Value::Boolean(flag),
-        noyalib::Value::String(text) => toml::Value::String(text),
-        noyalib::Value::Number(number) => match number {
-            noyalib::Number::Integer(integer) => toml::Value::Integer(integer),
-            noyalib::Number::Float(float) => {
-                let source = context
-                    .document
-                    .span_at(query)
-                    .map(|(start, end)| strip_node_properties(&context.text[start..end]));
-                // Without source text (a node reached only through an alias,
-                // whose anchor site was checked), fail closed on any integral
-                // float beyond i64: that is what an out-of-range integer becomes.
-                let widened_integer = match source {
-                    Some(source) => is_core_integer(source),
-                    None => float.fract() == 0.0 && float.abs() >= 9.223_372_036_854_776e18,
-                };
-                if widened_integer {
+        noyalib::Value::String(text) => {
+            let integer = context
+                .document
+                .span_at(query)
+                .map(|(start, end)| strip_node_properties(&context.text[start..end]))
+                .map(parse_core_integer);
+            match integer {
+                Some(CoreInteger::InRange(integer)) => toml::Value::Integer(integer),
+                Some(CoreInteger::OutOfRange) => {
                     return Err(context.error(
                         location,
                         display,
@@ -224,7 +247,36 @@ fn convert_value(
                         "integer out of range: configuration integers are 64-bit signed, as in TOML",
                     ));
                 }
-                toml::Value::Float(float)
+                _ => toml::Value::String(text),
+            }
+        }
+        noyalib::Value::Number(number) => match number {
+            noyalib::Number::Integer(integer) => toml::Value::Integer(integer),
+            noyalib::Number::Float(float) => {
+                let integer = context
+                    .document
+                    .span_at(query)
+                    .map(|(start, end)| strip_node_properties(&context.text[start..end]))
+                    .map(parse_core_integer)
+                    .unwrap_or_else(|| {
+                        if float.fract() == 0.0 && float.abs() >= 9.223_372_036_854_776e18 {
+                            CoreInteger::OutOfRange
+                        } else {
+                            CoreInteger::NotInteger
+                        }
+                    });
+                match integer {
+                    CoreInteger::InRange(integer) => toml::Value::Integer(integer),
+                    CoreInteger::OutOfRange => {
+                        return Err(context.error(
+                            location,
+                            display,
+                            "yaml_integer_range",
+                            "integer out of range: configuration integers are 64-bit signed, as in TOML",
+                        ));
+                    }
+                    CoreInteger::NotInteger => toml::Value::Float(float),
+                }
             }
             #[allow(unreachable_patterns)]
             _ => {
@@ -281,16 +333,61 @@ fn strip_node_properties(source: &str) -> &str {
     rest
 }
 
-/// YAML 1.2 core-schema integer forms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoreInteger {
+    NotInteger,
+    InRange(i64),
+    OutOfRange,
+}
+
+/// YAML 1.2 core-schema integer forms. The noyalib value pass can leave signed
+/// radix literals as strings; parse their source spelling here so the loader
+/// still preserves their integer meaning and refuses values outside i64.
+fn parse_core_integer(text: &str) -> CoreInteger {
+    let text = strip_node_properties(text).trim();
+    let (negative, unsigned) = if let Some(digits) = text.strip_prefix('-') {
+        (true, digits)
+    } else {
+        (false, text.strip_prefix('+').unwrap_or(text))
+    };
+    let (radix, digits) = if let Some(digits) = unsigned.strip_prefix("0o") {
+        (8, digits)
+    } else if let Some(digits) = unsigned.strip_prefix("0x") {
+        (16, digits)
+    } else {
+        (10, unsigned)
+    };
+    let valid = match radix {
+        8 => !digits.is_empty() && digits.bytes().all(|byte| (b'0'..=b'7').contains(&byte)),
+        16 => !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        _ => !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()),
+    };
+    if !valid {
+        return CoreInteger::NotInteger;
+    }
+    let Ok(magnitude) = u128::from_str_radix(digits, radix) else {
+        return CoreInteger::OutOfRange;
+    };
+    let limit = if negative {
+        1_u128 << 63
+    } else {
+        i64::MAX as u128
+    };
+    if magnitude > limit {
+        return CoreInteger::OutOfRange;
+    }
+    let integer = if negative && magnitude == (1_u128 << 63) {
+        i64::MIN
+    } else if negative {
+        -(magnitude as i64)
+    } else {
+        magnitude as i64
+    };
+    CoreInteger::InRange(integer)
+}
+
 fn is_core_integer(text: &str) -> bool {
-    let digits = text.strip_prefix(['-', '+']).unwrap_or(text);
-    if let Some(octal) = text.strip_prefix("0o") {
-        return !octal.is_empty() && octal.bytes().all(|b| (b'0'..=b'7').contains(&b));
-    }
-    if let Some(hex) = text.strip_prefix("0x") {
-        return !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit());
-    }
-    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+    !matches!(parse_core_integer(text), CoreInteger::NotInteger)
 }
 
 fn is_core_float(text: &str) -> bool {

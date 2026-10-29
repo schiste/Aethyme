@@ -261,12 +261,21 @@ fn yaml_integers_outside_i64_are_refused() {
         "x: -9223372036854775809\n",
         "x: 18446744073709551615\n",
         "x: [1, 99999999999999999999]\n",
+        "x: +0x8000000000000000\n",
+        "x: -0x8000000000000001\n",
+        "x: +0o1000000000000000000000\n",
+        "x: -0o1000000000000000000001\n",
     ] {
         let error = yaml(text).unwrap_err();
         assert_eq!(error.code(), "yaml_integer_range", "{text:?}: {error}");
     }
-    let document = yaml("x: 9223372036854775807\ny: 1.0e30\n").unwrap();
+    let document = yaml(
+        "x: 9223372036854775807\ny: 1.0e30\nhex: +0x7fffffffffffffff\noctal: -0o1000000000000000000000\n",
+    )
+    .unwrap();
     assert_eq!(document.value["x"], toml::Value::Integer(i64::MAX));
+    assert_eq!(document.value["hex"], toml::Value::Integer(i64::MAX));
+    assert_eq!(document.value["octal"], toml::Value::Integer(i64::MIN));
     assert_eq!(document.value["y"], toml::Value::Float(1.0e30));
 }
 
@@ -281,8 +290,14 @@ fn yaml_multi_document_streams_are_refused() {
 #[test]
 fn yaml_top_level_must_be_a_mapping_and_empty_is_an_empty_table() {
     assert_eq!(yaml("- a\n").unwrap_err().code(), "config_not_a_table");
-    let empty = yaml("# nothing configured\n").unwrap();
-    assert_eq!(empty.value, toml::Value::Table(toml::Table::new()));
+    for empty in ["", "# nothing configured\n", "---\n# no values\n"] {
+        let document = yaml(empty).unwrap();
+        assert_eq!(document.value, toml::Value::Table(toml::Table::new()));
+    }
+    for explicit_null in ["null\n", "~\n", "---\nnull\n"] {
+        let error = yaml(explicit_null).unwrap_err();
+        assert_eq!(error.code(), "yaml_null", "{explicit_null:?}: {error}");
+    }
 }
 
 #[test]
@@ -361,6 +376,38 @@ fn reader_based_loading_serves_commit_reads() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn unsafe_stems_are_rejected_before_filesystem_or_git_callbacks() {
+    use std::cell::Cell;
+    use std::convert::Infallible;
+
+    for stem in [
+        "../outside",
+        "..\\outside",
+        ".",
+        "",
+        "nested/name",
+        "CON",
+        "nul",
+        "COM1",
+        "LPT9",
+        "con.backup",
+    ] {
+        let called = Cell::new(false);
+        let resolved = try_read_config_text_with::<Infallible, _>(".aethyme", stem, |_| {
+            called.set(true);
+            Ok(None)
+        })
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(resolved.code(), "config_invalid_stem", "{stem:?}");
+        assert!(!called.get(), "reader ran for unsafe stem {stem:?}");
+        assert!(resolve_config_path(Path::new("/tmp"), stem).is_err());
+        assert!(!config_exists(Path::new("/tmp"), stem));
+        assert!(present_config_paths(Path::new("/tmp"), stem).is_empty());
+    }
 }
 
 #[test]
