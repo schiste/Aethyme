@@ -92,7 +92,13 @@ impl<'a> CleanupArchiveGuard<'a> {
     }
 
     fn permits_adopted(self) -> bool {
-        matches!(self, Self::Retirement { allow_adopted: true, .. })
+        matches!(
+            self,
+            Self::Retirement {
+                allow_adopted: true,
+                ..
+            }
+        )
     }
 
     fn is_retirement(self) -> bool {
@@ -107,9 +113,7 @@ impl<'a> CleanupArchiveGuard<'a> {
                     != Some(self.plan().branch_ref.as_str()))
     }
 
-    fn expected_cohort(
-        self,
-    ) -> Option<&'a crate::auto_cleanup::ClosedArtifactCheckoutCohort> {
+    fn expected_cohort(self) -> Option<&'a crate::auto_cleanup::ClosedArtifactCheckoutCohort> {
         match self {
             Self::Retirement {
                 expected_cohort, ..
@@ -2648,10 +2652,13 @@ impl Broker {
         if canonical_path != path {
             return Ok(false);
         }
-        let main_root = self.main_root.canonicalize().map_err(|source| BrokerError::Io {
-            path: self.main_root.clone(),
-            source,
-        })?;
+        let main_root = self
+            .main_root
+            .canonicalize()
+            .map_err(|source| BrokerError::Io {
+                path: self.main_root.clone(),
+                source,
+            })?;
         if canonical_path == main_root {
             return Ok(false);
         }
@@ -2664,18 +2671,20 @@ impl Broker {
         if checkout.root() != canonical_path.as_path() {
             return Ok(false);
         }
-        let expected_common = self.main_git_common_dir()?.canonicalize().map_err(|source| {
-            BrokerError::Io {
+        let expected_common = self
+            .main_git_common_dir()?
+            .canonicalize()
+            .map_err(|source| BrokerError::Io {
                 path: self.main_root.join(".git"),
                 source,
-            }
-        })?;
-        let actual_common = checkout.git_common_dir()?.canonicalize().map_err(|source| {
-            BrokerError::Io {
+            })?;
+        let actual_common = checkout
+            .git_common_dir()?
+            .canonicalize()
+            .map_err(|source| BrokerError::Io {
                 path: canonical_path.join(".git"),
                 source,
-            }
-        })?;
+            })?;
         if actual_common != expected_common {
             return Ok(false);
         }
@@ -4436,7 +4445,8 @@ impl Broker {
                 Ok(_) => {
                     return Err(BrokerOpError::CleanupSessionNotTerminal {
                         id: session_id,
-                        state: "cleaned; the recorded worktree path has since been recreated".into(),
+                        state: "cleaned; the recorded worktree path has since been recreated"
+                            .into(),
                     });
                 }
                 Err(source) => {
@@ -4493,8 +4503,7 @@ impl Broker {
         if archived_plan.session_id != session_id
             || archived_plan.target_origin != session.origin
             || (session.origin == SessionOrigin::Adopted && !allow_adopted)
-            || expected_cohort
-                .is_some_and(|cohort| cohort.owner_session_id() != session_id)
+            || expected_cohort.is_some_and(|cohort| cohort.owner_session_id() != session_id)
         {
             return Err(BrokerOpError::CleanupResolveRefused {
                 id: session_id,
@@ -4632,18 +4641,19 @@ impl Broker {
         if archive_guard.is_some_and(|guard| guard.plan().target_origin != session.origin) {
             return Err(BrokerOpError::CleanupResolveRefused {
                 id: session_id,
-                reason: "the archived target origin no longer matches the registered session".into(),
+                reason: "the archived target origin no longer matches the registered session"
+                    .into(),
             });
         }
         if archive_guard.is_some()
             && session.origin != SessionOrigin::Spawned
-            && !archive_guard.is_some_and(|guard| {
-                guard.is_retirement() && guard.permits_adopted()
-            })
+            && !archive_guard.is_some_and(|guard| guard.is_retirement() && guard.permits_adopted())
         {
             return Err(BrokerOpError::CleanupResolveRefused {
                 id: session_id,
-                reason: "only an explicitly adopted retirement plan may archive an adopted checkout".into(),
+                reason:
+                    "only an explicitly adopted retirement plan may archive an adopted checkout"
+                        .into(),
             });
         }
         if !force
@@ -4655,9 +4665,8 @@ impl Broker {
         if !force && let Some(proof) = self.interrupted_finish_orphan_cleanup_proof(session) {
             return self.resume_interrupted_finish_orphan_cleanup(session, &proof);
         }
-        let retirement_adopted = archive_guard.is_some_and(|guard| {
-            guard.is_retirement() && guard.permits_adopted()
-        });
+        let retirement_adopted =
+            archive_guard.is_some_and(|guard| guard.is_retirement() && guard.permits_adopted());
         if session.origin == SessionOrigin::Adopted && !retirement_adopted {
             if worktree_path_is_real_directory(&worktree_path, session_id)? {
                 if !force {
@@ -4810,7 +4819,8 @@ impl Broker {
                 if archived_worktree != worktree_path {
                     return Err(BrokerOpError::CleanupResolveRefused {
                         id: session_id,
-                        reason: "the cleanup cohort path no longer matches the archived checkout".into(),
+                        reason: "the cleanup cohort path no longer matches the archived checkout"
+                            .into(),
                     });
                 }
                 let current_cohort = self.closed_artifact_checkout_cohort_snapshot(
@@ -5339,9 +5349,7 @@ mod registered_removal_failure_tests {
         let repository = initialized_repository(owner.path());
         let storage = crate::test_storage::TestStorage::new();
         let mut broker = storage.open(&repository).unwrap();
-        let session = broker
-            .start_worktree("continuing work", None)
-            .unwrap();
+        let session = broker.start_worktree("continuing work", None).unwrap();
         let worktree = Path::new(&session.worktree_path).to_path_buf();
         let evidence = worktree.join("must-survive.txt");
         std::fs::write(&evidence, b"still in use").unwrap();
@@ -5423,23 +5431,23 @@ mod registered_removal_failure_tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
 
         assert_eq!(adopted.origin, SessionOrigin::Adopted);
-        assert!(broker
-            .registered_adopted_worktree_matches(
-                &adopted,
-                Path::new(&adopted.worktree_path),
-                deadline,
-            )
-            .unwrap());
+        assert!(
+            broker
+                .registered_adopted_worktree_matches(
+                    &adopted,
+                    Path::new(&adopted.worktree_path),
+                    deadline,
+                )
+                .unwrap()
+        );
 
         let mut primary_target = adopted.clone();
         primary_target.worktree_path = repository.to_string_lossy().into_owned();
-        assert!(!broker
-            .registered_adopted_worktree_matches(
-                &primary_target,
-                &repository,
-                deadline,
-            )
-            .unwrap());
+        assert!(
+            !broker
+                .registered_adopted_worktree_matches(&primary_target, &repository, deadline,)
+                .unwrap()
+        );
 
         let foreign_parent = owner.path().join("foreign");
         let foreign_repository = initialized_repository(&foreign_parent);
@@ -5459,9 +5467,11 @@ mod registered_removal_failure_tests {
             std::os::unix::fs::symlink(&linked, &alias).unwrap();
             let mut symlink_target = adopted.clone();
             symlink_target.worktree_path = alias.to_string_lossy().into_owned();
-            assert!(!broker
-                .registered_adopted_worktree_matches(&symlink_target, &alias, deadline)
-                .unwrap());
+            assert!(
+                !broker
+                    .registered_adopted_worktree_matches(&symlink_target, &alias, deadline)
+                    .unwrap()
+            );
         }
     }
 

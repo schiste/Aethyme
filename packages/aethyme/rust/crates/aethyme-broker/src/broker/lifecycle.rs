@@ -7110,11 +7110,10 @@ impl Broker {
             {
                 return Ok(());
             }
-            let cleanup_grace_hours = self.checkout_cleanup_grace_hours(&session);
+            let cleanup_request = self.checkout_cleanup_request_policy(&session);
             if session.cleanup_state != crate::SessionCleanupState::Closed
                 || !session.status.is_closed()
-                || (session.origin == crate::SessionOrigin::Spawned
-                    && cleanup_grace_hours.is_some())
+                || (session.origin == crate::SessionOrigin::Spawned && cleanup_request.is_some())
             {
                 // The store variant is idempotent for an already-closed
                 // Spawned row: it repairs an older missing outbox without
@@ -7124,11 +7123,11 @@ impl Broker {
                     session_id,
                     SessionStatus::Closed,
                     None,
-                    cleanup_grace_hours,
+                    cleanup_request.map(|request| request.grace_hours),
+                    cleanup_request.is_some_and(|request| request.compact_checkout),
                 )?;
             }
-            session.origin == crate::SessionOrigin::Spawned
-                && cleanup_grace_hours.is_some()
+            session.origin == crate::SessionOrigin::Spawned && cleanup_request.is_some()
         };
         // The terminal row and owed cleanup request commit together. Waking
         // the global worker happens only after releasing the lifecycle claim;

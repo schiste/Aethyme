@@ -229,31 +229,27 @@ impl Broker {
     pub(super) fn persist_finish_report(
         &mut self,
         report: &FinishReport,
-        checkout_cleanup_grace_hours: Option<u32>,
+        checkout_cleanup_request: Option<CheckoutCleanupRequestPolicy>,
     ) -> Result<(), BrokerOpError> {
         let payload = crate::events::session_finished_payload(report);
         self.store.finish_session_with_cleanup_request(
             report.session_id,
             &payload,
-            checkout_cleanup_grace_hours,
+            checkout_cleanup_request.map(|request| request.grace_hours),
+            checkout_cleanup_request.is_some_and(|request| request.compact_checkout),
         )?;
         Ok(())
     }
 
-    /// Grace for the durable post-close checkout request. `None` means the
+    /// Policy for a durable post-close checkout request. `None` means the
     /// caller must not create an automatic-removal obligation.
-    pub(crate) fn checkout_cleanup_grace_hours(&self, session: &Session) -> Option<u32> {
-        if session.origin != SessionOrigin::Spawned {
-            return None;
-        }
+    pub(crate) fn checkout_cleanup_request_policy(
+        &self,
+        session: &Session,
+    ) -> Option<CheckoutCleanupRequestPolicy> {
         let retention = crate::load_retention_policy(&self.main_root).ok()?;
-        if !retention.auto_cleanup_worktrees_on_finish {
-            return None;
-        }
         let cleanup = crate::AutoCleanupPolicy::load(&self.main_root).ok()?;
-        cleanup
-            .auto_remove
-            .then_some(retention.closed_worktree_grace_hours)
+        checkout_cleanup_request_policy_for(session.origin, &retention, cleanup.auto_remove)
     }
 
     pub(super) fn record_finished_handoff(
@@ -275,7 +271,7 @@ impl Broker {
         // through physical removal. Cleanup calls the already-claimed helper
         // below so this path never tries to acquire its own lock recursively.
         let _lifecycle_claim = self.claim_worktree_lifecycle()?;
-        let checkout_cleanup_grace_hours = self.checkout_cleanup_grace_hours(session);
+        let checkout_cleanup_request = self.checkout_cleanup_request_policy(session);
         let current_session = self.store.session(report.session_id)?;
         super::cleanup::ensure_lifecycle_session_unchanged(
             report.session_id,
@@ -303,7 +299,15 @@ impl Broker {
                     .into(),
             );
             self.finalize_finish_report(report);
-            self.record_finished_handoff(report)?;
+            let handoff_result = self.record_finished_handoff(report);
+            drop(_lifecycle_claim);
+            if checkout_cleanup_request.is_some() {
+                crate::warn_unrecorded(
+                    "wake post-close checkout cleanup",
+                    self.request_checkout_cleanup_after_close(report.session_id),
+                );
+            }
+            handoff_result?;
             return Ok(());
         }
         let worktree_present = worktree_path.exists();
@@ -374,7 +378,8 @@ impl Broker {
             self.store.begin_finish_cleanup_with_cleanup_request(
                 report.session_id,
                 &start_payload,
-                checkout_cleanup_grace_hours,
+                checkout_cleanup_request.map(|request| request.grace_hours),
+                checkout_cleanup_request.is_some_and(|request| request.compact_checkout),
             )?;
         }
         let cleanup_session = self.store.session(report.session_id)?;
@@ -431,7 +436,7 @@ impl Broker {
         self.finalize_finish_report(report);
         let handoff_result = self.record_finished_handoff(report);
         drop(_lifecycle_claim);
-        if checkout_cleanup_grace_hours.is_some() {
+        if checkout_cleanup_request.is_some() {
             crate::warn_unrecorded(
                 "wake post-close checkout cleanup",
                 self.request_checkout_cleanup_after_close(report.session_id),
@@ -586,10 +591,10 @@ impl Broker {
         let auto_cleanup_enabled = auto_cleanup_policy
             .as_ref()
             .is_ok_and(|policy| policy.auto_cleanup_worktrees_on_finish);
-        let checkout_cleanup_grace_hours = if options.keep_worktree {
+        let checkout_cleanup_request = if options.keep_worktree {
             None
         } else {
-            self.checkout_cleanup_grace_hours(&session)
+            self.checkout_cleanup_request_policy(&session)
         };
         let mut report = FinishReport {
             session_id,
@@ -982,8 +987,8 @@ impl Broker {
             );
         }
         self.finalize_finish_report(&mut report);
-        self.persist_finish_report(&report, checkout_cleanup_grace_hours)?;
-        if checkout_cleanup_grace_hours.is_some() {
+        self.persist_finish_report(&report, checkout_cleanup_request)?;
+        if checkout_cleanup_request.is_some() {
             crate::warn_unrecorded(
                 "wake post-close checkout cleanup",
                 self.request_checkout_cleanup_after_close(session_id),
@@ -1265,6 +1270,71 @@ impl Broker {
         };
         let expected = self.main_git_common_dir()?;
         Ok(actual == expected)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct CheckoutCleanupRequestPolicy {
+    pub(super) grace_hours: u32,
+    pub(super) compact_checkout: bool,
+}
+
+fn checkout_cleanup_request_policy_for(
+    origin: SessionOrigin,
+    retention: &crate::RetentionPolicy,
+    auto_remove: bool,
+) -> Option<CheckoutCleanupRequestPolicy> {
+    if origin != SessionOrigin::Spawned
+        || !retention.auto_cleanup_worktrees_on_finish
+        || !auto_remove
+    {
+        return None;
+    }
+    Some(CheckoutCleanupRequestPolicy {
+        grace_hours: retention.closed_worktree_grace_hours,
+        compact_checkout: retention.compact_closed_worktrees,
+    })
+}
+
+#[cfg(test)]
+mod checkout_cleanup_grace_tests {
+    use super::*;
+
+    #[test]
+    fn close_scheduling_uses_compact_opt_in_without_lowering_archive_retention() {
+        let mut retention = crate::RetentionPolicy::default();
+        assert_eq!(retention.closed_worktree_grace_hours, 15 * 24);
+        assert_eq!(
+            checkout_cleanup_request_policy_for(SessionOrigin::Spawned, &retention, true),
+            Some(CheckoutCleanupRequestPolicy {
+                grace_hours: 15 * 24,
+                compact_checkout: false,
+            })
+        );
+
+        retention.compact_closed_worktrees = true;
+        assert_eq!(
+            checkout_cleanup_request_policy_for(SessionOrigin::Spawned, &retention, true),
+            Some(CheckoutCleanupRequestPolicy {
+                grace_hours: 15 * 24,
+                compact_checkout: true,
+            })
+        );
+        assert_eq!(retention.closed_worktree_grace_hours, 15 * 24);
+        assert_eq!(
+            checkout_cleanup_request_policy_for(SessionOrigin::Adopted, &retention, true),
+            None
+        );
+        assert_eq!(
+            checkout_cleanup_request_policy_for(SessionOrigin::Spawned, &retention, false),
+            None
+        );
+
+        retention.auto_cleanup_worktrees_on_finish = false;
+        assert_eq!(
+            checkout_cleanup_request_policy_for(SessionOrigin::Spawned, &retention, true),
+            None
+        );
     }
 }
 
