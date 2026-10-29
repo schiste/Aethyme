@@ -1430,22 +1430,63 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
 }
 
 /// `broker start`.
+fn record_start_response_timings(
+    phases: &mut std::collections::BTreeMap<String, u64>,
+    command_started: std::time::Instant,
+    response_started: std::time::Instant,
+) {
+    phases.insert(
+        "response_preparation".into(),
+        u64::try_from(response_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
+    // Excludes serialization/output and metric persistence; the outer command
+    // metric measures through output. Totals overlap the individual phases.
+    phases.insert(
+        "total_before_output".into(),
+        u64::try_from(command_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
+    telemetry::set_command_metric_details(serde_json::json!({"phase_timings_ms": phases}));
+}
+
 pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
+    let command_started = std::time::Instant::now();
     Broker::reject_integration_based_review_task(parsed.pull_request)?;
     let context = session_context(&parsed)?;
     let task = parsed
         .task
         .ok_or(UsageError::Message("start requires --task".into()))?;
+    let open_started = std::time::Instant::now();
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     warn_stale_broker_binary(&broker);
     let agent_identity = session_agent_identity(parsed.agent.as_deref());
-    let report = broker.start_worktree_with_planned_paths_and_context(
+    let open_ms = u64::try_from(open_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let allocation_started = std::time::Instant::now();
+    let allocation = broker.start_worktree_with_planned_paths_and_context(
         &task,
         &parsed.planned_paths,
         agent_identity.as_deref(),
         context,
         parsed.base.as_deref(),
-    )?;
+    );
+    let allocation_ms = u64::try_from(allocation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let mut report = match allocation {
+        Ok(report) => report,
+        Err(error) => {
+            // A failed allocation has no report: preserve observed coarse
+            // phases without claiming unobserved internal phases were zero.
+            telemetry::set_command_metric_details(
+                serde_json::json!({"phase_timings_ms": {"broker_open": open_ms, "session_allocation": allocation_ms}}),
+            );
+            return Err(error.into());
+        }
+    };
+    report
+        .phase_timings_ms
+        .insert("broker_open".into(), open_ms);
+    report
+        .phase_timings_ms
+        .insert("session_allocation".into(), allocation_ms);
+    let response_started = std::time::Instant::now();
     // `start-agent` binds nothing: the agent it spawns is a different process
     // from its caller, and binds on its own first command.
     bind_caller_as_holder(broker.store(), report.session.id);
@@ -1473,6 +1514,11 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
             true,
         )?;
         let duplicates = broker.duplicate_work_for(session);
+        record_start_response_timings(
+            &mut report.phase_timings_ms,
+            command_started,
+            response_started,
+        );
         out!(
             "{}",
             session_action_json(
@@ -1513,12 +1559,22 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
         }
         render_duplicate_work(session.id, &broker.duplicate_work_for(session));
         out!("Worktree: cd {}", session.worktree_path);
+        record_start_response_timings(
+            &mut report.phase_timings_ms,
+            command_started,
+            response_started,
+        );
+        out!(
+            "Startup phase timings (ms): {}",
+            serde_json::to_string(&report.phase_timings_ms)?
+        );
     }
     Ok(())
 }
 
 /// `broker start-agent`.
 pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
+    let command_started = std::time::Instant::now();
     Broker::reject_integration_based_review_task(parsed.pull_request)?;
     let context = session_context(&parsed)?;
     let task = parsed
@@ -1527,16 +1583,36 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
     let cmd = parsed
         .cmd
         .ok_or(UsageError::Message("start-agent requires --cmd".into()))?;
+    let open_started = std::time::Instant::now();
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     warn_stale_broker_binary(&broker);
     let agent_identity = session_agent_identity(parsed.agent.as_deref());
-    let report = broker.start_agent_report_with_context(
+    let open_ms = u64::try_from(open_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let allocation_started = std::time::Instant::now();
+    let allocation = broker.start_agent_report_with_context(
         &task,
         &cmd,
         agent_identity.as_deref(),
         context,
         parsed.base.as_deref(),
-    )?;
+    );
+    let allocation_ms = u64::try_from(allocation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let mut report = match allocation {
+        Ok(report) => report,
+        Err(error) => {
+            telemetry::set_command_metric_details(
+                serde_json::json!({"phase_timings_ms": {"broker_open": open_ms, "session_allocation": allocation_ms}}),
+            );
+            return Err(error.into());
+        }
+    };
+    report
+        .phase_timings_ms
+        .insert("broker_open".into(), open_ms);
+    report
+        .phase_timings_ms
+        .insert("session_allocation".into(), allocation_ms);
+    let response_started = std::time::Instant::now();
     let tab_rename = crate::chau7_mcp::rename_session_tab(
         &report.session,
         None,
@@ -1548,6 +1624,11 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
     let session = &report.session;
     if parsed.json {
         let duplicates = broker.duplicate_work_for(session);
+        record_start_response_timings(
+            &mut report.phase_timings_ms,
+            command_started,
+            response_started,
+        );
         out!(
             "{}",
             session_action_json(&report, &tab_rename, None, &duplicates, None, None, None)?
@@ -1565,6 +1646,15 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
         render_start_base(&report.start_base);
         render_worktree_placement(&report.worktree_placement);
         render_duplicate_work(session.id, &broker.duplicate_work_for(session));
+        record_start_response_timings(
+            &mut report.phase_timings_ms,
+            command_started,
+            response_started,
+        );
+        out!(
+            "Startup phase timings (ms): {}",
+            serde_json::to_string(&report.phase_timings_ms)?
+        );
     }
     Ok(())
 }

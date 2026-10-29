@@ -16,7 +16,22 @@ const BROKER_OPEN_STORAGE_CONTEXT_MAX_BYTES: usize = 32 * 1024;
 const ARTIFACT_SWEEP_NAMESPACE_V2_DOMAIN: &[u8] = b"aethyme-artifact-sweep-context-v2\0";
 const ARTIFACT_SWEEP_NAMESPACE_V4_DOMAIN: &[u8] = b"aethyme-artifact-sweep-context-v4\0";
 
+fn timed_start_phase<T>(
+    phases: &mut std::collections::BTreeMap<String, u64>,
+    name: &'static str,
+    run: impl FnOnce() -> T,
+) -> T {
+    let started = std::time::Instant::now();
+    let result = run();
+    phases.insert(
+        name.into(),
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
+    result
+}
+
 struct CreatedSessionWorktree {
+    phase_timings_ms: std::collections::BTreeMap<String, u64>,
     slug: String,
     branch: String,
     start_base: SessionStartBase,
@@ -7149,6 +7164,7 @@ impl Broker {
         let context = self.session_context(context);
         let planned_paths = normalize_planned_paths(paths)?;
         let CreatedSessionWorktree {
+            mut phase_timings_ms,
             slug: _,
             branch,
             start_base,
@@ -7162,6 +7178,7 @@ impl Broker {
             &start_base,
             selected_promote_branch,
         );
+        let metadata_started = std::time::Instant::now();
         let worktree_instance_witness = capture_spawned_worktree_instance_witness(&worktree);
         let repository_contract = self.capture_repository_contract(worktree.root(), false)?;
         let new_session = NewSession {
@@ -7221,8 +7238,15 @@ impl Broker {
         };
         self.store.set_session_foreign_files(session.id, &[])?;
         let planned_explicit_leases = self.planned_explicit_leases(session.id, &planned_paths)?;
-        let preparation = self.preparation_status(session.id)?;
+        phase_timings_ms.insert(
+            "session_registration".into(),
+            u64::try_from(metadata_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
+        let preparation = timed_start_phase(&mut phase_timings_ms, "preparation_status", || {
+            self.preparation_status(session.id)
+        })?;
         Ok(StartReport {
+            phase_timings_ms,
             session,
             start_base,
             worktree_placement,
@@ -7280,6 +7304,7 @@ impl Broker {
             })?;
         let context = self.session_context(context);
         let CreatedSessionWorktree {
+            mut phase_timings_ms,
             slug,
             branch,
             start_base,
@@ -7288,6 +7313,7 @@ impl Broker {
             selected_promote_branch,
             _lifecycle_claim,
         } = self.create_session_worktree(task, explicit_base, &[])?;
+        let agent_setup_started = std::time::Instant::now();
         let base = start_base.commit.clone();
         let base_observation = crate::broker::SessionBaseObservation::from_start_base(
             &start_base,
@@ -7481,7 +7507,12 @@ impl Broker {
             });
         }
 
+        phase_timings_ms.insert(
+            "agent_setup".into(),
+            u64::try_from(agent_setup_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
         Ok(StartAgentReport {
+            phase_timings_ms,
             session,
             start_base,
             worktree_placement,
@@ -7494,24 +7525,35 @@ impl Broker {
         explicit_base: Option<&str>,
         planned_paths: &[String],
     ) -> Result<CreatedSessionWorktree, BrokerOpError> {
-        let refresh = self.refresh_default_branch_before_start();
+        let mut phase_timings_ms = std::collections::BTreeMap::new();
+        let refresh = timed_start_phase(&mut phase_timings_ms, "upstream_fetch", || {
+            self.refresh_default_branch_before_start()
+        });
         refresh.require_fresh_implicit_base(explicit_base)?;
         // Allocation needs a fresh base, not integration maintenance. In
         // verify-only mode selection below already uses the fetched default.
         // Reconciling here reads historical promotions and can wait on an
         // unrelated writer; submit and sync refresh integration themselves.
         let selected_promote = crate::merge::PromoteConfig::load(&self.main_root);
-        let mut start_base =
-            self.select_session_start_base_with_promote(explicit_base, &selected_promote)?;
+        let mut start_base = timed_start_phase(&mut phase_timings_ms, "base_selection", || {
+            self.select_session_start_base_with_promote(explicit_base, &selected_promote)
+        })?;
         refresh.record(&mut start_base);
         // Refresh may wait on another process or a remote. Acquire the
         // repository lifecycle claim only after that work. Root preparation
         // writes the marker and build defaults, so it belongs under the same
         // claim as storage's empty-root removal; otherwise a confirmed sweep
         // could delete a root prepared before this final claim.
-        let lifecycle_claim = self.claim_worktree_lifecycle()?;
-        self.preflight_worktree_checkout_count()?;
-        let placement = self.prepare_broker_worktree_root()?;
+        let lifecycle_claim =
+            timed_start_phase(&mut phase_timings_ms, "lifecycle_lock_wait", || {
+                self.claim_worktree_lifecycle()
+            })?;
+        timed_start_phase(&mut phase_timings_ms, "checkout_count", || {
+            self.preflight_worktree_checkout_count()
+        })?;
+        let placement = timed_start_phase(&mut phase_timings_ms, "worktree_root", || {
+            self.prepare_broker_worktree_root()
+        })?;
         // Choose the unique branch and recheck the destination immediately
         // before the checkout is allocated. The returned guard stays held
         // until the caller registers the session or rolls the checkout back.
@@ -7520,11 +7562,13 @@ impl Broker {
         let worktree_path = placement.root.join(&slug);
         self.refuse_nested_worktree_path(&worktree_path)?;
         let branch = format!("agent/{slug}");
-        self.preflight_session_checkout_storage(&placement)?;
-        let worktree = match self
-            .repo
-            .worktree_add(&worktree_path, &branch, &start_base.commit)
-        {
+        timed_start_phase(&mut phase_timings_ms, "storage_admission", || {
+            self.preflight_session_checkout_storage(&placement)
+        })?;
+        let worktree = match timed_start_phase(&mut phase_timings_ms, "git_worktree_add", || {
+            self.repo
+                .worktree_add(&worktree_path, &branch, &start_base.commit)
+        }) {
             Ok(worktree) => worktree,
             Err(error) => {
                 let primary = BrokerOpError::Git(error);
@@ -7548,6 +7592,7 @@ impl Broker {
             );
         }
         Ok(CreatedSessionWorktree {
+            phase_timings_ms,
             slug,
             branch,
             start_base,
