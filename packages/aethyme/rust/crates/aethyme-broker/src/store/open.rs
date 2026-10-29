@@ -1167,6 +1167,7 @@ impl BrokerStore {
     /// lifecycle claim is still current. The immediate transaction makes the
     /// session, holder event, and active lease comparisons atomic with the
     /// terminal event/status writes.
+    #[cfg(test)]
     pub(crate) fn abandon_session_if_unchanged(
         &mut self,
         expected_session: &Session,
@@ -1186,6 +1187,8 @@ impl BrokerStore {
         )
     }
 
+    // Each parameter is a distinct observed authority input to this transactional CAS.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn abandon_session_if_unchanged_with_cleanup_request(
         &mut self,
         expected_session: &Session,

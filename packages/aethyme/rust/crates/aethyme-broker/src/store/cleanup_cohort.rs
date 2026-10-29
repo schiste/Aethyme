@@ -967,6 +967,8 @@ impl BrokerStore {
     /// Commit one resolved page only if it still belongs to the current
     /// authority revision and checkpoint cursor. A mismatch never exposes a
     /// partial index; the next page call resets to the current generation.
+    // The revision, alias generation, cursor and page remain explicit CAS inputs.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn persist_cleanup_cohort_scan_page(
         &mut self,
         namespace: &str,
@@ -1828,7 +1830,7 @@ mod tests {
                 .unwrap();
             scanned_pages += 1;
 
-            if scanned_pages % 5 == 0 && next_id < 12 {
+            if scanned_pages.is_multiple_of(5) && next_id < 12 {
                 let before = store.cleanup_authority_revisions().unwrap();
                 let id = insert_session(&mut store, &format!("concurrent-{next_id}"));
                 store
