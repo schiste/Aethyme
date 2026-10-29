@@ -440,6 +440,59 @@ mod tests {
     }
 
     #[test]
+    fn later_backdated_expiry_cannot_replace_acknowledgement() {
+        let (_dir, mut store) = store();
+        let id = request(&mut store, "draft.rs");
+        let ack = store
+            .append_event(ACKED, Some(1), Some(&outcome_payload(id, "draft.rs", None)))
+            .unwrap();
+        store.set_event_timestamp_for_test(ack, 200);
+        let expired = store
+            .append_event(
+                crate::events::LEASE_RELEASED,
+                Some(1),
+                Some(r#"{"path":"draft.rs","reason":"expired"}"#),
+            )
+            .unwrap();
+        store.set_event_timestamp_for_test(expired, 100);
+        assert!(expired > ack, "expiry is appended after acknowledgement");
+
+        let all = requests(&store, |_, _| false).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].state, RequestState::Acked);
+        assert_eq!(all[0].resolved_at, Some(200));
+    }
+
+    #[test]
+    fn final_overlapping_release_uses_append_order_despite_backdated_expiry() {
+        let (_dir, mut store) = store();
+        request(&mut store, "draft.rs");
+        let first = store
+            .append_event(
+                crate::events::LEASE_RELEASED,
+                Some(1),
+                Some(r#"{"path":"draft.rs","reason":"earlier release"}"#),
+            )
+            .unwrap();
+        store.set_event_timestamp_for_test(first, 200);
+        let last = store
+            .append_event(
+                crate::events::LEASE_RELEASED,
+                Some(1),
+                Some(r#"{"path":"draft.rs","reason":"later expiry"}"#),
+            )
+            .unwrap();
+        store.set_event_timestamp_for_test(last, 100);
+        assert!(last > first, "expiry is the final durable release");
+
+        let all = requests(&store, |_, _| false).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].state, RequestState::Released);
+        assert_eq!(all[0].resolved_at, Some(100));
+        assert_eq!(all[0].resolution_reason.as_deref(), Some("later expiry"));
+    }
+
+    #[test]
     fn release_request_scan_keeps_known_events_in_order_and_ignores_unknown_kinds() {
         let (_dir, mut store) = store();
         let first = request(&mut store, "a.rs");
