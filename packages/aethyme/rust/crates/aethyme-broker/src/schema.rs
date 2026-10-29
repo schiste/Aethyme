@@ -129,6 +129,7 @@ pub const COLLABORATION_FENCE_SCHEMA: i64 = 51;
 
 /// Why a database carries the collaboration fence (`meta.collaboration_fence`).
 pub const COLLABORATION_FENCE_REASON: &str = "collaboration capture required";
+pub const COLLABORATION_FENCE_UNRESOLVED_REASON: &str = "committed configuration unresolved";
 
 /// The collaboration fence on a database: raised, or required by the
 /// committed config but not yet raised.
@@ -151,6 +152,15 @@ impl CollaborationFence {
         Self {
             min_compatible_schema: COLLABORATION_FENCE_SCHEMA,
             reason: COLLABORATION_FENCE_REASON.into(),
+            source: "committed".into(),
+            state: "pending",
+        }
+    }
+
+    pub(crate) fn pending_unresolved_config() -> Self {
+        Self {
+            min_compatible_schema: COLLABORATION_FENCE_SCHEMA,
+            reason: COLLABORATION_FENCE_UNRESOLVED_REASON.into(),
             source: "committed".into(),
             state: "pending",
         }

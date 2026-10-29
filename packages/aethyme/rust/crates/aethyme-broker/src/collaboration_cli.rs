@@ -869,14 +869,11 @@ fn fence_status(main_root: &Path, value: &mut Value, text: &mut String, next: &m
     let read = crate::Broker::open_snapshot(main_root)
         .map_err(|error| ("broker_unavailable", error.to_string()))
         .and_then(|broker| {
-            // The fence reader warns and returns nothing on a read error;
-            // read once directly so an error is reported, not taken as
-            // "no fence".
+            // Read once directly so a database error is reported, not taken
+            // as "no fence". The committed config is rechecked by Open.
             crate::schema::collaboration_fence(broker.store_ref().connection())
                 .map_err(|error| ("fence_unreadable", error.to_string()))?;
-            let config = crate::merge::repository_config_with_source(main_root);
-            Ok(broker
-                .collaboration_fence_state(crate::broker::FenceTrigger::Config(config.as_ref())))
+            Ok(broker.collaboration_fence_state(crate::broker::FenceTrigger::Open))
         });
     match read {
         Err((code, message)) => {
@@ -887,15 +884,26 @@ fn fence_status(main_root: &Path, value: &mut Value, text: &mut String, next: &m
         Ok(fence) => {
             value["collaboration_fence"] = serde_json::to_value(&fence).unwrap_or(Value::Null);
             match fence {
+                Some(fence)
+                    if fence.state == "pending"
+                        && fence.reason == crate::schema::COLLABORATION_FENCE_UNRESOLVED_REASON =>
+                {
+                    text.push_str(
+                        "  fence: pending (the committed config cannot be resolved; older \
+                         binaries can still open this repository until the policy is understood)\n",
+                    );
+                    next.push(
+                        "resolve the committed repository config; if it requires capture, the next writable broker command will raise the compatibility fence"
+                            .into(),
+                    );
+                }
                 Some(fence) if fence.state == "pending" => {
                     text.push_str(
                         "  fence: pending (the committed config requires capture; older \
                          binaries can still open this repository until it is raised)\n",
                     );
                     next.push(
-                        "run a writable broker command (e.g. `aethyme broker status`) to raise \
-                         the required-capture fence"
-                            .into(),
+                        "run a writable broker command to raise the required-capture fence".into(),
                     );
                 }
                 Some(fence) => text.push_str(&format!(
@@ -1288,9 +1296,17 @@ fn write_section(main_root: &Path, worktree: &Path, section: &str) -> Result<Pat
     // Both the file being edited and the policy in force (the committed
     // copy where one exists): never append a second [collaboration] table,
     // nor shadow one the policy reader would use.
-    let in_force = crate::merge::repository_config_with_source(main_root)
-        .map(|(text, _)| text)
-        .unwrap_or_default();
+    let in_force = match crate::merge::repository_config_checked(main_root) {
+        Ok(Some((text, _))) => text,
+        Ok(None) => String::new(),
+        Err(error) => {
+            return Err(Failure::refused(
+                "config_unresolved",
+                format!("the policy in force cannot be resolved: {error}; no config was changed"),
+                "resolve the repository config and keep exactly one readable format",
+            ));
+        }
+    };
     if crate::collaboration_submit::mentions_collaboration(&existing)
         || crate::collaboration_submit::mentions_collaboration(&in_force)
     {

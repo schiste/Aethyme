@@ -375,11 +375,9 @@ impl Broker {
             phase_started.elapsed().as_millis() as u64,
         );
         let phase_started = std::time::Instant::now();
-        let repository_config = crate::merge::repository_config_with_source(&self.main_root);
         let (promote_config, promote_config_warning) =
-            PromoteConfig::from_text(repository_config.as_ref().map(|(text, _)| text.as_str()));
-        let fence =
-            self.collaboration_fence_state(FenceTrigger::Config(repository_config.as_ref()));
+            PromoteConfig::load_with_warning(&self.main_root);
+        let fence = self.collaboration_fence_state(FenceTrigger::Open);
         let promotes = promote_config.mode.promotes_at_all();
         let summary = status_summary(
             &agents,
@@ -606,14 +604,12 @@ impl Broker {
         // row below that tells an agent integration may move, has drifted, or
         // needs reconciling is noise there (and some of it is `blocked`), so
         // the mode is read once and gates all of them.
-        // Read once and shared with the collaboration fence below, so the
-        // fence costs status no extra Git calls.
-        let repository_config = crate::merge::repository_config_with_source(&self.main_root);
+        // The policy reader and compatibility fence both use committed
+        // configuration and fail closed when that source cannot be resolved.
         let (promote_config, promote_config_warning) =
-            PromoteConfig::from_text(repository_config.as_ref().map(|(text, _)| text.as_str()));
+            PromoteConfig::load_with_warning(&self.main_root);
         let promotes = promote_config.mode.promotes_at_all();
-        let collaboration_fence =
-            self.collaboration_fence_state(FenceTrigger::Config(repository_config.as_ref()));
+        let collaboration_fence = self.collaboration_fence_state(FenceTrigger::Open);
         // One deadline for every phase below whose cost grows with sessions
         // and history; each phase that runs out names what it skipped.
         let budget = status_inspection_budget();

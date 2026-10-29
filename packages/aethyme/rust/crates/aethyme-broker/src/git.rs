@@ -2978,6 +2978,118 @@ impl GitRepo {
         self.tracking_upstream()
     }
 
+    /// The fetched default branch for policy reads, distinguishing a proven
+    /// absent ref from Git errors. A configured but unresolvable default or
+    /// upstream is not treated as permission to fall back to working-copy
+    /// policy.
+    pub(crate) fn upstream_default_checked(&self) -> Result<Option<(String, String)>, GitError> {
+        let default_ref = self.symbolic_ref_checked("refs/remotes/origin/HEAD")?;
+        if let Some(target) = default_ref {
+            if !target.starts_with("refs/remotes/origin/") {
+                return Err(GitError::UntrustedOutput {
+                    detail: "origin/HEAD does not target an origin remote-tracking branch".into(),
+                });
+            }
+            let commit = self.resolve_commit_checked(&target)?;
+            let short = target
+                .strip_prefix("refs/remotes/")
+                .unwrap_or(&target)
+                .to_string();
+            return Ok(Some((short, commit)));
+        }
+        let unexpected_direct_ref = run_git(
+            &self.root,
+            &[
+                "for-each-ref",
+                "--count=1",
+                "--format=%(refname)",
+                "refs/remotes/origin/HEAD",
+            ],
+        )?;
+        if !unexpected_direct_ref.is_empty() {
+            return Err(GitError::UntrustedOutput {
+                detail: "refs/remotes/origin/HEAD exists but is not a symbolic default ref".into(),
+            });
+        }
+
+        let Some(branch_ref) = self.symbolic_ref_checked("HEAD")? else {
+            return Ok(None);
+        };
+        let Some(branch) = branch_ref.strip_prefix("refs/heads/") else {
+            return Err(GitError::UntrustedOutput {
+                detail: "the checked-out branch ref is not under refs/heads".into(),
+            });
+        };
+        let branch_ref = format!("refs/heads/{branch}");
+        let upstream_ref = run_git(
+            &self.root,
+            &[
+                "for-each-ref",
+                "--count=1",
+                "--format=%(upstream)",
+                &branch_ref,
+            ],
+        )?;
+        if upstream_ref.is_empty() {
+            return Ok(None);
+        }
+        let upstream_name = run_git(
+            &self.root,
+            &[
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ],
+        )?;
+        if upstream_name.is_empty() {
+            return Err(GitError::UntrustedOutput {
+                detail: "Git reported a configured upstream without its name".into(),
+            });
+        }
+        let commit = self.resolve_commit_checked(&upstream_ref)?;
+        Ok(Some((upstream_name, commit)))
+    }
+
+    fn symbolic_ref_checked(&self, name: &str) -> Result<Option<String>, GitError> {
+        let args = ["symbolic-ref", "--quiet", name];
+        let mut command = git_command();
+        command
+            .args(args)
+            .current_dir(&self.root)
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        let output = run_git_process_output(command, &args, git_timeout())?;
+        if output.status.success() {
+            let value = String::from_utf8_lossy(&output.stdout)
+                .trim_end()
+                .to_string();
+            if value.is_empty() {
+                return Err(GitError::UntrustedOutput {
+                    detail: format!("git {} returned an empty symbolic ref", args.join(" ")),
+                });
+            }
+            return Ok(Some(value));
+        }
+        if output.status.code() == Some(1) && output.stderr.is_empty() {
+            return Ok(None);
+        }
+        Err(GitError::Git {
+            args: args.join(" "),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+
+    fn resolve_commit_checked(&self, reference: &str) -> Result<String, GitError> {
+        let revision = format!("{reference}^{{commit}}");
+        let value = run_git(&self.root, &["rev-parse", "--verify", "--quiet", &revision])?;
+        if value.is_empty() {
+            return Err(GitError::UntrustedOutput {
+                detail: format!("Git resolved {reference:?} to an empty commit"),
+            });
+        }
+        Ok(value)
+    }
+
     pub fn head_commit(&self) -> Result<String, GitError> {
         run_git(&self.root, &["rev-parse", "HEAD"])
     }
@@ -3364,6 +3476,111 @@ impl GitRepo {
         aethyme_config::read_config_text_with(aethyme_config::CONFIG_DIR, stem, |relpath| {
             self.file_at_commit(commit, relpath)
         })
+    }
+
+    /// [`Self::config_at_commit`] for policy reads. A missing tree entry is
+    /// distinct from a Git read failure, so callers cannot silently fall back
+    /// to working-copy policy when the committed tree could not be inspected.
+    pub(crate) fn config_at_commit_checked(
+        &self,
+        commit: &str,
+        stem: &str,
+    ) -> Result<Option<aethyme_config::ConfigText>, GitError> {
+        let exact_commit = self.resolve_commit_checked(commit)?;
+        aethyme_config::read_config_text_with(aethyme_config::CONFIG_DIR, stem, |relpath| {
+            self.file_at_commit_checked(&exact_commit, relpath)
+        })
+    }
+
+    fn file_at_commit_checked(&self, commit: &str, path: &str) -> Result<Option<String>, GitError> {
+        let path_value = Path::new(path);
+        if path_value.is_absolute()
+            || path_value.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                )
+            })
+            || path.contains(':')
+        {
+            return Err(GitError::Git {
+                args: "ls-tree <commit> -- <path>".into(),
+                stderr: "file path must be repository-relative and cannot contain ':'".into(),
+            });
+        }
+
+        let args = ["ls-tree", "-z", "--full-tree", commit, "--", path];
+        let output = self.run_git_output_limited(&args, 64 * 1024)?;
+        if output.stdout.is_empty() {
+            return Ok(None);
+        }
+        if output.stdout.last() != Some(&0) {
+            return Err(GitError::UntrustedOutput {
+                detail: format!("git {} returned an unterminated tree entry", args.join(" ")),
+            });
+        }
+        let mut records = output.stdout.split(|byte| *byte == 0);
+        let Some(record) = records.next().filter(|record| !record.is_empty()) else {
+            return Err(GitError::UntrustedOutput {
+                detail: format!("git {} returned an empty tree entry", args.join(" ")),
+            });
+        };
+        if records.any(|record| !record.is_empty()) {
+            return Err(GitError::UntrustedOutput {
+                detail: format!("git {} returned multiple matching paths", args.join(" ")),
+            });
+        }
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+            return Err(GitError::UntrustedOutput {
+                detail: format!("git {} returned a malformed tree entry", args.join(" ")),
+            });
+        };
+        let metadata = &record[..tab];
+        let recorded_path = &record[tab + 1..];
+        let fields: Vec<&[u8]> = metadata.split(|byte| *byte == b' ').collect();
+        if fields.len() != 3 || recorded_path != path.as_bytes() {
+            return Err(GitError::UntrustedOutput {
+                detail: format!("git {} returned an unexpected tree entry", args.join(" ")),
+            });
+        }
+        let regular_mode = fields[0] == b"100644" || fields[0] == b"100755";
+        if !regular_mode || fields[1] != b"blob" {
+            return Err(GitError::UntrustedOutput {
+                detail: format!("committed configuration path {path:?} is not a regular file"),
+            });
+        }
+        let object = std::str::from_utf8(fields[2]).map_err(|_| GitError::UntrustedOutput {
+            detail: "git ls-tree returned a non-UTF-8 object id".into(),
+        })?;
+        let args = ["cat-file", "blob", object];
+        let output = self.run_git_output_limited(&args, 4 * 1024 * 1024)?;
+        String::from_utf8(output.stdout)
+            .map(Some)
+            .map_err(|_| GitError::UntrustedOutput {
+                detail: format!("committed configuration {path:?} is not UTF-8"),
+            })
+    }
+
+    fn run_git_output_limited(
+        &self,
+        args: &[&str],
+        max_output_bytes: usize,
+    ) -> Result<std::process::Output, GitError> {
+        let mut command = git_command();
+        command
+            .args(args)
+            .current_dir(&self.root)
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        let deadline = Instant::now() + git_timeout();
+        let output =
+            run_git_process_output_limited(&mut command, args, deadline, max_output_bytes)?;
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        Ok(output)
     }
 
     /// [`Self::config_at_commit`] as TOML text: a TOML file byte-for-byte, a
