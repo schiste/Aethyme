@@ -10,7 +10,7 @@ use super::cli::{
     DOWN_SCHEMA, Failure, Options, Output, PARK_SCHEMA, PIN_SCHEMA, SWEEP_SCHEMA, TOUCH_SCHEMA,
     UP_SCHEMA, WAKE_SCHEMA, check, compile_context, environment_failure, workspace,
 };
-use super::compile::{compile, default_profile_name};
+use super::compile::compile;
 use super::lifecycle::{Lifecycle, LifecycleError, RESERVATION_GRANT, UpOptions, read_grant};
 use super::logs::environments_directory;
 use super::store::{EnvironmentRecord, EnvironmentStore};
@@ -147,12 +147,10 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
             });
         }
     };
-    let profile = options
-        .profile
-        .as_deref()
-        .or_else(|| default_profile_name(file))
-        .unwrap_or_default()
-        .to_string();
+    let (base, changed) =
+        super::infer::changed_paths(&workspace.worktree_root).map_err(environment_failure)?;
+    let inference = super::infer::infer(file, &changed).map_err(environment_failure)?;
+    let profile = choose_profile(file, &inference, options)?;
     let context = compile_context(&workspace, &checked.digest);
     let snapshot =
         compile(file, &checked.host, &profile, ENVIRONMENTS_FILE, &context).map_err(|error| {
@@ -164,6 +162,8 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
             }
         })?;
     let (mut lifecycle, warning) = open("env up", true)?;
+    let replaced =
+        replace_below_minimum(&mut lifecycle, &workspace.worktree_root, file, &inference)?;
     let main_root = workspace.repo.main_root().ok();
     let record = lifecycle
         .up(
@@ -181,6 +181,35 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
     if let Some(warning) = &warning {
         value["warning"] = json!(warning);
         text.push_str(&format!("warning: {warning}\n"));
+    }
+    if let Some(reason) = options.reason.as_deref()
+        && super::infer::profile_rank(file, &record.profile).is_some_and(|r| r > inference.rank)
+    {
+        lifecycle
+            .store
+            .note(
+                &record.env_id,
+                "profile above inferred minimum",
+                "env up",
+                Some(&json!({
+                    "profile": record.profile,
+                    "inferred_minimum": inference.minimum,
+                    "reason": reason,
+                })),
+            )
+            .map_err(|error| environment_failure(error.to_string()))?;
+    }
+    value["inference"] = json!({
+        "base": base,
+        "minimum": inference.minimum,
+        "fired": inference.fired,
+    });
+    if !replaced.is_empty() {
+        value["replaced"] = json!(replaced);
+        text.push_str(&format!(
+            "replaced below-minimum environment(s): {}\n",
+            replaced.join(", ")
+        ));
     }
     value["schema"] = json!(UP_SCHEMA);
     Ok((value, text, exit_status::SUCCESS))
@@ -455,6 +484,154 @@ pub(super) fn run_routes(_: &Options) -> Result<Output, Failure> {
             "etag": super::routes::etag(&routes),
             "routes": routes,
         }),
+        text,
+        exit_status::SUCCESS,
+    ))
+}
+
+/// The profile `env up` brings up: the inferred minimum unless `--profile`
+/// asks for one. Lower than the minimum is refused with the firing rules;
+/// higher needs `--reason`.
+fn choose_profile(
+    file: &super::spec::EnvironmentsFile,
+    inference: &super::infer::Inference,
+    options: &Options,
+) -> Result<String, Failure> {
+    let Some(requested) = options.profile.as_deref() else {
+        return Ok(inference.minimum.clone());
+    };
+    let rank = super::infer::profile_rank(file, requested).ok_or_else(|| Failure {
+        code: "unknown_profile",
+        message: format!("profile {requested:?} is not declared"),
+        next_action: "pass --profile with a declared profile".into(),
+        exit: exit_status::USAGE,
+    })?;
+    if rank < inference.rank {
+        let rules: Vec<String> = inference
+            .fired
+            .iter()
+            .map(|f| format!("{} -> {} ({})", f.rule, f.min_profile, f.paths.join(", ")))
+            .collect();
+        return Err(Failure {
+            code: "below_inferred_minimum",
+            message: format!(
+                "profile {requested} is below the inferred minimum {}; rules fired: {}",
+                inference.minimum,
+                rules.join("; ")
+            ),
+            next_action: format!(
+                "use --profile {} (or higher); if a rule is wrong, change [[rules]] in environments.toml",
+                inference.minimum
+            ),
+            exit: exit_status::REFUSED,
+        });
+    }
+    if rank > inference.rank
+        && options
+            .reason
+            .as_deref()
+            .is_none_or(|r| r.trim().is_empty())
+    {
+        return Err(Failure {
+            code: "reason_required",
+            message: format!(
+                "profile {requested} is above the inferred minimum {}; say why",
+                inference.minimum
+            ),
+            next_action: format!(
+                "rerun with --reason \"...\", or use --profile {}",
+                inference.minimum
+            ),
+            exit: exit_status::USAGE,
+        });
+    }
+    Ok(requested.to_string())
+}
+
+/// Destroy this worktree's live environments whose profile ranks below the
+/// inferred minimum, so a raised minimum replaces them instead of leaving a
+/// too-cheap environment running beside the new one.
+fn replace_below_minimum(
+    lifecycle: &mut Lifecycle,
+    worktree: &std::path::Path,
+    file: &super::spec::EnvironmentsFile,
+    inference: &super::infer::Inference,
+) -> Result<Vec<String>, Failure> {
+    let fingerprint = crate::console::worktree_fingerprint(worktree);
+    let below: Vec<String> = lifecycle
+        .store
+        .list(None)
+        .map_err(|error| environment_failure(error.to_string()))?
+        .into_iter()
+        .filter(|r| r.worktree_fingerprint == fingerprint && r.phase.retains_worktree())
+        .filter(|r| {
+            super::infer::profile_rank(file, &r.profile).is_some_and(|rank| rank < inference.rank)
+        })
+        .map(|r| r.env_id)
+        .collect();
+    for env_id in &below {
+        lifecycle.down(env_id, None).map_err(lifecycle_failure)?;
+    }
+    Ok(below)
+}
+
+pub(super) fn run_infer(options: &Options) -> Result<Output, Failure> {
+    let workspace = workspace(options)?;
+    let checked = check(&workspace)?;
+    let file = match (&checked.file, checked.diagnostics.is_empty()) {
+        (Some(file), true) => file,
+        _ => {
+            return Err(Failure {
+                code: "invalid_environments_file",
+                message: format!("{ENVIRONMENTS_FILE} has validation problems"),
+                next_action: "run `aethyme env validate` and fix every problem".into(),
+                exit: exit_status::VERIFICATION_FAILED,
+            });
+        }
+    };
+    if let Some(range) = &options.range {
+        let report = super::infer::infer_range(&workspace.worktree_root, file, range)
+            .map_err(environment_failure)?;
+        let mut text = format!("{} commit(s) in {range}\n", report.commits);
+        for (profile, count) in &report.profiles {
+            text.push_str(&format!(
+                "  {profile:<16} {count:>6}{}\n",
+                report
+                    .top_rule
+                    .get(profile)
+                    .map(|rule| format!("  (most often: {rule})"))
+                    .unwrap_or_default()
+            ));
+        }
+        return Ok((
+            json!({ "schema": super::cli::INFER_SCHEMA, "range": range, "report": report }),
+            text,
+            exit_status::SUCCESS,
+        ));
+    }
+    let (base, changed) =
+        super::infer::changed_paths(&workspace.worktree_root).map_err(environment_failure)?;
+    let inference = super::infer::infer(file, &changed).map_err(environment_failure)?;
+    let mut text = format!(
+        "minimum profile: {} ({} changed path(s))\n",
+        inference.minimum, inference.changed
+    );
+    for fired in &inference.fired {
+        text.push_str(&format!(
+            "  rule {} -> {}: {}\n",
+            fired.rule,
+            fired.min_profile,
+            fired.paths.join(", ")
+        ));
+    }
+    if !inference.unmatched.is_empty() {
+        text.push_str(&format!(
+            "  unmatched: {}\n",
+            inference.unmatched.join(", ")
+        ));
+    }
+    Ok((
+        json!({ "schema": super::cli::INFER_SCHEMA, "base": base, "inference": inference }),
         text,
         exit_status::SUCCESS,
     ))

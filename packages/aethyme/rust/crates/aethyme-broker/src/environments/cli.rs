@@ -37,6 +37,7 @@ pub const WAKE_SCHEMA: &str = "aethyme.env-wake/v1";
 pub const TOUCH_SCHEMA: &str = "aethyme.env-touch/v1";
 pub const PIN_SCHEMA: &str = "aethyme.env-pin/v1";
 pub const ROUTES_SCHEMA: &str = "aethyme.env-routes/v1";
+pub const INFER_SCHEMA: &str = "aethyme.env-infer/v1";
 
 pub const USAGE: &str = "\
 aethyme env — declared runnable environments per worktree
@@ -67,11 +68,21 @@ Usage:
       The environment's recorded phase transitions, oldest first.
   aethyme env logs <id> [<component>] [--tail N] [--json]
       The last N (default 50) lines of each component log, or of one.
-  aethyme env up [--profile <name>] [--wait <seconds>] [--reconfigure] [--json]
+  aethyme env infer [--range <rev-range>] [--json]
+      The minimum profile this worktree's changes need: [[rules]] globs over
+      the diff against its base (committed, uncommitted and untracked, both
+      sides of renames), the rules that fired with their paths, and the
+      paths no rule matched. --range evaluates every commit in a range and
+      prints how many would need each profile, for tuning rules.
+  aethyme env up [--profile <name> [--reason <text>]] [--wait <seconds>] [--reconfigure] [--json]
       Make sure this worktree's environment is up: create it, or return it
       if already active. Reserves its namespace and ports, waits up to
       --wait (default 300) for pool capacity, provisions, starts and
       health-checks every component in dependency order, and prints its
+      ports, URLs and variables. Without --profile it uses the inferred
+      minimum (`env infer`); a lower profile is refused, a higher one needs
+      --reason and is recorded. An environment of this worktree below the
+      minimum is destroyed and replaced. It prints its
       ports, URLs and the AETHYME_ENV_* variables. A failure rolls back and
       leaves the environment `failed` with its error. A changed profile
       needs --reconfigure (destroy, then recreate).
@@ -143,6 +154,7 @@ pub(super) struct Options {
     pub(super) abandon: bool,
     pub(super) reason: Option<String>,
     pub(super) pin_seconds: Option<u64>,
+    pub(super) range: Option<String>,
 }
 
 pub fn run(args: &[String]) -> u8 {
@@ -187,6 +199,7 @@ pub fn run(args: &[String]) -> u8 {
         "pin" => super::operate::run_pin(&options),
         "unpin" => super::operate::run_unpin(&options),
         "routes" => super::operate::run_routes(&options),
+        "infer" => super::operate::run_infer(&options),
         other => Err(Failure {
             code: "unknown_subcommand",
             message: format!("unknown env subcommand {other:?}"),
@@ -232,6 +245,7 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
         abandon: false,
         reason: None,
         pin_seconds: None,
+        range: None,
     };
     let number = |value: Option<&String>, flag: &str| -> Result<usize, Failure> {
         value
@@ -263,7 +277,14 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
                         .ok_or_else(|| usage("--for needs seconds from 60 to 86400".into()))?,
                 )
             }
-            "--reason" if matches!(command, "destroy" | "pin") => {
+            "--range" if command == "infer" => {
+                options.range = Some(
+                    args.next()
+                        .ok_or_else(|| usage("--range needs a revision range".into()))?
+                        .clone(),
+                )
+            }
+            "--reason" if matches!(command, "destroy" | "pin" | "up") => {
                 options.reason = Some(
                     args.next()
                         .ok_or_else(|| usage("--reason needs text".into()))?
