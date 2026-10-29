@@ -707,25 +707,6 @@ impl BrokerStore {
         Ok(updated)
     }
 
-    pub(crate) fn complete_checkout_cleanup_compactions(
-        &mut self,
-        session_ids: &[i64],
-        now_ms: i64,
-    ) -> Result<usize, BrokerError> {
-        let mut updated = 0usize;
-        for session_id in session_ids {
-            updated += self.conn.execute(
-                "UPDATE closed_checkout_cleanup_requests
-                 SET compact_completed_at_ms = ?2, compact_retry_after_ms = NULL,
-                     last_progress_at_ms = ?2
-                 WHERE session_id = ?1 AND compact_requested_at_ms IS NOT NULL
-                   AND compact_completed_at_ms IS NULL",
-                params![session_id, now_ms],
-            )?;
-        }
-        Ok(updated)
-    }
-
     /// A verified cleanup operation removed the checkout and the caller has
     /// recorded its terminal session transition. Both the full checkout and
     /// compact obligations are then satisfied, so neither lane should
@@ -754,18 +735,6 @@ impl BrokerStore {
             )?;
         }
         Ok(updated)
-    }
-
-    pub(crate) fn complete_due_checkout_cleanup_requests(
-        &mut self,
-        now_ms: i64,
-    ) -> Result<usize, BrokerError> {
-        Ok(self.conn.execute(
-            "UPDATE closed_checkout_cleanup_requests SET completed_at_ms = ?1,
-                    last_progress_at_ms = ?1
-             WHERE completed_at_ms IS NULL AND not_before_ms <= ?1",
-            [now_ms],
-        )?)
     }
 
     /// Start or resume one bounded page of the session-path inventory. The
@@ -2089,20 +2058,6 @@ mod tests {
                 .next_pending_checkout_cleanup_at_with_compaction(false)
                 .unwrap(),
             Some(full_due)
-        );
-        store
-            .complete_checkout_cleanup_compactions(&[id], 2500)
-            .unwrap();
-        assert_eq!(store.next_pending_checkout_compaction_at().unwrap(), None);
-        assert_eq!(
-            store
-                .next_pending_checkout_cleanup_at_with_compaction(true)
-                .unwrap(),
-            Some(full_due)
-        );
-        assert_eq!(
-            store.complete_due_checkout_cleanup_requests(5000).unwrap(),
-            0
         );
         assert_eq!(
             store
