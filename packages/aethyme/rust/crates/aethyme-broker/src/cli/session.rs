@@ -2211,11 +2211,15 @@ fn run_cleanup_resolve_batch(
                 );
                 for target in &plan.targets {
                     match &target.blocker {
-                        Some(blocker) => out!("  session {}: kept — {blocker}", target.session_id),
+                        Some(blocker) => out!(
+                            "  session {}: kept — {}",
+                            target.session_id,
+                            advisory_text(blocker)
+                        ),
                         None => out!(
                             "  session {}: archive then retire {}; {} unlanded commits, {} of patches and preserved files",
                             target.session_id,
-                            target.worktree_path.as_deref().unwrap_or_default(),
+                            advisory_text(target.worktree_path.as_deref().unwrap_or_default()),
                             target
                                 .unlanded_commits
                                 .map_or_else(|| "unknown".into(), |count| count.to_string()),
@@ -2241,18 +2245,23 @@ fn run_cleanup_resolve_batch(
                 );
                 for result in &outcome.results {
                     if let Some(error) = &result.error {
-                        out!("  session {}: kept — {error}", result.session_id);
+                        out!(
+                            "  session {}: kept — {}",
+                            result.session_id,
+                            advisory_text(error)
+                        );
                     }
                     if let Some(archive) = &result.outcome {
                         out!(
                             "  session {}: archive {}",
                             result.session_id,
-                            archive.archive.display()
+                            advisory_text(&archive.archive.to_string_lossy())
                         );
                         if let Some(error) = &archive.cleanup_error {
                             out!(
-                                "  Warning: session {} retained — {error}",
-                                result.session_id
+                                "  Warning: session {} retained — {}",
+                                result.session_id,
+                                advisory_text(error)
                             );
                         }
                     }
