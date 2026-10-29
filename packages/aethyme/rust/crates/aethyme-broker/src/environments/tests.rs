@@ -100,7 +100,12 @@ fn parse(text: &str) -> EnvironmentsFile {
 }
 
 fn diagnostics(text: &str) -> Vec<Diagnostic> {
-    validate(&parse(text), &HostEnvironmentsFile::default(), "env.toml", "host.toml")
+    validate(
+        &parse(text),
+        &HostEnvironmentsFile::default(),
+        "env.toml",
+        "host.toml",
+    )
 }
 
 fn context() -> CompileContext {
@@ -123,7 +128,11 @@ fn both_fixture_stacks_validate_without_stack_specific_code() {
         assert!(
             found.is_empty(),
             "{}",
-            found.iter().map(Diagnostic::render).collect::<Vec<_>>().join("\n")
+            found
+                .iter()
+                .map(Diagnostic::render)
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 }
@@ -346,17 +355,19 @@ fn every_rule_has_a_located_diagnostic() {
     ];
     for case in cases {
         let found = diagnostics(&case.toml);
-        let hit = found.iter().find(|d| d.code == case.code).unwrap_or_else(|| {
-            panic!(
-                "{}: expected {} in {:#?}",
-                case.name, case.code, found
-            )
-        });
+        let hit = found
+            .iter()
+            .find(|d| d.code == case.code)
+            .unwrap_or_else(|| panic!("{}: expected {} in {:#?}", case.name, case.code, found));
         assert_eq!(hit.file, "env.toml", "{}", case.name);
         assert_eq!(hit.profile.as_deref(), case.profile, "{}", case.name);
         assert_eq!(hit.component.as_deref(), case.component, "{}", case.name);
         assert_eq!(hit.field.as_deref(), Some(case.field), "{}", case.name);
-        assert!(!hit.fix.is_empty(), "{}: every diagnostic says how to fix it", case.name);
+        assert!(
+            !hit.fix.is_empty(),
+            "{}: every diagnostic says how to fix it",
+            case.name
+        );
     }
 }
 
@@ -365,11 +376,16 @@ fn a_host_pool_takes_its_limit_from_host_settings_only() {
     let toml = "schema = 1\n[pools.shared]\nscope = \"host\"\n[[profiles]]\nname = \"a\"\nunits = 2\ncomponents = [{ name = \"x\", runtime = \"process\", start = \"x\" }]\n";
     let file = parse(toml);
     let mut host = HostEnvironmentsFile::default();
-    host.pools.insert("shared".into(), HostPoolSpec { limit: 1 });
+    host.pools
+        .insert("shared".into(), HostPoolSpec { limit: 1 });
     let found = validate(&file, &host, "env.toml", "host.toml");
-    assert!(found.iter().any(|d| d.code == "units_exceed_limit"), "{found:#?}");
+    assert!(
+        found.iter().any(|d| d.code == "units_exceed_limit"),
+        "{found:#?}"
+    );
 
-    host.pools.insert("shared".into(), HostPoolSpec { limit: 8 });
+    host.pools
+        .insert("shared".into(), HostPoolSpec { limit: 8 });
     assert!(validate(&file, &host, "env.toml", "host.toml").is_empty());
     let compiled = compile(&file, &host, "a", "env.toml", &context()).unwrap();
     let pool = compiled.pool.expect("pool");
@@ -387,7 +403,11 @@ fn unknown_keys_and_syntax_errors_carry_line_and_column() {
     let diagnostic = loaded.value.expect_err("unknown key");
     assert_eq!(diagnostic.code, "parse_error");
     assert_eq!(diagnostic.line, Some(5), "{}", diagnostic.render());
-    assert!(diagnostic.render().starts_with("env.toml:5:"), "{}", diagnostic.render());
+    assert!(
+        diagnostic.render().starts_with("env.toml:5:"),
+        "{}",
+        diagnostic.render()
+    );
 }
 
 #[test]
@@ -410,7 +430,11 @@ fn components_compile_in_dependency_order_and_ties_keep_declaration_order() {
         &context(),
     )
     .unwrap();
-    let names: Vec<&str> = compiled.components.iter().map(|c| c.name.as_str()).collect();
+    let names: Vec<&str> = compiled
+        .components
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
     assert_eq!(names, ["db", "api"]);
     assert_eq!(compiled.components[0].runtime, Runtime::Hooks);
     assert_eq!(compiled.components[1].port_key.as_deref(), Some("port_api"));
@@ -430,7 +454,11 @@ fn identity_is_stable_per_owner_and_profile() {
     assert_ne!(id, environment_id("repo", &owner, "isolated"));
     assert_ne!(
         id,
-        environment_id("repo", &EnvironmentOwner::Ref { name: "a".into() }, "backend"),
+        environment_id(
+            "repo",
+            &EnvironmentOwner::Ref { name: "a".into() },
+            "backend"
+        ),
         "a ref owner never collides with a worktree of the same spelling"
     );
     assert!(id.starts_with("env-") && id.len() == 16, "{id}");
@@ -445,8 +473,14 @@ fn the_snapshot_digest_tracks_commands_not_where_the_file_came_from() {
     moved.source_commit = Some("b".repeat(40));
     moved.source_dirty = true;
     let second = compile(&file, &host, "backend", "env.toml", &moved).unwrap();
-    assert_eq!(first.digest, second.digest, "a new commit alone is not a reconfiguration");
-    assert_eq!(second.source.commit.as_deref(), Some("b".repeat(40).as_str()));
+    assert_eq!(
+        first.digest, second.digest,
+        "a new commit alone is not a reconfiguration"
+    );
+    assert_eq!(
+        second.source.commit.as_deref(),
+        Some("b".repeat(40).as_str())
+    );
 
     let edited = parse(&PYTHON_SQLITE.replace("db-drop.sh", "db-drop-v2.sh"));
     let third = compile(&edited, &host, "backend", "env.toml", &context()).unwrap();
@@ -479,7 +513,10 @@ fn a_profile_compiles_to_a_reservation_and_a_separate_capacity_request() {
             )
         })
         .collect();
-    assert_eq!(kinds, [(NAMESPACE_KEY, "namespace"), ("port_api", "tcp_port")]);
+    assert_eq!(
+        kinds,
+        [(NAMESPACE_KEY, "namespace"), ("port_api", "tcp_port")]
+    );
     assert!(
         !reservation
             .resources
@@ -500,7 +537,10 @@ fn a_profile_compiles_to_a_reservation_and_a_separate_capacity_request() {
     assert_ne!(reservation.request_id, capacity.request_id);
 
     let zero = compile(&file, &host, "static", "env.toml", &context()).unwrap();
-    assert!(zero.capacity_request(None).is_none(), "zero units never waits for capacity");
+    assert!(
+        zero.capacity_request(None).is_none(),
+        "zero units never waits for capacity"
+    );
 }
 
 /// `env plan` reports the coordinator's own plan for the compiled requests,
@@ -531,7 +571,10 @@ fn compiled_requests_are_accepted_and_planned_by_the_coordinator() {
         .iter()
         .find(|a| a.key == NAMESPACE_KEY)
         .unwrap();
-    assert!(namespace.value.starts_with(&compiled.env_id), "{namespace:?}");
+    assert!(
+        namespace.value.starts_with(&compiled.env_id),
+        "{namespace:?}"
+    );
     let capacity = coordinator
         .plan(&compiled.capacity_request(None).unwrap())
         .expect("valid capacity");
@@ -563,7 +606,13 @@ fn variables_name_every_port_and_receipt_and_nothing_inherited() {
         "AETHYME_ENV_RECEIPT_DB",
         "AETHYME_ENV_HOOK_ATTEMPT",
     ] {
-        assert!(names.iter().any(|n| n == expected), "{expected} in {names:?}");
+        assert!(
+            names.iter().any(|n| n == expected),
+            "{expected} in {names:?}"
+        );
     }
-    assert!(!names.iter().any(|n| n == "AETHYME_ENV_PORT_DB"), "db does not listen");
+    assert!(
+        !names.iter().any(|n| n == "AETHYME_ENV_PORT_DB"),
+        "db does not listen"
+    );
 }

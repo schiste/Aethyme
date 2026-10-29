@@ -89,6 +89,7 @@ pub use gate_debris::{
 };
 pub mod agent_supervisor;
 mod auto_cleanup;
+pub mod environments;
 pub mod execution_resources;
 pub mod execution_snapshot;
 pub mod execution_supervisor;
@@ -128,7 +129,6 @@ pub mod local_wave;
 mod main_drift;
 pub mod main_reconcile;
 pub mod managed_services;
-pub mod environments;
 mod measurement;
 mod merge;
 mod merge_chain;

@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::spec::{
-    ComponentSpec, Engine, EnvironmentsFile, HealthSpec, HostEnvironmentsFile, PoolScope,
-    Preempt, Runtime,
+    ComponentSpec, Engine, EnvironmentsFile, HealthSpec, HostEnvironmentsFile, PoolScope, Preempt,
+    Runtime,
 };
 use super::validate::{declared_engine, effective_rank, env_suffix, pool_limit, profile_pool};
 use crate::resources::{
@@ -331,9 +331,10 @@ pub fn topological_order(components: &[ComponentSpec]) -> Option<Vec<&ComponentS
     let mut placed: Vec<&ComponentSpec> = Vec::with_capacity(components.len());
     while !remaining.is_empty() {
         let ready = remaining.iter().position(|candidate| {
-            candidate.depends_on.iter().all(|dependency| {
-                placed.iter().any(|done| &done.name == dependency)
-            })
+            candidate
+                .depends_on
+                .iter()
+                .all(|dependency| placed.iter().any(|done| &done.name == dependency))
         })?;
         placed.push(remaining.remove(ready));
     }

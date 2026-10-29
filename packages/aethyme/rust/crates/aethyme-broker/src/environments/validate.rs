@@ -12,8 +12,8 @@ use globset::Glob;
 use serde::Serialize;
 
 use super::spec::{
-    ComponentSpec, Engine, EnvironmentsFile, HealthSpec, HostEnvironmentsFile, PoolScope,
-    ProfileSpec, Runtime, ENVIRONMENTS_SCHEMA,
+    ComponentSpec, ENVIRONMENTS_SCHEMA, Engine, EnvironmentsFile, HealthSpec, HostEnvironmentsFile,
+    PoolScope, ProfileSpec, Runtime,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -148,10 +148,7 @@ pub fn validate(
             None,
             None,
             Some("schema"),
-            format!(
-                "schema {} is not supported by this binary",
-                file.schema
-            ),
+            format!("schema {} is not supported by this binary", file.schema),
             format!("set schema = {ENVIRONMENTS_SCHEMA}, or upgrade aethyme"),
         );
         return c.out;
@@ -268,7 +265,10 @@ pub fn validate(
                 None,
                 None,
                 Some(&format!("{field}.min_profile")),
-                format!("min_profile {:?} is not a declared profile", rule.min_profile),
+                format!(
+                    "min_profile {:?} is not a declared profile",
+                    rule.min_profile
+                ),
                 "name a declared profile",
             );
         }
@@ -447,11 +447,7 @@ pub fn profile_pool<'a>(file: &'a EnvironmentsFile, profile: &'a ProfileSpec) ->
 }
 
 /// A pool's effective limit, from the file or host configuration.
-pub fn pool_limit(
-    file: &EnvironmentsFile,
-    host: &HostEnvironmentsFile,
-    pool: &str,
-) -> Option<u32> {
+pub fn pool_limit(file: &EnvironmentsFile, host: &HostEnvironmentsFile, pool: &str) -> Option<u32> {
     let spec = file.pools.get(pool)?;
     match spec.scope {
         PoolScope::Repository => spec.limit,
@@ -666,8 +662,7 @@ pub fn find_cycle(components: &[ComponentSpec]) -> Option<Vec<String>> {
             Some(Mark::Done) => return None,
             Some(Mark::Visiting) => {
                 let start = stack.iter().position(|n| *n == node).unwrap_or(0);
-                let mut cycle: Vec<String> =
-                    stack[start..].iter().map(|n| n.to_string()).collect();
+                let mut cycle: Vec<String> = stack[start..].iter().map(|n| n.to_string()).collect();
                 cycle.push(node.to_string());
                 return Some(cycle);
             }

@@ -88,7 +88,10 @@ pub fn run(args: &[String]) -> u8 {
     match result {
         Ok((value, text, exit)) => {
             if json {
-                println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).unwrap_or_default()
+                );
             } else {
                 print!("{text}");
             }
@@ -127,7 +130,11 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
                         .clone(),
                 )
             }
-            other => return Err(usage(format!("unexpected argument {other:?} for env {command}"))),
+            other => {
+                return Err(usage(format!(
+                    "unexpected argument {other:?} for env {command}"
+                )));
+            }
         }
     }
     Ok(options)
@@ -268,7 +275,11 @@ fn run_validate(options: &Options) -> Result<Output, Failure> {
         text.push_str(&format!(
             "{} problem{} found\n",
             checked.diagnostics.len(),
-            if checked.diagnostics.len() == 1 { "" } else { "s" }
+            if checked.diagnostics.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
         ));
     }
     let exit = if valid {
@@ -308,26 +319,22 @@ fn run_plan(options: &Options) -> Result<Output, Failure> {
         .unwrap_or_default()
         .to_string();
     let context = compile_context(&workspace, &checked.digest);
-    let compiled = compile(
-        file,
-        &checked.host,
-        &profile,
-        ENVIRONMENTS_FILE,
-        &context,
-    )
-    .map_err(|error| Failure {
-        code: "unknown_profile",
-        message: error.to_string(),
-        next_action: format!(
-            "pass --profile with one of: {}",
-            file.profiles
-                .iter()
-                .map(|p| p.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        exit: exit_status::USAGE,
-    })?;
+    let compiled =
+        compile(file, &checked.host, &profile, ENVIRONMENTS_FILE, &context).map_err(|error| {
+            Failure {
+                code: "unknown_profile",
+                message: error.to_string(),
+                next_action: format!(
+                    "pass --profile with one of: {}",
+                    file.profiles
+                        .iter()
+                        .map(|p| p.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                exit: exit_status::USAGE,
+            }
+        })?;
     let plans = advisory_plans(&compiled)?;
     Ok(render_plan(&compiled, plans))
 }
@@ -340,8 +347,12 @@ fn compile_context(workspace_root: &Workspace, file_digest: &str) -> CompileCont
         .as_deref()
         .and_then(|commit| repo.blob_at(commit, ENVIRONMENTS_FILE));
     let dirty = match committed {
-        Some(text) => format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes()))
-            != file_digest,
+        Some(text) => {
+            format!(
+                "{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes())
+            ) != file_digest
+        }
         None => true,
     };
     CompileContext {
@@ -527,4 +538,3 @@ fn summarize(plan: &Value) -> String {
         format!("blocked ({})", conflicts.join("; "))
     }
 }
-
