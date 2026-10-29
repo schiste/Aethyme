@@ -268,9 +268,7 @@ fn publish(root: &Path, record: &SupervisorRecord) -> io::Result<()> {
     let path = root.join(SUPERVISOR_STATE);
     let mut temporary = tempfile::NamedTempFile::new_in(root)?;
     serde_json::to_writer(&mut temporary, record)?;
-    temporary
-        .persist(&path)
-        .map_err(|error| error.error)?;
+    temporary.persist(&path).map_err(|error| error.error)?;
     crate::host_state::protect_host_state_path(&path, false)?;
     Ok(())
 }

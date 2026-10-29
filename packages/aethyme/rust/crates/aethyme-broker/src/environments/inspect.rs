@@ -106,7 +106,9 @@ pub(super) fn run_status(options: &Options) -> Result<Output, Failure> {
         };
         let record = store.resolve(id).map_err(store_failure)?;
         let components = store.components(&record.env_id).map_err(store_failure)?;
-        let transitions = store.transitions(&record.env_id, 10).map_err(store_failure)?;
+        let transitions = store
+            .transitions(&record.env_id, 10)
+            .map_err(store_failure)?;
         let mut text = summary_line(&record);
         for component in &components {
             text.push_str(&format!(
@@ -302,5 +304,9 @@ pub(super) fn run_supervise(options: &Options) -> Result<Output, Failure> {
     let reason = supervisor::run(&config, &mut work, &|| false)
         .map_err(|error| environment_failure(format!("supervisor: {error}")))?;
     let value = json!({ "schema": SUPERVISE_SCHEMA, "exit_reason": reason });
-    Ok((value, format!("supervisor exited: {reason:?}\n"), exit_status::SUCCESS))
+    Ok((
+        value,
+        format!("supervisor exited: {reason:?}\n"),
+        exit_status::SUCCESS,
+    ))
 }

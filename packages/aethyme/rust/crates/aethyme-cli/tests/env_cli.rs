@@ -114,14 +114,19 @@ fn validate_and_plan_are_read_only_and_versioned() {
     assert_eq!(value["host_state"], "absent");
     assert_eq!(value["start_order"], serde_json::json!(["api"]));
     assert!(
-        std::fs::read_dir(fixture.state.path()).unwrap().next().is_none(),
+        std::fs::read_dir(fixture.state.path())
+            .unwrap()
+            .next()
+            .is_none(),
         "validate and plan write no host state"
     );
 }
 
 #[test]
 fn an_invalid_file_exits_4_with_located_diagnostics() {
-    let fixture = Fixture::new(Some(&ENVIRONMENTS.replace("health = { http = \"/\" }\n", "")));
+    let fixture = Fixture::new(Some(
+        &ENVIRONMENTS.replace("health = { http = \"/\" }\n", ""),
+    ));
     let (code, value) = fixture.json(&["env", "validate"]);
     assert_eq!(code, 4, "{value}");
     let diagnostic = &value["diagnostics"][0];
@@ -137,7 +142,12 @@ fn a_repository_without_environments_is_refused_with_next_action() {
     assert_eq!(code, 3);
     assert_eq!(value["schema"], "aethyme.env-error/v1");
     assert_eq!(value["code"], "not_configured");
-    assert!(value["next_action"].as_str().unwrap().contains("environments.toml"));
+    assert!(
+        value["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("environments.toml")
+    );
 }
 
 #[test]
