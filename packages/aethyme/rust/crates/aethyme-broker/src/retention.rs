@@ -424,17 +424,18 @@ fn unknown_broker_field_warning(field: String) -> RetentionConfigWarning {
 pub fn load_retention_policy_report(
     repo: &Path,
 ) -> Result<RetentionPolicyLoadReport, RetentionConfigError> {
-    let path = repo.join(BROKER_CONFIG_RELPATH);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(RetentionPolicyLoadReport {
-                policy: RetentionPolicy::default(),
-                warnings: Vec::new(),
-            });
-        }
-        Err(source) => return Err(RetentionConfigError::Io { path, source }),
-    };
+    // `.aethyme/broker.toml`, `.yaml` or `.yml` (#1223), as TOML text.
+    let text =
+        match aethyme_config::read_config_toml(&repo.join(aethyme_config::CONFIG_DIR), "broker") {
+            Ok(Some((_, text))) => text,
+            Ok(None) => {
+                return Ok(RetentionPolicyLoadReport {
+                    policy: RetentionPolicy::default(),
+                    warnings: Vec::new(),
+                });
+            }
+            Err(error) => return Err(RetentionConfigError::Parse(error.to_string())),
+        };
 
     let root: toml::Value = toml::from_str(&text)
         .map_err(|error: toml::de::Error| RetentionConfigError::Parse(error.to_string()))?;

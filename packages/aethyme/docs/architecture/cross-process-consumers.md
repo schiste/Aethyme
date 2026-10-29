@@ -173,6 +173,12 @@ is inferred from generated-path classification.
 
 ## Inventory
 
+### YAML configuration files (#1223)
+
+Every human-authored `.aethyme` configuration stem (`config`, `gates`, `prepare`, `broker`) may now be written as `<stem>.toml`, `<stem>.yaml` or `<stem>.yml`. Exactly one may exist. If two are present, every reader refuses with `config_ambiguous_format` and names both files; neither is preferred. YAML is a strict YAML 1.2 subset converted into the same value the TOML file produces, so semantics are identical. The subset refuses `null`, duplicate keys, tags, merge keys (`<<`), non-string keys, integers outside i64 and multi-document streams, and caps alias expansion. Readers include checkout reads, reads at a commit (gate trust, `[promote]`, delivery policy, graph policy), init/certify existence checks and the collaboration enrollment reads. `GATE_POLICY` classification covers the `.yaml`/`.yml` twins of `gates` and `config`. The preparation source digest and gate-policy comparisons are over the parsed value, so converting a file between formats does not by itself invalidate caches or count as a policy change. Writers never rewrite YAML: `aethyme upgrade` reports a `manual_yaml_edit_required` blocker carrying the exact patch, and `aethyme deploy --graph-repository` refuses with the same code and prints the YAML to add. Rust consumers load configuration through `aethyme_config::load_config(dir, stem)` (re-exported as `aethyme_broker::config_source`).
+
+Compatibility: TOML-only repositories see no change. An older binary ignores a YAML file and behaves as if the stem were absent, so a repository that adopts YAML needs every agent on a binary with #1223. A wrapper that probes `.aethyme/gates.toml` to decide whether gates exist must also check the YAML twins. Covered by `aethyme-config` unit and lint tests, `aethyme-broker/tests/config_formats.rs`, and `repository_upgrade::yaml_config_tests`.
+
 ### Reviewed worktree identity recovery (#847)
 
 The operator-facing commands are

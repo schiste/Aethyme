@@ -4978,11 +4978,21 @@ impl Broker {
             // Opens run on every hook call: reach Git only when the working
             // copy says required, then confirm against the committed copy.
             FenceTrigger::Open => {
-                let text =
-                    std::fs::read_to_string(self.main_root.join(".aethyme/config.toml")).ok()?;
-                if !crate::collaboration_submit::requires_capture(
-                    &crate::collaboration_submit::setting_from_text(Some(&text)),
+                // Either format (#1223); an unresolvable working copy goes on
+                // to the committed copy rather than being read as "off".
+                let text = match aethyme_config::read_config_text(
+                    &self.main_root.join(aethyme_config::CONFIG_DIR),
+                    "config",
                 ) {
+                    Ok(None) => return None,
+                    Ok(Some(text)) => text.toml_text().ok().map(|toml| toml.into_owned()),
+                    Err(_) => None,
+                };
+                if let Some(text) = text
+                    && !crate::collaboration_submit::requires_capture(
+                        &crate::collaboration_submit::setting_from_text(Some(&text)),
+                    )
+                {
                     return None;
                 }
                 loaded = crate::merge::repository_config_with_source(&self.main_root);

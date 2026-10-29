@@ -281,13 +281,12 @@ impl AutoCleanupPolicy {
     /// unreadable one is an error, which the sweep turns into "removal off"
     /// rather than guessing what the operator meant.
     pub fn load(main_root: &Path) -> Result<Self, String> {
-        let path = main_root.join(".aethyme/config.toml");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
-            Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+        // `.aethyme/config.toml`, `.yaml` or `.yml` (#1223), as TOML text.
+        let Some((path, text)) =
+            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
+                .map_err(|error| error.to_string())?
+        else {
+            return Ok(Self::default());
         };
         let root: toml::Value = toml::from_str(&text)
             .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;

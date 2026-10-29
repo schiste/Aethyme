@@ -38,6 +38,11 @@ mod cleanup_audit;
 mod cleanup_batch;
 mod cleanup_resolve;
 mod clock;
+/// The shared `.aethyme` configuration loader (#1223): `<stem>.toml`,
+/// `<stem>.yaml` or `<stem>.yml`, exactly one, as one `toml::Value`.
+pub mod config_source {
+    pub use aethyme_config::*;
+}
 pub mod collaboration_archive;
 pub mod collaboration_capture;
 pub mod collaboration_cli;

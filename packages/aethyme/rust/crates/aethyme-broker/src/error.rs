@@ -19,6 +19,11 @@ pub enum BrokerError {
     #[error("broker db: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    /// A `.aethyme` configuration file could not be resolved or parsed.
+    /// Boxed so the error enum stays small.
+    #[error("{0}")]
+    Config(Box<aethyme_config::ConfigSourceError>),
+
     // Recovery must never be "run whatever binary is newer" (#361): the
     // newer schema may have come from an unreviewed gate build, and the
     // only binaries that should open shared state are released ones.
@@ -209,4 +214,10 @@ pub struct PlannedLeaseConflict {
     pub blocker_status: String,
     pub blocker_worktree: String,
     pub remediation: String,
+}
+
+impl From<aethyme_config::ConfigSourceError> for BrokerError {
+    fn from(error: aethyme_config::ConfigSourceError) -> Self {
+        Self::Config(Box::new(error))
+    }
 }

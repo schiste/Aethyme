@@ -2458,8 +2458,10 @@ fn collect_path_controls(surface_files: &OnboardingFileSnapshot) -> (Vec<Value>,
     if surface_files.contains_directory(".github/workflows") {
         dangerous.insert(".github/workflows".into());
     }
-    if surface_files.contains_file(".aethyme/gates.toml") {
-        dangerous.insert(".aethyme/gates.toml".into());
+    for gates in aethyme_config::candidate_relpaths("gates") {
+        if surface_files.contains_file(&gates) {
+            dangerous.insert(gates);
+        }
     }
     (
         generated
@@ -2478,7 +2480,7 @@ fn collect_path_controls(surface_files: &OnboardingFileSnapshot) -> (Vec<Value>,
         dangerous
             .into_iter()
             .map(|path| {
-                let reason = if path == ".aethyme/gates.toml" {
+                let reason = if aethyme_config::is_config_twin(&path, "gates") {
                     "repository validation policy; changes affect every broker submission"
                 } else if path == ".github/workflows" {
                     "repository automation; changes can affect publication or shared CI"
