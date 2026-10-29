@@ -158,7 +158,7 @@ pub fn ensure_running(root: &Path, executable: &Path) -> io::Result<SupervisorSt
             // Reap the child if it ever exits so it never lingers as a zombie
             // of this short-lived command; the supervisor is in its own group.
             std::thread::spawn(move || {
-                let _ = child.wait();
+                crate::warn_unrecorded("reap the environment supervisor", child.wait());
             });
             return Ok(observed);
         }
@@ -281,7 +281,7 @@ fn withdraw(root: &Path, pid: i32) {
         .and_then(|text| serde_json::from_str::<SupervisorRecord>(&text).ok())
         .is_some_and(|record| record.identity.pid == pid);
     if ours {
-        let _ = fs::remove_file(path);
+        crate::warn_unrecorded("remove the supervisor record", fs::remove_file(path));
     }
 }
 
