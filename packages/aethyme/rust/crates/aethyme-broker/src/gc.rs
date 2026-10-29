@@ -159,6 +159,16 @@ pub(crate) const AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY: &str =
 /// Backoff for a whole-checkout cleanup continuation that made no progress.
 pub(crate) const AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY: &str =
     "gc.artifact_sweep.checkout_cleanup_retry_after_ms";
+/// One-time bounded backfill of retained closed Spawned rows when the opt-in
+/// compact policy is enabled. This schedules witnessed candidates; the
+/// per-session outbox and fresh removal proof remain authoritative.
+const AUTO_COMPACT_BACKFILL_REQUESTED_KEY: &str = "gc.artifact_sweep.compact_backfill_requested_ms";
+const AUTO_COMPACT_BACKFILL_COMPLETED_KEY: &str = "gc.artifact_sweep.compact_backfill_completed_ms";
+const AUTO_COMPACT_BACKFILL_RETRY_AFTER_KEY: &str =
+    "gc.artifact_sweep.compact_backfill_retry_after_ms";
+const AUTO_COMPACT_BACKFILL_CURSOR_KEY: &str = "gc.artifact_sweep.compact_backfill_cursor";
+const AUTO_COMPACT_BACKFILL_HIGH_WATER_KEY: &str = "gc.artifact_sweep.compact_backfill_high_water";
+const AUTO_COMPACT_POLICY_ENABLED_KEY: &str = "gc.artifact_sweep.compact_policy_enabled";
 /// Bounded last-worker result; overwritten each run rather than appended.
 const ARTIFACT_SWEEP_WORKER_STATUS_KEY: &str = "gc.artifact_sweep.worker_status";
 const ARTIFACT_SWEEP_META_PREFIX: &str = "gc.artifact_sweep.";
@@ -170,6 +180,8 @@ const ARTIFACT_SWEEP_WORKER_NO_PROGRESS_PASSES: usize = 3;
 /// Positive partial deletion is progress, but must not let one detached worker
 /// run indefinitely while another process keeps replenishing the cache.
 const ARTIFACT_SWEEP_WORKER_MAX_PASSES: usize = 8;
+/// Discovery pages count as progress; the wall-time budget still bounds the worker.
+const AUTO_CHECKOUT_CLEANUP_WORKER_MAX_PASSES: usize = 4096;
 /// Pressure can multiply one sweep budget by twelve. Cap the worker's entire
 /// lifetime as well as each individual pass, retaining the cursor/request for
 /// a later normal open when this deadline expires.
@@ -178,6 +190,41 @@ const ARTIFACT_SWEEP_WORKER_RETRY_MS: i64 = 10 * 60_000;
 /// Cache work yields this part of the singleton worker's total budget to an
 /// independently requested whole-checkout cleanup pass.
 const AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE: Duration = Duration::from_secs(60);
+/// The detached worker gives an opt-in compact archive its own admission
+/// window. Foreground sweeps never archive checkout content.
+const AUTO_COMPACT_CHECKOUT_WORKER_RESERVE: Duration = Duration::from_secs(90);
+const AUTO_COMPACT_CHECKOUT_RETRY_MS: i64 = 10 * 60_000;
+const AUTO_COMPACT_BACKFILL_RETRY_MS: i64 = 60_000;
+const AUTO_COMPACT_CHECKOUT_BATCH_SIZE: usize = 1;
+const AUTO_COMPACT_BACKFILL_PAGE_SIZE: usize = 32;
+
+fn artifact_worker_cache_lane_duration(
+    checkout_cleanup_due: bool,
+    compact_checkout_due: bool,
+) -> Duration {
+    let mut reserve = Duration::ZERO;
+    if checkout_cleanup_due {
+        reserve = reserve.saturating_add(AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE);
+    }
+    if compact_checkout_due {
+        reserve = reserve.saturating_add(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE);
+    }
+    ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(reserve)
+}
+
+fn compact_checkout_worker_has_admission_budget(remaining: Duration) -> bool {
+    remaining >= AUTO_COMPACT_CHECKOUT_WORKER_RESERVE
+}
+
+fn compact_checkout_pending_is_due(
+    backfill_pending: bool,
+    backfill_retry_after_ms: Option<i64>,
+    next_outbox_due_ms: Option<i64>,
+    now: i64,
+) -> bool {
+    (backfill_pending && !backfill_retry_after_ms.is_some_and(|retry| retry > now))
+        || next_outbox_due_ms.is_some_and(|due| due <= now)
+}
 /// Each whole-checkout pass has its own bounded tranche; the cursor resumes
 /// after candidates inspected before this deadline.
 const AUTO_CHECKOUT_CLEANUP_WORKER_PASS_BUDGET: Duration = Duration::from_secs(30);
@@ -5342,12 +5389,25 @@ impl Broker {
             .next_pending_checkout_cleanup_at()?
             .unwrap_or(not_before_ms)
             .min(not_before_ms);
+        // Routine outbox reconciliation must not clear a retained target's
+        // cooldown merely because its original grace period has elapsed.
+        let now = now_ms();
+        let existing_retry = self
+            .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|retry| *retry > now)
+            .unwrap_or(0);
+        let retry_after = if next_due > now {
+            next_due.max(existing_retry)
+        } else {
+            existing_retry
+        };
         self.artifact_sweep_meta_set(
             AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY,
-            if next_due > now_ms() {
-                &next_due.to_string()
+            &if retry_after > now {
+                retry_after.to_string()
             } else {
-                ""
+                String::new()
             },
         )?;
         Ok(())
@@ -5422,7 +5482,11 @@ impl Broker {
             .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY)?
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
-        Ok(requested > completed || self.store().next_pending_checkout_cleanup_at()?.is_some())
+        let automatic_removal_enabled =
+            crate::AutoCleanupPolicy::load(self.main_root()).is_ok_and(|policy| policy.auto_remove);
+        Ok(requested > completed
+            || (automatic_removal_enabled
+                && self.store().next_pending_checkout_cleanup_at()?.is_some()))
     }
 
     fn auto_checkout_cleanup_retry_pending(&mut self, now: i64) -> Result<bool, BrokerOpError> {
@@ -5435,6 +5499,468 @@ impl Broker {
             .next_pending_checkout_cleanup_at()?
             .is_some_and(|retry_after| retry_after > now);
         Ok(metadata_retry || outbox_retry)
+    }
+
+    /// Detect the opt-in edge and queue a durable one-time stock backfill.
+    /// This is metadata-only on broker open; path enumeration stays in the
+    /// detached worker.
+    fn reconcile_compact_checkout_backfill(&mut self) -> Result<bool, BrokerOpError> {
+        let policy = load_retention_policy(self.main_root())?;
+        let enabled_marker = self.artifact_sweep_meta_get(AUTO_COMPACT_POLICY_ENABLED_KEY)?;
+        if !policy.compact_closed_worktrees {
+            if enabled_marker.as_deref() != Some("0") {
+                self.artifact_sweep_meta_set(AUTO_COMPACT_POLICY_ENABLED_KEY, "0")?;
+            }
+            return Ok(false);
+        }
+
+        let requested = self
+            .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_REQUESTED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let completed = self
+            .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_COMPLETED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        if enabled_marker.as_deref() != Some("1") && requested <= completed {
+            let generation = now_ms()
+                .max(requested.saturating_add(1))
+                .max(completed.saturating_add(1))
+                .max(1);
+            // Reset the cursor first. If the process stops before the request
+            // write, the next opt-in observation repeats these harmless
+            // resets; a durable generation can never inherit a completed
+            // cursor from the prior opt-in.
+            self.artifact_sweep_meta_set(AUTO_COMPACT_BACKFILL_CURSOR_KEY, "0")?;
+            self.artifact_sweep_meta_set(AUTO_COMPACT_BACKFILL_HIGH_WATER_KEY, "")?;
+            self.artifact_sweep_meta_set(AUTO_COMPACT_BACKFILL_RETRY_AFTER_KEY, "")?;
+            self.artifact_sweep_meta_set(
+                AUTO_COMPACT_BACKFILL_REQUESTED_KEY,
+                &generation.to_string(),
+            )?;
+        }
+        if enabled_marker.as_deref() != Some("1") {
+            self.artifact_sweep_meta_set(AUTO_COMPACT_POLICY_ENABLED_KEY, "1")?;
+        }
+        let requested = self
+            .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_REQUESTED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let completed = self
+            .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_COMPLETED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        Ok(requested > completed)
+    }
+
+    fn compact_checkout_backfill_pending(&mut self) -> Result<bool, BrokerOpError> {
+        let requested = self
+            .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_REQUESTED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let completed = self
+            .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_COMPLETED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        Ok(requested > completed)
+    }
+
+    fn compact_checkout_work_pending(&mut self) -> Result<bool, BrokerOpError> {
+        let policy = load_retention_policy(self.main_root())?;
+        if !policy.compact_closed_worktrees {
+            return Ok(false);
+        }
+        Ok(self.compact_checkout_backfill_pending()?
+            || self
+                .store()
+                .next_pending_checkout_compaction_at()?
+                .is_some())
+    }
+
+    fn compact_checkout_work_due(&mut self, now: i64) -> Result<bool, BrokerOpError> {
+        let policy = load_retention_policy(self.main_root())?;
+        if !policy.compact_closed_worktrees {
+            return Ok(false);
+        }
+        let retry_after = self
+            .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_RETRY_AFTER_KEY)?
+            .and_then(|value| value.parse::<i64>().ok());
+        let next_outbox_due = self.store().next_pending_checkout_compaction_at()?;
+        Ok(compact_checkout_pending_is_due(
+            self.compact_checkout_backfill_pending()?,
+            retry_after,
+            next_outbox_due,
+            now,
+        ))
+    }
+
+    /// Apply bounded backoff to both the stock seed and currently due rows.
+    /// The request rows remain durable and are still subject to fresh proof.
+    fn defer_auto_compact_checkout_worker(
+        &mut self,
+        reason: &str,
+        retry_ms: i64,
+    ) -> Result<(), BrokerOpError> {
+        let now = now_ms();
+        let retry_after = now.saturating_add(retry_ms);
+        if self.compact_checkout_backfill_pending()? {
+            self.artifact_sweep_meta_set(
+                AUTO_COMPACT_BACKFILL_RETRY_AFTER_KEY,
+                &retry_after.to_string(),
+            )?;
+        }
+        // Store limits each batch to 128 rows. Repeating a bounded number of
+        // times also cools down the current stock burst without walking
+        // session history on an ordinary broker open.
+        for _ in 0..8 {
+            let due = self.store().due_checkout_cleanup_compactions(now, 128)?;
+            if due.is_empty() {
+                break;
+            }
+            self.store()
+                .defer_checkout_cleanup_compactions(&due, retry_after, now)?;
+        }
+        self.write_artifact_sweep_worker_status(reason)
+    }
+
+    /// Reconcile the crash window after a verified checkout removal and the
+    /// terminal session-row update. This never removes paths: only an exact
+    /// terminal row whose recorded path is now absent can have its outbox
+    /// obligations acknowledged.
+    fn reconcile_terminal_checkout_cleanup_requests(
+        &mut self,
+        now: i64,
+    ) -> Result<usize, BrokerOpError> {
+        let terminal_ids = self.store().pending_terminal_checkout_cleanup_ids(
+            now,
+            0,
+            AUTO_COMPACT_BACKFILL_PAGE_SIZE,
+        )?;
+        let mut completed = 0usize;
+        for session_id in terminal_ids {
+            let session = match self.store().session(session_id) {
+                Ok(session)
+                    if session.status == crate::SessionStatus::Cleaned
+                        && session.cleanup_state == crate::SessionCleanupState::Cleaned =>
+                {
+                    session
+                }
+                _ => {
+                    self.store()
+                        .defer_terminal_checkout_cleanup_reconciliation(&[session_id], now)?;
+                    continue;
+                }
+            };
+            let path = Path::new(&session.worktree_path);
+            match std::fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    completed = completed.saturating_add(
+                        self.store()
+                            .complete_checkout_cleanup_requests_after_removal(&[session_id], now)?,
+                    );
+                }
+                Ok(_) | Err(_) => {
+                    self.store()
+                        .defer_terminal_checkout_cleanup_reconciliation(&[session_id], now)?;
+                }
+            }
+        }
+        Ok(completed)
+    }
+
+    /// Seed witnessed legacy Spawned rows from the complete bounded path
+    /// index. The Store rechecks origin, terminal state, cleanup state and
+    /// ownership witness transactionally before it creates any request.
+    fn seed_compact_checkout_backfill_pagewise(
+        &mut self,
+        request_generation: i64,
+        high_water_session_id: i64,
+        deadline: Instant,
+        grace_hours: u32,
+    ) -> Result<(bool, usize), BrokerOpError> {
+        let requested = self
+            .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_REQUESTED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let completed = self
+            .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_COMPLETED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        if requested != request_generation || completed >= request_generation {
+            return Ok((false, 0));
+        }
+
+        let stored_high_water = self
+            .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_HIGH_WATER_KEY)?
+            .and_then(|value| value.parse::<i64>().ok());
+        let high_water = stored_high_water.unwrap_or(high_water_session_id);
+        if stored_high_water.is_none() {
+            self.artifact_sweep_meta_set(
+                AUTO_COMPACT_BACKFILL_HIGH_WATER_KEY,
+                &high_water.to_string(),
+            )?;
+        }
+        let mut after = self
+            .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_CURSOR_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let mut scheduled = 0usize;
+        while after < high_water && Instant::now() < deadline {
+            let rows = self.store().cleanup_cohort_indexed_rows_page(
+                crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+                after,
+                AUTO_COMPACT_BACKFILL_PAGE_SIZE,
+            )?;
+            let rows = rows
+                .into_iter()
+                .take_while(|row| row.session_id <= high_water)
+                .collect::<Vec<_>>();
+            let Some(last) = rows.last().map(|row| row.session_id) else {
+                after = high_water;
+                self.artifact_sweep_meta_set(AUTO_COMPACT_BACKFILL_CURSOR_KEY, &after.to_string())?;
+                break;
+            };
+            let closed_ids = rows
+                .iter()
+                .filter(|row| row.cleanup_state == "closed")
+                .map(|row| row.session_id)
+                .collect::<Vec<_>>();
+            if !closed_ids.is_empty() {
+                scheduled = scheduled.saturating_add(
+                    self.store().request_closed_spawned_checkout_compactions(
+                        &closed_ids,
+                        grace_hours,
+                        now_ms(),
+                    )?,
+                );
+            }
+            after = last;
+            self.artifact_sweep_meta_set(AUTO_COMPACT_BACKFILL_CURSOR_KEY, &after.to_string())?;
+        }
+
+        if after >= high_water {
+            let current_requested = self
+                .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_REQUESTED_KEY)?
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0);
+            let current_completed = self
+                .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_COMPLETED_KEY)?
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0);
+            if current_requested == request_generation
+                && current_completed < request_generation
+                && load_retention_policy(self.main_root())?.compact_closed_worktrees
+            {
+                self.artifact_sweep_meta_set(
+                    AUTO_COMPACT_BACKFILL_COMPLETED_KEY,
+                    &request_generation.to_string(),
+                )?;
+                self.artifact_sweep_meta_set(AUTO_COMPACT_BACKFILL_RETRY_AFTER_KEY, "")?;
+                return Ok((true, scheduled));
+            }
+        }
+        Ok((false, scheduled))
+    }
+
+    /// Run one detached compact-maintenance pass. The alias index gets one
+    /// resumable full refresh; the indexed inventory and candidate cursor are
+    /// then consumed within the same reserved pass. Each worker attempts at
+    /// most one archive/removal, so its final lifecycle audit remains bounded.
+    fn auto_compact_checkout_recovery_pass(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), BrokerOpError> {
+        let retention = load_retention_policy(self.main_root())?;
+        if !retention.compact_closed_worktrees {
+            return Ok(());
+        }
+        if deadline.saturating_duration_since(Instant::now())
+            < crate::auto_cleanup::AUTO_COMPACTION_MIN_BUDGET
+        {
+            return self.defer_auto_compact_checkout_worker(
+                "compact_checkout_reserve_unavailable",
+                AUTO_COMPACT_BACKFILL_RETRY_MS,
+            );
+        }
+
+        let request_generation = self
+            .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_REQUESTED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let completed_generation = self
+            .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_COMPLETED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let backfill_pending = request_generation > completed_generation;
+        let root = self.main_root().to_path_buf();
+        let Ok(gc_lock) = GcLock::acquire(&root) else {
+            return self.defer_auto_compact_checkout_worker(
+                "compact_checkout_gc_lock_busy",
+                AUTO_COMPACT_BACKFILL_RETRY_MS,
+            );
+        };
+
+        // Leave the helper's minimum archive/removal reserve untouched while
+        // the full alias lap and bounded stock pages run.
+        let refresh_deadline = deadline
+            .checked_sub(crate::auto_cleanup::AUTO_COMPACTION_MIN_BUDGET)
+            .unwrap_or(deadline);
+        let mut refreshed_index = None;
+        let mut last_progress_sequence = None;
+        loop {
+            if Instant::now() >= refresh_deadline {
+                break;
+            }
+            let Some(state) = self.refresh_cleanup_cohort_aliases(Some(refresh_deadline))? else {
+                break;
+            };
+            if state.complete {
+                refreshed_index = Some(state);
+                break;
+            }
+            if last_progress_sequence == Some(state.progress_sequence) {
+                break;
+            }
+            last_progress_sequence = Some(state.progress_sequence);
+        }
+        let Some(index_state) = refreshed_index
+            .filter(|state| state.unresolved_rows == 0 && state.pending_dirty_rows == 0)
+        else {
+            drop(gc_lock);
+            return self.defer_auto_compact_checkout_worker(
+                "compact_checkout_alias_index_incomplete",
+                AUTO_COMPACT_BACKFILL_RETRY_MS,
+            );
+        };
+
+        let mut scheduled = 0usize;
+        let backfill_complete = if backfill_pending {
+            let (complete, count) = self.seed_compact_checkout_backfill_pagewise(
+                request_generation,
+                index_state.high_water_session_id,
+                refresh_deadline,
+                retention.closed_worktree_grace_hours,
+            )?;
+            scheduled = scheduled.saturating_add(count);
+            complete
+        } else {
+            true
+        };
+        drop(gc_lock);
+
+        if !backfill_complete {
+            self.artifact_sweep_meta_set(
+                AUTO_COMPACT_BACKFILL_RETRY_AFTER_KEY,
+                &now_ms()
+                    .saturating_add(AUTO_COMPACT_BACKFILL_RETRY_MS)
+                    .to_string(),
+            )?;
+        }
+        if deadline.saturating_duration_since(Instant::now())
+            < crate::auto_cleanup::AUTO_COMPACTION_MIN_BUDGET
+        {
+            return self.defer_auto_compact_checkout_worker(
+                "compact_checkout_worker_budget_exhausted",
+                AUTO_COMPACT_BACKFILL_RETRY_MS,
+            );
+        }
+
+        let due = self
+            .store()
+            .due_checkout_cleanup_compactions(now_ms(), AUTO_COMPACT_CHECKOUT_BATCH_SIZE)?;
+        let Some(session_id) = due.first().copied() else {
+            let status = if backfill_complete {
+                format!("compact_checkout_seeded={scheduled} no_due_candidates")
+            } else {
+                format!("compact_checkout_seed_progress={scheduled}")
+            };
+            self.write_artifact_sweep_worker_status(&status)?;
+            return Ok(());
+        };
+
+        let session = self.store().session(session_id)?;
+        if session.origin != crate::SessionOrigin::Spawned
+            || !session.status.is_closed()
+            || session.cleanup_state != crate::SessionCleanupState::Closed
+        {
+            self.store().defer_checkout_cleanup_compactions(
+                &[session_id],
+                now_ms().saturating_add(AUTO_COMPACT_CHECKOUT_RETRY_MS),
+                now_ms(),
+            )?;
+            return self.write_artifact_sweep_worker_status("compact_checkout_candidate_changed");
+        }
+        let worktree = PathBuf::from(&session.worktree_path);
+        let Some(cohort) = self.closed_artifact_checkout_cohort_for_session(
+            session_id,
+            &worktree,
+            Some(deadline),
+        )?
+        else {
+            self.store().defer_checkout_cleanup_compactions(
+                &[session_id],
+                now_ms().saturating_add(AUTO_COMPACT_CHECKOUT_RETRY_MS),
+                now_ms(),
+            )?;
+            return self.write_artifact_sweep_worker_status("compact_checkout_cohort_unavailable");
+        };
+        if cohort.owner_session_id() != session_id || cohort.owner_witness().is_none() {
+            self.store().defer_checkout_cleanup_compactions(
+                &[session_id],
+                now_ms().saturating_add(AUTO_COMPACT_CHECKOUT_RETRY_MS),
+                now_ms(),
+            )?;
+            return self.write_artifact_sweep_worker_status("compact_checkout_owner_unverified");
+        }
+        let cleanup_policy = match crate::AutoCleanupPolicy::load(self.main_root()) {
+            Ok(policy) => policy,
+            Err(reason) => {
+                self.store().defer_checkout_cleanup_compactions(
+                    &[session_id],
+                    now_ms().saturating_add(AUTO_COMPACT_CHECKOUT_RETRY_MS),
+                    now_ms(),
+                )?;
+                return self.write_artifact_sweep_worker_status(&format!(
+                    "compact_checkout_cleanup_policy_unavailable: {reason}"
+                ));
+            }
+        };
+        if !cleanup_policy.auto_remove || cleanup_policy.is_pinned(&worktree) {
+            self.store().defer_checkout_cleanup_compactions(
+                &[session_id],
+                now_ms().saturating_add(AUTO_COMPACT_CHECKOUT_RETRY_MS),
+                now_ms(),
+            )?;
+            return self.write_artifact_sweep_worker_status(if cleanup_policy.auto_remove {
+                "compact_checkout_pinned_by_cleanup_policy"
+            } else {
+                "compact_checkout_auto_remove_disabled"
+            });
+        }
+
+        match self.compact_closed_checkout(&cohort, deadline)? {
+            Some(outcome) if outcome.worktree_removed => {
+                self.store()
+                    .complete_checkout_cleanup_requests_after_removal(
+                        &cohort.session_ids(),
+                        now_ms(),
+                    )?;
+                self.write_artifact_sweep_worker_status(
+                    "compact_checkout_removed; next due rows remain wakeable",
+                )?;
+            }
+            Some(_outcome) | None => {
+                self.store().defer_checkout_cleanup_compactions(
+                    &cohort.session_ids(),
+                    now_ms().saturating_add(AUTO_COMPACT_CHECKOUT_RETRY_MS),
+                    now_ms(),
+                )?;
+                self.write_artifact_sweep_worker_status(
+                    "compact_checkout_deferred; request retained",
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Launch recovery after the request is durable and any conflicting
@@ -5452,24 +5978,27 @@ impl Broker {
     ) -> Result<(), BrokerOpError> {
         self.reconcile_checkout_cleanup_outbox()?;
         let root = self.main_root().to_path_buf();
+        if crate::host_state::path_is_ephemeral(&root) || artifact_worker_process_is_suppressed() {
+            return Ok(());
+        }
+        self.reconcile_compact_checkout_backfill()?;
         let artifact_pending = self.artifact_sweep_backlog_pending()?
             && crate::AutoCleanupPolicy::artifact_sweep_allowed(&root);
         let checkout_cleanup_pending = self.auto_checkout_cleanup_recovery_requested()?;
-        if crate::host_state::path_is_ephemeral(&root)
-            || artifact_worker_process_is_suppressed()
-            || !(artifact_pending || checkout_cleanup_pending)
-        {
+        let compact_pending = self.compact_checkout_work_pending()?;
+        if !(artifact_pending || checkout_cleanup_pending || compact_pending) {
             return Ok(());
         }
         let now = now_ms();
         let mut artifact_due = artifact_pending;
         let checkout_cleanup_due =
             checkout_cleanup_pending && !self.auto_checkout_cleanup_retry_pending(now)?;
+        let compact_due = compact_pending && self.compact_checkout_work_due(now)?;
         if !pressure_request {
             let namespace = self.artifact_sweep_namespace()?.to_string();
             artifact_due &= !worker_retry_pending(self.store(), &namespace, now)?;
         }
-        if !(artifact_due || checkout_cleanup_due) {
+        if !(artifact_due || checkout_cleanup_due || compact_due) {
             return Ok(());
         }
         let Some((router, _engine)) = artifact_worker_binaries() else {
@@ -5478,6 +6007,12 @@ impl Broker {
             }
             if checkout_cleanup_due {
                 self.defer_auto_checkout_cleanup_worker("runtime_unverified")?;
+            }
+            if compact_due {
+                self.defer_auto_compact_checkout_worker(
+                    "compact_checkout_runtime_unverified",
+                    AUTO_COMPACT_BACKFILL_RETRY_MS,
+                )?;
             }
             return Ok(());
         };
@@ -5490,6 +6025,12 @@ impl Broker {
             }
             if checkout_cleanup_due {
                 self.defer_auto_checkout_cleanup_worker("runtime_pair_unverified")?;
+            }
+            if compact_due {
+                self.defer_auto_compact_checkout_worker(
+                    "compact_checkout_runtime_pair_unverified",
+                    AUTO_COMPACT_BACKFILL_RETRY_MS,
+                )?;
             }
             return Ok(());
         }
@@ -5517,6 +6058,12 @@ impl Broker {
             if checkout_cleanup_due {
                 self.defer_auto_checkout_cleanup_worker("storage_context_unavailable")?;
             }
+            if compact_due {
+                self.defer_auto_compact_checkout_worker(
+                    "compact_checkout_storage_context_unavailable",
+                    AUTO_COMPACT_BACKFILL_RETRY_MS,
+                )?;
+            }
             return Ok(());
         }
         configure_artifact_worker_process_group(&mut command);
@@ -5530,6 +6077,12 @@ impl Broker {
                     self.defer_auto_checkout_cleanup_worker(&format!(
                         "worker_launch_failed: {error}"
                     ))?;
+                }
+                if compact_due {
+                    self.defer_auto_compact_checkout_worker(
+                        &format!("compact_checkout_worker_launch_failed: {error}"),
+                        AUTO_COMPACT_BACKFILL_RETRY_MS,
+                    )?;
                 }
                 return Ok(());
             }
@@ -5561,10 +6114,19 @@ impl Broker {
             return Ok(());
         }
         self.reconcile_checkout_cleanup_outbox()?;
+        self.reconcile_compact_checkout_backfill()?;
+        let reconciled_terminal_rows =
+            self.reconcile_terminal_checkout_cleanup_requests(now_ms())?;
+        if reconciled_terminal_rows > 0 {
+            self.write_artifact_sweep_worker_status(&format!(
+                "terminal_checkout_requests_reconciled={reconciled_terminal_rows}"
+            ))?;
+        }
         let artifact_pending = self.artifact_sweep_backlog_pending()?
             && crate::AutoCleanupPolicy::artifact_sweep_allowed(self.main_root());
         let checkout_cleanup_pending = self.auto_checkout_cleanup_recovery_requested()?;
-        if !(artifact_pending || checkout_cleanup_pending) {
+        let compact_pending = self.compact_checkout_work_pending()?;
+        if !(artifact_pending || checkout_cleanup_pending || compact_pending) {
             self.write_artifact_sweep_worker_status("no_backlog")?;
             return Ok(());
         }
@@ -5574,7 +6136,8 @@ impl Broker {
             artifact_pending && !worker_retry_pending(self.store(), &namespace, now)?;
         let checkout_cleanup_due =
             checkout_cleanup_pending && !self.auto_checkout_cleanup_retry_pending(now)?;
-        if !(artifact_due || checkout_cleanup_due) {
+        let compact_due = compact_pending && self.compact_checkout_work_due(now)?;
+        if !(artifact_due || checkout_cleanup_due || compact_due) {
             self.write_artifact_sweep_worker_status("retry_deferred")?;
             return Ok(());
         }
@@ -5584,6 +6147,12 @@ impl Broker {
             }
             if checkout_cleanup_due {
                 self.defer_auto_checkout_cleanup_worker("runtime_pair_unverified")?;
+            }
+            if compact_due {
+                self.defer_auto_compact_checkout_worker(
+                    "compact_checkout_runtime_pair_unverified",
+                    AUTO_COMPACT_BACKFILL_RETRY_MS,
+                )?;
             }
             return Ok(());
         }
@@ -5602,12 +6171,8 @@ impl Broker {
                 // separate cleanup lane. It yields a reserved tranche whenever
                 // both are due so a wide cache backlog cannot starve checkout
                 // progress.
-                let cache_duration = if checkout_cleanup_due {
-                    ARTIFACT_SWEEP_WORKER_MAX_DURATION
-                        .saturating_sub(AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE)
-                } else {
-                    ARTIFACT_SWEEP_WORKER_MAX_DURATION
-                };
+                let cache_duration =
+                    artifact_worker_cache_lane_duration(checkout_cleanup_due, compact_due);
                 self.run_artifact_sweep_recovery_worker_loop(
                     &policy,
                     request_generation,
@@ -5628,6 +6193,34 @@ impl Broker {
         };
 
         self.run_cleanup_after_cache_lane(cache_lane_result, |broker| {
+            // Compact archives run only in this detached worker. A fresh
+            // wake may have arrived during the cache lane, so recheck policy,
+            // the backfill marker and per-session due times here.
+            let compact_pending = broker.compact_checkout_work_pending()?;
+            let compact_due = compact_pending && broker.compact_checkout_work_due(now_ms())?;
+            if compact_due {
+                let remaining =
+                    ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(worker_started.elapsed());
+                if !compact_checkout_worker_has_admission_budget(remaining) {
+                    broker.defer_auto_compact_checkout_worker(
+                        "compact_checkout_worker_reserve_unavailable",
+                        AUTO_COMPACT_BACKFILL_RETRY_MS,
+                    )?;
+                } else {
+                    let pass_budget = remaining.min(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE);
+                    let deadline = Instant::now() + pass_budget;
+                    if let Err(error) = broker.auto_compact_checkout_recovery_pass(deadline) {
+                        if matches!(error, BrokerOpError::Store(_)) {
+                            return Err(error);
+                        }
+                        broker.defer_auto_compact_checkout_worker(
+                            &format!("compact_checkout_pass_failed: {error}"),
+                            AUTO_COMPACT_CHECKOUT_RETRY_MS,
+                        )?;
+                    }
+                }
+            }
+
             // A cleanup request may have arrived while the cache lane was
             // working. Re-read its generation instead of letting the worker
             // exit with newly queued work stranded behind its singleton lock.
@@ -5643,7 +6236,7 @@ impl Broker {
                     ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(worker_started.elapsed());
                 broker.run_auto_checkout_cleanup_recovery_worker_loop(
                     request_generation,
-                    Some(ARTIFACT_SWEEP_WORKER_MAX_PASSES),
+                    Some(AUTO_CHECKOUT_CLEANUP_WORKER_MAX_PASSES),
                     Some(remaining),
                     |broker, generation, pass_budget| {
                         let Some(pass_budget) = pass_budget else {
@@ -5709,6 +6302,15 @@ impl Broker {
             )));
         }
         let report = self.auto_remove_disposable_checkouts(Some(deadline))?;
+        let removed_ids = report
+            .removed
+            .iter()
+            .flat_map(|checkout| checkout.sessions.iter().copied())
+            .collect::<Vec<_>>();
+        if !removed_ids.is_empty() {
+            self.store()
+                .complete_checkout_cleanup_requests_after_removal(&removed_ids, now_ms())?;
+        }
         let policy_valid = report.config_error.is_none();
         let no_deferred_work = report.deferred == 0;
         let mut generation_completed = false;
@@ -5722,13 +6324,21 @@ impl Broker {
                     AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY,
                     &request_generation.to_string(),
                 )?;
-                self.artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY, "")?;
-                // A per-session close request is consumed only after this
-                // worker generation has a durable completion marker. A
-                // foreground pass or an incomplete discovery lap cannot
-                // silently acknowledge the request.
-                self.store()
-                    .complete_due_checkout_cleanup_requests(now_ms())?;
+                let now = now_ms();
+                let retained_due = report.enabled
+                    && self
+                        .store()
+                        .next_pending_checkout_cleanup_at()?
+                        .is_some_and(|due| due <= now);
+                let retry_after = if retained_due {
+                    now.saturating_add(ARTIFACT_SWEEP_WORKER_RETRY_MS)
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                self.artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY, &retry_after)?;
+                // Completing a scan generation grants no removal authority.
+                // Retained per-session obligations remain pending and cooled.
                 generation_completed = true;
             }
         }
@@ -5765,6 +6375,10 @@ impl Broker {
             let pass_budget = remaining
                 .map(|remaining| remaining.min(AUTO_CHECKOUT_CLEANUP_WORKER_PASS_BUDGET))
                 .or(Some(AUTO_CHECKOUT_CLEANUP_WORKER_PASS_BUDGET));
+            let progress_before = self
+                .store()
+                .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)?
+                .map_or(0, |state| state.progress_sequence);
             let pass = match cleanup_pass(self, request_generation, pass_budget) {
                 Ok(pass) => pass,
                 Err(error) => {
@@ -5774,6 +6388,11 @@ impl Broker {
                     return Ok(());
                 }
             };
+            let progress_after = self
+                .store()
+                .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)?
+                .map_or(0, |state| state.progress_sequence);
+            let discovery_progressed = progress_after > progress_before;
             let Some((report, generation_completed)) = pass else {
                 no_progress_passes = no_progress_passes.saturating_add(1);
                 if no_progress_passes >= ARTIFACT_SWEEP_WORKER_NO_PROGRESS_PASSES {
@@ -5808,7 +6427,7 @@ impl Broker {
                 ))?;
                 return Ok(());
             }
-            if report.removed.is_empty() {
+            if report.removed.is_empty() && !discovery_progressed {
                 no_progress_passes = no_progress_passes.saturating_add(1);
                 if no_progress_passes >= ARTIFACT_SWEEP_WORKER_NO_PROGRESS_PASSES {
                     self.defer_auto_checkout_cleanup_worker(&format!(
@@ -8685,6 +9304,163 @@ mod tests {
     }
 
     #[test]
+    fn compact_worker_has_separate_reserve_and_due_admission() {
+        assert_eq!(
+            artifact_worker_cache_lane_duration(false, false),
+            ARTIFACT_SWEEP_WORKER_MAX_DURATION
+        );
+        assert_eq!(
+            artifact_worker_cache_lane_duration(true, false),
+            ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE)
+        );
+        assert_eq!(
+            artifact_worker_cache_lane_duration(false, true),
+            ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE)
+        );
+        assert_eq!(
+            artifact_worker_cache_lane_duration(true, true),
+            ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(
+                AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE
+                    .saturating_add(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE)
+            )
+        );
+        assert!(!compact_checkout_worker_has_admission_budget(
+            AUTO_COMPACT_CHECKOUT_WORKER_RESERVE - Duration::from_millis(1)
+        ));
+        assert!(compact_checkout_worker_has_admission_budget(
+            AUTO_COMPACT_CHECKOUT_WORKER_RESERVE
+        ));
+        assert!(!compact_checkout_pending_is_due(
+            true,
+            Some(101),
+            Some(200),
+            100
+        ));
+        assert!(compact_checkout_pending_is_due(
+            true,
+            Some(99),
+            Some(200),
+            100
+        ));
+        assert!(compact_checkout_pending_is_due(false, None, Some(100), 100));
+        assert!(!compact_checkout_pending_is_due(
+            false,
+            None,
+            Some(101),
+            100
+        ));
+    }
+
+    #[test]
+    fn compact_stock_backfill_is_queued_on_opt_in_and_resumes_its_generation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        let config = root.join(crate::retention::BROKER_CONFIG_RELPATH);
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "[retention]\ncompact_closed_worktrees = false\n").unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        assert!(!broker.reconcile_compact_checkout_backfill().unwrap());
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_REQUESTED_KEY)
+                .unwrap(),
+            None,
+            "disabled policy does not queue a historical checkout scan"
+        );
+
+        std::fs::write(&config, "[retention]\ncompact_closed_worktrees = true\n").unwrap();
+        assert!(broker.reconcile_compact_checkout_backfill().unwrap());
+        let first_generation = broker
+            .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_REQUESTED_KEY)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("0")
+        );
+        broker
+            .artifact_sweep_meta_set(AUTO_COMPACT_BACKFILL_CURSOR_KEY, "24")
+            .unwrap();
+        broker
+            .artifact_sweep_meta_set(AUTO_COMPACT_BACKFILL_HIGH_WATER_KEY, "900")
+            .unwrap();
+        assert!(broker.reconcile_compact_checkout_backfill().unwrap());
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(first_generation.as_str()),
+            "an incomplete opt-in backfill resumes its existing generation"
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("24")
+        );
+
+        std::fs::write(&config, "[retention]\ncompact_closed_worktrees = false\n").unwrap();
+        assert!(!broker.reconcile_compact_checkout_backfill().unwrap());
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(first_generation.as_str()),
+            "opt-out pauses rather than erases pending work"
+        );
+        std::fs::write(&config, "[retention]\ncompact_closed_worktrees = true\n").unwrap();
+        assert!(broker.reconcile_compact_checkout_backfill().unwrap());
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("24"),
+            "re-enabling a pending generation resumes from its durable cursor"
+        );
+
+        broker
+            .artifact_sweep_meta_set(AUTO_COMPACT_BACKFILL_COMPLETED_KEY, &first_generation)
+            .unwrap();
+        std::fs::write(&config, "[retention]\ncompact_closed_worktrees = false\n").unwrap();
+        assert!(!broker.reconcile_compact_checkout_backfill().unwrap());
+        std::fs::write(&config, "[retention]\ncompact_closed_worktrees = true\n").unwrap();
+        assert!(broker.reconcile_compact_checkout_backfill().unwrap());
+        let next_generation = broker
+            .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_REQUESTED_KEY)
+            .unwrap()
+            .unwrap();
+        assert!(next_generation.parse::<i64>().unwrap() > first_generation.parse::<i64>().unwrap());
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("0"),
+            "a completed backfill is restarted after a later opt-in edge"
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_COMPACT_BACKFILL_HIGH_WATER_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
     fn artifact_sweep_state_is_shared_by_linked_worktrees_but_isolated_by_storage_context() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("repository");
@@ -9308,6 +10084,137 @@ mod tests {
                 .as_deref(),
             Some(""),
             "a new request after completion clears only its own lane backoff"
+        );
+    }
+
+    #[test]
+    fn checkout_worker_discovery_progress_survives_zero_removal_passes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        let connection = rusqlite::Connection::open(broker.store().db_path()).unwrap();
+        for index in 0..129 {
+            connection
+                .execute(
+                    "INSERT INTO sessions (worktree_path, branch, origin, status,
+                     created_at, updated_at, last_activity_at)
+                 VALUES (?1, ?2, 'spawned', 'active', 1, 1, 1)",
+                    rusqlite::params![
+                        root.join(format!("unmaterialized-{index}"))
+                            .to_string_lossy(),
+                        format!("agent/history-{index}"),
+                    ],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        let mut passes = 0;
+        broker
+            .run_auto_checkout_cleanup_recovery_worker_loop(
+                1,
+                Some(64),
+                Some(Duration::from_secs(60)),
+                |broker, _, remaining| {
+                    passes += 1;
+                    let state = broker
+                        .refresh_cleanup_cohort_aliases(Some(
+                            Instant::now() + remaining.unwrap_or(Duration::from_secs(30)),
+                        ))?
+                        .expect("the inventory has a persisted checkpoint");
+                    Ok(Some((
+                        crate::auto_cleanup::AutoCleanupReport::default(),
+                        state.complete,
+                    )))
+                },
+            )
+            .unwrap();
+        assert!(
+            passes > ARTIFACT_SWEEP_WORKER_NO_PROGRESS_PASSES,
+            "discovery must continue beyond the old zero-removal backoff threshold"
+        );
+        let state = broker
+            .store()
+            .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)
+            .unwrap()
+            .unwrap();
+        assert!(state.complete, "all history rows must be discovered");
+        assert!(
+            !broker
+                .auto_checkout_cleanup_retry_pending(now_ms())
+                .unwrap(),
+            "actual discovery progress must not be treated as a stalled worker"
+        );
+    }
+
+    #[test]
+    fn retained_checkout_outbox_reconciliation_preserves_cooldown() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        let connection = rusqlite::Connection::open(broker.store().db_path()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (worktree_path, branch, origin, status, cleanup_state,
+                 created_at, updated_at, last_activity_at, closed_at)
+             VALUES (?1, 'agent/retained', 'spawned', 'cleaned', 'closed', 1, 1, 1, 1)",
+                [root.join("retained-checkout").to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        let session_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO closed_checkout_cleanup_requests
+                 (session_id, requested_at_ms, not_before_ms, last_progress_at_ms)
+             VALUES (?1, 1, 1, 1)",
+                [session_id],
+            )
+            .unwrap();
+        drop(connection);
+        broker
+            .artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY, "7")
+            .unwrap();
+        broker
+            .artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY, "7")
+            .unwrap();
+        let retry_after = now_ms()
+            .saturating_add(ARTIFACT_SWEEP_WORKER_RETRY_MS)
+            .to_string();
+        broker
+            .artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY, &retry_after)
+            .unwrap();
+        broker.reconcile_checkout_cleanup_outbox().unwrap();
+        broker.reconcile_checkout_cleanup_outbox().unwrap();
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(retry_after.as_str())
+        );
+        assert!(
+            broker
+                .auto_checkout_cleanup_retry_pending(now_ms())
+                .unwrap()
+        );
+        assert!(
+            broker
+                .store()
+                .pending_checkout_cleanup_request(session_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_none(),
+            "retained checkout must remain an outstanding obligation"
         );
     }
 

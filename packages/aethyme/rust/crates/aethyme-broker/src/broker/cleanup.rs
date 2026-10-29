@@ -4207,8 +4207,7 @@ impl Broker {
         }
         self.repo
             .delete_branch_ref_checked(&session.branch, &expected_proof.branch_tip)?;
-        self.store
-            .set_session_status(session.id, SessionStatus::Cleaned, None)?;
+        self.mark_removed_checkout_sessions_cleaned(&[session.id], session.id)?;
         Ok(())
     }
 
@@ -4279,8 +4278,7 @@ impl Broker {
         }
         self.repo
             .delete_branch_ref_checked(&session.branch, &expected_proof.branch_tip)?;
-        self.store
-            .set_session_status(session.id, SessionStatus::Cleaned, None)?;
+        self.mark_removed_checkout_sessions_cleaned(&[session.id], session.id)?;
         Ok(())
     }
 
@@ -4441,7 +4439,9 @@ impl Broker {
         {
             let worktree_path = Path::new(&session.worktree_path);
             match std::fs::symlink_metadata(worktree_path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.mark_removed_checkout_sessions_cleaned(&[session_id], session_id)?;
+                }
                 Ok(_) => {
                     return Err(BrokerOpError::CleanupSessionNotTerminal {
                         id: session_id,
@@ -4593,9 +4593,17 @@ impl Broker {
                 )) => {
                     #[cfg(not(unix))]
                     {
+                        if archive_guard.is_some_and(|guard| guard.expected_cohort().is_some()) {
+                            return Err(BrokerOpError::DirtyWorktree {
+                                id: session_id,
+                                reason:
+                                    "artifact-use protection is unavailable; preserved the worktree"
+                                        .into(),
+                            });
+                        }
                         // Keep the pre-existing explicit cleanup contract on
                         // targets that cannot run the artifact-use protocol.
-                        // The unattended consumers remain fail-closed there.
+                        // Automatic compact cleanup remains fail-closed above.
                         None
                     }
                     #[cfg(unix)]
@@ -4691,8 +4699,7 @@ impl Broker {
                     .worktree_remove_registered(&worktree_path, force)?;
             }
             require_worktree_path_absent(&worktree_path, session_id)?;
-            self.store
-                .set_session_status(session_id, SessionStatus::Cleaned, None)?;
+            self.mark_removed_checkout_sessions_cleaned(&[session_id], session_id)?;
             return Ok(());
         }
         // Recorded sizes, not a walk: removal needs the provenance verdict,
@@ -4738,6 +4745,7 @@ impl Broker {
         }
 
         let mut removed_orphan_branch = None;
+        let mut removed_checkout_session_ids = vec![session_id];
         let retained_checkout_present =
             worktree_path_is_real_directory(&worktree_path, session_id)?;
         if archive_guard.is_some() && !retained_checkout_present {
@@ -4834,6 +4842,52 @@ impl Broker {
                         reason: "the closed checkout cohort changed after archive verification; the archive and checkout were preserved".into(),
                     });
                 }
+                if expected_cohort.owner_session_id() != session_id {
+                    return Err(BrokerOpError::CleanupResolveRefused {
+                        id: session_id,
+                        reason: "the archived session is no longer the owner of its closed checkout cohort; the archive and checkout were preserved".into(),
+                    });
+                }
+                if !self.cleanup_cohort_filesystem_aliases_match(
+                    expected_cohort.alias_refresh_generation(),
+                    Some(status_limits.deadline),
+                )? {
+                    return Err(BrokerOpError::CleanupResolveRefused {
+                        id: session_id,
+                        reason: "the registered checkout alias inventory changed or could not be rechecked after archive verification; the archive and checkout were preserved".into(),
+                    });
+                }
+                let cleanup_policy = crate::AutoCleanupPolicy::load(self.main_root()).map_err(
+                    |reason| BrokerOpError::CleanupResolveRefused {
+                        id: session_id,
+                        reason: format!(
+                            "automatic checkout cleanup policy could not be rechecked; the archive and checkout were preserved: {reason}"
+                        ),
+                    },
+                )?;
+                if !cleanup_policy.auto_remove || cleanup_policy.is_pinned(archived_worktree) {
+                    return Err(BrokerOpError::CleanupResolveRefused {
+                        id: session_id,
+                        reason: if cleanup_policy.auto_remove {
+                            "the checkout is now pinned by cleanup policy; the archive and checkout were preserved".into()
+                        } else {
+                            "automatic checkout removal is now disabled; the archive and checkout were preserved".into()
+                        },
+                    });
+                }
+                let open_file_snapshot = crate::reclaim::open_file_snapshot_under(Path::new("/"));
+                if let Some(reason) = crate::reclaim::open_file_snapshot_blocker_for_worktree(
+                    &open_file_snapshot,
+                    archived_worktree,
+                ) {
+                    return Err(BrokerOpError::CleanupResolveRefused {
+                        id: session_id,
+                        reason: format!(
+                            "the checkout has active or unverified process use; the archive and checkout were preserved: {reason}"
+                        ),
+                    });
+                }
+                removed_checkout_session_ids = expected_cohort.session_ids();
             }
             if self.is_orphaned_worktree_of_this_repository_checked(&worktree_path)? {
                 if archive_guard.is_some_and(|guard| guard.preserves_branch(session)) {
@@ -4865,8 +4919,47 @@ impl Broker {
             self.repo
                 .delete_branch_ref_checked(&session.branch, &branch_tip)?;
         }
+        self.mark_removed_checkout_sessions_cleaned(&removed_checkout_session_ids, session_id)?;
+        Ok(())
+    }
+
+    /// Record a checkout removal only after the physical checkout was proven
+    /// absent. Retirement callers pass the complete closed cohort; other
+    /// callers settle only the row they just removed. Raw alias symlinks may
+    /// remain dangling, and additional cohort branch refs are left intact.
+    fn mark_removed_checkout_sessions_cleaned(
+        &mut self,
+        session_ids: &[i64],
+        owner_id: i64,
+    ) -> Result<(), BrokerOpError> {
+        let mut ids = session_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        for id in &ids {
+            let current = self.store.session(*id)?;
+            if current.status == SessionStatus::Cleaned
+                && current.cleanup_state == crate::SessionCleanupState::Cleaned
+            {
+                continue;
+            }
+            if !current.status.is_closed()
+                || current.cleanup_state != crate::SessionCleanupState::Closed
+            {
+                return Err(BrokerOpError::DirtyWorktree {
+                    id: owner_id,
+                    reason: format!(
+                        "closed checkout cohort member {id} changed before cleanup could be recorded"
+                    ),
+                });
+            }
+            self.store
+                .set_session_status(*id, SessionStatus::Cleaned, None)?;
+        }
         self.store
-            .set_session_status(session_id, SessionStatus::Cleaned, None)?;
+            .complete_checkout_cleanup_requests_after_removal(
+                &ids,
+                crate::collaboration_gc::now_ms(),
+            )?;
         Ok(())
     }
 
