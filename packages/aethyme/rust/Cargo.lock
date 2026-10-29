@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-config"
-version = "0.8.46"
+version = "0.8.47"
 dependencies = [
  "noyalib",
  "serde",
