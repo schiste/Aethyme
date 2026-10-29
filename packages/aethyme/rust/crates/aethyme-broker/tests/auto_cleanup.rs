@@ -964,7 +964,8 @@ fn a_retained_spawn_record_does_not_own_a_same_repo_checkout_replacement() {
     assert!(refreshed.removed.is_empty(), "{refreshed:#?}");
     assert!(
         kept_reason(&refreshed, &worktree)
-            .contains("worktree instance no longer matches its spawn record")
+            .contains("closed checkout cohort or ownership witness changed"),
+        "{refreshed:#?}"
     );
     assert_eq!(
         persisted_spawn_witness_root_generation(&mut broker, spawned_id),
