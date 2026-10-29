@@ -16,12 +16,36 @@ version and the target, oldest first. Each schema migration runs on first open
 and is one-way, so rollback is limited to the oldest binary that still reads
 the newest schema you have opened.
 
-Breaking releases: [v0.8.44](#v0844), [v0.8.43](#v0843), [v0.8.42](#v0842), [v0.8.41](#v0841), [v0.8.40](#v0840), [v0.8.38](#v0838), [v0.8.37](#v0837), [v0.8.33](#v0833), [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
+Breaking releases: [v0.8.47](#v0847), [v0.8.44](#v0844), [v0.8.43](#v0843), [v0.8.42](#v0842), [v0.8.41](#v0841), [v0.8.40](#v0840), [v0.8.38](#v0838), [v0.8.37](#v0837), [v0.8.33](#v0833), [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
 [v0.7.25](#v0725), [v0.7.23](#v0723), [v0.7.22](#v0722), [v0.7.19](#v0719),
 [v0.7.18](#v0718), [v0.7.16](#v0716), [v0.7.9](#v079), [v0.7.8](#v078),
 [v0.7.4](#v074), [v0.7.2](#v072),
 [v0.7.1](#v071), [v0.5.0](#v050), [v0.3.0](#v030),
 [v0.2.2](#v022), [v0.2.0](#v020).
+
+## v0.8.47
+
+### Compatibility
+
+The repository broker database advances to schema 59 with compatibility floor 58. The additive tables and triggers track incremental cleanup discovery and durable post-close requests; do not rewrite schema markers when changing binaries. Normal heartbeat updates and witness registration do not restart a session-history scan.
+
+Compact retirement introduces recovery archive schema 5. Its receipt binds the preserved branch identities, delivery-root evidence, creation timestamp and minimum recovery age. Older strict readers retain these archives as unsupported rather than treating them as disposable. Ordinary schema-4 recovery remains readable. Recovery plans expose additive origin, checkout identity and root-proof fields; exact batch plans/results use schema 1 and report partial completion with a nonzero exit status.
+
+`[retention] compact_closed_worktrees` is default-off. When enabled, it permits background compaction of a closed, witnessed broker-created checkout during its normal grace period. It preserves verified recovery for at least the larger of fifteen days and the configured closed-checkout grace, measured from archive creation. Full-checkout removal due time and compact retry scheduling remain separate. Explicit keep, live owners, pins, incomplete inspections and unknown ownership remain protected. Manual legacy/adopted retirement requires exact reviewed targets; adopted retirement also requires `--allow-adopted` and keeps branches.
+
+Supported configuration stems accept one of TOML, YAML or YML. Keep only one format for a stem; ambiguous twins and invalid policy documents are errors, not permission to use defaults. Working policy reads require a real configuration directory and regular candidate files; unresolved metadata or reads are errors. Environment profiles continue to use `.aethyme/environments.toml` and the documented host TOML profile. The new environment state is separate from the repository broker database. Committed policy files must be regular Git files; a symlink or unresolved Git read is refused rather than read as an absent policy. Unresolved collaboration policy reports pending without persisting a compatibility fence; repair the committed policy or ref and retry. A verified required-capture fence remains one-way.
+
+### Migrate and verify
+
+Preserve repository configuration and take a consistent broker database backup before opening the new runtime. Install the matching signed router/engine pair, confirm both version/build identities, and inspect maintenance diagnostics. Leave the existing cleanup and retention settings in place until the paired runtime is verified.
+
+To opt in after verification, add `compact_closed_worktrees = true` under `[retention]` in `.aethyme/broker.toml`. Keep `recovery_archive_days` at least as long as the required recovery floor; the default thirty-day archive window covers the default fifteen-day grace. Inspect the background worker's progress and typed deferrals. A verified archive alone is not a removed checkout.
+
+For an explicitly reviewed backlog, plan `aethyme broker finish cleanup resolve <id>... --batch --archive --json`, review the exact IDs and blockers, then use that plan's confirmation. Use `--allow-adopted` only for adopted targets whose retirement is authorized. Replan after changed content; never use a raw recursive deletion to bypass a refusal.
+
+### Rollback
+
+Schema-58-compatible binaries can read the additive database, but cannot run schema-5 retirement. Settle the new maintenance worker, preserve its verified archives, and remove the new compact-policy key before using an older binary. Older scanners must retain unsupported archives; do not delete or relabel them to make an old cleanup plan pass. Restore a pre-upgrade database only as a separately reviewed recovery with no intervening work to lose.
 
 ## v0.8.44
 

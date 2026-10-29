@@ -37,19 +37,36 @@ impl Default for LeaseLivenessPolicy {
 
 impl LeaseLivenessPolicy {
     /// Read like the other `[leases]` keys: committed config on the default
-    /// branch, else the main checkout's file. A missing, unparseable or
-    /// negative value keeps the default.
+    /// branch, else the main checkout's file. A missing config or a negative
+    /// threshold keeps the default; an unresolved or syntactically invalid
+    /// config conservatively keeps gone leases blocking.
     pub fn load(main_root: &Path) -> Self {
-        crate::merge::repository_config_text(main_root)
-            .map(|text| Self::from_config_text(&text))
-            .unwrap_or_default()
+        match crate::merge::repository_config_checked(main_root) {
+            Ok(Some((text, _))) => match text.parse::<toml::Value>() {
+                Ok(value) => Self::from_value(value),
+                Err(_) => Self::with_unresolved_configuration(),
+            },
+            Ok(None) => Self::default(),
+            Err(_) => Self::with_unresolved_configuration(),
+        }
+    }
+
+    fn with_unresolved_configuration() -> Self {
+        Self {
+            stale_grace_ms: i64::MAX,
+            ..Self::default()
+        }
     }
 
     pub fn from_config_text(text: &str) -> Self {
-        let mut policy = Self::default();
         let Ok(value) = text.parse::<toml::Value>() else {
-            return policy;
+            return Self::default();
         };
+        Self::from_value(value)
+    }
+
+    fn from_value(value: toml::Value) -> Self {
+        let mut policy = Self::default();
         let minutes = |key: &str| {
             value
                 .get("leases")
@@ -394,6 +411,35 @@ mod tests {
             classify(true, &HolderObservation::Running, Some(7), 0, 0, policy());
         assert_eq!(liveness, LeaseLiveness::Released);
         assert!(!evidence.holds);
+    }
+
+    #[test]
+    fn ambiguous_configuration_keeps_gone_leases_blocking() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join(".aethyme");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("config.toml"),
+            "[leases]\nstale_grace_minutes = 360\n",
+        )
+        .unwrap();
+        std::fs::write(
+            config.join("config.yaml"),
+            "leases:\n  stale_grace_minutes: 0\n",
+        )
+        .unwrap();
+
+        let policy = LeaseLivenessPolicy::load(root.path());
+        assert_eq!(policy.stale_grace_ms, i64::MAX);
+        let (_, evidence) = classify(
+            false,
+            &HolderObservation::Gone { since: 0 },
+            Some(7),
+            0,
+            i64::MAX / 2,
+            policy,
+        );
+        assert!(evidence.holds);
     }
 
     #[test]

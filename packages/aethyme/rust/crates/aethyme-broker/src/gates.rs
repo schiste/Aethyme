@@ -56,6 +56,9 @@ pub enum GateConfigError {
     Missing(PathBuf),
     #[error("gates.toml: {0}")]
     Parse(String),
+    /// Two format twins, or a YAML file outside the strict subset (#1223).
+    #[error("{0}")]
+    Config(Box<aethyme_config::ConfigSourceError>),
     #[error("gate {gate:?}: invalid trigger glob {glob:?}: {message}")]
     BadGlob {
         gate: String,
@@ -206,10 +209,15 @@ impl Gate {
 
 /// Load and validate `.aethyme/gates.toml`, sorted cheap-first.
 pub fn load_gates(main_root: &Path) -> Result<Vec<Gate>, GateConfigError> {
-    let path = main_root.join(GATES_CONFIG_RELPATH);
-    let text =
-        std::fs::read_to_string(&path).map_err(|_| GateConfigError::Missing(path.clone()))?;
-    parse_gates(&text)
+    // `.aethyme/gates.toml`, `.yaml` or `.yml` (#1223); two twins is an error
+    // naming both, from every command that loads gates.
+    match aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "gates") {
+        Ok(Some((_, text))) => parse_gates(&text),
+        Ok(None) => Err(GateConfigError::Missing(
+            main_root.join(GATES_CONFIG_RELPATH),
+        )),
+        Err(error) => Err(GateConfigError::Config(Box::new(error))),
+    }
 }
 
 /// Parse and normalize gate configuration already read from an exact source
@@ -397,7 +405,7 @@ pub fn load_gates_at_commit(
             reference: head.into(),
         })?;
     let text = repo
-        .file_at_commit(&head_sha, GATES_CONFIG_RELPATH)?
+        .config_toml_at_commit(&head_sha, "gates")?
         .ok_or_else(|| GateScopeError::MissingConfiguration {
             head_sha: head_sha.clone(),
             path: GATES_CONFIG_RELPATH.into(),
@@ -1428,7 +1436,7 @@ pub(crate) fn process_started_at_ms(pid: i32) -> Option<i64> {
 /// microseconds since the epoch on macOS, clock ticks since boot on Linux.
 /// `None` when the process does not exist or the platform cannot say.
 #[cfg(target_os = "macos")]
-fn process_start_time(pid: i32) -> Option<u64> {
+pub(crate) fn process_start_time(pid: i32) -> Option<u64> {
     if pid <= 0 {
         return None;
     }
@@ -1459,7 +1467,7 @@ fn process_start_time(pid: i32) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn process_start_time(pid: i32) -> Option<u64> {
+pub(crate) fn process_start_time(pid: i32) -> Option<u64> {
     if pid <= 0 {
         return None;
     }
@@ -1468,7 +1476,7 @@ fn process_start_time(pid: i32) -> Option<u64> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn process_start_time(_pid: i32) -> Option<u64> {
+pub(crate) fn process_start_time(_pid: i32) -> Option<u64> {
     None
 }
 
@@ -7276,6 +7284,22 @@ mod tests {
     fn write_config(dir: &Path, body: &str) {
         std::fs::create_dir_all(dir.join(".aethyme")).unwrap();
         std::fs::write(dir.join(GATES_CONFIG_RELPATH), body).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_config_twin_is_not_treated_as_missing_or_fallback() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), "[[gate]]\nname='lint'\ncommand='true'\n");
+        assert_eq!(load_gates(tmp.path()).unwrap().len(), 1);
+        symlink("missing-target", tmp.path().join(".aethyme/gates.yaml")).unwrap();
+
+        assert!(matches!(
+            load_gates(tmp.path()),
+            Err(GateConfigError::Config(_))
+        ));
     }
 
     fn command_context<'a>(

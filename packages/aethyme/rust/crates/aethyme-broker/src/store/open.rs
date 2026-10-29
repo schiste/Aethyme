@@ -787,6 +787,7 @@ impl BrokerStore {
         if changed == 0 {
             return Err(BrokerError::SessionNotFound(replaced_id));
         }
+        record_lease_releases_in_tx(&tx, replaced_id, None, None, now, "session_replaced", true)?;
         delete_session_base_observation(&tx, replaced_id)?;
         release_checkpoint_pin_in_tx(&tx, replaced_id, now)?;
         tx.execute("DELETE FROM leases WHERE session_id = ?1", [replaced_id])?;
@@ -1029,8 +1030,57 @@ impl BrokerStore {
         status: SessionStatus,
         exit_code: Option<i64>,
     ) -> Result<(), BrokerError> {
+        self.set_session_status_with_cleanup_request(id, status, exit_code, None, false)
+    }
+
+    /// Transition a session and, when requested by the terminal caller,
+    /// record its delayed automatic-cleanup obligation in the same database
+    /// transaction. The caller supplies the policy grace duration; the due
+    /// timestamp is derived from the close timestamp written here.
+    pub(crate) fn set_session_status_with_cleanup_request(
+        &mut self,
+        id: i64,
+        status: SessionStatus,
+        exit_code: Option<i64>,
+        cleanup_grace_hours: Option<u32>,
+        compact_checkout: bool,
+    ) -> Result<(), BrokerError> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
+        if status == SessionStatus::Closed {
+            let existing: Option<(String, String, Option<i64>)> = tx
+                .query_row(
+                    "SELECT cleanup_state, origin, closed_at FROM sessions WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((cleanup_state, origin, closed_at)) = existing else {
+                return Err(BrokerError::SessionNotFound(id));
+            };
+            if cleanup_state == "cleaned" {
+                tx.commit()?;
+                return Ok(());
+            }
+            // An explicit repeated close repairs a missing outbox row without
+            // moving the original close timestamp or emitting duplicate
+            // lifecycle events. The outbox upsert itself is idempotent.
+            if cleanup_state == "closed" {
+                if origin == SessionOrigin::Spawned.as_str()
+                    && let (Some(grace_hours), Some(closed_at)) = (cleanup_grace_hours, closed_at)
+                {
+                    crate::store::cleanup_cohort::enqueue_checkout_cleanup_in_tx(
+                        &tx,
+                        id,
+                        closed_at,
+                        grace_hours,
+                        compact_checkout,
+                    )?;
+                }
+                tx.commit()?;
+                return Ok(());
+            }
+        }
         // `closed_at` records the first close and is never moved: cleanup
         // after a state-only close, or a second close, must not overwrite it.
         // Retention and the closed-worktree grace period are measured from
@@ -1073,6 +1123,7 @@ impl BrokerStore {
         // implicit-lease snapshot behind forever (722 orphaned rows for
         // ~25 sessions observed in the 2026-07-17 dogfood database).
         if status.is_closed() {
+            record_lease_releases_in_tx(&tx, id, None, None, now, "session_closed", true)?;
             delete_session_base_observation(&tx, id)?;
             release_checkpoint_pin_in_tx(&tx, id, now)?;
             tx.execute("DELETE FROM leases WHERE session_id = ?1", [id])?;
@@ -1090,6 +1141,24 @@ impl BrokerStore {
                 .map(crate::events::session_exit_payload)
                 .as_deref(),
         )?;
+        if status == SessionStatus::Closed
+            && let Some(grace_hours) = cleanup_grace_hours
+        {
+            let (origin, closed_at): (String, i64) = tx.query_row(
+                "SELECT origin, closed_at FROM sessions WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if origin == SessionOrigin::Spawned.as_str() {
+                crate::store::cleanup_cohort::enqueue_checkout_cleanup_in_tx(
+                    &tx,
+                    id,
+                    closed_at,
+                    grace_hours,
+                    compact_checkout,
+                )?;
+            }
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1098,6 +1167,7 @@ impl BrokerStore {
     /// lifecycle claim is still current. The immediate transaction makes the
     /// session, holder event, and active lease comparisons atomic with the
     /// terminal event/status writes.
+    #[cfg(test)]
     pub(crate) fn abandon_session_if_unchanged(
         &mut self,
         expected_session: &Session,
@@ -1105,6 +1175,29 @@ impl BrokerStore {
         expected_active_leases: &[Lease],
         observed_at_ms: i64,
         abandoned_payload: &str,
+    ) -> Result<bool, BrokerError> {
+        self.abandon_session_if_unchanged_with_cleanup_request(
+            expected_session,
+            expected_holder_event_id,
+            expected_active_leases,
+            observed_at_ms,
+            abandoned_payload,
+            None,
+            false,
+        )
+    }
+
+    // Each parameter is a distinct observed authority input to this transactional CAS.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn abandon_session_if_unchanged_with_cleanup_request(
+        &mut self,
+        expected_session: &Session,
+        expected_holder_event_id: Option<i64>,
+        expected_active_leases: &[Lease],
+        observed_at_ms: i64,
+        abandoned_payload: &str,
+        cleanup_grace_hours: Option<u32>,
+        compact_checkout: bool,
     ) -> Result<bool, BrokerError> {
         // Do not let a held SQLite writer lock stall an unattended maintenance
         // pass while it owns the repository lifecycle claim. This short CAS is
@@ -1182,6 +1275,18 @@ impl BrokerStore {
                 return Ok(false);
             }
 
+            if expected_session.origin == SessionOrigin::Spawned
+                && let Some(grace_hours) = cleanup_grace_hours
+            {
+                crate::store::cleanup_cohort::enqueue_checkout_cleanup_in_tx(
+                    &tx,
+                    expected_session.id,
+                    closed_at,
+                    grace_hours,
+                    compact_checkout,
+                )?;
+            }
+
             insert_event(
                 &tx,
                 closed_at,
@@ -1190,6 +1295,15 @@ impl BrokerStore {
                 Some(abandoned_payload),
             )?;
             close_open_activity_in_tx(&tx, expected_session.id, closed_at)?;
+            record_lease_releases_in_tx(
+                &tx,
+                expected_session.id,
+                None,
+                None,
+                closed_at,
+                "session_abandoned",
+                true,
+            )?;
             delete_session_base_observation(&tx, expected_session.id)?;
             release_checkpoint_pin_in_tx(&tx, expected_session.id, closed_at)?;
             tx.execute(
@@ -1229,6 +1343,16 @@ impl BrokerStore {
     /// Atomically close a successfully finished session and persist its
     /// redacted structured handoff after snapshotting leases upstream.
     pub fn finish_session(&mut self, id: i64, handoff_payload: &str) -> Result<(), BrokerError> {
+        self.finish_session_with_cleanup_request(id, handoff_payload, None, false)
+    }
+
+    pub(crate) fn finish_session_with_cleanup_request(
+        &mut self,
+        id: i64,
+        handoff_payload: &str,
+        cleanup_grace_hours: Option<u32>,
+        compact_checkout: bool,
+    ) -> Result<(), BrokerError> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
         let changed = tx.execute(
@@ -1239,15 +1363,33 @@ impl BrokerStore {
             params![id, now],
         )?;
         if changed == 0 {
-            let exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
-                [id],
-                |row| row.get(0),
-            )?;
-            if exists {
+            let existing: Option<(String, String, Option<i64>)> = tx
+                .query_row(
+                    "SELECT cleanup_state, origin, closed_at FROM sessions WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((cleanup_state, origin, closed_at)) = existing else {
+                return Err(BrokerError::SessionNotFound(id));
+            };
+            if cleanup_state == "closed"
+                && origin == SessionOrigin::Spawned.as_str()
+                && let (Some(grace_hours), Some(closed_at)) = (cleanup_grace_hours, closed_at)
+            {
+                crate::store::cleanup_cohort::enqueue_checkout_cleanup_in_tx(
+                    &tx,
+                    id,
+                    closed_at,
+                    grace_hours,
+                    compact_checkout,
+                )?;
+            }
+            if cleanup_state == "closed" || cleanup_state == "cleaned" {
+                tx.commit()?;
                 return Ok(());
             }
-            return Err(BrokerError::SessionNotFound(id));
+            return Err(BrokerError::SessionNotOpen(id));
         }
         delete_session_base_observation(&tx, id)?;
         release_checkpoint_pin_in_tx(&tx, id, now)?;
@@ -1271,6 +1413,21 @@ impl BrokerStore {
             Some(id),
             Some(handoff_payload),
         )?;
+        if let Some(grace_hours) = cleanup_grace_hours {
+            let origin: String =
+                tx.query_row("SELECT origin FROM sessions WHERE id = ?1", [id], |row| {
+                    row.get(0)
+                })?;
+            if origin == SessionOrigin::Spawned.as_str() {
+                crate::store::cleanup_cohort::enqueue_checkout_cleanup_in_tx(
+                    &tx,
+                    id,
+                    now,
+                    grace_hours,
+                    compact_checkout,
+                )?;
+            }
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1282,6 +1439,16 @@ impl BrokerStore {
         &mut self,
         id: i64,
         cleanup_payload: &str,
+    ) -> Result<(), BrokerError> {
+        self.begin_finish_cleanup_with_cleanup_request(id, cleanup_payload, None, false)
+    }
+
+    pub(crate) fn begin_finish_cleanup_with_cleanup_request(
+        &mut self,
+        id: i64,
+        cleanup_payload: &str,
+        cleanup_grace_hours: Option<u32>,
+        compact_checkout: bool,
     ) -> Result<(), BrokerError> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
@@ -1308,6 +1475,21 @@ impl BrokerStore {
                  WHERE id = ?1",
                 params![id, now],
             )?;
+            if let Some(grace_hours) = cleanup_grace_hours {
+                let origin: String =
+                    tx.query_row("SELECT origin FROM sessions WHERE id = ?1", [id], |row| {
+                        row.get(0)
+                    })?;
+                if origin == SessionOrigin::Spawned.as_str() {
+                    crate::store::cleanup_cohort::enqueue_checkout_cleanup_in_tx(
+                        &tx,
+                        id,
+                        now,
+                        grace_hours,
+                        compact_checkout,
+                    )?;
+                }
+            }
             delete_session_base_observation(&tx, id)?;
             release_checkpoint_pin_in_tx(&tx, id, now)?;
             release_session_leases_in_tx(&tx, id, now, "finish")?;
@@ -1316,6 +1498,25 @@ impl BrokerStore {
                 [id],
             )?;
             insert_event(&tx, now, "session.closed", Some(id), None)?;
+        } else if state == "closed"
+            && let Some(grace_hours) = cleanup_grace_hours
+        {
+            let (origin, closed_at): (String, Option<i64>) = tx.query_row(
+                "SELECT origin, closed_at FROM sessions WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if origin == SessionOrigin::Spawned.as_str()
+                && let Some(closed_at) = closed_at
+            {
+                crate::store::cleanup_cohort::enqueue_checkout_cleanup_in_tx(
+                    &tx,
+                    id,
+                    closed_at,
+                    grace_hours,
+                    compact_checkout,
+                )?;
+            }
         }
         insert_event(
             &tx,
@@ -1427,17 +1628,55 @@ impl BrokerStore {
         paths: &[String],
     ) -> Result<(), BrokerError> {
         let now = now_ms();
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "DELETE FROM leases WHERE session_id = ?1 AND kind = 'implicit'",
-            [session_id],
-        )?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Vec<(i64, String, Option<i64>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, path, released_at FROM leases
+                 WHERE session_id = ?1 AND kind = 'implicit'
+                 ORDER BY id",
+            )?;
+            stmt.query_map([session_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        let desired: std::collections::BTreeSet<&str> = paths.iter().map(String::as_str).collect();
+        let retained: std::collections::BTreeSet<String> = existing
+            .iter()
+            .filter(|(_, path, released_at)| {
+                released_at.is_none() && desired.contains(path.as_str())
+            })
+            .map(|(_, path, _)| path.clone())
+            .collect();
+        for (lease_id, path, released_at) in existing {
+            if retained.contains(&path) {
+                continue;
+            }
+            if released_at.is_none() {
+                record_lease_releases_in_tx(
+                    &tx,
+                    session_id,
+                    Some(&path),
+                    Some("implicit"),
+                    now,
+                    "implicit_lease_replaced",
+                    true,
+                )?;
+            }
+            tx.execute("DELETE FROM leases WHERE id = ?1", [lease_id])?;
+        }
         {
+            let mut inserted = std::collections::BTreeSet::new();
             let mut stmt = tx.prepare(
                 "INSERT INTO leases (session_id, path, kind, created_at)
                  VALUES (?1, ?2, 'implicit', ?3)",
             )?;
             for path in paths {
+                if retained.contains(path) || !inserted.insert(path.as_str()) {
+                    continue;
+                }
                 stmt.execute(params![session_id, path, now])?;
             }
         }
@@ -1490,8 +1729,11 @@ impl BrokerStore {
         reason: &str,
     ) -> Result<Vec<i64>, BrokerError> {
         let now = now_ms();
-        let tx = self.conn.transaction()?;
-        let ids = record_lease_releases_in_tx(&tx, session_id, Some(path), now, reason)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ids =
+            record_lease_releases_in_tx(&tx, session_id, Some(path), None, now, reason, true)?;
         tx.execute(
             "UPDATE leases SET released_at = ?3
              WHERE session_id = ?1 AND path = ?2 AND released_at IS NULL",
@@ -1505,18 +1747,22 @@ impl BrokerStore {
     /// This path-wide helper is retained for internal lifecycle operations.
     pub fn release_lease(&mut self, session_id: i64, path: &str) -> Result<(), BrokerError> {
         let now = now_ms();
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        record_lease_releases_in_tx(
+            &tx,
+            session_id,
+            Some(path),
+            None,
+            now,
+            "lease_released",
+            true,
+        )?;
         tx.execute(
             "UPDATE leases SET released_at = ?3
              WHERE session_id = ?1 AND path = ?2 AND released_at IS NULL",
             params![session_id, path, now],
-        )?;
-        insert_event(
-            &tx,
-            now,
-            crate::events::LEASE_RELEASED,
-            Some(session_id),
-            Some(&crate::events::lease_path_payload(path)),
         )?;
         tx.commit()?;
         Ok(())

@@ -398,6 +398,10 @@ impl Broker {
             .map(|session| session.id)
             .collect::<Vec<_>>();
         holder_process_table.prime(self.store_ref(), &retirement_candidates, None);
+        let enqueue_closed_checkout_cleanup = crate::load_retention_policy(&self.main_root)
+            .is_ok_and(|policy| policy.auto_cleanup_worktrees_on_finish)
+            && crate::AutoCleanupPolicy::load(&self.main_root)
+                .is_ok_and(|policy| policy.auto_remove);
         for session in sessions {
             let fs_activity = worktree_activity_ms(&self.main_root, &session);
             let activity_at = fs_activity.unwrap_or(0).max(session.last_activity_at);
@@ -437,7 +441,7 @@ impl Broker {
             // had (#176). Closing here does not delete anything -- it makes the
             // worktree a cleanup *candidate*, which `cleanup_item` then judges
             // on its own merits. Candidacy is granted; eligibility is earned.
-            if !derived_status.is_closed()
+            let abandoned_now = !derived_status.is_closed()
                 && matches!(
                     self.try_close_abandoned_session(
                         session.id,
@@ -447,9 +451,17 @@ impl Broker {
                         true,
                     )?,
                     AbandonedSessionCloseOutcome::Closed
-                )
-            {
+                );
+            if abandoned_now {
                 derived_status = SessionStatus::Closed;
+                if enqueue_closed_checkout_cleanup
+                    && session.origin == crate::SessionOrigin::Spawned
+                {
+                    crate::warn_unrecorded(
+                        "wake post-close checkout cleanup",
+                        self.request_checkout_cleanup_after_close(session.id),
+                    );
+                }
             }
             views.push(AgentView {
                 session,
@@ -747,13 +759,18 @@ impl Broker {
             abandon_after_ms,
             current.pid.map(crate::broker::session_pid_alive),
         );
-        match self.store().abandon_session_if_unchanged(
-            &current,
-            holder.binding_event_id,
-            &leases,
-            observed_at,
-            &abandoned_payload,
-        ) {
+        let cleanup_request = self.checkout_cleanup_request_policy(&current);
+        match self
+            .store()
+            .abandon_session_if_unchanged_with_cleanup_request(
+                &current,
+                holder.binding_event_id,
+                &leases,
+                observed_at,
+                &abandoned_payload,
+                cleanup_request.map(|request| request.grace_hours),
+                cleanup_request.is_some_and(|request| request.compact_checkout),
+            ) {
             Ok(true) => Ok(AbandonedSessionCloseOutcome::Closed),
             Ok(false) => Ok(AbandonedSessionCloseOutcome::Changed),
             Err(BrokerError::SessionRetirementDatabaseBusy) => {
@@ -1527,38 +1544,13 @@ impl Broker {
         request: &crate::lease_requests::LeaseReleaseRequest,
         kind: &str,
         reason: Option<&str>,
-    ) -> Result<(), BrokerOpError> {
-        let held: Vec<String> = self
-            .store
-            .active_leases()?
-            .into_iter()
-            .filter(|lease| {
-                lease.session_id == request.holder_session_id
-                    && crate::leases::paths_overlap(&request.path, &lease.path)
-            })
-            .map(|lease| lease.path)
-            .collect();
-        // The same audited release a finish records (#358), with the reason
-        // `request_acked` or `request_granted`.
-        let release_reason = if kind == crate::lease_requests::GRANTED {
-            "request_granted"
-        } else {
-            "request_acked"
-        };
-        for path in held {
-            self.store
-                .release_lease_for(request.holder_session_id, &path, release_reason)?;
-        }
-        self.store.append_event(
+    ) -> Result<bool, BrokerOpError> {
+        Ok(self.store.resolve_lease_release_request(
+            request.request_id,
+            request.holder_session_id,
             kind,
-            Some(request.holder_session_id),
-            Some(&crate::lease_requests::outcome_payload(
-                request.request_id,
-                &request.path,
-                reason,
-            )),
-        )?;
-        Ok(())
+            reason,
+        )?)
     }
 
     /// The holder acknowledges a request: its leases on the path are released.
@@ -1636,12 +1628,13 @@ impl Broker {
                     view.liveness == crate::lease_liveness::LeaseLiveness::Stale
                         && !view.liveness_evidence.holds
                 });
-            if gone_past_grace {
-                self.release_for_request(
+            if gone_past_grace
+                && self.release_for_request(
                     &request,
                     crate::lease_requests::GRANTED,
                     Some("holder_stale"),
-                )?;
+                )?
+            {
                 granted.push(request.request_id);
             }
         }
@@ -3665,7 +3658,10 @@ mod generic_guarded_exec_tests {
         let mut fetch_broker = storage.open(repository.path()).unwrap();
         let cleanup = fetch_broker.cleanup(session_id, true);
         assert!(
-            matches!(&cleanup, Err(BrokerOpError::DirtyWorktree { .. })),
+            matches!(
+                &cleanup,
+                Err(BrokerOpError::CleanupSessionNotTerminal { .. })
+            ),
             "cleanup must leave a session worktree alone while its commit hook is running: {cleanup:?}"
         );
         assert!(worktree.is_dir(), "the active commit worktree was removed");
@@ -3701,6 +3697,7 @@ mod generic_guarded_exec_tests {
             committed.committed_paths.as_deref().unwrap(),
             &["tracked.txt".to_owned()]
         );
+        fetch_broker.close(unrelated_session.id).unwrap();
         fetch_broker.cleanup(unrelated_session.id, true).unwrap();
     }
 

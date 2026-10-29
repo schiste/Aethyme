@@ -65,6 +65,35 @@ fn repository_lifecycle_lock_path(main_root: &Path) -> io::Result<std::path::Pat
     repository_runtime_lock_path(main_root, "worktree-lifecycle.lock")
 }
 
+/// Try to claim one session's compact-recovery writer without blocking other
+/// lifecycle operations. The persistent lock is released automatically when
+/// the process exits, so an interrupted archive attempt can be reconciled.
+pub(crate) fn try_acquire_retirement_archive_lock(
+    main_root: &Path,
+    session_id: i64,
+) -> io::Result<Option<ExclusiveFileLock>> {
+    if session_id <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "retirement lock requires a positive session id",
+        ));
+    }
+    let name = format!("checkout-retirement-{session_id}.lock");
+    let path = repository_runtime_lock_path(main_root, &name)?;
+    let file = open_lock_file_nofollow(&path)?;
+    let Some(lock) = ExclusiveFileLock::try_acquire(file)? else {
+        return Ok(None);
+    };
+    if repository_runtime_lock_path(main_root, &name)? != path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "retirement archive lock path changed while it was acquired",
+        ));
+    }
+    verify_named_lock_file(&path, &lock.file)?;
+    Ok(Some(lock))
+}
+
 fn repository_runtime_lock_path(main_root: &Path, name: &str) -> io::Result<std::path::PathBuf> {
     Ok(repository_runtime_directory(main_root)?.join(name))
 }

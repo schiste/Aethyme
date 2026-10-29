@@ -2127,28 +2127,44 @@ pub(super) fn render_cleanup_audit(audit: &crate::CleanupAudit, detail: bool) {
 
 /// `broker cleanup resolve <session-id> --archive [--confirm <sha256>]`.
 fn run_cleanup_resolve(parsed: Parsed) -> Result<(), UsageError> {
-    let usage = "usage: aethyme broker finish cleanup resolve <session-id> --archive [--confirm <sha256>] [--json]";
-    let [_, id] = parsed.positional.as_slice() else {
-        return Err(UsageError::Message(format!(
-            "cleanup resolve takes exactly one session id; {usage}"
-        )));
+    let usage = "usage: aethyme broker finish cleanup resolve <session-id>... --archive [--batch] [--retire] [--allow-adopted] [--confirm <sha256>] [--json]";
+    let Some((command, ids)) = parsed.positional.split_first() else {
+        return Err(UsageError::Message(usage.into()));
     };
-    let id: i64 = id
-        .parse()
-        .map_err(|_| UsageError::Message("session id must be an integer".into()))?;
-    // Archiving is the only resolution this verb performs. Requiring the word
-    // keeps the command from reading as a softer spelling of discard, which
-    // stays `cleanup <session-id> --force`.
+    if command != "resolve" || ids.is_empty() {
+        return Err(UsageError::Message(usage.into()));
+    }
+    let ids: Vec<i64> = ids
+        .iter()
+        .map(|id| {
+            id.parse()
+                .map_err(|_| UsageError::Message("session IDs must be integers".into()))
+        })
+        .collect::<Result<_, _>>()?;
+    // Reject ambiguous scope before opening state or inspecting a checkout.
+    let ids = crate::cleanup_batch::validated_targets(&ids)?;
     if !parsed.archive {
         return Err(UsageError::Message(format!(
-            "cleanup resolve requires --archive; to discard instead, run `aethyme broker finish \
-             cleanup {id} --force`; {usage}"
+            "cleanup resolve requires --archive; {usage}"
         )));
     }
+    if parsed.read_only_snapshot && parsed.confirm.is_some() {
+        return Err(UsageError::Message(
+            "recovery apply requires the current writable repository database".into(),
+        ));
+    }
     let mut broker = open_broker(parsed.read_only_snapshot)?;
+    if parsed.cleanup_batch || ids.len() > 1 {
+        return run_cleanup_resolve_batch(&mut broker, &ids, &parsed);
+    }
+    let id = ids[0];
     match parsed.confirm.as_deref() {
         None => {
-            let plan = broker.cleanup_resolve_plan(id)?;
+            let plan = if parsed.retire || parsed.allow_adopted {
+                broker.cleanup_resolve_retirement_plan(id, parsed.allow_adopted)?
+            } else {
+                broker.cleanup_resolve_plan(id)?
+            };
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
@@ -2156,7 +2172,11 @@ fn run_cleanup_resolve(parsed: Parsed) -> Result<(), UsageError> {
             }
         }
         Some(confirm) => {
-            let outcome = broker.cleanup_resolve_apply(id, confirm)?;
+            let outcome = if parsed.retire || parsed.allow_adopted {
+                broker.cleanup_resolve_retirement_apply(id, confirm, parsed.allow_adopted)?
+            } else {
+                broker.cleanup_resolve_apply(id, confirm)?
+            };
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&outcome)?);
             } else {
@@ -2167,6 +2187,107 @@ fn run_cleanup_resolve(parsed: Parsed) -> Result<(), UsageError> {
                         "Warning: the archive is verified, but removing the worktree failed: {error}"
                     ),
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_cleanup_resolve_batch(
+    broker: &mut Broker,
+    ids: &[i64],
+    parsed: &Parsed,
+) -> Result<(), UsageError> {
+    match parsed.confirm.as_deref() {
+        None => {
+            let plan = broker.cleanup_resolve_batch_plan(ids, parsed.allow_adopted)?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                out!(
+                    "Recovery batch {}: {} exact targets",
+                    plan.digest,
+                    plan.targets.len()
+                );
+                for target in &plan.targets {
+                    if target.already_removed {
+                        out!(
+                            "  session {}: already removed; no new removal",
+                            target.session_id
+                        );
+                        continue;
+                    }
+                    match &target.blocker {
+                        Some(blocker) => out!(
+                            "  session {}: kept — {}",
+                            target.session_id,
+                            advisory_text(blocker)
+                        ),
+                        None => out!(
+                            "  session {}: archive then retire {}; {} unlanded commits, {} of patches and preserved files",
+                            target.session_id,
+                            advisory_text(target.worktree_path.as_deref().unwrap_or_default()),
+                            target
+                                .unlanded_commits
+                                .map_or_else(|| "unknown".into(), |count| count.to_string()),
+                            target
+                                .preserved_file_bytes
+                                .map(human_bytes)
+                                .unwrap_or_else(|| "unknown".into()),
+                        ),
+                    }
+                }
+                out!("  apply: {}", plan.apply_command);
+            }
+        }
+        Some(confirm) => {
+            let outcome = broker.cleanup_resolve_batch_apply(ids, confirm, parsed.allow_adopted)?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                out!(
+                    "Recovery batch: {} worktrees removed; {} targets retained",
+                    outcome.removed_count,
+                    outcome.remaining_session_ids.len()
+                );
+                for result in &outcome.results {
+                    if result.already_removed {
+                        out!(
+                            "  session {}: already removed; no new removal",
+                            result.session_id
+                        );
+                    }
+                    if let Some(error) = &result.error {
+                        out!(
+                            "  session {}: kept — {}",
+                            result.session_id,
+                            advisory_text(error)
+                        );
+                    }
+                    if let Some(archive) = &result.outcome {
+                        out!(
+                            "  session {}: archive {}",
+                            result.session_id,
+                            advisory_text(&archive.archive.to_string_lossy())
+                        );
+                        if let Some(error) = &archive.cleanup_error {
+                            out!(
+                                "  Warning: session {} retained — {}",
+                                result.session_id,
+                                advisory_text(error)
+                            );
+                        }
+                    }
+                }
+                if !outcome.remaining_session_ids.is_empty() {
+                    out!(
+                        "  next: review a new --batch plan for the remaining exact session IDs {:?}",
+                        outcome.remaining_session_ids
+                    );
+                }
+            }
+            if !outcome.remaining_session_ids.is_empty() {
+                return Err(UsageError::SilentExit(crate::exit_status::FAILED));
             }
         }
     }

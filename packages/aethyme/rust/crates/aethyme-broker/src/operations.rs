@@ -1664,7 +1664,9 @@ pub(crate) fn process_is_gone(pid: i64) -> bool {
 /// pre-push protection the repository relies on, which is the repository
 /// owner's decision to make, not ours.
 fn hooks_outside_lock_enabled(main_root: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(main_root.join(".aethyme/config.toml")) else {
+    let Ok(Some((_, text))) =
+        aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
+    else {
         return false;
     };
     let Ok(value) = text.parse::<toml::Value>() else {
@@ -1682,7 +1684,9 @@ fn hooks_outside_lock_enabled(main_root: &Path) -> bool {
 /// probe measures the cost without changing the conservative repository-wide
 /// policy or making a merge depend on a second provider call.
 fn measure_pr_merge_ref_enabled(main_root: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(main_root.join(".aethyme/config.toml")) else {
+    let Ok(Some((_, text))) =
+        aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
+    else {
         return false;
     };
     let Ok(value) = text.parse::<toml::Value>() else {

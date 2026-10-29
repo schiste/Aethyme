@@ -153,12 +153,22 @@ fn existing_enrollment_project_id(
     worktree: &Path,
     current: &CommitOid,
 ) -> Result<Option<ProjectId>, Failure> {
-    let Some(config_bytes) = archive::raw_file_at_commit(worktree, current, CONFIG_PATH.as_bytes())
-        .map_err(|error| Failure::domain("archive", error.to_string()))?
+    // `.aethyme/config` in either format (#1223).
+    let Ok(Some(config_text)) = aethyme_config::try_read_config_text_with(
+        aethyme_config::CONFIG_DIR,
+        "config",
+        |relpath| {
+            Ok::<_, Failure>(
+                archive::raw_file_at_commit(worktree, current, relpath.as_bytes())
+                    .map_err(|error| Failure::domain("archive", error.to_string()))?
+                    .and_then(|bytes| String::from_utf8(bytes).ok()),
+            )
+        },
+    )?
     else {
         return Ok(None);
     };
-    let Ok(config_text) = std::str::from_utf8(&config_bytes) else {
+    let Ok(config_text) = config_text.toml_text() else {
         return Ok(None);
     };
     let Ok(config) = config_text.parse::<toml::Value>() else {
@@ -577,6 +587,56 @@ pub(super) fn committed_enrollment(config: &str) -> Result<(ProjectKey, String),
         })?
         .to_string();
     Ok((project, pointer))
+}
+
+/// The committed `.aethyme/config` in either format (#1223), as TOML text,
+/// read with [`committed_regular_file`]'s regular-file and size checks.
+pub(super) fn committed_config_toml(
+    repo: &Path,
+    commit: &CommitOid,
+    snapshot: &SourceSnapshot,
+    limit: usize,
+) -> Result<String, Failure> {
+    let present: Vec<String> = aethyme_config::candidate_relpaths("config")
+        .into_iter()
+        .filter(|path| {
+            snapshot
+                .entries()
+                .iter()
+                .any(|entry| entry.path() == path.as_bytes())
+        })
+        .collect();
+    if present.len() > 1 {
+        return Err(Failure::refused(
+            "config_ambiguous_format",
+            format!(
+                "{} are both committed; keep exactly one configuration file",
+                present.join(" and ")
+            ),
+            CONFIRM_NEXT,
+        ));
+    }
+    let path = present
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| CONFIG_PATH.into());
+    let bytes = committed_regular_file(repo, commit, snapshot, &path, limit)?;
+    let text = String::from_utf8(bytes).map_err(|_| {
+        Failure::refused(
+            "config_unreadable",
+            "committed config is not UTF-8",
+            CONFIRM_NEXT,
+        )
+    })?;
+    let text = aethyme_config::ConfigText {
+        format: aethyme_config::ConfigFormat::from_path(Path::new(&path))
+            .unwrap_or(aethyme_config::ConfigFormat::Toml),
+        path: path.into(),
+        text,
+    };
+    text.toml_text()
+        .map(|toml| toml.into_owned())
+        .map_err(|error| Failure::refused("config_invalid", error.to_string(), CONFIRM_NEXT))
 }
 
 pub(super) fn committed_regular_file(

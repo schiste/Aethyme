@@ -24,20 +24,20 @@ pub struct GraphIntegrityPolicy {
 
 impl GraphIntegrityPolicy {
     pub fn load(repo_root: &Path) -> Result<Self, GraphIntegrityPolicyError> {
-        let path = repo_root.join(GRAPH_CONFIG_RELPATH);
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
-            Err(error) => {
-                return Err(GraphIntegrityPolicyError::Read {
-                    path,
-                    message: error.to_string(),
-                });
-            }
-        };
-        Self::parse_at(&text, path)
+        // `.aethyme/config.toml`, `.yaml` or `.yml` (#1223), as TOML text.
+        match aethyme_config::read_config_toml(
+            &repo_root.join(aethyme_config::CONFIG_DIR),
+            "config",
+        ) {
+            Ok(Some((path, text))) => Self::parse_at(&text, path),
+            Ok(None) => Ok(Self::default()),
+            Err(error) => Err(GraphIntegrityPolicyError::Read {
+                path: error
+                    .path()
+                    .map_or_else(|| repo_root.join(GRAPH_CONFIG_RELPATH), Path::to_path_buf),
+                message: error.to_string(),
+            }),
+        }
     }
 
     /// Parse policy bytes obtained from an exact Git tree without consulting

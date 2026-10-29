@@ -652,7 +652,7 @@ fn graph_policy_at_commit(
     commit: &str,
 ) -> Result<(GraphIntegrityPolicy, u64), String> {
     match repository
-        .file_at_commit(commit, GRAPH_CONFIG_RELPATH)
+        .config_toml_at_commit(commit, "config")
         .map_err(|error| error.to_string())?
     {
         Some(text) => {
@@ -737,8 +737,16 @@ fn build_plan(repo_hint: &Path) -> Result<BuiltPlan, String> {
         .unwrap_or_else(|| "unconfigured".into());
     let pinned_engine_version = read_engine_version(&proposal.root).ok();
     performance.policy_loading.elapsed_us = policy_started.elapsed().as_micros();
-    performance.policy_loading.bytes_read = file_len(&proposal.root.join(GRAPH_CONFIG_RELPATH))
-        + file_len(&proposal.root.join(".aethyme/engine-version"));
+    performance.policy_loading.bytes_read =
+        file_len(
+            &aethyme_broker::config_source::config_path_or_default(
+                &proposal
+                    .root
+                    .join(aethyme_broker::config_source::CONFIG_DIR),
+                "config",
+            )
+            .unwrap_or_else(|_| proposal.root.join(GRAPH_CONFIG_RELPATH)),
+        ) + file_len(&proposal.root.join(".aethyme/engine-version"));
     let running_version = env!("CARGO_PKG_VERSION").to_string();
 
     let compatibility = graph_compatibility(&policy, pinned_engine_version.as_deref());

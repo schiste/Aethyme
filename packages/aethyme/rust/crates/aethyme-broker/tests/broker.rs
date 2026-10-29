@@ -445,6 +445,20 @@ fn cleanup_refuses_dirty_and_unmerged_then_force_discards() {
 
     let session = broker.start_agent("doomed", "true", None).unwrap();
     let wt = std::path::PathBuf::from(&session.worktree_path);
+    wait_for_agent_pid_exit(&broker, session.id);
+    broker.close(session.id).unwrap();
+    assert!(
+        broker
+            .store()
+            .session(session.id)
+            .unwrap()
+            .status
+            .is_closed()
+    );
+    assert_eq!(
+        broker.store().session(session.id).unwrap().cleanup_state,
+        aethyme_broker::SessionCleanupState::Closed
+    );
 
     // Uncommitted file → refuse.
     std::fs::write(wt.join("wip.rs"), "x\n").unwrap();
@@ -2355,23 +2369,35 @@ fn status_brief_loads_promotion_config_once_from_committed_default() {
         );
 
         let events = std::fs::read_to_string(&trace).unwrap();
-        let config_reads = events
+        let starts = events
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter(|event| event["event"] == "start")
+            .collect::<Vec<_>>();
+        let tree_reads = starts
+            .iter()
             .filter(|event| {
                 event["argv"].as_array().is_some_and(|argv| {
-                    argv.get(1).and_then(serde_json::Value::as_str) == Some("show")
-                        && argv.iter().any(|arg| {
-                            arg.as_str()
-                                .is_some_and(|arg| arg.ends_with(":.aethyme/config.toml"))
-                        })
+                    argv.get(1).and_then(serde_json::Value::as_str) == Some("ls-tree")
+                        && argv
+                            .iter()
+                            .any(|arg| arg.as_str().is_some_and(|arg| arg.ends_with("config.toml")))
+                })
+            })
+            .count();
+        let blob_reads = starts
+            .iter()
+            .filter(|event| {
+                event["argv"].as_array().is_some_and(|argv| {
+                    argv.get(1).and_then(serde_json::Value::as_str) == Some("cat-file")
+                        && argv.get(2).and_then(serde_json::Value::as_str) == Some("blob")
                 })
             })
             .count();
         assert_eq!(
-            config_reads, 1,
-            "one summary must read committed config once, trace={events}"
+            (tree_reads, blob_reads),
+            (1, 1),
+            "one summary must perform one strict committed-config tree/blob read, trace={events}"
         );
         return;
     }

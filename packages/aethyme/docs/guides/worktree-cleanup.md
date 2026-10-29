@@ -1,6 +1,6 @@
 # Closed-session worktree cleanup
 
-Last Updated: 2026-10-28
+Last Updated: 2026-10-29
 
 Removing a session worktree is a reviewed operation, with one deterministic
 exception described under *Automatic removal* below. A closed session is not
@@ -279,6 +279,49 @@ Archive creation and checkout removal are separate results. Inspect
 `worktree_removed` and `cleanup_error` even after a successful command, and keep
 the reported archive path. Never count an archived-but-retained checkout as
 removed or use `--force` to work around a refusal.
+
+## Compact recovery for an exact checkout batch
+
+Keep recoverable history without retaining a full prepared checkout:
+
+```sh
+aethyme broker finish cleanup resolve <id-1> <id-2> <id-3> --batch --archive --json
+```
+
+Review the complete exact-target plan, then run its `apply_command`. A batch
+accepts 1–4096 unique positive session IDs; `--batch` keeps the same command
+available when only one target remains. It also permits a delivered closed
+checkout to be archived inside the automatic full-checkout grace window.
+For a single compact recovery with an item confirmation, use `--retire`.
+This is an explicit operator decision; planning alone removes nothing.
+
+The batch confirmation binds the repository, exact IDs, checkout origins and
+paths, content confirmations, and adopted-checkout opt-in. Before the first
+archive is created, the broker rebuilds every target confirmation. Changed
+content or a newly eligible previously blocked item invalidates the batch.
+Each target is checked again through ordinary verified recovery before removal.
+The byte estimate counts patches and preserved files; commit bundle size is
+additional and remains bounded by ordinary archive admission.
+
+Use `--allow-adopted` only when you own the named adopted checkouts and intend
+to retire them. Their branches remain. This does not synthesize original
+broker ownership or turn an unrecorded directory into a broker-owned checkout.
+Unrecorded paths need a separate explicit registration/ownership decision.
+Live, unsafe and uninspectable targets remain protected in either mode.
+
+Independent targets continue when another target is protected or fails. JSON
+reports each archive/removal outcome and `remaining_session_ids`; any retained
+target makes the batch exit nonzero. Replan only those remaining IDs and review
+a new confirmation. Never attach an old digest to a reduced or expanded list.
+After an interrupted run, replanning the original exact set also works: a fully
+cleaned ledger row with an absent checkout is marked `already_removed`, grants
+no removal authority, and adds nothing to `removed_count`. A recreated path
+stays blocked. Apply rechecks each completion marker; missing byte estimates
+and archive outcomes remain null rather than claiming preserved contents.
+Archives remain subject to the recovery retention policy; do not manually
+remove them as regenerable cache or claim an archive-only result as a removed
+checkout. The default archive window is 30 days, exceeding the default 15-day
+closed-checkout grace.
 
 ## 4. Prove containment before discarding anything else
 

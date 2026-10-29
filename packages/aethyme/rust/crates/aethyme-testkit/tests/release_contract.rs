@@ -10,6 +10,7 @@ const RELEASE_HELPER_BINARY_DIR_ENV: &str = "AETHYME_RELEASE_HELPER_BINARY_DIR";
 const PRODUCTION_CRATES: &[&str] = &[
     "aethyme-broker",
     "aethyme-cli",
+    "aethyme-config",
     "aethyme-engine",
     "aethyme-enhance",
     "aethyme-graph-indexer",

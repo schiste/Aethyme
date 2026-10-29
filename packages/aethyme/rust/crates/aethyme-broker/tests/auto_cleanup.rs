@@ -159,6 +159,41 @@ fn persisted_spawn_witness_count(broker: &mut Broker, session_id: i64) -> i64 {
     .unwrap()
 }
 
+fn persisted_spawn_witness_root_generation(broker: &mut Broker, session_id: i64) -> String {
+    let connection = rusqlite::Connection::open_with_flags(
+        broker.store().db_path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let witness: String = connection
+        .query_row(
+            "SELECT witness_json FROM spawned_worktree_instances WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&witness).unwrap();
+    value
+        .get("root_generation_sha256")
+        .and_then(serde_json::Value::as_str)
+        .expect("spawn must persist the root generation digest")
+        .to_owned()
+}
+
+fn assert_alias_inventory_barrier(report: &AutoCleanupReport, deferred: usize) {
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert_eq!(report.deferred, deferred, "{report:#?}");
+    let inventory = report
+        .kept
+        .iter()
+        .find(|kept| kept.worktree == "<session checkout inventory>")
+        .expect("stale alias proof must keep the whole cleanup batch");
+    assert!(
+        inventory.reason.contains("registered checkout paths"),
+        "{inventory:#?}"
+    );
+}
+
 /// Match repositories that explicitly keep pnpm's store inside each checkout.
 fn pnpm_store_fixture(ignored: bool) -> Fixture {
     let fx = fixture();
@@ -409,11 +444,14 @@ fn an_inspected_kept_checkout_checkpoints_the_cursor() {
         .meta_get("auto_cleanup.cursor")
         .unwrap()
         .expect("an inspected candidate checkpoints the cursor");
-    assert_eq!(
-        cursor,
-        format!(
-            r#"{{"version":1,"after_session_id":{session_id},"high_water_session_id":{session_id}}}"#
-        )
+    let cursor: serde_json::Value = serde_json::from_str(&cursor).unwrap();
+    assert_eq!(cursor["version"], 3);
+    assert_eq!(cursor["after_session_id"], session_id);
+    assert_eq!(cursor["high_water_session_id"], session_id);
+    assert!(
+        cursor["cohort_generation"]
+            .as_i64()
+            .is_some_and(|value| value > 0)
     );
     assert!(worktree.exists());
 }
@@ -754,10 +792,12 @@ fn a_spawned_session_without_a_persisted_witness_is_not_backfilled() {
     assert!(report.removed.is_empty(), "{report:#?}");
     assert!(
         kept_reason(&report, &worktree)
-            .contains("spawn-time worktree instance identity is unavailable")
-            || kept_reason(&report, &worktree)
-                .contains("no matching spawn-time worktree instance witness"),
-        "{report:#?}"
+            .contains("closed checkout cohort or ownership witness changed")
+    );
+    assert_eq!(
+        persisted_spawn_witness_count(&mut broker, spawned_id),
+        0,
+        "cleanup must not manufacture missing spawn-time evidence"
     );
     assert!(
         worktree.exists(),
@@ -769,7 +809,7 @@ fn a_spawned_session_without_a_persisted_witness_is_not_backfilled() {
 fn a_closed_re_adoption_after_selection_keeps_the_checkout_for_that_pass() {
     let fx = fixture();
     let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
-    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let (spawned_id, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     let plan = broker.auto_cleanup_plan_now(None).unwrap().unwrap();
     #[cfg(unix)]
     assert_eq!(plan.selected_worktrees().len(), 1);
@@ -784,7 +824,16 @@ fn a_closed_re_adoption_after_selection_keeps_the_checkout_for_that_pass() {
 
     assert!(report.removed.is_empty(), "{report:#?}");
     #[cfg(unix)]
-    assert!(kept_reason(&report, &worktree).contains("closed session set changed"));
+    {
+        let canonical = std::fs::canonicalize(&worktree).unwrap();
+        let inventory_deferred = report.deferred == 1 && report.kept.is_empty();
+        let cohort_kept = report.deferred == 0
+            && report.kept.iter().any(|kept| {
+                kept.worktree == canonical.to_string_lossy().into_owned()
+                    && kept.reason.contains("closed session set changed")
+            });
+        assert!(inventory_deferred || cohort_kept, "{report:#?}");
+    }
     #[cfg(not(unix))]
     assert!(
         kept_reason(&report, &worktree)
@@ -792,6 +841,14 @@ fn a_closed_re_adoption_after_selection_keeps_the_checkout_for_that_pass() {
         "{report:#?}"
     );
     assert!(worktree.exists());
+    assert_eq!(
+        broker.store().session(spawned_id).unwrap().cleanup_state,
+        aethyme_broker::SessionCleanupState::Closed
+    );
+    assert_eq!(
+        broker.store().session(adopted.id).unwrap().cleanup_state,
+        aethyme_broker::SessionCleanupState::Closed
+    );
 }
 
 #[cfg(unix)]
@@ -802,6 +859,7 @@ fn a_retained_spawn_record_does_not_own_a_foreign_checkout_replacement() {
     let (spawned_id, worktree, _) = merged_closed_session(&fx, &mut broker, true);
     let plan = broker.auto_cleanup_plan_now(None).unwrap().unwrap();
     assert_eq!(plan.selected_worktrees().len(), 1);
+    let spawn_generation = persisted_spawn_witness_root_generation(&mut broker, spawned_id);
     let worktree_text = worktree.to_string_lossy().into_owned();
     git(&fx.repo, &["worktree", "remove", "--force", &worktree_text]);
 
@@ -843,12 +901,15 @@ fn a_retained_spawn_record_does_not_own_a_foreign_checkout_replacement() {
 
     let report = broker.auto_cleanup_apply_now(plan).unwrap().unwrap();
 
-    assert!(report.removed.is_empty(), "{report:#?}");
-    assert!(kept_reason(&report, &worktree).contains("changed before removal"));
-    assert!(
-        kept_reason(&report, &worktree)
-            .contains("worktree instance no longer matches its spawn record")
+    assert_alias_inventory_barrier(&report, 1);
+    assert_eq!(
+        persisted_spawn_witness_root_generation(&mut broker, spawned_id),
+        spawn_generation,
+        "stale apply must not bind the foreign replacement to the original spawn witness"
     );
+    let refreshed = run(&mut broker);
+    assert!(refreshed.removed.is_empty(), "{refreshed:#?}");
+    assert!(kept_reason(&refreshed, &worktree).contains("not a broker-owned worktree"));
     assert!(worktree.join("shared.txt").exists());
     assert!(worktree.exists());
     assert_eq!(
@@ -868,26 +929,7 @@ fn a_retained_spawn_record_does_not_own_a_same_repo_checkout_replacement() {
     assert_eq!(plan.selected_worktrees().len(), 1);
     let worktree_text = worktree.to_string_lossy().into_owned();
     let branch = broker.store().session(spawned_id).unwrap().branch;
-    let spawn_generation = {
-        let connection = rusqlite::Connection::open_with_flags(
-            broker.store().db_path(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        let witness: String = connection
-            .query_row(
-                "SELECT witness_json FROM spawned_worktree_instances WHERE session_id = ?1",
-                [spawned_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_str(&witness).unwrap();
-        value
-            .get("root_generation_sha256")
-            .and_then(serde_json::Value::as_str)
-            .expect("spawn must persist the root generation digest")
-            .to_owned()
-    };
+    let spawn_generation = persisted_spawn_witness_root_generation(&mut broker, spawned_id);
     assert_eq!(spawn_generation.len(), 64);
     git(&fx.repo, &["worktree", "remove", "--force", &worktree_text]);
     git(
@@ -911,7 +953,24 @@ fn a_retained_spawn_record_does_not_own_a_same_repo_checkout_replacement() {
     assert!(report.removed.is_empty(), "{report:#?}");
     assert!(
         kept_reason(&report, &worktree)
-            .contains("worktree instance no longer matches its spawn record")
+            .contains("closed checkout cohort or ownership witness changed")
+    );
+    assert_eq!(
+        persisted_spawn_witness_root_generation(&mut broker, spawned_id),
+        spawn_generation,
+        "the retained witness must not be rebound to the replacement instance"
+    );
+    let refreshed = run(&mut broker);
+    assert!(refreshed.removed.is_empty(), "{refreshed:#?}");
+    assert!(
+        kept_reason(&refreshed, &worktree)
+            .contains("closed checkout cohort or ownership witness changed"),
+        "{refreshed:#?}"
+    );
+    assert_eq!(
+        persisted_spawn_witness_root_generation(&mut broker, spawned_id),
+        spawn_generation,
+        "a fresh inventory pass must not rebind the original spawn witness"
     );
     assert!(worktree.join("shared.txt").exists());
     assert!(worktree.exists());
@@ -974,13 +1033,14 @@ fn a_head_moved_after_selection_is_proved_again_not_reused() {
 
 #[cfg(unix)]
 #[test]
-fn removal_past_the_selection_deadline_defers_all_but_the_first() {
+fn expired_selection_deadline_defers_until_alias_inventory_can_be_rechecked() {
     let fx = fixture();
     let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, first, _) = merged_closed_session(&fx, &mut broker, true);
     let (_, second, _) = merged_closed_session(&fx, &mut broker, true);
-    // Removal finds the budget already spent, as it does when a broker open
-    // spent it selecting. Injected, so a loaded runner cannot race it.
+    // An already-expired deadline cannot complete the mandatory apply-time
+    // filesystem alias audit, so none of the selected paths is authorized.
+    // Injected, so a loaded runner cannot race it.
     let plan = broker
         .auto_cleanup_plan_now(None)
         .unwrap()
@@ -988,11 +1048,10 @@ fn removal_past_the_selection_deadline_defers_all_but_the_first() {
         .with_deadline(Some(std::time::Instant::now()));
     assert_eq!(plan.selected_worktrees().len(), 2);
     let report = broker.auto_cleanup_apply_now(plan).unwrap().unwrap();
-    assert_eq!(report.removed.len(), 1, "{report:#?}");
-    assert_eq!(report.deferred, 1, "{report:#?}");
-    assert_ne!(first.exists(), second.exists());
-    // Unbounded, the next pass removes the one left.
-    assert_eq!(run(&mut broker).removed.len(), 1);
+    assert_alias_inventory_barrier(&report, 2);
+    assert!(first.exists() && second.exists());
+    // A fresh unbounded pass can complete the audit and make progress.
+    assert_eq!(run(&mut broker).removed.len(), 2);
     assert!(!first.exists() && !second.exists());
 }
 

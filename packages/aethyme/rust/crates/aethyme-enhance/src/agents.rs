@@ -302,7 +302,10 @@ pub fn render_agents_document(repo: Option<&Path>) -> Result<String, String> {
 /// Agent-facing broker coordination protocol, rendered only when the repo
 /// is broker-configured.
 fn render_broker_protocol_compact(repo: &Path) -> String {
-    if !(repo.join(".aethyme/gates.toml").exists() || repo.join(".aethyme/config.toml").exists()) {
+    let config_dir = repo.join(aethyme_config::CONFIG_DIR);
+    if !(aethyme_config::config_exists(&config_dir, "gates")
+        || aethyme_config::config_exists(&config_dir, "config"))
+    {
         return String::new();
     }
     // The heading keeps "Broker Coordination": `certify`'s agents-protocol
@@ -399,11 +402,16 @@ let agents push session branches and open draft PRs by setting
 ///
 /// Stated in guidance only when written: an unconfigured repository keeps its
 /// generated files unchanged rather than advertising a default it never chose.
+/// `.aethyme/config` in either format (#1223); unreadable reads as absent.
+fn repository_config(repo: &Path) -> Option<toml::Value> {
+    aethyme_config::load_config(&repo.join(aethyme_config::CONFIG_DIR), "config")
+        .ok()
+        .flatten()
+        .map(|document| document.value)
+}
+
 fn pr_size_thresholds(repo: &Path) -> Option<(u64, u64)> {
-    let config = std::fs::read_to_string(repo.join(".aethyme/config.toml"))
-        .ok()?
-        .parse::<toml::Value>()
-        .ok()?;
+    let config = repository_config(repo)?;
     let size = config.get("review")?.get("pr_size")?;
     let files = u64::try_from(size.get("max_files")?.as_integer()?).ok()?;
     let lines = u64::try_from(size.get("max_changed_lines")?.as_integer()?).ok()?;
@@ -418,9 +426,7 @@ fn pr_size_thresholds(repo: &Path) -> Option<(u64, u64)> {
 /// unreadable declaration must not grant it; the broker applies the same
 /// rule before pushing.
 fn pushes_session_branches(repo: &Path) -> bool {
-    std::fs::read_to_string(repo.join(".aethyme/config.toml"))
-        .ok()
-        .and_then(|text| text.parse::<toml::Value>().ok())
+    repository_config(repo)
         .and_then(|config| {
             config
                 .get("delivery")?

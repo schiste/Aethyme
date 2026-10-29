@@ -3,6 +3,7 @@ exclude = ["vendor/libsqlite3-sys-0.30.1"]
 members = [
     "crates/aethyme-broker",
     "crates/aethyme-cli",
+    "crates/aethyme-config",
     "crates/aethyme-contracts",
     "crates/aethyme-engine",
     "crates/aethyme-enhance",
@@ -58,7 +59,7 @@ unicode-normalization = "0.1"
 walkdir = "2"
 
 [workspace.package]
-version = "0.8.46"
+version = "0.8.47"
 
 # Workspace lint floor. Every crate opts in with `[lints] workspace = true`.
 #

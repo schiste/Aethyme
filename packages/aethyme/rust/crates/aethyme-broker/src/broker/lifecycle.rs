@@ -4975,20 +4975,25 @@ impl Broker {
         }
         let loaded;
         let config = match trigger {
-            // Opens run on every hook call: reach Git only when the working
-            // copy says required, then confirm against the committed copy.
-            FenceTrigger::Open => {
-                let text =
-                    std::fs::read_to_string(self.main_root.join(".aethyme/config.toml")).ok()?;
-                if !crate::collaboration_submit::requires_capture(
-                    &crate::collaboration_submit::setting_from_text(Some(&text)),
-                ) {
-                    return None;
-                }
-                loaded = crate::merge::repository_config_with_source(&self.main_root);
+            FenceTrigger::Open | FenceTrigger::Config(None) => {
+                loaded = match crate::merge::committed_repository_config_checked(&self.main_root) {
+                    Ok(Some(text)) => Some((text, "committed")),
+                    Ok(None) => return None,
+                    Err(error) => {
+                        crate::warn_unrecorded(
+                            "resolve the committed configuration for the collaboration fence",
+                            Err::<(), _>(error),
+                        );
+                        // An unresolved policy is not evidence that the
+                        // repository requires capture. Keep it visible as a
+                        // pending read without persisting a one-way floor;
+                        // the next open must recheck repaired committed text.
+                        return Some(crate::CollaborationFence::pending_unresolved_config());
+                    }
+                };
                 loaded.as_ref()
             }
-            FenceTrigger::Config(config) => config,
+            FenceTrigger::Config(Some(config)) => Some(config),
         };
         let (text, "committed") = config.map(|(text, source)| (text.as_str(), *source))? else {
             return None;
@@ -7096,8 +7101,48 @@ impl Broker {
     }
 
     pub(super) fn close_unchecked(&mut self, session_id: i64) -> Result<(), BrokerOpError> {
-        self.store
-            .set_session_status(session_id, SessionStatus::Closed, None)?;
+        let should_wake_checkout_cleanup = {
+            let initial_session = self.store.session(session_id)?;
+            let _lifecycle_claim = self.claim_worktree_lifecycle()?;
+            let session = self.store.session(session_id)?;
+            super::cleanup::ensure_lifecycle_session_unchanged(
+                session_id,
+                &initial_session,
+                &session,
+            )?;
+            if session.cleanup_state == crate::SessionCleanupState::Cleaned
+                && session.status == SessionStatus::Cleaned
+            {
+                return Ok(());
+            }
+            let cleanup_request = self.checkout_cleanup_request_policy(&session);
+            if session.cleanup_state != crate::SessionCleanupState::Closed
+                || !session.status.is_closed()
+                || (session.origin == crate::SessionOrigin::Spawned && cleanup_request.is_some())
+            {
+                // The store variant is idempotent for an already-closed
+                // Spawned row: it repairs an older missing outbox without
+                // moving the original close timestamp or emitting a second
+                // status transition.
+                self.store.set_session_status_with_cleanup_request(
+                    session_id,
+                    SessionStatus::Closed,
+                    None,
+                    cleanup_request.map(|request| request.grace_hours),
+                    cleanup_request.is_some_and(|request| request.compact_checkout),
+                )?;
+            }
+            session.origin == crate::SessionOrigin::Spawned && cleanup_request.is_some()
+        };
+        // The terminal row and owed cleanup request commit together. Waking
+        // the global worker happens only after releasing the lifecycle claim;
+        // the per-session not-before time and fresh proofs still gate removal.
+        if should_wake_checkout_cleanup {
+            crate::warn_unrecorded(
+                "wake post-close checkout cleanup",
+                self.request_checkout_cleanup_after_close(session_id),
+            );
+        }
         // Closing must not fail because a best-effort artifact sweep did;
         // report the failure instead of discarding it.
         crate::warn_unrecorded(

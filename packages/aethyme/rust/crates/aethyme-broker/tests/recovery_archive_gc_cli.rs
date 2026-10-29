@@ -2,6 +2,7 @@
 //! through a reviewed `gc plan` / `gc apply`, and only when the broker can
 //! vouch for them.
 
+use sha2::Digest;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -71,6 +72,15 @@ fn archive_root(repo: &Path) -> PathBuf {
 /// Close a session holding one unlanded commit and, when `dirty`, an
 /// uncommitted edit; archive it through the reviewed resolve path.
 fn archived_session(repo: &Path, name: &str, dirty: bool) -> (i64, String, PathBuf) {
+    archived_session_with_mode(repo, name, dirty, false)
+}
+
+fn archived_session_with_mode(
+    repo: &Path,
+    name: &str,
+    dirty: bool,
+    retirement: bool,
+) -> (i64, String, PathBuf) {
     let session = {
         let mut broker = common::open_fixture_repository_path_broker(repo).unwrap();
         let session = broker.start_worktree(name, None).unwrap();
@@ -85,24 +95,14 @@ fn archived_session(repo: &Path, name: &str, dirty: bool) -> (i64, String, PathB
         session
     };
     let id = session.id.to_string();
-    let reviewed = json(&run(
-        repo,
-        &["finish", "cleanup", "resolve", &id, "--archive", "--json"],
-    ));
+    let mut args = vec!["finish", "cleanup", "resolve", &id, "--archive", "--json"];
+    if retirement {
+        args.push("--retire");
+    }
+    let reviewed = json(&run(repo, &args));
     let digest = reviewed["digest"].as_str().unwrap().to_owned();
-    let outcome = json(&run(
-        repo,
-        &[
-            "finish",
-            "cleanup",
-            "resolve",
-            &id,
-            "--archive",
-            "--confirm",
-            &digest,
-            "--json",
-        ],
-    ));
+    args.extend(["--confirm", &digest]);
+    let outcome = json(&run(repo, &args));
     let head = reviewed["head"].as_str().unwrap().to_owned();
     (
         session.id,
@@ -122,7 +122,20 @@ fn edit_manifest(archive: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
 fn age(archive: &Path, days: i64) {
     edit_manifest(archive, |manifest| {
         let created = manifest["created_at_ms"].as_i64().unwrap();
-        manifest["created_at_ms"] = serde_json::json!(created - days * DAY_MS);
+        let aged = created - days * DAY_MS;
+        if manifest["schema_version"] == 5 {
+            // Build a consistently aged fixture, not a one-sided metadata edit.
+            let record_path = archive.join("retirement.json");
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+            assert_eq!(record["archive_created_at_ms"], created);
+            record["archive_created_at_ms"] = serde_json::json!(aged);
+            let bytes = serde_json::to_vec(&record).unwrap();
+            manifest["retirement_record_sha256"] =
+                serde_json::json!(format!("{:x}", sha2::Sha256::digest(&bytes)));
+            std::fs::write(record_path, bytes).unwrap();
+        }
+        manifest["created_at_ms"] = serde_json::json!(aged);
     });
 }
 
@@ -330,4 +343,127 @@ fn a_digest_reviewed_before_another_archive_expired_is_refused() {
     );
     assert!(!output.status.success(), "a stale digest must be refused");
     assert!(first.exists() && second.exists(), "nothing was removed");
+}
+
+#[test]
+fn retirement_archive_floor_survives_landing_and_a_shorter_current_policy() {
+    for dirty in [false, true] {
+        let tmp = repo();
+        let (_, head, archive) = archived_session_with_mode(tmp.path(), "retirement", dirty, true);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(archive.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["schema_version"], 5);
+        assert!(manifest["minimum_archive_retention_ms"].as_u64().unwrap() >= 15 * DAY_MS as u64);
+        if !dirty {
+            git(tmp.path(), &["merge", "-q", "--ff-only", &head]);
+        }
+        std::fs::write(
+            tmp.path().join(".aethyme/broker.toml"),
+            "[retention]\nrecovery_archive_days = 1\n",
+        )
+        .unwrap();
+        age(&archive, 2);
+        let protected = plan(tmp.path());
+        assert!(proposed(&protected).is_empty(), "{protected}");
+        assert!(
+            unowned(&protected).is_empty(),
+            "a valid protected archive remains owned: {protected}"
+        );
+        assert!(archive.exists());
+
+        age(&archive, 14);
+        let expired = plan(tmp.path());
+        let candidates = proposed(&expired);
+        assert_eq!(candidates.len(), 1, "{expired}");
+        assert_eq!(candidates[0]["landed"], !dirty);
+        let digest = expired["digest"].as_str().unwrap();
+        let applied = json(&run(
+            tmp.path(),
+            &["gc", "apply", "--confirm", digest, "--full-scan", "--json"],
+        ));
+        assert_eq!(
+            applied["recovery_archives_removed"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "{applied}"
+        );
+        assert!(!archive.exists());
+    }
+}
+
+#[test]
+fn a_retirement_archive_with_an_inconsistent_creation_time_stays_protected() {
+    let tmp = repo();
+    let (_, head, archive) =
+        archived_session_with_mode(tmp.path(), "inconsistent-time", false, true);
+    git(tmp.path(), &["merge", "-q", "--ff-only", &head]);
+    edit_manifest(&archive, |manifest| {
+        let created = manifest["created_at_ms"].as_i64().unwrap();
+        manifest["created_at_ms"] = serde_json::json!(created - 365 * DAY_MS);
+    });
+    let reviewed = plan(tmp.path());
+    assert!(proposed(&reviewed).is_empty(), "{reviewed}");
+    let rejected = unowned(&reviewed);
+    assert_eq!(rejected.len(), 1, "{reviewed}");
+    assert!(rejected[0].contains("retirement"), "{rejected:?}");
+    assert!(archive.exists());
+}
+
+#[test]
+fn landed_retirement_head_does_not_hide_an_unlanded_recorded_branch_root() {
+    let tmp = repo();
+    let mut broker = common::open_fixture_repository_path_broker(tmp.path()).unwrap();
+    let session = broker.start_worktree("two archive roots", None).unwrap();
+    let worktree = PathBuf::from(&session.worktree_path);
+    std::fs::write(
+        worktree.join("unique-recorded-root.txt"),
+        b"unlanded recorded work\n",
+    )
+    .unwrap();
+    git(&worktree, &["add", "unique-recorded-root.txt"]);
+    git(&worktree, &["commit", "-qm", "unique recorded root"]);
+    let recorded_tip = git(&worktree, &["rev-parse", "HEAD"]);
+    git(
+        &worktree,
+        &["switch", "-c", "already-delivered-checkout", "main"],
+    );
+    assert_ne!(git(&worktree, &["rev-parse", "HEAD"]), recorded_tip);
+    assert_eq!(
+        git(&worktree, &["rev-parse", "HEAD"]),
+        git(tmp.path(), &["rev-parse", "main"])
+    );
+    broker.close(session.id).unwrap();
+    drop(broker);
+    let id = session.id.to_string();
+    let mut args = vec![
+        "finish",
+        "cleanup",
+        "resolve",
+        &id,
+        "--retire",
+        "--archive",
+        "--json",
+    ];
+    let reviewed = json(&run(tmp.path(), &args));
+    let digest = reviewed["digest"].as_str().unwrap();
+    args.extend(["--confirm", digest]);
+    let outcome = json(&run(tmp.path(), &args));
+    assert_eq!(outcome["worktree_removed"], true);
+    let archive = PathBuf::from(outcome["archive"].as_str().unwrap());
+    age(&archive, 16);
+    let protected = plan(tmp.path());
+    assert!(
+        proposed(&protected).is_empty(),
+        "the recorded root remains unique under the default 30-day archive policy: {protected}"
+    );
+    assert!(unowned(&protected).is_empty(), "{protected}");
+    assert!(archive.exists());
+
+    git(tmp.path(), &["merge", "-q", "--ff-only", &recorded_tip]);
+    let landed = plan(tmp.path());
+    let candidates = proposed(&landed);
+    assert_eq!(candidates.len(), 1, "{landed}");
+    assert_eq!(candidates[0]["landed"], true);
 }

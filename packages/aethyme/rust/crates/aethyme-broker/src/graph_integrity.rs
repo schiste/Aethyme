@@ -13,8 +13,8 @@ use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, lin
 #[cfg(test)]
 use aethyme_graph_storage::GraphAuthority;
 use aethyme_graph_storage::{
-    GRAPH_CONFIG_RELPATH, GraphIntegrityPolicy, bootstrap_repo, committed_source_tree_digest,
-    read_coverage, read_engine_version, write_graph_authority_manifest,
+    GraphIntegrityPolicy, bootstrap_repo, committed_source_tree_digest, read_coverage,
+    read_engine_version, write_graph_authority_manifest,
 };
 
 pub(crate) fn load_graph_policy_at_commit(
@@ -29,7 +29,7 @@ pub(crate) fn load_graph_policy_at_commit(
         .into());
     }
     let _git_environment = crate::git::graph_verification_git_guard();
-    match repository.file_at_commit(commit, GRAPH_CONFIG_RELPATH)? {
+    match repository.config_toml_at_commit(commit, "config")? {
         Some(text) => Ok(GraphIntegrityPolicy::parse(&text)?),
         None => Ok(GraphIntegrityPolicy::default()),
     }
@@ -819,7 +819,7 @@ mod tests {
 
     fn write_config(root: &Path, body: &str) {
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
-        std::fs::write(root.join(GRAPH_CONFIG_RELPATH), body).unwrap();
+        std::fs::write(root.join(aethyme_graph_storage::GRAPH_CONFIG_RELPATH), body).unwrap();
     }
 
     fn git(root: &Path, args: &[&str]) {
