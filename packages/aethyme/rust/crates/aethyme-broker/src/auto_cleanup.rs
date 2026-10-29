@@ -3326,7 +3326,7 @@ mod tests {
                 "INSERT INTO sessions (
                      worktree_path, branch, origin, status, cleanup_state, closed_at,
                      created_at, updated_at, last_activity_at
-                 ) VALUES (?1, ?2, 'adopted', 'closed', 'closed', 1, 1, 1, 1)",
+                 ) VALUES (?1, ?2, 'adopted', 'cleaned', 'closed', 1, 1, 1, 1)",
                 rusqlite::params![
                     legacy_path.to_string_lossy(),
                     format!("agent/legacy-{index}")
@@ -3441,7 +3441,7 @@ mod tests {
                 "INSERT INTO sessions (
                      worktree_path, branch, origin, status, cleanup_state, closed_at,
                      created_at, updated_at, last_activity_at
-                 ) VALUES (?1, 'agent/unrelated', 'adopted', 'closed', 'closed', 1, 1, 1, 1)",
+                 ) VALUES (?1, 'agent/unrelated', 'adopted', 'cleaned', 'closed', 1, 1, 1, 1)",
                 [unrelated_path.to_string_lossy().as_ref()],
             )
             .unwrap();
