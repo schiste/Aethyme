@@ -30,6 +30,8 @@ pub mod lifecycle;
 pub mod logs;
 mod operate;
 mod park;
+pub mod proxy;
+pub mod routes;
 pub mod spec;
 pub mod store;
 pub mod supervisor;
@@ -43,6 +45,8 @@ mod drivers_tests;
 mod lifecycle_tests;
 #[cfg(test)]
 mod park_tests;
+#[cfg(test)]
+mod proxy_tests;
 #[cfg(test)]
 mod store_tests;
 #[cfg(test)]

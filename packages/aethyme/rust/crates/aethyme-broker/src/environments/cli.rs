@@ -36,6 +36,7 @@ pub const PARK_SCHEMA: &str = "aethyme.env-park/v1";
 pub const WAKE_SCHEMA: &str = "aethyme.env-wake/v1";
 pub const TOUCH_SCHEMA: &str = "aethyme.env-touch/v1";
 pub const PIN_SCHEMA: &str = "aethyme.env-pin/v1";
+pub const ROUTES_SCHEMA: &str = "aethyme.env-routes/v1";
 
 pub const USAGE: &str = "\
 aethyme env — declared runnable environments per worktree
@@ -101,6 +102,13 @@ Usage:
   aethyme env pin <id> --for <seconds> --reason <text> [--json]
       Keep the environment awake (up to 24 h). `env unpin <id>` ends it.
       Pins are recorded in the environment's history.
+  aethyme env routes [--json]
+      The route table the built-in proxy serves on 127.0.0.1:4180
+      (AETHYME_ENV_PROXY_PORT): <component>.<namespace>.<route_domain> and
+      <namespace>.<route_domain> per routed component, with the upstream port
+      while active. A request to a parked environment's host wakes it and is
+      held until it is healthy. Reach a host with your browser
+      (*.localhost) or with `curl -H 'Host: <host>' http://127.0.0.1:4180/`.
   aethyme env sweep [--json]
       Destroy environments whose worktree no longer exists (from a
       temporary export of their recorded commit) and retry failed destroys
@@ -178,6 +186,7 @@ pub fn run(args: &[String]) -> u8 {
         "touch" => super::operate::run_touch(&options),
         "pin" => super::operate::run_pin(&options),
         "unpin" => super::operate::run_unpin(&options),
+        "routes" => super::operate::run_routes(&options),
         other => Err(Failure {
             code: "unknown_subcommand",
             message: format!("unknown env subcommand {other:?}"),

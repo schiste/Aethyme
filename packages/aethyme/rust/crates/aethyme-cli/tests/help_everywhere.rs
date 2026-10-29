@@ -116,6 +116,7 @@ const COMMANDS: &[&str] = &[
     "env touch",
     "env pin",
     "env unpin",
+    "env routes",
     "certify",
     "init",
     "deploy",

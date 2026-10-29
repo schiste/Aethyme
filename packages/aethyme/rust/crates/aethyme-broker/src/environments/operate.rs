@@ -416,6 +416,50 @@ pub(super) fn run_exec(rest: &[String]) -> u8 {
     }
 }
 
+pub(super) fn run_routes(_: &Options) -> Result<Output, Failure> {
+    let root = environments_directory()
+        .ok_or_else(|| environment_failure("host state directory is unavailable".into()))?;
+    let routes = match EnvironmentStore::open_default_read_only()
+        .map_err(|error| environment_failure(error.to_string()))?
+    {
+        Some(store) => super::routes::route_table(&store, &root)
+            .map_err(|error| environment_failure(error.to_string()))?,
+        None => Vec::new(),
+    };
+    let port = super::proxy::proxy_port();
+    let mut text = format!("proxy: http://127.0.0.1:{port} (Host header selects the route)\n");
+    if routes.is_empty() {
+        text.push_str("no routes\n");
+    }
+    for route in &routes {
+        text.push_str(&format!(
+            "  {:<48} {} {} {}\n",
+            route.host,
+            route.env_id,
+            route.state,
+            route
+                .upstream
+                .map(|p| format!("-> 127.0.0.1:{p}"))
+                .or_else(|| route
+                    .static_dir
+                    .as_ref()
+                    .map(|d| format!("static {}", d.display())))
+                .unwrap_or_else(|| "(wakes on request)".into())
+        ));
+    }
+    Ok((
+        json!({
+            "schema": super::cli::ROUTES_SCHEMA,
+            "proxy": format!("http://127.0.0.1:{port}"),
+            "token_file": root.join(super::proxy::TOKEN_FILE),
+            "etag": super::routes::etag(&routes),
+            "routes": routes,
+        }),
+        text,
+        exit_status::SUCCESS,
+    ))
+}
+
 pub(super) fn run_sweep(_: &Options) -> Result<Output, Failure> {
     let (mut lifecycle, _) = open("env sweep", false)?;
     lifecycle.renew_leases().map_err(lifecycle_failure)?;
@@ -436,10 +480,60 @@ pub(super) fn run_sweep(_: &Options) -> Result<Output, Failure> {
 /// up while anything needs supervision.
 pub struct LifecycleWork {
     pub watch: super::supervisor::StoreWatch,
+    /// The proxy starts on the first tick, i.e. only in the supervisor that
+    /// won the singleton lock.
+    pub proxy_started: bool,
+}
+
+/// Start the wake-on-request proxy on loopback in this (supervisor)
+/// process. A port already in use is logged, not fatal: everything except
+/// wake on request keeps working.
+fn start_proxy() {
+    let (Some(root), Ok(store_path), Ok(host_db)) = (
+        environments_directory(),
+        super::store::default_store_path(),
+        crate::resources::default_host_resource_db_path(),
+    ) else {
+        eprintln!("warning: aethyme env proxy not started: host state unavailable");
+        return;
+    };
+    let token = match super::proxy::ensure_token(&root) {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!("warning: aethyme env proxy not started: token: {error}");
+            return;
+        }
+    };
+    let port = super::proxy::proxy_port();
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("warning: aethyme env proxy not started on 127.0.0.1:{port}: {error}");
+            return;
+        }
+    };
+    let config = std::sync::Arc::new(super::proxy::ProxyConfig {
+        root,
+        store_path,
+        host_db,
+        token,
+        holder_pid: Some(std::process::id()),
+    });
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    std::thread::spawn(move || {
+        crate::warn_unrecorded(
+            "serve the environment proxy",
+            super::proxy::serve(listener, config, stop),
+        );
+    });
 }
 
 impl super::supervisor::SupervisorWork for LifecycleWork {
     fn tick(&mut self) -> super::supervisor::TickOutcome {
+        if !self.proxy_started {
+            self.proxy_started = true;
+            start_proxy();
+        }
         if let Ok((mut lifecycle, _)) = open("supervisor", false) {
             crate::warn_unrecorded("renew environment leases", lifecycle.renew_leases());
             crate::warn_unrecorded("sweep orphaned environments", lifecycle.sweep_orphans());
