@@ -9,7 +9,11 @@
 //!
 //! Requests live in the event log, not a table of their own: a request is its
 //! `lease.release_requested` event, and its outcome is the later event that
-//! names it. Nothing here changes the broker schema.
+//! names it. A request also resolves when its requester closes or its holder
+//! releases the path through another lifecycle operation. Nothing here changes
+//! the broker schema.
+
+use std::collections::HashMap;
 
 use crate::BrokerStore;
 
@@ -30,6 +34,8 @@ pub enum RequestState {
     /// The holder no longer holds the path for some other reason (finish,
     /// an explicit release, expiry).
     Released,
+    /// The requester session closed while the holder still held the path.
+    Cancelled,
 }
 
 impl RequestState {
@@ -40,6 +46,7 @@ impl RequestState {
             Self::Declined => "declined",
             Self::Granted => "granted",
             Self::Released => "released",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -55,7 +62,7 @@ pub struct LeaseReleaseRequest {
     pub state: RequestState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_at: Option<i64>,
-    /// Why it was declined, or `holder_stale` for a grant.
+    /// Why it was declined, granted, released, or cancelled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution_reason: Option<String>,
 }
@@ -75,15 +82,47 @@ struct OutcomePayload {
     reason: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+struct ReleasedPayload {
+    path: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RequestResolution {
+    event_id: i64,
+    resolved_at: i64,
+    state: RequestState,
+    reason: Option<String>,
+}
+
+// Event IDs are the durable event-log order. Timestamps can be backdated to
+// a lease's expires_at, so they must not decide which terminal outcome wins.
+fn record_resolution(
+    resolutions: &mut HashMap<i64, RequestResolution>,
+    request_id: i64,
+    candidate: RequestResolution,
+) {
+    let is_earlier = resolutions
+        .get(&request_id)
+        .map(|current| candidate.event_id < current.event_id)
+        .unwrap_or(true);
+    if is_earlier {
+        resolutions.insert(request_id, candidate);
+    }
+}
+
 /// Every release request in the event log, oldest first, with its state.
-/// `holds(holder, path)` says whether the holder still holds the path, which
-/// turns a request whose lease went away by other means into `released`.
+/// `holds(holder, path)` supplies a current-state fallback when no
+/// auditable release event remains for an unresolved request.
 pub fn requests(
     store: &BrokerStore,
     holds: impl Fn(i64, &str) -> bool,
 ) -> Result<Vec<LeaseReleaseRequest>, crate::BrokerOpError> {
     let events = store.lease_release_events()?;
     let mut requests: Vec<LeaseReleaseRequest> = Vec::new();
+    let mut outcome_resolutions = HashMap::<i64, RequestResolution>::new();
     for event in &events {
         let Some(payload) = event.payload_json.as_deref() else {
             continue;
@@ -114,21 +153,194 @@ pub fn requests(
         let Ok(outcome) = serde_json::from_str::<OutcomePayload>(payload) else {
             continue;
         };
-        if let Some(request) = requests
-            .iter_mut()
-            .find(|request| request.request_id == outcome.request_id)
-            && request.state == RequestState::Pending
+        if requests
+            .iter()
+            .any(|request| request.request_id == outcome.request_id)
         {
-            request.state = state;
-            request.resolved_at = Some(event.ts);
-            request.resolution_reason = outcome.reason;
+            record_resolution(
+                &mut outcome_resolutions,
+                outcome.request_id,
+                RequestResolution {
+                    event_id: event.id,
+                    resolved_at: event.ts,
+                    state,
+                    reason: outcome.reason,
+                },
+            );
         }
     }
+
+    let mut resolutions = outcome_resolutions.clone();
+    let mut held_by_request = HashMap::<i64, bool>::new();
+    let mut release_resolutions = HashMap::<i64, RequestResolution>::new();
+    let mut release_scan_after = HashMap::<i64, i64>::new();
+    let mut release_scan_before = HashMap::<i64, Option<(i64, i64)>>::new();
+    let mut closure_scan_after = HashMap::<i64, i64>::new();
+    for request in &requests {
+        held_by_request.insert(
+            request.request_id,
+            holds(request.holder_session_id, &request.path),
+        );
+        let outcome_boundary = outcome_resolutions
+            .get(&request.request_id)
+            .map(|outcome| (outcome.event_id, outcome.resolved_at));
+        release_scan_after
+            .entry(request.holder_session_id)
+            .and_modify(|first_id| *first_id = (*first_id).min(request.request_id))
+            .or_insert(request.request_id);
+        match release_scan_before.entry(request.holder_session_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(outcome_boundary);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let before = match (*entry.get(), outcome_boundary) {
+                    (Some(current), Some(next)) => {
+                        Some((current.0.max(next.0), current.1.max(next.1)))
+                    }
+                    (None, _) | (_, None) => None,
+                };
+                entry.insert(before);
+            }
+        }
+        closure_scan_after
+            .entry(request.requester_session_id)
+            .and_modify(|first_id| *first_id = (*first_id).min(request.request_id))
+            .or_insert(request.request_id);
+    }
+
+    for (holder_session_id, first_request_id) in release_scan_after {
+        let before = release_scan_before
+            .get(&holder_session_id)
+            .copied()
+            .flatten();
+        for event in store.lease_release_events_for_holder_since(
+            holder_session_id,
+            first_request_id,
+            before,
+        )? {
+            let Some(payload) = event.payload_json.as_deref() else {
+                continue;
+            };
+            let Ok(released) = serde_json::from_str::<ReleasedPayload>(payload) else {
+                continue;
+            };
+            for request in &requests {
+                if request.holder_session_id != holder_session_id
+                    || request.request_id >= event.id
+                    || !crate::leases::paths_overlap(&request.path, &released.path)
+                {
+                    continue;
+                }
+                let explicit_outcome = outcome_resolutions.get(&request.request_id);
+                // Paired acknowledgement and grant releases are recorded
+                // before their outcome event in the same operation.
+                let paired_outcome = explicit_outcome.is_some_and(|outcome| {
+                    outcome.event_id > event.id
+                        && ((outcome.state == RequestState::Acked
+                            && released.reason.as_deref() == Some("request_acked"))
+                            || (outcome.state == RequestState::Granted
+                                && released.reason.as_deref() == Some("request_granted")))
+                });
+                if paired_outcome {
+                    continue;
+                }
+                // A request can cover several leases. Keep the final
+                // overlapping release as its resolution only when the
+                // holder no longer has any active lease for the requested
+                // path; an earlier partial release must leave it pending.
+                if held_by_request.get(&request.request_id) != Some(&false) {
+                    continue;
+                }
+                let candidate = RequestResolution {
+                    event_id: event.id,
+                    resolved_at: event.ts,
+                    state: RequestState::Released,
+                    reason: Some(
+                        released
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "lease_released".to_string()),
+                    ),
+                };
+                match release_resolutions.entry(request.request_id) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(candidate);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry)
+                        if candidate.event_id > entry.get().event_id =>
+                    {
+                        entry.insert(candidate);
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {}
+                }
+            }
+        }
+    }
+
+    for (request_id, resolution) in release_resolutions {
+        record_resolution(&mut resolutions, request_id, resolution);
+    }
+
+    for (requester_session_id, first_request_id) in closure_scan_after {
+        for event in store.lease_request_closure_events_for_session_since(
+            requester_session_id,
+            first_request_id,
+        )? {
+            for request in &requests {
+                if request.requester_session_id == requester_session_id
+                    && request.request_id < event.id
+                {
+                    record_resolution(
+                        &mut resolutions,
+                        request.request_id,
+                        RequestResolution {
+                            event_id: event.id,
+                            resolved_at: event.ts,
+                            state: RequestState::Cancelled,
+                            reason: Some("requester_closed".into()),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
     for request in &mut requests {
-        if request.state == RequestState::Pending
-            && !holds(request.holder_session_id, &request.path)
-        {
+        if let Some(resolution) = resolutions.remove(&request.request_id) {
+            request.state = resolution.state;
+            request.resolved_at = Some(resolution.resolved_at);
+            request.resolution_reason = resolution.reason;
+        }
+    }
+
+    let mut requester_closed_at = HashMap::<i64, Option<i64>>::new();
+    for request in &mut requests {
+        if request.state != RequestState::Pending {
+            continue;
+        }
+        if held_by_request.get(&request.request_id) == Some(&false) {
             request.state = RequestState::Released;
+            request.resolution_reason = Some("release_evidence_unavailable".into());
+            continue;
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            requester_closed_at.entry(request.requester_session_id)
+        {
+            let closed_at = match store.session(request.requester_session_id) {
+                Ok(session) if session.status.is_closed() => {
+                    Some(session.closed_at.unwrap_or(session.updated_at))
+                }
+                Ok(_) | Err(crate::BrokerError::SessionNotFound(_)) => None,
+                Err(error) => return Err(error.into()),
+            };
+            entry.insert(closed_at);
+        }
+        if let Some(Some(closed_at)) = requester_closed_at.get(&request.requester_session_id)
+            && *closed_at >= request.requested_at
+        {
+            request.state = RequestState::Cancelled;
+            request.resolved_at = Some(*closed_at);
+            request.resolution_reason = Some("requester_closed".into());
         }
     }
     Ok(requests)

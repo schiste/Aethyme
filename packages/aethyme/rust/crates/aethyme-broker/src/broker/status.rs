@@ -1538,10 +1538,10 @@ impl Broker {
         {
             advice.push(StatusAdvice {
                 id: "lease.release-requested",
-                severity: StatusAdviceSeverity::Warning,
+                severity: StatusAdviceSeverity::Notice,
                 reason: "another session asked this session to release a lease",
                 summary: format!(
-                    "session {} asks session {} to release {} (request {}): {}",
+                    "session {} asked session {} to release {} (request {}); this is advisory and does not block edits in separate worktrees: {}",
                     request.requester_session_id,
                     request.holder_session_id,
                     request.path,
