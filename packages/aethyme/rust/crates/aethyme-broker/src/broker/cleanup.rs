@@ -4764,6 +4764,8 @@ impl Broker {
                     self.cleanup_resolve_retirement_revalidation_plan(
                         session_id,
                         archive_guard.permits_adopted(),
+                        archived_plan.retirement_witness_sha256.as_deref(),
+                        status_limits.deadline,
                     )?
                 } else {
                     self.cleanup_resolve_revalidation_plan(session_id)?
