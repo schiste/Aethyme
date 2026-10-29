@@ -5949,7 +5949,7 @@ impl Broker {
                     "compact_checkout_removed; next due rows remain wakeable",
                 )?;
             }
-            Some(_outcome) | None => {
+            Some(_) | None => {
                 self.store().defer_checkout_cleanup_compactions(
                     &cohort.session_ids(),
                     now_ms().saturating_add(AUTO_COMPACT_CHECKOUT_RETRY_MS),
