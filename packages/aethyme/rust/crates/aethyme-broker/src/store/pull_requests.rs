@@ -1151,25 +1151,64 @@ impl BrokerStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Lease releases by one holder after a particular request was created.
-    /// Callers use this only for holders with unresolved requests, avoiding a
-    /// scan of every historical `lease.released` event on each status read.
+    /// Lease releases by one holder in a request's event window.
+    /// Callers scope these reads to involved sessions and request ids, avoiding
+    /// a repository-wide scan of release history on each status read.
     pub(crate) fn lease_release_events_for_holder_since(
         &self,
         holder_session_id: i64,
         after_event_id: i64,
+        before_event_id: Option<i64>,
     ) -> Result<Vec<Event>, BrokerError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, schema_version, ts, kind, session_id, payload_json
              FROM events
              WHERE kind = ?1 AND session_id = ?2 AND id > ?3
+               AND (?4 IS NULL OR id < ?4)
              ORDER BY id",
         )?;
         let rows = stmt.query_map(
             params![
                 crate::events::LEASE_RELEASED,
                 holder_session_id,
-                after_event_id
+                after_event_id,
+                before_event_id
+            ],
+            |row| {
+                Ok(Event {
+                    id: row.get(0)?,
+                    schema_version: row.get(1)?,
+                    ts: row.get(2)?,
+                    kind: row.get(3)?,
+                    session_id: row.get(4)?,
+                    payload_json: row.get(5)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Session terminal events after a release request. These resolve
+    /// requests from the requester side in event-id order.
+    pub(crate) fn lease_request_closure_events_for_session_since(
+        &self,
+        session_id: i64,
+        after_event_id: i64,
+    ) -> Result<Vec<Event>, BrokerError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, schema_version, ts, kind, session_id, payload_json
+             FROM events
+             WHERE session_id = ?1 AND id > ?2 AND kind IN (?3, ?4, ?5, ?6)
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                session_id,
+                after_event_id,
+                "session.closed",
+                "session.cleaned",
+                "session.abandoned",
+                crate::events::SESSION_FINISHED
             ],
             |row| {
                 Ok(Event {
