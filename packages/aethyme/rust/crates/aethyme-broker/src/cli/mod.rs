@@ -24,6 +24,7 @@ mod render;
 mod report;
 mod resources;
 mod review;
+mod service;
 mod session;
 mod ship;
 mod status;
@@ -1111,6 +1112,11 @@ fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 
         return crate::exit_status::USAGE;
     }
     let started = std::time::Instant::now();
+    // The opt-in host service has its own bounded parser and never opens a
+    // repository, runs startup maintenance or fast-forwards a checkout.
+    if args.first().map(String::as_str) == Some("service") {
+        return service::run_service(&args[1..]);
+    }
     maybe_fast_forward_main_checkout(args, &mode);
     // Dispatched before the shared parser: the contract check is a CI/gate
     // entry point with its own flags (`--base`, `--pr-body`) and its own

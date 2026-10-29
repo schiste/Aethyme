@@ -2,3 +2,6 @@
 //! until explicitly migrated; protocol availability never enables routing.
 
 pub mod protocol;
+
+#[cfg(unix)]
+pub mod transport;

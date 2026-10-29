@@ -35,7 +35,7 @@ exists. Default activation is a separate reviewed change.
 ## Protocol v1: health only
 
 The Rust contract lives in `aethyme_broker::service::protocol`. Its presence is
-not a routing switch. This foundation does not expose a service CLI yet.
+not a routing switch.
 
 One connection carries one UTF-8 JSON request and response, each terminated by
 one newline. A frame is at most 65,536 bytes including the newline. Writers check
@@ -68,6 +68,49 @@ restrict socket access to that user, fence concurrent startup, and refuse
 unsafe path replacements. It must not expose shell execution or deserialize
 arbitrary CLI argv. Repository identity, request context, authorization and
 durable idempotency must be designed before introducing mutation methods.
+
+## Opt-in foreground transport
+
+After the transport PR merges, create a private directory and resolve its
+canonical absolute path (for example with `pwd -P`), then run:
+
+```sh
+mkdir -m 700 /tmp/aethyme-service-example
+aethyme broker advanced service serve /private/tmp/aethyme-service-example
+```
+
+From another terminal:
+
+```sh
+aethyme broker advanced service ping /private/tmp/aethyme-service-example --json
+```
+
+On Linux use `/tmp/aethyme-service-example` when that is its canonical path.
+The directory must already exist, belong to the current user and deny group
+and other access. Paths containing symlinks are refused. The socket is mode
+0600; a permanent locked file in the directory provides singleton ownership.
+Do not unlink that lock file while any service is running.
+
+`serve` runs in the foreground until interrupted or stopped by its process
+supervisor. No launch agent is installed and no existing broker request is
+rerouted. `ping` emits the v1 Response JSON, with or without `--json`, and
+returns a nonzero exit when the endpoint is absent, unsafe or incompatible.
+Invalid arguments fail before opening a socket. Help, serve and ping do not
+initialize, upgrade, reconcile or maintain repository state.
+
+At most 16 client handlers run concurrently. Each frame has a two-second
+absolute read deadline and socket writes have a two-second timeout. Overload
+closes the additional connection without claiming execution. This is currently
+safe because the only method is a read-only health request. A malformed client
+is closed without a response; a parsed incompatible version gets the typed
+error described above. A stale owned socket is recovered under the singleton
+lock on restart. An unexpected file at the socket path is preserved and causes
+startup to fail. Orderly library shutdown removes only the bound socket inode;
+abrupt process exit leaves a socket for the next startup to recover.
+
+The runtime directory is explicitly selected in this opt-in phase. Automatic
+per-user discovery, startup, shutdown requests and migration of repository jobs
+are later steps; this phase does not yet reduce existing broker process counts.
 
 ## Acceptance before default activation
 
