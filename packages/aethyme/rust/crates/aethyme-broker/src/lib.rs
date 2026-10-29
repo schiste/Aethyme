@@ -21,6 +21,7 @@
 //!   sessions, stress-tested at 20 (see `tests/stress.rs`).
 
 mod advisories;
+pub mod service;
 pub mod agent_hook;
 pub mod analysis_view;
 mod archive_cleanup;
