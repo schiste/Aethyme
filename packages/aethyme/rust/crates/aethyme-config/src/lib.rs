@@ -179,33 +179,78 @@ pub fn is_config_twin(relpath: &str, stem: &str) -> bool {
                 .any(|candidate| candidate == relpath))
 }
 
-/// Whether any twin of `stem` exists as a file in `dir`.
+/// Whether any twin of the stem exists as a regular file in dir.
+///
+/// This convenience predicate is best-effort. Use
+/// [present_config_paths_checked] or [resolve_config_path] when the result
+/// controls a configuration read or write.
 #[must_use]
 pub fn config_exists(dir: &Path, stem: &str) -> bool {
-    validate_stem(stem).is_ok()
-        && candidate_file_names(stem)
-            .iter()
-            .any(|name| dir.join(name).is_file())
+    present_config_paths_checked(dir, stem).is_ok_and(|paths| !paths.is_empty())
 }
 
-/// The twins of `stem` present as files in `dir`.
+/// The twins of the stem present as files in dir.
+///
+/// This convenience listing is best-effort. Use
+/// [present_config_paths_checked] or [resolve_config_path] for an
+/// authoritative decision.
 #[must_use]
 pub fn present_config_paths(dir: &Path, stem: &str) -> Vec<PathBuf> {
-    if validate_stem(stem).is_err() {
-        return Vec::new();
+    present_config_paths_checked(dir, stem).unwrap_or_default()
+}
+
+/// The twins of the stem present as regular files in dir, refusing symlinks,
+/// other non-file entries, and metadata errors. Only a genuinely absent path
+/// is ignored.
+pub fn present_config_paths_checked(
+    dir: &Path,
+    stem: &str,
+) -> Result<Vec<PathBuf>, ConfigSourceError> {
+    validate_stem(stem)?;
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(ConfigSourceError::Read {
+                path: dir.to_path_buf(),
+                message: "configuration directory is not a real directory".into(),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(ConfigSourceError::Read {
+                path: dir.to_path_buf(),
+                message: error.to_string(),
+            });
+        }
     }
-    candidate_file_names(stem)
-        .iter()
-        .map(|name| dir.join(name))
-        .filter(|path| path.is_file())
-        .collect()
+    let mut present = Vec::new();
+    for name in candidate_file_names(stem) {
+        let path = dir.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => present.push(path),
+            Ok(_) => {
+                return Err(ConfigSourceError::Read {
+                    path,
+                    message: "configuration candidate is not a regular file".into(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ConfigSourceError::Read {
+                    path,
+                    message: error.to_string(),
+                });
+            }
+        }
+    }
+    Ok(present)
 }
 
 /// The single configuration file for `stem` in `dir`, if any. Two twins
 /// present is [`ConfigSourceError::Ambiguous`].
 pub fn resolve_config_path(dir: &Path, stem: &str) -> Result<Option<PathBuf>, ConfigSourceError> {
     validate_stem(stem)?;
-    let mut present = present_config_paths(dir, stem);
+    let mut present = present_config_paths_checked(dir, stem)?;
     match present.len() {
         0 => Ok(None),
         1 => Ok(present.pop()),
@@ -648,7 +693,7 @@ fn write_normalized(value: &toml::Value, out: &mut String) {
 pub enum ConfigSourceError {
     /// More than one twin of a stem exists.
     Ambiguous { stem: String, paths: Vec<PathBuf> },
-    /// The resolved file exists but could not be read.
+    /// The candidate could not be inspected or read.
     Read { path: PathBuf, message: String },
     /// The file is not valid configuration.
     Invalid {

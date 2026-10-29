@@ -216,9 +216,6 @@ pub fn load_gates(main_root: &Path) -> Result<Vec<Gate>, GateConfigError> {
         Ok(None) => Err(GateConfigError::Missing(
             main_root.join(GATES_CONFIG_RELPATH),
         )),
-        Err(aethyme_config::ConfigSourceError::Read { path, .. }) => {
-            Err(GateConfigError::Missing(path))
-        }
         Err(error) => Err(GateConfigError::Config(Box::new(error))),
     }
 }
@@ -7287,6 +7284,22 @@ mod tests {
     fn write_config(dir: &Path, body: &str) {
         std::fs::create_dir_all(dir.join(".aethyme")).unwrap();
         std::fs::write(dir.join(GATES_CONFIG_RELPATH), body).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_config_twin_is_not_treated_as_missing_or_fallback() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), "[[gate]]\nname='lint'\ncommand='true'\n");
+        assert_eq!(load_gates(tmp.path()).unwrap().len(), 1);
+        symlink("missing-target", tmp.path().join(".aethyme/gates.yaml")).unwrap();
+
+        assert!(matches!(
+            load_gates(tmp.path()),
+            Err(GateConfigError::Config(_))
+        ));
     }
 
     fn command_context<'a>(
