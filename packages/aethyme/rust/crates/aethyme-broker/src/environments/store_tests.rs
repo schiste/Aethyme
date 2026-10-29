@@ -74,8 +74,16 @@ fn registering_twice_returns_the_same_environment() {
     assert!(valid_env_id(&first.env_id), "{}", first.env_id);
     let components = store.components(&first.env_id).unwrap();
     let names: Vec<&str> = components.iter().map(|c| c.component.as_str()).collect();
-    assert_eq!(names, ["db", "api"], "components are reported in start order");
-    assert!(components.iter().all(|c| c.phase == ManagedServicePhase::Intent));
+    assert_eq!(
+        names,
+        ["db", "api"],
+        "components are reported in start order"
+    );
+    assert!(
+        components
+            .iter()
+            .all(|c| c.phase == ManagedServicePhase::Intent)
+    );
     let other = store.register(&snapshot("b"), None, None).unwrap();
     assert_ne!(first.env_id, other.env_id);
 }
@@ -102,7 +110,11 @@ fn phase_changes_are_compare_and_swap_and_recorded() {
         Err(error) => panic!("{error}"),
     }
     match store.transition(&id, 2, EnvironmentPhase::Active, "no", "test", None) {
-        Err(StoreError::IllegalTransition { from: "parked", to: "active", .. }) => {}
+        Err(StoreError::IllegalTransition {
+            from: "parked",
+            to: "active",
+            ..
+        }) => {}
         other => panic!("parked -> active must go through waking: {other:?}"),
     }
     let parked = store.get(&id).unwrap().unwrap();
@@ -110,7 +122,10 @@ fn phase_changes_are_compare_and_swap_and_recorded() {
     let waking = store
         .transition(&id, 2, EnvironmentPhase::Waking, "wake", "test", None)
         .unwrap();
-    assert_eq!(waking.parked_at, None, "parked_at describes the current park only");
+    assert_eq!(
+        waking.parked_at, None,
+        "parked_at describes the current park only"
+    );
     let history = store.transitions(&id, 100).unwrap();
     let path: Vec<(Option<&str>, &str)> = history
         .iter()
@@ -133,14 +148,24 @@ fn a_destroyed_environment_is_replanned_under_the_same_id() {
     let record = store.register(&snapshot("a"), None, None).unwrap();
     let id = record.env_id.clone();
     store
-        .transition(&id, 0, EnvironmentPhase::Destroyed, "never started", "test", None)
+        .transition(
+            &id,
+            0,
+            EnvironmentPhase::Destroyed,
+            "never started",
+            "test",
+            None,
+        )
         .unwrap();
     store.set_namespace(&id, "ns-1").unwrap();
     let again = store.register(&snapshot("a"), None, None).unwrap();
     assert_eq!(again.env_id, id);
     assert_eq!(again.phase, EnvironmentPhase::Planned);
     assert_eq!(again.phase_generation, 2);
-    assert_eq!(again.namespace, None, "a re-created environment gets a fresh reservation");
+    assert_eq!(
+        again.namespace, None,
+        "a re-created environment gets a fresh reservation"
+    );
 }
 
 #[test]
@@ -162,7 +187,10 @@ fn only_planned_and_destroyed_release_the_worktree() {
     }
     assert!(!Planned.retains_worktree());
     assert!(!Destroyed.retains_worktree());
-    assert!(!Destroyed.may_follow(DestroyFailed), "a failed destroy is retried, never skipped");
+    assert!(
+        !Destroyed.may_follow(DestroyFailed),
+        "a failed destroy is retried, never skipped"
+    );
     assert!(!Destroyed.may_follow(Active), "destroy is always explicit");
 }
 
@@ -187,7 +215,10 @@ fn component_phases_are_write_ahead_and_a_new_instance_counts_attempts() {
         store.set_component(&id, "api", phase, None, None).unwrap();
     }
     match store.set_component(&id, "api", Settled, None, None) {
-        Err(StoreError::IllegalComponentTransition { from: "create_pending", .. }) => {}
+        Err(StoreError::IllegalComponentTransition {
+            from: "create_pending",
+            ..
+        }) => {}
         other => panic!("an unknown create is never assumed absent: {other:?}"),
     }
     let identity = serde_json::json!({"pid": 1, "pgid": 1, "start_time": 1});
@@ -200,7 +231,10 @@ fn component_phases_are_write_ahead_and_a_new_instance_counts_attempts() {
     }
     let again = store.set_component(&id, "api", Intent, None, None).unwrap();
     assert_eq!(again.attempt, 1, "settled -> intent starts a new instance");
-    assert_eq!(again.identity, None, "a new instance forgets the old identity");
+    assert_eq!(
+        again.identity, None,
+        "a new instance forgets the old identity"
+    );
 }
 
 #[test]
@@ -211,8 +245,11 @@ fn a_newer_store_schema_is_refused_and_a_missing_store_is_not_created() {
     assert!(!path.exists(), "reading never creates the database");
     drop(EnvironmentStore::open(&path).unwrap());
     let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute("UPDATE meta SET value = '99' WHERE key = 'schema_version'", [])
-        .unwrap();
+    conn.execute(
+        "UPDATE meta SET value = '99' WHERE key = 'schema_version'",
+        [],
+    )
+    .unwrap();
     drop(conn);
     match EnvironmentStore::open(&path) {
         Err(StoreError::SchemaTooNew {
@@ -285,7 +322,11 @@ struct Script(Vec<bool>);
 
 impl SupervisorWork for Script {
     fn tick(&mut self) -> TickOutcome {
-        let needs = if self.0.is_empty() { false } else { self.0.remove(0) };
+        let needs = if self.0.is_empty() {
+            false
+        } else {
+            self.0.remove(0)
+        };
         TickOutcome {
             needs_supervisor: needs,
         }
@@ -319,21 +360,29 @@ fn a_second_supervisor_exits_while_one_runs() {
         let stop = stop.clone();
         std::thread::spawn(move || {
             let config = quick(root, 60_000);
-            supervisor::run(&config, &mut Script(Vec::new()), &|| stop.load(Ordering::SeqCst))
-                .unwrap()
+            supervisor::run(&config, &mut Script(Vec::new()), &|| {
+                stop.load(Ordering::SeqCst)
+            })
+            .unwrap()
         })
     };
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while !supervisor::status(&root).running() {
-        assert!(std::time::Instant::now() < deadline, "first supervisor never published");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first supervisor never published"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
     let status = supervisor::status(&root);
     assert_eq!(status.pid, Some(std::process::id() as i32));
-    let second = supervisor::run(&quick(root.clone(), 10), &mut Script(Vec::new()), &|| false)
-        .unwrap();
+    let second =
+        supervisor::run(&quick(root.clone(), 10), &mut Script(Vec::new()), &|| false).unwrap();
     assert_eq!(second, ExitReason::AlreadyRunning);
-    assert!(supervisor::status(&root).running(), "the loser never withdraws the winner's record");
+    assert!(
+        supervisor::status(&root).running(),
+        "the loser never withdraws the winner's record"
+    );
     stop.store(true, Ordering::SeqCst);
     assert_eq!(first.join().unwrap(), ExitReason::Stopped);
     assert_eq!(supervisor::status(&root).state, "absent");
@@ -346,7 +395,10 @@ fn store_watch_keeps_the_supervisor_while_an_environment_needs_it() {
     let mut watch = StoreWatch {
         store_path: path.clone(),
     };
-    assert!(!watch.tick().needs_supervisor, "no store, nothing to supervise");
+    assert!(
+        !watch.tick().needs_supervisor,
+        "no store, nothing to supervise"
+    );
     let mut store = EnvironmentStore::open(&path).unwrap();
     let id = store.register(&snapshot("a"), None, None).unwrap().env_id;
     assert!(!watch.tick().needs_supervisor, "planned needs nothing yet");

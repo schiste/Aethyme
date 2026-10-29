@@ -167,7 +167,10 @@ impl EnvironmentPhase {
 
     /// Whether the environment holds (or is acquiring) pool capacity.
     pub fn holds_capacity(self) -> bool {
-        matches!(self, Self::Starting | Self::Active | Self::Stopping | Self::Waking)
+        matches!(
+            self,
+            Self::Starting | Self::Active | Self::Stopping | Self::Waking
+        )
     }
 
     /// Whether a host supervisor must be running for this phase to make
@@ -608,11 +611,7 @@ impl EnvironmentStore {
         Ok(components)
     }
 
-    pub fn transitions(
-        &self,
-        env_id: &str,
-        limit: usize,
-    ) -> Result<Vec<Transition>, StoreError> {
+    pub fn transitions(&self, env_id: &str, limit: usize) -> Result<Vec<Transition>, StoreError> {
         let mut statement = self.conn.prepare(
             "SELECT seq, env_id, from_phase, to_phase, reason, actor, at, detail_json
              FROM environment_transitions WHERE env_id = ?1 ORDER BY seq DESC LIMIT ?2",
