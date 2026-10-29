@@ -2,6 +2,7 @@
 //! through a reviewed `gc plan` / `gc apply`, and only when the broker can
 //! vouch for them.
 
+use sha2::Digest;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -121,7 +122,20 @@ fn edit_manifest(archive: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
 fn age(archive: &Path, days: i64) {
     edit_manifest(archive, |manifest| {
         let created = manifest["created_at_ms"].as_i64().unwrap();
-        manifest["created_at_ms"] = serde_json::json!(created - days * DAY_MS);
+        let aged = created - days * DAY_MS;
+        if manifest["schema_version"] == 5 {
+            // Build a consistently aged fixture, not a one-sided metadata edit.
+            let record_path = archive.join("retirement.json");
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+            assert_eq!(record["archive_created_at_ms"], created);
+            record["archive_created_at_ms"] = serde_json::json!(aged);
+            let bytes = serde_json::to_vec(&record).unwrap();
+            manifest["retirement_record_sha256"] =
+                serde_json::json!(format!("{:x}", sha2::Sha256::digest(&bytes)));
+            std::fs::write(record_path, bytes).unwrap();
+        }
+        manifest["created_at_ms"] = serde_json::json!(aged);
     });
 }
 
@@ -377,4 +391,22 @@ fn retirement_archive_floor_survives_landing_and_a_shorter_current_policy() {
         );
         assert!(!archive.exists());
     }
+}
+
+#[test]
+fn a_retirement_archive_with_an_inconsistent_creation_time_stays_protected() {
+    let tmp = repo();
+    let (_, head, archive) =
+        archived_session_with_mode(tmp.path(), "inconsistent-time", false, true);
+    git(tmp.path(), &["merge", "-q", "--ff-only", &head]);
+    edit_manifest(&archive, |manifest| {
+        let created = manifest["created_at_ms"].as_i64().unwrap();
+        manifest["created_at_ms"] = serde_json::json!(created - 365 * DAY_MS);
+    });
+    let reviewed = plan(tmp.path());
+    assert!(proposed(&reviewed).is_empty(), "{reviewed}");
+    let rejected = unowned(&reviewed);
+    assert_eq!(rejected.len(), 1, "{reviewed}");
+    assert!(rejected[0].contains("retirement"), "{rejected:?}");
+    assert!(archive.exists());
 }
