@@ -114,6 +114,21 @@ struct AutoCleanupCursor {
     high_water_session_id: i64,
 }
 
+/// Durable progress observed by the whole-checkout recovery worker. The path
+/// inventory, checkout-group planner and abandoned-session pass each advance
+/// a separate cursor, so removal count alone is not a complete progress test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct AutoCleanupProgressMarker {
+    cohort_generation: i64,
+    alias_refresh_generation: i64,
+    alias_progress_sequence: i64,
+    group_cursor_generation: i64,
+    group_cursor_after_session_id: i64,
+    group_cursor_high_water_session_id: i64,
+    retirement_cursor_after_session_id: i64,
+    retirement_cursor_high_water_session_id: i64,
+}
+
 impl Default for AutoCleanupCursor {
     fn default() -> Self {
         Self {
@@ -1249,6 +1264,29 @@ impl Broker {
         }
         *expected_raw = Some(value);
         Ok(())
+    }
+
+    /// Capture every durable cursor that can advance during an automatic
+    /// whole-checkout pass. A pass may discover inventory or move through
+    /// checkout groups without deleting anything.
+    pub(crate) fn auto_cleanup_progress_marker(
+        &mut self,
+    ) -> Result<AutoCleanupProgressMarker, BrokerOpError> {
+        let cohort = self
+            .store()
+            .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)?;
+        let (group_cursor, _) = self.auto_cleanup_cursor()?;
+        let (retirement_cursor, _) = self.session_retirement_cursor()?;
+        Ok(AutoCleanupProgressMarker {
+            cohort_generation: cohort.map_or(0, |state| state.generation),
+            alias_refresh_generation: cohort.map_or(0, |state| state.alias_refresh_generation),
+            alias_progress_sequence: cohort.map_or(0, |state| state.progress_sequence),
+            group_cursor_generation: group_cursor.cohort_generation,
+            group_cursor_after_session_id: group_cursor.after_session_id,
+            group_cursor_high_water_session_id: group_cursor.high_water_session_id,
+            retirement_cursor_after_session_id: retirement_cursor.after_session_id,
+            retirement_cursor_high_water_session_id: retirement_cursor.high_water_session_id,
+        })
     }
 
     /// Advance one durable, bounded page of checkout-path discovery. The
