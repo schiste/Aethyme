@@ -243,17 +243,9 @@ impl Broker {
     /// Grace for the durable post-close checkout request. `None` means the
     /// caller must not create an automatic-removal obligation.
     pub(crate) fn checkout_cleanup_grace_hours(&self, session: &Session) -> Option<u32> {
-        if session.origin != SessionOrigin::Spawned {
-            return None;
-        }
         let retention = crate::load_retention_policy(&self.main_root).ok()?;
-        if !retention.auto_cleanup_worktrees_on_finish {
-            return None;
-        }
         let cleanup = crate::AutoCleanupPolicy::load(&self.main_root).ok()?;
-        cleanup
-            .auto_remove
-            .then_some(retention.closed_worktree_grace_hours)
+        checkout_cleanup_grace_hours_for_policy(session.origin, &retention, cleanup.auto_remove)
     }
 
     pub(super) fn record_finished_handoff(
@@ -1265,6 +1257,60 @@ impl Broker {
         };
         let expected = self.main_git_common_dir()?;
         Ok(actual == expected)
+    }
+}
+
+fn checkout_cleanup_grace_hours_for_policy(
+    origin: SessionOrigin,
+    retention: &crate::RetentionPolicy,
+    auto_remove: bool,
+) -> Option<u32> {
+    if origin != SessionOrigin::Spawned
+        || !retention.auto_cleanup_worktrees_on_finish
+        || !auto_remove
+    {
+        return None;
+    }
+    Some(if retention.compact_closed_worktrees {
+        0
+    } else {
+        retention.closed_worktree_grace_hours
+    })
+}
+
+#[cfg(test)]
+mod checkout_cleanup_grace_tests {
+    use super::*;
+
+    #[test]
+    fn close_scheduling_uses_compact_opt_in_without_lowering_archive_retention() {
+        let mut retention = crate::RetentionPolicy::default();
+        assert_eq!(retention.closed_worktree_grace_hours, 15 * 24);
+        assert_eq!(
+            checkout_cleanup_grace_hours_for_policy(SessionOrigin::Spawned, &retention, true),
+            Some(15 * 24)
+        );
+
+        retention.compact_closed_worktrees = true;
+        assert_eq!(
+            checkout_cleanup_grace_hours_for_policy(SessionOrigin::Spawned, &retention, true),
+            Some(0)
+        );
+        assert_eq!(retention.closed_worktree_grace_hours, 15 * 24);
+        assert_eq!(
+            checkout_cleanup_grace_hours_for_policy(SessionOrigin::Adopted, &retention, true),
+            None
+        );
+        assert_eq!(
+            checkout_cleanup_grace_hours_for_policy(SessionOrigin::Spawned, &retention, false),
+            None
+        );
+
+        retention.auto_cleanup_worktrees_on_finish = false;
+        assert_eq!(
+            checkout_cleanup_grace_hours_for_policy(SessionOrigin::Spawned, &retention, true),
+            None
+        );
     }
 }
 
