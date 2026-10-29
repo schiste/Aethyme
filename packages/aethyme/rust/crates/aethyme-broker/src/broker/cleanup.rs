@@ -2514,33 +2514,8 @@ impl Broker {
         )
     }
 
-    pub(crate) fn cleanup_item_for_recovery_archive_with_status_limits(
-        &self,
-        session: &Session,
-        scan: crate::SizeScan,
-        records: &mut crate::measurement::SizeRecords,
-        status_output_bytes: usize,
-        status_path_fields: usize,
-        delivery_targets: &[String],
-        allow_adopted_path: bool,
-    ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
-        let status_limits = CleanupStatusLimits::new(
-            self.landing_deadline.get(),
-            status_output_bytes,
-            status_path_fields,
-        );
-        let live_checkouts = self.cleanup_live_checkout_snapshot(Some(status_limits.deadline))?;
-        self.cleanup_item_for_recovery_archive_with_limits_and_live_checkouts(
-            session,
-            scan,
-            records,
-            status_limits,
-            delivery_targets,
-            allow_adopted_path,
-            &live_checkouts,
-        )
-    }
-
+    // Keep the independent archive policy, status budget, and live-checkout proof explicit.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn cleanup_item_for_recovery_archive_with_status_limits_and_live_checkouts(
         &self,
         session: &Session,
@@ -2588,6 +2563,8 @@ impl Broker {
         )
     }
 
+    // Keep the independent archive policy, status budget, and live-checkout proof explicit.
+    #[allow(clippy::too_many_arguments)]
     fn cleanup_item_for_recovery_archive_with_limits_and_live_checkouts(
         &self,
         session: &Session,
@@ -4525,7 +4502,15 @@ impl Broker {
     /// Perform cleanup while the caller holds the repository lifecycle claim.
     /// Finish uses this after recording its durable cleanup intent under the
     /// same claim; reacquiring here would deadlock on the persistent lock.
-    pub(super) fn cleanup_under_lifecycle_claim(
+    pub(super) fn cleanup_without_archive_under_lifecycle_claim(
+        &mut self,
+        session: &Session,
+        force: bool,
+    ) -> Result<(), BrokerOpError> {
+        self.cleanup_under_lifecycle_claim(session, force, None)
+    }
+
+    fn cleanup_under_lifecycle_claim(
         &mut self,
         session: &Session,
         force: bool,

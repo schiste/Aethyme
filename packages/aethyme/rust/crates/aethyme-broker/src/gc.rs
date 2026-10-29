@@ -222,7 +222,7 @@ fn compact_checkout_pending_is_due(
     next_outbox_due_ms: Option<i64>,
     now: i64,
 ) -> bool {
-    (backfill_pending && !backfill_retry_after_ms.is_some_and(|retry| retry > now))
+    (backfill_pending && backfill_retry_after_ms.is_none_or(|retry| retry <= now))
         || next_outbox_due_ms.is_some_and(|due| due <= now)
 }
 /// Each whole-checkout pass has its own bounded tranche; the cursor resumes

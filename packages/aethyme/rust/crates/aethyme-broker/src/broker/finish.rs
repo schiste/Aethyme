@@ -243,7 +243,7 @@ impl Broker {
 
     /// Policy for a durable post-close checkout request. `None` means the
     /// caller must not create an automatic-removal obligation.
-    pub(crate) fn checkout_cleanup_request_policy(
+    pub(super) fn checkout_cleanup_request_policy(
         &self,
         session: &Session,
     ) -> Option<CheckoutCleanupRequestPolicy> {
@@ -388,7 +388,7 @@ impl Broker {
         // `git worktree remove` of a multi-gigabyte tree halfway leaves an
         // orphaned directory instead of a faster answer.
         match crate::git::without_git_deadline(|| {
-            self.cleanup_under_lifecycle_claim(&cleanup_session, false, None)
+            self.cleanup_without_archive_under_lifecycle_claim(&cleanup_session, false)
         }) {
             Ok(()) => {
                 report.status = FinishStatus::Cleaned;
@@ -1296,48 +1296,6 @@ fn checkout_cleanup_request_policy_for(
     })
 }
 
-#[cfg(test)]
-mod checkout_cleanup_grace_tests {
-    use super::*;
-
-    #[test]
-    fn close_scheduling_uses_compact_opt_in_without_lowering_archive_retention() {
-        let mut retention = crate::RetentionPolicy::default();
-        assert_eq!(retention.closed_worktree_grace_hours, 15 * 24);
-        assert_eq!(
-            checkout_cleanup_request_policy_for(SessionOrigin::Spawned, &retention, true),
-            Some(CheckoutCleanupRequestPolicy {
-                grace_hours: 15 * 24,
-                compact_checkout: false,
-            })
-        );
-
-        retention.compact_closed_worktrees = true;
-        assert_eq!(
-            checkout_cleanup_request_policy_for(SessionOrigin::Spawned, &retention, true),
-            Some(CheckoutCleanupRequestPolicy {
-                grace_hours: 15 * 24,
-                compact_checkout: true,
-            })
-        );
-        assert_eq!(retention.closed_worktree_grace_hours, 15 * 24);
-        assert_eq!(
-            checkout_cleanup_request_policy_for(SessionOrigin::Adopted, &retention, true),
-            None
-        );
-        assert_eq!(
-            checkout_cleanup_request_policy_for(SessionOrigin::Spawned, &retention, false),
-            None
-        );
-
-        retention.auto_cleanup_worktrees_on_finish = false;
-        assert_eq!(
-            checkout_cleanup_request_policy_for(SessionOrigin::Spawned, &retention, true),
-            None
-        );
-    }
-}
-
 fn finish_retention_warning(
     deadline_active: bool,
     retention_audit: impl FnOnce() -> Result<CleanupRetention, BrokerOpError>,
@@ -1383,4 +1341,46 @@ pub(crate) struct HeadDelivery<'q> {
     /// Commits not represented on any delivery target; `finish` refuses
     /// while this is above zero.
     pub(crate) unsubmitted_commits: u64,
+}
+
+#[cfg(test)]
+mod checkout_cleanup_grace_tests {
+    use super::*;
+
+    #[test]
+    fn close_scheduling_uses_compact_opt_in_without_lowering_archive_retention() {
+        let mut retention = crate::RetentionPolicy::default();
+        assert_eq!(retention.closed_worktree_grace_hours, 15 * 24);
+        assert_eq!(
+            checkout_cleanup_request_policy_for(SessionOrigin::Spawned, &retention, true),
+            Some(CheckoutCleanupRequestPolicy {
+                grace_hours: 15 * 24,
+                compact_checkout: false,
+            })
+        );
+
+        retention.compact_closed_worktrees = true;
+        assert_eq!(
+            checkout_cleanup_request_policy_for(SessionOrigin::Spawned, &retention, true),
+            Some(CheckoutCleanupRequestPolicy {
+                grace_hours: 15 * 24,
+                compact_checkout: true,
+            })
+        );
+        assert_eq!(retention.closed_worktree_grace_hours, 15 * 24);
+        assert_eq!(
+            checkout_cleanup_request_policy_for(SessionOrigin::Adopted, &retention, true),
+            None
+        );
+        assert_eq!(
+            checkout_cleanup_request_policy_for(SessionOrigin::Spawned, &retention, false),
+            None
+        );
+
+        retention.auto_cleanup_worktrees_on_finish = false;
+        assert_eq!(
+            checkout_cleanup_request_policy_for(SessionOrigin::Spawned, &retention, true),
+            None
+        );
+    }
 }

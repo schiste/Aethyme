@@ -638,10 +638,6 @@ fn read_regular_file_no_follow(path: &Path, max_bytes: u64) -> std::io::Result<V
     Ok(bytes)
 }
 
-fn hash_regular_file_no_follow(path: &Path, max_bytes: u64) -> std::io::Result<(u64, String)> {
-    hash_regular_file_no_follow_until(path, max_bytes, None)
-}
-
 fn hash_regular_file_no_follow_until(
     path: &Path,
     max_bytes: u64,
@@ -701,6 +697,7 @@ fn now_ms() -> i64 {
 }
 
 /// Hash what an untracked path is, without following a link.
+#[cfg(test)]
 fn describe_untracked(full: &Path, relative: &str) -> std::io::Result<Option<ArchivedFile>> {
     describe_untracked_until(full, relative, None)
 }
@@ -1123,6 +1120,9 @@ impl Broker {
         }
     }
 
+    // Keep these inputs explicit at the archive proof boundary: each bound and
+    // eligibility flag narrows what the plan may authorize.
+    #[allow(clippy::too_many_arguments)]
     fn cleanup_resolve_plan_with_limits_and_eligibility(
         &self,
         session_id: i64,
@@ -1270,18 +1270,18 @@ impl Broker {
                 item.reason
             )));
         }
-        let mut unlanded_commits = checkout.commits_not_on_any(&head, &delivery_targets)?;
+        let mut unlanded_commits = checkout.commits_not_on_any(&head, delivery_targets)?;
         if retirement_mode
             && let Some(branch_tip) = branch_tip.as_deref()
             && (branch_tip != head || checkout_branch_mismatch)
         {
-            unlanded_commits.extend(checkout.commits_not_on_any(branch_tip, &delivery_targets)?);
+            unlanded_commits.extend(checkout.commits_not_on_any(branch_tip, delivery_targets)?);
         }
         if retirement_mode
             && let Some(checkout_tip) = checkout_branch_tip.as_deref()
             && checkout_branch_ref.as_deref() != Some(item.branch_ref.as_str())
         {
-            unlanded_commits.extend(checkout.commits_not_on_any(checkout_tip, &delivery_targets)?);
+            unlanded_commits.extend(checkout.commits_not_on_any(checkout_tip, delivery_targets)?);
         }
         unlanded_commits.sort();
         unlanded_commits.dedup();
@@ -1712,6 +1712,9 @@ impl Broker {
         )
     }
 
+    // The injectable writers let tests exercise archive durability and failure
+    // paths without changing the production checks or their order.
+    #[allow(clippy::too_many_arguments)]
     fn cleanup_resolve_apply_with_bundle_writer_mode<F, S, H, B>(
         &mut self,
         session_id: i64,
@@ -2858,7 +2861,7 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
             .iter()
             .all(|commit| valid_git_object_id(commit))
         || (if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
-            manifest.bundle.is_some() != !recovery_bundle_roots_from_manifest(manifest)?.is_empty()
+            manifest.bundle.is_some() == recovery_bundle_roots_from_manifest(manifest)?.is_empty()
         } else {
             manifest.bundle.is_some() == manifest.unlanded_commits.is_empty()
         })
@@ -3071,10 +3074,6 @@ fn recovery_archive_expected_files(
 
 /// Enumerate archive files without following links. Incomplete or unexpectedly
 /// large trees stay unowned so retention never assumes their contents away.
-fn recovery_archive_file_set(root: &Path) -> Result<std::collections::BTreeSet<PathBuf>, String> {
-    recovery_archive_file_set_until(root, None)
-}
-
 fn recovery_archive_file_set_until(
     root: &Path,
     deadline: Option<Instant>,
@@ -4155,6 +4154,7 @@ fn serialize_recovery_manifest(
 
 /// Copy at most the byte length captured by the reviewed plan, then read one
 /// extra byte to detect growth without writing beyond that plan.
+#[cfg(test)]
 fn copy_expected_bytes_with_probe<R: Read, W: Write>(
     source: &mut R,
     target: &mut W,
@@ -4196,15 +4196,6 @@ fn copy_expected_bytes_with_probe_until<R: Read, W: Write>(
         ));
     }
     Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn copy_regular_archive_file(
-    source: &Path,
-    archive_root: &Path,
-    relative: &str,
-    expected: &ArchivedFile,
-) -> Result<(), String> {
-    copy_regular_archive_file_until(source, archive_root, relative, expected, None)
 }
 
 fn copy_regular_archive_file_until(
@@ -4308,6 +4299,7 @@ fn sync_archive_directory(_path: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(test)]
 fn sync_archive_directories_bottom_up<S>(root: &Path, sync_directory: &S) -> Result<(), String>
 where
     S: Fn(&Path) -> std::io::Result<()>,
@@ -4437,6 +4429,9 @@ struct RecoveryBundleWriter<B> {
     write_to: B,
 }
 
+// The explicit paths, timing bound, sync hook, and bundle writer are the
+// narrow fault-injection seam used to verify the durable archive protocol.
+#[allow(clippy::too_many_arguments)]
 fn write_verified_archive_with_bundle_writer<S, B>(
     repository: &GitRepo,
     checkout: &GitRepo,
