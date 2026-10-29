@@ -1038,10 +1038,14 @@ pub struct AdoptReport {
     pub carried_ownership: Option<AdoptCarriedOwnership>,
 }
 
+/// Internal timing transport keeps the public library report structs stable.
+pub(crate) struct TimedStartReport<T> {
+    pub report: T,
+    pub phase_timings_ms: std::collections::BTreeMap<String, u64>,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct StartReport {
-    /// Wall-clock startup phases in milliseconds; totals overlap their subphases.
-    pub phase_timings_ms: std::collections::BTreeMap<String, u64>,
     #[serde(flatten)]
     pub session: Session,
     pub start_base: SessionStartBase,
@@ -1055,8 +1059,6 @@ pub struct StartReport {
 /// not accept planned path leases.
 #[derive(Debug, serde::Serialize)]
 pub struct StartAgentReport {
-    /// Worktree allocation phases, followed by detached agent setup.
-    pub phase_timings_ms: std::collections::BTreeMap<String, u64>,
     #[serde(flatten)]
     pub session: Session,
     pub start_base: SessionStartBase,

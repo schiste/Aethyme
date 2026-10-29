@@ -1077,13 +1077,17 @@ retain their separate requirements.
 
 New `broker start --json` and detached `broker start --cmd ... --json` reports
 add `phase_timings_ms`, a map of nonnegative integer wall-clock milliseconds.
-Existing report fields remain unchanged. Allocation records `upstream_fetch`,
+Existing report fields and public Rust report types remain unchanged. Timings
+are CLI metadata carried internally alongside the library reports. Allocation records `upstream_fetch`,
 `base_selection`, `lifecycle_lock_wait`, `checkout_count`, `worktree_root`,
 `storage_admission` and `git_worktree_add`. Ordinary starts add
 `session_registration` (including ownership witness and repository-contract
 capture) and `preparation_status`; detached starts add `agent_setup`.
 CLI reports also record `broker_open`, `session_allocation`,
-`response_preparation` and `total_before_output`. Human output prints the map.
+`response_preparation` and `total_before_output`, captured before the success
+response is serialized or printed. Earlier warnings may already have been
+emitted. Human output additionally records `human_render_and_advisories` for
+rendering and advisories after that boundary, then prints the map.
 The same map is included in the existing command-metric details. Failed
 allocation records only the observed coarse open/allocation phases; missing
 internal phases are unknown, not zero. Sub-millisecond observed phases round

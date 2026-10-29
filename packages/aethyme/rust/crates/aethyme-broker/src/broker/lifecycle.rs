@@ -7161,6 +7161,24 @@ impl Broker {
         context: SessionContext,
         explicit_base: Option<&str>,
     ) -> Result<StartReport, BrokerOpError> {
+        self.start_worktree_with_planned_paths_and_context_timed(
+            task,
+            paths,
+            agent_identity,
+            context,
+            explicit_base,
+        )
+        .map(|timed| timed.report)
+    }
+
+    pub(crate) fn start_worktree_with_planned_paths_and_context_timed(
+        &mut self,
+        task: &str,
+        paths: &[String],
+        agent_identity: Option<&str>,
+        context: SessionContext,
+        explicit_base: Option<&str>,
+    ) -> Result<TimedStartReport<StartReport>, BrokerOpError> {
         let context = self.session_context(context);
         let planned_paths = normalize_planned_paths(paths)?;
         let CreatedSessionWorktree {
@@ -7245,13 +7263,15 @@ impl Broker {
         let preparation = timed_start_phase(&mut phase_timings_ms, "preparation_status", || {
             self.preparation_status(session.id)
         })?;
-        Ok(StartReport {
+        Ok(TimedStartReport {
             phase_timings_ms,
-            session,
-            start_base,
-            worktree_placement,
-            planned_explicit_leases,
-            preparation,
+            report: StartReport {
+                session,
+                start_base,
+                worktree_placement,
+                planned_explicit_leases,
+                preparation,
+            },
         })
     }
 
@@ -7293,6 +7313,24 @@ impl Broker {
         context: SessionContext,
         explicit_base: Option<&str>,
     ) -> Result<StartAgentReport, BrokerOpError> {
+        self.start_agent_report_with_context_timed(
+            task,
+            command,
+            agent_identity,
+            context,
+            explicit_base,
+        )
+        .map(|timed| timed.report)
+    }
+
+    pub(crate) fn start_agent_report_with_context_timed(
+        &mut self,
+        task: &str,
+        command: &str,
+        agent_identity: Option<&str>,
+        context: SessionContext,
+        explicit_base: Option<&str>,
+    ) -> Result<TimedStartReport<StartAgentReport>, BrokerOpError> {
         crate::agent_supervisor::ensure_supported().map_err(|source| BrokerOpError::Spawn {
             command: command.to_owned(),
             source,
@@ -7511,11 +7549,13 @@ impl Broker {
             "agent_setup".into(),
             u64::try_from(agent_setup_started.elapsed().as_millis()).unwrap_or(u64::MAX),
         );
-        Ok(StartAgentReport {
+        Ok(TimedStartReport {
             phase_timings_ms,
-            session,
-            start_base,
-            worktree_placement,
+            report: StartAgentReport {
+                session,
+                start_base,
+                worktree_placement,
+            },
         })
     }
 
