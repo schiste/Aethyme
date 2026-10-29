@@ -1424,6 +1424,89 @@ struct Protection {
     security: Option<GlobSet>,
 }
 
+fn baseline_config_toml<F>(stem: &str, read: F) -> Result<Option<String>, ResolutionError>
+where
+    F: FnMut(&str) -> Result<Option<String>, ResolutionError>,
+{
+    let config = aethyme_config::try_read_config_text_with(aethyme_config::CONFIG_DIR, stem, read)?;
+    let Some(text) = config.map_err(|error| {
+        invalid(format!(
+            "baseline {}/{stem} configuration is unresolved: {error}",
+            aethyme_config::CONFIG_DIR
+        ))
+    })?
+    else {
+        return Ok(None);
+    };
+    let toml = text.toml_text().map_err(|error| {
+        invalid(format!(
+            "baseline {} configuration is invalid: {error}",
+            text.path.display()
+        ))
+    })?;
+    Ok(Some(toml.into_owned()))
+}
+
+fn validate_baseline_config_kind(path: &str, kind: EntryKind) -> Result<(), ResolutionError> {
+    match kind {
+        EntryKind::Regular | EntryKind::Executable => Ok(()),
+        EntryKind::Symlink => Err(invalid(format!(
+            "baseline configuration {path} is a symlink"
+        ))),
+    }
+}
+
+fn decode_baseline_config(path: &str, bytes: Vec<u8>) -> Result<String, ResolutionError> {
+    String::from_utf8(bytes).map_err(|error| {
+        invalid(format!(
+            "baseline configuration {path} is not UTF-8: {error}"
+        ))
+    })
+}
+
+fn parse_baseline_gates(config: &str) -> Result<Vec<crate::gates::Gate>, ResolutionError> {
+    crate::gates::parse_gates(config)
+        .map_err(|error| invalid(format!("baseline .aethyme/gates is invalid: {error}")))
+}
+
+fn security_patterns_from_config(config: &str) -> Result<Vec<String>, ResolutionError> {
+    let value: toml::Value = config
+        .parse()
+        .map_err(|error| invalid(format!("baseline .aethyme/config is invalid: {error}")))?;
+    if let Some(review) = value.get("review") {
+        let review = review
+            .as_table()
+            .ok_or_else(|| invalid("baseline .aethyme/config review section must be a table"))?;
+        if let Some(trigger) = review.get("trigger") {
+            let trigger = trigger.as_table().ok_or_else(|| {
+                invalid("baseline .aethyme/config review.trigger section must be a table")
+            })?;
+            if trigger.get("rule").is_some_and(|rules| !rules.is_array()) {
+                return Err(invalid(
+                    "baseline .aethyme/config review.trigger.rule must be an array",
+                ));
+            }
+        }
+    }
+    let policy =
+        crate::review_trigger::ReviewTriggerPolicy::from_toml_str(config, ".aethyme/config")
+            .map_err(|error| {
+                invalid(format!(
+                    "baseline .aethyme/config review policy is invalid: {error}"
+                ))
+            })?;
+    Ok(policy
+        .rule
+        .into_iter()
+        .filter(|rule| {
+            rule.require
+                .iter()
+                .any(|require| require == SECURITY_REQUIREMENT)
+        })
+        .flat_map(|rule| rule.paths)
+        .collect())
+}
+
 impl Protection {
     /// The fixed rules, the requirements' harness paths, and the policy the
     /// baseline itself carries: the files its gate commands name and the
@@ -1440,28 +1523,18 @@ impl Protection {
             .collect();
         let read = |path: &str| -> Result<Option<String>, ResolutionError> {
             match baseline.get(path.as_bytes()) {
-                Some((_, digest)) => Ok(Some(
-                    String::from_utf8_lossy(&composer::blob(store, digest)?).into_owned(),
-                )),
+                Some((kind, digest)) => {
+                    validate_baseline_config_kind(path, *kind)?;
+                    let bytes = composer::blob(store, digest)?;
+                    Ok(Some(decode_baseline_config(path, bytes)?))
+                }
                 None => Ok(None),
             }
         };
         let mut gate_files = BTreeSet::new();
-        // Either format (#1223); an ambiguous or invalid file contributes nothing,
-        // exactly like an unparseable one.
-        let config_toml = |stem: &str| -> Result<Option<String>, ResolutionError> {
-            Ok(aethyme_config::try_read_config_text_with(
-                aethyme_config::CONFIG_DIR,
-                stem,
-                |relpath| read(relpath),
-            )?
-            .ok()
-            .flatten()
-            .and_then(|text| text.toml_text().ok().map(|toml| toml.into_owned())))
-        };
-        if let Some(gates) = config_toml("gates")?
-            && let Ok(gates) = crate::gates::parse_gates(&gates)
-        {
+        let config_toml = |stem: &str| baseline_config_toml(stem, |relpath| read(relpath));
+        if let Some(gates) = config_toml("gates")? {
+            let gates = parse_baseline_gates(&gates)?;
             for gate in gates {
                 for token in gate.command.split(|c: char| {
                     c.is_whitespace() || matches!(c, '\'' | '"' | '=' | ';' | '&' | '|' | '(' | ')')
@@ -1474,38 +1547,10 @@ impl Protection {
                 }
             }
         }
-        let mut security_patterns = Vec::new();
-        if let Some(config) = config_toml("config")?
-            && let Ok(config) = config.parse::<toml::Table>()
-            && let Some(rules) = config
-                .get("review")
-                .and_then(|review| review.get("trigger"))
-                .and_then(|trigger| trigger.get("rule"))
-                .and_then(|rules| rules.as_array())
-        {
-            for rule in rules {
-                let security = rule
-                    .get("require")
-                    .and_then(|require| require.as_array())
-                    .is_some_and(|require| {
-                        require
-                            .iter()
-                            .any(|r| r.as_str() == Some(SECURITY_REQUIREMENT))
-                    });
-                if !security {
-                    continue;
-                }
-                for path in rule
-                    .get("paths")
-                    .and_then(|paths| paths.as_array())
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|path| path.as_str())
-                {
-                    security_patterns.push(path.to_string());
-                }
-            }
-        }
+        let mut security_patterns = match config_toml("config")? {
+            Some(config) => security_patterns_from_config(&config)?,
+            None => Vec::new(),
+        };
         security_patterns.sort();
         security_patterns.dedup();
         let security = if security_patterns.is_empty() {
@@ -4911,6 +4956,32 @@ mod tests {
             security_patterns: Vec::new(),
             security: None,
         }
+    }
+
+    #[test]
+    fn protection_configuration_errors_are_not_downgraded_to_no_protection() {
+        let ambiguous = baseline_config_toml("config", |path| {
+            Ok(match path {
+                ".aethyme/config.toml" => Some("[review.trigger]\nenabled = true\n".into()),
+                ".aethyme/config.yaml" => Some("review: {}\n".into()),
+                _ => None,
+            })
+        });
+        assert!(matches!(ambiguous, Err(ResolutionError::InvalidRequest(_))));
+
+        let malformed =
+            baseline_config_toml("config", |path| {
+                Ok((path == ".aethyme/config.toml")
+                    .then(|| "[review.trigger\nenabled = true\n".into()))
+            })
+            .unwrap()
+            .unwrap();
+        assert!(security_patterns_from_config(&malformed).is_err());
+
+        assert!(security_patterns_from_config("review = false").is_err());
+        assert!(parse_baseline_gates("gate = [{ name = 7, command = 'cargo test' }]").is_err());
+        assert!(decode_baseline_config(".aethyme/config.toml", vec![0xff]).is_err());
+        assert!(validate_baseline_config_kind(".aethyme/config.toml", EntryKind::Symlink).is_err());
     }
 
     #[test]
