@@ -759,7 +759,7 @@ impl Broker {
             abandon_after_ms,
             current.pid.map(crate::broker::session_pid_alive),
         );
-        let cleanup_grace_hours = self.checkout_cleanup_grace_hours(&current);
+        let cleanup_request = self.checkout_cleanup_request_policy(&current);
         match self
             .store()
             .abandon_session_if_unchanged_with_cleanup_request(
@@ -768,7 +768,8 @@ impl Broker {
                 &leases,
                 observed_at,
                 &abandoned_payload,
-                cleanup_grace_hours,
+                cleanup_request.map(|request| request.grace_hours),
+                cleanup_request.is_some_and(|request| request.compact_checkout),
             ) {
             Ok(true) => Ok(AbandonedSessionCloseOutcome::Closed),
             Ok(false) => Ok(AbandonedSessionCloseOutcome::Changed),
