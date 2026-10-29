@@ -200,8 +200,12 @@ fn probe_spec(ctx: &DriverContext<'_>, spec: &HealthSpec) -> Health {
     let Some(path) = &spec.http else {
         return Health::Healthy;
     };
-    let _ = stream.set_read_timeout(Some(PROBE_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(PROBE_TIMEOUT));
+    if let Err(error) = stream
+        .set_read_timeout(Some(PROBE_TIMEOUT))
+        .and_then(|()| stream.set_write_timeout(Some(PROBE_TIMEOUT)))
+    {
+        return Health::NotYet(format!("probe timeout: {error}"));
+    }
     let request = format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
     if let Err(error) = stream.write_all(request.as_bytes()) {
         return Health::NotYet(format!("send: {error}"));
@@ -293,7 +297,7 @@ impl Driver for ProcessDriver {
         // Reap the child whenever it exits so it never lingers as a zombie of
         // a long-lived parent (the supervisor). Identity outlives the handle.
         std::thread::spawn(move || {
-            let _ = child.wait();
+            crate::warn_unrecorded("reap an environment component", child.wait());
         });
         match identity {
             Some(identity) => Ok(ComponentIdentity::Process(identity)),
@@ -569,6 +573,17 @@ impl ComposeDriver {
     }
 }
 
+/// Remove a generated file. Missing is fine; any other failure is reported,
+/// never silently dropped, because a stale env file holds variable values.
+fn remove_if_present(path: PathBuf) {
+    match std::fs::remove_file(&path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            crate::warn_unrecorded(&format!("remove {}", path.display()), Err::<(), _>(error))
+        }
+        _ => {}
+    }
+}
+
 fn yaml_scalar(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into())
 }
@@ -651,7 +666,7 @@ impl Driver for ComposeDriver {
         if let Some(text) = &ctx.component.commands.destroy {
             ctx.hook("destroy", text)?;
         }
-        let _ = std::fs::remove_file(
+        remove_if_present(
             ctx.directory
                 .join(format!("{}.compose-labels.yml", ctx.component.name)),
         );
@@ -783,7 +798,7 @@ impl Driver for ContainerDriver {
                 }
             }
         }
-        let _ = std::fs::remove_file(ctx.directory.join(format!("{}.env", ctx.component.name)));
+        remove_if_present(ctx.directory.join(format!("{}.env", ctx.component.name)));
         if let Some(text) = &ctx.component.commands.destroy {
             ctx.hook("destroy", text)?;
         }

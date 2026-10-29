@@ -259,7 +259,7 @@ pub fn parse_receipt(stdout: &str) -> Result<Option<Value>, String> {
 
 pub(crate) fn append_log(log: &Path, text: &str) {
     if let Ok(mut file) = open_for_append(log, LOG_CAP_BYTES) {
-        let _ = file.write_all(text.as_bytes());
+        crate::warn_unrecorded("append to a component log", file.write_all(text.as_bytes()));
     }
 }
 
