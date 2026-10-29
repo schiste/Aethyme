@@ -1058,25 +1058,6 @@ impl Broker {
         )
     }
 
-    pub(crate) fn cleanup_resolve_retirement_plan_with_witness(
-        &self,
-        session_id: i64,
-        witness_sha256: &str,
-    ) -> Result<CleanupResolvePlan, BrokerOpError> {
-        self.cleanup_resolve_plan_with_limits_and_eligibility(
-            session_id,
-            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
-            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
-            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
-            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
-            true,
-            false,
-            true,
-            Some(witness_sha256),
-            None,
-        )
-    }
-
     fn cleanup_resolve_plan_with_limits(
         &self,
         session_id: i64,
