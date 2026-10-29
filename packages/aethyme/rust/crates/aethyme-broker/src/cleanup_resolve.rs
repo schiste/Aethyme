@@ -6033,7 +6033,7 @@ mod tests {
             );
         }
 
-        value["schema_version"] = serde_json::json!(RECOVERY_ARCHIVE_SCHEMA_VERSION + 1);
+        value["schema_version"] = serde_json::json!(RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION + 1);
         let future: StoredManifest = serde_json::from_value(value).unwrap();
         assert!(
             recovery_archive_expected_files(&future)
