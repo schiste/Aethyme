@@ -16,7 +16,22 @@ const BROKER_OPEN_STORAGE_CONTEXT_MAX_BYTES: usize = 32 * 1024;
 const ARTIFACT_SWEEP_NAMESPACE_V2_DOMAIN: &[u8] = b"aethyme-artifact-sweep-context-v2\0";
 const ARTIFACT_SWEEP_NAMESPACE_V4_DOMAIN: &[u8] = b"aethyme-artifact-sweep-context-v4\0";
 
+fn timed_start_phase<T>(
+    phases: &mut std::collections::BTreeMap<String, u64>,
+    name: &'static str,
+    run: impl FnOnce() -> T,
+) -> T {
+    let started = std::time::Instant::now();
+    let result = run();
+    phases.insert(
+        name.into(),
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
+    result
+}
+
 struct CreatedSessionWorktree {
+    phase_timings_ms: std::collections::BTreeMap<String, u64>,
     slug: String,
     branch: String,
     start_base: SessionStartBase,
@@ -4960,20 +4975,25 @@ impl Broker {
         }
         let loaded;
         let config = match trigger {
-            // Opens run on every hook call: reach Git only when the working
-            // copy says required, then confirm against the committed copy.
-            FenceTrigger::Open => {
-                let text =
-                    std::fs::read_to_string(self.main_root.join(".aethyme/config.toml")).ok()?;
-                if !crate::collaboration_submit::requires_capture(
-                    &crate::collaboration_submit::setting_from_text(Some(&text)),
-                ) {
-                    return None;
-                }
-                loaded = crate::merge::repository_config_with_source(&self.main_root);
+            FenceTrigger::Open | FenceTrigger::Config(None) => {
+                loaded = match crate::merge::committed_repository_config_checked(&self.main_root) {
+                    Ok(Some(text)) => Some((text, "committed")),
+                    Ok(None) => return None,
+                    Err(error) => {
+                        crate::warn_unrecorded(
+                            "resolve the committed configuration for the collaboration fence",
+                            Err::<(), _>(error),
+                        );
+                        // An unresolved policy is not evidence that the
+                        // repository requires capture. Keep it visible as a
+                        // pending read without persisting a one-way floor;
+                        // the next open must recheck repaired committed text.
+                        return Some(crate::CollaborationFence::pending_unresolved_config());
+                    }
+                };
                 loaded.as_ref()
             }
-            FenceTrigger::Config(config) => config,
+            FenceTrigger::Config(Some(config)) => Some(config),
         };
         let (text, "committed") = config.map(|(text, source)| (text.as_str(), *source))? else {
             return None;
@@ -7081,8 +7101,48 @@ impl Broker {
     }
 
     pub(super) fn close_unchecked(&mut self, session_id: i64) -> Result<(), BrokerOpError> {
-        self.store
-            .set_session_status(session_id, SessionStatus::Closed, None)?;
+        let should_wake_checkout_cleanup = {
+            let initial_session = self.store.session(session_id)?;
+            let _lifecycle_claim = self.claim_worktree_lifecycle()?;
+            let session = self.store.session(session_id)?;
+            super::cleanup::ensure_lifecycle_session_unchanged(
+                session_id,
+                &initial_session,
+                &session,
+            )?;
+            if session.cleanup_state == crate::SessionCleanupState::Cleaned
+                && session.status == SessionStatus::Cleaned
+            {
+                return Ok(());
+            }
+            let cleanup_request = self.checkout_cleanup_request_policy(&session);
+            if session.cleanup_state != crate::SessionCleanupState::Closed
+                || !session.status.is_closed()
+                || (session.origin == crate::SessionOrigin::Spawned && cleanup_request.is_some())
+            {
+                // The store variant is idempotent for an already-closed
+                // Spawned row: it repairs an older missing outbox without
+                // moving the original close timestamp or emitting a second
+                // status transition.
+                self.store.set_session_status_with_cleanup_request(
+                    session_id,
+                    SessionStatus::Closed,
+                    None,
+                    cleanup_request.map(|request| request.grace_hours),
+                    cleanup_request.is_some_and(|request| request.compact_checkout),
+                )?;
+            }
+            session.origin == crate::SessionOrigin::Spawned && cleanup_request.is_some()
+        };
+        // The terminal row and owed cleanup request commit together. Waking
+        // the global worker happens only after releasing the lifecycle claim;
+        // the per-session not-before time and fresh proofs still gate removal.
+        if should_wake_checkout_cleanup {
+            crate::warn_unrecorded(
+                "wake post-close checkout cleanup",
+                self.request_checkout_cleanup_after_close(session_id),
+            );
+        }
         // Closing must not fail because a best-effort artifact sweep did;
         // report the failure instead of discarding it.
         crate::warn_unrecorded(
@@ -7146,9 +7206,28 @@ impl Broker {
         context: SessionContext,
         explicit_base: Option<&str>,
     ) -> Result<StartReport, BrokerOpError> {
+        self.start_worktree_with_planned_paths_and_context_timed(
+            task,
+            paths,
+            agent_identity,
+            context,
+            explicit_base,
+        )
+        .map(|timed| timed.report)
+    }
+
+    pub(crate) fn start_worktree_with_planned_paths_and_context_timed(
+        &mut self,
+        task: &str,
+        paths: &[String],
+        agent_identity: Option<&str>,
+        context: SessionContext,
+        explicit_base: Option<&str>,
+    ) -> Result<TimedStartReport<StartReport>, BrokerOpError> {
         let context = self.session_context(context);
         let planned_paths = normalize_planned_paths(paths)?;
         let CreatedSessionWorktree {
+            mut phase_timings_ms,
             slug: _,
             branch,
             start_base,
@@ -7162,6 +7241,7 @@ impl Broker {
             &start_base,
             selected_promote_branch,
         );
+        let metadata_started = std::time::Instant::now();
         let worktree_instance_witness = capture_spawned_worktree_instance_witness(&worktree);
         let repository_contract = self.capture_repository_contract(worktree.root(), false)?;
         let new_session = NewSession {
@@ -7221,13 +7301,22 @@ impl Broker {
         };
         self.store.set_session_foreign_files(session.id, &[])?;
         let planned_explicit_leases = self.planned_explicit_leases(session.id, &planned_paths)?;
-        let preparation = self.preparation_status(session.id)?;
-        Ok(StartReport {
-            session,
-            start_base,
-            worktree_placement,
-            planned_explicit_leases,
-            preparation,
+        phase_timings_ms.insert(
+            "session_registration".into(),
+            u64::try_from(metadata_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
+        let preparation = timed_start_phase(&mut phase_timings_ms, "preparation_status", || {
+            self.preparation_status(session.id)
+        })?;
+        Ok(TimedStartReport {
+            phase_timings_ms,
+            report: StartReport {
+                session,
+                start_base,
+                worktree_placement,
+                planned_explicit_leases,
+                preparation,
+            },
         })
     }
 
@@ -7269,6 +7358,24 @@ impl Broker {
         context: SessionContext,
         explicit_base: Option<&str>,
     ) -> Result<StartAgentReport, BrokerOpError> {
+        self.start_agent_report_with_context_timed(
+            task,
+            command,
+            agent_identity,
+            context,
+            explicit_base,
+        )
+        .map(|timed| timed.report)
+    }
+
+    pub(crate) fn start_agent_report_with_context_timed(
+        &mut self,
+        task: &str,
+        command: &str,
+        agent_identity: Option<&str>,
+        context: SessionContext,
+        explicit_base: Option<&str>,
+    ) -> Result<TimedStartReport<StartAgentReport>, BrokerOpError> {
         crate::agent_supervisor::ensure_supported().map_err(|source| BrokerOpError::Spawn {
             command: command.to_owned(),
             source,
@@ -7280,6 +7387,7 @@ impl Broker {
             })?;
         let context = self.session_context(context);
         let CreatedSessionWorktree {
+            mut phase_timings_ms,
             slug,
             branch,
             start_base,
@@ -7288,6 +7396,7 @@ impl Broker {
             selected_promote_branch,
             _lifecycle_claim,
         } = self.create_session_worktree(task, explicit_base, &[])?;
+        let agent_setup_started = std::time::Instant::now();
         let base = start_base.commit.clone();
         let base_observation = crate::broker::SessionBaseObservation::from_start_base(
             &start_base,
@@ -7481,10 +7590,17 @@ impl Broker {
             });
         }
 
-        Ok(StartAgentReport {
-            session,
-            start_base,
-            worktree_placement,
+        phase_timings_ms.insert(
+            "agent_setup".into(),
+            u64::try_from(agent_setup_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
+        Ok(TimedStartReport {
+            phase_timings_ms,
+            report: StartAgentReport {
+                session,
+                start_base,
+                worktree_placement,
+            },
         })
     }
 
@@ -7494,24 +7610,35 @@ impl Broker {
         explicit_base: Option<&str>,
         planned_paths: &[String],
     ) -> Result<CreatedSessionWorktree, BrokerOpError> {
-        let refresh = self.refresh_default_branch_before_start();
+        let mut phase_timings_ms = std::collections::BTreeMap::new();
+        let refresh = timed_start_phase(&mut phase_timings_ms, "upstream_fetch", || {
+            self.refresh_default_branch_before_start()
+        });
         refresh.require_fresh_implicit_base(explicit_base)?;
         // Allocation needs a fresh base, not integration maintenance. In
         // verify-only mode selection below already uses the fetched default.
         // Reconciling here reads historical promotions and can wait on an
         // unrelated writer; submit and sync refresh integration themselves.
         let selected_promote = crate::merge::PromoteConfig::load(&self.main_root);
-        let mut start_base =
-            self.select_session_start_base_with_promote(explicit_base, &selected_promote)?;
+        let mut start_base = timed_start_phase(&mut phase_timings_ms, "base_selection", || {
+            self.select_session_start_base_with_promote(explicit_base, &selected_promote)
+        })?;
         refresh.record(&mut start_base);
         // Refresh may wait on another process or a remote. Acquire the
         // repository lifecycle claim only after that work. Root preparation
         // writes the marker and build defaults, so it belongs under the same
         // claim as storage's empty-root removal; otherwise a confirmed sweep
         // could delete a root prepared before this final claim.
-        let lifecycle_claim = self.claim_worktree_lifecycle()?;
-        self.preflight_worktree_checkout_count()?;
-        let placement = self.prepare_broker_worktree_root()?;
+        let lifecycle_claim =
+            timed_start_phase(&mut phase_timings_ms, "lifecycle_lock_wait", || {
+                self.claim_worktree_lifecycle()
+            })?;
+        timed_start_phase(&mut phase_timings_ms, "checkout_count", || {
+            self.preflight_worktree_checkout_count()
+        })?;
+        let placement = timed_start_phase(&mut phase_timings_ms, "worktree_root", || {
+            self.prepare_broker_worktree_root()
+        })?;
         // Choose the unique branch and recheck the destination immediately
         // before the checkout is allocated. The returned guard stays held
         // until the caller registers the session or rolls the checkout back.
@@ -7520,11 +7647,13 @@ impl Broker {
         let worktree_path = placement.root.join(&slug);
         self.refuse_nested_worktree_path(&worktree_path)?;
         let branch = format!("agent/{slug}");
-        self.preflight_session_checkout_storage(&placement)?;
-        let worktree = match self
-            .repo
-            .worktree_add(&worktree_path, &branch, &start_base.commit)
-        {
+        timed_start_phase(&mut phase_timings_ms, "storage_admission", || {
+            self.preflight_session_checkout_storage(&placement)
+        })?;
+        let worktree = match timed_start_phase(&mut phase_timings_ms, "git_worktree_add", || {
+            self.repo
+                .worktree_add(&worktree_path, &branch, &start_base.commit)
+        }) {
             Ok(worktree) => worktree,
             Err(error) => {
                 let primary = BrokerOpError::Git(error);
@@ -7548,6 +7677,7 @@ impl Broker {
             );
         }
         Ok(CreatedSessionWorktree {
+            phase_timings_ms,
             slug,
             branch,
             start_base,

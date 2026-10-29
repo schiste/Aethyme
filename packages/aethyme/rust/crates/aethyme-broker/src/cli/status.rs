@@ -206,17 +206,17 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         if !lease_waiters.is_empty() {
             out!();
             out!(
-                "Lease waiters: {} pending release requests",
+                "Lease release requests: {} pending (they do not block edits in separate worktrees)",
                 lease_waiters.len()
             );
             for request in lease_waiters.iter().take(10) {
                 let waited = now_ms().saturating_sub(request.requested_at).max(0) as u64 / 1_000;
                 out!(
-                    "  request {}: session {} waiting for {} held by session {} ({} ago)",
+                    "  request {}: session {} asked session {} to release {} ({} ago)",
                     request.request_id,
                     request.requester_session_id,
-                    request.path,
                     request.holder_session_id,
+                    request.path,
                     crate::operations::humanize_duration(waited)
                 );
             }

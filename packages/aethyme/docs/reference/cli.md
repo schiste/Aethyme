@@ -745,6 +745,18 @@ until an explicit fetch makes ancestry verification possible.
 - `aethyme broker advanced console plan [--allow-parallel] [--json]`
 - `aethyme broker advanced console run [--wait <duration>] [--allow-parallel] [--json] -- <command> ...`
 
+Successful `resources run --json` and `console run --json` reports include
+`phase_timings_ms`; the command-metrics row records the same map as each phase
+finishes, including partial timings when a later phase fails. Values are
+wall-clock milliseconds: `resource_acquisition` includes waiting for the
+resource lease, `environment_preparation` prepares child variables,
+`child_spawn` starts the main command, `child_execution` includes supervised
+execution and lease renewal, `cleanup_execution` covers a requested cleanup
+command when it runs, and `lease_finalization` releases or quarantines the
+lease. Missing phases were not reached or were skipped (for example, cleanup
+when none was requested). The command-level `duration_ms` remains the
+end-to-end CLI time; phase timings are components and need not sum to it.
+
 `gc reap --dry-run` opens the host registry read-only and projects dead-holder
 capacity reconciliation. Its JSON uses `aethyme.host-resource-reap-preview/v1`:
 `evaluated_at_ms`, `would_reclaim_capacity_units`, `candidates[]` (lease id,
@@ -838,7 +850,7 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker advanced representation record --session <id> --confirm <sha256> [--json]`
 - `aethyme broker finish cleanup <session-id> [--force] [--json]`
 - `aethyme broker finish cleanup --all-cleaned [--apply --confirm <sha256>] [--json]`
-- `aethyme broker finish cleanup resolve <session-id> --archive [--confirm <sha256>] [--json]`
+- `aethyme broker finish cleanup resolve <session-id>... --archive [--batch] [--retire] [--allow-adopted] [--confirm <sha256>] [--json]`
 - `aethyme broker finish cleanup audit [--repo <path>] [--detail] [--json]`
 - `aethyme broker advanced main reconcile plan [--detail] [--resolution-file <path>] [--write-resolution-template <path>] [--json]`
 - `aethyme broker advanced main reconcile apply --session <id> --confirm <sha256> [--resolution-file <path>] [--json]`
@@ -1562,12 +1574,17 @@ construction. The broker names that, from local facts only, and never blocks:
   `broker advanced leases explain [<paths...>]` explains each lease.
 - **Lease release requests (#359):** `broker advanced leases request-release
   <path> --session <id> --reason <why>` asks every other holder of the path;
+  requests are advisory and do not block edits in separate worktrees. Check
+  the holder's task and relevant diff before requesting coordination or
+  waiting;
   the holder answers with `leases ack <request-id>` (releasing) or `leases
   decline <request-id> --reason <why>`. A holder gone past
   `stale_grace_minutes` is granted against automatically; one whose liveness
   is unknown never is. `leases wait <path> --session <id> [--timeout
-  <seconds>]` replaces polling: exit 0 released, 10 granted, 11 declined, 12
-  timeout.
+  <seconds>]` explicitly blocks until the path is free: exit 0 released, 10
+  granted, 11 declined, 12 timeout, or 13 cancelled when the requester session
+  closes while a holder still holds the path. Use it only when the task needs
+  that exact path now.
 
 Work that reaches the default branch through a reviewed pull request is
 delivered, but leaves no promoted queue entry, and a squash merge rewrites the

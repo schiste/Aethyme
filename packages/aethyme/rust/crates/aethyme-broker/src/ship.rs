@@ -134,11 +134,12 @@ impl RepositoryDeliveryConfig {
     }
 
     pub fn load(main_root: &Path) -> Result<Option<Self>, String> {
-        let path = main_root.join(".aethyme/config.toml");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+        // `.aethyme/config.toml`, `.yaml` or `.yml` (#1223), as TOML text.
+        let Some((_, text)) =
+            aethyme_config::read_config_toml(&main_root.join(aethyme_config::CONFIG_DIR), "config")
+                .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
         };
         Self::from_config_text(&text)
     }
@@ -1551,7 +1552,7 @@ fn repository_delivery_selection(
     }
     let (configured, trusted_config_digest) = match broker
         .repo_handle()
-        .file_at_commit(&trusted_config_commit, ".aethyme/config.toml")?
+        .config_toml_at_commit(&trusted_config_commit, "config")?
     {
         Some(text) => {
             let digest = crate::sha256_bytes(text.as_bytes());
@@ -3630,7 +3631,7 @@ fn publication_policy_at(
     }
     let Some(text) = broker
         .repo_handle()
-        .file_at_commit(policy_source_commit, ".aethyme/config.toml")?
+        .config_toml_at_commit(policy_source_commit, "config")?
     else {
         return Ok(ShipPublicationPolicy::default());
     };

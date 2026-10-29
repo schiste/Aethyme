@@ -736,8 +736,23 @@ type CommittedPolicies = (
 );
 fn policies(carrier: &GitCarrier, commit: &str) -> Result<CommittedPolicies, AcceptanceError> {
     let commit = sha(commit)?;
-    let text = archive::raw_file_at_commit(carrier.repo.root(), &commit, b".aethyme/config.toml")?
-        .unwrap_or_default();
+    // `.aethyme/config` in either format (#1223), as TOML text.
+    let text = aethyme_config::try_read_config_text_with(
+        aethyme_config::CONFIG_DIR,
+        "config",
+        |relpath| {
+            archive::raw_file_at_commit(carrier.repo.root(), &commit, relpath.as_bytes())?
+                .map(|bytes| String::from_utf8(bytes).map_err(|_| invalid("policy UTF-8")))
+                .transpose()
+        },
+    )?
+    .and_then(|text| {
+        text.map(|text| text.toml_text().map(|toml| toml.into_owned()))
+            .transpose()
+    })
+    .map_err(|error| invalid(&error.to_string()))?
+    .unwrap_or_default()
+    .into_bytes();
     let utf = std::str::from_utf8(&text).map_err(|_| invalid("policy UTF-8"))?;
     let review = crate::ReviewPolicy::from_config_text(utf)?;
     let publication = crate::ShipPublicationPolicy::from_config_text(utf)?;

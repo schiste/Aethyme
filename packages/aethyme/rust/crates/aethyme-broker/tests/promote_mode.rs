@@ -430,13 +430,32 @@ fn configuration_reads_skip_rediscovery_and_recheck_the_current_default_ref() {
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .filter(|event| event["event"] == "start")
         .collect();
-    let shows = starts
+    let tree_reads = starts
         .iter()
-        .filter(|event| event["argv"][1] == "show")
+        .filter(|event| {
+            event["argv"][1] == "ls-tree"
+                && event["argv"].as_array().is_some_and(|argv| {
+                    argv.iter()
+                        .any(|arg| arg.as_str().is_some_and(|arg| arg.ends_with("config.toml")))
+                })
+        })
+        .count();
+    let blob_reads = starts
+        .iter()
+        .filter(|event| event["argv"][1] == "cat-file" && event["argv"][2] == "blob")
+        .count();
+    let default_ref_reads = starts
+        .iter()
+        .filter(|event| {
+            event["argv"][1] == "symbolic-ref"
+                && event["argv"][2] == "--quiet"
+                && event["argv"][3] == "refs/remotes/origin/HEAD"
+        })
         .count();
     assert_eq!(
-        shows, 3,
-        "positive witness: all three policy loads must read committed content"
+        (tree_reads, blob_reads, default_ref_reads),
+        (3, 3, 3),
+        "positive witness: each policy load resolves the current default and reads committed content"
     );
     let discovery = starts
         .iter()

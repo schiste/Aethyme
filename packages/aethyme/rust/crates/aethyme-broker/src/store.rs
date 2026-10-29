@@ -370,40 +370,51 @@ const SESSION_SELECT: &str = "SELECT id, worktree_path, branch, origin, status, 
      cleanup_completed_at, agent_identity, repository_name, tab_name, ai_provider, short_name \
      FROM sessions";
 
-/// Record one `lease.released` event per lease `session_id` still holds
-/// (optionally only those on `path`), naming its generation and `reason`,
-/// and return their ids. The one audit path every reasoned release shares:
-/// a terminal finish (#358) and an acknowledged or granted release request
-/// (#359).
+/// Record one `lease.released` event per unreleased lease for `session_id`
+/// (optionally scoped by path and kind), naming its generation and reason.
+/// Expired rows carry their effective expiry time when included; request
+/// acknowledgements exclude them because they no longer block the requested
+/// path.
 fn record_lease_releases_in_tx(
     tx: &rusqlite::Transaction<'_>,
     session_id: i64,
     path: Option<&str>,
+    kind: Option<&str>,
     now: i64,
     reason: &str,
+    include_expired: bool,
 ) -> Result<Vec<i64>, BrokerError> {
-    let held: Vec<(i64, String, i64)> = {
+    let held: Vec<(i64, String, i64, Option<i64>)> = {
         let mut stmt = tx.prepare(
-            "SELECT id, path, created_at FROM leases
+            "SELECT id, path, created_at, expires_at FROM leases
              WHERE session_id = ?1 AND released_at IS NULL
-               AND (expires_at IS NULL OR expires_at > ?2)
-               AND (?3 IS NULL OR path = ?3)
+               AND (?2 IS NULL OR path = ?2)
+               AND (?3 IS NULL OR kind = ?3)
+               AND (?4 != 0 OR expires_at IS NULL OR expires_at > ?5)
              ORDER BY id",
         )?;
-        stmt.query_map(params![session_id, now, path], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
+        stmt.query_map(
+            params![session_id, path, kind, include_expired, now],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?
         .collect::<Result<_, _>>()?
     };
     let mut ids = Vec::with_capacity(held.len());
-    for (lease_id, path, created_at) in held {
+    for (lease_id, path, created_at, expires_at) in held {
+        let (released_at, release_reason) = match expires_at {
+            Some(expires_at) if expires_at <= now => (expires_at, "lease_expired"),
+            _ => (now, reason),
+        };
         insert_event(
             tx,
-            now,
+            released_at,
             crate::events::LEASE_RELEASED,
             Some(session_id),
             Some(&crate::events::lease_released_payload(
-                &path, reason, lease_id, created_at,
+                &path,
+                release_reason,
+                lease_id,
+                created_at,
             )),
         )?;
         ids.push(lease_id);
@@ -421,7 +432,7 @@ fn release_session_leases_in_tx(
     now: i64,
     reason: &str,
 ) -> Result<(), BrokerError> {
-    record_lease_releases_in_tx(tx, session_id, None, now, reason)?;
+    record_lease_releases_in_tx(tx, session_id, None, None, now, reason, true)?;
     tx.execute("DELETE FROM leases WHERE session_id = ?1", [session_id])?;
     Ok(())
 }
@@ -2830,6 +2841,7 @@ mod review_ledger_tests {
 }
 
 mod base_incidents;
+pub(crate) mod cleanup_cohort;
 mod coordination;
 #[path = "store/fresh_database.rs"]
 pub(crate) mod fresh_database;

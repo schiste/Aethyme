@@ -23,6 +23,7 @@
 mod advisories;
 pub mod agent_hook;
 pub mod analysis_view;
+mod archive_cleanup;
 mod artifact_catalog;
 mod artifact_claim;
 mod atomic_file;
@@ -35,8 +36,14 @@ mod change_classification;
 mod chau7_mcp;
 mod chau7_tabs;
 mod cleanup_audit;
+mod cleanup_batch;
 mod cleanup_resolve;
 mod clock;
+/// The shared `.aethyme` configuration loader (#1223): `<stem>.toml`,
+/// `<stem>.yaml` or `<stem>.yml`, exactly one, as one `toml::Value`.
+pub mod config_source {
+    pub use aethyme_config::*;
+}
 pub mod collaboration_archive;
 pub mod collaboration_capture;
 pub mod collaboration_cli;
@@ -297,6 +304,10 @@ pub use change_classification::{
 pub use cleanup_audit::{
     AuditDisposition, AuditItem, AuditOwner, AuditSummary, AuditTarget,
     CLEANUP_AUDIT_SCHEMA_VERSION, CheckoutState, CleanupAudit, CommittedWork,
+};
+pub use cleanup_batch::{
+    CLEANUP_RESOLVE_BATCH_SCHEMA_VERSION, CleanupResolveBatchOutcome, CleanupResolveBatchPlan,
+    CleanupResolveBatchResult, CleanupResolveBatchTarget, MAX_CLEANUP_RESOLVE_BATCH_TARGETS,
 };
 pub use cleanup_resolve::{
     ArchivedFile, CLEANUP_RESOLVE_SCHEMA_VERSION, CleanupResolveOutcome, CleanupResolvePlan,

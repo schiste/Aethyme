@@ -257,16 +257,19 @@ Usage:
       Ask every other session holding a lease on <path> to release it. The
       holder sees the request in broker status with ack/decline commands. A
       holder gone past [leases] stale_grace_minutes is granted against at
-      once; one whose liveness is unknown never is.
+      once; one whose liveness is unknown never is. This is advisory and does
+      not block edits in separate worktrees; inspect the holder's task and
+      relevant diff before requesting coordination.
   aethyme broker leases ack <request-id> --session <holder> [--json]
       Acknowledge a release request: the holder's leases on the path are
       released.
   aethyme broker leases decline <request-id> --session <holder> --reason <why> [--json]
       Decline a release request; the leases stay.
   aethyme broker leases wait <path> --session <id> [--timeout <seconds>] [--json]
-      Block until no other session holds <path> (exit 0, released), the
+      Explicitly block this command until no other session holds <path> (exit 0, released), the
       broker granted it from a stale holder (exit 10), a request was declined
-      (exit 11), or --timeout (default 300) ran out (exit 12).
+      (exit 11), the requester session closed and cancelled the request while
+      the path remains held (exit 13), or --timeout (default 300) ran out (exit 12).
   aethyme broker leases export (--session <id> | --entry <id>) [--limit <n>] [--json]
       Export bounded, redacted lease ownership and deterministic routing
       categories from committed [leases.routing] configuration. Includes
@@ -823,7 +826,7 @@ Usage:
       by default; --apply revalidates and removes only clean worktrees whose
       session work is represented on main, integration, or configured upstream.
       Adopted worktrees are never included in the bulk sweep.
-  aethyme broker cleanup resolve <session-id> --archive [--confirm <sha256>] [--json]
+  aethyme broker cleanup resolve <session-id>... --archive [--batch] [--retire] [--allow-adopted] [--confirm <sha256>] [--json]
       Preserve, then remove, a closed session's worktree that cleanup refuses
       because it is dirty, holds pending commits, or cannot be proved landed.
       Without --confirm it prints what would be archived and a digest. With it,
@@ -1107,6 +1110,7 @@ fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 
         eprint!("{}", surface::public_help());
         return crate::exit_status::USAGE;
     }
+    let started = std::time::Instant::now();
     maybe_fast_forward_main_checkout(args, &mode);
     // Dispatched before the shared parser: the contract check is a CI/gate
     // entry point with its own flags (`--base`, `--pr-body`) and its own
@@ -1116,7 +1120,6 @@ fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 
     if args.first().map(String::as_str) == Some("check-contract") {
         return crate::contract_check::run(&args[1..]);
     }
-    let started = std::time::Instant::now();
     let command_output = crate::cli_output::snapshot();
     let (code, record_outcome, error) = match run_inner(args, &mode) {
         Ok(()) => (0, true, None),
@@ -1249,7 +1252,18 @@ pub fn report_dispatch_error(args: &[String], code: u8, message: &str) -> u8 {
 /// inspect it. A linked session worktree is never moved here; it has the
 /// explicit `broker sync --session <id>` path instead.
 fn maybe_fast_forward_main_checkout(args: &[String], mode: &CompatibilityMode) {
-    if !matches!(mode, CompatibilityMode::Normal) || routine_status(args) {
+    // A new session fetches its own upstream and allocates an independent
+    // checkout. Scanning or moving the primary checkout is unrelated work,
+    // can wait on its index, and can run expensive user Git hooks.
+    let creates_new_session = match args.first().map(String::as_str) {
+        // Parse flags rather than scanning raw tokens: task/path values may
+        // themselves equal an option. Invalid requests need no maintenance.
+        Some("start") => !parse(&args[1..])
+            .is_ok_and(|parsed| parsed.adopt || parsed.reuse || parsed.replace_stale),
+        Some("start-agent") => true,
+        _ => false,
+    };
+    if creates_new_session || !matches!(mode, CompatibilityMode::Normal) || routine_status(args) {
         return;
     }
     // Only the everyday public commands keep the checkout current. Hooks run
@@ -1622,6 +1636,9 @@ struct Parsed {
     take_over: bool,
     all: bool,
     all_cleaned: bool,
+    cleanup_batch: bool,
+    allow_adopted: bool,
+    retire: bool,
     archive: bool,
     abandon: bool,
     keep_worktree: bool,
@@ -1768,6 +1785,9 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         take_over: false,
         all: false,
         all_cleaned: false,
+        cleanup_batch: false,
+        allow_adopted: false,
+        retire: false,
         archive: false,
         abandon: false,
         keep_worktree: false,
@@ -1854,6 +1874,9 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
             "--all" => parsed.all = true,
             "--all-cleaned" => parsed.all_cleaned = true,
             "--archive" => parsed.archive = true,
+            "--batch" => parsed.cleanup_batch = true,
+            "--allow-adopted" => parsed.allow_adopted = true,
+            "--retire" => parsed.retire = true,
             "--abandon" => parsed.abandon = true,
             "--keep-worktree" => parsed.keep_worktree = true,
             "--open-pr" => parsed.open_pr = true,

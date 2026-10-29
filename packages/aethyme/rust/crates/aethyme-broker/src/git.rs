@@ -247,6 +247,17 @@ pub enum GitError {
 
     #[error("could not parse git worktree list --porcelain -z: {reason}")]
     WorktreeListParse { reason: String },
+
+    /// A committed `.aethyme` configuration file is ambiguous or invalid.
+    /// Boxed so the error enum stays small.
+    #[error("{0}")]
+    Config(Box<aethyme_config::ConfigSourceError>),
+}
+
+impl From<aethyme_config::ConfigSourceError> for GitError {
+    fn from(error: aethyme_config::ConfigSourceError) -> Self {
+        Self::Config(Box::new(error))
+    }
 }
 
 /// Overrides [`DEFAULT_GIT_TIMEOUT`], in whole seconds.
@@ -2967,6 +2978,118 @@ impl GitRepo {
         self.tracking_upstream()
     }
 
+    /// The fetched default branch for policy reads, distinguishing a proven
+    /// absent ref from Git errors. A configured but unresolvable default or
+    /// upstream is not treated as permission to fall back to working-copy
+    /// policy.
+    pub(crate) fn upstream_default_checked(&self) -> Result<Option<(String, String)>, GitError> {
+        let default_ref = self.symbolic_ref_checked("refs/remotes/origin/HEAD")?;
+        if let Some(target) = default_ref {
+            if !target.starts_with("refs/remotes/origin/") {
+                return Err(GitError::UntrustedOutput {
+                    detail: "origin/HEAD does not target an origin remote-tracking branch".into(),
+                });
+            }
+            let commit = self.resolve_commit_checked(&target)?;
+            let short = target
+                .strip_prefix("refs/remotes/")
+                .unwrap_or(&target)
+                .to_string();
+            return Ok(Some((short, commit)));
+        }
+        let unexpected_direct_ref = run_git(
+            &self.root,
+            &[
+                "for-each-ref",
+                "--count=1",
+                "--format=%(refname)",
+                "refs/remotes/origin/HEAD",
+            ],
+        )?;
+        if !unexpected_direct_ref.is_empty() {
+            return Err(GitError::UntrustedOutput {
+                detail: "refs/remotes/origin/HEAD exists but is not a symbolic default ref".into(),
+            });
+        }
+
+        let Some(branch_ref) = self.symbolic_ref_checked("HEAD")? else {
+            return Ok(None);
+        };
+        let Some(branch) = branch_ref.strip_prefix("refs/heads/") else {
+            return Err(GitError::UntrustedOutput {
+                detail: "the checked-out branch ref is not under refs/heads".into(),
+            });
+        };
+        let branch_ref = format!("refs/heads/{branch}");
+        let upstream_ref = run_git(
+            &self.root,
+            &[
+                "for-each-ref",
+                "--count=1",
+                "--format=%(upstream)",
+                &branch_ref,
+            ],
+        )?;
+        if upstream_ref.is_empty() {
+            return Ok(None);
+        }
+        let upstream_name = run_git(
+            &self.root,
+            &[
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ],
+        )?;
+        if upstream_name.is_empty() {
+            return Err(GitError::UntrustedOutput {
+                detail: "Git reported a configured upstream without its name".into(),
+            });
+        }
+        let commit = self.resolve_commit_checked(&upstream_ref)?;
+        Ok(Some((upstream_name, commit)))
+    }
+
+    fn symbolic_ref_checked(&self, name: &str) -> Result<Option<String>, GitError> {
+        let args = ["symbolic-ref", "--quiet", name];
+        let mut command = git_command();
+        command
+            .args(args)
+            .current_dir(&self.root)
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        let output = run_git_process_output(command, &args, git_timeout())?;
+        if output.status.success() {
+            let value = String::from_utf8_lossy(&output.stdout)
+                .trim_end()
+                .to_string();
+            if value.is_empty() {
+                return Err(GitError::UntrustedOutput {
+                    detail: format!("git {} returned an empty symbolic ref", args.join(" ")),
+                });
+            }
+            return Ok(Some(value));
+        }
+        if output.status.code() == Some(1) && output.stderr.is_empty() {
+            return Ok(None);
+        }
+        Err(GitError::Git {
+            args: args.join(" "),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+
+    fn resolve_commit_checked(&self, reference: &str) -> Result<String, GitError> {
+        let revision = format!("{reference}^{{commit}}");
+        let value = run_git(&self.root, &["rev-parse", "--verify", "--quiet", &revision])?;
+        if value.is_empty() {
+            return Err(GitError::UntrustedOutput {
+                detail: format!("Git resolved {reference:?} to an empty commit"),
+            });
+        }
+        Ok(value)
+    }
+
     pub fn head_commit(&self) -> Result<String, GitError> {
         run_git(&self.root, &["rev-parse", "HEAD"])
     }
@@ -3342,6 +3465,221 @@ impl GitRepo {
 
     /// Read one repository-relative UTF-8 file from an exact commit without
     /// checking it out or mutating refs, indexes, or worktree state.
+    /// The `.aethyme/<stem>` configuration committed at `commit`, in whichever
+    /// format it was written (#1223). Two format twins committed together is
+    /// [`GitError::Config`], never a silent preference.
+    pub fn config_at_commit(
+        &self,
+        commit: &str,
+        stem: &str,
+    ) -> Result<Option<aethyme_config::ConfigText>, GitError> {
+        aethyme_config::read_config_text_with(aethyme_config::CONFIG_DIR, stem, |relpath| {
+            self.file_at_commit(commit, relpath)
+        })
+    }
+
+    /// [`Self::config_at_commit`] for policy reads. A missing tree entry is
+    /// distinct from a Git read failure, so callers cannot silently fall back
+    /// to working-copy policy when the committed tree could not be inspected.
+    /// Read configuration from a commit OID that was already resolved and
+    /// verified by the caller. All format twins are checked in one tree
+    /// inspection so a strict policy read does not launch one Git process per
+    /// extension.
+    pub(crate) fn config_at_resolved_commit_checked(
+        &self,
+        commit: &str,
+        stem: &str,
+    ) -> Result<Option<aethyme_config::ConfigText>, GitError> {
+        let candidate_paths = aethyme_config::candidate_relpaths(stem);
+        let mut loaded: Option<BTreeMap<String, String>> = None;
+        aethyme_config::read_config_text_with(aethyme_config::CONFIG_DIR, stem, |relpath| {
+            if loaded.is_none() {
+                let objects =
+                    self.config_tree_entries_at_commit_checked(commit, &candidate_paths)?;
+                let present_paths = candidate_paths
+                    .iter()
+                    .filter(|path| objects.contains_key(*path))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if present_paths.len() > 1 {
+                    return Err(aethyme_config::ConfigSourceError::Ambiguous {
+                        stem: stem.to_string(),
+                        paths: present_paths.into_iter().map(PathBuf::from).collect(),
+                    }
+                    .into());
+                }
+                let files = if let Some(path) = present_paths.first() {
+                    let object = objects.get(path).ok_or_else(|| GitError::UntrustedOutput {
+                        detail: format!(
+                            "git ls-tree omitted the selected configuration path {path:?}"
+                        ),
+                    })?;
+                    BTreeMap::from([(path.clone(), self.config_blob_checked(object, path)?)])
+                } else {
+                    BTreeMap::new()
+                };
+                loaded = Some(files);
+            }
+            Ok(loaded
+                .as_ref()
+                .and_then(|files| files.get(relpath))
+                .cloned())
+        })
+    }
+
+    fn config_tree_entries_at_commit_checked(
+        &self,
+        commit: &str,
+        paths: &[String],
+    ) -> Result<BTreeMap<String, String>, GitError> {
+        let mut owned_args = vec![
+            "ls-tree".to_string(),
+            "-z".to_string(),
+            "--full-tree".to_string(),
+            commit.to_string(),
+            "--".to_string(),
+        ];
+        for path in paths {
+            let path_value = Path::new(path);
+            if path_value.is_absolute()
+                || path_value.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                    )
+                })
+                || path.contains(':')
+                || path.contains('\\')
+            {
+                return Err(GitError::Git {
+                    args: "ls-tree <commit> -- <path>".into(),
+                    stderr:
+                        "file path must be repository-relative and cannot contain pathspec magic"
+                            .into(),
+                });
+            }
+            // Config stems may contain portable glob characters such as
+            // brackets. Keep each candidate literal so the tree query cannot
+            // match a neighboring path by Git pathspec rules.
+            owned_args.push(format!(":(literal){path}"));
+        }
+        let args = owned_args.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = self.run_git_output_limited(&args, 64 * 1024)?;
+        let records = Self::strict_config_tree_records(&output.stdout, &args)?;
+
+        let mut objects = BTreeMap::new();
+        for record in records {
+            let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+                return Err(GitError::UntrustedOutput {
+                    detail: format!("git {} returned a malformed tree entry", args.join(" ")),
+                });
+            };
+            let metadata = &record[..tab];
+            let recorded_path = &record[tab + 1..];
+            let fields = metadata.split(|byte| *byte == b' ').collect::<Vec<_>>();
+            if fields.len() != 3 {
+                return Err(GitError::UntrustedOutput {
+                    detail: format!("git {} returned an unexpected tree entry", args.join(" ")),
+                });
+            }
+            let Some(path) = paths.iter().find(|path| path.as_bytes() == recorded_path) else {
+                return Err(GitError::UntrustedOutput {
+                    detail: format!(
+                        "git {} returned an unexpected configuration path",
+                        args.join(" ")
+                    ),
+                });
+            };
+            let regular_mode = fields[0] == b"100644" || fields[0] == b"100755";
+            if !regular_mode || fields[1] != b"blob" {
+                return Err(GitError::UntrustedOutput {
+                    detail: format!("committed configuration path {path:?} is not a regular file"),
+                });
+            }
+            let object = std::str::from_utf8(fields[2]).map_err(|_| GitError::UntrustedOutput {
+                detail: "git ls-tree returned a non-UTF-8 object id".into(),
+            })?;
+            if objects.insert(path.clone(), object.to_string()).is_some() {
+                return Err(GitError::UntrustedOutput {
+                    detail: format!(
+                        "git {} returned a duplicate configuration path",
+                        args.join(" ")
+                    ),
+                });
+            }
+        }
+        Ok(objects)
+    }
+
+    fn strict_config_tree_records<'a>(
+        stdout: &'a [u8],
+        args: &[&str],
+    ) -> Result<Vec<&'a [u8]>, GitError> {
+        if stdout.is_empty() {
+            return Ok(Vec::new());
+        }
+        if stdout.last() != Some(&0) {
+            return Err(GitError::UntrustedOutput {
+                detail: format!("git {} returned an unterminated tree entry", args.join(" ")),
+            });
+        }
+
+        // Consume exactly one framing NUL. Any remaining empty record indicates
+        // malformed nonempty output, not an absent configuration path.
+        let records = stdout[..stdout.len() - 1]
+            .split(|byte| *byte == 0)
+            .collect::<Vec<_>>();
+        if records.iter().any(|record| record.is_empty()) {
+            return Err(GitError::UntrustedOutput {
+                detail: format!("git {} returned an empty tree entry", args.join(" ")),
+            });
+        }
+        Ok(records)
+    }
+
+    fn config_blob_checked(&self, object: &str, path: &str) -> Result<String, GitError> {
+        let args = ["cat-file", "blob", object];
+        let output = self.run_git_output_limited(&args, 4 * 1024 * 1024)?;
+        String::from_utf8(output.stdout).map_err(|_| GitError::UntrustedOutput {
+            detail: format!("committed configuration {path:?} is not UTF-8"),
+        })
+    }
+
+    fn run_git_output_limited(
+        &self,
+        args: &[&str],
+        max_output_bytes: usize,
+    ) -> Result<std::process::Output, GitError> {
+        let mut command = git_command();
+        command
+            .args(args)
+            .current_dir(&self.root)
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        let deadline = Instant::now() + git_timeout();
+        let output =
+            run_git_process_output_limited(&mut command, args, deadline, max_output_bytes)?;
+        if !output.status.success() {
+            return Err(GitError::Git {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        Ok(output)
+    }
+
+    /// [`Self::config_at_commit`] as TOML text: a TOML file byte-for-byte, a
+    /// YAML file validated and rendered from the same value.
+    pub fn config_toml_at_commit(
+        &self,
+        commit: &str,
+        stem: &str,
+    ) -> Result<Option<String>, GitError> {
+        match self.config_at_commit(commit, stem)? {
+            Some(text) => Ok(Some(text.toml_text()?.into_owned())),
+            None => Ok(None),
+        }
+    }
+
     pub fn file_at_commit(&self, commit: &str, path: &str) -> Result<Option<String>, GitError> {
         let path_value = Path::new(path);
         if path_value.is_absolute()
@@ -10171,5 +10509,38 @@ mod working_tree_hash_process_group_tests {
             matches!(error, GitError::Git { ref args, .. } if args.contains("add")),
             "a completed nonzero Git child keeps the ordinary Git error: {error:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod config_tree_record_tests {
+    use super::*;
+
+    #[test]
+    fn checked_tree_records_accept_only_empty_output_or_nonempty_nul_records() {
+        let args = ["ls-tree", "-z"];
+        assert!(
+            GitRepo::strict_config_tree_records(b"", &args)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            GitRepo::strict_config_tree_records(b"entry\0", &args).unwrap(),
+            vec![b"entry".as_slice()]
+        );
+
+        for malformed in [b"\0".as_slice(), b"entry\0\0", b"\0entry\0"] {
+            assert!(
+                matches!(
+                    GitRepo::strict_config_tree_records(malformed, &args),
+                    Err(GitError::UntrustedOutput { .. })
+                ),
+                "malformed output {malformed:?} must not mean absence"
+            );
+        }
+        assert!(matches!(
+            GitRepo::strict_config_tree_records(b"unterminated", &args),
+            Err(GitError::UntrustedOutput { .. })
+        ));
     }
 }

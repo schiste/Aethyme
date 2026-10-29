@@ -597,7 +597,16 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
         ],
     ),
     ("cleanup audit", &["--detail", "--repo"]),
-    ("cleanup resolve", &["--archive", "--confirm"]),
+    (
+        "cleanup resolve",
+        &[
+            "--archive",
+            "--confirm",
+            "--batch",
+            "--allow-adopted",
+            "--retire",
+        ],
+    ),
     (
         "main reconcile plan",
         &[

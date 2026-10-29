@@ -71,9 +71,17 @@ pub(crate) enum Setting {
 
 /// The setting and where the config came from (`None` without a config).
 pub(crate) fn setting(main_root: &Path) -> (Setting, Option<&'static str>) {
-    match crate::merge::repository_config_with_source(main_root) {
-        Some((text, source)) => (setting_from_text(Some(&text)), Some(source)),
-        None => (Setting::Off, None),
+    match crate::merge::repository_config_checked(main_root) {
+        Ok(Some((text, source))) => (setting_from_text(Some(&text)), Some(source)),
+        Ok(None) => (Setting::Off, None),
+        // An ambiguous or invalid configuration cannot say capture is off.
+        Err(error) => (
+            Setting::Unsupported {
+                code: "config_unresolved",
+                detail: error.to_string(),
+            },
+            None,
+        ),
     }
 }
 
@@ -1284,6 +1292,103 @@ mod tests {
         .unwrap();
         let reopened = crate::Broker::open(fixture.repo.path()).unwrap();
         assert!(effective_fence(&reopened).is_none());
+        assert_eq!(fence(fixture.repo.path()), None);
+    }
+
+    /// Broker opens use committed policy even when the checkout's config is
+    /// stale or missing.
+    #[test]
+    fn opening_uses_committed_required_policy_when_local_config_is_off_or_absent() {
+        for remove_local in [false, true] {
+            let fixture = fixture_with("off", true);
+            commit_upstream_policy(&fixture, "required");
+            if remove_local {
+                std::fs::remove_file(fixture.repo.path().join(".aethyme/config.toml")).unwrap();
+            }
+
+            let _reopened = crate::Broker::open(fixture.repo.path()).unwrap();
+            assert_eq!(
+                fence(fixture.repo.path()).unwrap().state,
+                "active",
+                "remove_local={remove_local}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_committed_config_stays_pending_until_repaired_to_off() {
+        let fixture = fixture_with("off", true);
+        let origin = fixture._origin.as_ref().unwrap().path();
+        let other = tempfile::tempdir().unwrap();
+        git(
+            other.path(),
+            &["clone", "-q", origin.to_str().unwrap(), "."],
+        );
+        std::fs::write(
+            other.path().join(".aethyme/config.yaml"),
+            "collaboration:\n  capture: off\n  project: proj-test\n",
+        )
+        .unwrap();
+        git(other.path(), &["add", "-f", ".aethyme/config.yaml"]);
+        git(other.path(), &["commit", "-qm", "config twin"]);
+        git(other.path(), &["push", "-q", "origin", "HEAD:main"]);
+        git(fixture.repo.path(), &["fetch", "-q", "origin"]);
+
+        let snapshot = crate::Broker::open_snapshot(fixture.repo.path()).unwrap();
+        let view = snapshot.status_current_snapshot(0).unwrap();
+        let pending = view.collaboration_fence.unwrap();
+        assert_eq!(pending.state, "pending");
+        assert_eq!(
+            pending.reason,
+            crate::schema::COLLABORATION_FENCE_UNRESOLVED_REASON
+        );
+        assert_eq!(fence(fixture.repo.path()), None);
+
+        let _reopened = crate::Broker::open(fixture.repo.path()).unwrap();
+        assert_eq!(fence(fixture.repo.path()), None);
+
+        // Once the committed twins are repaired to the already-present off
+        // policy, a writable open remains unfenced.
+        git(other.path(), &["rm", "-q", ".aethyme/config.yaml"]);
+        git(other.path(), &["commit", "-qm", "resolve config"]);
+        git(other.path(), &["push", "-q", "origin", "HEAD:main"]);
+        git(fixture.repo.path(), &["fetch", "-q", "origin"]);
+        let _reopened = crate::Broker::open(fixture.repo.path()).unwrap();
+        assert_eq!(fence(fixture.repo.path()), None);
+    }
+
+    #[test]
+    fn malformed_committed_toml_does_not_suppress_the_pending_fence() {
+        let fixture = fixture_with("off", true);
+        let origin = fixture._origin.as_ref().unwrap().path();
+        let other = tempfile::tempdir().unwrap();
+        git(
+            other.path(),
+            &["clone", "-q", origin.to_str().unwrap(), "."],
+        );
+        std::fs::write(
+            other.path().join(".aethyme/config.toml"),
+            r#"[collaboration
+capture = "off"
+"#,
+        )
+        .unwrap();
+        git(other.path(), &["add", "-f", ".aethyme/config.toml"]);
+        git(other.path(), &["commit", "-qm", "invalid config"]);
+        git(other.path(), &["push", "-q", "origin", "HEAD:main"]);
+        git(fixture.repo.path(), &["fetch", "-q", "origin"]);
+
+        let snapshot = crate::Broker::open_snapshot(fixture.repo.path()).unwrap();
+        let view = snapshot.status_current_snapshot(0).unwrap();
+        let pending = view.collaboration_fence.unwrap();
+        assert_eq!(pending.state, "pending");
+        assert_eq!(
+            pending.reason,
+            crate::schema::COLLABORATION_FENCE_UNRESOLVED_REASON
+        );
+        assert_eq!(fence(fixture.repo.path()), None);
+
+        let _reopened = crate::Broker::open(fixture.repo.path()).unwrap();
         assert_eq!(fence(fixture.repo.path()), None);
     }
 

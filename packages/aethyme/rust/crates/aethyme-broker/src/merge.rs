@@ -225,7 +225,20 @@ impl PromoteConfig {
     }
 
     pub(crate) fn load_with_warning(main_root: &Path) -> (Self, Option<String>) {
-        Self::from_text(repository_config_text(main_root).as_deref())
+        match repository_config_checked(main_root) {
+            Ok(Some((text, _))) => Self::from_text(Some(&text)),
+            Ok(None) => Self::from_text(None),
+            Err(error) => (
+                Self {
+                    branch: DEFAULT_INTEGRATION_BRANCH.to_string(),
+                    mode: PromoteMode::VerifyOnly,
+                },
+                Some(format!(
+                    "repository configuration is unresolved ({}); promotion is disabled until it is corrected",
+                    error.code()
+                )),
+            ),
+        }
     }
 
     pub(crate) fn from_text(text: Option<&str>) -> (Self, Option<String>) {
@@ -237,8 +250,15 @@ impl PromoteConfig {
         let Some(text) = text else {
             return (config, warning);
         };
-        let Ok(value) = text.parse::<toml::Value>() else {
-            return (config, warning);
+        let value = match text.parse::<toml::Value>() {
+            Ok(value) => value,
+            Err(error) => {
+                config.mode = PromoteMode::VerifyOnly;
+                warning = Some(format!(
+                    "repository configuration is invalid ({error}); promotion is disabled until it is corrected"
+                ));
+                return (config, warning);
+            }
         };
         if let Some(promote) = value.get("promote") {
             if let Some(branch) = promote.get("branch").and_then(|v| v.as_str()) {
@@ -289,9 +309,12 @@ pub(crate) fn session_baseline(
     Some(from_integration)
 }
 
-/// The repository's `.aethyme/config.toml` under the broker's one trust rule:
-/// as committed on the fetched default branch when that exists, else the main
-/// checkout's working-tree file. `[promote]` and `[worktrees]` both read it.
+/// The repository's `.aethyme/config` (TOML or YAML, #1223) under the
+/// broker's one trust rule: as committed on the fetched default branch when
+/// that exists, else the main checkout's working-tree file. `[promote]` and
+/// `[worktrees]` both read it. The text is TOML: a YAML file is validated and
+/// rendered from the same value. An ambiguous or invalid file reads as absent
+/// here; callers that must report it use [`repository_config_checked`].
 pub(crate) fn repository_config_text(main_root: &Path) -> Option<String> {
     repository_config_with_source(main_root).map(|(text, _)| text)
 }
@@ -300,27 +323,84 @@ pub(crate) fn repository_config_text(main_root: &Path) -> Option<String> {
 /// fetched default branch) or `working_copy` (the main checkout's file, used
 /// when there is no fetched default branch or it does not hold the file).
 pub(crate) fn repository_config_with_source(main_root: &Path) -> Option<(String, &'static str)> {
+    repository_config_checked(main_root).ok().flatten()
+}
+
+/// [`repository_config_with_source`], keeping why the configuration could
+/// not be resolved: two format twins, or YAML outside the strict subset.
+pub(crate) fn repository_config_checked(
+    main_root: &Path,
+) -> Result<Option<(String, &'static str)>, aethyme_config::ConfigSourceError> {
     crate::status_reads::configuration(main_root, || {
-        committed_config_text(main_root)
-            .map(|text| (text, "committed"))
-            .or_else(|| {
-                std::fs::read_to_string(main_root.join(".aethyme/config.toml"))
-                    .ok()
-                    .map(|text| (text, "working_copy"))
+        if let Some(text) = committed_config_text(main_root)? {
+            return Ok(Some((text, "committed")));
+        }
+        aethyme_config::read_config_text(&main_root.join(aethyme_config::CONFIG_DIR), "config")?
+            .map(|text| {
+                text.toml_text()
+                    .map(|toml| (toml.into_owned(), "working_copy"))
             })
+            .transpose()
     })
 }
 
-/// `.aethyme/config.toml` as committed on the fetched default branch, if there
-/// is one and it holds the file.
-fn committed_config_text(main_root: &Path) -> Option<String> {
+/// `.aethyme/config` as committed on the fetched default branch, if there
+/// is one and it holds the file, as TOML text.
+pub(crate) fn committed_repository_config_checked(
+    main_root: &Path,
+) -> Result<Option<String>, aethyme_config::ConfigSourceError> {
+    let Some(text) = committed_config_text(main_root)? else {
+        return Ok(None);
+    };
+    if let Err(error) = text.parse::<toml::Value>() {
+        return Err(aethyme_config::ConfigSourceError::Invalid {
+            path: main_root
+                .join(aethyme_config::CONFIG_DIR)
+                .join("config.toml"),
+            location: None,
+            key_path: None,
+            code: "config_invalid_toml",
+            message: format!("the committed configuration is not valid TOML: {error}"),
+        });
+    }
+    Ok(Some(text))
+}
+
+fn committed_config_text(
+    main_root: &Path,
+) -> Result<Option<String>, aethyme_config::ConfigSourceError> {
+    crate::status_reads::committed_configuration(main_root, || {
+        committed_config_text_uncached(main_root)
+    })
+}
+
+fn committed_config_text_uncached(
+    main_root: &Path,
+) -> Result<Option<String>, aethyme_config::ConfigSourceError> {
     // The caller already supplies the main checkout root. Reuse that path
-    // without another discovery process; ref and content reads remain fresh.
+    // without another discovery process; ref and content reads remain fresh
+    // for each command-local observation.
     let repo = GitRepo::at_known_root(main_root);
-    let (_, commit) = repo.upstream_default()?;
-    repo.file_at_commit(&commit, ".aethyme/config.toml")
-        .ok()
-        .flatten()
+    let Some((_, commit)) = repo.upstream_default_checked().map_err(|error| {
+        aethyme_config::ConfigSourceError::Read {
+            path: main_root.join(aethyme_config::CONFIG_DIR).join("config"),
+            message: format!("could not resolve the fetched default branch: {error}"),
+        }
+    })?
+    else {
+        return Ok(None);
+    };
+    match repo.config_at_resolved_commit_checked(&commit, "config") {
+        Ok(Some(text)) => Ok(Some(text.toml_text()?.into_owned())),
+        Ok(None) => Ok(None),
+        Err(crate::GitError::Config(error)) => Err(*error),
+        Err(error) => Err(aethyme_config::ConfigSourceError::Read {
+            path: main_root.join(aethyme_config::CONFIG_DIR).join("config"),
+            message: format!(
+                "could not read configuration from the fetched default branch: {error}"
+            ),
+        }),
+    }
 }
 
 /// Result of one submit: the queue entry after simulate (+ gates when
@@ -1423,12 +1503,10 @@ impl Broker {
             Some(gates) => (gates, true),
             None => (Vec::new(), false),
         };
-        let gate_policy_changed = self
-            .repo_handle()
-            .file_at_commit(&base, crate::gates::GATES_CONFIG_RELPATH)?
+        let gate_policy_changed = self.repo_handle().config_toml_at_commit(&base, "gates")?
             != self
                 .repo_handle()
-                .file_at_commit(merge_commit, crate::gates::GATES_CONFIG_RELPATH)?;
+                .config_toml_at_commit(merge_commit, "gates")?;
         if gate_policy_changed || graph_policy_changed {
             self.store().append_event(
                 crate::events::MERGE_POLICY_DEFERRED,
@@ -2737,6 +2815,195 @@ mod promotion_ref_tests {
         git(dir, &["rev-parse", "HEAD"])
     }
 
+    #[test]
+    fn an_ambiguous_committed_config_disables_automatic_promotion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(dir.join(".aethyme")).unwrap();
+        std::fs::write(
+            dir.join(".aethyme/config.toml"),
+            "[promote]\nmode = \"auto\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".aethyme/config.yaml"),
+            "promote:\n  mode: verify-only\n",
+        )
+        .unwrap();
+        git(
+            dir,
+            &["add", ".aethyme/config.toml", ".aethyme/config.yaml"],
+        );
+        git(dir, &["commit", "-q", "-m", "ambiguous config"]);
+        let committed = git(dir, &["rev-parse", "HEAD"]);
+        git(dir, &["update-ref", "refs/remotes/origin/main", &committed]);
+        git(
+            dir,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        std::fs::remove_file(dir.join(".aethyme/config.yaml")).unwrap();
+
+        let (config, warning) = PromoteConfig::load_with_warning(dir);
+        assert_eq!(config.mode, PromoteMode::VerifyOnly);
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("config_ambiguous_format")),
+            "{warning:?}"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_committed_default_does_not_fall_back_to_local_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        let _base = commit(dir, "README");
+        std::fs::create_dir_all(dir.join(".aethyme")).unwrap();
+        std::fs::write(
+            dir.join(".aethyme/config.toml"),
+            r#"[promote]
+mode = "auto"
+"#,
+        )
+        .unwrap();
+        git(
+            dir,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/missing",
+            ],
+        );
+
+        let error = repository_config_checked(dir).unwrap_err();
+        assert_eq!(error.code(), "config_read_failed");
+    }
+
+    #[test]
+    fn origin_default_must_target_its_remote_tracking_namespace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        let commit = commit(dir, "README");
+        git(
+            dir,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/heads/main",
+            ],
+        );
+        git(dir, &["update-ref", "refs/heads/main", &commit]);
+        std::fs::create_dir_all(dir.join(".aethyme")).unwrap();
+        std::fs::write(
+            dir.join(".aethyme/config.toml"),
+            r#"[promote]
+mode = "auto"
+"#,
+        )
+        .unwrap();
+
+        let error = repository_config_checked(dir).unwrap_err();
+        assert_eq!(error.code(), "config_read_failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committed_config_symlink_is_unresolved_not_working_copy_fallback() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        let _base = commit(dir, "README");
+        let config_dir = dir.join(".aethyme");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        symlink("missing-target", config_dir.join("config.toml")).unwrap();
+        git(dir, &["add", "-f", ".aethyme/config.toml"]);
+        git(dir, &["commit", "-q", "-m", "symlinked config"]);
+        let commit = git(dir, &["rev-parse", "HEAD"]);
+        git(dir, &["update-ref", "refs/remotes/origin/main", &commit]);
+        git(
+            dir,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        std::fs::remove_file(config_dir.join("config.toml")).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[promote]\nmode = \"auto\"\n",
+        )
+        .unwrap();
+
+        let error = repository_config_checked(dir).unwrap_err();
+        assert_eq!(error.code(), "config_read_failed");
+    }
+
+    #[test]
+    fn absent_default_and_upstream_still_use_working_copy_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        let _base = commit(dir, "README");
+        std::fs::create_dir_all(dir.join(".aethyme")).unwrap();
+        std::fs::write(
+            dir.join(".aethyme/config.toml"),
+            r#"[promote]
+mode = "auto"
+"#,
+        )
+        .unwrap();
+
+        let (text, source) = repository_config_checked(dir).unwrap().unwrap();
+        assert_eq!(source, "working_copy");
+        assert!(text.contains("mode = \"auto\""));
+    }
+
+    #[test]
+    fn a_resolved_default_without_config_keeps_documented_local_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        let commit = commit(dir, "README");
+        git(dir, &["update-ref", "refs/remotes/origin/main", &commit]);
+        git(
+            dir,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        std::fs::create_dir_all(dir.join(".aethyme")).unwrap();
+        std::fs::write(
+            dir.join(".aethyme/config.toml"),
+            r#"[promote]
+mode = "auto"
+"#,
+        )
+        .unwrap();
+
+        let (text, source) = repository_config_checked(dir).unwrap().unwrap();
+        assert_eq!(source, "working_copy");
+        assert!(text.contains("mode = \"auto\""));
+    }
+
+    #[test]
+    fn invalid_promotion_config_does_not_restore_automatic_mode() {
+        let (config, warning) = PromoteConfig::from_text(Some("[promote]\nmode = ["));
+        assert_eq!(config.mode, PromoteMode::VerifyOnly);
+        assert!(warning.is_some());
+    }
+
     /// Two promotions verified against the same base: the first advances
     /// integration, and the second must see that its base moved instead of
     /// overwriting the first promotion.
@@ -2843,7 +3110,10 @@ mod verification_candidate_tests {
         let base = commit_file(root, "base.txt", "base\n");
         let input = commit_file(root, "change.txt", "change\n");
         let tree = git(root, &["write-tree"]);
-        assert!(!root.join(".aethyme/gates.toml").exists());
+        assert!(!aethyme_config::config_exists(
+            &root.join(aethyme_config::CONFIG_DIR),
+            "gates"
+        ));
 
         let repo = GitRepo::discover(root).unwrap();
         let candidate = mint_verification_candidate(

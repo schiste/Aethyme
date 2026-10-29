@@ -88,15 +88,16 @@ impl Default for ReviewPolicy {
 
 impl ReviewPolicy {
     pub fn load(root: &Path) -> Result<Self, BrokerOpError> {
-        let path = root.join(".aethyme/config.toml");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
+        // `.aethyme/config.toml`, `.yaml` or `.yml` (#1223), as TOML text.
+        let text = match aethyme_config::read_config_toml(
+            &root.join(aethyme_config::CONFIG_DIR),
+            "config",
+        ) {
+            Ok(Some((_, text))) => text,
+            Ok(None) => return Ok(Self::default()),
             Err(error) => {
                 return Err(BrokerOpError::ReviewLifecycle {
-                    reason: format!("cannot read {}: {error}", path.display()),
+                    reason: error.to_string(),
                 });
             }
         };

@@ -88,6 +88,7 @@
     "closed_worktree_grace_hours": "integer",
     "closed_worktrees_days": "integer",
     "command_metrics_days": "integer",
+    "compact_closed_worktrees": "bool",
     "gate_cache_bytes_budget": "integer",
     "gate_results_days": "integer",
     "idle_session_artifact_hours": "integer",

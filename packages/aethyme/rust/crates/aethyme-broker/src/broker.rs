@@ -261,6 +261,10 @@ pub enum BrokerOpError {
     #[error("refusing to clean session {id}: {reason} (use --force to discard)")]
     DirtyWorktree { id: i64, reason: String },
     #[error(
+        "refusing to clean session {id}: physical cleanup requires a closed, not-yet-cleaned session; current state is {state} (--force does not override this)"
+    )]
+    CleanupSessionNotTerminal { id: i64, state: String },
+    #[error(
         "refusing to clean session {id}: its worktree {path} is the checkout of live session \
          {live_id}; finish that session first (--force does not override this)"
     )]
@@ -1036,6 +1040,12 @@ pub struct AdoptReport {
     /// Present when the session kept its predecessor's ownership boundary.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub carried_ownership: Option<AdoptCarriedOwnership>,
+}
+
+/// Internal timing transport keeps the public library report structs stable.
+pub(crate) struct TimedStartReport<T> {
+    pub report: T,
+    pub phase_timings_ms: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1878,8 +1888,8 @@ pub struct PendingOperationView {
 /// What prompts a collaboration-fence check (#660); see
 /// `Broker::collaboration_fence_state`.
 pub(crate) enum FenceTrigger<'a> {
-    /// A broker open: cheap, reaching Git only when the working copy says
-    /// `capture = "required"`.
+    /// A broker open or unresolved caller read: check the fetched default
+    /// branch because only committed policy can raise the compatibility fence.
     Open,
     /// A caller that already loaded the repository config (text, source).
     Config(Option<&'a (String, &'static str)>),

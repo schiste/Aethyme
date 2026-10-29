@@ -4,6 +4,42 @@ use super::*;
 
 pub(super) const HOST_RESOURCE_INPUT_MAX_BYTES: u64 = 1024 * 1024;
 
+fn record_resource_run_phase(
+    phase_timings_ms: &mut std::collections::BTreeMap<String, u128>,
+    phase: &'static str,
+    duration_ms: u128,
+) {
+    phase_timings_ms.insert(phase.to_string(), duration_ms);
+    super::telemetry::set_command_metric_details(serde_json::json!({
+        "phase_timings_ms": phase_timings_ms,
+    }));
+}
+
+#[derive(serde::Serialize)]
+struct TimedResourceRunReport<'a> {
+    #[serde(flatten)]
+    report: &'a crate::HostResourceRunReport,
+    phase_timings_ms: &'a std::collections::BTreeMap<String, u128>,
+}
+
+fn serialize_timed_resource_run_report(
+    report: &crate::HostResourceRunReport,
+    phase_timings_ms: &std::collections::BTreeMap<String, u128>,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&TimedResourceRunReport {
+        report,
+        phase_timings_ms,
+    })
+}
+
+fn format_phase_timings_ms(phase_timings_ms: &std::collections::BTreeMap<String, u128>) -> String {
+    phase_timings_ms
+        .iter()
+        .map(|(phase, duration_ms)| format!("{phase}={duration_ms}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub(super) fn read_resource_json<T: serde::de::DeserializeOwned>(
     path: &std::path::Path,
 ) -> Result<T, UsageError> {
@@ -568,7 +604,8 @@ pub(super) fn run_console(parsed: Parsed) -> Result<(), UsageError> {
             let mut marker_path = None;
             let marker_repository = repository.clone();
             let marker_worktree = worktree_root.clone();
-            let report = coordinator.run_supervised_with_environment(
+            let mut phase_timings_ms = std::collections::BTreeMap::new();
+            let report = coordinator.run_supervised_with_environment_observed(
                 &request,
                 wait,
                 &parsed.exec_command,
@@ -652,6 +689,9 @@ pub(super) fn run_console(parsed: Parsed) -> Result<(), UsageError> {
                         eprintln!("console: {message}");
                     }
                 },
+                |phase, duration_ms| {
+                    record_resource_run_phase(&mut phase_timings_ms, phase, duration_ms)
+                },
             );
             let report = match report {
                 Ok(report) => report,
@@ -703,12 +743,16 @@ pub(super) fn run_console(parsed: Parsed) -> Result<(), UsageError> {
                 })?;
             }
             if json {
-                eprintln!("{}", serde_json::to_string(&report)?);
+                eprintln!(
+                    "{}",
+                    serialize_timed_resource_run_report(&report, &phase_timings_ms)?
+                );
             } else {
                 eprintln!(
-                    "console: child={} final={}",
+                    "console: child={} final={} phases_ms=[{}]",
                     report.child_exit_code,
-                    report.final_lease_state.as_str()
+                    report.final_lease_state.as_str(),
+                    format_phase_timings_ms(&phase_timings_ms)
                 );
             }
             let exit = if report.child_exit_code != 0 {
@@ -1191,12 +1235,14 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                 std::env::current_dir().map_err(|error| UsageError::Message(error.to_string()))?;
             let mut coordinator = crate::HostResourceCoordinator::open_default()?;
             let json = parsed.json;
-            let report = coordinator.run_supervised(
+            let mut phase_timings_ms = std::collections::BTreeMap::new();
+            let report = coordinator.run_supervised_with_environment_observed(
                 &request,
                 wait,
                 &parsed.exec_command,
                 parsed.cleanup_command.as_deref(),
                 &cwd,
+                |_grant| Ok(std::collections::BTreeMap::new()),
                 |message| {
                     if json {
                         eprintln!(
@@ -1210,6 +1256,9 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                     } else {
                         eprintln!("resource run: {message}");
                     }
+                },
+                |phase, duration_ms| {
+                    record_resource_run_phase(&mut phase_timings_ms, phase, duration_ms)
                 },
             );
             let report = match report {
@@ -1243,15 +1292,19 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                 }
             };
             if json {
-                eprintln!("{}", serde_json::to_string(&report)?);
+                eprintln!(
+                    "{}",
+                    serialize_timed_resource_run_report(&report, &phase_timings_ms)?
+                );
             } else {
                 eprintln!(
-                    "resource run: child={} cleanup={} final={}",
+                    "resource run: child={} cleanup={} final={} phases_ms=[{}]",
                     report.child_exit_code,
                     report
                         .cleanup_exit_code
                         .map_or_else(|| "not-requested".into(), |code| code.to_string()),
-                    report.final_lease_state.as_str()
+                    report.final_lease_state.as_str(),
+                    format_phase_timings_ms(&phase_timings_ms)
                 );
             }
             let lifecycle_failed = report.authority_lost
