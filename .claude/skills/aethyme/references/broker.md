@@ -512,6 +512,10 @@ blocked.
      [--repo <owner/name>] --reason "<authorization>" -- <git-args> ...
    ```
 
+   Remote Git operations, including `fetch` and `push`, require an explicit
+   `--repo <owner/name>` before `--`. A configured `origin` does not replace
+   this coordinator identity.
+
    Read-only GitHub CLI inspection and explicitly authorized local `gh auth`
    setup may run directly. Every GitHub repository or account mutation
    (pull requests, issues, comments, workflows, releases, settings, secrets,
