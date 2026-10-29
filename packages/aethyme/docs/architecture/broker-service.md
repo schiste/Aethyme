@@ -1,5 +1,7 @@
 # Progressive broker service
 
+Last Updated: 2026-10-29
+
 The broker currently coordinates CLI processes through SQLite transactions and
 file locks. A shared service will own recurring work and request scheduling,
 while build, test and review workers remain separate processes. Every step must
