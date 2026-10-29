@@ -1885,11 +1885,13 @@ impl Broker {
             && plan.recovery_archive_schema_version
                 == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
         {
-            format!(
-                "{session_id}-{}-retirement-v6-{}",
-                &plan.head[..12],
-                plan.digest
-            )
+            pinned_retirement_archive_name(session_id, &plan.head, &plan.digest).map_err(
+                |reason| BrokerOpError::RecoveryArchiveUnverified {
+                    id: session_id,
+                    path: archive_root.to_string_lossy().into_owned(),
+                    reason,
+                },
+            )?
         } else if retirement_mode {
             format!("{session_id}-{}-{}", &plan.head[..12], plan.digest)
         } else {
@@ -2943,6 +2945,20 @@ fn is_retirement_archive_schema(schema_version: u32) -> bool {
         RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
             | PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
     )
+}
+
+fn pinned_retirement_archive_name(
+    session_id: i64,
+    head: &str,
+    retirement_digest: &str,
+) -> Result<String, String> {
+    if session_id <= 0 || !valid_git_object_id(head) || !valid_sha256(retirement_digest) {
+        return Err("cannot name a schema v6 archive from an invalid identity".into());
+    }
+    Ok(format!(
+        "{session_id}-{}-retirement-v6-{retirement_digest}",
+        &head[..12]
+    ))
 }
 
 fn recovery_archive_prerequisite_refs(
@@ -4040,6 +4056,22 @@ impl Broker {
             ));
         }
         validate_manifest_identity(&manifest)?;
+        if manifest.schema_version == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+            let retirement_digest = manifest
+                .plan_digest
+                .as_deref()
+                .ok_or_else(|| "schema v6 archive is missing its plan digest".to_owned())?;
+            let expected_name = pinned_retirement_archive_name(
+                manifest.session_id,
+                &manifest.head,
+                retirement_digest,
+            )?;
+            if dir.file_name().and_then(std::ffi::OsStr::to_str) != Some(expected_name.as_str()) {
+                return Err(format!(
+                    "schema v6 archive directory name is not its canonical retirement identity: expected {expected_name}"
+                ));
+            }
+        }
         verify_recovery_archive_tree(dir, &manifest)?;
         if is_retirement_archive_schema(manifest.schema_version) {
             verify_retirement_archive_record_for_manifest(dir, &manifest)?;
@@ -4155,7 +4187,20 @@ impl Broker {
         &self,
         archive: &OwnedRecoveryArchive,
     ) -> Result<(), String> {
-        remove_recovery_prerequisite_refs_after_archive_removal(self.repo_handle(), archive)
+        let configured_root = self
+            .recovery_archive_root()
+            .map_err(|error| format!("cannot resolve recovery archive root: {error}"))?;
+        let root = inspect_archive_root(&configured_root).map_err(|error| {
+            format!(
+                "cannot safely inspect recovery archive root: {}",
+                error.reason
+            )
+        })?;
+        remove_recovery_prerequisite_refs_after_archive_removal(
+            self.repo_handle(),
+            archive,
+            root.as_deref(),
+        )
     }
 
     /// Whether every preserved root reached the primary checkout or upstream,
@@ -4819,6 +4864,7 @@ fn verify_recovery_prerequisite_refs_installed(
 fn remove_recovery_prerequisite_refs_after_archive_removal(
     repository: &GitRepo,
     archive: &OwnedRecoveryArchive,
+    archive_root: Option<&Path>,
 ) -> Result<(), String> {
     match std::fs::symlink_metadata(&archive.path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -4843,6 +4889,26 @@ fn remove_recovery_prerequisite_refs_after_archive_removal(
         );
     }
     let deadline = recovery_bundle_deadline()?;
+    match archive_root {
+        Some(root) => {
+            if !archive
+                .path
+                .parent()
+                .is_some_and(|parent| same_path(parent, root))
+            {
+                return Err(
+                    "archive path no longer belongs directly under the configured recovery root; prerequisite refs were retained".into(),
+                );
+            }
+            refuse_duplicate_recovery_prerequisite_refs(root, &archive.path, &expected, deadline)?;
+        }
+        None if archive.path.parent().is_some_and(|parent| parent.exists()) => {
+            return Err(
+                "configured recovery root is missing while its archive parent still exists; prerequisite refs were retained".into(),
+            );
+        }
+        None => {}
+    }
     let actual = list_recovery_prerequisite_refs(repository, &expected, deadline)?;
     let expected_map = recovery_prerequisite_ref_map(&expected);
     for (name, object_id) in &actual {
@@ -4862,6 +4928,134 @@ fn remove_recovery_prerequisite_refs_after_archive_removal(
         return Err(
             "recovery prerequisite refs remain after their exact removal transaction".into(),
         );
+    }
+    Ok(())
+}
+
+fn refuse_duplicate_recovery_prerequisite_refs(
+    root: &Path,
+    removed_archive: &Path,
+    expected_refs: &[RecoveryArchivePrerequisiteRef],
+    deadline: Instant,
+) -> Result<(), String> {
+    require_real_directory(root)?;
+    let expected_names = expected_refs
+        .iter()
+        .map(|reference| reference.ref_name.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let entries = std::fs::read_dir(root)
+        .map_err(|error| format!("cannot scan archive siblings before releasing refs: {error}"))?;
+    let mut scanned = 0_usize;
+    for entry in entries {
+        if Instant::now() >= deadline {
+            return Err(
+                "archive sibling scan exceeded its deadline; prerequisite refs were retained"
+                    .into(),
+            );
+        }
+        scanned = scanned.saturating_add(1);
+        if scanned > MAX_RECOVERY_ARCHIVE_TREE_ENTRIES {
+            return Err(format!(
+                "archive sibling scan exceeded its {}-entry bound; prerequisite refs were retained",
+                MAX_RECOVERY_ARCHIVE_TREE_ENTRIES
+            ));
+        }
+        let entry = entry.map_err(|error| {
+            format!("cannot read archive sibling entry; prerequisite refs were retained: {error}")
+        })?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            format!("cannot inspect archive sibling; prerequisite refs were retained: {error}")
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "archive sibling {} is a symlink; prerequisite refs were retained because duplicate use cannot be ruled out",
+                path.display()
+            ));
+        }
+        if metadata.is_file() {
+            continue;
+        }
+        if !metadata.is_dir() {
+            return Err(format!(
+                "archive sibling {} has an unsupported file type; prerequisite refs were retained",
+                path.display()
+            ));
+        }
+        if same_path(&path, removed_archive) {
+            return Err(
+                "archive path reappeared during sibling scan; prerequisite refs were retained"
+                    .into(),
+            );
+        }
+        for (file_name, max_bytes, schema_version) in [
+            (
+                MANIFEST_FILE,
+                MAX_RECOVERY_MANIFEST_BYTES,
+                PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION,
+            ),
+            (
+                RETIREMENT_ARCHIVE_RECORD_FILE,
+                MAX_RETIREMENT_ARCHIVE_RECORD_BYTES,
+                PINNED_RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION,
+            ),
+        ] {
+            let file_path = path.join(file_name);
+            let bytes = match read_regular_file_no_follow(&file_path, max_bytes) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "cannot safely read archive sibling {} while checking prerequisite refs; refs were retained: {error}",
+                        file_path.display()
+                    ));
+                }
+            };
+            let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+                format!(
+                    "cannot parse archive sibling {} while checking prerequisite refs; refs were retained: {error}",
+                    file_path.display()
+                )
+            })?;
+            let is_v6 = value
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+                == Some(u64::from(schema_version));
+            let Some(refs_value) = value.get("prerequisite_refs") else {
+                if is_v6 {
+                    return Err(format!(
+                        "schema v6 sibling {} is missing prerequisite refs; refs were retained",
+                        file_path.display()
+                    ));
+                }
+                continue;
+            };
+            let refs: Vec<RecoveryArchivePrerequisiteRef> = serde_json::from_value(
+                refs_value.clone(),
+            )
+            .map_err(|error| {
+                format!(
+                    "cannot decode prerequisite refs in sibling {}; refs were retained: {error}",
+                    file_path.display()
+                )
+            })?;
+            if is_v6 && refs.is_empty() {
+                return Err(format!(
+                    "schema v6 sibling {} has an empty prerequisite set; refs were retained",
+                    file_path.display()
+                ));
+            }
+            if let Some(reference) = refs
+                .iter()
+                .find(|reference| expected_names.contains(reference.ref_name.as_str()))
+            {
+                return Err(format!(
+                    "archive sibling {} also references prerequisite {}; refs were retained",
+                    path.display(),
+                    reference.ref_name
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -5636,6 +5830,27 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "git {args:?}");
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn copy_archive_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+        std::fs::create_dir(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            let metadata = std::fs::symlink_metadata(&source_path)?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                copy_archive_tree(&source_path, &destination_path)?;
+            } else if metadata.is_file() && !metadata.file_type().is_symlink() {
+                std::fs::copy(&source_path, &destination_path)?;
+            } else {
+                return Err(std::io::Error::other(format!(
+                    "fixture archive contains a non-regular entry: {}",
+                    source_path.display()
+                )));
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -6549,6 +6764,27 @@ mod tests {
             recovery_bundle_required(&plan),
             "the archived session root still requires the verified bundle"
         );
+        let restored_ref = "refs/heads/aethyme-recovery-bundle-test";
+        let bundle_path = outcome.archive.join(BUNDLE_FILE);
+        let source_refspec = format!("{branch_ref}:{restored_ref}");
+        let restored = isolated_git_output(
+            &repository,
+            &[
+                "fetch",
+                "--no-tags",
+                bundle_path.to_str().unwrap(),
+                source_refspec.as_str(),
+            ],
+        );
+        assert!(
+            restored.status.success(),
+            "could not restore the archived root after pruning: {}",
+            String::from_utf8_lossy(&restored.stderr)
+        );
+        assert_eq!(
+            git_output(&repository, &["rev-parse", "--verify", restored_ref]),
+            head
+        );
     }
 
     #[test]
@@ -6639,6 +6875,50 @@ mod tests {
             "a conflicting-pin archive must remain outside owned GC deletion candidates"
         );
         assert!(outcome.archive.is_dir());
+    }
+
+    #[test]
+    fn copied_v6_archive_is_unowned_and_blocks_shared_pin_release() {
+        let (_owner, repository, _storage, mut broker, session, _worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("retirement duplicate archive pin use");
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        let outcome = broker
+            .cleanup_resolve_retirement_apply(session.id, &plan.digest, false)
+            .unwrap();
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        let owned = broker.owned_recovery_archive(&outcome.archive).unwrap();
+        let copied_archive = outcome.archive.with_file_name(format!(
+            "{}-copy",
+            outcome
+                .archive
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap()
+        ));
+        copy_archive_tree(&outcome.archive, &copied_archive).unwrap();
+        let copy_error = broker.owned_recovery_archive(&copied_archive).unwrap_err();
+        assert!(
+            copy_error.contains("canonical retirement identity"),
+            "a renamed copy cannot become a second owned archive: {copy_error}"
+        );
+
+        std::fs::remove_dir_all(&outcome.archive).unwrap();
+        let release_error = broker
+            .release_recovery_archive_prerequisite_refs_after_removal(&owned)
+            .unwrap_err();
+        assert!(
+            release_error.contains("also references prerequisite"),
+            "refs used by a sibling archive must be retained: {release_error}"
+        );
+        assert!(copied_archive.is_dir());
+        for pin in &owned.prerequisite_refs {
+            assert_eq!(
+                git_output(&repository, &["rev-parse", "--verify", &pin.ref_name]),
+                pin.object_id
+            );
+        }
     }
 
     #[test]
