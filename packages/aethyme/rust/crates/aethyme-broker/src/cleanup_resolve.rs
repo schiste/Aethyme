@@ -42,7 +42,7 @@ const PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 2;
 const PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 3;
 const RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 4;
 const RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 5;
-const RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION: u32 = 1;
+const RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION: u32 = 2;
 const RETIREMENT_ARCHIVE_RECORD_FILE: &str = "retirement.json";
 const MAX_RETIREMENT_ARCHIVE_RECORD_BYTES: u64 = 64 * 1024;
 const MIN_RECOVERY_ARCHIVE_RETENTION_MS: u64 = 15 * 24 * 60 * 60 * 1_000;
@@ -296,9 +296,38 @@ pub struct RecoveryRootProof {
     pub available_from_delivery: bool,
 }
 
-/// Retirement confirmations wrap the existing content digest with the
-/// archive schema, immutable retention floor, origin, explicit opt-in and
-/// exact delivery-availability classification for every recovery root.
+/// Stable source identity for restarting owned partial staging when only
+/// the delivery snapshot has advanced. It intentionally excludes delivery
+/// targets and root availability, but binds the source files and root OIDs.
+#[derive(serde::Serialize)]
+struct RetirementContentIdentityInputV1<'a> {
+    schema_version: u32,
+    recovery_archive_schema_version: u32,
+    session_id: i64,
+    repository_path: &'a str,
+    worktree_path: &'a str,
+    target_origin: &'a str,
+    allow_adopted: bool,
+    minimum_archive_retention_ms: u64,
+    owner_witness_sha256: Option<&'a str>,
+    branch_ref: &'a str,
+    branch_tip: Option<&'a str>,
+    checkout_branch_ref: Option<&'a str>,
+    checkout_branch_tip: Option<&'a str>,
+    head: &'a str,
+    staged_patch_bytes: u64,
+    staged_patch_sha256: &'a str,
+    unstaged_patch_bytes: u64,
+    unstaged_patch_sha256: &'a str,
+    untracked_files: &'a [ArchivedFile],
+    untracked_bytes: u64,
+    ignored_paths: &'a [IgnoredPath],
+    ignored_files: &'a [ArchivedFile],
+    ignored_bytes: u64,
+    ignored_policy_sha256: &'a str,
+    recovery_root_identities: Vec<(&'a str, &'a str)>,
+}
+
 #[derive(serde::Serialize)]
 struct RetirementDigestInputV1<'a> {
     content_digest: &'a str,
@@ -321,6 +350,7 @@ struct RetirementArchiveRecord {
     allow_adopted: bool,
     minimum_archive_retention_ms: u64,
     archive_created_at_ms: i64,
+    content_identity_sha256: String,
     owner_witness_sha256: Option<String>,
     delivery_targets_sha256: String,
     worktree_path: String,
@@ -1877,12 +1907,12 @@ impl Broker {
                                 .map_err(|error| io_error(&archive, error))?;
                         }
                         Err(verification_error) => {
-                            verify_retirement_archive_record_for_plan(&partial_path, &plan)
+                            verify_retirement_archive_record_for_content_identity(&partial_path, &plan)
                                 .map_err(|marker_error| BrokerOpError::RecoveryArchiveUnverified {
                                     id: session_id,
                                     path: partial_path.to_string_lossy().into_owned(),
                                     reason: format!(
-                                        "incomplete retirement staging is not proven to belong to the current plan; it was retained: {verification_error}; {marker_error}"
+                                        "incomplete retirement staging is not proven to belong to the current source identity; it was retained: {verification_error}; {marker_error}"
                                     ),
                                 })?;
                             let revalidation_context =
@@ -2264,6 +2294,56 @@ fn known_recovery_archive_payload_bytes(plan: &CleanupResolvePlan) -> Result<u64
     Ok(total)
 }
 
+fn retirement_content_identity_sha256(plan: &CleanupResolvePlan) -> Result<String, String> {
+    let minimum_archive_retention_ms = plan
+        .minimum_archive_retention_ms
+        .ok_or_else(|| "retirement plan has no immutable archive retention floor".to_owned())?;
+    let allow_adopted = plan
+        .retirement_allow_adopted
+        .ok_or_else(|| "retirement plan has no explicit adopted-origin mode".to_owned())?;
+    let authorization_ignored_paths = authorization_ignored_paths(&plan.ignored_paths);
+    let mut recovery_root_identities = plan
+        .recovery_root_proofs
+        .iter()
+        .map(|proof| (proof.ref_name.as_str(), proof.object_id.as_str()))
+        .collect::<Vec<_>>();
+    recovery_root_identities.sort_unstable();
+    recovery_root_identities.dedup();
+    let input = RetirementContentIdentityInputV1 {
+        schema_version: CLEANUP_RESOLVE_SCHEMA_VERSION,
+        recovery_archive_schema_version: plan.recovery_archive_schema_version,
+        session_id: plan.session_id,
+        repository_path: &plan.repository_path,
+        worktree_path: &plan.worktree_path,
+        target_origin: plan.target_origin.as_str(),
+        allow_adopted,
+        minimum_archive_retention_ms,
+        owner_witness_sha256: plan.retirement_witness_sha256.as_deref(),
+        branch_ref: &plan.branch_ref,
+        branch_tip: plan.branch_tip.as_deref(),
+        checkout_branch_ref: plan.checkout_branch_ref.as_deref(),
+        checkout_branch_tip: plan.checkout_branch_tip.as_deref(),
+        head: &plan.head,
+        staged_patch_bytes: plan.staged_patch_bytes,
+        staged_patch_sha256: &plan.staged_patch_sha256,
+        unstaged_patch_bytes: plan.unstaged_patch_bytes,
+        unstaged_patch_sha256: &plan.unstaged_patch_sha256,
+        untracked_files: &plan.untracked_files,
+        untracked_bytes: plan.untracked_bytes,
+        ignored_paths: &authorization_ignored_paths,
+        ignored_files: &plan.ignored_files,
+        ignored_bytes: plan.ignored_bytes,
+        ignored_policy_sha256: &plan.ignored_policy_sha256,
+        recovery_root_identities,
+    };
+    let bytes = serde_json::to_vec(&input)
+        .map_err(|error| format!("cannot encode retirement content identity: {error}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"aethyme-cleanup-retirement-content-v1\0");
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn retirement_archive_record_for_plan(
     plan: &CleanupResolvePlan,
     archive_created_at_ms: i64,
@@ -2282,6 +2362,7 @@ fn retirement_archive_record_for_plan(
         allow_adopted,
         minimum_archive_retention_ms,
         archive_created_at_ms,
+        content_identity_sha256: retirement_content_identity_sha256(plan)?,
         owner_witness_sha256: plan.retirement_witness_sha256.clone(),
         delivery_targets_sha256: delivery_targets_sha256(&plan.delivery_targets)?,
         worktree_path: plan.worktree_path.clone(),
@@ -2328,6 +2409,7 @@ fn validate_retirement_archive_record_fields(
         || (record.target_origin == "adopted" && !record.allow_adopted)
         || record.minimum_archive_retention_ms < MIN_RECOVERY_ARCHIVE_RETENTION_MS
         || record.archive_created_at_ms < 0
+        || !valid_sha256(&record.content_identity_sha256)
         || record
             .owner_witness_sha256
             .as_deref()
@@ -2377,6 +2459,32 @@ fn verify_retirement_archive_record_for_plan(
     let expected = retirement_archive_record_for_plan(plan, actual.archive_created_at_ms)?;
     if actual != expected {
         return Err("retirement record does not match the reviewed plan".into());
+    }
+    Ok(())
+}
+
+fn verify_retirement_archive_record_for_content_identity(
+    root: &Path,
+    plan: &CleanupResolvePlan,
+) -> Result<(), String> {
+    let (actual, _) = read_retirement_archive_record(root)?;
+    let mut expected = retirement_archive_record_for_plan(plan, actual.archive_created_at_ms)?;
+    let mut actual = actual;
+    // A target may advance while a verified incomplete staging directory is
+    // waiting for its next attempt. Its delivery envelope must be rebuilt, but
+    // the archive directory is ours to restart only if its source identity is
+    // unchanged. The refreshed delivery vectors remain covered by the normal
+    // exact-plan confirmation below before any source mutation.
+    actual.plan_digest.clear();
+    expected.plan_digest.clear();
+    actual.delivery_targets_sha256.clear();
+    expected.delivery_targets_sha256.clear();
+    actual.recovery_root_proofs_sha256.clear();
+    expected.recovery_root_proofs_sha256.clear();
+    if actual != expected {
+        return Err(
+            "retirement staging record does not match the current source content identity".into(),
+        );
     }
     Ok(())
 }
@@ -2519,6 +2627,22 @@ fn validate_root_proof_delivery_availability(
         if available != proof.available_from_delivery {
             return Err(format!(
                 "schema v5 recovery root {} has an incorrect delivery-availability proof",
+                proof.ref_name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_available_root_proofs_from_delivery(
+    repository: &GitRepo,
+    delivery_targets: &[String],
+    proofs: &[RecoveryRootProof],
+) -> Result<(), String> {
+    for proof in proofs.iter().filter(|proof| proof.available_from_delivery) {
+        if !root_available_from_delivery(repository, &proof.object_id, delivery_targets)? {
+            return Err(format!(
+                "schema v5 recovery root {} is marked available but is not held by its recorded delivery targets",
                 proof.ref_name
             ));
         }
@@ -3463,13 +3587,6 @@ impl Broker {
         verify_recovery_archive_tree(dir, &manifest)?;
         if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
             verify_retirement_archive_record_for_manifest(dir, &manifest)?;
-            validate_root_proof_delivery_availability(
-                self.repo_handle(),
-                &manifest.delivery_targets,
-                manifest.recovery_root_proofs.as_deref().ok_or_else(|| {
-                    "schema v5 archive is missing its recovery root proofs".to_owned()
-                })?,
-            )?;
         }
         if !same_path(Path::new(&manifest.repository), self.main_root()) {
             return Err(format!(
@@ -3487,6 +3604,25 @@ impl Broker {
                 "session {} ran on {}, not {}",
                 manifest.session_id, session.branch, manifest.branch_ref
             ));
+        }
+        if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+            let proofs = manifest.recovery_root_proofs.as_deref().ok_or_else(|| {
+                "schema v5 archive is missing its recovery root proofs".to_owned()
+            })?;
+            validate_available_root_proofs_from_delivery(
+                self.repo_handle(),
+                &manifest.delivery_targets,
+                proofs,
+            )?;
+            let bundled_roots = recovery_bundle_roots_from_manifest(&manifest)?;
+            if !bundled_roots.is_empty() {
+                verify_recovery_bundle(
+                    self.repo_handle(),
+                    &dir.join(BUNDLE_FILE),
+                    &bundled_roots,
+                    recovery_bundle_deadline()?,
+                )?;
+            }
         }
         let recovery_roots =
             if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
@@ -4676,6 +4812,46 @@ mod tests {
         assert!(status.success(), "git {args:?}");
     }
 
+    fn isolated_git_output(dir: &Path, args: &[&str]) -> std::process::Output {
+        let mut command = Command::new("git");
+        command
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_GRAFT_FILE");
+        for name in [
+            "GIT_DIR",
+            "GIT_COMMON_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_OBJECT_DIRECTORY_RELATIVE",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_SHALLOW_FILE",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_PREFIX",
+            "GIT_CONFIG",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+        ] {
+            command.env_remove(name);
+        }
+        for (name, _) in std::env::vars_os() {
+            let name = name.to_string_lossy();
+            if name.starts_with("GIT_CONFIG_KEY_") || name.starts_with("GIT_CONFIG_VALUE_") {
+                command.env_remove(name.as_ref());
+            }
+        }
+        command.output().unwrap()
+    }
+
     fn git_output(dir: &Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
             .args(args)
@@ -5176,6 +5352,254 @@ mod tests {
             available_from_delivery: true,
         }]);
         assert!(broker.recovery_archive_landed(&legacy_archive));
+    }
+
+    fn interrupt_retirement_bundle_write(
+        _checkout: &GitRepo,
+        _delivery_targets: &[String],
+        _additional_roots: &[String],
+        _max_bytes: u64,
+        _deadline: Instant,
+        file: &mut std::fs::File,
+    ) -> Result<u64, String> {
+        file.write_all(b"interrupted bundle staging")
+            .map_err(|error| format!("cannot write interrupted test bundle: {error}"))?;
+        Err("simulated interrupted retirement bundle write".into())
+    }
+
+    #[test]
+    fn retirement_partial_restarts_after_delivery_only_change() {
+        let (_owner, repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("retirement partial delivery refresh");
+        let original_plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        let original_content_identity = retirement_content_identity_sha256(&original_plan).unwrap();
+        let error = broker
+            .cleanup_resolve_apply_with_bundle_writer_mode(
+                session.id,
+                &original_plan.digest,
+                || panic!("interrupted staging must fail before archive verification"),
+                sync_archive_directory,
+                |_, _| {
+                    Some(crate::disk_headroom::DiskHeadroom {
+                        bytes: u64::MAX,
+                        inodes: None,
+                    })
+                },
+                true,
+                false,
+                None,
+                None,
+                None,
+                RecoveryBundleWriter {
+                    max_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+                    write_to: interrupt_retirement_bundle_write,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("simulated interrupted retirement bundle write"),
+            "{error}"
+        );
+
+        let partial = original_plan
+            .archive_root
+            .join(format!("{}.retirement.partial", session.id));
+        assert!(partial.is_dir());
+        assert!(!partial.join(MANIFEST_FILE).exists());
+        let (mut partial_record, _) = read_retirement_archive_record(&partial).unwrap();
+        assert_eq!(
+            partial_record.content_identity_sha256,
+            original_content_identity
+        );
+        let old_partial_time = now_ms() - 20 * 24 * 60 * 60 * 1_000;
+        partial_record.archive_created_at_ms = old_partial_time;
+        std::fs::write(
+            partial.join(RETIREMENT_ARCHIVE_RECORD_FILE),
+            serde_json::to_vec(&partial_record).unwrap(),
+        )
+        .unwrap();
+
+        let merge = isolated_git_output(&repository, &["merge", "--ff-only", &session.branch]);
+        assert!(
+            merge.status.success(),
+            "could not advance delivery target: {}",
+            String::from_utf8_lossy(&merge.stderr)
+        );
+        let refreshed_plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        assert_ne!(original_plan.digest, refreshed_plan.digest);
+        assert_eq!(
+            retirement_content_identity_sha256(&refreshed_plan).unwrap(),
+            original_content_identity
+        );
+        assert!(
+            refreshed_plan
+                .recovery_root_proofs
+                .iter()
+                .all(|root| root.available_from_delivery)
+        );
+
+        let outcome = broker
+            .cleanup_resolve_retirement_apply(session.id, &refreshed_plan.digest, false)
+            .unwrap();
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        assert!(!worktree.exists());
+        assert!(!partial.exists());
+        assert!(!outcome.archive.join(BUNDLE_FILE).exists());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.archive.join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        assert!(manifest["created_at_ms"].as_i64().unwrap() > old_partial_time);
+        let final_record = read_retirement_archive_record(&outcome.archive).unwrap().0;
+        assert_eq!(
+            final_record.content_identity_sha256,
+            original_content_identity
+        );
+        assert!(
+            now_ms().saturating_sub(final_record.archive_created_at_ms)
+                < i64::try_from(final_record.minimum_archive_retention_ms).unwrap(),
+            "restarting an old partial must assign the rebuilt archive a fresh retention age"
+        );
+    }
+
+    #[test]
+    fn retirement_content_identity_ignores_disposable_directory_churn_but_binds_files() {
+        let (_owner, _repository, _storage, mut broker, session, _worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("retirement source identity classification");
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        let original = retirement_content_identity_sha256(&plan).unwrap();
+
+        let mut with_disposable_directory = plan.clone();
+        with_disposable_directory.ignored_paths.push(IgnoredPath {
+            path: "target/generated".into(),
+            classification: IgnoredPathClassification::DisposableDirectory,
+        });
+        assert_eq!(
+            retirement_content_identity_sha256(&with_disposable_directory).unwrap(),
+            original,
+            "policy-authorized disposable directory churn must not strand staging"
+        );
+
+        let file = ArchivedFile {
+            path: "credentials.txt".into(),
+            bytes: 6,
+            sha256: sha256_hex(b"secret"),
+            symlink: false,
+            mode: Some(0o600),
+        };
+        let mut with_preserved_file = with_disposable_directory;
+        with_preserved_file.ignored_files.push(file);
+        let file_identity = retirement_content_identity_sha256(&with_preserved_file).unwrap();
+        assert_ne!(file_identity, original);
+        with_preserved_file.ignored_files[0].sha256 = sha256_hex(b"changed");
+        assert_ne!(
+            retirement_content_identity_sha256(&with_preserved_file).unwrap(),
+            file_identity,
+            "preserved ignored-file content changes must block partial restart"
+        );
+    }
+
+    #[test]
+    fn v5_bundle_keeps_pruned_unavailable_roots_owned_and_checks_bundle_membership() {
+        let (_owner, repository, _storage, mut broker, session, worktree, _base, head, branch) =
+            closed_unique_commit_fixture("retirement archive survives source pruning");
+        std::fs::remove_file(worktree.join("preserve.txt")).unwrap();
+
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        assert!(
+            plan.recovery_root_proofs
+                .iter()
+                .any(|root| root.object_id == head && !root.available_from_delivery)
+        );
+        let outcome = broker
+            .cleanup_resolve_retirement_apply(session.id, &plan.digest, false)
+            .unwrap();
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        assert!(!worktree.exists());
+
+        let expire =
+            isolated_git_output(&repository, &["reflog", "expire", "--expire=now", "--all"]);
+        assert!(
+            expire.status.success(),
+            "{}",
+            String::from_utf8_lossy(&expire.stderr)
+        );
+        let gc = isolated_git_output(&repository, &["gc", "--prune=now"]);
+        assert!(
+            gc.status.success(),
+            "{}",
+            String::from_utf8_lossy(&gc.stderr)
+        );
+        let branch_ref = format!("refs/heads/{branch}");
+        let branch = isolated_git_output(
+            &repository,
+            &["show-ref", "--verify", "--quiet", &branch_ref],
+        );
+        assert!(
+            !branch.status.success(),
+            "retirement should remove its matching branch ref"
+        );
+        let missing = isolated_git_output(&repository, &["cat-file", "-e", &head]);
+        assert!(
+            !missing.status.success(),
+            "the source object should be unreachable and pruned before the ownership check"
+        );
+
+        let archived = broker.owned_recovery_archive(&outcome.archive).unwrap();
+        assert!(
+            archived
+                .recovery_roots
+                .iter()
+                .any(|root| root.object_id == head && !root.available_from_delivery)
+        );
+        assert!(!broker.recovery_archive_landed(&archived));
+        assert!(
+            now_ms().saturating_sub(archived.created_at_ms)
+                < i64::try_from(archived.minimum_archive_retention_ms.unwrap()).unwrap(),
+            "the recently created archive must remain inside its immutable minimum age"
+        );
+        let inventory = broker.recovery_archives().unwrap();
+        assert_eq!(inventory.owned.len(), 1, "{inventory:?}");
+        assert!(inventory.unowned.is_empty(), "{inventory:?}");
+
+        let replacement_bundle = _owner.path().join("bundle-without-retirement-root");
+        let bundle = isolated_git_output(
+            &repository,
+            &[
+                "bundle",
+                "create",
+                replacement_bundle.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        assert!(
+            bundle.status.success(),
+            "could not create the incomplete replacement bundle: {}",
+            String::from_utf8_lossy(&bundle.stderr)
+        );
+        let bundle_path = outcome.archive.join(BUNDLE_FILE);
+        std::fs::copy(&replacement_bundle, &bundle_path).unwrap();
+        let bundle_bytes = std::fs::read(&bundle_path).unwrap();
+        let manifest_path = outcome.archive.join(MANIFEST_FILE);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["bundle_bytes"] = serde_json::json!(bundle_bytes.len() as u64);
+        manifest["bundle_sha256"] = serde_json::json!(sha256_hex(&bundle_bytes));
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = broker.owned_recovery_archive(&outcome.archive).unwrap_err();
+        assert!(error.contains("does not hold"), "{error}");
     }
 
     #[test]
