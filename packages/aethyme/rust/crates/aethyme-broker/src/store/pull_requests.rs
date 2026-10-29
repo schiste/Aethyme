@@ -1343,11 +1343,13 @@ impl BrokerStore {
                 None,
                 now,
                 release_reason,
+                false,
             )?;
             tx.execute(
                 "UPDATE leases SET released_at = ?3
-                 WHERE session_id = ?1 AND path = ?2 AND released_at IS NULL",
-                params![holder_session_id, lease_path, now],
+                 WHERE session_id = ?1 AND path = ?2 AND released_at IS NULL
+                   AND (expires_at IS NULL OR expires_at > ?4)",
+                params![holder_session_id, lease_path, now, now],
             )?;
         }
         let outcome_payload =

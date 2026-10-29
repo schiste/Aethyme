@@ -372,8 +372,9 @@ const SESSION_SELECT: &str = "SELECT id, worktree_path, branch, origin, status, 
 
 /// Record one `lease.released` event per unreleased lease for `session_id`
 /// (optionally scoped by path and kind), naming its generation and reason.
-/// Expired rows carry their effective expiry time even when cleanup observes
-/// them later, so they remain ordered with other terminal events.
+/// Expired rows carry their effective expiry time when included; request
+/// acknowledgements exclude them because they no longer block the requested
+/// path.
 fn record_lease_releases_in_tx(
     tx: &rusqlite::Transaction<'_>,
     session_id: i64,
@@ -381,6 +382,7 @@ fn record_lease_releases_in_tx(
     kind: Option<&str>,
     now: i64,
     reason: &str,
+    include_expired: bool,
 ) -> Result<Vec<i64>, BrokerError> {
     let held: Vec<(i64, String, i64, Option<i64>)> = {
         let mut stmt = tx.prepare(
@@ -388,11 +390,13 @@ fn record_lease_releases_in_tx(
              WHERE session_id = ?1 AND released_at IS NULL
                AND (?2 IS NULL OR path = ?2)
                AND (?3 IS NULL OR kind = ?3)
+               AND (?4 != 0 OR expires_at IS NULL OR expires_at > ?5)
              ORDER BY id",
         )?;
-        stmt.query_map(params![session_id, path, kind], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?
+        stmt.query_map(
+            params![session_id, path, kind, include_expired, now],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?
         .collect::<Result<_, _>>()?
     };
     let mut ids = Vec::with_capacity(held.len());
@@ -428,7 +432,7 @@ fn release_session_leases_in_tx(
     now: i64,
     reason: &str,
 ) -> Result<(), BrokerError> {
-    record_lease_releases_in_tx(tx, session_id, None, None, now, reason)?;
+    record_lease_releases_in_tx(tx, session_id, None, None, now, reason, true)?;
     tx.execute("DELETE FROM leases WHERE session_id = ?1", [session_id])?;
     Ok(())
 }
