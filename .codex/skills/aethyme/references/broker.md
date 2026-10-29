@@ -110,6 +110,13 @@ blocked.
    mean it failed. Before editing, confirm the session's reported repository
    and worktree root match the repository you intended.
 
+   A broker command's wall-clock duration is end-to-end; it does not measure
+   any one phase. Preserve the complete command output and use `phase_timings_ms`
+   when available. Phase timings can overlap, and time the broker does not
+   report is unknown: do not assign it to fetch, lock wait, checkout creation,
+   or another phase. If displayed output is truncated, inspect the saved full
+   output before drawing timing conclusions.
+
    `cd` into the reported worktree before editing. If you are already in a
    dedicated worktree, use
    `aethyme broker start --adopt --task "<your task>" --short-name "<short name>" --path <planned-path>` instead.
