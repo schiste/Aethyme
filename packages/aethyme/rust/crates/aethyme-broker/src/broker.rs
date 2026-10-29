@@ -1038,6 +1038,12 @@ pub struct AdoptReport {
     pub carried_ownership: Option<AdoptCarriedOwnership>,
 }
 
+/// Internal timing transport keeps the public library report structs stable.
+pub(crate) struct TimedStartReport<T> {
+    pub report: T,
+    pub phase_timings_ms: std::collections::BTreeMap<String, u64>,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct StartReport {
     #[serde(flatten)]
