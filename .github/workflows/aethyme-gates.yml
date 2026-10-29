@@ -66,20 +66,6 @@ jobs:
         with:
           toolchain: stable
 
-      # This job is on the release path (a release is tagged only on a commit
-      # whose gates passed) and used to build everything from scratch.
-      # rust-cache keeps third-party dependencies only and rebuilds the
-      # workspace's own crates, so a restore never stands in for compiling the
-      # code under test.
-      - name: Cache the aethyme release build
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          workspaces: packages/aethyme/rust
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Build aethyme binary
-        run: cargo build --locked --release --manifest-path packages/aethyme/rust/Cargo.toml --bin aethyme
-
       # The cargo-test gate runs the workspace suite under nextest when it is
       # on PATH (`.aethyme/gates.toml`); under `cargo test` that gate took
       # about 17 minutes here. Same pinned version as oss-ci.yml.
@@ -108,6 +94,18 @@ jobs:
           key: aethyme-gate-cache-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('packages/aethyme/rust/Cargo.lock') }}
           restore-keys: |
             aethyme-gate-cache-${{ runner.os }}-${{ steps.toolchain.outputs.cachekey }}-
+
+      # Build the router with the same dev profile and managed target directory
+      # used by cross-process-contract, so that gate reuses these compiled
+      # workspace crates instead of rebuilding them inside its timeout.
+      - name: Build aethyme in the gates' managed cache
+        env:
+          CHAU7_CTO_OPTIM_ACTIVE: "1"
+          CARGO_INCREMENTAL: "0"
+          CARGO_BUILD_JOBS: "1"
+          CARGO_PROFILE_DEV_DEBUG: "1"
+          CARGO_TARGET_DIR: ${{ env.GATE_CACHE_DIR }}
+        run: cargo build --locked --manifest-path packages/aethyme/rust/Cargo.toml --bin aethyme
 
       # A merge commit whose tree a pull-request run already tested
       # (OSS CI's record-tested-tree job, after the workspace suite and the
@@ -149,7 +147,7 @@ jobs:
           COVERED_BY_PR_SUITE: "cargo-test fast-guards workflow-contract gate-policy"
         run: |
           set -euo pipefail
-          aethyme=packages/aethyme/rust/target/release/aethyme
+          aethyme="$GATE_CACHE_DIR/debug/aethyme"
           if [ -z "${TESTED_BY_RUN:-}" ]; then
             exec "$aethyme" broker advanced gates run --all
           fi
