@@ -16,12 +16,32 @@ version and the target, oldest first. Each schema migration runs on first open
 and is one-way, so rollback is limited to the oldest binary that still reads
 the newest schema you have opened.
 
-Breaking releases: [v0.8.47](#v0847), [v0.8.44](#v0844), [v0.8.43](#v0843), [v0.8.42](#v0842), [v0.8.41](#v0841), [v0.8.40](#v0840), [v0.8.38](#v0838), [v0.8.37](#v0837), [v0.8.33](#v0833), [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
+Breaking releases: [v0.8.48](#v0848), [v0.8.47](#v0847), [v0.8.44](#v0844), [v0.8.43](#v0843), [v0.8.42](#v0842), [v0.8.41](#v0841), [v0.8.40](#v0840), [v0.8.38](#v0838), [v0.8.37](#v0837), [v0.8.33](#v0833), [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
 [v0.7.25](#v0725), [v0.7.23](#v0723), [v0.7.22](#v0722), [v0.7.19](#v0719),
 [v0.7.18](#v0718), [v0.7.16](#v0716), [v0.7.9](#v079), [v0.7.8](#v078),
 [v0.7.4](#v074), [v0.7.2](#v072),
 [v0.7.1](#v071), [v0.5.0](#v050), [v0.3.0](#v030),
 [v0.2.2](#v022), [v0.2.0](#v020).
+
+## v0.8.48
+
+### Compatibility
+
+New retirement archives use manifest schema 6 and receipt schema 3. Schemas 1–5 remain readable. Earlier strict readers retain schema-6 archives as unsupported; they cannot validate or reclaim them. No broker database compatibility-floor change is introduced by this archive format. Recreate retirement plans after upgrading: the stable confirmation binds preserved content and ownership while allowing forward delivery progress.
+
+Incremental bundles require their prerequisite objects in the owning repository. New repository-local prerequisite refs keep those objects reachable after checkout removal. Preserve these refs and the archives together; copying a bundle alone does not make it self-contained. GC removes exact pins only after complete archive removal and a complete sibling-reference scan. An interruption or uncertain scan retains pins, including possible orphan pins after a crash.
+
+### Migrate and verify
+
+Install the matching signed router/engine pair. Preserve existing archives, repository policy and the fifteen-day minimum recovery floor. Check both actual executable identities before creating a new exact-target retirement plan. Apply only the reviewed confirmation and verify each target reports checkout removal; successful archive creation alone does not establish reclaimed storage.
+
+The separate host-scoped `environments.db` advances to schema 2, adding the recorded primary root needed for orphan teardown; the repository broker and host resource databases do not change schema in this release. Back up this environment store before its first upgraded open. Older strict environment readers refuse the new version.
+
+Environment lifecycle improvements share per-environment operation ownership and retain unresolved resource obligations. Do not bypass a teardown refusal by manually releasing its capacity or namespace lease. Explicit abandonment remains an audited operator decision.
+
+### Rollback
+
+Older binaries cannot operate on schema-6 recovery archives. Keep them and their prerequisite refs intact, settle new environment lifecycle operations, and avoid concurrent old lifecycle clients. Do not rewrite archive or database schema markers to permit an older reader.
 
 ## v0.8.47
 

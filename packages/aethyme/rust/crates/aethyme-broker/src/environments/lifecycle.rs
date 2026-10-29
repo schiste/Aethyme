@@ -156,6 +156,14 @@ pub(super) fn bindings_from(
 }
 
 impl Lifecycle {
+    pub(super) fn operation_lock(
+        &self,
+        env_id: &str,
+    ) -> Result<crate::file_lock::ExclusiveFileLock, LifecycleError> {
+        crate::file_lock::try_acquire_environment_operation_lock(&self.root, env_id)
+            .map_err(|error| LifecycleError::Io(error.to_string()))
+    }
+
     pub(super) fn context<'a>(
         &self,
         environment: &'a CompiledEnvironment,
@@ -240,6 +248,18 @@ impl Lifecycle {
         session_id: Option<i64>,
         options: &UpOptions,
     ) -> Result<EnvironmentRecord, LifecycleError> {
+        let _operation = self.operation_lock(&snapshot.env_id)?;
+        self.up_locked(snapshot, worktree, main_root, session_id, options)
+    }
+
+    fn up_locked(
+        &mut self,
+        snapshot: &CompiledEnvironment,
+        worktree: &Path,
+        main_root: Option<&Path>,
+        session_id: Option<i64>,
+        options: &UpOptions,
+    ) -> Result<EnvironmentRecord, LifecycleError> {
         let mut record = self.store.register(snapshot, Some(worktree), session_id)?;
         if let Some(main_root) = main_root {
             self.store.set_main_root(&record.env_id, main_root)?;
@@ -250,8 +270,22 @@ impl Lifecycle {
                     env_id: record.env_id,
                 });
             }
-            self.down(&record.env_id, None)?;
+            self.down_locked(&record.env_id, None)?;
             record = self.store.register(snapshot, Some(worktree), session_id)?;
+        }
+        if record.phase == EnvironmentPhase::Failed
+            && (record.capacity_lease_id.is_some()
+                || self
+                    .store
+                    .components(&record.env_id)?
+                    .iter()
+                    .any(|component| component.identity.is_some()))
+        {
+            return Err(LifecycleError::WrongPhase {
+                env_id: record.env_id,
+                phase: "failed",
+                next: "run `aethyme env destroy <id> --retry` to settle the previous attempt before retrying up".into(),
+            });
         }
         match record.phase {
             EnvironmentPhase::Active => {
@@ -260,7 +294,7 @@ impl Lifecycle {
             }
             EnvironmentPhase::Planned | EnvironmentPhase::Failed => {}
             // `up` is "make sure it is up": a parked environment is woken.
-            EnvironmentPhase::Parked => return self.wake(&record.env_id, options.wait),
+            EnvironmentPhase::Parked => return self.wake_locked(&record.env_id, options.wait),
             other => {
                 return Err(LifecycleError::WrongPhase {
                     env_id: record.env_id,
@@ -593,48 +627,62 @@ impl Lifecycle {
         failed: &str,
         error: DriverError,
     ) -> Result<EnvironmentRecord, LifecycleError> {
-        // Never leave an environment half-up: stop what started, release
-        // capacity, keep provisioned data for a retry or `env down`.
+        // Stop every component whose start returned an identity. Confirmed
+        // stops can be settled; a failed stop keeps its exact identity and
+        // running phase so `env down` can retry without losing ownership.
+        let mut rollback_errors = Vec::new();
         for (name, identity) in started.iter().rev() {
             if let Some(component) = snapshot.components.iter().find(|c| &c.name == name) {
                 let ctx = self.context(snapshot, component, bindings, 1);
-                if let Err(stop) = driver_for(component.runtime).stop(&ctx, identity) {
-                    append_log(
-                        &ctx.log(),
-                        &format!("[aethyme] rollback stop failed: {stop}\n"),
-                    );
+                match driver_for(component.runtime).stop(&ctx, identity) {
+                    Ok(()) => self.component_to(
+                        &record.env_id,
+                        name,
+                        &[
+                            ManagedServicePhase::RemovalPending,
+                            ManagedServicePhase::Removed,
+                            ManagedServicePhase::Settled,
+                        ],
+                        None,
+                        None,
+                    )?,
+                    Err(stop) => {
+                        append_log(
+                            &ctx.log(),
+                            &format!("[aethyme] rollback stop failed: {stop}\n"),
+                        );
+                        rollback_errors.push(json!({
+                            "component": name,
+                            "code": stop.code(),
+                            "message": stop.to_string(),
+                        }));
+                    }
                 }
             }
         }
-        let mut settle = started
-            .iter()
-            .map(|(name, _)| name.clone())
-            .collect::<Vec<_>>();
-        settle.push(failed.to_string());
-        settle.dedup();
-        for name in &settle {
-            // Components that never started stay `created`: their provisioned
-            // data is kept for a retry or `env down`.
-            crate::warn_unrecorded(
-                &format!("record {name} as stopped"),
-                self.component_to(
-                    &record.env_id,
-                    name,
-                    &[
-                        ManagedServicePhase::RemovalPending,
-                        ManagedServicePhase::Removed,
-                        ManagedServicePhase::Settled,
-                    ],
-                    None,
-                    None,
-                ),
-            );
+        if !started.iter().any(|(name, _)| name == failed) {
+            // The failing component never produced an identity; keep its
+            // provisioned data but settle its start attempt for retry/down.
+            self.component_to(
+                &record.env_id,
+                failed,
+                &[
+                    ManagedServicePhase::RemovalPending,
+                    ManagedServicePhase::Removed,
+                    ManagedServicePhase::Settled,
+                ],
+                None,
+                None,
+            )?;
         }
-        self.release_capacity(&record.env_id)?;
+        if rollback_errors.is_empty() {
+            self.release_capacity(&record.env_id)?;
+        }
         let detail = json!({
             "code": error.code(),
             "component": failed,
             "message": error.to_string(),
+            "rollback_errors": rollback_errors,
         });
         self.store.set_error(&record.env_id, Some(&detail))?;
         let current = self
@@ -672,6 +720,16 @@ impl Lifecycle {
     /// may have leaked; it exists for resources that are already gone or that
     /// an operator removed by hand.
     pub fn down(
+        &mut self,
+        env_id: &str,
+        abandon: Option<&str>,
+    ) -> Result<EnvironmentRecord, LifecycleError> {
+        let record = self.store.resolve(env_id)?;
+        let _operation = self.operation_lock(&record.env_id)?;
+        self.down_locked(&record.env_id, abandon)
+    }
+
+    fn down_locked(
         &mut self,
         env_id: &str,
         abandon: Option<&str>,
@@ -813,6 +871,21 @@ impl Lifecycle {
         if let Some(root) = &record.worktree_root
             && Path::new(root).is_dir()
         {
+            // A path can be reused after manual checkout removal. Never run
+            // recorded hooks in a replacement repository at the same name.
+            if let Some(main_root) = &record.main_root {
+                let expected = crate::git::GitRepo::worktree_common_dir(Path::new(main_root))
+                    .map_err(|error| format!("cannot verify recorded repository: {error}"))?
+                    .canonicalize()
+                    .map_err(|error| format!("cannot resolve recorded repository: {error}"))?;
+                let actual = crate::git::GitRepo::worktree_common_dir(Path::new(root))
+                    .map_err(|error| format!("cannot verify current worktree: {error}"))?
+                    .canonicalize()
+                    .map_err(|error| format!("cannot resolve current worktree: {error}"))?;
+                if actual != expected {
+                    return Err("worktree path now belongs to a different repository".into());
+                }
+            }
             return Ok((PathBuf::from(root), None));
         }
         let needs_files = record
@@ -947,17 +1020,21 @@ pub(super) fn now_ms() -> i64 {
 
 /// The id of the environment that owns `lease_id`, if any. Generic lease
 /// release and reconcile refuse such leases.
-pub fn environment_owning_lease(store_path: &Path, lease_id: &str) -> Option<String> {
-    let store = EnvironmentStore::open_read_only(store_path).ok()??;
-    store
-        .list(None)
-        .ok()?
+pub fn environment_owning_lease(
+    store_path: &Path,
+    lease_id: &str,
+) -> Result<Option<String>, super::store::StoreError> {
+    let Some(store) = EnvironmentStore::open_read_only(store_path)? else {
+        return Ok(None);
+    };
+    Ok(store
+        .list(None)?
         .into_iter()
         .find(|r| {
             r.reservation_lease_id.as_deref() == Some(lease_id)
                 || r.capacity_lease_id.as_deref() == Some(lease_id)
         })
-        .map(|r| r.env_id)
+        .map(|r| r.env_id))
 }
 
 /// Destroy every live environment of `worktree` before it is removed.
@@ -970,7 +1047,9 @@ pub fn destroy_for_worktree_with(
     worktree: &Path,
 ) -> Result<Vec<String>, String> {
     let fingerprint = crate::console::worktree_fingerprint(worktree);
-    let Ok(Some(reader)) = EnvironmentStore::open_read_only(store_path) else {
+    let Some(reader) =
+        EnvironmentStore::open_read_only(store_path).map_err(|error| error.to_string())?
+    else {
         return Ok(Vec::new());
     };
     let live: Vec<String> = reader
@@ -1010,15 +1089,10 @@ pub fn destroy_for_worktree_with(
 
 /// [`destroy_for_worktree_with`] on the default host paths.
 pub fn destroy_for_worktree(worktree: &Path) -> Result<Vec<String>, String> {
-    let (Ok(store), Ok(host_db), Some(root)) = (
-        super::store::default_store_path(),
-        crate::resources::default_host_resource_db_path(),
-        super::logs::environments_directory(),
-    ) else {
-        return Ok(Vec::new());
-    };
-    if !store.exists() {
-        return Ok(Vec::new());
-    }
+    let store = super::store::default_store_path().map_err(|error| error.to_string())?;
+    let host_db =
+        crate::resources::default_host_resource_db_path().map_err(|error| error.to_string())?;
+    let root = super::logs::environments_directory()
+        .ok_or_else(|| "host state directory is unavailable".to_owned())?;
     destroy_for_worktree_with(&store, &host_db, &root, worktree)
 }

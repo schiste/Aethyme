@@ -20,6 +20,33 @@ struct Host {
     root: PathBuf,
 }
 
+struct ProcessGroupCleanup {
+    pgid: i32,
+    armed: bool,
+}
+
+impl ProcessGroupCleanup {
+    fn new(pgid: i32) -> Self {
+        Self { pgid, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessGroupCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            // SAFETY: the fixture records this process group from its own
+            // component's background child, not from an unrelated process.
+            unsafe {
+                libc::killpg(self.pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 impl Host {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -272,6 +299,128 @@ health = {{ command = 'test -f "{flag}"', timeout_seconds = 1, interval_ms = 50 
         "a later wake succeeds"
     );
     lifecycle.down(&snapshot.env_id, None).unwrap();
+}
+
+#[test]
+fn a_failed_wake_stop_quarantines_identity_and_capacity_for_down_retry() {
+    let host = Host::new();
+    let flags = tempfile::tempdir().unwrap();
+    let orphan_on_wake = flags.path().join("orphan-on-wake");
+    let text = format!(
+        r#"
+schema = 1
+[pools.envs]
+limit = 1
+[[profiles]]
+name = "p"
+units = 1
+[[profiles.components]]
+name = "api"
+runtime = "process"
+env = {{ MARKERS = "{m}" }}
+start = 'if test -f "$MARKERS/orphan-on-wake"; then sleep 300 & echo "$$" > "$MARKERS/leader.pid"; echo "$!" > "$MARKERS/child.pid"; sleep 0.2; else exec sleep 300; fi'
+health = {{ command = 'test ! -f "$MARKERS/orphan-on-wake" || (test -s "$MARKERS/leader.pid" && test -s "$MARKERS/child.pid")', timeout_seconds = 2, interval_ms = 20 }}
+[[profiles.components]]
+name = "worker"
+runtime = "process"
+depends_on = ["api"]
+env = {{ MARKERS = "{m}" }}
+start = 'if test -f "$MARKERS/orphan-on-wake"; then leader=$(cat "$MARKERS/leader.pid"); while kill -0 "$leader" 2>/dev/null; do sleep 0.01; done; exit 9; else exec sleep 300; fi'
+health = {{ command = 'test ! -f "$MARKERS/orphan-on-wake" || false', timeout_seconds = 2, interval_ms = 20 }}
+"#,
+        m = flags.path().display()
+    );
+    let worktree = tempfile::tempdir().unwrap();
+    let snapshot = snapshot(&text, worktree.path());
+    let mut lifecycle = host.lifecycle();
+    let active = lifecycle
+        .up(&snapshot, worktree.path(), None, None, &up_options())
+        .unwrap();
+    lifecycle.park(&active.env_id, "test").unwrap();
+    std::fs::write(&orphan_on_wake, "").unwrap();
+
+    match lifecycle.wake(&active.env_id, Duration::from_secs(2)) {
+        Err(LifecycleError::Driver(error)) => assert_eq!(error.code(), "start_exited"),
+        other => panic!("the worker start should fail after the api leader exits: {other:?}"),
+    }
+    let child_pid: i32 = std::fs::read_to_string(flags.path().join("child.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: the PID came from the background child started by this fixture.
+    let process_group = unsafe { libc::getpgid(child_pid) };
+    assert!(process_group > 0, "fixture child has no process group");
+    let mut cleanup = ProcessGroupCleanup::new(process_group);
+
+    let quarantined = lifecycle.store.get(&active.env_id).unwrap().unwrap();
+    assert_eq!(quarantined.phase, EnvironmentPhase::Quarantined);
+    assert!(quarantined.capacity_lease_id.is_some());
+    assert_eq!(host.capacity_leases(), 1, "rollback keeps capacity leased");
+    assert_eq!(
+        quarantined.last_error.as_ref().unwrap()["component"],
+        "worker"
+    );
+    assert_eq!(
+        quarantined.last_error.as_ref().unwrap()["rollback_errors"][0]["component"],
+        "api"
+    );
+    assert_eq!(
+        quarantined.last_error.as_ref().unwrap()["rollback_errors"][0]["code"],
+        "unproven"
+    );
+
+    let api = lifecycle
+        .store
+        .components(&active.env_id)
+        .unwrap()
+        .into_iter()
+        .find(|component| component.component == "api")
+        .unwrap();
+    assert_eq!(
+        api.phase,
+        crate::managed_services::ManagedServicePhase::Running
+    );
+    let saved_identity = api.identity.clone().expect("running identity retained");
+    let identity: ComponentIdentity = serde_json::from_value(saved_identity.clone()).unwrap();
+    let ComponentIdentity::Process(process) = identity else {
+        panic!("api should have a process identity");
+    };
+    assert_eq!(process.pgid, process_group);
+    assert_eq!(process.observe(), Observation::Unproven);
+
+    assert!(lifecycle.down(&active.env_id, None).is_err());
+    let failed_down = lifecycle.store.get(&active.env_id).unwrap().unwrap();
+    assert_eq!(failed_down.phase, EnvironmentPhase::DestroyFailed);
+    assert_eq!(host.capacity_leases(), 1);
+    let api_after_down = lifecycle
+        .store
+        .components(&active.env_id)
+        .unwrap()
+        .into_iter()
+        .find(|component| component.component == "api")
+        .unwrap();
+    assert_eq!(
+        api_after_down.phase,
+        crate::managed_services::ManagedServicePhase::Running
+    );
+    assert_eq!(api_after_down.identity, Some(saved_identity));
+
+    // SAFETY: the group is the one verified from the retained process identity.
+    unsafe {
+        libc::killpg(process_group, libc::SIGKILL);
+    }
+    for _ in 0..80 {
+        if !super::identity::group_exists(process_group) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(!super::identity::group_exists(process_group));
+    cleanup.disarm();
+    let destroyed = lifecycle.down(&active.env_id, None).unwrap();
+    assert_eq!(destroyed.phase, EnvironmentPhase::Destroyed);
+    assert_eq!(host.capacity_leases(), 0);
 }
 
 #[test]
