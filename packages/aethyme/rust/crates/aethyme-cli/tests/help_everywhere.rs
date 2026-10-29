@@ -111,6 +111,8 @@ const COMMANDS: &[&str] = &[
     "env down",
     "env destroy",
     "env sweep",
+    "env park",
+    "env wake",
     "certify",
     "init",
     "deploy",

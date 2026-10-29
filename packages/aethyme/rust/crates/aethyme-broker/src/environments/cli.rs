@@ -32,6 +32,8 @@ pub const SUPERVISE_SCHEMA: &str = "aethyme.env-supervise/v1";
 pub const UP_SCHEMA: &str = "aethyme.env-up/v1";
 pub const DOWN_SCHEMA: &str = "aethyme.env-down/v1";
 pub const SWEEP_SCHEMA: &str = "aethyme.env-sweep/v1";
+pub const PARK_SCHEMA: &str = "aethyme.env-park/v1";
+pub const WAKE_SCHEMA: &str = "aethyme.env-wake/v1";
 
 pub const USAGE: &str = "\
 aethyme env — declared runnable environments per worktree
@@ -78,6 +80,15 @@ Usage:
       --retry runs destroy again. --abandon releases the leases without
       running destroy and records what may have leaked; use it only for
       resources that are already gone.
+  aethyme env park <id> [--json]
+      Stop every component and return the environment's capacity units to
+      its pool, keeping its namespace, ports and provisioned data. Only an
+      active environment parks; parking a parked one does nothing.
+  aethyme env wake <id> [--wait <seconds>] [--json]
+      Acquire capacity (waiting up to --wait, default 300), start every
+      component and wait for health. Without capacity it stays parked with
+      capacity_timeout; a failed start rolls back to parked. `env up` on a
+      parked environment wakes it.
   aethyme env sweep [--json]
       Destroy environments whose worktree no longer exists (from a
       temporary export of their recorded commit) and retry failed destroys
@@ -141,6 +152,8 @@ pub fn run(args: &[String]) -> u8 {
         "down" => super::operate::run_down(&options),
         "destroy" => super::operate::run_destroy(&options),
         "sweep" => super::operate::run_sweep(&options),
+        "park" => super::operate::run_park(&options),
+        "wake" => super::operate::run_wake(&options),
         other => Err(Failure {
             code: "unknown_subcommand",
             message: format!("unknown env subcommand {other:?}"),
@@ -202,7 +215,7 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
                         .ok_or_else(|| usage("--repo needs a path".into()))?,
                 ))
             }
-            "--wait" if command == "up" => {
+            "--wait" if matches!(command, "up" | "wake") => {
                 options.wait_seconds = number(args.next(), "--wait")? as u64
             }
             "--reconfigure" if command == "up" => options.reconfigure = true,
@@ -228,7 +241,10 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
             "--limit" if command == "history" => options.limit = number(args.next(), "--limit")?,
             positional
                 if !positional.starts_with('-')
-                    && matches!(command, "status" | "history" | "logs" | "down" | "destroy")
+                    && matches!(
+                        command,
+                        "status" | "history" | "logs" | "down" | "destroy" | "park" | "wake"
+                    )
                     && options.positional.len() < if command == "logs" { 2 } else { 1 } =>
             {
                 options.positional.push(positional.to_string())

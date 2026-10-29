@@ -99,7 +99,7 @@ fn grant_path(root: &Path, env_id: &str, name: &str) -> PathBuf {
     root.join(env_id).join(name)
 }
 
-fn write_grant(
+pub(super) fn write_grant(
     root: &Path,
     env_id: &str,
     name: &str,
@@ -131,7 +131,7 @@ pub fn read_grant(root: &Path, env_id: &str, name: &str) -> Option<HostResourceG
     serde_json::from_slice(&text).ok()
 }
 
-fn bindings_from(
+pub(super) fn bindings_from(
     grant: Option<&HostResourceGrant>,
     worktree: &Path,
     receipts: BTreeMap<String, Value>,
@@ -156,7 +156,7 @@ fn bindings_from(
 }
 
 impl Lifecycle {
-    fn context<'a>(
+    pub(super) fn context<'a>(
         &self,
         environment: &'a CompiledEnvironment,
         component: &'a super::compile::CompiledComponent,
@@ -173,7 +173,7 @@ impl Lifecycle {
         }
     }
 
-    fn receipts(&self, env_id: &str) -> Result<BTreeMap<String, Value>, LifecycleError> {
+    pub(super) fn receipts(&self, env_id: &str) -> Result<BTreeMap<String, Value>, LifecycleError> {
         Ok(self
             .store
             .components(env_id)?
@@ -182,7 +182,7 @@ impl Lifecycle {
             .collect())
     }
 
-    fn advance(
+    pub(super) fn advance(
         &mut self,
         record: &EnvironmentRecord,
         to: EnvironmentPhase,
@@ -199,7 +199,7 @@ impl Lifecycle {
         )?)
     }
 
-    fn component_to(
+    pub(super) fn component_to(
         &mut self,
         env_id: &str,
         component: &str,
@@ -259,12 +259,13 @@ impl Lifecycle {
                 return Ok(record);
             }
             EnvironmentPhase::Planned | EnvironmentPhase::Failed => {}
+            // `up` is "make sure it is up": a parked environment is woken.
+            EnvironmentPhase::Parked => return self.wake(&record.env_id, options.wait),
             other => {
                 return Err(LifecycleError::WrongPhase {
                     env_id: record.env_id,
                     phase: other.as_str(),
                     next: match other {
-                        EnvironmentPhase::Parked => "run `aethyme env wake <id>`".into(),
                         EnvironmentPhase::DestroyFailed => {
                             "run `aethyme env destroy <id> --retry`".into()
                         }
@@ -465,7 +466,7 @@ impl Lifecycle {
     /// run left it. A component still recorded as running from a crashed run
     /// is stopped first (only if its identity is proven), then a new instance
     /// starts.
-    fn prepare_start(
+    pub(super) fn prepare_start(
         &mut self,
         env_id: &str,
         snapshot: &CompiledEnvironment,
@@ -649,7 +650,7 @@ impl Lifecycle {
         Err(LifecycleError::Driver(error))
     }
 
-    fn release_capacity(&mut self, env_id: &str) -> Result<(), LifecycleError> {
+    pub(super) fn release_capacity(&mut self, env_id: &str) -> Result<(), LifecycleError> {
         if let Some(grant) = read_grant(&self.root, env_id, CAPACITY_GRANT) {
             match self.coordinator.release(
                 &grant.lease.lease_id,
@@ -937,7 +938,7 @@ fn export_commit(main_root: &Path, commit: &str, into: &Path) -> Result<(), Stri
     Ok(())
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

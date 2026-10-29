@@ -43,6 +43,7 @@ Environments (declared in .aethyme/environments.toml):
                               resources a profile would reserve
   env up|down|destroy|sweep   bring this worktree's environment up, destroy it
                               (leases released only after destroy succeeds)
+  env park|wake <id>          stop and return capacity units, or wake again
   env status|list|history|logs
                               recorded environments, their phases, history
                               and component logs; host supervisor state

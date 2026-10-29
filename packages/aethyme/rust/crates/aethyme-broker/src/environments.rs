@@ -28,6 +28,7 @@ mod inspect;
 pub mod lifecycle;
 pub mod logs;
 mod operate;
+mod park;
 pub mod spec;
 pub mod store;
 pub mod supervisor;
@@ -37,6 +38,8 @@ pub mod validate;
 mod drivers_tests;
 #[cfg(test)]
 mod lifecycle_tests;
+#[cfg(test)]
+mod park_tests;
 #[cfg(test)]
 mod store_tests;
 #[cfg(test)]

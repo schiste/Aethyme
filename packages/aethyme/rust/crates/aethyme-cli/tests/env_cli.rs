@@ -256,3 +256,40 @@ health = { command = "true", timeout_seconds = 10, interval_ms = 50 }
     assert_eq!(code, 2, "{refused}");
     assert_eq!(refused["code"], "usage");
 }
+
+/// #1212 through the router: park returns capacity, wake keeps the ports.
+#[test]
+fn park_then_wake_keeps_ports_through_the_cli() {
+    let environments = r#"
+schema = 1
+[pools.envs]
+limit = 1
+[[profiles]]
+name = "backend"
+units = 1
+[[profiles.components]]
+name = "api"
+runtime = "process"
+listen = true
+start = "exec sleep 300"
+health = { command = "true", timeout_seconds = 10, interval_ms = 50 }
+"#;
+    let fixture = Fixture::new(Some(environments));
+    let (code, up) = fixture.json(&["env", "up", "--wait", "5"]);
+    assert_eq!(code, 0, "{up}");
+    let env_id = up["env_id"].as_str().unwrap().to_string();
+    let (code, parked) = fixture.json(&["env", "park", &env_id]);
+    assert_eq!(code, 0, "{parked}");
+    assert_eq!(parked["schema"], "aethyme.env-park/v1");
+    assert_eq!(parked["phase"], "parked");
+    assert_eq!(parked["units_to_wake"], 1);
+    let (code, woken) = fixture.json(&["env", "wake", &env_id, "--wait", "5"]);
+    assert_eq!(code, 0, "{woken}");
+    assert_eq!(woken["phase"], "active");
+    assert_eq!(
+        woken["ports"], up["ports"],
+        "the reservation, and so the ports, survive"
+    );
+    let (code, _) = fixture.json(&["env", "down", &env_id]);
+    assert_eq!(code, 0);
+}

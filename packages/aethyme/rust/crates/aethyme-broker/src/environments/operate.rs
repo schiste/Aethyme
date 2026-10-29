@@ -6,8 +6,8 @@ use serde_json::{Value, json};
 
 use super::ENVIRONMENTS_FILE;
 use super::cli::{
-    DOWN_SCHEMA, Failure, Options, Output, SWEEP_SCHEMA, UP_SCHEMA, check, compile_context,
-    environment_failure, workspace,
+    DOWN_SCHEMA, Failure, Options, Output, PARK_SCHEMA, SWEEP_SCHEMA, UP_SCHEMA, WAKE_SCHEMA,
+    check, compile_context, environment_failure, workspace,
 };
 use super::compile::{compile, default_profile_name};
 use super::lifecycle::{Lifecycle, LifecycleError, RESERVATION_GRANT, UpOptions, read_grant};
@@ -119,6 +119,9 @@ fn describe(lifecycle: &Lifecycle, record: &EnvironmentRecord) -> (Value, String
         "profile": record.profile,
         "phase": record.phase,
         "namespace": record.namespace,
+        "parked_at": record.parked_at,
+        "units_to_wake": record.snapshot.units,
+        "pool": record.snapshot.pool.as_ref().map(|pool| json!({"name": pool.name, "limit": pool.limit})),
         "ports": ports,
         "variables": variables,
         "last_error": record.last_error,
@@ -221,6 +224,30 @@ pub(super) fn run_destroy(options: &Options) -> Result<Output, Failure> {
     let (mut value, text) = describe(&lifecycle, &record);
     value["schema"] = json!(DOWN_SCHEMA);
     value["abandoned"] = json!(abandon.is_some());
+    Ok((value, text, exit_status::SUCCESS))
+}
+
+pub(super) fn run_park(options: &Options) -> Result<Output, Failure> {
+    let id = required_id(options)?;
+    let (mut lifecycle, _) = open("env park", false)?;
+    let record = lifecycle.park(&id, "park").map_err(lifecycle_failure)?;
+    let (mut value, text) = describe(&lifecycle, &record);
+    value["schema"] = json!(PARK_SCHEMA);
+    Ok((value, text, exit_status::SUCCESS))
+}
+
+pub(super) fn run_wake(options: &Options) -> Result<Output, Failure> {
+    let id = required_id(options)?;
+    let (mut lifecycle, warning) = open("env wake", true)?;
+    let record = lifecycle
+        .wake(&id, Duration::from_secs(options.wait_seconds))
+        .map_err(lifecycle_failure)?;
+    let (mut value, mut text) = describe(&lifecycle, &record);
+    if let Some(warning) = &warning {
+        value["warning"] = json!(warning);
+        text.push_str(&format!("warning: {warning}\n"));
+    }
+    value["schema"] = json!(WAKE_SCHEMA);
     Ok((value, text, exit_status::SUCCESS))
 }
 
