@@ -151,11 +151,13 @@ const ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY: &str = "gc.artifact_sweep.recovery_
 const ARTIFACT_SWEEP_RETRY_AFTER_KEY: &str = "gc.artifact_sweep.retry_after_ms";
 /// Separate durable request for whole-checkout cleanup deferred by an ordinary
 /// automatic pass. Cache-only recovery requests never set this marker.
-const AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY: &str = "gc.artifact_sweep.checkout_cleanup_requested_ms";
+pub(crate) const AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY: &str =
+    "gc.artifact_sweep.checkout_cleanup_requested_ms";
 /// Highest whole-checkout cleanup request generation completed by its lane.
-const AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY: &str = "gc.artifact_sweep.checkout_cleanup_completed_ms";
+pub(crate) const AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY: &str =
+    "gc.artifact_sweep.checkout_cleanup_completed_ms";
 /// Backoff for a whole-checkout cleanup continuation that made no progress.
-const AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY: &str =
+pub(crate) const AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY: &str =
     "gc.artifact_sweep.checkout_cleanup_retry_after_ms";
 /// Bounded last-worker result; overwritten each run rather than appended.
 const ARTIFACT_SWEEP_WORKER_STATUS_KEY: &str = "gc.artifact_sweep.worker_status";
@@ -5262,6 +5264,108 @@ impl Broker {
         Ok(())
     }
 
+    /// Persist a whole-checkout cleanup generation for an atomically queued
+    /// terminal obligation. This is used after the close transaction and
+    /// acquires the GC lock itself.
+    pub(crate) fn request_checkout_cleanup_after_close(
+        &mut self,
+        session_id: i64,
+    ) -> Result<(), BrokerOpError> {
+        let root = self.main_root().to_path_buf();
+        let _lock = GcLock::acquire(&root)?;
+        self.request_checkout_cleanup_after_close_under_gc_lock(session_id)
+    }
+
+    /// Under-lock half of [`Self::request_checkout_cleanup_after_close`].
+    /// Callers already holding `GcLock` must use this method to avoid
+    /// recursive lock acquisition.
+    pub(crate) fn request_checkout_cleanup_after_close_under_gc_lock(
+        &mut self,
+        session_id: i64,
+    ) -> Result<(), BrokerOpError> {
+        let Some(request) = self.store().pending_checkout_cleanup_request(session_id)? else {
+            return Ok(());
+        };
+        if request.completed_at_ms.is_some() {
+            return Ok(());
+        }
+        let session = self.store().session(session_id)?;
+        if session.origin != crate::SessionOrigin::Spawned
+            || !session.status.is_closed()
+            || session.cleanup_state != crate::SessionCleanupState::Closed
+        {
+            return Ok(());
+        }
+        let cleanup_allowed =
+            crate::AutoCleanupPolicy::load(self.main_root()).is_ok_and(|policy| {
+                policy.auto_remove && !policy.is_pinned(Path::new(&session.worktree_path))
+            });
+        if !cleanup_allowed {
+            return Ok(());
+        }
+        self.queue_pending_checkout_cleanup_generation(request.not_before_ms)
+    }
+
+    fn queue_pending_checkout_cleanup_generation(
+        &mut self,
+        not_before_ms: i64,
+    ) -> Result<(), BrokerOpError> {
+        let requested = self
+            .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let completed = self
+            .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let generation = if requested > completed {
+            requested
+        } else {
+            now_ms()
+                .max(requested.saturating_add(1))
+                .max(completed.saturating_add(1))
+                .max(1)
+        };
+        if generation != requested {
+            self.artifact_sweep_meta_set(
+                AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY,
+                &generation.to_string(),
+            )?;
+        }
+        let next_due = self
+            .store()
+            .next_pending_checkout_cleanup_at()?
+            .unwrap_or(not_before_ms)
+            .min(not_before_ms);
+        self.artifact_sweep_meta_set(
+            AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY,
+            if next_due > now_ms() {
+                &next_due.to_string()
+            } else {
+                ""
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Recover a crash between the session-close transaction and its worker
+    /// wake-up. The outbox is small and indexed by due time; it does not scan
+    /// session history.
+    fn reconcile_checkout_cleanup_outbox(&mut self) -> Result<(), BrokerOpError> {
+        let Some(next_due) = self.store().next_pending_checkout_cleanup_at()? else {
+            return Ok(());
+        };
+        let root = self.main_root().to_path_buf();
+        let Ok(_lock) = GcLock::acquire(&root) else {
+            return Ok(());
+        };
+        if !crate::AutoCleanupPolicy::load(self.main_root()).is_ok_and(|policy| policy.auto_remove)
+        {
+            return Ok(());
+        }
+        self.queue_pending_checkout_cleanup_generation(next_due)
+    }
+
     /// Record a separate continuation request only when a general automatic
     /// checkout-cleanup pass deferred work. This is called under the sweep's
     /// GC lock; cache backlog alone and FinishDrain never create cleanup
@@ -5313,14 +5417,19 @@ impl Broker {
             .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY)?
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
-        Ok(requested > completed)
+        Ok(requested > completed || self.store().next_pending_checkout_cleanup_at()?.is_some())
     }
 
     fn auto_checkout_cleanup_retry_pending(&mut self, now: i64) -> Result<bool, BrokerOpError> {
-        Ok(self
+        let metadata_retry = self
             .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY)?
             .and_then(|value| value.parse::<i64>().ok())
-            .is_some_and(|retry_after| retry_after > now))
+            .is_some_and(|retry_after| retry_after > now);
+        let outbox_retry = self
+            .store()
+            .next_pending_checkout_cleanup_at()?
+            .is_some_and(|retry_after| retry_after > now);
+        Ok(metadata_retry || outbox_retry)
     }
 
     /// Launch recovery after the request is durable and any conflicting
@@ -5336,6 +5445,7 @@ impl Broker {
         &mut self,
         pressure_request: bool,
     ) -> Result<(), BrokerOpError> {
+        self.reconcile_checkout_cleanup_outbox()?;
         let root = self.main_root().to_path_buf();
         let artifact_pending = self.artifact_sweep_backlog_pending()?
             && crate::AutoCleanupPolicy::artifact_sweep_allowed(&root);
@@ -5445,6 +5555,7 @@ impl Broker {
             self.write_artifact_sweep_worker_status("refused_ephemeral_repository")?;
             return Ok(());
         }
+        self.reconcile_checkout_cleanup_outbox()?;
         let artifact_pending = self.artifact_sweep_backlog_pending()?
             && crate::AutoCleanupPolicy::artifact_sweep_allowed(self.main_root());
         let checkout_cleanup_pending = self.auto_checkout_cleanup_recovery_requested()?;
@@ -5607,6 +5718,12 @@ impl Broker {
                     &request_generation.to_string(),
                 )?;
                 self.artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY, "")?;
+                // A per-session close request is consumed only after this
+                // worker generation has a durable completion marker. A
+                // foreground pass or an incomplete discovery lap cannot
+                // silently acknowledge the request.
+                self.store()
+                    .complete_due_checkout_cleanup_requests(now_ms())?;
                 generation_completed = true;
             }
         }
@@ -6519,21 +6636,23 @@ impl Broker {
             .map(|session| PathBuf::from(&session.worktree_path))
             .collect::<Vec<_>>();
         let mut closed_cohort_index_failed = false;
-        let closed_cohort_index = if ignored_directory_policy.is_some() {
-            let closed_sessions = self.store().cleaned_sessions()?;
-            match self.closed_artifact_checkout_cohort_index(
-                closed_sessions,
-                &live_sessions,
-                Some(discovery_deadline),
-            ) {
-                Ok(Some(index)) => Some(index),
-                Ok(None) | Err(_) => {
+        let closed_cohort_index_unresolved = if ignored_directory_policy.is_some() {
+            match self.advance_cleanup_cohort_scan(Some(discovery_deadline))? {
+                Some(state) if state.complete => {
+                    closed_cohort_index_failed = state.unresolved_rows > 0;
+                    state.unresolved_rows
+                }
+                Some(state) => {
                     closed_cohort_index_failed = true;
-                    None
+                    state.unresolved_rows
+                }
+                None => {
+                    closed_cohort_index_failed = true;
+                    0
                 }
             }
         } else {
-            None
+            0
         };
         let mut preparation_entries_reclaimed = 0usize;
         let mut scan_completed = !closed_cohort_index_failed;
@@ -6608,7 +6727,11 @@ impl Broker {
         if closed_cohort_index_failed {
             blocked_interrupted_paths.push(BlockedInterruptedPath {
                 path: None,
-                reason: "closed_checkout_cohort_index_unavailable",
+                reason: if closed_cohort_index_unresolved > 0 {
+                    "closed_checkout_path_resolution_unavailable"
+                } else {
+                    "closed_checkout_cohort_index_unavailable"
+                },
             });
         }
         let mut interrupted_paths = match decode_interrupted_paths(interrupted_value.as_deref()) {
@@ -6788,16 +6911,24 @@ impl Broker {
                 continue;
             }
             let expected_ignored_cohort = if ignored_directory_policy.is_some() {
-                let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
-                let cohort = closed_cohort_index
+                let cohort = if closed_cohort_index_failed {
+                    None
+                } else {
+                    self.closed_artifact_checkout_cohort_for_session(
+                        session.id,
+                        &root,
+                        Some(discovery_deadline),
+                    )?
+                };
+                if cohort
                     .as_ref()
-                    .and_then(|index| index.get(&canonical_root));
-                if cohort.is_some_and(|cohort| cohort.owner_session_id() != session.id) {
+                    .is_some_and(|cohort| cohort.owner_session_id() != session.id)
+                {
                     // The canonical group is processed once at its spawned
                     // owner row, regardless of how many closed aliases name it.
                     continue;
                 }
-                cohort.cloned()
+                cohort
             } else {
                 None
             };

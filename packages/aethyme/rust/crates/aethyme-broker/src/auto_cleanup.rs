@@ -90,7 +90,9 @@ const GLOB_PROBES: &[&str] = &[
 /// `gc plan` show.
 pub(crate) const AUTO_CLEANUP_LAST_REPORT_KEY: &str = "auto_cleanup.last_report";
 const AUTO_CLEANUP_CURSOR_KEY: &str = "auto_cleanup.cursor";
-const AUTO_CLEANUP_CURSOR_VERSION: u32 = 1;
+const AUTO_CLEANUP_CURSOR_VERSION: u32 = 3;
+const CLEANUP_COHORT_SCAN_PAGE_SIZE: usize = 16;
+const CLEANUP_COHORT_UNBOUNDED_PAGE_CAP: usize = 128;
 const SESSION_RETIREMENT_CURSOR_KEY: &str = "auto_cleanup.session_retirement_cursor";
 const SESSION_RETIREMENT_CURSOR_VERSION: u32 = 1;
 const SESSION_RETIREMENT_PAGE_SIZE: usize = 128;
@@ -104,6 +106,7 @@ const IGNORED_PATH_LISTING_BUDGET: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct AutoCleanupCursor {
     version: u32,
+    cohort_generation: i64,
     after_session_id: i64,
     high_water_session_id: i64,
 }
@@ -112,6 +115,7 @@ impl Default for AutoCleanupCursor {
     fn default() -> Self {
         Self {
             version: AUTO_CLEANUP_CURSOR_VERSION,
+            cohort_generation: 0,
             after_session_id: 0,
             high_water_session_id: 0,
         }
@@ -123,6 +127,7 @@ fn decode_auto_cleanup_cursor(value: Option<&str>) -> AutoCleanupCursor {
         .and_then(|value| serde_json::from_str::<AutoCleanupCursor>(value).ok())
         .filter(|cursor| {
             cursor.version == AUTO_CLEANUP_CURSOR_VERSION
+                && cursor.cohort_generation >= 0
                 && cursor.after_session_id >= 0
                 && cursor.high_water_session_id >= cursor.after_session_id
         })
@@ -184,12 +189,7 @@ struct AutoCleanupVerdictOptions<'a> {
 }
 
 fn checkout_group_cursor_session_id(group: &AutoCleanupCheckoutGroup) -> i64 {
-    group
-        .sessions
-        .iter()
-        .map(|session| session.id)
-        .min()
-        .unwrap_or(0)
+    group.cursor_session_id
 }
 
 /// Sort candidates by their minimum session ID and return the unvisited
@@ -691,6 +691,8 @@ pub(crate) struct AutoCleanupCandidate {
 struct AutoCleanupCheckoutGroup {
     worktree: PathBuf,
     sessions: Vec<Session>,
+    complete: bool,
+    cursor_session_id: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -699,7 +701,6 @@ struct ClosedArtifactSessionSnapshot {
     worktree_path: String,
     branch: String,
     origin: SessionOrigin,
-    updated_at: i64,
     spawned_instance_witness: Option<crate::events::SpawnedWorktreeInstanceWitness>,
 }
 
@@ -716,6 +717,21 @@ pub(crate) struct ClosedArtifactCheckoutCohort {
 impl ClosedArtifactCheckoutCohort {
     pub(crate) fn owner_session_id(&self) -> i64 {
         self.owner_session_id
+    }
+
+    pub(crate) fn worktree(&self) -> &Path {
+        &self.worktree
+    }
+
+    pub(crate) fn session_ids(&self) -> Vec<i64> {
+        self.sessions.iter().map(|session| session.id).collect()
+    }
+
+    pub(crate) fn owner_witness(&self) -> Option<&crate::events::SpawnedWorktreeInstanceWitness> {
+        self.sessions
+            .iter()
+            .find(|session| session.id == self.owner_session_id)
+            .and_then(|session| session.spawned_instance_witness.as_ref())
     }
 
     pub(crate) fn matches_checkout_instance(&self, checkout: &GitRepo) -> bool {
@@ -735,6 +751,7 @@ struct AutoCleanupGroupScan {
     groups: Vec<AutoCleanupCheckoutGroup>,
     live: Vec<Session>,
     live_worktrees: Vec<ResolvedWorktreePath>,
+    unresolved_rows: i64,
 }
 
 enum AutoCleanupGroupInspection {
@@ -789,7 +806,12 @@ fn group_closed_checkout_sessions(
     Some(
         by_path
             .into_iter()
-            .map(|(worktree, sessions)| AutoCleanupCheckoutGroup { worktree, sessions })
+            .map(|(worktree, sessions)| AutoCleanupCheckoutGroup {
+                worktree,
+                cursor_session_id: sessions.iter().map(|session| session.id).min().unwrap_or(0),
+                sessions,
+                complete: true,
+            })
             .collect(),
     )
 }
@@ -1217,193 +1239,297 @@ impl Broker {
         Ok(())
     }
 
-    /// Build the complete closed-checkout ownership index once for a bounded
-    /// artifact-sweep pass. The session table and canonical aliases are
-    /// resolved once; callers use the returned owner/cohort snapshots to avoid
-    /// rescanning every retained row for each ignored directory.
-    pub(crate) fn closed_artifact_checkout_cohort_index(
+    /// Advance one durable, bounded page of checkout-path discovery. The
+    /// indexed rows are candidate evidence only; selected worktrees still go
+    /// through the full lifecycle, alias, witness, and filesystem checks.
+    pub(crate) fn advance_cleanup_cohort_scan(
         &mut self,
-        closed: Vec<Session>,
-        live: &[Session],
         deadline: Option<Instant>,
-    ) -> Result<
-        Option<std::collections::BTreeMap<PathBuf, ClosedArtifactCheckoutCohort>>,
-        BrokerOpError,
-    > {
-        if deadline_expired(deadline) {
+    ) -> Result<Option<crate::store::cleanup_cohort::CleanupCohortScanState>, BrokerOpError> {
+        let page = self.store().cleanup_cohort_scan_page(
+            crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+            CLEANUP_COHORT_SCAN_PAGE_SIZE,
+            now_ms(),
+        )?;
+        if !page.dirty_sessions.is_empty() {
+            let mut dirty_rows = Vec::with_capacity(page.dirty_sessions.len());
+            for dirty in &page.dirty_sessions {
+                if deadline_expired(deadline) {
+                    break;
+                }
+                let row = dirty.session.as_ref().map(|session| {
+                    let resolved = ResolvedWorktreePath::resolve(Path::new(&session.worktree_path));
+                    let mut errors = resolved.resolution_errors;
+                    let canonical_path = match resolved.canonical_or_raw.to_str() {
+                        Some(path) => path.to_owned(),
+                        None => {
+                            errors.push("canonical checkout path is not Unicode".into());
+                            session.worktree_path.clone()
+                        }
+                    };
+                    let git_dir = resolved.git_dir.and_then(|path| match path.to_str() {
+                        Some(path) => Some(path.to_owned()),
+                        None => {
+                            errors.push("Git directory path is not Unicode".into());
+                            None
+                        }
+                    });
+                    crate::store::cleanup_cohort::CleanupCohortResolvedRow {
+                        session_id: session.id,
+                        raw_path: session.worktree_path.clone(),
+                        canonical_path,
+                        git_dir,
+                        resolution_error: (!errors.is_empty()).then(|| errors.join("; ")),
+                        cleanup_state: session.cleanup_state.as_str().to_owned(),
+                    }
+                });
+                dirty_rows.push(
+                    crate::store::cleanup_cohort::CleanupCohortDirtyResolvedRow {
+                        session_id: dirty.session_id,
+                        revision: dirty.revision,
+                        row,
+                    },
+                );
+            }
+            if dirty_rows.is_empty() {
+                return Ok(self.store().cleanup_cohort_scan_state(
+                    crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+                )?);
+            }
+            let outcome = self.store().persist_cleanup_cohort_dirty_page(
+                crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+                page.state.generation,
+                &dirty_rows,
+                now_ms(),
+            )?;
+            if outcome == crate::store::cleanup_cohort::CleanupCohortPersistOutcome::Changed {
+                return Ok(self.store().cleanup_cohort_scan_state(
+                    crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+                )?);
+            }
+            return Ok(self.store().cleanup_cohort_scan_state(
+                crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+            )?);
+        }
+        if page.sessions.is_empty() {
+            return Ok(Some(page.state));
+        }
+        let expected_after = page.state.after_session_id;
+        let mut resolved_rows = Vec::with_capacity(page.sessions.len());
+        for session in &page.sessions {
+            if deadline_expired(deadline) {
+                break;
+            }
+            let resolved = ResolvedWorktreePath::resolve(Path::new(&session.worktree_path));
+            let mut errors = resolved.resolution_errors;
+            let canonical_path = match resolved.canonical_or_raw.to_str() {
+                Some(path) => path.to_owned(),
+                None => {
+                    errors.push("canonical checkout path is not Unicode".into());
+                    session.worktree_path.clone()
+                }
+            };
+            let git_dir = resolved.git_dir.and_then(|path| match path.to_str() {
+                Some(path) => Some(path.to_owned()),
+                None => {
+                    errors.push("Git directory path is not Unicode".into());
+                    None
+                }
+            });
+            resolved_rows.push(crate::store::cleanup_cohort::CleanupCohortResolvedRow {
+                session_id: session.id,
+                raw_path: session.worktree_path.clone(),
+                canonical_path,
+                git_dir,
+                resolution_error: (!errors.is_empty()).then(|| errors.join("; ")),
+                cleanup_state: session.cleanup_state.as_str().to_owned(),
+            });
+        }
+        if resolved_rows.is_empty() {
+            return Ok(self.store().cleanup_cohort_scan_state(
+                crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+            )?);
+        }
+        let reached_high_water = resolved_rows
+            .last()
+            .is_some_and(|row| row.session_id >= page.state.high_water_session_id);
+        let outcome = self.store().persist_cleanup_cohort_scan_page(
+            crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+            page.state.revision,
+            page.state.generation,
+            expected_after,
+            &resolved_rows,
+            reached_high_water,
+            now_ms(),
+        )?;
+        if outcome == crate::store::cleanup_cohort::CleanupCohortPersistOutcome::Changed {
+            return Ok(self.store().cleanup_cohort_scan_state(
+                crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+            )?);
+        }
+        Ok(self
+            .store()
+            .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)?)
+    }
+
+    fn complete_cleanup_cohort_scan(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<Option<crate::store::cleanup_cohort::CleanupCohortScanState>, BrokerOpError> {
+        let mut pages = 0usize;
+        loop {
+            let Some(state) = self.advance_cleanup_cohort_scan(deadline)? else {
+                return Ok(None);
+            };
+            pages += 1;
+            if state.complete
+                || deadline.is_some()
+                || deadline_expired(deadline)
+                || pages >= CLEANUP_COHORT_UNBOUNDED_PAGE_CAP
+            {
+                return Ok(Some(state));
+            }
+        }
+    }
+
+    /// Construct one complete cohort from the persisted path index. The full
+    /// apply-time snapshot below remains the authority and detects any change
+    /// since this revision-bound lookup.
+    pub(crate) fn closed_artifact_checkout_cohort_for_session(
+        &mut self,
+        session_id: i64,
+        worktree: &Path,
+        deadline: Option<Instant>,
+    ) -> Result<Option<ClosedArtifactCheckoutCohort>, BrokerOpError> {
+        let Some(index_state) = self
+            .store()
+            .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)?
+        else {
+            return Ok(None);
+        };
+        if !index_state.complete || index_state.unresolved_rows != 0 || deadline_expired(deadline) {
             return Ok(None);
         }
-        let all_rows = closed
-            .iter()
-            .cloned()
-            .chain(live.iter().cloned())
-            .collect::<Vec<_>>();
-        let mut all_resolved = Vec::with_capacity(all_rows.len());
-        for row in &all_rows {
-            if deadline_expired(deadline) {
-                return Ok(None);
-            }
-            all_resolved.push((
-                row,
-                ResolvedWorktreePath::resolve(Path::new(&row.worktree_path)),
-            ));
-        }
-        // A row with an unresolved path makes every candidate's alias proof
-        // unknown, just as the pairwise classifier did. Keep the whole pass
-        // incomplete instead of repeatedly comparing every candidate with
-        // every unresolved row.
-        if all_resolved
-            .iter()
-            .any(|(_, resolved)| !resolved.resolution_errors.is_empty())
+        let witness_revision = self.store().cleanup_witness_revision()?;
+        let selected = self.store().session(session_id)?;
+        if selected.status != crate::types::SessionStatus::Closed
+            || selected.cleanup_state != SessionCleanupState::Closed
         {
             return Ok(None);
         }
-        let mut rows_at_path = std::collections::BTreeMap::<PathBuf, Vec<usize>>::new();
-        let mut rows_below_path = std::collections::BTreeMap::<PathBuf, Vec<usize>>::new();
-        let mut rows_at_git_dir = std::collections::BTreeMap::<PathBuf, Vec<usize>>::new();
-        for (index, (_, resolved)) in all_resolved.iter().enumerate() {
-            if deadline_expired(deadline) {
-                return Ok(None);
-            }
-            for path in [&resolved.raw, &resolved.canonical_or_raw] {
-                rows_at_path.entry(path.clone()).or_default().push(index);
-                for ancestor in path.ancestors() {
-                    if deadline_expired(deadline) {
-                        return Ok(None);
-                    }
-                    rows_below_path
-                        .entry(ancestor.to_path_buf())
-                        .or_default()
-                        .push(index);
-                }
-            }
-            if let Some(git_dir) = &resolved.git_dir {
-                rows_at_git_dir
-                    .entry(git_dir.clone())
-                    .or_default()
-                    .push(index);
-            }
+        let resolved = ResolvedWorktreePath::resolve(worktree);
+        if !resolved.resolution_errors.is_empty() || deadline_expired(deadline) {
+            return Ok(None);
         }
-        let Some(groups) = group_closed_checkout_sessions(closed, deadline) else {
+        let Some(canonical_path) = resolved.canonical_or_raw.to_str() else {
             return Ok(None);
         };
-        let mut index = std::collections::BTreeMap::new();
-        for group in groups {
-            if deadline_expired(deadline) {
-                return Ok(None);
-            }
-            if group.sessions.is_empty()
-                || group.sessions.iter().any(|session| {
-                    session.status != crate::types::SessionStatus::Closed
-                        || session.cleanup_state != SessionCleanupState::Closed
-                })
-            {
-                continue;
-            }
-            match std::fs::symlink_metadata(&group.worktree) {
-                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                    continue;
-                }
-                Ok(_) => {}
-                Err(_) => continue,
-            }
-            let resolved = ResolvedWorktreePath::resolve(&group.worktree);
-            if !resolved.resolution_errors.is_empty() || deadline_expired(deadline) {
-                continue;
-            }
-            let group_ids = group
-                .sessions
-                .iter()
-                .map(|session| session.id)
-                .collect::<std::collections::BTreeSet<_>>();
-            let mut possible_aliases = std::collections::BTreeSet::new();
-            for path in [&resolved.raw, &resolved.canonical_or_raw] {
-                for ancestor in path.ancestors() {
-                    if deadline_expired(deadline) {
-                        return Ok(None);
-                    }
-                    if let Some(rows) = rows_at_path.get(ancestor) {
-                        possible_aliases.extend(rows.iter().copied());
-                    }
-                }
-                if let Some(rows) = rows_below_path.get(path) {
-                    possible_aliases.extend(rows.iter().copied());
-                }
-            }
-            if let Some(git_dir) = &resolved.git_dir
-                && let Some(rows) = rows_at_git_dir.get(git_dir)
-            {
-                possible_aliases.extend(rows.iter().copied());
-            }
-            let mut aliases_are_closed = true;
-            for index in possible_aliases {
-                if deadline_expired(deadline) {
-                    return Ok(None);
-                }
-                let (row, row_path) = &all_resolved[index];
-                match live_worktree_overlap(&resolved, row_path) {
-                    LiveOverlapEvidence::Disjoint => {}
-                    LiveOverlapEvidence::Overlap
-                        if row.status == crate::types::SessionStatus::Closed
-                            && row.cleanup_state == SessionCleanupState::Closed
-                            && group_ids.contains(&row.id) => {}
-                    LiveOverlapEvidence::Overlap | LiveOverlapEvidence::Unknown => {
-                        aliases_are_closed = false;
-                        break;
-                    }
-                }
-            }
-            if !aliases_are_closed {
-                continue;
-            }
-
-            let mut sessions = Vec::with_capacity(group.sessions.len());
-            let mut owner_session_id = None;
-            for session in &group.sessions {
-                if deadline_expired(deadline) {
-                    return Ok(None);
-                }
-                let spawned_instance_witness = if session.origin == SessionOrigin::Spawned {
-                    self.store().spawned_worktree_instance_witness(session.id)?
-                } else {
-                    None
-                };
-                if owner_session_id.is_none()
-                    && session.origin == SessionOrigin::Spawned
-                    && spawned_instance_witness.as_ref().is_some_and(|witness| {
-                        witness.worktree_path == group.worktree.to_string_lossy()
-                    })
-                {
-                    owner_session_id = Some(session.id);
-                }
-                sessions.push(ClosedArtifactSessionSnapshot {
-                    id: session.id,
-                    worktree_path: session.worktree_path.clone(),
-                    branch: session.branch.clone(),
-                    origin: session.origin,
-                    updated_at: session.updated_at,
-                    spawned_instance_witness,
-                });
-            }
-            let Some(owner_session_id) = owner_session_id else {
-                continue;
-            };
-            if deadline_expired(deadline) {
-                return Ok(None);
-            }
-            index.insert(
-                resolved.canonical_or_raw.clone(),
-                ClosedArtifactCheckoutCohort {
-                    worktree: resolved.canonical_or_raw,
-                    sessions,
-                    owner_session_id,
-                },
-            );
-        }
-        if deadline_expired(deadline) {
+        let (sessions, group_truncated) = self.store().cleanup_cohort_sessions_for_path(
+            crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+            canonical_path,
+        )?;
+        if group_truncated
+            || !sessions.iter().any(|session| session.id == session_id)
+            || sessions.is_empty()
+            || sessions.iter().any(|session| {
+                session.status != crate::types::SessionStatus::Closed
+                    || session.cleanup_state != SessionCleanupState::Closed
+            })
+        {
             return Ok(None);
         }
-        Ok(Some(index))
+        let group_ids = sessions
+            .iter()
+            .map(|session| session.id)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let mut candidate_paths = std::collections::BTreeSet::new();
+        let mut candidate_ancestors = std::collections::BTreeSet::new();
+        for path in [&resolved.raw, &resolved.canonical_or_raw] {
+            let Some(text) = path.to_str() else {
+                return Ok(None);
+            };
+            candidate_paths.insert(text.to_owned());
+            for ancestor in path.ancestors() {
+                let Some(text) = ancestor.to_str() else {
+                    return Ok(None);
+                };
+                candidate_ancestors.insert(text.to_owned());
+            }
+        }
+        let candidate_paths = candidate_paths.into_iter().collect::<Vec<_>>();
+        let candidate_ancestors = candidate_ancestors.into_iter().collect::<Vec<_>>();
+        let git_dir = resolved.git_dir.as_deref().and_then(Path::to_str);
+        let alias_rows = self.store().cleanup_cohort_alias_rows(
+            crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+            &candidate_ancestors,
+            &candidate_paths,
+            git_dir,
+        )?;
+        let resolved_candidate = resolved;
+        for row in alias_rows {
+            if deadline_expired(deadline) || row.resolution_error.is_some() {
+                return Ok(None);
+            }
+            let row_path = ResolvedWorktreePath {
+                raw: PathBuf::from(&row.raw_path),
+                canonical_or_raw: PathBuf::from(&row.canonical_path),
+                git_dir: row.git_dir.map(PathBuf::from),
+                resolution_errors: Vec::new(),
+            };
+            match live_worktree_overlap(&resolved_candidate, &row_path) {
+                LiveOverlapEvidence::Disjoint => {}
+                LiveOverlapEvidence::Overlap
+                    if row.cleanup_state == "closed" && group_ids.contains(&row.session_id) => {}
+                LiveOverlapEvidence::Overlap | LiveOverlapEvidence::Unknown => {
+                    return Ok(None);
+                }
+            }
+        }
+
+        let mut snapshots = Vec::with_capacity(sessions.len());
+        let mut owner_session_id = None;
+        for session in &sessions {
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
+            let spawned_instance_witness = if session.origin == SessionOrigin::Spawned {
+                self.store().spawned_worktree_instance_witness(session.id)?
+            } else {
+                None
+            };
+            if owner_session_id.is_none()
+                && session.origin == SessionOrigin::Spawned
+                && spawned_instance_witness
+                    .as_ref()
+                    .is_some_and(|witness| witness.worktree_path == canonical_path)
+            {
+                owner_session_id = Some(session.id);
+            }
+            snapshots.push(ClosedArtifactSessionSnapshot {
+                id: session.id,
+                worktree_path: session.worktree_path.clone(),
+                branch: session.branch.clone(),
+                origin: session.origin,
+                spawned_instance_witness,
+            });
+        }
+        let Some(owner_session_id) = owner_session_id else {
+            return Ok(None);
+        };
+        if self
+            .store()
+            .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)?
+            .is_none_or(|current| current.revision != index_state.revision || !current.complete)
+            || self.store().cleanup_witness_revision()? != witness_revision
+        {
+            return Ok(None);
+        }
+        Ok(Some(ClosedArtifactCheckoutCohort {
+            worktree: resolved_candidate.canonical_or_raw,
+            sessions: snapshots,
+            owner_session_id,
+        }))
     }
 
     /// Snapshot one retained checkout's full canonical cohort and its
@@ -1418,6 +1544,7 @@ impl Broker {
         if deadline_expired(deadline) {
             return Ok(None);
         }
+        let authority_revisions = self.store().cleanup_authority_revisions()?;
         let expected_path = worktree.to_string_lossy().into_owned();
         let current = self.store().session(session_id)?;
         if current.status != crate::types::SessionStatus::Closed
@@ -1489,7 +1616,6 @@ impl Broker {
         if selected.worktree_path != current.worktree_path
             || selected.branch != current.branch
             || selected.origin != current.origin
-            || selected.updated_at != current.updated_at
         {
             return Ok(None);
         }
@@ -1523,7 +1649,6 @@ impl Broker {
                 worktree_path: session.worktree_path.clone(),
                 branch: session.branch.clone(),
                 origin: session.origin,
-                updated_at: session.updated_at,
                 spawned_instance_witness,
             });
         }
@@ -1536,7 +1661,7 @@ impl Broker {
             || current_after.worktree_path != current.worktree_path
             || current_after.branch != current.branch
             || current_after.origin != current.origin
-            || current_after.updated_at != current.updated_at
+            || self.store().cleanup_authority_revisions()? != authority_revisions
         {
             return Ok(None);
         }
@@ -1548,15 +1673,79 @@ impl Broker {
         }))
     }
 
-    /// Collect complete canonical cohorts and a complete live-path index.
-    /// This pass does no per-cohort Git or ownership proof: the durable cursor
-    /// must choose a fair tranche before that work begins.
+    /// Collect one bounded page of complete canonical cohorts from the
+    /// revision-bound path index. A partial inventory is never used to choose
+    /// a candidate; a complete inventory is paged before per-group Git or
+    /// ownership proof begins.
     fn auto_cleanup_checkout_groups(
         &mut self,
+        cursor: &mut AutoCleanupCursor,
         deadline: Option<Instant>,
     ) -> Result<Option<AutoCleanupGroupScan>, BrokerOpError> {
+        let Some(index_state) = self.complete_cleanup_cohort_scan(deadline)? else {
+            return Ok(None);
+        };
+        if !index_state.complete {
+            return Ok(None);
+        }
+        if index_state.unresolved_rows > 0 {
+            return Ok(Some(AutoCleanupGroupScan {
+                groups: Vec::new(),
+                live: Vec::new(),
+                live_worktrees: Vec::new(),
+                unresolved_rows: index_state.unresolved_rows,
+            }));
+        }
+        let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
+        let maximum_group_id = self
+            .store()
+            .cleanup_cohort_group_max_session_id(namespace)?;
+        if cursor.cohort_generation != index_state.generation {
+            *cursor = AutoCleanupCursor {
+                cohort_generation: index_state.generation,
+                after_session_id: 0,
+                high_water_session_id: maximum_group_id,
+                ..AutoCleanupCursor::default()
+            };
+        } else {
+            cursor.high_water_session_id = cursor.high_water_session_id.max(maximum_group_id);
+            if self
+                .store()
+                .cleanup_cohort_group_page(
+                    namespace,
+                    cursor.after_session_id,
+                    cursor.high_water_session_id,
+                    1,
+                )?
+                .is_empty()
+            {
+                cursor.after_session_id = 0;
+                cursor.high_water_session_id = maximum_group_id;
+            }
+        }
         if deadline_expired(deadline) {
             return Ok(None);
+        }
+        let indexed_groups = self.store().cleanup_cohort_group_page(
+            namespace,
+            cursor.after_session_id,
+            cursor.high_water_session_id,
+            32,
+        )?;
+        let mut groups = Vec::with_capacity(indexed_groups.len());
+        for (canonical_path, first_session_id) in indexed_groups {
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
+            let (sessions, truncated) = self
+                .store()
+                .cleanup_cohort_sessions_for_path(namespace, &canonical_path)?;
+            groups.push(AutoCleanupCheckoutGroup {
+                worktree: PathBuf::from(canonical_path),
+                sessions,
+                complete: !truncated,
+                cursor_session_id: first_session_id,
+            });
         }
         let live = self.store().live_sessions()?;
         if deadline_expired(deadline) {
@@ -1565,17 +1754,11 @@ impl Broker {
         let Some(live_worktrees) = resolve_live_worktree_paths(&live, deadline) else {
             return Ok(None);
         };
-        let closed = self.store().cleaned_sessions()?;
-        if deadline_expired(deadline) {
-            return Ok(None);
-        }
-        let Some(groups) = group_closed_checkout_sessions(closed, deadline) else {
-            return Ok(None);
-        };
         Ok(Some(AutoCleanupGroupScan {
             groups,
             live,
             live_worktrees,
+            unresolved_rows: 0,
         }))
     }
 
@@ -1602,6 +1785,11 @@ impl Broker {
                 reason,
             })
         };
+        if !group.complete {
+            return Ok(keep(
+                "checkout ownership cohort exceeded the bounded discovery limit".into(),
+            ));
+        }
         if deadline_expired(deadline) {
             return Ok(AutoCleanupGroupInspection::Deferred);
         }
@@ -2272,7 +2460,8 @@ impl Broker {
         plan.report.sessions_retired = retirement.retired;
         plan.report.deferred += retirement.deferred;
         plan.report.retirement_deferred_reasons = retirement.reasons;
-        self.auto_cleanup_apply(plan)
+        let report = self.auto_cleanup_apply(plan)?;
+        Ok(report)
     }
 
     /// Select the checkouts every proof currently allows removing. Removes
@@ -2320,33 +2509,35 @@ impl Broker {
         if !policy.auto_remove {
             return Ok(AutoCleanupPlan::nothing(report));
         }
-        let Some(mut scan) = self.auto_cleanup_checkout_groups(deadline)? else {
+        let (mut cursor, mut expected_cursor) = self.auto_cleanup_cursor()?;
+        let cursor_before_scan = cursor;
+        let Some(scan) = self.auto_cleanup_checkout_groups(&mut cursor, deadline)? else {
             report.deferred += 1;
             return Ok(AutoCleanupPlan::nothing(report));
         };
-
-        // The complete canonical groups and full live index are available
-        // before the cursor selects a tranche. Grouping still scans history;
-        // the cursor prevents per-group Git and ownership checks from
-        // restarting at the beginning when a selected proof uses the budget.
-        let (mut cursor, mut expected_cursor) = self.auto_cleanup_cursor()?;
-        let lap = auto_cleanup_lap_range(
-            &mut scan.groups,
-            &mut cursor,
-            checkout_group_cursor_session_id,
-        );
-        let deferred_after_lap = scan.groups.len().saturating_sub(lap.end);
-        let groups = scan.groups.drain(lap).collect::<Vec<_>>();
-        report.deferred += deferred_after_lap;
+        if scan.unresolved_rows > 0 {
+            report.kept.push(AutoKeptCheckout {
+                worktree: "<session checkout inventory>".into(),
+                sessions: Vec::new(),
+                reason: format!(
+                    "{} session checkout path(s) could not be resolved; cleanup remains blocked",
+                    scan.unresolved_rows
+                ),
+            });
+            return Ok(AutoCleanupPlan::nothing(report));
+        }
+        if cursor != cursor_before_scan {
+            self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
+        }
 
         let mut upstream_checked = false;
         let mut upstream = None;
         let mut selected = Vec::new();
-        let group_count = groups.len();
         let mut lease_process_table = LeaseProcessTableSnapshot::default();
-        for (index, group) in groups.into_iter().enumerate() {
+        let mut stop_for_deadline = false;
+        for group in scan.groups {
             if deadline_expired(deadline) {
-                report.deferred += group_count - index;
+                stop_for_deadline = true;
                 break;
             }
             let cursor_session_id = checkout_group_cursor_session_id(&group);
@@ -2435,9 +2626,22 @@ impl Broker {
             cursor.after_session_id = cursor_session_id;
             self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
             if stop_for_deadline {
-                report.deferred += group_count - index - 1;
+                stop_for_deadline = true;
                 break;
             }
+        }
+        if stop_for_deadline {
+            report.deferred += self.store().cleanup_cohort_group_count(
+                crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+                cursor.after_session_id,
+                cursor.high_water_session_id,
+            )?;
+        } else {
+            report.deferred += self.store().cleanup_cohort_group_count(
+                crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+                cursor.after_session_id,
+                cursor.high_water_session_id,
+            )?;
         }
         Ok(AutoCleanupPlan {
             report,
@@ -3202,6 +3406,7 @@ mod tests {
 
         let seed = AutoCleanupCursor {
             version: super::AUTO_CLEANUP_CURSOR_VERSION,
+            cohort_generation: 1,
             after_session_id: first_id,
             high_water_session_id: second_id,
         };
@@ -3306,6 +3511,7 @@ mod tests {
         assert!(second_id < third_id);
         let deferred_cursor = AutoCleanupCursor {
             version: super::AUTO_CLEANUP_CURSOR_VERSION,
+            cohort_generation: 1,
             after_session_id: first_id,
             high_water_session_id: third_id,
         };
@@ -3362,6 +3568,22 @@ mod tests {
             "a fresh pass resumes at the next uninspected complete group"
         );
         assert_eq!(resumed_pass.report.deferred, 0);
+
+        broker
+            .store()
+            .set_session_status(first_id, crate::types::SessionStatus::Active, None)
+            .unwrap();
+        let reactivated_pass = broker.auto_cleanup_plan(None).unwrap();
+        assert!(
+            !reactivated_pass
+                .selected_worktrees()
+                .contains(&first_path.to_string_lossy().into_owned()),
+            "a reactivated live owner makes its previously closed checkout ineligible"
+        );
+        assert!(
+            first_path.is_dir(),
+            "reactivation must preserve the checkout"
+        );
     }
 
     #[test]

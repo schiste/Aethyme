@@ -34,7 +34,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 58;
+pub const SCHEMA_VERSION: i64 = 59;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -97,6 +97,11 @@ pub const SCHEMA_VERSION: i64 = 58;
 ///   Raising the floor prevents fresh old opens; already-open old database
 ///   handles are not revoked. Operators must drain those clients before
 ///   enabling unattended checkout or ignored-directory reclamation.
+/// - v59: adds a transactional revision for cleanup-relevant session and
+///   spawned-worktree witness changes, plus resumable cleanup-scan storage.
+///   Its triggers ignore heartbeat-only updates, so active work does not
+///   repeatedly invalidate a bounded history scan. Older v58 writers still
+///   pass through the triggers, so the compatibility floor remains v58.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 58;
 
 /// Migration that introduced profile-bound gate-cache reads and writes.
@@ -1943,6 +1948,125 @@ CREATE INDEX IF NOT EXISTS guarded_exec_helper_observations_latest
 // Protocol-only compatibility fence: there is no structural SQL change.
 const MIGRATION_V58: &str = "SELECT 1;";
 
+// Cleanup discovery checkpoints are hints only; only a complete snapshot
+// whose session and witness revision still matches may supply candidates.
+// Keep the revision triggers narrow so last_activity_at/PID/updated_at
+// heartbeats do not invalidate progress for active sessions.
+const MIGRATION_V59: &str = "
+CREATE TABLE IF NOT EXISTS session_cleanup_revision (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    witness_revision INTEGER NOT NULL DEFAULT 0 CHECK (witness_revision >= 0)
+);
+INSERT OR IGNORE INTO session_cleanup_revision (id, revision) VALUES (1, 0);
+
+
+CREATE TABLE IF NOT EXISTS cleanup_cohort_dirty_sessions (
+    session_id INTEGER PRIMARY KEY,
+    revision INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS cleanup_cohort_dirty_sessions_revision
+    ON cleanup_cohort_dirty_sessions(revision, session_id);
+
+CREATE TABLE IF NOT EXISTS cleanup_cohort_scans (
+    namespace TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
+    high_water_session_id INTEGER NOT NULL,
+    after_session_id INTEGER NOT NULL,
+    complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
+    progress_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cleanup_cohort_scan_rows (
+    namespace TEXT NOT NULL REFERENCES cleanup_cohort_scans(namespace) ON DELETE CASCADE,
+    session_id INTEGER NOT NULL,
+    raw_path TEXT NOT NULL,
+    canonical_path TEXT NOT NULL,
+    git_dir TEXT,
+    resolution_error TEXT,
+    cleanup_state TEXT NOT NULL,
+    PRIMARY KEY (namespace, session_id)
+);
+CREATE INDEX IF NOT EXISTS cleanup_cohort_scan_rows_path
+    ON cleanup_cohort_scan_rows(namespace, canonical_path, cleanup_state, session_id);
+CREATE TABLE IF NOT EXISTS cleanup_cohort_scan_path_ancestors (
+    namespace TEXT NOT NULL REFERENCES cleanup_cohort_scans(namespace) ON DELETE CASCADE,
+    ancestor_path TEXT NOT NULL,
+    session_id INTEGER NOT NULL,
+    PRIMARY KEY (namespace, ancestor_path, session_id)
+);
+CREATE INDEX IF NOT EXISTS cleanup_cohort_scan_path_ancestors_session
+    ON cleanup_cohort_scan_path_ancestors(namespace, session_id);
+CREATE TABLE IF NOT EXISTS cleanup_cohort_scan_groups (
+    namespace TEXT NOT NULL REFERENCES cleanup_cohort_scans(namespace) ON DELETE CASCADE,
+    canonical_path TEXT NOT NULL,
+    first_session_id INTEGER NOT NULL,
+    PRIMARY KEY (namespace, canonical_path),
+    UNIQUE (namespace, first_session_id)
+);
+CREATE INDEX IF NOT EXISTS cleanup_cohort_scan_groups_first
+    ON cleanup_cohort_scan_groups(namespace, first_session_id);
+CREATE TABLE IF NOT EXISTS closed_checkout_cleanup_requests (
+    session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    requested_at_ms INTEGER NOT NULL,
+    not_before_ms INTEGER NOT NULL,
+    completed_at_ms INTEGER,
+    last_progress_at_ms INTEGER NOT NULL,
+    compact_requested_at_ms INTEGER,
+    compact_retry_after_ms INTEGER,
+    compact_completed_at_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS closed_checkout_cleanup_requests_pending
+    ON closed_checkout_cleanup_requests(not_before_ms, compact_retry_after_ms, session_id)
+    WHERE completed_at_ms IS NULL;
+
+-- Session mutations invalidate only their own cached row. The worker drains
+-- these IDs in bounded pages instead of restarting historical discovery.
+CREATE TRIGGER IF NOT EXISTS session_cleanup_revision_insert
+AFTER INSERT ON sessions
+BEGIN
+    UPDATE session_cleanup_revision SET revision = revision + 1 WHERE id = 1;
+    INSERT OR REPLACE INTO cleanup_cohort_dirty_sessions(session_id, revision)
+    SELECT NEW.id, revision FROM session_cleanup_revision WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS session_cleanup_revision_delete
+AFTER DELETE ON sessions
+BEGIN
+    UPDATE session_cleanup_revision SET revision = revision + 1 WHERE id = 1;
+    INSERT OR REPLACE INTO cleanup_cohort_dirty_sessions(session_id, revision)
+    SELECT OLD.id, revision FROM session_cleanup_revision WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS session_cleanup_revision_update
+AFTER UPDATE OF worktree_path, origin, status, cleanup_state ON sessions
+WHEN OLD.worktree_path IS NOT NEW.worktree_path
+  OR OLD.origin IS NOT NEW.origin
+  OR OLD.cleanup_state IS NOT NEW.cleanup_state
+  OR ((OLD.status = 'cleaned') != (NEW.status = 'cleaned'))
+BEGIN
+    UPDATE session_cleanup_revision SET revision = revision + 1 WHERE id = 1;
+    INSERT OR REPLACE INTO cleanup_cohort_dirty_sessions(session_id, revision)
+    SELECT NEW.id, revision FROM session_cleanup_revision WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS session_cleanup_revision_witness_insert
+AFTER INSERT ON spawned_worktree_instances
+BEGIN
+    UPDATE session_cleanup_revision
+    SET witness_revision = witness_revision + 1 WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS session_cleanup_revision_witness_update
+AFTER UPDATE ON spawned_worktree_instances
+BEGIN
+    UPDATE session_cleanup_revision
+    SET witness_revision = witness_revision + 1 WHERE id = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS session_cleanup_revision_witness_delete
+AFTER DELETE ON spawned_worktree_instances
+BEGIN
+    UPDATE session_cleanup_revision
+    SET witness_revision = witness_revision + 1 WHERE id = 1;
+END;
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -2002,6 +2126,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V56,
     MIGRATION_V57,
     MIGRATION_V58,
+    MIGRATION_V59,
 ];
 
 /// Migrations that only add columns. One is skipped when every column it adds
@@ -2031,7 +2156,33 @@ const TABLE_MIGRATIONS: &[(i64, &str, &[&str])] = &[
     (55, MIGRATION_V55, &["guarded_exec_receipts"]),
     (56, MIGRATION_V56, &["base_failure_incidents"]),
     (57, MIGRATION_V57, &["guarded_exec_helper_observations"]),
+    (
+        59,
+        MIGRATION_V59,
+        &[
+            "session_cleanup_revision",
+            "cleanup_cohort_dirty_sessions",
+            "cleanup_cohort_scans",
+            "cleanup_cohort_scan_rows",
+            "cleanup_cohort_scan_path_ancestors",
+            "cleanup_cohort_scan_groups",
+            "closed_checkout_cleanup_requests",
+        ],
+    ),
 ];
+
+const TRIGGER_MIGRATIONS: &[(i64, &str, &[&str])] = &[(
+    59,
+    MIGRATION_V59,
+    &[
+        "session_cleanup_revision_insert",
+        "session_cleanup_revision_delete",
+        "session_cleanup_revision_update",
+        "session_cleanup_revision_witness_insert",
+        "session_cleanup_revision_witness_update",
+        "session_cleanup_revision_witness_delete",
+    ],
+)];
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, BrokerError> {
     let count: i64 = conn.query_row(
@@ -2046,6 +2197,15 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool, BrokerError> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
         [table],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn trigger_exists(conn: &Connection, trigger: &str) -> Result<bool, BrokerError> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+        [trigger],
         |row| row.get(0),
     )?;
     Ok(count > 0)
@@ -2085,6 +2245,15 @@ fn missing_recorded_objects(conn: &Connection, version: i64) -> Result<bool, Bro
             }
         }
     }
+    for (v, _, triggers) in TRIGGER_MIGRATIONS {
+        if version >= *v {
+            for trigger in *triggers {
+                if !trigger_exists(conn, trigger)? {
+                    return Ok(true);
+                }
+            }
+        }
+    }
     for (v, columns) in COLUMN_ONLY_MIGRATIONS {
         if version >= *v {
             for (table, column) in *columns {
@@ -2110,6 +2279,11 @@ fn repair_recorded_migrations(conn: &Connection) -> Result<(), BrokerError> {
         for (v, sql, _) in TABLE_MIGRATIONS {
             if version >= *v {
                 conn.execute_batch(&idempotent_creates(sql))?;
+            }
+        }
+        for (v, sql, _) in TRIGGER_MIGRATIONS {
+            if version >= *v {
+                conn.execute_batch(sql)?;
             }
         }
         for (v, columns) in COLUMN_ONLY_MIGRATIONS {
