@@ -445,7 +445,10 @@ health = {{ command = "false", timeout_seconds = 2, interval_ms = 50 }}
     let start_error = record.last_error.as_ref().unwrap();
     assert_eq!(start_error["component"], "failed");
     assert_eq!(start_error["rollback_errors"][0]["component"], "worker");
-    assert_eq!(start_error["rollback_errors"][0]["code"], "identity_unproven");
+    assert_eq!(
+        start_error["rollback_errors"][0]["code"],
+        "identity_unproven"
+    );
 
     let worker = lifecycle
         .store
