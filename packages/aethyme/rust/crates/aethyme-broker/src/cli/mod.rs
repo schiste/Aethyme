@@ -823,7 +823,7 @@ Usage:
       by default; --apply revalidates and removes only clean worktrees whose
       session work is represented on main, integration, or configured upstream.
       Adopted worktrees are never included in the bulk sweep.
-  aethyme broker cleanup resolve <session-id> --archive [--confirm <sha256>] [--json]
+  aethyme broker cleanup resolve <session-id>... --archive [--batch] [--retire] [--allow-adopted] [--confirm <sha256>] [--json]
       Preserve, then remove, a closed session's worktree that cleanup refuses
       because it is dirty, holds pending commits, or cannot be proved landed.
       Without --confirm it prints what would be archived and a digest. With it,
@@ -1633,6 +1633,9 @@ struct Parsed {
     take_over: bool,
     all: bool,
     all_cleaned: bool,
+    cleanup_batch: bool,
+    allow_adopted: bool,
+    retire: bool,
     archive: bool,
     abandon: bool,
     keep_worktree: bool,
@@ -1779,6 +1782,9 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         take_over: false,
         all: false,
         all_cleaned: false,
+        cleanup_batch: false,
+        allow_adopted: false,
+        retire: false,
         archive: false,
         abandon: false,
         keep_worktree: false,
@@ -1865,6 +1871,9 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
             "--all" => parsed.all = true,
             "--all-cleaned" => parsed.all_cleaned = true,
             "--archive" => parsed.archive = true,
+            "--batch" => parsed.cleanup_batch = true,
+            "--allow-adopted" => parsed.allow_adopted = true,
+            "--retire" => parsed.retire = true,
             "--abandon" => parsed.abandon = true,
             "--keep-worktree" => parsed.keep_worktree = true,
             "--open-pr" => parsed.open_pr = true,

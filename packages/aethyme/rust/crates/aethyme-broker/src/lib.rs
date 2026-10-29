@@ -35,6 +35,7 @@ mod change_classification;
 mod chau7_mcp;
 mod chau7_tabs;
 mod cleanup_audit;
+mod cleanup_batch;
 mod cleanup_resolve;
 mod clock;
 pub mod collaboration_archive;
@@ -296,6 +297,10 @@ pub use change_classification::{
 pub use cleanup_audit::{
     AuditDisposition, AuditItem, AuditOwner, AuditSummary, AuditTarget,
     CLEANUP_AUDIT_SCHEMA_VERSION, CheckoutState, CleanupAudit, CommittedWork,
+};
+pub use cleanup_batch::{
+    CLEANUP_RESOLVE_BATCH_SCHEMA_VERSION, CleanupResolveBatchOutcome, CleanupResolveBatchPlan,
+    CleanupResolveBatchResult, CleanupResolveBatchTarget, MAX_CLEANUP_RESOLVE_BATCH_TARGETS,
 };
 pub use cleanup_resolve::{
     ArchivedFile, CLEANUP_RESOLVE_SCHEMA_VERSION, CleanupResolveOutcome, CleanupResolvePlan,

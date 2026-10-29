@@ -732,3 +732,159 @@ fn live_eligible_and_unmarked_requests_are_refused() {
 
 #[path = "common/json_error.rs"]
 mod json_error;
+
+#[test]
+fn recovery_batch_retires_closed_targets_without_removing_a_live_target() {
+    let tmp = repo();
+    let (first, first_path) = dirty_closed_session(tmp.path());
+    let (second, second_path) = dirty_closed_session(tmp.path());
+    let live = isolation::open(tmp.path())
+        .start_worktree("live batch target", None)
+        .unwrap();
+    let live_id = live.id.to_string();
+    let live_path = PathBuf::from(&live.worktree_path);
+    let args = [
+        "finish",
+        "cleanup",
+        "resolve",
+        &first,
+        &second,
+        &live_id,
+        "--batch",
+        "--archive",
+        "--json",
+    ];
+    let plan = json(&run(tmp.path(), &args));
+    assert_eq!(plan["targets"].as_array().unwrap().len(), 3);
+    let protected = plan["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|target| target["session_id"] == live.id)
+        .unwrap();
+    assert!(protected["confirmation"].is_null());
+    assert!(
+        protected["blocker"]
+            .as_str()
+            .unwrap()
+            .contains("close it first")
+    );
+    assert!(first_path.exists() && second_path.exists() && live_path.exists());
+    let digest = plan["digest"].as_str().unwrap();
+    let mut apply_args = args.to_vec();
+    apply_args.extend(["--confirm", digest]);
+    let applied = run(tmp.path(), &apply_args);
+    assert!(
+        !applied.status.success(),
+        "partial completion must have a nonzero status"
+    );
+    let outcome: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert_eq!(outcome["removed_count"], 2);
+    assert_eq!(
+        outcome["remaining_session_ids"],
+        serde_json::json!([live.id])
+    );
+    assert!(!first_path.exists() && !second_path.exists());
+    assert!(live_path.exists());
+    for result in outcome["results"].as_array().unwrap() {
+        if result["session_id"] != live.id {
+            assert!(result["outcome"]["worktree_removed"].as_bool().unwrap());
+            let archive = Path::new(result["outcome"]["archive"].as_str().unwrap());
+            assert!(archive.join("manifest.json").is_file());
+            assert_eq!(
+                std::fs::read(archive.join("untracked/data.bin")).unwrap(),
+                [0, 255, 1, 7]
+            );
+        }
+    }
+}
+
+#[test]
+fn recovery_batch_rejects_changed_content_before_removing_any_target() {
+    let tmp = repo();
+    let (first, first_path) = dirty_closed_session(tmp.path());
+    let (second, second_path) = dirty_closed_session(tmp.path());
+    let args = [
+        "finish",
+        "cleanup",
+        "resolve",
+        &first,
+        &second,
+        "--batch",
+        "--archive",
+        "--json",
+    ];
+    let plan = json(&run(tmp.path(), &args));
+    std::fs::write(second_path.join("data.bin"), b"changed after review").unwrap();
+    let mut apply_args = args.to_vec();
+    apply_args.extend(["--confirm", plan["digest"].as_str().unwrap()]);
+    let rejected = run(tmp.path(), &apply_args);
+    assert!(!rejected.status.success());
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&rejected.stdout),
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(diagnostic.contains("confirmation changed"), "{diagnostic}");
+    assert!(first_path.exists() && second_path.exists());
+    assert_eq!(
+        std::fs::read(second_path.join("data.bin")).unwrap(),
+        b"changed after review"
+    );
+}
+
+#[test]
+fn recovery_batch_can_compact_a_delivered_checkout_inside_grace() {
+    let tmp = repo();
+    let (id, worktree) = closed_session(tmp.path(), "compact delivered fixture");
+    let args = [
+        "finish",
+        "cleanup",
+        "resolve",
+        &id,
+        "--batch",
+        "--archive",
+        "--json",
+    ];
+    let plan = json(&run(tmp.path(), &args));
+    assert!(plan["targets"][0]["blocker"].is_null());
+    assert!(plan["apply_command"].as_str().unwrap().contains("--batch"));
+    assert!(worktree.exists());
+    let mut apply_args = args.to_vec();
+    apply_args.extend(["--confirm", plan["digest"].as_str().unwrap()]);
+    let outcome = json(&run(tmp.path(), &apply_args));
+    assert_eq!(outcome["removed_count"], 1);
+    assert!(!worktree.exists());
+    let archive = Path::new(
+        outcome["results"][0]["outcome"]["archive"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(archive.join("manifest.json").is_file());
+}
+
+#[test]
+fn recovery_batch_rejects_duplicate_ids_before_checkout_inspection() {
+    let tmp = repo();
+    let (id, worktree) = closed_session(tmp.path(), "duplicate scope fixture");
+    let rejected = run(
+        tmp.path(),
+        &[
+            "finish",
+            "cleanup",
+            "resolve",
+            &id,
+            &id,
+            "--archive",
+            "--json",
+        ],
+    );
+    assert!(!rejected.status.success());
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&rejected.stdout),
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(diagnostic.contains("duplicate session ID"), "{diagnostic}");
+    assert!(worktree.exists());
+}
