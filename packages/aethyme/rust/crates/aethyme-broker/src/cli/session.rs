@@ -142,6 +142,8 @@ fn render_tab_rename(outcome: &crate::chau7_mcp::SessionTabRename) {
     }
 }
 
+// Keep optional CLI metadata explicit while sharing the existing adopt/start serializer.
+#[allow(clippy::too_many_arguments)]
 fn session_action_json<T: serde::Serialize>(
     report: &T,
     tab_rename: &crate::chau7_mcp::SessionTabRename,
