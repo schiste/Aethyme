@@ -126,7 +126,7 @@ impl Server {
                 let mut active = Vec::new();
                 for worker in workers.drain(..) {
                     if worker.is_finished() {
-                        let _ = worker.join();
+                        join_worker(worker);
                     } else {
                         active.push(worker);
                     }
@@ -135,7 +135,9 @@ impl Server {
                 match self.listener.accept() {
                     Ok((stream, _)) if workers.len() < MAX_CLIENTS => {
                         workers.push(thread::spawn(move || {
-                            let _ = respond(stream);
+                            if let Err(error) = respond(stream) {
+                                eprintln!("broker service: client request failed: {error}");
+                            }
                         }));
                     }
                     Ok(_) => {} // Bounded overload: close without claiming execution.
@@ -149,7 +151,7 @@ impl Server {
             Ok(())
         })();
         for worker in workers {
-            let _ = worker.join();
+            join_worker(worker);
         }
         result
     }
@@ -159,9 +161,16 @@ impl Drop for Server {
     fn drop(&mut self) {
         if let Ok(metadata) = fs::symlink_metadata(&self.socket)
             && (metadata.dev(), metadata.ino()) == self.socket_identity
+            && let Err(error) = fs::remove_file(&self.socket)
         {
-            let _ = fs::remove_file(&self.socket);
+            eprintln!("broker service: socket cleanup failed: {error}");
         }
+    }
+}
+
+fn join_worker(worker: JoinHandle<()>) {
+    if worker.join().is_err() {
+        eprintln!("broker service: client handler panicked");
     }
 }
 

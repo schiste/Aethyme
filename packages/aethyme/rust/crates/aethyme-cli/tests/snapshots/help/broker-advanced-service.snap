@@ -1,0 +1,8 @@
+exit: 0
+--- stdout
+  aethyme broker advanced service serve <private-runtime-directory>
+  aethyme broker advanced service ping <private-runtime-directory> [--json]
+      Opt-in foreground health service; existing broker operations stay local.
+      Create an absolute canonical directory owned by this user, mode 0700.
+      Stop with Ctrl-C or your process supervisor; no implicit activation.
+--- stderr
