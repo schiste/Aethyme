@@ -23,6 +23,7 @@ path = "src/bin/broker-cli-shim.rs"
 
 [dependencies]
 # Experimental v0 contracts: the AQ0 analysis envelope (#655).
+aethyme-config = { path = "../aethyme-config" }
 aethyme-contracts = { path = "../aethyme-contracts" }
 aethyme-engine = { path = "../aethyme-engine" }
 aethyme-enhance = { path = "../aethyme-enhance" }

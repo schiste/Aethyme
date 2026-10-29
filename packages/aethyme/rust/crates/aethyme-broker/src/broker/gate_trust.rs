@@ -145,12 +145,12 @@ pub(crate) fn policy_at_root(root: &Path) -> Result<GatePolicy, BrokerOpError> {
 
 /// The policy as committed at `commit`.
 pub(crate) fn policy_at_commit(repo: &GitRepo, commit: &str) -> Result<GatePolicy, BrokerOpError> {
-    let gates = match repo.file_at_commit(commit, crate::gates::GATES_CONFIG_RELPATH)? {
+    let gates = match repo.config_toml_at_commit(commit, "gates")? {
         Some(text) => crate::gates::parse_gates(&text)?,
         None => Vec::new(),
     };
     let prepare = repo
-        .file_at_commit(commit, crate::preparation::PREPARATION_CONFIG_RELPATH)?
+        .config_toml_at_commit(commit, "prepare")?
         .map(|text| crate::preparation::parse_config(&text))
         .transpose()?;
     Ok(GatePolicy::from_parts(&gates, prepare.as_ref()))

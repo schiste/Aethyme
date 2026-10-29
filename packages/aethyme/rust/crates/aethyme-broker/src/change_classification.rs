@@ -88,7 +88,16 @@ const DEPENDENCY_MANIFESTS: &[&str] = &[
 ];
 
 /// Broker policy: a change here alters what gates run or how reviews route.
-const GATE_POLICY: &[&str] = &[".aethyme/gates.toml", ".aethyme/config.toml"];
+/// Every format twin is listed (#1223): a policy change written in YAML must
+/// route exactly like the TOML one, or YAML support would be a review bypass.
+const GATE_POLICY: &[&str] = &[
+    ".aethyme/gates.toml",
+    ".aethyme/gates.yaml",
+    ".aethyme/gates.yml",
+    ".aethyme/config.toml",
+    ".aethyme/config.yaml",
+    ".aethyme/config.yml",
+];
 
 const WORKFLOWS: &[&str] = &[".github/workflows/**"];
 
@@ -191,6 +200,9 @@ pub enum ChangeClassificationError {
         path: String,
         source: toml::de::Error,
     },
+    /// The configuration is ambiguous (two format twins) or invalid YAML.
+    #[error("{0}")]
+    Config(#[from] aethyme_config::ConfigSourceError),
     #[error(
         "{path}: review.classification schema_version {found} is newer than this broker \
          understands ({supported}); upgrade aethyme or pin the policy"
@@ -211,20 +223,13 @@ impl ChangeClassificationPolicy {
     /// Load from `.aethyme/config.toml`; an absent file or table is the
     /// documented default. A newer schema refuses rather than defaulting.
     pub fn load(root: &Path) -> Result<Self, ChangeClassificationError> {
-        let path = root.join(".aethyme/config.toml");
-        let display = path.display().to_string();
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
-            Err(source) => {
-                return Err(ChangeClassificationError::Read {
-                    path: display,
-                    source,
-                });
-            }
+        // `.aethyme/config.toml`, `.yaml` or `.yml` (#1223), as TOML text.
+        let Some((path, text)) =
+            aethyme_config::read_config_toml(&root.join(aethyme_config::CONFIG_DIR), "config")?
+        else {
+            return Ok(Self::default());
         };
+        let display = path.display().to_string();
         Self::from_toml_str(&text, &display)
     }
 
@@ -1219,6 +1224,31 @@ mod tests {
                 SizeTier::Trivial,
                 "{path}: size and risk are separate"
             );
+        }
+    }
+
+    #[test]
+    fn gate_policy_covers_every_config_format_twin() {
+        for path in [
+            ".aethyme/gates.toml",
+            ".aethyme/gates.yaml",
+            ".aethyme/gates.yml",
+            ".aethyme/config.toml",
+            ".aethyme/config.yaml",
+            ".aethyme/config.yml",
+        ] {
+            let c = classify(
+                &ChangeClassificationPolicy::default(),
+                &inputs(vec![file(path, 1, 0)]),
+            );
+            assert_eq!(c.signals.gate_policy, vec![path.to_string()], "{path}");
+            assert_eq!(c.computed_risk, "high", "{path}");
+        }
+        // Every stem whose policy routes reviews or gates is covered.
+        for stem in ["gates", "config"] {
+            for relpath in crate::config_source::candidate_relpaths(stem) {
+                assert!(GATE_POLICY.contains(&relpath.as_str()), "{relpath}");
+            }
         }
     }
 

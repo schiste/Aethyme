@@ -289,9 +289,12 @@ pub(crate) fn session_baseline(
     Some(from_integration)
 }
 
-/// The repository's `.aethyme/config.toml` under the broker's one trust rule:
-/// as committed on the fetched default branch when that exists, else the main
-/// checkout's working-tree file. `[promote]` and `[worktrees]` both read it.
+/// The repository's `.aethyme/config` (TOML or YAML, #1223) under the
+/// broker's one trust rule: as committed on the fetched default branch when
+/// that exists, else the main checkout's working-tree file. `[promote]` and
+/// `[worktrees]` both read it. The text is TOML: a YAML file is validated and
+/// rendered from the same value. An ambiguous or invalid file reads as absent
+/// here; callers that must report it use [`repository_config_checked`].
 pub(crate) fn repository_config_text(main_root: &Path) -> Option<String> {
     repository_config_with_source(main_root).map(|(text, _)| text)
 }
@@ -300,27 +303,49 @@ pub(crate) fn repository_config_text(main_root: &Path) -> Option<String> {
 /// fetched default branch) or `working_copy` (the main checkout's file, used
 /// when there is no fetched default branch or it does not hold the file).
 pub(crate) fn repository_config_with_source(main_root: &Path) -> Option<(String, &'static str)> {
+    repository_config_checked(main_root).ok().flatten()
+}
+
+/// [`repository_config_with_source`], keeping why the configuration could
+/// not be resolved: two format twins, or YAML outside the strict subset.
+pub(crate) fn repository_config_checked(
+    main_root: &Path,
+) -> Result<Option<(String, &'static str)>, aethyme_config::ConfigSourceError> {
     crate::status_reads::configuration(main_root, || {
-        committed_config_text(main_root)
-            .map(|text| (text, "committed"))
-            .or_else(|| {
-                std::fs::read_to_string(main_root.join(".aethyme/config.toml"))
-                    .ok()
-                    .map(|text| (text, "working_copy"))
+        if let Some(text) = committed_config_text(main_root)? {
+            return Ok(Some((text, "committed")));
+        }
+        Ok(
+            aethyme_config::read_config_text(
+                &main_root.join(aethyme_config::CONFIG_DIR),
+                "config",
+            )?
+            .map(|text| {
+                text.toml_text()
+                    .map(|toml| (toml.into_owned(), "working_copy"))
             })
+            .transpose()?,
+        )
     })
 }
 
-/// `.aethyme/config.toml` as committed on the fetched default branch, if there
-/// is one and it holds the file.
-fn committed_config_text(main_root: &Path) -> Option<String> {
+/// `.aethyme/config` as committed on the fetched default branch, if there
+/// is one and it holds the file, as TOML text.
+fn committed_config_text(
+    main_root: &Path,
+) -> Result<Option<String>, aethyme_config::ConfigSourceError> {
     // The caller already supplies the main checkout root. Reuse that path
     // without another discovery process; ref and content reads remain fresh.
     let repo = GitRepo::at_known_root(main_root);
-    let (_, commit) = repo.upstream_default()?;
-    repo.file_at_commit(&commit, ".aethyme/config.toml")
-        .ok()
-        .flatten()
+    let Some((_, commit)) = repo.upstream_default() else {
+        return Ok(None);
+    };
+    match repo.config_at_commit(&commit, "config") {
+        Ok(Some(text)) => Ok(Some(text.toml_text()?.into_owned())),
+        Ok(None) => Ok(None),
+        Err(crate::GitError::Config(error)) => Err(error),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Result of one submit: the queue entry after simulate (+ gates when
@@ -1423,12 +1448,10 @@ impl Broker {
             Some(gates) => (gates, true),
             None => (Vec::new(), false),
         };
-        let gate_policy_changed = self
-            .repo_handle()
-            .file_at_commit(&base, crate::gates::GATES_CONFIG_RELPATH)?
+        let gate_policy_changed = self.repo_handle().config_toml_at_commit(&base, "gates")?
             != self
                 .repo_handle()
-                .file_at_commit(merge_commit, crate::gates::GATES_CONFIG_RELPATH)?;
+                .config_toml_at_commit(merge_commit, "gates")?;
         if gate_policy_changed || graph_policy_changed {
             self.store().append_event(
                 crate::events::MERGE_POLICY_DEFERRED,
@@ -2843,7 +2866,10 @@ mod verification_candidate_tests {
         let base = commit_file(root, "base.txt", "base\n");
         let input = commit_file(root, "change.txt", "change\n");
         let tree = git(root, &["write-tree"]);
-        assert!(!root.join(".aethyme/gates.toml").exists());
+        assert!(!aethyme_config::config_exists(
+            &root.join(aethyme_config::CONFIG_DIR),
+            "gates"
+        ));
 
         let repo = GitRepo::discover(root).unwrap();
         let candidate = mint_verification_candidate(

@@ -19,6 +19,10 @@ pub enum BrokerError {
     #[error("broker db: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    /// A `.aethyme` configuration file could not be resolved or parsed.
+    #[error("{0}")]
+    Config(#[from] aethyme_config::ConfigSourceError),
+
     // Recovery must never be "run whatever binary is newer" (#361): the
     // newer schema may have come from an unreviewed gate build, and the
     // only binaries that should open shared state are released ones.
