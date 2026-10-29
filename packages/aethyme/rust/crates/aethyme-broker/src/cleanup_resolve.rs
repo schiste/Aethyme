@@ -22,6 +22,8 @@
 //! Protected standalone ignored files and links are archived; strict-policy
 //! leftovers leave the worktree in place.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -108,7 +110,87 @@ pub struct ArchivedFile {
 pub(crate) struct CleanupResolveRetirementContext {
     delivery_targets: Vec<String>,
     live_checkouts: Vec<(i64, crate::auto_cleanup::ResolvedWorktreePath)>,
+    ancestry_memo: PlanAncestryMemo,
     deadline: Option<Instant>,
+}
+
+/// A memo scoped to one captured retirement-planning context. Its keys are
+/// exact commit IDs, so results cannot leak across plans or changing refs.
+/// Apply-time validation deliberately uses the uncached Git helper below.
+#[derive(Default)]
+pub(crate) struct PlanAncestryMemo {
+    delivery_targets: Vec<String>,
+    deadline: Option<Instant>,
+    results: RefCell<HashMap<(String, String), bool>>,
+}
+
+impl PlanAncestryMemo {
+    fn for_delivery_targets(delivery_targets: &[String], deadline: Option<Instant>) -> Self {
+        Self {
+            delivery_targets: delivery_targets.to_vec(),
+            deadline,
+            results: RefCell::default(),
+        }
+    }
+
+    pub(crate) fn check(
+        &self,
+        repository: &GitRepo,
+        ancestor: &str,
+        descendant: &str,
+    ) -> Result<bool, String> {
+        self.check_until(repository, ancestor, descendant, None)
+    }
+
+    pub(crate) fn check_until(
+        &self,
+        repository: &GitRepo,
+        ancestor: &str,
+        descendant: &str,
+        deadline: Option<Instant>,
+    ) -> Result<bool, String> {
+        let deadline = match (self.deadline, deadline) {
+            (Some(context), Some(call)) => Some(context.min(call)),
+            (Some(context), None) => Some(context),
+            (None, Some(call)) => Some(call),
+            (None, None) => None,
+        };
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            || !self
+                .delivery_targets
+                .iter()
+                .any(|target| target == descendant)
+        {
+            return repository
+                .is_ancestor_checked(ancestor, descendant)
+                .map_err(|error| error.to_string());
+        }
+        self.check_with(ancestor, descendant, || {
+            repository
+                .is_ancestor_checked(ancestor, descendant)
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn check_with(
+        &self,
+        ancestor: &str,
+        descendant: &str,
+        check: impl FnOnce() -> Result<bool, String>,
+    ) -> Result<bool, String> {
+        let key = (ancestor.to_owned(), descendant.to_owned());
+        if let Some(result) = self.results.borrow().get(&key) {
+            return Ok(*result);
+        }
+
+        match check() {
+            Ok(result) => {
+                self.results.borrow_mut().insert(key, result);
+                Ok(result)
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1039,6 +1121,7 @@ impl Broker {
         let delivery_targets = self.cleanup_delivery_targets()?;
         let live_checkouts = self.cleanup_live_checkout_snapshot(deadline)?;
         Ok(CleanupResolveRetirementContext {
+            ancestry_memo: PlanAncestryMemo::for_delivery_targets(&delivery_targets, deadline),
             delivery_targets,
             live_checkouts,
             deadline,
@@ -1217,6 +1300,7 @@ impl Broker {
                 status_output_bytes,
                 status_path_fields,
                 delivery_targets,
+                &context.ancestry_memo,
                 allow_adopted && session.origin == SessionOrigin::Adopted,
                 &context.live_checkouts,
             )?
@@ -1443,6 +1527,7 @@ impl Broker {
                 checkout_branch_ref.as_deref(),
                 checkout_branch_tip.as_deref(),
                 delivery_targets,
+                &context.ancestry_memo,
             )
             .map_err(refuse)?
         } else {
@@ -2819,6 +2904,7 @@ fn recovery_root_proofs_for_plan_parts(
     checkout_branch_ref: Option<&str>,
     checkout_branch_tip: Option<&str>,
     delivery_targets: &[String],
+    ancestry_memo: &PlanAncestryMemo,
 ) -> Result<Vec<RecoveryRootProof>, String> {
     recovery_root_identities_for_plan_parts(
         head,
@@ -2830,16 +2916,37 @@ fn recovery_root_proofs_for_plan_parts(
     .into_iter()
     .map(|(ref_name, object_id)| {
         Ok(RecoveryRootProof {
-            available_from_delivery: root_available_from_delivery(
+            available_from_delivery: root_available_from_delivery_during_plan(
                 repository,
                 &object_id,
                 delivery_targets,
+                ancestry_memo,
             )?,
             ref_name,
             object_id,
         })
     })
     .collect()
+}
+
+fn root_available_from_delivery_during_plan(
+    repository: &GitRepo,
+    object_id: &str,
+    delivery_targets: &[String],
+    ancestry_memo: &PlanAncestryMemo,
+) -> Result<bool, String> {
+    for target in delivery_targets {
+        match ancestry_memo.check(repository, object_id, target) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot check recovery root {object_id} against delivery target {target}: {error}"
+                ));
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn validate_root_proof_identities(
@@ -5751,6 +5858,44 @@ fn restore_readme(plan: &CleanupResolvePlan, has_bundle: bool) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn plan_ancestry_memo_caches_verdicts_but_retries_errors() {
+        let memo = PlanAncestryMemo::default();
+        let errors = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            let result = memo.check_with("ancestor", "target-error", || {
+                errors.set(errors.get() + 1);
+                Err("temporary Git failure".into())
+            });
+            assert_eq!(result, Err("temporary Git failure".into()));
+        }
+        assert_eq!(errors.get(), 2);
+
+        let negatives = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            assert_eq!(
+                memo.check_with("ancestor", "target-negative", || {
+                    negatives.set(negatives.get() + 1);
+                    Ok(false)
+                }),
+                Ok(false)
+            );
+        }
+        assert_eq!(negatives.get(), 1);
+
+        let positives = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            assert_eq!(
+                memo.check_with("ancestor", "target-positive", || {
+                    positives.set(positives.get() + 1);
+                    Ok(true)
+                }),
+                Ok(true)
+            );
+        }
+        assert_eq!(positives.get(), 1);
+    }
+
     #[cfg(unix)]
     fn write_over_cap_bundle(
         _checkout: &GitRepo,
@@ -5889,6 +6034,7 @@ mod tests {
             plan.checkout_branch_ref.as_deref(),
             plan.checkout_branch_tip.as_deref(),
             &plan.delivery_targets,
+            &PlanAncestryMemo::for_delivery_targets(&plan.delivery_targets, None),
         )
         .unwrap();
 
@@ -7248,6 +7394,7 @@ mod tests {
             plan.checkout_branch_ref.as_deref(),
             plan.checkout_branch_tip.as_deref(),
             &plan.delivery_targets,
+            &PlanAncestryMemo::for_delivery_targets(&plan.delivery_targets, None),
         )
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -7409,7 +7556,7 @@ mod tests {
         assert!(
             validate_manifest_identity(&v4_with_v5_only_fields)
                 .unwrap_err()
-                .contains("only schema v5 archives may declare retirement metadata")
+                .contains("only retirement archives may declare retirement metadata")
         );
 
         let legacy_digest = legacy_v2_cleanup_resolve_digest(&plan, &proof).unwrap();
