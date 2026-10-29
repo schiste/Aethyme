@@ -29,6 +29,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - During issue-status audits, treat plan and architecture prose as a claim:
   map each acceptance criterion to current implementation and test assertions
   at the audited commit before marking it absent or complete.
+- Before extending ancestry-check deadlines, time the exact Git object pairs
+  and compare commit-graph coverage with reachable history. If measured graph
+  staleness is causal, refresh derived metadata through coordinated Git, repeat
+  the same probes, and then verify the native operation succeeds. Configure
+  incremental graph maintenance separately; faster raw Git alone does not prove
+  successful cleanup or authorize deletion.
 - Inspect caution zones before changing generated or vendored areas.
 
 ## Validation Checklist
