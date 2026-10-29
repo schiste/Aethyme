@@ -5961,7 +5961,13 @@ mod tests {
                 command.env_remove(name.as_ref());
             }
         }
-        command.output().unwrap()
+        command
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap()
     }
 
     fn git_output(dir: &Path, args: &[&str]) -> String {

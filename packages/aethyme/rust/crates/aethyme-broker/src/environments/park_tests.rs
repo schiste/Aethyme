@@ -319,14 +319,14 @@ name = "api"
 runtime = "process"
 env = {{ MARKERS = "{m}" }}
 start = 'if test -f "$MARKERS/orphan-on-wake"; then sleep 300 & echo "$$" > "$MARKERS/leader.pid"; echo "$!" > "$MARKERS/child.pid"; sleep 0.2; else exec sleep 300; fi'
-health = {{ command = 'test ! -f "$MARKERS/orphan-on-wake" || (test -s "$MARKERS/leader.pid" && test -s "$MARKERS/child.pid")', timeout_seconds = 2, interval_ms = 20 }}
+health = {{ command = 'test ! -f "$MARKERS/orphan-on-wake" || (test -s "$MARKERS/leader.pid" && test -s "$MARKERS/child.pid")', timeout_seconds = 2, interval_ms = 50 }}
 [[profiles.components]]
 name = "worker"
 runtime = "process"
 depends_on = ["api"]
 env = {{ MARKERS = "{m}" }}
 start = 'if test -f "$MARKERS/orphan-on-wake"; then leader=$(cat "$MARKERS/leader.pid"); while kill -0 "$leader" 2>/dev/null; do sleep 0.01; done; exit 9; else exec sleep 300; fi'
-health = {{ command = 'test ! -f "$MARKERS/orphan-on-wake" || false', timeout_seconds = 2, interval_ms = 20 }}
+health = {{ command = 'test ! -f "$MARKERS/orphan-on-wake" || false', timeout_seconds = 2, interval_ms = 50 }}
 "#,
         m = flags.path().display()
     );

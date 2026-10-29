@@ -404,14 +404,14 @@ name = "worker"
 runtime = "process"
 env = {{ MARKERS = "{m}" }}
 start = 'sleep 300 & echo "$$" > "$MARKERS/worker-leader.pid"; echo "$!" > "$MARKERS/worker-child.pid"; sleep 0.2'
-health = {{ command = 'test -s "$MARKERS/worker-leader.pid" && test -s "$MARKERS/worker-child.pid"', timeout_seconds = 2, interval_ms = 20 }}
+health = {{ command = 'test -s "$MARKERS/worker-leader.pid" && test -s "$MARKERS/worker-child.pid"', timeout_seconds = 2, interval_ms = 50 }}
 [[profiles.components]]
 name = "failed"
 runtime = "process"
 depends_on = ["worker"]
 env = {{ MARKERS = "{m}" }}
 start = 'leader=$(cat "$MARKERS/worker-leader.pid"); while kill -0 "$leader" 2>/dev/null; do sleep 0.01; done; exit 9'
-health = {{ command = "false", timeout_seconds = 2, interval_ms = 20 }}
+health = {{ command = "false", timeout_seconds = 2, interval_ms = 50 }}
 "#,
         m = host.markers.display()
     );
