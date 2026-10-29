@@ -304,6 +304,13 @@ blocked.
    Read the pull-request body back and compare it with the approved file before
    handing the draft off for review.
 
+   When interpreting an Aethyme review-status comment, read
+   `aethyme broker advanced review ledger --repo <owner/name> --pr <number> --json`
+   and match the latest row's requested commit and state to the current PR head.
+   The comment is a projection and can still say `requested` after the ledger
+   marks a review `abandoned`; it does not prove a reviewer is active or has
+   finished.
+
    For notes and other free-form broker text passed through a shell, prefer
    literal argv via Python `subprocess.run([...])` or a quoted here-doc; do
    not inline text containing shell substitutions or quote characters. For
