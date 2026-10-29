@@ -22,7 +22,9 @@ use super::compile::{CompiledEnvironment, EnvironmentOwner};
 use crate::managed_services::ManagedServicePhase;
 
 pub const ENVIRONMENTS_DB: &str = "environments.db";
-pub const STORE_SCHEMA_VERSION: i64 = 1;
+/// v2 (#1211): `environments.main_root`, so destroy can export the recorded
+/// commit after the worktree is gone.
+pub const STORE_SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -36,6 +38,7 @@ CREATE TABLE IF NOT EXISTS environments (
   owner_ref TEXT NOT NULL,
   worktree_fingerprint TEXT NOT NULL,
   worktree_root TEXT,
+  main_root TEXT,
   session_id INTEGER,
   profile TEXT NOT NULL,
   profile_digest TEXT NOT NULL,
@@ -195,6 +198,9 @@ pub struct EnvironmentRecord {
     pub owner: EnvironmentOwner,
     pub worktree_fingerprint: String,
     pub worktree_root: Option<String>,
+    /// The repository's main checkout, used to export the recorded commit
+    /// when the worktree is gone (#1211).
+    pub main_root: Option<String>,
     pub session_id: Option<i64>,
     pub profile: String,
     pub profile_digest: String,
@@ -336,9 +342,17 @@ impl EnvironmentStore {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        // v1 -> v2: additive column. Older binaries ignore it.
+        let has_main_root = conn
+            .prepare("SELECT 1 FROM pragma_table_info('environments') WHERE name = 'main_root'")?
+            .exists([])?;
+        if !has_main_root {
+            conn.execute_batch("ALTER TABLE environments ADD COLUMN main_root TEXT")?;
+        }
         conn.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)
-             ON CONFLICT(key) DO NOTHING",
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value
+             WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
             params![STORE_SCHEMA_VERSION.to_string()],
         )?;
         Ok(Self { conn })
@@ -351,8 +365,24 @@ impl EnvironmentStore {
     /// Open for reading without creating anything. `None` when no
     /// environment has ever been recorded on this host.
     pub fn open_read_only(path: &Path) -> Result<Option<Self>, StoreError> {
-        if !path.exists() {
-            return Ok(None);
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(StoreError::Io {
+                    path: path.into(),
+                    source,
+                });
+            }
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(StoreError::Io {
+                    path: path.into(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "environments database path is not a regular file",
+                    ),
+                });
+            }
         }
         let conn = Connection::open_with_flags(
             path,
@@ -360,6 +390,17 @@ impl EnvironmentStore {
         )?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Self::check_version(&conn)?;
+        let current = conn
+            .prepare("SELECT 1 FROM pragma_table_info('environments') WHERE name = 'main_root'")?
+            .exists([])?;
+        if !current {
+            // An existing store from an older binary: bring it forward once
+            // (additive only), then read. A missing store is still never
+            // created by a read.
+            drop(conn);
+            drop(Self::open(path)?);
+            return Self::open_read_only(path);
+        }
         Ok(Some(Self { conn }))
     }
 
@@ -721,6 +762,78 @@ impl EnvironmentStore {
         }
     }
 
+    /// Forget a component's instance after its rollback destroy succeeded:
+    /// back to `intent` with no identity or receipt, so the next `up`
+    /// provisions it again. Only for confirmed rollbacks; it bypasses phase
+    /// topology on purpose.
+    pub fn reset_component(&mut self, env_id: &str, component: &str) -> Result<(), StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE environment_components SET phase = ?3, identity_json = NULL,
+               receipt_json = NULL, updated_at = ?4
+             WHERE env_id = ?1 AND component = ?2",
+            params![
+                env_id,
+                component,
+                ManagedServicePhase::Intent.as_str(),
+                now_ms()
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(format!("{env_id}/{component}")));
+        }
+        Ok(())
+    }
+
+    pub fn set_pin(
+        &mut self,
+        env_id: &str,
+        until: Option<i64>,
+        reason: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE environments SET pinned_until = ?2, pin_reason = ?3, updated_at = ?4
+             WHERE env_id = ?1",
+            params![env_id, until, reason, now_ms()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(env_id.into()));
+        }
+        Ok(())
+    }
+
+    /// Record an event that is not a phase change (a pin, an idle park's
+    /// reason) in the same history, as a transition from the current phase
+    /// to itself.
+    pub fn note(
+        &mut self,
+        env_id: &str,
+        reason: &str,
+        actor: &str,
+        detail: Option<&serde_json::Value>,
+    ) -> Result<(), StoreError> {
+        let record = self
+            .get(env_id)?
+            .ok_or_else(|| StoreError::NotFound(env_id.into()))?;
+        insert_transition(
+            &self.conn,
+            env_id,
+            Some(record.phase),
+            record.phase,
+            reason,
+            actor,
+            now_ms(),
+            detail,
+        )
+    }
+
+    pub fn set_main_root(&mut self, env_id: &str, main_root: &Path) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE environments SET main_root = ?2 WHERE env_id = ?1",
+            params![env_id, main_root.to_string_lossy()],
+        )?;
+        Ok(())
+    }
+
     pub fn set_leases(
         &mut self,
         env_id: &str,
@@ -892,7 +1005,7 @@ fn load_record(conn: &Connection, env_id: &str) -> Result<Option<EnvironmentReco
                worktree_root, session_id, profile, profile_digest, spec_snapshot_json,
                namespace, phase, phase_generation, reservation_lease_id, capacity_lease_id,
                created_at, updated_at, last_activity_at, pinned_until, pin_reason, parked_at,
-               last_error_json
+               last_error_json, main_root
              FROM environments WHERE env_id = ?1",
             params![env_id],
             |row| {
@@ -922,6 +1035,7 @@ fn load_record(conn: &Connection, env_id: &str) -> Result<Option<EnvironmentReco
                         row.get::<_, Option<String>>(19)?,
                         row.get::<_, Option<i64>>(20)?,
                         row.get::<_, Option<String>>(21)?,
+                        row.get::<_, Option<String>>(22)?,
                     ),
                 ))
             },
@@ -953,6 +1067,7 @@ fn load_record(conn: &Connection, env_id: &str) -> Result<Option<EnvironmentReco
             pin_reason,
             parked_at,
             last_error,
+            main_root,
         ),
     )) = row
     else {
@@ -973,6 +1088,7 @@ fn load_record(conn: &Connection, env_id: &str) -> Result<Option<EnvironmentReco
         owner,
         worktree_fingerprint,
         worktree_root,
+        main_root,
         session_id,
         profile,
         profile_digest,

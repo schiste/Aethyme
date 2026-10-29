@@ -6,7 +6,9 @@ use super::compile::{CompileContext, CompiledEnvironment, EnvironmentOwner, comp
 use super::identity::{Observation, ProcessIdentity};
 use super::logs::{log_path, open_for_append, remove_environment_directory, tail};
 use super::spec::{EnvironmentsFile, HostEnvironmentsFile};
-use super::store::{EnvironmentPhase, EnvironmentStore, StoreError, valid_env_id};
+use super::store::{
+    EnvironmentPhase, EnvironmentStore, STORE_SCHEMA_VERSION, StoreError, valid_env_id,
+};
 use super::supervisor::{
     self, ExitReason, StoreWatch, SupervisorConfig, SupervisorWork, TickOutcome,
 };
@@ -254,7 +256,7 @@ fn a_newer_store_schema_is_refused_and_a_missing_store_is_not_created() {
     match EnvironmentStore::open(&path) {
         Err(StoreError::SchemaTooNew {
             found: 99,
-            supported: 1,
+            supported: STORE_SCHEMA_VERSION,
         }) => {}
         other => panic!("{:?}", other.err()),
     }

@@ -700,6 +700,13 @@ Agent broker:
 Environments (declared in .aethyme/environments.toml):
   env validate|plan           check profiles statically; preview the host
                               resources a profile would reserve
+  env up|down|destroy|sweep   bring this worktree's environment up, destroy it
+                              (leases released only after destroy succeeds)
+  env park|wake <id>          stop and return capacity units, or wake again
+  env exec <id> -- <cmd>      run a command against the environment; never
+                              parked while it runs (env touch|pin|unpin)
+  env routes                  hostnames the loopback proxy (127.0.0.1:4180)
+                              serves; a request to a parked one wakes it
   env status|list|history|logs
                               recorded environments, their phases, history
                               and component logs; host supervisor state

@@ -22,7 +22,9 @@
 //! Protected standalone ignored files and links are archived; strict-policy
 //! leftovers leave the worktree in place.
 
-use std::io::{Read, Write};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,7 +44,9 @@ const PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 2;
 const PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 3;
 const RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 4;
 const RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 5;
+const PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION: u32 = 6;
 const RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION: u32 = 2;
+const PINNED_RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION: u32 = 3;
 const RETIREMENT_ARCHIVE_RECORD_FILE: &str = "retirement.json";
 const MAX_RETIREMENT_ARCHIVE_RECORD_BYTES: u64 = 64 * 1024;
 const MIN_RECOVERY_ARCHIVE_RETENTION_MS: u64 = 15 * 24 * 60 * 60 * 1_000;
@@ -50,6 +54,7 @@ const AUTO_COMPACTION_STAGING_RESERVE: Duration = Duration::from_secs(10);
 const MAX_RECOVERY_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_RECOVERY_BUNDLE_STDERR_BYTES: usize = 64 * 1024;
 const MAX_RECOVERY_BUNDLE_METADATA_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_RECOVERY_ARCHIVE_PREREQUISITE_REFS: usize = 128;
 
 /// Directory beneath the host state directory holding one subdirectory of
 /// archives per repository.
@@ -105,7 +110,87 @@ pub struct ArchivedFile {
 pub(crate) struct CleanupResolveRetirementContext {
     delivery_targets: Vec<String>,
     live_checkouts: Vec<(i64, crate::auto_cleanup::ResolvedWorktreePath)>,
+    ancestry_memo: PlanAncestryMemo,
     deadline: Option<Instant>,
+}
+
+/// A memo scoped to one captured retirement-planning context. Its keys are
+/// exact commit IDs, so results cannot leak across plans or changing refs.
+/// Apply-time validation deliberately uses the uncached Git helper below.
+#[derive(Default)]
+pub(crate) struct PlanAncestryMemo {
+    delivery_targets: Vec<String>,
+    deadline: Option<Instant>,
+    results: RefCell<HashMap<(String, String), bool>>,
+}
+
+impl PlanAncestryMemo {
+    fn for_delivery_targets(delivery_targets: &[String], deadline: Option<Instant>) -> Self {
+        Self {
+            delivery_targets: delivery_targets.to_vec(),
+            deadline,
+            results: RefCell::default(),
+        }
+    }
+
+    pub(crate) fn check(
+        &self,
+        repository: &GitRepo,
+        ancestor: &str,
+        descendant: &str,
+    ) -> Result<bool, String> {
+        self.check_until(repository, ancestor, descendant, None)
+    }
+
+    pub(crate) fn check_until(
+        &self,
+        repository: &GitRepo,
+        ancestor: &str,
+        descendant: &str,
+        deadline: Option<Instant>,
+    ) -> Result<bool, String> {
+        let deadline = match (self.deadline, deadline) {
+            (Some(context), Some(call)) => Some(context.min(call)),
+            (Some(context), None) => Some(context),
+            (None, Some(call)) => Some(call),
+            (None, None) => None,
+        };
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            || !self
+                .delivery_targets
+                .iter()
+                .any(|target| target == descendant)
+        {
+            return repository
+                .is_ancestor_checked(ancestor, descendant)
+                .map_err(|error| error.to_string());
+        }
+        self.check_with(ancestor, descendant, || {
+            repository
+                .is_ancestor_checked(ancestor, descendant)
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn check_with(
+        &self,
+        ancestor: &str,
+        descendant: &str,
+        check: impl FnOnce() -> Result<bool, String>,
+    ) -> Result<bool, String> {
+        let key = (ancestor.to_owned(), descendant.to_owned());
+        if let Some(result) = self.results.borrow().get(&key) {
+            return Ok(*result);
+        }
+
+        match check() {
+            Ok(result) => {
+                self.results.borrow_mut().insert(key, result);
+                Ok(result)
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -340,6 +425,29 @@ struct RetirementDigestInputV1<'a> {
     recovery_root_proofs_sha256: &'a str,
 }
 
+/// Schema v6 confirmations bind immutable checkout contents and root names,
+/// while the captured delivery envelope remains archive evidence that can be
+/// refreshed after a forward-only delivery move.
+#[derive(serde::Serialize)]
+struct RetirementDigestInputV2<'a> {
+    content_digest: &'a str,
+    recovery_archive_schema_version: u32,
+    minimum_archive_retention_ms: u64,
+    target_origin: &'a str,
+    allow_adopted: bool,
+    owner_witness_sha256: Option<&'a str>,
+    checkout_branch_ref: Option<&'a str>,
+    checkout_branch_tip: Option<&'a str>,
+    recovery_root_identities: Vec<(&'a str, &'a str)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecoveryArchivePrerequisiteRef {
+    pub ref_name: String,
+    pub object_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RetirementArchiveRecord {
@@ -360,6 +468,10 @@ struct RetirementArchiveRecord {
     checkout_branch_tip: Option<String>,
     recovery_root_proofs_sha256: String,
     head: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery_targets: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prerequisite_refs: Option<Vec<RecoveryArchivePrerequisiteRef>>,
 }
 
 #[derive(serde::Serialize)]
@@ -403,6 +515,8 @@ struct RecoveryManifest<'a> {
     recovery_root_proofs: Option<&'a [RecoveryRootProof]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     delivery_targets_sha256: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prerequisite_refs: Option<&'a [RecoveryArchivePrerequisiteRef]>,
     disposition: &'a str,
     head: &'a str,
     /// Where `head` diverged from the primary checkout, when Git can say.
@@ -1007,6 +1121,7 @@ impl Broker {
         let delivery_targets = self.cleanup_delivery_targets()?;
         let live_checkouts = self.cleanup_live_checkout_snapshot(deadline)?;
         Ok(CleanupResolveRetirementContext {
+            ancestry_memo: PlanAncestryMemo::for_delivery_targets(&delivery_targets, deadline),
             delivery_targets,
             live_checkouts,
             deadline,
@@ -1168,6 +1283,14 @@ impl Broker {
         };
         let _git_deadline = context.deadline.map(crate::git::limit_git_until);
         let delivery_targets = &context.delivery_targets;
+        if retirement_mode
+            && (delivery_targets.is_empty()
+                || delivery_targets.len() > MAX_RECOVERY_ARCHIVE_PREREQUISITE_REFS)
+        {
+            return Err(refuse(format!(
+                "retirement requires 1 to {MAX_RECOVERY_ARCHIVE_PREREQUISITE_REFS} captured delivery prerequisites"
+            )));
+        }
         let mut records = crate::measurement::SizeRecords::default();
         let Some(item) = self
             .cleanup_item_for_recovery_archive_with_status_limits_and_live_checkouts(
@@ -1177,6 +1300,7 @@ impl Broker {
                 status_output_bytes,
                 status_path_fields,
                 delivery_targets,
+                &context.ancestry_memo,
                 allow_adopted && session.origin == SessionOrigin::Adopted,
                 &context.live_checkouts,
             )?
@@ -1400,9 +1524,12 @@ impl Broker {
                 &head,
                 &item.branch_ref,
                 branch_tip.as_deref(),
-                checkout_branch_ref.as_deref(),
-                checkout_branch_tip.as_deref(),
+                (
+                    checkout_branch_ref.as_deref(),
+                    checkout_branch_tip.as_deref(),
+                ),
                 delivery_targets,
+                &context.ancestry_memo,
             )
             .map_err(refuse)?
         } else {
@@ -1426,11 +1553,13 @@ impl Broker {
             None
         };
         let recovery_archive_schema_version = if retirement_mode {
-            RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+            PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
         } else {
             RECOVERY_ARCHIVE_SCHEMA_VERSION
         };
-        let digest = if retirement_mode {
+        let digest = if retirement_mode
+            && recovery_archive_schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        {
             let retirement_input = RetirementDigestInputV1 {
                 content_digest: &content_digest,
                 recovery_archive_schema_version,
@@ -1448,6 +1577,31 @@ impl Broker {
             };
             let mut hasher = Sha256::new();
             hasher.update(b"aethyme-cleanup-retirement-v1\0");
+            hasher.update(
+                serde_json::to_vec(&retirement_input).map_err(|error| refuse(error.to_string()))?,
+            );
+            format!("{:x}", hasher.finalize())
+        } else if retirement_mode {
+            let mut root_identities = recovery_root_proofs
+                .iter()
+                .map(|proof| (proof.ref_name.as_str(), proof.object_id.as_str()))
+                .collect::<Vec<_>>();
+            root_identities.sort_unstable();
+            root_identities.dedup();
+            let retirement_input = RetirementDigestInputV2 {
+                content_digest: &content_digest,
+                recovery_archive_schema_version,
+                minimum_archive_retention_ms: minimum_archive_retention_ms
+                    .expect("retirement plans have a minimum archive retention"),
+                target_origin: session.origin.as_str(),
+                allow_adopted,
+                owner_witness_sha256: retirement_witness_sha256,
+                checkout_branch_ref: checkout_branch_ref.as_deref(),
+                checkout_branch_tip: checkout_branch_tip.as_deref(),
+                recovery_root_identities: root_identities,
+            };
+            let mut hasher = Sha256::new();
+            hasher.update(b"aethyme-cleanup-retirement-v2\0");
             hasher.update(
                 serde_json::to_vec(&retirement_input).map_err(|error| refuse(error.to_string()))?,
             );
@@ -1519,8 +1673,8 @@ impl Broker {
     }
 
     /// Apply an explicitly reviewed compact-retirement plan. This uses archive
-    /// schema 5, which carries an immutable retention floor; older readers
-    /// refuse the archive instead of silently ignoring that promise.
+    /// schema 6, which carries an immutable retention floor and pins the exact
+    /// incremental-bundle prerequisites in the repository before removal.
     pub fn cleanup_resolve_retirement_apply(
         &mut self,
         session_id: i64,
@@ -1792,6 +1946,19 @@ impl Broker {
                 actual: confirm.to_owned(),
             });
         }
+        let prerequisite_deadline = if plan.recovery_archive_schema_version
+            == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        {
+            let git_deadline = recovery_bundle_deadline().map_err(|reason| {
+                BrokerOpError::CleanupResolveRefused {
+                    id: session_id,
+                    reason: format!("cannot establish prerequisite-ref deadline: {reason}"),
+                }
+            })?;
+            Some(operation_deadline.map_or(git_deadline, |deadline| deadline.min(git_deadline)))
+        } else {
+            None
+        };
         ensure_auto_retirement_staging_reserve(operation_deadline, session_id)?;
         let session = self.store_ref().session(session_id)?;
         let archive_root = prepare_archive_root(&plan.archive_root).map_err(|reason| {
@@ -1801,7 +1968,18 @@ impl Broker {
                 reason,
             }
         })?;
-        let name = if retirement_mode {
+        let name = if retirement_mode
+            && plan.recovery_archive_schema_version
+                == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        {
+            pinned_retirement_archive_name(session_id, &plan.head, &plan.digest).map_err(
+                |reason| BrokerOpError::RecoveryArchiveUnverified {
+                    id: session_id,
+                    path: archive_root.to_string_lossy().into_owned(),
+                    reason,
+                },
+            )?
+        } else if retirement_mode {
             format!("{session_id}-{}-{}", &plan.head[..12], plan.digest)
         } else {
             format!(
@@ -1810,7 +1988,11 @@ impl Broker {
                 archive_staging_nonce()
             )
         };
-        let partial_name = if retirement_mode {
+        let partial_name = if plan.recovery_archive_schema_version
+            == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        {
+            format!("{session_id}.retirement-v6.partial")
+        } else if retirement_mode {
             format!("{session_id}.retirement.partial")
         } else {
             format!("{name}.partial")
@@ -1823,15 +2005,39 @@ impl Broker {
             Ok(metadata)
                 if retirement_mode && metadata.is_dir() && !metadata.file_type().is_symlink() =>
             {
-                verify_recovery_archive_for_plan(self.repo_handle(), &archive, &plan).map_err(
-                    |reason| BrokerOpError::RecoveryArchiveUnverified {
-                        id: session_id,
-                        path: archive.to_string_lossy().into_owned(),
-                        reason: format!(
-                            "existing retirement receipt failed verification: {reason}"
-                        ),
-                    },
-                )?;
+                if plan.recovery_archive_schema_version
+                    == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+                {
+                    verify_recovery_archive_payload_for_plan(self.repo_handle(), &archive, &plan)
+                        .and_then(|()| {
+                            install_recovery_prerequisite_refs_in_archive(
+                                self.repo_handle(),
+                                &archive,
+                                prerequisite_deadline
+                                    .expect("schema v6 retirement has a Git deadline"),
+                            )
+                        })
+                        .and_then(|()| {
+                            verify_recovery_archive_for_plan(self.repo_handle(), &archive, &plan)
+                        })
+                        .map_err(|reason| BrokerOpError::RecoveryArchiveUnverified {
+                            id: session_id,
+                            path: archive.to_string_lossy().into_owned(),
+                            reason: format!(
+                                "existing retirement receipt failed verification: {reason}"
+                            ),
+                        })?;
+                } else {
+                    verify_recovery_archive_for_plan(self.repo_handle(), &archive, &plan).map_err(
+                        |reason| BrokerOpError::RecoveryArchiveUnverified {
+                            id: session_id,
+                            path: archive.to_string_lossy().into_owned(),
+                            reason: format!(
+                                "existing retirement receipt failed verification: {reason}"
+                            ),
+                        },
+                    )?;
+                }
                 archive_reused = true;
             }
             Ok(_) => {
@@ -1858,6 +2064,23 @@ impl Broker {
                         &plan,
                     ) {
                         Ok(()) => {
+                            if plan.recovery_archive_schema_version
+                                == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+                            {
+                                install_recovery_prerequisite_refs_in_archive(
+                                    self.repo_handle(),
+                                    &partial_path,
+                                    prerequisite_deadline
+                                        .expect("schema v6 retirement has a Git deadline"),
+                                )
+                                .map_err(|reason| {
+                                    BrokerOpError::RecoveryArchiveUnverified {
+                                        id: session_id,
+                                        path: partial_path.to_string_lossy().into_owned(),
+                                        reason,
+                                    }
+                                })?;
+                            }
                             sync_archive_directories_bottom_up_until(
                                 &partial_path,
                                 &sync_directory,
@@ -1903,6 +2126,22 @@ impl Broker {
                                     id: session_id,
                                     actual: confirm.to_owned(),
                                 });
+                            }
+                            if plan.recovery_archive_schema_version
+                                == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+                            {
+                                require_no_recovery_prerequisite_refs_for_partial(
+                                    self.repo_handle(),
+                                    &partial_path,
+                                    prerequisite_deadline.expect("schema v6 retirement has a Git deadline"),
+                                )
+                                .map_err(|reason| BrokerOpError::RecoveryArchiveUnverified {
+                                    id: session_id,
+                                    path: partial_path.to_string_lossy().into_owned(),
+                                    reason: format!(
+                                        "incomplete archive has prerequisite refs and cannot be restarted safely: {reason}"
+                                    ),
+                                })?;
                             }
                             ensure_auto_retirement_staging_reserve(operation_deadline, session_id)?;
                             std::fs::remove_dir_all(&partial_path).map_err(|error| {
@@ -1951,6 +2190,35 @@ impl Broker {
                                     path: partial.to_string_lossy().into_owned(),
                                     reason,
                                 });
+                            }
+                            if plan.recovery_archive_schema_version
+                                == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+                            {
+                                install_recovery_prerequisite_refs_in_archive(
+                                    self.repo_handle(),
+                                    &partial,
+                                    prerequisite_deadline
+                                        .expect("schema v6 retirement has a Git deadline"),
+                                )
+                                .map_err(|reason| {
+                                    BrokerOpError::RecoveryArchiveUnverified {
+                                        id: session_id,
+                                        path: partial.to_string_lossy().into_owned(),
+                                        reason,
+                                    }
+                                })?;
+                                sync_archive_directories_bottom_up_until(
+                                    &partial,
+                                    &sync_directory,
+                                    operation_deadline,
+                                )
+                                .map_err(|reason| {
+                                    BrokerOpError::RecoveryArchiveUnverified {
+                                        id: session_id,
+                                        path: partial.to_string_lossy().into_owned(),
+                                        reason,
+                                    }
+                                })?;
                             }
                             std::fs::rename(&partial, &archive)
                                 .map_err(|error| io_error(&archive, error))?;
@@ -2017,6 +2285,34 @@ impl Broker {
                             path: partial.to_string_lossy().into_owned(),
                             reason,
                         });
+                    }
+                    if plan.recovery_archive_schema_version
+                        == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+                    {
+                        install_recovery_prerequisite_refs_in_archive(
+                            self.repo_handle(),
+                            &partial,
+                            prerequisite_deadline.expect("schema v6 retirement has a Git deadline"),
+                        )
+                        .map_err(|reason| {
+                            BrokerOpError::RecoveryArchiveUnverified {
+                                id: session_id,
+                                path: partial.to_string_lossy().into_owned(),
+                                reason,
+                            }
+                        })?;
+                        sync_archive_directories_bottom_up_until(
+                            &partial,
+                            &sync_directory,
+                            operation_deadline,
+                        )
+                        .map_err(|reason| {
+                            BrokerOpError::RecoveryArchiveUnverified {
+                                id: session_id,
+                                path: partial.to_string_lossy().into_owned(),
+                                reason,
+                            }
+                        })?;
                     }
                     std::fs::rename(&partial, &archive)
                         .map_err(|error| io_error(&archive, error))?;
@@ -2130,6 +2426,8 @@ struct StoredManifest {
     recovery_root_proofs: Option<Vec<RecoveryRootProof>>,
     #[serde(default)]
     delivery_targets_sha256: Option<String>,
+    #[serde(default)]
+    prerequisite_refs: Option<Vec<RecoveryArchivePrerequisiteRef>>,
     disposition: String,
     head: String,
     base: Option<String>,
@@ -2179,6 +2477,12 @@ pub(crate) struct OwnedRecoveryArchive {
     pub created_at_ms: i64,
     /// Immutable minimum archive age copied from the reviewed retirement plan.
     pub minimum_archive_retention_ms: Option<u64>,
+    /// Exact repository-local refs retaining incremental-bundle prerequisites.
+    /// These may only be removed after the complete archive tree is removed.
+    pub prerequisite_refs: Vec<RecoveryArchivePrerequisiteRef>,
+    /// Captured v6 archive identity used to validate the exact ref namespace.
+    pub retirement_digest: Option<String>,
+    pub prerequisite_targets: Vec<String>,
     /// Staged, unstaged, untracked or protected ignored changes -- work no
     /// commit carries, so no delivery target can ever hold it.
     pub holds_uncommitted: bool,
@@ -2323,8 +2627,14 @@ fn retirement_archive_record_for_plan(
     let allow_adopted = plan
         .retirement_allow_adopted
         .ok_or_else(|| "retirement plan has no explicit adopted-origin mode".to_owned())?;
+    let is_pinned_retirement =
+        plan.recovery_archive_schema_version == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION;
     let record = RetirementArchiveRecord {
-        schema_version: RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION,
+        schema_version: if is_pinned_retirement {
+            PINNED_RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION
+        } else {
+            RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION
+        },
         session_id: plan.session_id,
         plan_digest: plan.digest.clone(),
         target_origin: plan.target_origin.as_str().to_owned(),
@@ -2341,6 +2651,16 @@ fn retirement_archive_record_for_plan(
         checkout_branch_tip: plan.checkout_branch_tip.clone(),
         recovery_root_proofs_sha256: recovery_root_proofs_sha256(&plan.recovery_root_proofs)?,
         head: plan.head.clone(),
+        delivery_targets: is_pinned_retirement.then(|| plan.delivery_targets.clone()),
+        prerequisite_refs: is_pinned_retirement
+            .then(|| {
+                recovery_archive_prerequisite_refs(
+                    plan.session_id,
+                    &plan.digest,
+                    &plan.delivery_targets,
+                )
+            })
+            .transpose()?,
     };
     validate_retirement_archive_record_fields(&record)?;
     Ok(record)
@@ -2371,8 +2691,10 @@ fn create_retirement_archive_record(root: &Path, plan: &CleanupResolvePlan) -> R
 fn validate_retirement_archive_record_fields(
     record: &RetirementArchiveRecord,
 ) -> Result<(), String> {
-    if record.schema_version != RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION
-        || record.session_id <= 0
+    if !matches!(
+        record.schema_version,
+        RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION | PINNED_RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION
+    ) || record.session_id <= 0
         || !valid_sha256(&record.plan_digest)
         || !matches!(record.target_origin.as_str(), "spawned" | "adopted")
         || (record.target_origin == "adopted" && !record.allow_adopted)
@@ -2402,8 +2724,34 @@ fn validate_retirement_archive_record_fields(
         || !valid_sha256(&record.delivery_targets_sha256)
         || !valid_sha256(&record.recovery_root_proofs_sha256)
         || !valid_git_object_id(&record.head)
+        || (record.schema_version == RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION
+            && (record.delivery_targets.is_some() || record.prerequisite_refs.is_some()))
+        || (record.schema_version == PINNED_RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION
+            && validate_retirement_record_prerequisites(record).is_err())
     {
         return Err("retirement record is incomplete or malformed".into());
+    }
+    Ok(())
+}
+
+fn validate_retirement_record_prerequisites(
+    record: &RetirementArchiveRecord,
+) -> Result<(), String> {
+    let targets = record.delivery_targets.as_deref().ok_or_else(|| {
+        "schema v6 retirement record is missing captured delivery targets".to_owned()
+    })?;
+    if !targets.iter().all(|target| valid_git_object_id(target))
+        || delivery_targets_sha256(targets)? != record.delivery_targets_sha256
+    {
+        return Err("schema v6 retirement record delivery targets are malformed".into());
+    }
+    let expected =
+        recovery_archive_prerequisite_refs(record.session_id, &record.plan_digest, targets)?;
+    if record.prerequisite_refs.as_deref() != Some(expected.as_slice()) {
+        return Err(
+            "schema v6 retirement record prerequisite refs do not match its delivery snapshot"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -2450,6 +2798,12 @@ fn verify_retirement_archive_record_for_content_identity(
     expected.delivery_targets_sha256.clear();
     actual.recovery_root_proofs_sha256.clear();
     expected.recovery_root_proofs_sha256.clear();
+    if plan.recovery_archive_schema_version == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+        actual.delivery_targets = None;
+        expected.delivery_targets = None;
+        actual.prerequisite_refs = None;
+        expected.prerequisite_refs = None;
+    }
     if actual != expected {
         return Err(
             "retirement staging record does not match the current source content identity".into(),
@@ -2479,6 +2833,15 @@ fn verify_retirement_archive_record_for_manifest(
         || Some(record.delivery_targets_sha256.as_str())
             != manifest.delivery_targets_sha256.as_deref()
         || record.head != manifest.head
+        || record.prerequisite_refs.as_deref() != manifest.prerequisite_refs.as_deref()
+        || record
+            .delivery_targets
+            .as_deref()
+            .is_some_and(|targets| targets != manifest.delivery_targets)
+        || (manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+            && record.schema_version != RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION)
+        || (manifest.schema_version == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+            && record.schema_version != PINNED_RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION)
     {
         return Err("retirement record does not match its archive manifest".into());
     }
@@ -2540,10 +2903,11 @@ fn recovery_root_proofs_for_plan_parts(
     head: &str,
     branch_ref: &str,
     branch_tip: Option<&str>,
-    checkout_branch_ref: Option<&str>,
-    checkout_branch_tip: Option<&str>,
+    checkout_branch: (Option<&str>, Option<&str>),
     delivery_targets: &[String],
+    ancestry_memo: &PlanAncestryMemo,
 ) -> Result<Vec<RecoveryRootProof>, String> {
+    let (checkout_branch_ref, checkout_branch_tip) = checkout_branch;
     recovery_root_identities_for_plan_parts(
         head,
         branch_ref,
@@ -2554,16 +2918,37 @@ fn recovery_root_proofs_for_plan_parts(
     .into_iter()
     .map(|(ref_name, object_id)| {
         Ok(RecoveryRootProof {
-            available_from_delivery: root_available_from_delivery(
+            available_from_delivery: root_available_from_delivery_during_plan(
                 repository,
                 &object_id,
                 delivery_targets,
+                ancestry_memo,
             )?,
             ref_name,
             object_id,
         })
     })
     .collect()
+}
+
+fn root_available_from_delivery_during_plan(
+    repository: &GitRepo,
+    object_id: &str,
+    delivery_targets: &[String],
+    ancestry_memo: &PlanAncestryMemo,
+) -> Result<bool, String> {
+    for target in delivery_targets {
+        match ancestry_memo.check(repository, object_id, target) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot check recovery root {object_id} against delivery target {target}: {error}"
+                ));
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn validate_root_proof_identities(
@@ -2619,6 +3004,38 @@ fn validate_available_root_proofs_from_delivery(
     Ok(())
 }
 
+fn validate_delivery_prerequisites_remain_current(
+    repository: &GitRepo,
+    captured_targets: &[String],
+    current_targets: &[String],
+) -> Result<(), String> {
+    for prerequisite in captured_targets {
+        let mut retained = false;
+        let mut error_detail = None;
+        for target in current_targets {
+            match repository.is_ancestor_checked(prerequisite, target) {
+                Ok(true) => {
+                    retained = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(error) => error_detail = Some(error.to_string()),
+            }
+        }
+        if !retained {
+            return Err(match error_detail {
+                Some(error) => format!(
+                    "captured archive prerequisite {prerequisite} could not be verified against current delivery targets: {error}"
+                ),
+                None => format!(
+                    "captured archive prerequisite {prerequisite} is no longer retained by current delivery history"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn recovery_root_proofs_sha256(proofs: &[RecoveryRootProof]) -> Result<String, String> {
     let bytes = serde_json::to_vec(proofs)
         .map_err(|error| format!("cannot encode recovery root proof: {error}"))?;
@@ -2631,8 +3048,73 @@ fn delivery_targets_sha256(targets: &[String]) -> Result<String, String> {
     Ok(sha256_hex(&bytes))
 }
 
+fn is_retirement_archive_schema(schema_version: u32) -> bool {
+    matches!(
+        schema_version,
+        RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+            | PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+    )
+}
+
+fn pinned_retirement_archive_name(
+    session_id: i64,
+    head: &str,
+    retirement_digest: &str,
+) -> Result<String, String> {
+    if session_id <= 0 || !valid_git_object_id(head) || !valid_sha256(retirement_digest) {
+        return Err("cannot name a schema v6 archive from an invalid identity".into());
+    }
+    Ok(format!(
+        "{session_id}-{}-retirement-v6-{retirement_digest}",
+        &head[..12]
+    ))
+}
+
+fn recovery_archive_prerequisite_refs(
+    session_id: i64,
+    retirement_digest: &str,
+    delivery_targets: &[String],
+) -> Result<Vec<RecoveryArchivePrerequisiteRef>, String> {
+    if session_id <= 0 || !valid_sha256(retirement_digest) {
+        return Err(
+            "cannot name archive prerequisite refs from an invalid retirement identity".into(),
+        );
+    }
+    let target_digest = delivery_targets_sha256(delivery_targets)?;
+    let object_ids = delivery_targets
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    if object_ids.is_empty() {
+        return Err("retirement archive has no delivery prerequisites to pin".into());
+    }
+    if object_ids.len() > MAX_RECOVERY_ARCHIVE_PREREQUISITE_REFS {
+        return Err(format!(
+            "delivery snapshot has {} distinct prerequisites; the supported limit is {}",
+            object_ids.len(),
+            MAX_RECOVERY_ARCHIVE_PREREQUISITE_REFS
+        ));
+    }
+    if object_ids
+        .iter()
+        .any(|object_id| !valid_git_object_id(object_id))
+    {
+        return Err("delivery snapshot contains an invalid prerequisite object id".into());
+    }
+    Ok(object_ids
+        .into_iter()
+        .enumerate()
+        .map(|(index, object_id)| RecoveryArchivePrerequisiteRef {
+            ref_name: format!(
+                "refs/aethyme/recovery-prerequisites/v1/{session_id}/{retirement_digest}/{target_digest}/{index}"
+            ),
+            object_id: object_id.to_owned(),
+        })
+        .collect())
+}
+
 fn recovery_bundle_roots(plan: &CleanupResolvePlan) -> Vec<(String, String)> {
-    if plan.recovery_archive_schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+    if is_retirement_archive_schema(plan.recovery_archive_schema_version) {
         return plan
             .recovery_root_proofs
             .iter()
@@ -2657,11 +3139,11 @@ fn recovery_bundle_refs(plan: &CleanupResolvePlan) -> Vec<String> {
 fn recovery_bundle_roots_from_manifest(
     manifest: &StoredManifest,
 ) -> Result<Vec<(String, String)>, String> {
-    if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+    if is_retirement_archive_schema(manifest.schema_version) {
         let proofs = manifest
             .recovery_root_proofs
             .as_ref()
-            .ok_or_else(|| "schema v5 archive is missing its recovery root proofs".to_owned())?;
+            .ok_or_else(|| "retirement archive is missing its recovery root proofs".to_owned())?;
         let digest = recovery_root_proofs_sha256(proofs)?;
         if Some(digest.as_str()) != manifest.recovery_root_proofs_sha256.as_deref() {
             return Err(
@@ -2720,7 +3202,8 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
         }
         PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
         | RECOVERY_ARCHIVE_SCHEMA_VERSION
-        | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION => match manifest.bundle.as_deref() {
+        | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        | PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION => match manifest.bundle.as_deref() {
             Some(_) => {
                 let Some(bytes) = manifest.bundle_bytes else {
                     return Err("bundle archive is missing its byte length".into());
@@ -2741,13 +3224,13 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
         version => return Err(format!("manifest schema {version} is not supported")),
     }
 
-    if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+    if is_retirement_archive_schema(manifest.schema_version) {
         if manifest
             .minimum_archive_retention_ms
             .is_none_or(|floor| floor < MIN_RECOVERY_ARCHIVE_RETENTION_MS)
         {
             return Err(
-                "schema v5 manifest is missing a valid minimum archive retention floor".into(),
+                "retirement manifest is missing a valid minimum archive retention floor".into(),
             );
         }
         if !manifest
@@ -2765,7 +3248,7 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
                 .is_some_and(valid_sha256)
         {
             return Err(
-                "schema v5 manifest is missing its retirement or root-proof identity".into(),
+                "retirement manifest is missing its retirement or root-proof identity".into(),
             );
         }
         if manifest
@@ -2778,12 +3261,12 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
                 .is_some_and(|tip| !valid_git_object_id(tip) || tip != manifest.head)
             || manifest.checkout_branch_ref.is_some() != manifest.checkout_branch_tip.is_some()
         {
-            return Err("schema v5 manifest has an invalid checked-out branch identity".into());
+            return Err("retirement manifest has an invalid checked-out branch identity".into());
         }
         let delivery_hash = delivery_targets_sha256(&manifest.delivery_targets)?;
         if Some(delivery_hash.as_str()) != manifest.delivery_targets_sha256.as_deref() {
             return Err(
-                "schema v5 delivery target roots do not match their recorded identity".into(),
+                "retirement delivery target roots do not match their recorded identity".into(),
             );
         }
         let identities = recovery_root_identities_for_plan_parts(
@@ -2796,13 +3279,29 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
         let proofs = manifest
             .recovery_root_proofs
             .as_deref()
-            .ok_or_else(|| "schema v5 archive is missing its recovery root proofs".to_owned())?;
+            .ok_or_else(|| "retirement archive is missing its recovery root proofs".to_owned())?;
         validate_root_proof_identities(proofs, &identities)?;
         let root_proofs_hash = recovery_root_proofs_sha256(proofs)?;
         if Some(root_proofs_hash.as_str()) != manifest.recovery_root_proofs_sha256.as_deref() {
             return Err(
-                "schema v5 manifest root proof does not match its branch identities".into(),
+                "retirement manifest root proof does not match its branch identities".into(),
             );
+        }
+        if manifest.schema_version == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+            let plan_digest = manifest
+                .plan_digest
+                .as_deref()
+                .ok_or_else(|| "schema v6 manifest is missing its plan digest".to_owned())?;
+            let expected = recovery_archive_prerequisite_refs(
+                manifest.session_id,
+                plan_digest,
+                &manifest.delivery_targets,
+            )?;
+            if manifest.prerequisite_refs.as_deref() != Some(expected.as_slice()) {
+                return Err("schema v6 manifest prerequisite refs do not match its captured delivery snapshot".into());
+            }
+        } else if manifest.prerequisite_refs.is_some() {
+            return Err("schema v5 manifest unexpectedly contains prerequisite refs".into());
         }
     } else if manifest.minimum_archive_retention_ms.is_some()
         || manifest.retirement_record_sha256.is_some()
@@ -2811,8 +3310,9 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
         || manifest.recovery_root_proofs_sha256.is_some()
         || manifest.recovery_root_proofs.is_some()
         || manifest.delivery_targets_sha256.is_some()
+        || manifest.prerequisite_refs.is_some()
     {
-        return Err("only schema v5 archives may declare retirement metadata".into());
+        return Err("only retirement archives may declare retirement metadata".into());
     }
 
     if manifest.session_id <= 0
@@ -2830,7 +3330,9 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
             "dirty" | "pending_commits" | "unproven_provenance"
         ) || (matches!(
             manifest.schema_version,
-            RECOVERY_ARCHIVE_SCHEMA_VERSION | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+            RECOVERY_ARCHIVE_SCHEMA_VERSION
+                | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+                | PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
         ) && manifest.disposition == "eligible"))
         || !valid_git_object_id(&manifest.head)
         || manifest
@@ -2844,7 +3346,9 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
         || manifest.landing.is_null()
         || (matches!(
             manifest.schema_version,
-            RECOVERY_ARCHIVE_SCHEMA_VERSION | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+            RECOVERY_ARCHIVE_SCHEMA_VERSION
+                | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+                | PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
         ) && !matches!(
             manifest
                 .landing
@@ -2860,7 +3364,7 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
             .unlanded_commits
             .iter()
             .all(|commit| valid_git_object_id(commit))
-        || (if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+        || (if is_retirement_archive_schema(manifest.schema_version) {
             manifest.bundle.is_some() == recovery_bundle_roots_from_manifest(manifest)?.is_empty()
         } else {
             manifest.bundle.is_some() == manifest.unlanded_commits.is_empty()
@@ -2920,20 +3424,21 @@ fn validate_archived_file_modes(
         PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION
         | PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
         | RECOVERY_ARCHIVE_SCHEMA_VERSION
-        | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+        | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        | PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
             #[cfg(unix)]
             if files
                 .iter()
                 .any(|file| !file.symlink && file.mode.is_none())
             {
                 return Err(format!(
-                    "schema v2/v3/v4/v5 {label} entry is missing its Unix file mode"
+                    "schema v2/v3/v4/v5/v6 {label} entry is missing its Unix file mode"
                 ));
             }
             #[cfg(not(unix))]
             if files.iter().any(|file| file.mode.is_some()) {
                 return Err(format!(
-                    "schema v2/v3/v4/v5 {label} file modes cannot be verified on this platform"
+                    "schema v2/v3/v4/v5/v6 {label} file modes cannot be verified on this platform"
                 ));
             }
         }
@@ -2982,7 +3487,8 @@ fn recovery_archive_expected_files(
         PREVIOUS_RECOVERY_ARCHIVE_SCHEMA_VERSION
         | PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
         | RECOVERY_ARCHIVE_SCHEMA_VERSION
-        | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+        | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        | PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
             if manifest.ignored_directory.as_deref() != Some(IGNORED_DIRECTORY) {
                 return Err(
                     "schema v2/v3/v4/v5 manifest is missing its ignored directory identity".into(),
@@ -3055,7 +3561,7 @@ fn recovery_archive_expected_files(
     if manifest.bundle.is_some() {
         expected.insert(PathBuf::from(BUNDLE_FILE));
     }
-    if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+    if is_retirement_archive_schema(manifest.schema_version) {
         expected.insert(PathBuf::from(RETIREMENT_ARCHIVE_RECORD_FILE));
     }
     expected.extend(
@@ -3205,6 +3711,7 @@ fn verify_recovery_archive_tree_until(
                         | PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
                         | RECOVERY_ARCHIVE_SCHEMA_VERSION
                         | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+                        | PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
                 )
                 && permission_mode(&metadata) != file.mode
             {
@@ -3220,6 +3727,7 @@ fn verify_recovery_archive_tree_until(
         PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
             | RECOVERY_ARCHIVE_SCHEMA_VERSION
             | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+            | PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
     ) && let Some(bundle) = manifest.bundle.as_deref()
     {
         let path = root.join(bundle);
@@ -3267,7 +3775,57 @@ pub(crate) fn verify_recovery_archive_for_plan(
         root,
         plan,
         effective_archive_deadline(None),
-    )
+    )?;
+    if plan.recovery_archive_schema_version == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+        let manifest_bytes = read_recovery_manifest(&root.join(MANIFEST_FILE))?;
+        let manifest: StoredManifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|error| format!("unreadable {MANIFEST_FILE}: {error}"))?;
+        let refs = manifest
+            .prerequisite_refs
+            .as_deref()
+            .ok_or_else(|| "schema v6 archive is missing its prerequisite refs".to_owned())?;
+        verify_recovery_prerequisite_refs_installed(repository, refs, recovery_bundle_deadline()?)?;
+    }
+    Ok(())
+}
+
+fn install_recovery_prerequisite_refs_in_archive(
+    repository: &GitRepo,
+    root: &Path,
+    deadline: Instant,
+) -> Result<(), String> {
+    let manifest_bytes = read_recovery_manifest(&root.join(MANIFEST_FILE))?;
+    let manifest: StoredManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| format!("unreadable {MANIFEST_FILE}: {error}"))?;
+    validate_manifest_identity(&manifest)?;
+    if manifest.schema_version != PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+        return Ok(());
+    }
+    let refs = manifest
+        .prerequisite_refs
+        .as_deref()
+        .ok_or_else(|| "schema v6 archive is missing its prerequisite refs".to_owned())?;
+    ensure_recovery_prerequisite_refs_installed(repository, refs, deadline)?;
+    verify_recovery_prerequisite_refs_installed(repository, refs, deadline)
+}
+
+fn require_no_recovery_prerequisite_refs_for_partial(
+    repository: &GitRepo,
+    root: &Path,
+    deadline: Instant,
+) -> Result<(), String> {
+    let (record, _) = read_retirement_archive_record(root)?;
+    if record.schema_version != PINNED_RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION {
+        return Err("partial archive is not a schema v6 retirement record".into());
+    }
+    let refs = record
+        .prerequisite_refs
+        .as_deref()
+        .ok_or_else(|| "partial archive has no prerequisite-ref identity".to_owned())?;
+    if !list_recovery_prerequisite_refs(repository, refs, deadline)?.is_empty() {
+        return Err("one or more prerequisite refs already exist".into());
+    }
+    Ok(())
 }
 
 /// Verify archive payload and manifest against a plan without imposing a
@@ -3308,6 +3866,39 @@ fn verify_recovery_archive_payload_for_plan_until(
         validate_root_proof_delivery_availability(repository, &manifest.delivery_targets, proofs)?;
         if proofs != plan.recovery_root_proofs.as_slice() {
             return Err("archive recovery root proofs differ from the reviewed plan".into());
+        }
+    } else if manifest.schema_version == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+        verify_retirement_archive_record_for_manifest(root, &manifest)?;
+        verify_retirement_archive_record_for_content_identity(root, plan)?;
+        let proofs = manifest
+            .recovery_root_proofs
+            .as_deref()
+            .ok_or_else(|| "schema v6 archive is missing its recovery root proofs".to_owned())?;
+        validate_root_proof_delivery_availability(repository, &manifest.delivery_targets, proofs)?;
+        let identities = recovery_root_identities_for_plan_parts(
+            &plan.head,
+            &plan.branch_ref,
+            plan.branch_tip.as_deref(),
+            plan.checkout_branch_ref.as_deref(),
+            plan.checkout_branch_tip.as_deref(),
+        )?;
+        validate_root_proof_identities(proofs, &identities)?;
+        validate_delivery_prerequisites_remain_current(
+            repository,
+            &manifest.delivery_targets,
+            &plan.delivery_targets,
+        )?;
+        let bundled_roots = recovery_bundle_roots_from_manifest(&manifest)?
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        for (reference, object_id) in &identities {
+            if !root_available_from_delivery(repository, object_id, &plan.delivery_targets)?
+                && !bundled_roots.contains(&(reference.clone(), object_id.clone()))
+            {
+                return Err(format!(
+                    "schema v6 archive neither currently delivers nor bundles required root {reference} at {object_id}"
+                ));
+            }
         }
     }
     let mut informational_ignored_directories = false;
@@ -3359,16 +3950,26 @@ fn verify_recovery_archive_payload_for_plan_until(
             (manifest.plan_digest.as_deref() == Some(plan.digest.as_str()))
                 .then(|| plan.digest.clone())
         }
+        PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+            informational_ignored_directories = true;
+            (manifest.plan_digest.as_deref() == Some(plan.digest.as_str()))
+                .then(|| plan.digest.clone())
+        }
         _ => None,
     };
     let expected_landing = serde_json::to_value(&plan.landing)
         .map_err(|error| format!("cannot encode reviewed landing verdict: {error}"))?;
-    let expected_retirement_record_sha256 =
-        if plan.recovery_archive_schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+    let expected_retirement_record_sha256 = match plan.recovery_archive_schema_version {
+        RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
             Some(retirement_archive_record_sha256(root, plan)?)
-        } else {
-            None
-        };
+        }
+        PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION => {
+            verify_retirement_archive_record_for_content_identity(root, plan)?;
+            let (_, record_bytes) = read_retirement_archive_record(root)?;
+            Some(sha256_hex(&record_bytes))
+        }
+        _ => None,
+    };
     let expected_root_proofs_sha256 =
         if plan.recovery_archive_schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
             Some(recovery_root_proofs_sha256(&plan.recovery_root_proofs)?)
@@ -3395,11 +3996,21 @@ fn verify_recovery_archive_payload_for_plan_until(
                     != expected_root_proofs_sha256.as_deref()
                 || manifest.delivery_targets_sha256.as_deref()
                     != expected_delivery_targets_sha256.as_deref()))
+        || (plan.recovery_archive_schema_version
+            == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+            && (manifest.schema_version != PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+                || manifest.minimum_archive_retention_ms != plan.minimum_archive_retention_ms
+                || manifest.retirement_record_sha256.as_deref()
+                    != expected_retirement_record_sha256.as_deref()
+                || manifest.checkout_branch_ref != plan.checkout_branch_ref
+                || manifest.checkout_branch_tip != plan.checkout_branch_tip))
         || manifest.session_id != plan.session_id
         || !same_path(Path::new(&manifest.repository), repository.root())
         || (matches!(
             manifest.schema_version,
-            RECOVERY_ARCHIVE_SCHEMA_VERSION | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+            RECOVERY_ARCHIVE_SCHEMA_VERSION
+                | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+                | PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
         ) && !same_path(
             Path::new(&manifest.repository),
             Path::new(&plan.repository_path),
@@ -3408,12 +4019,16 @@ fn verify_recovery_archive_payload_for_plan_until(
         || manifest.branch_ref != plan.branch_ref
         || (matches!(
             manifest.schema_version,
-            RECOVERY_ARCHIVE_SCHEMA_VERSION | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+            RECOVERY_ARCHIVE_SCHEMA_VERSION
+                | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+                | PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
         ) && manifest.branch_tip != plan.branch_tip)
-        || manifest.disposition != plan.disposition.as_str()
+        || (manifest.schema_version != PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+            && manifest.disposition != plan.disposition.as_str())
         || manifest.head != plan.head
-        || manifest.delivery_targets != plan.delivery_targets
-        || manifest.unlanded_commits != plan.unlanded_commits
+        || (manifest.schema_version != PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+            && (manifest.delivery_targets != plan.delivery_targets
+                || manifest.unlanded_commits != plan.unlanded_commits))
         || (matches!(
             manifest.schema_version,
             RECOVERY_ARCHIVE_SCHEMA_VERSION | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
@@ -3542,6 +4157,7 @@ impl Broker {
                 | PREVIOUS_BUNDLE_RECOVERY_ARCHIVE_SCHEMA_VERSION
                 | RECOVERY_ARCHIVE_SCHEMA_VERSION
                 | RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+                | PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
         ) {
             return Err(format!(
                 "manifest schema {} is not supported",
@@ -3549,8 +4165,24 @@ impl Broker {
             ));
         }
         validate_manifest_identity(&manifest)?;
+        if manifest.schema_version == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+            let retirement_digest = manifest
+                .plan_digest
+                .as_deref()
+                .ok_or_else(|| "schema v6 archive is missing its plan digest".to_owned())?;
+            let expected_name = pinned_retirement_archive_name(
+                manifest.session_id,
+                &manifest.head,
+                retirement_digest,
+            )?;
+            if dir.file_name().and_then(std::ffi::OsStr::to_str) != Some(expected_name.as_str()) {
+                return Err(format!(
+                    "schema v6 archive directory name is not its canonical retirement identity: expected {expected_name}"
+                ));
+            }
+        }
         verify_recovery_archive_tree(dir, &manifest)?;
-        if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+        if is_retirement_archive_schema(manifest.schema_version) {
             verify_retirement_archive_record_for_manifest(dir, &manifest)?;
         }
         if !same_path(Path::new(&manifest.repository), self.main_root()) {
@@ -3588,19 +4220,46 @@ impl Broker {
                     recovery_bundle_deadline()?,
                 )?;
             }
+        } else if manifest.schema_version == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+            let proofs = manifest.recovery_root_proofs.as_deref().ok_or_else(|| {
+                "schema v6 archive is missing its recovery root proofs".to_owned()
+            })?;
+            validate_available_root_proofs_from_delivery(
+                self.repo_handle(),
+                &manifest.delivery_targets,
+                proofs,
+            )?;
+            let bundled_roots = recovery_bundle_roots_from_manifest(&manifest)?;
+            if !bundled_roots.is_empty() {
+                verify_recovery_bundle(
+                    self.repo_handle(),
+                    &dir.join(BUNDLE_FILE),
+                    &bundled_roots,
+                    recovery_bundle_deadline()?,
+                )?;
+            }
+            let prerequisite_refs = manifest
+                .prerequisite_refs
+                .as_deref()
+                .ok_or_else(|| "schema v6 archive is missing its prerequisite refs".to_owned())?;
+            verify_recovery_prerequisite_refs_installed(
+                self.repo_handle(),
+                prerequisite_refs,
+                recovery_bundle_deadline()?,
+            )?;
         }
-        let recovery_roots =
-            if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
-                manifest.recovery_root_proofs.clone().ok_or_else(|| {
-                    "schema v5 archive is missing its recovery root proofs".to_owned()
-                })?
-            } else {
-                vec![RecoveryRootProof {
-                    ref_name: "HEAD".into(),
-                    object_id: manifest.head.clone(),
-                    available_from_delivery: !manifest.unlanded_commits.contains(&manifest.head),
-                }]
-            };
+        let recovery_roots = if is_retirement_archive_schema(manifest.schema_version) {
+            manifest
+                .recovery_root_proofs
+                .clone()
+                .ok_or_else(|| "schema v5 archive is missing its recovery root proofs".to_owned())?
+        } else {
+            vec![RecoveryRootProof {
+                ref_name: "HEAD".into(),
+                object_id: manifest.head.clone(),
+                available_from_delivery: !manifest.unlanded_commits.contains(&manifest.head),
+            }]
+        };
         Ok(OwnedRecoveryArchive {
             path: dir.to_path_buf(),
             session_id: manifest.session_id,
@@ -3608,6 +4267,18 @@ impl Broker {
             recovery_roots,
             created_at_ms: manifest.created_at_ms,
             minimum_archive_retention_ms: manifest.minimum_archive_retention_ms,
+            prerequisite_refs: manifest.prerequisite_refs.clone().unwrap_or_default(),
+            retirement_digest: (manifest.schema_version
+                == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION)
+                .then(|| manifest.plan_digest.clone())
+                .flatten(),
+            prerequisite_targets: if manifest.schema_version
+                == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+            {
+                manifest.delivery_targets.clone()
+            } else {
+                Vec::new()
+            },
             holds_uncommitted: manifest.staged_patch.bytes > 0
                 || manifest.unstaged_patch.bytes > 0
                 || !manifest.untracked_files.is_empty()
@@ -3616,6 +4287,29 @@ impl Broker {
                     .as_deref()
                     .is_some_and(|files| !files.is_empty()),
         })
+    }
+
+    /// Release v6 incremental-bundle prerequisite refs only after the caller
+    /// has removed the complete archive tree. Every ref is deleted with its
+    /// manifest-bound expected OID in one Git ref transaction.
+    pub(crate) fn release_recovery_archive_prerequisite_refs_after_removal(
+        &self,
+        archive: &OwnedRecoveryArchive,
+    ) -> Result<(), String> {
+        let configured_root = self
+            .recovery_archive_root()
+            .map_err(|error| format!("cannot resolve recovery archive root: {error}"))?;
+        let root = inspect_archive_root(&configured_root).map_err(|error| {
+            format!(
+                "cannot safely inspect recovery archive root: {}",
+                error.reason
+            )
+        })?;
+        remove_recovery_prerequisite_refs_after_archive_removal(
+            self.repo_handle(),
+            archive,
+            root.as_deref(),
+        )
     }
 
     /// Whether every preserved root reached the primary checkout or upstream,
@@ -4068,6 +4762,412 @@ fn run_recovery_git_output_limited(
     Ok(output)
 }
 
+fn run_recovery_git_output_with_input_limited(
+    command: &mut Command,
+    input: &[u8],
+    deadline: Instant,
+    label: &str,
+) -> Result<std::process::Output, String> {
+    let (effective_deadline, budget) = recovery_git_budget(deadline)?;
+    let mut input_file =
+        tempfile::tempfile().map_err(|error| format!("cannot prepare {label} input: {error}"))?;
+    input_file
+        .write_all(input)
+        .and_then(|()| input_file.seek(std::io::SeekFrom::Start(0)).map(|_| ()))
+        .map_err(|error| format!("cannot stage {label} input: {error}"))?;
+    let result = crate::bounded_output::output_with_input_limited(
+        command,
+        input_file,
+        budget,
+        MAX_RECOVERY_BUNDLE_METADATA_OUTPUT_BYTES,
+    )
+    .map_err(|error| format!("cannot run {label}: {error}"))?;
+    let output = match result {
+        crate::bounded_output::LimitedOutput::Completed(output) => output,
+        crate::bounded_output::LimitedOutput::Deadline => {
+            return Err(format!("{label} exceeded its Git deadline"));
+        }
+        crate::bounded_output::LimitedOutput::OutputLimit => {
+            return Err(format!(
+                "{label} output exceeded its {MAX_RECOVERY_BUNDLE_METADATA_OUTPUT_BYTES}-byte cap"
+            ));
+        }
+    };
+    if Instant::now() >= effective_deadline {
+        return Err(format!("{label} exceeded its Git deadline"));
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "{label} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output)
+}
+
+fn list_recovery_prerequisite_refs(
+    repository: &GitRepo,
+    expected: &[RecoveryArchivePrerequisiteRef],
+    deadline: Instant,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let Some(first) = expected.first() else {
+        return Err("schema v6 retirement archive has no prerequisite refs".into());
+    };
+    let (prefix, _) = first
+        .ref_name
+        .rsplit_once('/')
+        .ok_or_else(|| "schema v6 prerequisite ref has no sequence component".to_owned())?;
+    let prefix = format!("{prefix}/");
+    if expected
+        .iter()
+        .any(|reference| !reference.ref_name.starts_with(&prefix))
+    {
+        return Err("schema v6 prerequisite refs do not share one exact namespace".into());
+    }
+    let mut command = crate::git::git_command();
+    command
+        .args([
+            "for-each-ref",
+            "--format=%(refname) %(objectname) %(symref)",
+        ])
+        .arg(&prefix)
+        .current_dir(repository.root())
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    let output = run_recovery_git_output_limited(
+        &mut command,
+        deadline,
+        "recovery prerequisite ref inspection",
+    )?;
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "recovery prerequisite ref inspection returned non-UTF-8 output".to_owned())?;
+    let mut refs = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        let mut fields = line.splitn(3, ' ');
+        let name = fields.next().unwrap_or_default();
+        let object_id = fields.next().unwrap_or_default();
+        let symbolic_target = fields.next().unwrap_or_default();
+        if !name.starts_with(&prefix)
+            || !valid_git_object_id(object_id)
+            || !symbolic_target.is_empty()
+            || refs.insert(name.to_owned(), object_id.to_owned()).is_some()
+        {
+            return Err(
+                "recovery prerequisite namespace contains a malformed or symbolic ref".into(),
+            );
+        }
+    }
+    Ok(refs)
+}
+
+fn recovery_prerequisite_ref_map(
+    refs: &[RecoveryArchivePrerequisiteRef],
+) -> std::collections::BTreeMap<String, String> {
+    refs.iter()
+        .map(|reference| (reference.ref_name.clone(), reference.object_id.clone()))
+        .collect()
+}
+
+fn recovery_prerequisite_ref_transaction(
+    repository: &GitRepo,
+    operations: &[(&str, &RecoveryArchivePrerequisiteRef)],
+    deadline: Instant,
+) -> Result<(), String> {
+    if operations.is_empty() {
+        return Ok(());
+    }
+    let mut input = String::from("start\noption no-deref\n");
+    for (operation, reference) in operations {
+        if !matches!(*operation, "create" | "delete")
+            || !reference
+                .ref_name
+                .starts_with("refs/aethyme/recovery-prerequisites/v1/")
+            || !valid_git_object_id(&reference.object_id)
+        {
+            return Err("refused malformed recovery prerequisite ref transaction".into());
+        }
+        input.push_str(operation);
+        input.push(' ');
+        input.push_str(&reference.ref_name);
+        input.push(' ');
+        input.push_str(&reference.object_id);
+        input.push('\n');
+    }
+    input.push_str("prepare\ncommit\n");
+    let mut command = crate::git::git_command();
+    command
+        .args([
+            "-c",
+            "core.fsync=reference",
+            "-c",
+            "core.fsyncMethod=fsync",
+            "update-ref",
+            "--stdin",
+        ])
+        .current_dir(repository.root())
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    run_recovery_git_output_with_input_limited(
+        &mut command,
+        input.as_bytes(),
+        deadline,
+        "recovery prerequisite ref transaction",
+    )?;
+    Ok(())
+}
+
+fn ensure_recovery_prerequisite_refs_installed(
+    repository: &GitRepo,
+    expected: &[RecoveryArchivePrerequisiteRef],
+    deadline: Instant,
+) -> Result<(), String> {
+    let expected_map = recovery_prerequisite_ref_map(expected);
+    let actual = list_recovery_prerequisite_refs(repository, expected, deadline)?;
+    for (name, object_id) in &actual {
+        if expected_map.get(name) != Some(object_id) {
+            return Err(format!(
+                "recovery prerequisite ref {name} has a conflicting object id"
+            ));
+        }
+    }
+    let missing = expected
+        .iter()
+        .filter(|reference| !actual.contains_key(&reference.ref_name))
+        .map(|reference| ("create", reference))
+        .collect::<Vec<_>>();
+    if !missing.is_empty()
+        && let Err(first_error) =
+            recovery_prerequisite_ref_transaction(repository, &missing, deadline)
+    {
+        // Another writer may have installed the same complete set in the
+        // meantime. Accept only that exact result; never overwrite it.
+        let after = list_recovery_prerequisite_refs(repository, expected, deadline)?;
+        if after != expected_map {
+            return Err(first_error);
+        }
+    }
+    let installed = list_recovery_prerequisite_refs(repository, expected, deadline)?;
+    if installed != expected_map {
+        return Err(
+            "recovery prerequisite refs were not durably installed at their expected object ids"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn verify_recovery_prerequisite_refs_installed(
+    repository: &GitRepo,
+    expected: &[RecoveryArchivePrerequisiteRef],
+    deadline: Instant,
+) -> Result<(), String> {
+    let actual = list_recovery_prerequisite_refs(repository, expected, deadline)?;
+    if actual != recovery_prerequisite_ref_map(expected) {
+        return Err(
+            "recovery prerequisite refs are missing or differ from their manifest-bound object ids"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn remove_recovery_prerequisite_refs_after_archive_removal(
+    repository: &GitRepo,
+    archive: &OwnedRecoveryArchive,
+    archive_root: Option<&Path>,
+) -> Result<(), String> {
+    match std::fs::symlink_metadata(&archive.path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot confirm archive removal: {error}")),
+        Ok(_) => return Err("archive tree still exists; prerequisite refs were retained".into()),
+    }
+    if archive.prerequisite_refs.is_empty() {
+        return Ok(());
+    }
+    let retirement_digest = archive
+        .retirement_digest
+        .as_deref()
+        .ok_or_else(|| "archive prerequisite refs have no retirement digest".to_owned())?;
+    let expected = recovery_archive_prerequisite_refs(
+        archive.session_id,
+        retirement_digest,
+        &archive.prerequisite_targets,
+    )?;
+    if expected != archive.prerequisite_refs {
+        return Err(
+            "archive prerequisite refs no longer match their verified archive identity".into(),
+        );
+    }
+    let deadline = recovery_bundle_deadline()?;
+    match archive_root {
+        Some(root) => {
+            if !archive
+                .path
+                .parent()
+                .is_some_and(|parent| same_path(parent, root))
+            {
+                return Err(
+                    "archive path no longer belongs directly under the configured recovery root; prerequisite refs were retained".into(),
+                );
+            }
+            refuse_duplicate_recovery_prerequisite_refs(root, &archive.path, &expected, deadline)?;
+        }
+        None if archive.path.parent().is_some_and(|parent| parent.exists()) => {
+            return Err(
+                "configured recovery root is missing while its archive parent still exists; prerequisite refs were retained".into(),
+            );
+        }
+        None => {}
+    }
+    let actual = list_recovery_prerequisite_refs(repository, &expected, deadline)?;
+    let expected_map = recovery_prerequisite_ref_map(&expected);
+    for (name, object_id) in &actual {
+        if expected_map.get(name) != Some(object_id) {
+            return Err(format!(
+                "recovery prerequisite ref {name} changed; no prerequisite refs were removed"
+            ));
+        }
+    }
+    let present = expected
+        .iter()
+        .filter(|reference| actual.contains_key(&reference.ref_name))
+        .map(|reference| ("delete", reference))
+        .collect::<Vec<_>>();
+    recovery_prerequisite_ref_transaction(repository, &present, deadline)?;
+    if !list_recovery_prerequisite_refs(repository, &expected, deadline)?.is_empty() {
+        return Err(
+            "recovery prerequisite refs remain after their exact removal transaction".into(),
+        );
+    }
+    Ok(())
+}
+
+fn refuse_duplicate_recovery_prerequisite_refs(
+    root: &Path,
+    removed_archive: &Path,
+    expected_refs: &[RecoveryArchivePrerequisiteRef],
+    deadline: Instant,
+) -> Result<(), String> {
+    require_real_directory(root)?;
+    let expected_names = expected_refs
+        .iter()
+        .map(|reference| reference.ref_name.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let entries = std::fs::read_dir(root)
+        .map_err(|error| format!("cannot scan archive siblings before releasing refs: {error}"))?;
+    let mut scanned = 0_usize;
+    for entry in entries {
+        if Instant::now() >= deadline {
+            return Err(
+                "archive sibling scan exceeded its deadline; prerequisite refs were retained"
+                    .into(),
+            );
+        }
+        scanned = scanned.saturating_add(1);
+        if scanned > MAX_RECOVERY_ARCHIVE_TREE_ENTRIES {
+            return Err(format!(
+                "archive sibling scan exceeded its {}-entry bound; prerequisite refs were retained",
+                MAX_RECOVERY_ARCHIVE_TREE_ENTRIES
+            ));
+        }
+        let entry = entry.map_err(|error| {
+            format!("cannot read archive sibling entry; prerequisite refs were retained: {error}")
+        })?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            format!("cannot inspect archive sibling; prerequisite refs were retained: {error}")
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "archive sibling {} is a symlink; prerequisite refs were retained because duplicate use cannot be ruled out",
+                path.display()
+            ));
+        }
+        if metadata.is_file() {
+            continue;
+        }
+        if !metadata.is_dir() {
+            return Err(format!(
+                "archive sibling {} has an unsupported file type; prerequisite refs were retained",
+                path.display()
+            ));
+        }
+        if same_path(&path, removed_archive) {
+            return Err(
+                "archive path reappeared during sibling scan; prerequisite refs were retained"
+                    .into(),
+            );
+        }
+        for (file_name, max_bytes, schema_version) in [
+            (
+                MANIFEST_FILE,
+                MAX_RECOVERY_MANIFEST_BYTES,
+                PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION,
+            ),
+            (
+                RETIREMENT_ARCHIVE_RECORD_FILE,
+                MAX_RETIREMENT_ARCHIVE_RECORD_BYTES,
+                PINNED_RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION,
+            ),
+        ] {
+            let file_path = path.join(file_name);
+            let bytes = match read_regular_file_no_follow(&file_path, max_bytes) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "cannot safely read archive sibling {} while checking prerequisite refs; refs were retained: {error}",
+                        file_path.display()
+                    ));
+                }
+            };
+            let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+                format!(
+                    "cannot parse archive sibling {} while checking prerequisite refs; refs were retained: {error}",
+                    file_path.display()
+                )
+            })?;
+            let is_v6 = value
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+                == Some(u64::from(schema_version));
+            let Some(refs_value) = value.get("prerequisite_refs") else {
+                if is_v6 {
+                    return Err(format!(
+                        "schema v6 sibling {} is missing prerequisite refs; refs were retained",
+                        file_path.display()
+                    ));
+                }
+                continue;
+            };
+            let refs: Vec<RecoveryArchivePrerequisiteRef> = serde_json::from_value(
+                refs_value.clone(),
+            )
+            .map_err(|error| {
+                format!(
+                    "cannot decode prerequisite refs in sibling {}; refs were retained: {error}",
+                    file_path.display()
+                )
+            })?;
+            if is_v6 && refs.is_empty() {
+                return Err(format!(
+                    "schema v6 sibling {} has an empty prerequisite set; refs were retained",
+                    file_path.display()
+                ));
+            }
+            if let Some(reference) = refs
+                .iter()
+                .find(|reference| expected_names.contains(reference.ref_name.as_str()))
+            {
+                return Err(format!(
+                    "archive sibling {} also references prerequisite {}; refs were retained",
+                    path.display(),
+                    reference.ref_name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn verify_recovery_bundle(
     repository: &GitRepo,
     bundle: &Path,
@@ -4452,16 +5552,20 @@ where
         .canonicalize()
         .map_err(|error| format!("cannot resolve archive staging directory: {error}"))?;
     require_real_directory(&dir)?;
-    let (retirement_record_sha256, archive_created_at_ms) =
-        if plan.recovery_archive_schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+    let (retirement_record_sha256, archive_created_at_ms, prerequisite_refs) =
+        if is_retirement_archive_schema(plan.recovery_archive_schema_version) {
             let (record, bytes) = read_retirement_archive_record(&dir)?;
             let expected = retirement_archive_record_for_plan(plan, record.archive_created_at_ms)?;
             if record != expected {
                 return Err("retirement staging record does not match the reviewed plan".into());
             }
-            (Some(sha256_hex(&bytes)), record.archive_created_at_ms)
+            (
+                Some(sha256_hex(&bytes)),
+                record.archive_created_at_ms,
+                record.prerequisite_refs,
+            )
         } else {
-            (None, now_ms())
+            (None, now_ms(), None)
         };
 
     // Patches are taken again rather than trusted from the plan: the digest
@@ -4613,13 +5717,13 @@ where
 
     check_archive_deadline(deadline, "recovery manifest write")?;
     let manifest_root_proofs_sha256 =
-        if plan.recovery_archive_schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+        if is_retirement_archive_schema(plan.recovery_archive_schema_version) {
             Some(recovery_root_proofs_sha256(&plan.recovery_root_proofs)?)
         } else {
             None
         };
     let manifest_delivery_targets_sha256 =
-        if plan.recovery_archive_schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+        if is_retirement_archive_schema(plan.recovery_archive_schema_version) {
             Some(delivery_targets_sha256(&plan.delivery_targets)?)
         } else {
             None
@@ -4628,9 +5732,9 @@ where
         schema_version: plan.recovery_archive_schema_version,
         plan_digest: &plan.digest,
         created_at_ms: archive_created_at_ms,
-        minimum_archive_retention_ms: if plan.recovery_archive_schema_version
-            == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
-        {
+        minimum_archive_retention_ms: if is_retirement_archive_schema(
+            plan.recovery_archive_schema_version,
+        ) {
             plan.minimum_archive_retention_ms
         } else {
             None
@@ -4643,19 +5747,20 @@ where
         worktree_path: &plan.worktree_path,
         branch_ref: &plan.branch_ref,
         branch_tip: plan.branch_tip.as_deref(),
-        checkout_branch_ref: (plan.recovery_archive_schema_version
-            == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION)
+        checkout_branch_ref: is_retirement_archive_schema(plan.recovery_archive_schema_version)
             .then_some(plan.checkout_branch_ref.as_deref())
             .flatten(),
-        checkout_branch_tip: (plan.recovery_archive_schema_version
-            == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION)
+        checkout_branch_tip: is_retirement_archive_schema(plan.recovery_archive_schema_version)
             .then_some(plan.checkout_branch_tip.as_deref())
             .flatten(),
         recovery_root_proofs_sha256: manifest_root_proofs_sha256.as_deref(),
-        recovery_root_proofs: (plan.recovery_archive_schema_version
-            == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION)
+        recovery_root_proofs: is_retirement_archive_schema(plan.recovery_archive_schema_version)
             .then_some(plan.recovery_root_proofs.as_slice()),
         delivery_targets_sha256: manifest_delivery_targets_sha256.as_deref(),
+        prerequisite_refs: (plan.recovery_archive_schema_version
+            == PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION)
+            .then_some(prerequisite_refs.as_deref())
+            .flatten(),
         disposition: plan.disposition.as_str(),
         head: &plan.head,
         base: repository
@@ -4715,9 +5820,7 @@ fn restore_readme(plan: &CleanupResolvePlan, has_bundle: bool) -> String {
             plan.head
         )
     };
-    let branch_roots_note = if plan.recovery_archive_schema_version
-        == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
-    {
+    let branch_roots_note = if is_retirement_archive_schema(plan.recovery_archive_schema_version) {
         let recorded_tip = plan.branch_tip.as_deref().unwrap_or("unknown");
         let checkout_branch = plan
             .checkout_branch_ref
@@ -4755,6 +5858,44 @@ fn restore_readme(plan: &CleanupResolvePlan, has_bundle: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_ancestry_memo_caches_verdicts_but_retries_errors() {
+        let memo = PlanAncestryMemo::default();
+        let errors = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            let result = memo.check_with("ancestor", "target-error", || {
+                errors.set(errors.get() + 1);
+                Err("temporary Git failure".into())
+            });
+            assert_eq!(result, Err("temporary Git failure".into()));
+        }
+        assert_eq!(errors.get(), 2);
+
+        let negatives = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            assert_eq!(
+                memo.check_with("ancestor", "target-negative", || {
+                    negatives.set(negatives.get() + 1);
+                    Ok(false)
+                }),
+                Ok(false)
+            );
+        }
+        assert_eq!(negatives.get(), 1);
+
+        let positives = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            assert_eq!(
+                memo.check_with("ancestor", "target-positive", || {
+                    positives.set(positives.get() + 1);
+                    Ok(true)
+                }),
+                Ok(true)
+            );
+        }
+        assert_eq!(positives.get(), 1);
+    }
 
     #[cfg(unix)]
     fn write_over_cap_bundle(
@@ -4820,7 +5961,13 @@ mod tests {
                 command.env_remove(name.as_ref());
             }
         }
-        command.output().unwrap()
+        command
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap()
     }
 
     fn git_output(dir: &Path, args: &[&str]) -> String {
@@ -4835,6 +5982,27 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "git {args:?}");
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn copy_archive_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+        std::fs::create_dir(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            let metadata = std::fs::symlink_metadata(&source_path)?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                copy_archive_tree(&source_path, &destination_path)?;
+            } else if metadata.is_file() && !metadata.file_type().is_symlink() {
+                std::fs::copy(&source_path, &destination_path)?;
+            } else {
+                return Err(std::io::Error::other(format!(
+                    "fixture archive contains a non-regular entry: {}",
+                    source_path.display()
+                )));
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -4870,9 +6038,12 @@ mod tests {
             &head,
             &plan.branch_ref,
             plan.branch_tip.as_deref(),
-            plan.checkout_branch_ref.as_deref(),
-            plan.checkout_branch_tip.as_deref(),
+            (
+                plan.checkout_branch_ref.as_deref(),
+                plan.checkout_branch_tip.as_deref(),
+            ),
             &plan.delivery_targets,
+            &PlanAncestryMemo::for_delivery_targets(&plan.delivery_targets, None),
         )
         .unwrap();
 
@@ -5304,6 +6475,9 @@ mod tests {
             recovery_roots,
             created_at_ms: now_ms(),
             minimum_archive_retention_ms: Some(MIN_RECOVERY_ARCHIVE_RETENTION_MS),
+            prerequisite_refs: Vec::new(),
+            retirement_digest: None,
+            prerequisite_targets: Vec::new(),
             holds_uncommitted: false,
         };
 
@@ -5381,7 +6555,7 @@ mod tests {
 
         let partial = original_plan
             .archive_root
-            .join(format!("{}.retirement.partial", session.id));
+            .join(format!("{}.retirement-v6.partial", session.id));
         assert!(partial.is_dir());
         assert!(!partial.join(MANIFEST_FILE).exists());
         let (mut partial_record, _) = read_retirement_archive_record(&partial).unwrap();
@@ -5406,7 +6580,7 @@ mod tests {
         let refreshed_plan = broker
             .cleanup_resolve_retirement_plan(session.id, false)
             .unwrap();
-        assert_ne!(original_plan.digest, refreshed_plan.digest);
+        assert_eq!(original_plan.digest, refreshed_plan.digest);
         assert_eq!(
             retirement_content_identity_sha256(&refreshed_plan).unwrap(),
             original_content_identity
@@ -5428,6 +6602,20 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(outcome.archive.join(MANIFEST_FILE)).unwrap())
                 .unwrap();
+        assert_eq!(
+            manifest["schema_version"],
+            PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        );
+        let prerequisite_refs = manifest["prerequisite_refs"].as_array().unwrap();
+        assert!(!prerequisite_refs.is_empty());
+        for pin in prerequisite_refs {
+            let ref_name = pin["ref_name"].as_str().unwrap();
+            let object_id = pin["object_id"].as_str().unwrap();
+            assert_eq!(
+                git_output(&repository, &["rev-parse", "--verify", ref_name]),
+                object_id
+            );
+        }
         assert!(manifest["created_at_ms"].as_i64().unwrap() > old_partial_time);
         let final_record = read_retirement_archive_record(&outcome.archive).unwrap().0;
         assert_eq!(
@@ -5439,6 +6627,538 @@ mod tests {
                 < i64::try_from(final_record.minimum_archive_retention_ms).unwrap(),
             "restarting an old partial must assign the rebuilt archive a fresh retention age"
         );
+    }
+
+    #[test]
+    fn retirement_partial_preserves_checkout_when_source_content_changes() {
+        let (_owner, _repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("retirement partial source change");
+        let reviewed_plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        let interrupted = broker
+            .cleanup_resolve_apply_with_bundle_writer_mode(
+                session.id,
+                &reviewed_plan.digest,
+                || panic!("interrupted staging must fail before archive verification"),
+                sync_archive_directory,
+                |_, _| {
+                    Some(crate::disk_headroom::DiskHeadroom {
+                        bytes: u64::MAX,
+                        inodes: None,
+                    })
+                },
+                true,
+                false,
+                None,
+                None,
+                None,
+                RecoveryBundleWriter {
+                    max_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+                    write_to: interrupt_retirement_bundle_write,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            interrupted.contains("simulated interrupted retirement bundle write"),
+            "{interrupted}"
+        );
+
+        let partial = reviewed_plan
+            .archive_root
+            .join(format!("{}.retirement-v6.partial", session.id));
+        let receipt_before = std::fs::read(partial.join(RETIREMENT_ARCHIVE_RECORD_FILE)).unwrap();
+        let bundle_before = std::fs::read(partial.join(BUNDLE_FILE)).unwrap();
+        assert_eq!(bundle_before, b"interrupted bundle staging");
+        std::fs::write(worktree.join("preserve.txt"), "changed after review\n").unwrap();
+
+        let stale = broker
+            .cleanup_resolve_retirement_apply(session.id, &reviewed_plan.digest, false)
+            .unwrap_err();
+        assert!(
+            matches!(
+                &stale,
+                BrokerOpError::CleanupResolveConfirmationMismatch { .. }
+            ),
+            "the old confirmation must be refused before touching staging: {stale}"
+        );
+        let changed_plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        assert_ne!(reviewed_plan.digest, changed_plan.digest);
+        let restart = broker
+            .cleanup_resolve_retirement_apply(session.id, &changed_plan.digest, false)
+            .unwrap_err();
+        assert!(
+            matches!(&restart, BrokerOpError::RecoveryArchiveUnverified { .. }),
+            "a new confirmation must not replace staging for changed source content: {restart}"
+        );
+
+        assert!(worktree.is_dir());
+        assert_eq!(
+            std::fs::read(worktree.join("preserve.txt")).unwrap(),
+            b"changed after review\n"
+        );
+        assert!(partial.is_dir());
+        assert_eq!(
+            std::fs::read(partial.join(RETIREMENT_ARCHIVE_RECORD_FILE)).unwrap(),
+            receipt_before
+        );
+        assert_eq!(
+            std::fs::read(partial.join(BUNDLE_FILE)).unwrap(),
+            bundle_before
+        );
+    }
+
+    #[test]
+    fn retirement_confirmation_survives_forward_delivery_move_before_apply() {
+        let (_owner, repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("retirement forward delivery before apply");
+        let reviewed_plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+
+        let merge = isolated_git_output(
+            &repository,
+            &["merge", "--ff-only", session.branch.as_str()],
+        );
+        assert!(
+            merge.status.success(),
+            "could not advance delivery target: {}",
+            String::from_utf8_lossy(&merge.stderr)
+        );
+        let current_plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        assert_eq!(reviewed_plan.digest, current_plan.digest);
+        assert_ne!(
+            reviewed_plan.delivery_targets,
+            current_plan.delivery_targets
+        );
+        assert!(
+            current_plan
+                .recovery_root_proofs
+                .iter()
+                .all(|proof| proof.available_from_delivery)
+        );
+
+        let outcome = broker
+            .cleanup_resolve_retirement_apply(session.id, &reviewed_plan.digest, false)
+            .unwrap();
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        assert!(!worktree.exists());
+        assert!(!outcome.archive.join(BUNDLE_FILE).exists());
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.archive.join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest["schema_version"],
+            PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            manifest["delivery_targets"],
+            serde_json::json!(current_plan.delivery_targets)
+        );
+        for pin in manifest["prerequisite_refs"].as_array().unwrap() {
+            let ref_name = pin["ref_name"].as_str().unwrap();
+            let object_id = pin["object_id"].as_str().unwrap();
+            assert_eq!(
+                git_output(&repository, &["rev-parse", "--verify", ref_name]),
+                object_id
+            );
+        }
+    }
+
+    #[test]
+    fn retirement_archive_refuses_backward_delivery_move_and_keeps_prerequisite_pins() {
+        let (_owner, repository, _storage, mut broker, session, worktree, base, head, branch_ref) =
+            closed_unique_commit_fixture("retirement archive backward delivery move");
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        assert!(plan.delivery_targets.contains(&base));
+
+        let tree = format!("{base}^{{tree}}");
+        let unrelated_root = isolated_git_output(
+            &repository,
+            &["commit-tree", &tree, "-m", "unrelated delivery root"],
+        );
+        assert!(
+            unrelated_root.status.success(),
+            "could not create unrelated delivery root: {}",
+            String::from_utf8_lossy(&unrelated_root.stderr)
+        );
+        let unrelated_root = String::from_utf8(unrelated_root.stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+
+        let repository_after_archive = repository.clone();
+        let moved_target = unrelated_root.clone();
+        let outcome = broker
+            .cleanup_resolve_apply_with_bundle_writer_mode(
+                session.id,
+                &plan.digest,
+                move || {
+                    let moved = isolated_git_output(
+                        &repository_after_archive,
+                        &["update-ref", "refs/heads/main", moved_target.as_str()],
+                    );
+                    assert!(
+                        moved.status.success(),
+                        "could not move the delivery ref: {}",
+                        String::from_utf8_lossy(&moved.stderr)
+                    );
+                },
+                sync_archive_directory,
+                |_, _| {
+                    Some(crate::disk_headroom::DiskHeadroom {
+                        bytes: u64::MAX,
+                        inodes: None,
+                    })
+                },
+                true,
+                false,
+                None,
+                None,
+                None,
+                RecoveryBundleWriter {
+                    max_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+                    write_to: write_recovery_bundle_to_file,
+                },
+            )
+            .unwrap();
+
+        assert!(!outcome.worktree_removed, "{outcome:?}");
+        assert!(
+            outcome
+                .cleanup_error
+                .as_deref()
+                .is_some_and(|error| error.contains("archive prerequisites are no longer retained")),
+            "backward delivery movement must refuse checkout removal: {outcome:?}"
+        );
+        assert!(worktree.is_dir());
+        assert_eq!(
+            std::fs::read(worktree.join("preserve.txt")).unwrap(),
+            b"uncommitted recovery data\n"
+        );
+        assert_eq!(
+            GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref(&branch_ref)
+                .as_deref(),
+            Some(head.as_str())
+        );
+        assert!(outcome.archive.is_dir());
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.archive.join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest["schema_version"],
+            PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        );
+        let prerequisite_refs = manifest["prerequisite_refs"].as_array().unwrap();
+        assert!(!prerequisite_refs.is_empty());
+        for pin in prerequisite_refs {
+            let ref_name = pin["ref_name"].as_str().unwrap();
+            let object_id = pin["object_id"].as_str().unwrap();
+            assert_eq!(
+                git_output(&repository, &["rev-parse", "--verify", ref_name]),
+                object_id
+            );
+        }
+
+        let refreshed_plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        assert_eq!(plan.digest, refreshed_plan.digest);
+        assert!(
+            !refreshed_plan.delivery_targets.contains(&base),
+            "the fixture must actually move the captured delivery prerequisite"
+        );
+        let retry_error = broker
+            .cleanup_resolve_retirement_apply(session.id, &refreshed_plan.digest, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            retry_error.contains("prerequisite") && retry_error.contains("verification"),
+            "a completed archive with a lost prerequisite must refuse reuse: {retry_error}"
+        );
+        assert!(worktree.is_dir());
+        assert!(outcome.archive.is_dir());
+        for pin in prerequisite_refs {
+            let ref_name = pin["ref_name"].as_str().unwrap();
+            let object_id = pin["object_id"].as_str().unwrap();
+            assert_eq!(
+                git_output(&repository, &["rev-parse", "--verify", ref_name]),
+                object_id
+            );
+        }
+    }
+
+    #[test]
+    fn retirement_pins_keep_bundle_prerequisites_after_checkout_removal_and_git_prune() {
+        let (_owner, repository, _storage, mut broker, session, worktree, base, head, branch_ref) =
+            closed_unique_commit_fixture("retirement pinned bundle survives prune");
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        assert!(plan.delivery_targets.contains(&base));
+        assert!(recovery_bundle_required(&plan));
+
+        let outcome = broker
+            .cleanup_resolve_retirement_apply(session.id, &plan.digest, false)
+            .unwrap();
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        assert!(!worktree.exists());
+        assert!(
+            !isolated_git_output(
+                &repository,
+                &["show-ref", "--verify", "--quiet", &branch_ref]
+            )
+            .status
+            .success(),
+            "ordinary spawned cleanup should remove its matching branch"
+        );
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(outcome.archive.join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        assert!(outcome.archive.join(BUNDLE_FILE).is_file());
+        let prerequisite_refs = manifest["prerequisite_refs"].as_array().unwrap();
+        assert!(
+            prerequisite_refs
+                .iter()
+                .any(|pin| { pin["object_id"].as_str() == Some(base.as_str()) })
+        );
+
+        let tree = format!("{base}^{{tree}}");
+        let unrelated_root = isolated_git_output(
+            &repository,
+            &["commit-tree", &tree, "-m", "unrelated delivery root"],
+        );
+        assert!(
+            unrelated_root.status.success(),
+            "could not create unrelated delivery root: {}",
+            String::from_utf8_lossy(&unrelated_root.stderr)
+        );
+        let unrelated_root = String::from_utf8(unrelated_root.stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        let moved = isolated_git_output(
+            &repository,
+            &["update-ref", "refs/heads/main", &unrelated_root],
+        );
+        assert!(
+            moved.status.success(),
+            "could not move the delivery ref: {}",
+            String::from_utf8_lossy(&moved.stderr)
+        );
+        let reflogs =
+            isolated_git_output(&repository, &["reflog", "expire", "--expire=now", "--all"]);
+        assert!(
+            reflogs.status.success(),
+            "could not expire old reflogs: {}",
+            String::from_utf8_lossy(&reflogs.stderr)
+        );
+        let pruned = isolated_git_output(&repository, &["gc", "--prune=now"]);
+        assert!(
+            pruned.status.success(),
+            "could not prune unreachable Git objects: {}",
+            String::from_utf8_lossy(&pruned.stderr)
+        );
+        assert!(
+            isolated_git_output(
+                &repository,
+                &["cat-file", "-e", &format!("{base}^{{commit}}")]
+            )
+            .status
+            .success(),
+            "the exact captured prerequisite object must remain reachable through its pin"
+        );
+        assert!(
+            !isolated_git_output(
+                &repository,
+                &["cat-file", "-e", &format!("{head}^{{commit}}")]
+            )
+            .status
+            .success(),
+            "the removed checkout's unlanded commit should be absent from the repository after prune"
+        );
+
+        let owned = broker.owned_recovery_archive(&outcome.archive).unwrap();
+        let captured_targets: Vec<String> =
+            serde_json::from_value(manifest["delivery_targets"].clone()).unwrap();
+        assert_eq!(owned.prerequisite_targets, captured_targets);
+        assert_eq!(
+            owned.prerequisite_refs,
+            serde_json::from_value::<Vec<RecoveryArchivePrerequisiteRef>>(
+                manifest["prerequisite_refs"].clone()
+            )
+            .unwrap()
+        );
+        assert!(
+            recovery_bundle_required(&plan),
+            "the archived session root still requires the verified bundle"
+        );
+        let restored_ref = "refs/heads/aethyme-recovery-bundle-test";
+        let bundle_path = outcome.archive.join(BUNDLE_FILE);
+        let source_refspec = format!("{branch_ref}:{restored_ref}");
+        let restored = isolated_git_output(
+            &repository,
+            &[
+                "fetch",
+                "--no-tags",
+                bundle_path.to_str().unwrap(),
+                source_refspec.as_str(),
+            ],
+        );
+        assert!(
+            restored.status.success(),
+            "could not restore the archived root after pruning: {}",
+            String::from_utf8_lossy(&restored.stderr)
+        );
+        assert_eq!(
+            git_output(&repository, &["rev-parse", "--verify", restored_ref]),
+            head
+        );
+    }
+
+    #[test]
+    fn retirement_missing_or_conflicting_prerequisite_pin_blocks_archive_ownership() {
+        let (_owner, repository, _storage, mut broker, session, _worktree, base, head, _branch) =
+            closed_unique_commit_fixture("retirement pin ownership tampering");
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        let outcome = broker
+            .cleanup_resolve_retirement_apply(session.id, &plan.digest, false)
+            .unwrap();
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        let owned = broker.owned_recovery_archive(&outcome.archive).unwrap();
+        let pin = owned
+            .prerequisite_refs
+            .first()
+            .expect("schema v6 archive has at least one prerequisite pin");
+
+        let removed = isolated_git_output(
+            &repository,
+            &[
+                "update-ref",
+                "-d",
+                pin.ref_name.as_str(),
+                pin.object_id.as_str(),
+            ],
+        );
+        assert!(
+            removed.status.success(),
+            "could not remove the fixture prerequisite ref: {}",
+            String::from_utf8_lossy(&removed.stderr)
+        );
+        assert!(
+            broker.owned_recovery_archive(&outcome.archive).is_err(),
+            "an archive with a missing pin must not be treated as broker-owned"
+        );
+        let scan = broker.recovery_archives().unwrap();
+        assert!(
+            scan.owned
+                .iter()
+                .all(|archive| archive.path != outcome.archive)
+                && scan
+                    .unowned
+                    .iter()
+                    .any(|(path, _)| path == &outcome.archive),
+            "the missing-pin archive must be excluded from GC's owned deletion candidates"
+        );
+
+        let conflicting_oid = if pin.object_id != head { head } else { base };
+        let installed = isolated_git_output(
+            &repository,
+            &[
+                "update-ref",
+                pin.ref_name.as_str(),
+                conflicting_oid.as_str(),
+            ],
+        );
+        assert!(
+            installed.status.success(),
+            "could not install the foreign conflicting ref: {}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let deadline = recovery_bundle_deadline().unwrap();
+        assert!(
+            ensure_recovery_prerequisite_refs_installed(
+                &GitRepo::discover(&repository).unwrap(),
+                &owned.prerequisite_refs,
+                deadline,
+            )
+            .is_err(),
+            "retry must refuse a conflicting pin rather than overwrite it"
+        );
+        assert_eq!(
+            git_output(&repository, &["rev-parse", "--verify", &pin.ref_name]),
+            conflicting_oid
+        );
+        assert!(broker.owned_recovery_archive(&outcome.archive).is_err());
+        let scan = broker.recovery_archives().unwrap();
+        assert!(
+            scan.owned
+                .iter()
+                .all(|archive| archive.path != outcome.archive)
+                && scan
+                    .unowned
+                    .iter()
+                    .any(|(path, _)| path == &outcome.archive),
+            "a conflicting-pin archive must remain outside owned GC deletion candidates"
+        );
+        assert!(outcome.archive.is_dir());
+    }
+
+    #[test]
+    fn copied_v6_archive_is_unowned_and_blocks_shared_pin_release() {
+        let (_owner, repository, _storage, mut broker, session, _worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("retirement duplicate archive pin use");
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        let outcome = broker
+            .cleanup_resolve_retirement_apply(session.id, &plan.digest, false)
+            .unwrap();
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        let owned = broker.owned_recovery_archive(&outcome.archive).unwrap();
+        let copied_archive = outcome.archive.with_file_name(format!(
+            "{}-copy",
+            outcome
+                .archive
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap()
+        ));
+        copy_archive_tree(&outcome.archive, &copied_archive).unwrap();
+        let copy_error = broker.owned_recovery_archive(&copied_archive).unwrap_err();
+        assert!(
+            copy_error.contains("canonical retirement identity"),
+            "a renamed copy cannot become a second owned archive: {copy_error}"
+        );
+
+        std::fs::remove_dir_all(&outcome.archive).unwrap();
+        let release_error = broker
+            .release_recovery_archive_prerequisite_refs_after_removal(&owned)
+            .unwrap_err();
+        assert!(
+            release_error.contains("also references prerequisite"),
+            "refs used by a sibling archive must be retained: {release_error}"
+        );
+        assert!(copied_archive.is_dir());
+        for pin in &owned.prerequisite_refs {
+            assert_eq!(
+                git_output(&repository, &["rev-parse", "--verify", &pin.ref_name]),
+                pin.object_id
+            );
+        }
     }
 
     #[test]
@@ -5683,9 +7403,12 @@ mod tests {
             &plan.head,
             &plan.branch_ref,
             plan.branch_tip.as_deref(),
-            plan.checkout_branch_ref.as_deref(),
-            plan.checkout_branch_tip.as_deref(),
+            (
+                plan.checkout_branch_ref.as_deref(),
+                plan.checkout_branch_tip.as_deref(),
+            ),
             &plan.delivery_targets,
+            &PlanAncestryMemo::for_delivery_targets(&plan.delivery_targets, None),
         )
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -5847,7 +7570,7 @@ mod tests {
         assert!(
             validate_manifest_identity(&v4_with_v5_only_fields)
                 .unwrap_err()
-                .contains("only schema v5 archives may declare retirement metadata")
+                .contains("only retirement archives may declare retirement metadata")
         );
 
         let legacy_digest = legacy_v2_cleanup_resolve_digest(&plan, &proof).unwrap();
@@ -6067,7 +7790,8 @@ mod tests {
             );
         }
 
-        value["schema_version"] = serde_json::json!(RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION + 1);
+        value["schema_version"] =
+            serde_json::json!(PINNED_RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION + 1);
         let future: StoredManifest = serde_json::from_value(value).unwrap();
         assert!(
             recovery_archive_expected_files(&future)
