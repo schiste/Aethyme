@@ -88,6 +88,8 @@ struct SessionActionOutput<'a, T: serde::Serialize> {
     /// Cached, path-only advisory for explicit planned leases.
     #[serde(skip_serializing_if = "Option::is_none")]
     planned_path_pr_overlaps: Option<&'a crate::PlannedPathPrOverlapCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase_timings_ms: Option<&'a std::collections::BTreeMap<String, u64>>,
 }
 
 /// One warning line per other session that looks like the same work.
@@ -140,6 +142,8 @@ fn render_tab_rename(outcome: &crate::chau7_mcp::SessionTabRename) {
     }
 }
 
+// Keep optional CLI metadata explicit while sharing the existing adopt/start serializer.
+#[allow(clippy::too_many_arguments)]
 fn session_action_json<T: serde::Serialize>(
     report: &T,
     tab_rename: &crate::chau7_mcp::SessionTabRename,
@@ -148,6 +152,7 @@ fn session_action_json<T: serde::Serialize>(
     scope_overlaps: Option<&[crate::ScopeOverlap]>,
     scope_overlaps_warning: Option<&str>,
     planned_path_pr_overlaps: Option<&crate::PlannedPathPrOverlapCheck>,
+    phase_timings_ms: Option<&std::collections::BTreeMap<String, u64>>,
 ) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(&SessionActionOutput {
         report,
@@ -159,6 +164,7 @@ fn session_action_json<T: serde::Serialize>(
         scope_overlaps,
         scope_overlaps_warning,
         planned_path_pr_overlaps,
+        phase_timings_ms,
     })
 }
 
@@ -1259,6 +1265,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
                 scope_overlaps.as_deref(),
                 scope_overlaps_warning.as_deref(),
                 planned_path_pr_overlaps.as_ref(),
+                None,
             )?
         );
     } else {
@@ -1430,22 +1437,73 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
 }
 
 /// `broker start`.
+fn record_start_response_timings(
+    phases: &mut std::collections::BTreeMap<String, u64>,
+    command_started: std::time::Instant,
+    response_started: std::time::Instant,
+) {
+    phases.insert(
+        "response_preparation".into(),
+        u64::try_from(response_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
+    // Excludes serialization/output and metric persistence; the outer command
+    // metric measures through output. Totals overlap the individual phases.
+    phases.insert(
+        "total_before_output".into(),
+        u64::try_from(command_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
+    telemetry::set_command_metric_details(serde_json::json!({"phase_timings_ms": phases}));
+}
+
+fn record_start_render_timings(
+    phases: &mut std::collections::BTreeMap<String, u64>,
+    render_started: std::time::Instant,
+) {
+    phases.insert(
+        "human_render_and_advisories".into(),
+        u64::try_from(render_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
+    telemetry::set_command_metric_details(serde_json::json!({"phase_timings_ms": phases}));
+}
+
 pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
+    let command_started = std::time::Instant::now();
     Broker::reject_integration_based_review_task(parsed.pull_request)?;
     let context = session_context(&parsed)?;
     let task = parsed
         .task
         .ok_or(UsageError::Message("start requires --task".into()))?;
+    let open_started = std::time::Instant::now();
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     warn_stale_broker_binary(&broker);
     let agent_identity = session_agent_identity(parsed.agent.as_deref());
-    let report = broker.start_worktree_with_planned_paths_and_context(
+    let open_ms = u64::try_from(open_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let allocation_started = std::time::Instant::now();
+    let allocation = broker.start_worktree_with_planned_paths_and_context_timed(
         &task,
         &parsed.planned_paths,
         agent_identity.as_deref(),
         context,
         parsed.base.as_deref(),
-    )?;
+    );
+    let allocation_ms = u64::try_from(allocation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let crate::broker::TimedStartReport {
+        report,
+        mut phase_timings_ms,
+    } = match allocation {
+        Ok(report) => report,
+        Err(error) => {
+            // A failed allocation has no report: preserve observed coarse
+            // phases without claiming unobserved internal phases were zero.
+            telemetry::set_command_metric_details(
+                serde_json::json!({"phase_timings_ms": {"broker_open": open_ms, "session_allocation": allocation_ms}}),
+            );
+            return Err(error.into());
+        }
+    };
+    phase_timings_ms.insert("broker_open".into(), open_ms);
+    phase_timings_ms.insert("session_allocation".into(), allocation_ms);
+    let response_started = std::time::Instant::now();
     // `start-agent` binds nothing: the agent it spawns is a different process
     // from its caller, and binds on its own first command.
     bind_caller_as_holder(broker.store(), report.session.id);
@@ -1473,6 +1531,7 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
             true,
         )?;
         let duplicates = broker.duplicate_work_for(session);
+        record_start_response_timings(&mut phase_timings_ms, command_started, response_started);
         out!(
             "{}",
             session_action_json(
@@ -1483,9 +1542,12 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
                 scope_overlaps.as_deref(),
                 scope_overlaps_warning.as_deref(),
                 planned_path_pr_overlaps.as_ref(),
+                Some(&phase_timings_ms),
             )?
         );
     } else {
+        record_start_response_timings(&mut phase_timings_ms, command_started, response_started);
+        let render_started = std::time::Instant::now();
         out!(
             "Started session {} — worktree {} on branch {}",
             session.id,
@@ -1513,12 +1575,18 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
         }
         render_duplicate_work(session.id, &broker.duplicate_work_for(session));
         out!("Worktree: cd {}", session.worktree_path);
+        record_start_render_timings(&mut phase_timings_ms, render_started);
+        out!(
+            "Startup phase timings (ms): {}",
+            serde_json::to_string(&phase_timings_ms)?
+        );
     }
     Ok(())
 }
 
 /// `broker start-agent`.
 pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
+    let command_started = std::time::Instant::now();
     Broker::reject_integration_based_review_task(parsed.pull_request)?;
     let context = session_context(&parsed)?;
     let task = parsed
@@ -1527,16 +1595,35 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
     let cmd = parsed
         .cmd
         .ok_or(UsageError::Message("start-agent requires --cmd".into()))?;
+    let open_started = std::time::Instant::now();
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     warn_stale_broker_binary(&broker);
     let agent_identity = session_agent_identity(parsed.agent.as_deref());
-    let report = broker.start_agent_report_with_context(
+    let open_ms = u64::try_from(open_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let allocation_started = std::time::Instant::now();
+    let allocation = broker.start_agent_report_with_context_timed(
         &task,
         &cmd,
         agent_identity.as_deref(),
         context,
         parsed.base.as_deref(),
-    )?;
+    );
+    let allocation_ms = u64::try_from(allocation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let crate::broker::TimedStartReport {
+        report,
+        mut phase_timings_ms,
+    } = match allocation {
+        Ok(report) => report,
+        Err(error) => {
+            telemetry::set_command_metric_details(
+                serde_json::json!({"phase_timings_ms": {"broker_open": open_ms, "session_allocation": allocation_ms}}),
+            );
+            return Err(error.into());
+        }
+    };
+    phase_timings_ms.insert("broker_open".into(), open_ms);
+    phase_timings_ms.insert("session_allocation".into(), allocation_ms);
+    let response_started = std::time::Instant::now();
     let tab_rename = crate::chau7_mcp::rename_session_tab(
         &report.session,
         None,
@@ -1548,11 +1635,23 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
     let session = &report.session;
     if parsed.json {
         let duplicates = broker.duplicate_work_for(session);
+        record_start_response_timings(&mut phase_timings_ms, command_started, response_started);
         out!(
             "{}",
-            session_action_json(&report, &tab_rename, None, &duplicates, None, None, None)?
+            session_action_json(
+                &report,
+                &tab_rename,
+                None,
+                &duplicates,
+                None,
+                None,
+                None,
+                Some(&phase_timings_ms)
+            )?
         );
     } else {
+        record_start_response_timings(&mut phase_timings_ms, command_started, response_started);
+        let render_started = std::time::Instant::now();
         out!(
             "Started session {} (pid {}) — worktree {} on branch {}\nLog: {}",
             session.id,
@@ -1565,6 +1664,11 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
         render_start_base(&report.start_base);
         render_worktree_placement(&report.worktree_placement);
         render_duplicate_work(session.id, &broker.duplicate_work_for(session));
+        record_start_render_timings(&mut phase_timings_ms, render_started);
+        out!(
+            "Startup phase timings (ms): {}",
+            serde_json::to_string(&phase_timings_ms)?
+        );
     }
     Ok(())
 }

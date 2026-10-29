@@ -24,6 +24,21 @@
   "last_activity_at": "integer",
   "log_path": "null",
   "origin": "string",
+  "phase_timings_ms": {
+    "base_selection": "integer",
+    "broker_open": "integer",
+    "checkout_count": "integer",
+    "git_worktree_add": "integer",
+    "lifecycle_lock_wait": "integer",
+    "preparation_status": "integer",
+    "response_preparation": "integer",
+    "session_allocation": "integer",
+    "session_registration": "integer",
+    "storage_admission": "integer",
+    "total_before_output": "integer",
+    "upstream_fetch": "integer",
+    "worktree_root": "integer"
+  },
   "pid": "null",
   "planned_explicit_leases": [],
   "preparation": {
