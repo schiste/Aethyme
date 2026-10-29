@@ -714,11 +714,13 @@ impl GateRunOutcome {
     ///
     /// This is deliberately narrower than `failure_class`. That class is partly
     /// inferred from the command's own log, which is the change's test output:
-    /// a failing test that prints "request timed out", or a deleted script
-    /// reported as "command not found", is classified `Timeout` or
-    /// `Environment` too. Deferring on the class would let such a change be
-    /// deferred forever, with the agent told to resubmit unchanged code. So the
-    /// flag is set only where the broker observed the fault itself: host
+    /// a deleted script reported as "command not found" is classified
+    /// `Environment`, while timeout classification requires the broker's
+    /// explicit deadline flag or the conventional exit code 124. Arbitrary
+    /// test output such as "request timed out" is not enough. Deferring on the
+    /// class would let a change be deferred forever, with the agent told to
+    /// resubmit unchanged code. So the flag is set only where the broker
+    /// observed the fault itself: host
     /// resources were refused, the command never started (disk headroom, spawn
     /// failure, an invalidated broker database), the broker detected a host
     /// resource error or incomplete output capture, the command ran out of
@@ -3814,7 +3816,7 @@ fn classify_gate_result(
             exit_code: Some(code),
             resource_error: None,
             ..
-        }) if is_timeout_error(code, log_path) => (
+        }) if code == 124 => (
             GateStatus::Error,
             Some(GateFailureClass::Timeout),
             Some(code as i64),
@@ -3913,19 +3915,6 @@ fn cached_failure_class(status: GateStatus) -> Option<GateFailureClass> {
         GateStatus::Fail => Some(GateFailureClass::CachedPriorFail),
         _ => None,
     }
-}
-
-fn is_timeout_error(exit_code: i32, log_path: &Path) -> bool {
-    if exit_code == 124 {
-        return true;
-    }
-    let Ok(log) = std::fs::read(log_path) else {
-        return false;
-    };
-    let lower = String::from_utf8_lossy(&log).to_ascii_lowercase();
-    lower.contains("timed out")
-        || lower.contains("timeout exceeded")
-        || lower.contains("command timed out")
 }
 
 fn is_resource_contention_error(command: &str, log_path: &Path) -> bool {
@@ -7784,6 +7773,9 @@ mod tests {
                 class.is_some(),
                 "{output:?} still gets a class for advisories"
             );
+            if code == 124 {
+                assert_eq!(class, Some(GateFailureClass::Timeout));
+            }
             assert!(
                 !observed_host_fault(&status, &log),
                 "{output:?} (exit {code}) is the change's output, not a host fault"
@@ -7794,6 +7786,40 @@ mod tests {
             &Ok(command_outcome(Some(0), false)),
             &log
         ));
+    }
+
+    #[test]
+    fn test_output_timeout_text_does_not_mark_the_gate_as_timed_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("gate.log");
+        std::fs::write(
+            &log,
+            "✓ runProcess terminates timed out commands 72ms\nNo test suite found\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            classify_gate_result(
+                "pnpm quality:test:changed",
+                &log,
+                Ok(command_outcome(Some(1), false)),
+            ),
+            (
+                GateStatus::Fail,
+                Some(GateFailureClass::TestFailure),
+                Some(1)
+            )
+        );
+
+        std::fs::write(&log, "").unwrap();
+        assert_eq!(
+            classify_gate_result(
+                "pnpm quality:test:changed",
+                &log,
+                Ok(command_outcome(Some(1), true)),
+            ),
+            (GateStatus::Error, Some(GateFailureClass::Timeout), Some(1))
+        );
     }
 
     /// The control: a gate that genuinely ran and failed must keep reporting a
