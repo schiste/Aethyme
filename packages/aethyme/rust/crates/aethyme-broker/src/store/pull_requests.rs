@@ -1306,6 +1306,28 @@ impl BrokerStore {
         {
             return Ok(false);
         }
+        // Current status alone is insufficient: a closed requester may have
+        // been reused before this transaction. Its closure after the request
+        // still cancels that request, even if reuse made the session active.
+        let requester_closed_after_request: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM events
+                 WHERE session_id = ?1 AND id > ?2
+                   AND kind IN (?3, ?4, ?5, ?6)
+             )",
+            params![
+                requester_session_id,
+                request_id,
+                "session.closed",
+                "session.cleaned",
+                "session.abandoned",
+                crate::events::SESSION_FINISHED,
+            ],
+            |row| row.get(0),
+        )?;
+        if requester_closed_after_request {
+            return Ok(false);
+        }
 
         let now = now_ms();
         let active_paths = {
