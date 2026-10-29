@@ -4593,9 +4593,17 @@ impl Broker {
                 )) => {
                     #[cfg(not(unix))]
                     {
+                        if archive_guard.is_some_and(|guard| guard.expected_cohort().is_some()) {
+                            return Err(BrokerOpError::DirtyWorktree {
+                                id: session_id,
+                                reason:
+                                    "artifact-use protection is unavailable; preserved the worktree"
+                                        .into(),
+                            });
+                        }
                         // Keep the pre-existing explicit cleanup contract on
                         // targets that cannot run the artifact-use protocol.
-                        // The unattended consumers remain fail-closed there.
+                        // Automatic compact cleanup remains fail-closed above.
                         None
                     }
                     #[cfg(unix)]
@@ -4847,6 +4855,36 @@ impl Broker {
                     return Err(BrokerOpError::CleanupResolveRefused {
                         id: session_id,
                         reason: "the registered checkout alias inventory changed or could not be rechecked after archive verification; the archive and checkout were preserved".into(),
+                    });
+                }
+                let cleanup_policy = crate::AutoCleanupPolicy::load(self.main_root()).map_err(
+                    |reason| BrokerOpError::CleanupResolveRefused {
+                        id: session_id,
+                        reason: format!(
+                            "automatic checkout cleanup policy could not be rechecked; the archive and checkout were preserved: {reason}"
+                        ),
+                    },
+                )?;
+                if !cleanup_policy.auto_remove || cleanup_policy.is_pinned(archived_worktree) {
+                    return Err(BrokerOpError::CleanupResolveRefused {
+                        id: session_id,
+                        reason: if cleanup_policy.auto_remove {
+                            "the checkout is now pinned by cleanup policy; the archive and checkout were preserved".into()
+                        } else {
+                            "automatic checkout removal is now disabled; the archive and checkout were preserved".into()
+                        },
+                    });
+                }
+                let open_file_snapshot = crate::reclaim::open_file_snapshot_under(Path::new("/"));
+                if let Some(reason) = crate::reclaim::open_file_snapshot_blocker_for_worktree(
+                    &open_file_snapshot,
+                    archived_worktree,
+                ) {
+                    return Err(BrokerOpError::CleanupResolveRefused {
+                        id: session_id,
+                        reason: format!(
+                            "the checkout has active or unverified process use; the archive and checkout were preserved: {reason}"
+                        ),
                     });
                 }
                 removed_checkout_session_ids = expected_cohort.session_ids();

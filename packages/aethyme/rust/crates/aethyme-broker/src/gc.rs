@@ -5624,10 +5624,27 @@ impl Broker {
         let refresh_deadline = deadline
             .checked_sub(crate::auto_cleanup::AUTO_COMPACTION_MIN_BUDGET)
             .unwrap_or(deadline);
-        let index_state = self.refresh_cleanup_cohort_aliases(Some(refresh_deadline))?;
-        let Some(index_state) = index_state.filter(|state| {
-            state.complete && state.unresolved_rows == 0 && state.pending_dirty_rows == 0
-        }) else {
+        let mut refreshed_index = None;
+        let mut last_progress_sequence = None;
+        loop {
+            if Instant::now() >= refresh_deadline {
+                break;
+            }
+            let Some(state) = self.refresh_cleanup_cohort_aliases(Some(refresh_deadline))? else {
+                break;
+            };
+            if state.complete {
+                refreshed_index = Some(state);
+                break;
+            }
+            if last_progress_sequence == Some(state.progress_sequence) {
+                break;
+            }
+            last_progress_sequence = Some(state.progress_sequence);
+        }
+        let Some(index_state) = refreshed_index
+            .filter(|state| state.unresolved_rows == 0 && state.pending_dirty_rows == 0)
+        else {
             drop(gc_lock);
             return self.defer_auto_compact_checkout_worker(
                 "compact_checkout_alias_index_incomplete",
@@ -5714,6 +5731,31 @@ impl Broker {
             )?;
             return self.write_artifact_sweep_worker_status("compact_checkout_owner_unverified");
         }
+        let cleanup_policy = match crate::AutoCleanupPolicy::load(self.main_root()) {
+            Ok(policy) => policy,
+            Err(reason) => {
+                self.store().defer_checkout_cleanup_compactions(
+                    &[session_id],
+                    now_ms().saturating_add(AUTO_COMPACT_CHECKOUT_RETRY_MS),
+                    now_ms(),
+                )?;
+                return self.write_artifact_sweep_worker_status(&format!(
+                    "compact_checkout_cleanup_policy_unavailable: {reason}"
+                ));
+            }
+        };
+        if !cleanup_policy.auto_remove || cleanup_policy.is_pinned(&worktree) {
+            self.store().defer_checkout_cleanup_compactions(
+                &[session_id],
+                now_ms().saturating_add(AUTO_COMPACT_CHECKOUT_RETRY_MS),
+                now_ms(),
+            )?;
+            return self.write_artifact_sweep_worker_status(if cleanup_policy.auto_remove {
+                "compact_checkout_pinned_by_cleanup_policy"
+            } else {
+                "compact_checkout_auto_remove_disabled"
+            });
+        }
 
         match self.compact_closed_checkout(&cohort, deadline)? {
             Some(outcome) if outcome.worktree_removed => {
@@ -5757,7 +5799,7 @@ impl Broker {
         if crate::host_state::path_is_ephemeral(&root) || artifact_worker_process_is_suppressed() {
             return Ok(());
         }
-        let _ = self.reconcile_compact_checkout_backfill()?;
+        self.reconcile_compact_checkout_backfill()?;
         let artifact_pending = self.artifact_sweep_backlog_pending()?
             && crate::AutoCleanupPolicy::artifact_sweep_allowed(&root);
         let checkout_cleanup_pending = self.auto_checkout_cleanup_recovery_requested()?;
@@ -5889,7 +5931,7 @@ impl Broker {
             self.write_artifact_sweep_worker_status("refused_ephemeral_repository")?;
             return Ok(());
         }
-        let _ = self.reconcile_compact_checkout_backfill()?;
+        self.reconcile_compact_checkout_backfill()?;
         let reconciled_terminal_rows =
             self.reconcile_terminal_checkout_cleanup_requests(now_ms())?;
         if reconciled_terminal_rows > 0 {
