@@ -229,10 +229,31 @@ impl Broker {
     pub(super) fn persist_finish_report(
         &mut self,
         report: &FinishReport,
+        checkout_cleanup_grace_hours: Option<u32>,
     ) -> Result<(), BrokerOpError> {
         let payload = crate::events::session_finished_payload(report);
-        self.store.finish_session(report.session_id, &payload)?;
+        self.store.finish_session_with_cleanup_request(
+            report.session_id,
+            &payload,
+            checkout_cleanup_grace_hours,
+        )?;
         Ok(())
+    }
+
+    /// Grace for the durable post-close checkout request. `None` means the
+    /// caller must not create an automatic-removal obligation.
+    pub(crate) fn checkout_cleanup_grace_hours(&self, session: &Session) -> Option<u32> {
+        if session.origin != SessionOrigin::Spawned {
+            return None;
+        }
+        let retention = crate::load_retention_policy(&self.main_root).ok()?;
+        if !retention.auto_cleanup_worktrees_on_finish {
+            return None;
+        }
+        let cleanup = crate::AutoCleanupPolicy::load(&self.main_root).ok()?;
+        cleanup
+            .auto_remove
+            .then_some(retention.closed_worktree_grace_hours)
     }
 
     pub(super) fn record_finished_handoff(
@@ -254,6 +275,7 @@ impl Broker {
         // through physical removal. Cleanup calls the already-claimed helper
         // below so this path never tries to acquire its own lock recursively.
         let _lifecycle_claim = self.claim_worktree_lifecycle()?;
+        let checkout_cleanup_grace_hours = self.checkout_cleanup_grace_hours(session);
         let current_session = self.store.session(report.session_id)?;
         super::cleanup::ensure_lifecycle_session_unchanged(
             report.session_id,
@@ -349,8 +371,11 @@ impl Broker {
                 branch_present,
                 recovery_proof.as_ref(),
             );
-            self.store
-                .begin_finish_cleanup(report.session_id, &start_payload)?;
+            self.store.begin_finish_cleanup_with_cleanup_request(
+                report.session_id,
+                &start_payload,
+                checkout_cleanup_grace_hours,
+            )?;
         }
         let cleanup_session = self.store.session(report.session_id)?;
         // `finish --timeout` bounds the checks that decide whether to close.
@@ -404,7 +429,15 @@ impl Broker {
             }
         }
         self.finalize_finish_report(report);
-        self.record_finished_handoff(report)?;
+        let handoff_result = self.record_finished_handoff(report);
+        drop(_lifecycle_claim);
+        if checkout_cleanup_grace_hours.is_some() {
+            crate::warn_unrecorded(
+                "wake post-close checkout cleanup",
+                self.request_checkout_cleanup_after_close(report.session_id),
+            );
+        }
+        handoff_result?;
         Ok(())
     }
 
@@ -553,6 +586,11 @@ impl Broker {
         let auto_cleanup_enabled = auto_cleanup_policy
             .as_ref()
             .is_ok_and(|policy| policy.auto_cleanup_worktrees_on_finish);
+        let checkout_cleanup_grace_hours = if options.keep_worktree {
+            None
+        } else {
+            self.checkout_cleanup_grace_hours(&session)
+        };
         let mut report = FinishReport {
             session_id,
             worktree_path: session.worktree_path.clone(),
@@ -644,7 +682,7 @@ impl Broker {
                     .into(),
             );
             self.finalize_finish_report(&mut report);
-            self.persist_finish_report(&report)?;
+            self.persist_finish_report(&report, None)?;
             return Ok(report);
         }
 
@@ -944,7 +982,13 @@ impl Broker {
             );
         }
         self.finalize_finish_report(&mut report);
-        self.persist_finish_report(&report)?;
+        self.persist_finish_report(&report, checkout_cleanup_grace_hours)?;
+        if checkout_cleanup_grace_hours.is_some() {
+            crate::warn_unrecorded(
+                "wake post-close checkout cleanup",
+                self.request_checkout_cleanup_after_close(session_id),
+            );
+        }
         Ok(report)
     }
 

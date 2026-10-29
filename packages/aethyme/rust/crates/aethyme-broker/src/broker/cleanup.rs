@@ -62,6 +62,63 @@ struct CleanupStatusLimits {
     path_fields: usize,
 }
 
+#[derive(Clone, Copy)]
+enum CleanupArchiveGuard<'a> {
+    LegacySpawned {
+        plan: &'a crate::CleanupResolvePlan,
+        archive_path: &'a Path,
+    },
+    Retirement {
+        plan: &'a crate::CleanupResolvePlan,
+        archive_path: &'a Path,
+        allow_adopted: bool,
+        expected_cohort: Option<&'a crate::auto_cleanup::ClosedArtifactCheckoutCohort>,
+    },
+}
+
+impl<'a> CleanupArchiveGuard<'a> {
+    fn plan(self) -> &'a crate::CleanupResolvePlan {
+        match self {
+            Self::LegacySpawned { plan, .. } | Self::Retirement { plan, .. } => plan,
+        }
+    }
+
+    fn archive_path(self) -> &'a Path {
+        match self {
+            Self::LegacySpawned { archive_path, .. } | Self::Retirement { archive_path, .. } => {
+                archive_path
+            }
+        }
+    }
+
+    fn permits_adopted(self) -> bool {
+        matches!(self, Self::Retirement { allow_adopted: true, .. })
+    }
+
+    fn is_retirement(self) -> bool {
+        matches!(self, Self::Retirement { .. })
+    }
+
+    fn preserves_branch(self, session: &Session) -> bool {
+        self.is_retirement()
+            && (session.origin == SessionOrigin::Adopted
+                || self.plan().branch_tip.as_deref() != Some(self.plan().head.as_str())
+                || self.plan().checkout_branch_ref.as_deref()
+                    != Some(self.plan().branch_ref.as_str()))
+    }
+
+    fn expected_cohort(
+        self,
+    ) -> Option<&'a crate::auto_cleanup::ClosedArtifactCheckoutCohort> {
+        match self {
+            Self::Retirement {
+                expected_cohort, ..
+            } => expected_cohort,
+            Self::LegacySpawned { .. } => None,
+        }
+    }
+}
+
 impl CleanupStatusLimits {
     fn new(
         overall_deadline: Option<std::time::Instant>,
@@ -86,6 +143,7 @@ struct CleanupInspectionContext<'a> {
     landing_cache: &'a mut crate::representation::LandingVerdictCache,
     status_limits: CleanupStatusLimits,
     size_deadline: Option<std::time::Instant>,
+    allow_adopted_path: bool,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2460,8 +2518,37 @@ impl Broker {
         status_output_bytes: usize,
         status_path_fields: usize,
         delivery_targets: &[String],
+        allow_adopted_path: bool,
     ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
-        self.cleanup_item_for_recovery_archive_with_limits(
+        let status_limits = CleanupStatusLimits::new(
+            self.landing_deadline.get(),
+            status_output_bytes,
+            status_path_fields,
+        );
+        let live_checkouts = self.cleanup_live_checkout_snapshot(Some(status_limits.deadline))?;
+        self.cleanup_item_for_recovery_archive_with_limits_and_live_checkouts(
+            session,
+            scan,
+            records,
+            status_limits,
+            delivery_targets,
+            allow_adopted_path,
+            &live_checkouts,
+        )
+    }
+
+    pub(crate) fn cleanup_item_for_recovery_archive_with_status_limits_and_live_checkouts(
+        &self,
+        session: &Session,
+        scan: crate::SizeScan,
+        records: &mut crate::measurement::SizeRecords,
+        status_output_bytes: usize,
+        status_path_fields: usize,
+        delivery_targets: &[String],
+        allow_adopted_path: bool,
+        live_checkouts: &[(i64, crate::auto_cleanup::ResolvedWorktreePath)],
+    ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
+        self.cleanup_item_for_recovery_archive_with_limits_and_live_checkouts(
             session,
             scan,
             records,
@@ -2471,6 +2558,8 @@ impl Broker {
                 status_path_fields,
             ),
             delivery_targets,
+            allow_adopted_path,
+            live_checkouts,
         )
     }
 
@@ -2481,22 +2570,134 @@ impl Broker {
         records: &mut crate::measurement::SizeRecords,
         status_limits: CleanupStatusLimits,
         delivery_targets: &[String],
+        allow_adopted_path: bool,
+    ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
+        let live_checkouts = self.cleanup_live_checkout_snapshot(Some(status_limits.deadline))?;
+        self.cleanup_item_for_recovery_archive_with_limits_and_live_checkouts(
+            session,
+            scan,
+            records,
+            status_limits,
+            delivery_targets,
+            allow_adopted_path,
+            &live_checkouts,
+        )
+    }
+
+    fn cleanup_item_for_recovery_archive_with_limits_and_live_checkouts(
+        &self,
+        session: &Session,
+        scan: crate::SizeScan,
+        records: &mut crate::measurement::SizeRecords,
+        status_limits: CleanupStatusLimits,
+        delivery_targets: &[String],
+        allow_adopted_path: bool,
+        live_checkouts: &[(i64, crate::auto_cleanup::ResolvedWorktreePath)],
     ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
         let mut landing_cache = crate::representation::LandingVerdictCache::default();
-        let live_checkouts = self.cleanup_live_checkout_snapshot(Some(status_limits.deadline))?;
         self.cleanup_item_scanned_with_tips(
             session,
             scan,
             records,
             CleanupInspectionContext {
                 branch_tips: None,
-                live_checkouts: &live_checkouts,
+                live_checkouts,
                 delivery_targets: CleanupDeliveryTargets::ArchivePreservation(delivery_targets),
                 landing_cache: &mut landing_cache,
                 status_limits,
                 size_deadline: None,
+                allow_adopted_path,
             },
         )
+    }
+
+    /// An explicitly opted-in adopted retirement may inspect a path outside
+    /// Aethyme's managed worktree root only if Git registers that exact real
+    /// linked checkout in this repository. Ordinary cleanup never calls this.
+    fn registered_adopted_worktree_matches(
+        &self,
+        session: &Session,
+        path: &Path,
+        deadline: std::time::Instant,
+    ) -> Result<bool, BrokerOpError> {
+        if session.origin != SessionOrigin::Adopted
+            || !path.is_absolute()
+            || path == self.main_root.as_path()
+            || path != Path::new(&session.worktree_path)
+        {
+            return Ok(false);
+        }
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => {
+                return Err(BrokerError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                }
+                .into());
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Ok(false);
+        }
+        let canonical_path = path.canonicalize().map_err(|source| BrokerError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if canonical_path != path {
+            return Ok(false);
+        }
+        let main_root = self.main_root.canonicalize().map_err(|source| BrokerError::Io {
+            path: self.main_root.clone(),
+            source,
+        })?;
+        if canonical_path == main_root {
+            return Ok(false);
+        }
+
+        let _deadline = crate::git::limit_git_until(Some(deadline));
+        let checkout = match GitRepo::discover(&canonical_path) {
+            Ok(checkout) => checkout,
+            Err(_) => return Ok(false),
+        };
+        if checkout.root() != canonical_path.as_path() {
+            return Ok(false);
+        }
+        let expected_common = self.main_git_common_dir()?.canonicalize().map_err(|source| {
+            BrokerError::Io {
+                path: self.main_root.join(".git"),
+                source,
+            }
+        })?;
+        let actual_common = checkout.git_common_dir()?.canonicalize().map_err(|source| {
+            BrokerError::Io {
+                path: canonical_path.join(".git"),
+                source,
+            }
+        })?;
+        if actual_common != expected_common {
+            return Ok(false);
+        }
+
+        let head = checkout.head_commit()?;
+        let registrations = self.repo.worktree_inventory()?;
+        let matching = registrations
+            .iter()
+            .filter(|entry| entry.path == canonical_path)
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Ok(false);
+        }
+        let entry = matching[0];
+        Ok(!entry.bare
+            && !entry.prunable
+            && !entry.locked
+            && entry.head.as_deref() == Some(head.as_str())
+            && entry
+                .branch
+                .as_deref()
+                .is_none_or(|branch| branch.starts_with("refs/heads/")))
     }
 
     fn archive_preservation_ancestry(
@@ -2548,6 +2749,7 @@ impl Broker {
                 landing_cache: &mut landing_cache,
                 status_limits,
                 size_deadline: None,
+                allow_adopted_path: false,
             },
         )
     }
@@ -2570,6 +2772,7 @@ impl Broker {
             landing_cache,
             status_limits,
             size_deadline,
+            allow_adopted_path,
         } = inspection;
         let worktree_path = PathBuf::from(&session.worktree_path);
         let worktree_present = worktree_path.exists();
@@ -2591,6 +2794,19 @@ impl Broker {
             .flatten();
         let broker_owned =
             unreachable.is_none() && self.is_broker_owned_worktree(session, &worktree_path);
+        let adopted_archive_path = if !broker_owned
+            && allow_adopted_path
+            && session.origin == SessionOrigin::Adopted
+            && unreachable.is_none()
+        {
+            self.registered_adopted_worktree_matches(
+                session,
+                &worktree_path,
+                status_limits.deadline,
+            )?
+        } else {
+            false
+        };
         let live_owner = if worktree_present {
             overlapping_live_checkout(session.id, &worktree_path, live_checkouts)
         } else {
@@ -2623,10 +2839,10 @@ impl Broker {
             // here would act on a checkout nobody can see, so it stays blocked
             // until the volume is back.
             (CleanupDisposition::InspectionFailed, reason, None)
-        } else if !broker_owned {
+        } else if !broker_owned && !adopted_archive_path {
             (
                 CleanupDisposition::UnsafePath,
-                "spawned session path is outside the broker-owned worktree directory".into(),
+                "session path is outside the broker-owned worktree directory and is not an exact registered adopted checkout".into(),
                 None,
             )
         } else if worktree_present {
@@ -2984,6 +3200,7 @@ impl Broker {
                             crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
                         ),
                         size_deadline: deadline,
+                        allow_adopted_path: false,
                     },
                 )?;
                 if scan.measures()
@@ -4208,6 +4425,30 @@ impl Broker {
         let _lifecycle_claim = self.claim_worktree_lifecycle()?;
         let session = self.store.session(session_id)?;
         ensure_lifecycle_session_unchanged(session_id, &initial_session, &session)?;
+        // Preserve the idempotent success case, but never reinterpret a path
+        // that reappeared after recorded cleanup as belonging to this row.
+        if session.cleanup_state == crate::SessionCleanupState::Cleaned
+            && session.status == SessionStatus::Cleaned
+        {
+            let worktree_path = Path::new(&session.worktree_path);
+            match std::fs::symlink_metadata(worktree_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(BrokerOpError::CleanupSessionNotTerminal {
+                        id: session_id,
+                        state: "cleaned; the recorded worktree path has since been recreated".into(),
+                    });
+                }
+                Err(source) => {
+                    return Err(BrokerError::Io {
+                        path: worktree_path.to_path_buf(),
+                        source,
+                    }
+                    .into());
+                }
+            }
+            return Ok(());
+        }
         self.cleanup_under_lifecycle_claim(&session, force, None)
     }
 
@@ -4224,7 +4465,52 @@ impl Broker {
         let _lifecycle_claim = self.claim_worktree_lifecycle()?;
         let session = self.store.session(session_id)?;
         ensure_lifecycle_session_unchanged(session_id, &initial_session, &session)?;
-        self.cleanup_under_lifecycle_claim(&session, true, Some((archived_plan, archive_path)))
+        self.cleanup_under_lifecycle_claim(
+            &session,
+            true,
+            Some(CleanupArchiveGuard::LegacySpawned {
+                plan: archived_plan,
+                archive_path,
+            }),
+        )
+    }
+
+    /// Remove an explicitly reviewed retirement target only after its archive
+    /// was written and verified. The opt-in is per call and must agree with
+    /// the plan's captured origin; adopted session branches are retained.
+    pub(crate) fn cleanup_after_recovery_archive_for_retirement(
+        &mut self,
+        session_id: i64,
+        archived_plan: &crate::CleanupResolvePlan,
+        archive_path: &Path,
+        allow_adopted: bool,
+        expected_cohort: Option<&crate::auto_cleanup::ClosedArtifactCheckoutCohort>,
+    ) -> Result<(), BrokerOpError> {
+        let initial_session = self.store.session(session_id)?;
+        let _lifecycle_claim = self.claim_worktree_lifecycle()?;
+        let session = self.store.session(session_id)?;
+        ensure_lifecycle_session_unchanged(session_id, &initial_session, &session)?;
+        if archived_plan.session_id != session_id
+            || archived_plan.target_origin != session.origin
+            || (session.origin == SessionOrigin::Adopted && !allow_adopted)
+            || expected_cohort
+                .is_some_and(|cohort| cohort.owner_session_id() != session_id)
+        {
+            return Err(BrokerOpError::CleanupResolveRefused {
+                id: session_id,
+                reason: "retirement archive does not match the exact closed session and explicit origin opt-in".into(),
+            });
+        }
+        self.cleanup_under_lifecycle_claim(
+            &session,
+            true,
+            Some(CleanupArchiveGuard::Retirement {
+                plan: archived_plan,
+                archive_path,
+                allow_adopted,
+                expected_cohort,
+            }),
+        )
     }
 
     /// Perform cleanup while the caller holds the repository lifecycle claim.
@@ -4234,7 +4520,7 @@ impl Broker {
         &mut self,
         session: &Session,
         force: bool,
-        archive_guard: Option<(&crate::CleanupResolvePlan, &Path)>,
+        archive_guard: Option<CleanupArchiveGuard<'_>>,
     ) -> Result<(), BrokerOpError> {
         self.cleanup_under_lifecycle_claim_with_status_limits(
             session,
@@ -4252,10 +4538,25 @@ impl Broker {
         &mut self,
         session: &Session,
         force: bool,
-        archive_guard: Option<(&crate::CleanupResolvePlan, &Path)>,
+        archive_guard: Option<CleanupArchiveGuard<'_>>,
         status_limits: CleanupStatusLimits,
     ) -> Result<(), BrokerOpError> {
         let session_id = session.id;
+        // Physical removal is only valid after an explicit terminal
+        // transition. In particular, --force cannot turn an open session's
+        // checkout into a cleanup candidate.
+        if !session.status.is_closed()
+            || session.cleanup_state != crate::SessionCleanupState::Closed
+        {
+            return Err(BrokerOpError::CleanupSessionNotTerminal {
+                id: session_id,
+                state: format!(
+                    "status={}, cleanup_state={}",
+                    session.status.as_str(),
+                    session.cleanup_state.as_str()
+                ),
+            });
+        }
         let _session_commit_claim =
             crate::file_lock::try_acquire_session_commit_lock(self.main_root(), session_id)
                 .map_err(|source| BrokerOpError::DirtyWorktree {
@@ -4328,11 +4629,21 @@ impl Broker {
             None
         };
         let _artifact_use_reclaimer = artifact_use_reclaimer;
-        if archive_guard.is_some() && session.origin != SessionOrigin::Spawned {
+        if archive_guard.is_some_and(|guard| guard.plan().target_origin != session.origin) {
             return Err(BrokerOpError::CleanupResolveRefused {
                 id: session_id,
-                reason: "only broker-spawned worktrees can be removed after archive resolution"
-                    .into(),
+                reason: "the archived target origin no longer matches the registered session".into(),
+            });
+        }
+        if archive_guard.is_some()
+            && session.origin != SessionOrigin::Spawned
+            && !archive_guard.is_some_and(|guard| {
+                guard.is_retirement() && guard.permits_adopted()
+            })
+        {
+            return Err(BrokerOpError::CleanupResolveRefused {
+                id: session_id,
+                reason: "only an explicitly adopted retirement plan may archive an adopted checkout".into(),
             });
         }
         if !force
@@ -4344,7 +4655,10 @@ impl Broker {
         if !force && let Some(proof) = self.interrupted_finish_orphan_cleanup_proof(session) {
             return self.resume_interrupted_finish_orphan_cleanup(session, &proof);
         }
-        if session.origin == SessionOrigin::Adopted {
+        let retirement_adopted = archive_guard.is_some_and(|guard| {
+            guard.is_retirement() && guard.permits_adopted()
+        });
+        if session.origin == SessionOrigin::Adopted && !retirement_adopted {
             if worktree_path_is_real_directory(&worktree_path, session_id)? {
                 if !force {
                     let targets = self.cleanup_delivery_targets()?;
@@ -4376,13 +4690,14 @@ impl Broker {
         // not the byte count, and a walk here only widens the window between
         // the live-checkout check below and the removal.
         let mut records = crate::measurement::SizeRecords::default();
-        let item = if let Some((archived_plan, _)) = archive_guard {
+        let item = if let Some(archive_guard) = archive_guard {
             self.cleanup_item_for_recovery_archive_with_limits(
                 session,
                 crate::SizeScan::Recorded,
                 &mut records,
                 status_limits,
-                &archived_plan.delivery_targets,
+                &archive_guard.plan().delivery_targets,
+                archive_guard.permits_adopted(),
             )?
         } else {
             self.cleanup_item_scanned_with_limits(
@@ -4424,10 +4739,24 @@ impl Broker {
         }
         if retained_checkout_present {
             self.refuse_live_checkout(session_id, &worktree_path)?;
-            if let Some((archived_plan, archive_path)) = archive_guard {
+            if let Some(archive_guard) = archive_guard {
+                let archived_plan = archive_guard.plan();
+                let archive_path = archive_guard.archive_path();
                 let _archive_deadline = crate::git::limit_git_until(status_limits.deadline);
-                let current = self.cleanup_resolve_revalidation_plan(session_id)?;
-                if current.digest != archived_plan.digest {
+                let current = if archive_guard.is_retirement() {
+                    self.cleanup_resolve_retirement_revalidation_plan(
+                        session_id,
+                        archive_guard.permits_adopted(),
+                    )?
+                } else {
+                    self.cleanup_resolve_revalidation_plan(session_id)?
+                };
+                if current.digest != archived_plan.digest
+                    || current.target_origin != session.origin
+                    || archived_plan.target_origin != session.origin
+                    || current.checkout_branch_ref != archived_plan.checkout_branch_ref
+                    || current.checkout_branch_tip != archived_plan.checkout_branch_tip
+                {
                     return Err(BrokerOpError::CleanupResolveRefused {
                         id: session_id,
                         reason: "worktree contents or ignored cleanup policy changed after archive verification; the archive was kept and the worktree remains in place; review a new resolve plan before retrying".into(),
@@ -4474,7 +4803,35 @@ impl Broker {
                     ),
                 })?;
             }
+            if let Some(archive_guard) = archive_guard
+                && let Some(expected_cohort) = archive_guard.expected_cohort()
+            {
+                let archived_worktree = Path::new(&archive_guard.plan().worktree_path);
+                if archived_worktree != worktree_path {
+                    return Err(BrokerOpError::CleanupResolveRefused {
+                        id: session_id,
+                        reason: "the cleanup cohort path no longer matches the archived checkout".into(),
+                    });
+                }
+                let current_cohort = self.closed_artifact_checkout_cohort_snapshot(
+                    expected_cohort.owner_session_id(),
+                    archived_worktree,
+                    status_limits.deadline,
+                )?;
+                if current_cohort.as_ref() != Some(expected_cohort) {
+                    return Err(BrokerOpError::CleanupResolveRefused {
+                        id: session_id,
+                        reason: "the closed checkout cohort changed after archive verification; the archive and checkout were preserved".into(),
+                    });
+                }
+            }
             if self.is_orphaned_worktree_of_this_repository_checked(&worktree_path)? {
+                if archive_guard.is_some_and(|guard| guard.preserves_branch(session)) {
+                    return Err(BrokerOpError::CleanupResolveRefused {
+                        id: session_id,
+                        reason: "the archived checkout became an orphan; preserving its registered branch and checkout for recovery".into(),
+                    });
+                }
                 removed_orphan_branch = Some(self.remove_proven_orphan_worktree(
                     session,
                     item.as_ref(),
@@ -4493,6 +4850,7 @@ impl Broker {
         }
         if let Some(branch_tip) = item.and_then(|item| item.branch_tip)
             && session.origin == SessionOrigin::Spawned
+            && !archive_guard.is_some_and(|guard| guard.preserves_branch(session))
         {
             self.repo
                 .delete_branch_ref_checked(&session.branch, &branch_tip)?;
@@ -4505,7 +4863,7 @@ impl Broker {
     // Reuse one ownership observation across a full plan instead of opening
     // the session table and canonicalizing every live path per closed row.
     // Apply takes a fresh observation under the lifecycle claim.
-    fn cleanup_live_checkout_snapshot(
+    pub(crate) fn cleanup_live_checkout_snapshot(
         &self,
         deadline: Option<std::time::Instant>,
     ) -> Result<Vec<(i64, crate::auto_cleanup::ResolvedWorktreePath)>, BrokerOpError> {
@@ -4919,7 +5277,7 @@ mod registered_removal_failure_tests {
         collect_orphan_residue, open_directory_at, remove_orphan_residue_pass,
         tracked_tree_contains_directory,
     };
-    use crate::{SessionCleanupState, git::with_git_deadline};
+    use crate::{SessionCleanupState, SessionOrigin, git::with_git_deadline};
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::ffi::CString;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -4973,6 +5331,138 @@ mod registered_removal_failure_tests {
             worktree.join(gitdir)
         };
         std::fs::remove_dir_all(gitdir).unwrap();
+    }
+
+    #[test]
+    fn force_cleanup_refuses_a_nonterminal_session_without_changing_its_checkout() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = initialized_repository(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("continuing work", None)
+            .unwrap();
+        let worktree = Path::new(&session.worktree_path).to_path_buf();
+        let evidence = worktree.join("must-survive.txt");
+        std::fs::write(&evidence, b"still in use").unwrap();
+        let branch_ref = format!("refs/heads/{}", session.branch);
+
+        let error = broker.cleanup(session.id, true).unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::BrokerOpError::CleanupSessionNotTerminal { id, .. } if id == session.id
+        ));
+        assert!(worktree.is_dir());
+        assert_eq!(std::fs::read(evidence).unwrap(), b"still in use");
+        assert_eq!(
+            broker.store().session(session.id).unwrap().cleanup_state,
+            SessionCleanupState::Open
+        );
+        assert!(broker.repo.resolve_ref(&branch_ref).is_some());
+    }
+
+    #[test]
+    fn cleaned_session_does_not_authorize_removing_a_recreated_path() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = initialized_repository(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("already-cleaned path reuse", None)
+            .unwrap();
+        let worktree = Path::new(&session.worktree_path).to_path_buf();
+        broker.close(session.id).unwrap();
+
+        let closed = broker.store().session(session.id).unwrap();
+        assert_eq!(closed.status, SessionStatus::Cleaned);
+        assert_eq!(closed.cleanup_state, SessionCleanupState::Closed);
+
+        broker.cleanup(session.id, false).unwrap();
+        broker.cleanup(session.id, false).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        let replacement = worktree.join("new-owner-data.txt");
+        std::fs::write(&replacement, b"not this session's checkout").unwrap();
+
+        let error = broker.cleanup(session.id, true).unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::BrokerOpError::CleanupSessionNotTerminal { id, state }
+                if id == session.id && state.contains("recreated")
+        ));
+        assert_eq!(
+            std::fs::read(replacement).unwrap(),
+            b"not this session's checkout"
+        );
+        assert_eq!(
+            broker.store().session(session.id).unwrap().cleanup_state,
+            SessionCleanupState::Cleaned
+        );
+    }
+
+    #[test]
+    fn adopted_archive_path_requires_an_exact_nonprimary_linked_worktree() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = initialized_repository(owner.path());
+        let linked = owner.path().join("adopted-linked-worktree");
+        let linked_arg = linked.to_string_lossy().into_owned();
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "adopted-cleanup-fixture",
+                &linked_arg,
+            ],
+        );
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let adopted = broker.adopt(&linked, Some("exact adopted path")).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+
+        assert_eq!(adopted.origin, SessionOrigin::Adopted);
+        assert!(broker
+            .registered_adopted_worktree_matches(
+                &adopted,
+                Path::new(&adopted.worktree_path),
+                deadline,
+            )
+            .unwrap());
+
+        let mut primary_target = adopted.clone();
+        primary_target.worktree_path = repository.to_string_lossy().into_owned();
+        assert!(!broker
+            .registered_adopted_worktree_matches(
+                &primary_target,
+                &repository,
+                deadline,
+            )
+            .unwrap());
+
+        let foreign_parent = owner.path().join("foreign");
+        let foreign_repository = initialized_repository(&foreign_parent);
+        let mut foreign_target = adopted.clone();
+        foreign_target.worktree_path = foreign_repository.to_string_lossy().into_owned();
+        assert!(!broker
+            .registered_adopted_worktree_matches(
+                &foreign_target,
+                &foreign_repository,
+                deadline,
+            )
+            .unwrap());
+
+        #[cfg(unix)]
+        {
+            let alias = owner.path().join("adopted-path-alias");
+            std::os::unix::fs::symlink(&linked, &alias).unwrap();
+            let mut symlink_target = adopted.clone();
+            symlink_target.worktree_path = alias.to_string_lossy().into_owned();
+            assert!(!broker
+                .registered_adopted_worktree_matches(&symlink_target, &alias, deadline)
+                .unwrap());
+        }
     }
 
     fn repository_with_ignored_cleanup_fixture(root: &Path) -> std::path::PathBuf {

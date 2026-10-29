@@ -7096,8 +7096,49 @@ impl Broker {
     }
 
     pub(super) fn close_unchecked(&mut self, session_id: i64) -> Result<(), BrokerOpError> {
-        self.store
-            .set_session_status(session_id, SessionStatus::Closed, None)?;
+        let should_wake_checkout_cleanup = {
+            let initial_session = self.store.session(session_id)?;
+            let _lifecycle_claim = self.claim_worktree_lifecycle()?;
+            let session = self.store.session(session_id)?;
+            super::cleanup::ensure_lifecycle_session_unchanged(
+                session_id,
+                &initial_session,
+                &session,
+            )?;
+            if session.cleanup_state == crate::SessionCleanupState::Cleaned
+                && session.status == SessionStatus::Cleaned
+            {
+                return Ok(());
+            }
+            let cleanup_grace_hours = self.checkout_cleanup_grace_hours(&session);
+            if session.cleanup_state != crate::SessionCleanupState::Closed
+                || !session.status.is_closed()
+                || (session.origin == crate::SessionOrigin::Spawned
+                    && cleanup_grace_hours.is_some())
+            {
+                // The store variant is idempotent for an already-closed
+                // Spawned row: it repairs an older missing outbox without
+                // moving the original close timestamp or emitting a second
+                // status transition.
+                self.store.set_session_status_with_cleanup_request(
+                    session_id,
+                    SessionStatus::Closed,
+                    None,
+                    cleanup_grace_hours,
+                )?;
+            }
+            session.origin == crate::SessionOrigin::Spawned
+                && cleanup_grace_hours.is_some()
+        };
+        // The terminal row and owed cleanup request commit together. Waking
+        // the global worker happens only after releasing the lifecycle claim;
+        // the per-session not-before time and fresh proofs still gate removal.
+        if should_wake_checkout_cleanup {
+            crate::warn_unrecorded(
+                "wake post-close checkout cleanup",
+                self.request_checkout_cleanup_after_close(session_id),
+            );
+        }
         // Closing must not fail because a best-effort artifact sweep did;
         // report the failure instead of discarding it.
         crate::warn_unrecorded(

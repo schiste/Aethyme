@@ -398,6 +398,10 @@ impl Broker {
             .map(|session| session.id)
             .collect::<Vec<_>>();
         holder_process_table.prime(self.store_ref(), &retirement_candidates, None);
+        let enqueue_closed_checkout_cleanup = crate::load_retention_policy(&self.main_root)
+            .is_ok_and(|policy| policy.auto_cleanup_worktrees_on_finish)
+            && crate::AutoCleanupPolicy::load(&self.main_root)
+                .is_ok_and(|policy| policy.auto_remove);
         for session in sessions {
             let fs_activity = worktree_activity_ms(&self.main_root, &session);
             let activity_at = fs_activity.unwrap_or(0).max(session.last_activity_at);
@@ -437,7 +441,7 @@ impl Broker {
             // had (#176). Closing here does not delete anything -- it makes the
             // worktree a cleanup *candidate*, which `cleanup_item` then judges
             // on its own merits. Candidacy is granted; eligibility is earned.
-            if !derived_status.is_closed()
+            let abandoned_now = !derived_status.is_closed()
                 && matches!(
                     self.try_close_abandoned_session(
                         session.id,
@@ -447,9 +451,17 @@ impl Broker {
                         true,
                     )?,
                     AbandonedSessionCloseOutcome::Closed
-                )
-            {
+                );
+            if abandoned_now {
                 derived_status = SessionStatus::Closed;
+                if enqueue_closed_checkout_cleanup
+                    && session.origin == crate::SessionOrigin::Spawned
+                {
+                    crate::warn_unrecorded(
+                        "wake post-close checkout cleanup",
+                        self.request_checkout_cleanup_after_close(session.id),
+                    );
+                }
             }
             views.push(AgentView {
                 session,
@@ -747,12 +759,14 @@ impl Broker {
             abandon_after_ms,
             current.pid.map(crate::broker::session_pid_alive),
         );
-        match self.store().abandon_session_if_unchanged(
+        let cleanup_grace_hours = self.checkout_cleanup_grace_hours(&current);
+        match self.store().abandon_session_if_unchanged_with_cleanup_request(
             &current,
             holder.binding_event_id,
             &leases,
             observed_at,
             &abandoned_payload,
+            cleanup_grace_hours,
         ) {
             Ok(true) => Ok(AbandonedSessionCloseOutcome::Closed),
             Ok(false) => Ok(AbandonedSessionCloseOutcome::Changed),
@@ -3665,7 +3679,7 @@ mod generic_guarded_exec_tests {
         let mut fetch_broker = storage.open(repository.path()).unwrap();
         let cleanup = fetch_broker.cleanup(session_id, true);
         assert!(
-            matches!(&cleanup, Err(BrokerOpError::DirtyWorktree { .. })),
+            matches!(&cleanup, Err(BrokerOpError::CleanupSessionNotTerminal { .. })),
             "cleanup must leave a session worktree alone while its commit hook is running: {cleanup:?}"
         );
         assert!(worktree.is_dir(), "the active commit worktree was removed");
@@ -3701,6 +3715,7 @@ mod generic_guarded_exec_tests {
             committed.committed_paths.as_deref().unwrap(),
             &["tracked.txt".to_owned()]
         );
+        fetch_broker.close(unrelated_session.id).unwrap();
         fetch_broker.cleanup(unrelated_session.id, true).unwrap();
     }
 

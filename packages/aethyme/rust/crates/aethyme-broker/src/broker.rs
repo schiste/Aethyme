@@ -261,6 +261,10 @@ pub enum BrokerOpError {
     #[error("refusing to clean session {id}: {reason} (use --force to discard)")]
     DirtyWorktree { id: i64, reason: String },
     #[error(
+        "refusing to clean session {id}: physical cleanup requires a closed, not-yet-cleaned session; current state is {state} (--force does not override this)"
+    )]
+    CleanupSessionNotTerminal { id: i64, state: String },
+    #[error(
         "refusing to clean session {id}: its worktree {path} is the checkout of live session \
          {live_id}; finish that session first (--force does not override this)"
     )]
