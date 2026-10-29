@@ -369,8 +369,17 @@ pub(crate) fn committed_repository_config_checked(
 fn committed_config_text(
     main_root: &Path,
 ) -> Result<Option<String>, aethyme_config::ConfigSourceError> {
+    crate::status_reads::committed_configuration(main_root, || {
+        committed_config_text_uncached(main_root)
+    })
+}
+
+fn committed_config_text_uncached(
+    main_root: &Path,
+) -> Result<Option<String>, aethyme_config::ConfigSourceError> {
     // The caller already supplies the main checkout root. Reuse that path
-    // without another discovery process; ref and content reads remain fresh.
+    // without another discovery process; ref and content reads remain fresh
+    // for each command-local observation.
     let repo = GitRepo::at_known_root(main_root);
     let Some((_, commit)) = repo.upstream_default_checked().map_err(|error| {
         aethyme_config::ConfigSourceError::Read {
@@ -381,7 +390,7 @@ fn committed_config_text(
     else {
         return Ok(None);
     };
-    match repo.config_at_commit_checked(&commit, "config") {
+    match repo.config_at_resolved_commit_checked(&commit, "config") {
         Ok(Some(text)) => Ok(Some(text.toml_text()?.into_owned())),
         Ok(None) => Ok(None),
         Err(crate::GitError::Config(error)) => Err(*error),
