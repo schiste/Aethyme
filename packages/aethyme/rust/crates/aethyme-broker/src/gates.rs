@@ -1439,7 +1439,7 @@ pub(crate) fn process_started_at_ms(pid: i32) -> Option<i64> {
 /// microseconds since the epoch on macOS, clock ticks since boot on Linux.
 /// `None` when the process does not exist or the platform cannot say.
 #[cfg(target_os = "macos")]
-fn process_start_time(pid: i32) -> Option<u64> {
+pub(crate) fn process_start_time(pid: i32) -> Option<u64> {
     if pid <= 0 {
         return None;
     }
@@ -1470,7 +1470,7 @@ fn process_start_time(pid: i32) -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn process_start_time(pid: i32) -> Option<u64> {
+pub(crate) fn process_start_time(pid: i32) -> Option<u64> {
     if pid <= 0 {
         return None;
     }
@@ -1479,7 +1479,7 @@ fn process_start_time(pid: i32) -> Option<u64> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn process_start_time(_pid: i32) -> Option<u64> {
+pub(crate) fn process_start_time(_pid: i32) -> Option<u64> {
     None
 }
 

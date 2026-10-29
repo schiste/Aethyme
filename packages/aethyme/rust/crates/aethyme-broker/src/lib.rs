@@ -95,6 +95,7 @@ pub use gate_debris::{
 };
 pub mod agent_supervisor;
 mod auto_cleanup;
+pub mod environments;
 pub mod execution_resources;
 pub mod execution_snapshot;
 pub mod execution_supervisor;
