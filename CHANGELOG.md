@@ -4,6 +4,20 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.46] - 2026-10-29
+
+### Changed
+
+- New-session startup fetches its own upstream without scanning or moving the
+  unrelated primary checkout. Fresh-base and lease admission checks remain.
+- New worktree startup reports numeric phase timings for fetch, lifecycle-lock
+  wait, storage admission, checkout, registration and response preparation in
+  JSON and local command telemetry. Detached starts also report their setup
+  phase. Totals overlap subphases; the reported pre-output total excludes
+  serialization/output and router dispatch.
+- Command elapsed metrics now include pre-dispatch primary-checkout maintenance
+  for commands that still perform it.
+
 ## [0.8.45] - 2026-10-28
 
 ### Changed

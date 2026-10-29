@@ -1071,3 +1071,41 @@ unavailable for cleanup authorization, never as `present`. Exact-content
 landing evidence requires matching complete committed entries; executable bits
 and symlink types are part of the proof. Existing ancestry and patch proofs
 retain their separate requirements.
+
+
+## New-session startup phase timings (2026-10-29)
+
+New `broker start --json` and detached `broker start --cmd ... --json` reports
+add `phase_timings_ms`, a map of nonnegative integer wall-clock milliseconds.
+Existing report fields and public Rust report types remain unchanged. Timings
+are CLI metadata carried internally alongside the library reports. Allocation records `upstream_fetch`,
+`base_selection`, `lifecycle_lock_wait`, `checkout_count`, `worktree_root`,
+`storage_admission` and `git_worktree_add`. Ordinary starts add
+`session_registration` (including ownership witness and repository-contract
+capture) and `preparation_status`; detached starts add `agent_setup`.
+CLI reports also record `broker_open`, `session_allocation`,
+`response_preparation` and `total_before_output`, captured before the success
+response is serialized or printed. Earlier warnings may already have been
+emitted. Human output additionally records `human_render_and_advisories` for
+rendering, declared-scope capture and advisories after that boundary, then
+prints the map.
+The same map is included in the existing command-metric details. Failed
+allocation records only the observed coarse open/allocation phases; missing
+internal phases are unknown, not zero. Sub-millisecond observed phases round
+down to zero.
+
+`session_allocation` and `total_before_output` overlap the narrower phases;
+consumers must not sum every map value. `total_before_output` excludes router
+and compatibility dispatch, serialization/output, and metric persistence.
+The outer command elapsed metric includes output and, for commands that still
+perform it, primary-checkout maintenance; external wall-clock measurements can
+also include router/process launch and teardown. Do not label whole-command
+latency as Git worktree-creation time.
+
+New-session creation no longer scans or fast-forwards the primary checkout.
+When a remote default is configured, an implicit base still requires a
+successful bounded upstream fetch. Repositories without a remote default
+retain their existing local-base behavior. Startup still reads committed
+policy and checks root identity, storage and path leases.
+Adopt/reuse behavior and explicit session sync remain unchanged. Regression
+coverage lives in `aethyme-broker/tests/start_base_cli.rs`.

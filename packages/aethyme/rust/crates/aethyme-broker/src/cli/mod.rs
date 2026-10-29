@@ -1109,6 +1109,7 @@ fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 
         eprint!("{}", surface::public_help());
         return crate::exit_status::USAGE;
     }
+    let started = std::time::Instant::now();
     maybe_fast_forward_main_checkout(args, &mode);
     // Dispatched before the shared parser: the contract check is a CI/gate
     // entry point with its own flags (`--base`, `--pr-body`) and its own
@@ -1118,7 +1119,6 @@ fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 
     if args.first().map(String::as_str) == Some("check-contract") {
         return crate::contract_check::run(&args[1..]);
     }
-    let started = std::time::Instant::now();
     let command_output = crate::cli_output::snapshot();
     let (code, record_outcome, error) = match run_inner(args, &mode) {
         Ok(()) => (0, true, None),
@@ -1251,7 +1251,18 @@ pub fn report_dispatch_error(args: &[String], code: u8, message: &str) -> u8 {
 /// inspect it. A linked session worktree is never moved here; it has the
 /// explicit `broker sync --session <id>` path instead.
 fn maybe_fast_forward_main_checkout(args: &[String], mode: &CompatibilityMode) {
-    if !matches!(mode, CompatibilityMode::Normal) || routine_status(args) {
+    // A new session fetches its own upstream and allocates an independent
+    // checkout. Scanning or moving the primary checkout is unrelated work,
+    // can wait on its index, and can run expensive user Git hooks.
+    let creates_new_session = match args.first().map(String::as_str) {
+        // Parse flags rather than scanning raw tokens: task/path values may
+        // themselves equal an option. Invalid requests need no maintenance.
+        Some("start") => !parse(&args[1..])
+            .is_ok_and(|parsed| parsed.adopt || parsed.reuse || parsed.replace_stale),
+        Some("start-agent") => true,
+        _ => false,
+    };
+    if creates_new_session || !matches!(mode, CompatibilityMode::Normal) || routine_status(args) {
         return;
     }
     // Only the everyday public commands keep the checkout current. Hooks run
