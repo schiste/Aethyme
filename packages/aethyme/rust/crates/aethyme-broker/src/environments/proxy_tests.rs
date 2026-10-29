@@ -120,8 +120,16 @@ fn snapshot(text: &str, worktree: &Path) -> CompiledEnvironment {
     .unwrap()
 }
 
-const WEB: &str = r#"
+/// A python http.server component on its own port range. Tests have
+/// separate host databases, so the coordinator cannot keep parallel tests
+/// off each other's ports: every test that binds one gets its own range.
+fn web(port_start: u16) -> String {
+    format!(
+        r#"
 schema = 1
+[ports]
+start = {port_start}
+end = {end}
 [[profiles]]
 name = "p"
 [[profiles.components]]
@@ -130,8 +138,11 @@ runtime = "process"
 listen = true
 route = true
 start = "exec python3 -m http.server --bind 127.0.0.1 $AETHYME_ENV_PORT_WEB"
-health = { http = "/", timeout_seconds = 20, interval_ms = 100 }
-"#;
+health = {{ http = "/", timeout_seconds = 20, interval_ms = 100 }}
+"#,
+        end = port_start + 49
+    )
+}
 
 fn python_available() -> bool {
     std::process::Command::new("python3")
@@ -166,7 +177,7 @@ fn routes_name_reserved_ports_only_while_active() {
     }
     let host = Host::new();
     let worktree = tempfile::tempdir().unwrap();
-    let (mut lifecycle, id) = up(&host, WEB, worktree.path());
+    let (mut lifecycle, id) = up(&host, &web(43100), worktree.path());
     let record = lifecycle.store.get(&id).unwrap().unwrap();
     let namespace = record.namespace.clone().unwrap();
     let reserved: u16 = read_grant(&host.root(), &id, RESERVATION_GRANT)
@@ -226,7 +237,7 @@ fn a_request_to_a_parked_environment_wakes_it_and_succeeds() {
         "hello from the environment",
     )
     .unwrap();
-    let (mut lifecycle, id) = up(&host, WEB, worktree.path());
+    let (mut lifecycle, id) = up(&host, &web(43150), worktree.path());
     let namespace = lifecycle
         .store
         .get(&id)
@@ -267,6 +278,9 @@ fn the_wake_endpoint_needs_the_token_and_never_creates() {
     let worktree = tempfile::tempdir().unwrap();
     let text = r#"
 schema = 1
+[ports]
+start = 43200
+end = 43299
 [[profiles]]
 name = "p"
 [[profiles.components]]
