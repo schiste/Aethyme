@@ -128,6 +128,7 @@ pub mod local_wave;
 mod main_drift;
 pub mod main_reconcile;
 pub mod managed_services;
+pub mod environments;
 mod measurement;
 mod merge;
 mod merge_chain;

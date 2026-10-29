@@ -421,6 +421,9 @@ fn main_with_args(args: &[String]) -> ExitCode {
         // Opt-in Local collaboration (#680). Disabled unless the repository's
         // [collaboration] policy enables it; nothing runs in the background.
         "collab" => ExitCode::from(aethyme_broker::collaboration_cli::run(&args[1..])),
+        // Declared runnable environments per worktree (#1208). Profiles,
+        // validation and plans are read-only (#1209).
+        "env" => ExitCode::from(aethyme_broker::environments::cli::run(&args[1..])),
         // Broker commands have been native Rust from birth (issue #31).
         "broker" if readiness_remediation::is_command(command.args) => {
             ExitCode::from(readiness_remediation::run(&command.args[1..]))
@@ -694,6 +697,10 @@ Agent broker:
                               verified, atomic upgrade (= update apply)
   upgrade plan|apply|recover  review, apply, or recover repository migrations
 
+Environments (declared in .aethyme/environments.toml):
+  env validate|plan           check profiles statically; preview the host
+                              resources a profile would reserve
+
 Collaboration (opt-in, experimental; disabled unless [collaboration] enables it):
   collab status|enroll        policy, state root and captures; mint a project ID
   collab capture|gc|context|brief
@@ -760,6 +767,7 @@ fn answer_help(route: help::HelpRoute, args: &[String]) -> ExitCode {
                 "deploy" => repository_deploy::run(rest),
                 "upgrade" => repository_upgrade::run(rest),
                 "collab" => aethyme_broker::collaboration_cli::run(rest),
+                "env" => aethyme_broker::environments::cli::run(rest),
                 other => {
                     eprintln!("Error: no help route for {other}");
                     2

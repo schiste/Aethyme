@@ -35,7 +35,7 @@ const GROUP_NATIVE: &[&str] = &[
 
 /// Commands that check for `--help` anywhere before doing anything, so the
 /// full command line can be passed through.
-const PASSTHROUGH_NATIVE: &[&str] = &["deploy", "upgrade", "collab"];
+const PASSTHROUGH_NATIVE: &[&str] = &["deploy", "upgrade", "collab", "env"];
 
 /// Commands answered by the broker CLI's help surface.
 const BROKER_HELP: &[&str] = &["broker", "certify", "init"];
