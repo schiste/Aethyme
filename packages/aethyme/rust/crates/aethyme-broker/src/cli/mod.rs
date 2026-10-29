@@ -1252,12 +1252,15 @@ fn maybe_fast_forward_main_checkout(args: &[String], mode: &CompatibilityMode) {
     // A new session fetches its own upstream and allocates an independent
     // checkout. Scanning or moving the primary checkout is unrelated work,
     // can wait on its index, and can run expensive user Git hooks.
-    if args
-        .first()
-        .is_some_and(|arg| arg == "start" || arg == "start-agent")
-        || !matches!(mode, CompatibilityMode::Normal)
-        || routine_status(args)
-    {
+    let creates_new_session = match args.first().map(String::as_str) {
+        // Parse flags rather than scanning raw tokens: task/path values may
+        // themselves equal an option. Invalid requests need no maintenance.
+        Some("start") => !parse(&args[1..])
+            .is_ok_and(|parsed| parsed.adopt || parsed.reuse || parsed.replace_stale),
+        Some("start-agent") => true,
+        _ => false,
+    };
+    if creates_new_session || !matches!(mode, CompatibilityMode::Normal) || routine_status(args) {
         return;
     }
     // Only the everyday public commands keep the checkout current. Hooks run

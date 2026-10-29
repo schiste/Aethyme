@@ -321,6 +321,45 @@ fn start_preserves_dirty_primary_and_reports_observed_phases() {
     );
 }
 
+#[test]
+fn reuse_flag_as_task_text_still_creates_an_independent_checkout() {
+    let tmp = fixture();
+    std::fs::write(tmp.path().join("README.md"), "operator changes\n").unwrap();
+    let output = run(tmp.path(), &["start", "--task", "--reuse", "--json"]);
+    let value = json(&output);
+    assert!(value["phase_timings_ms"].is_object());
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("left the main checkout unchanged"),
+        "an option consumed as task text is not an adoption flag"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("README.md")).unwrap(),
+        b"operator changes\n"
+    );
+}
+
+#[test]
+fn adopt_reuse_and_replace_stale_keep_primary_maintenance() {
+    for flag in ["--adopt", "--reuse", "--replace-stale"] {
+        let tmp = fixture();
+        std::fs::write(tmp.path().join("README.md"), "operator changes\n").unwrap();
+        let output = run(
+            tmp.path(),
+            &["start", flag, "--task", "existing checkout", "--json"],
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("left the main checkout unchanged"),
+            "existing-checkout flag {flag} must retain primary maintenance: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("README.md")).unwrap(),
+            b"operator changes\n"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn start_attributes_post_checkout_hook_delay_to_git_worktree_add() {
