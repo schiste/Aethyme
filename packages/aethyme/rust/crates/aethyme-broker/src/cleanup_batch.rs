@@ -8,7 +8,9 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::{Broker, BrokerOpError, CleanupResolveOutcome, SessionOrigin};
+use crate::{
+    Broker, BrokerOpError, CleanupResolveOutcome, SessionCleanupState, SessionOrigin, SessionStatus,
+};
 
 pub const CLEANUP_RESOLVE_BATCH_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CLEANUP_RESOLVE_BATCH_TARGETS: usize = 4096;
@@ -20,6 +22,9 @@ pub struct CleanupResolveBatchTarget {
     pub target_origin: Option<SessionOrigin>,
     /// No confirmation means this item is blocked and has no removal authority.
     pub confirmation: Option<String>,
+    /// A terminal ledger row whose exact recorded path is already absent.
+    /// This marker grants no removal or archive authority.
+    pub already_removed: bool,
     pub preserved_file_bytes: Option<u64>,
     pub unlanded_commits: Option<usize>,
     pub blocker: Option<String>,
@@ -39,6 +44,7 @@ pub struct CleanupResolveBatchPlan {
 pub struct CleanupResolveBatchResult {
     pub session_id: i64,
     pub outcome: Option<CleanupResolveOutcome>,
+    pub already_removed: bool,
     pub error: Option<String>,
 }
 
@@ -102,6 +108,7 @@ fn batch_digest(
             hash.update((field.len() as u64).to_be_bytes());
             hash.update(field.as_bytes());
         }
+        hash.update([u8::from(target.already_removed)]);
         // Per-item confirmations already bind content, path and cleanup policy.
         // Blocker prose is diagnostic and must not become unstable authority.
         match target.confirmation.as_deref() {
@@ -117,6 +124,29 @@ fn batch_digest(
 }
 
 impl Broker {
+    fn already_removed_batch_target(&self, session_id: i64) -> Option<CleanupResolveBatchTarget> {
+        let session = self.store_ref().session(session_id).ok()?;
+        if session.status != SessionStatus::Cleaned
+            || session.cleanup_state != SessionCleanupState::Cleaned
+        {
+            return None;
+        }
+        match std::fs::symlink_metadata(&session.worktree_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Some(CleanupResolveBatchTarget {
+                    session_id,
+                    worktree_path: Some(session.worktree_path),
+                    target_origin: Some(session.origin),
+                    confirmation: None,
+                    already_removed: true,
+                    preserved_file_bytes: None,
+                    unlanded_commits: None,
+                    blocker: None,
+                })
+            }
+            _ => None,
+        }
+    }
     /// Plan compact recovery for an explicit set, including already delivered
     /// spawned checkouts. Planning is read-only and ignores no safety refusal.
     pub fn cleanup_resolve_batch_plan(
@@ -125,14 +155,26 @@ impl Broker {
         allow_adopted: bool,
     ) -> Result<CleanupResolveBatchPlan, BrokerOpError> {
         let ids = validated_targets(session_ids)?;
+        // One complete read-only ownership/delivery observation for this plan.
+        // Apply still obtains fresh per-item evidence under lifecycle guards.
+        let context = self.cleanup_resolve_retirement_context()?;
         let mut targets = Vec::with_capacity(ids.len());
         for session_id in ids {
-            let target = match self.cleanup_resolve_retirement_plan(session_id, allow_adopted) {
+            if let Some(completed) = self.already_removed_batch_target(session_id) {
+                targets.push(completed);
+                continue;
+            }
+            let target = match self.cleanup_resolve_retirement_plan_with_context(
+                session_id,
+                allow_adopted,
+                &context,
+            ) {
                 Ok(plan) => CleanupResolveBatchTarget {
                     session_id,
                     worktree_path: Some(plan.worktree_path),
                     target_origin: Some(plan.target_origin),
                     confirmation: Some(plan.digest),
+                    already_removed: false,
                     preserved_file_bytes: Some(
                         plan.staged_patch_bytes
                             .saturating_add(plan.unstaged_patch_bytes)
@@ -147,6 +189,7 @@ impl Broker {
                     worktree_path: None,
                     target_origin: None,
                     confirmation: None,
+                    already_removed: false,
                     preserved_file_bytes: None,
                     unlanded_commits: None,
                     blocker: Some(error.to_string()),
@@ -202,6 +245,26 @@ impl Broker {
         let mut removed_count = 0;
         for target in plan.targets {
             let session_id = target.session_id;
+            if target.already_removed {
+                let unchanged =
+                    self.already_removed_batch_target(session_id)
+                        .is_some_and(|current| {
+                            current.worktree_path == target.worktree_path
+                                && current.target_origin == target.target_origin
+                        });
+                if !unchanged {
+                    remaining_session_ids.push(session_id);
+                }
+                results.push(CleanupResolveBatchResult {
+                    session_id,
+                    outcome: None,
+                    already_removed: unchanged,
+                    error: (!unchanged).then(|| {
+                        "the previously removed target changed; review its current state".into()
+                    }),
+                });
+                continue;
+            }
             let result = match target.confirmation {
                 Some(confirmation) => match self.cleanup_resolve_retirement_apply(
                     session_id,
@@ -217,6 +280,7 @@ impl Broker {
                         CleanupResolveBatchResult {
                             session_id,
                             outcome: Some(outcome),
+                            already_removed: false,
                             error: None,
                         }
                     }
@@ -225,6 +289,7 @@ impl Broker {
                         CleanupResolveBatchResult {
                             session_id,
                             outcome: None,
+                            already_removed: false,
                             error: Some(error.to_string()),
                         }
                     }
@@ -234,6 +299,7 @@ impl Broker {
                     CleanupResolveBatchResult {
                         session_id,
                         outcome: None,
+                        already_removed: false,
                         error: target.blocker,
                     }
                 }
@@ -260,6 +326,7 @@ mod tests {
             worktree_path: Some(format!("/checkouts/{session_id}")),
             target_origin: Some(SessionOrigin::Spawned),
             confirmation: confirmation.map(str::to_owned),
+            already_removed: false,
             preserved_file_bytes: None,
             unlanded_commits: None,
             blocker: None,
@@ -307,6 +374,9 @@ mod tests {
         let mut changed_origin = original.clone();
         changed_origin[0].target_origin = Some(SessionOrigin::Adopted);
         assert_ne!(digest, batch_digest("/repo", false, &changed_origin));
+        let mut completion_change = original.clone();
+        completion_change[1].already_removed = true;
+        assert_ne!(digest, batch_digest("/repo", false, &completion_change));
         let mut diagnostic_change = original.clone();
         diagnostic_change[1].blocker = Some("a newer diagnostic".into());
         assert_eq!(digest, batch_digest("/repo", false, &diagnostic_change));

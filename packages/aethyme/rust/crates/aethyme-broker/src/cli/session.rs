@@ -2244,6 +2244,12 @@ fn run_cleanup_resolve_batch(
                     outcome.remaining_session_ids.len()
                 );
                 for result in &outcome.results {
+                    if result.already_removed {
+                        out!(
+                            "  session {}: already removed; no new removal",
+                            result.session_id
+                        );
+                    }
                     if let Some(error) = &result.error {
                         out!(
                             "  session {}: kept — {}",

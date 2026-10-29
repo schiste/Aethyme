@@ -1009,3 +1009,72 @@ fn retirement_preserves_recorded_and_switched_checkout_branch_roots() {
         }
     }
 }
+
+#[test]
+fn recovery_batch_resume_skips_removed_targets_but_keeps_recreated_paths() {
+    let tmp = repo();
+    let (first, first_path) = closed_session(tmp.path(), "first resume target");
+    let (second, second_path) = closed_session(tmp.path(), "second resume target");
+    let single = [
+        "finish",
+        "cleanup",
+        "resolve",
+        &first,
+        "--batch",
+        "--archive",
+        "--json",
+    ];
+    let initial = json(&run(tmp.path(), &single));
+    let mut first_apply = single.to_vec();
+    first_apply.extend(["--confirm", initial["digest"].as_str().unwrap()]);
+    assert_eq!(json(&run(tmp.path(), &first_apply))["removed_count"], 1);
+    assert!(!first_path.exists() && second_path.exists());
+
+    let original_set = [
+        "finish",
+        "cleanup",
+        "resolve",
+        &first,
+        &second,
+        "--batch",
+        "--archive",
+        "--json",
+    ];
+    let reviewed = json(&run(tmp.path(), &original_set));
+    assert_eq!(reviewed["targets"][0]["already_removed"], true);
+    assert!(reviewed["targets"][0]["confirmation"].is_null());
+    assert!(reviewed["targets"][0]["preserved_file_bytes"].is_null());
+    let mut resumed_apply = original_set.to_vec();
+    resumed_apply.extend(["--confirm", reviewed["digest"].as_str().unwrap()]);
+    let outcome = json(&run(tmp.path(), &resumed_apply));
+    assert_eq!(outcome["removed_count"], 1);
+    assert_eq!(outcome["remaining_session_ids"], serde_json::json!([]));
+    assert_eq!(outcome["results"][0]["already_removed"], true);
+    assert!(outcome["results"][0]["outcome"].is_null());
+    assert!(!first_path.exists() && !second_path.exists());
+
+    std::fs::create_dir(&first_path).unwrap();
+    std::fs::write(
+        first_path.join("replacement-owner.txt"),
+        b"keep replacement\n",
+    )
+    .unwrap();
+    let reviewed = json(&run(tmp.path(), &original_set));
+    assert_eq!(reviewed["targets"][0]["already_removed"], false);
+    assert!(reviewed["targets"][0]["confirmation"].is_null());
+    assert!(reviewed["targets"][0]["blocker"].is_string());
+    let mut apply = original_set.to_vec();
+    apply.extend(["--confirm", reviewed["digest"].as_str().unwrap()]);
+    let retained = run(tmp.path(), &apply);
+    assert!(!retained.status.success());
+    let outcome: serde_json::Value = serde_json::from_slice(&retained.stdout).unwrap();
+    assert_eq!(outcome["removed_count"], 0);
+    assert_eq!(
+        outcome["remaining_session_ids"],
+        serde_json::json!([first.parse::<i64>().unwrap()])
+    );
+    assert_eq!(
+        std::fs::read(first_path.join("replacement-owner.txt")).unwrap(),
+        b"keep replacement\n"
+    );
+}

@@ -313,6 +313,11 @@ Independent targets continue when another target is protected or fails. JSON
 reports each archive/removal outcome and `remaining_session_ids`; any retained
 target makes the batch exit nonzero. Replan only those remaining IDs and review
 a new confirmation. Never attach an old digest to a reduced or expanded list.
+After an interrupted run, replanning the original exact set also works: a fully
+cleaned ledger row with an absent checkout is marked `already_removed`, grants
+no removal authority, and adds nothing to `removed_count`. A recreated path
+stays blocked. Apply rechecks each completion marker; missing byte estimates
+and archive outcomes remain null rather than claiming preserved contents.
 Archives remain subject to the recovery retention policy; do not manually
 remove them as regenerable cache or claim an archive-only result as a removed
 checkout. The default archive window is 30 days, exceeding the default 15-day
