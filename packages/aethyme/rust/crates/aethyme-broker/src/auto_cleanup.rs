@@ -1637,6 +1637,35 @@ impl Broker {
             }
         }
 
+        let current_witness = if sessions
+            .iter()
+            .any(|session| session.origin == SessionOrigin::Spawned)
+        {
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
+            let checkout_result = {
+                let _git_deadline = deadline.map(crate::git::limit_git_until);
+                GitRepo::discover(&resolved_candidate.canonical_or_raw)
+            };
+            let Ok(checkout) = checkout_result else {
+                return Ok(None);
+            };
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
+            let witness = {
+                let _git_deadline = deadline.map(crate::git::limit_git_until);
+                checkout.spawned_worktree_instance_witness()
+            };
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
+            witness
+        } else {
+            None
+        };
+
         let mut snapshots = Vec::with_capacity(sessions.len());
         let mut owner_session_id = None;
         for session in &sessions {
@@ -2611,10 +2640,8 @@ impl Broker {
         let mut upstream = None;
         let mut selected = Vec::new();
         let mut lease_process_table = LeaseProcessTableSnapshot::default();
-        let mut stop_for_deadline = false;
         for group in scan.groups {
             if deadline_expired(deadline) {
-                stop_for_deadline = true;
                 break;
             }
             let cursor_session_id = checkout_group_cursor_session_id(&group);
@@ -2703,23 +2730,17 @@ impl Broker {
             cursor.after_session_id = cursor_session_id;
             self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
             if stop_for_deadline {
-                stop_for_deadline = true;
                 break;
             }
         }
-        if stop_for_deadline {
-            report.deferred += self.store().cleanup_cohort_group_count(
-                crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
-                cursor.after_session_id,
-                cursor.high_water_session_id,
-            )?;
-        } else {
-            report.deferred += self.store().cleanup_cohort_group_count(
-                crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
-                cursor.after_session_id,
-                cursor.high_water_session_id,
-            )?;
-        }
+        // The current deferred group, if any, was counted above and the cursor
+        // persisted through it. On an early deadline break it still points to
+        // the prior group, so this adds the unvisited suffix in either case.
+        report.deferred += self.store().cleanup_cohort_group_count(
+            crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+            cursor.after_session_id,
+            cursor.high_water_session_id,
+        )?;
         Ok(AutoCleanupPlan {
             report,
             policy,
@@ -3033,6 +3054,8 @@ mod tests {
         decode_session_retirement_cursor, first_live_worktree_overlap,
         group_closed_checkout_sessions, ignored_content_reason, resolve_worktree_paths_until,
     };
+    #[cfg(unix)]
+    use super::{AutoCleanupCandidate, AutoCleanupPlan, AutoCleanupReport, ContainmentProof};
     use super::{SESSION_RETIREMENT_CURSOR_KEY, now_ms};
     #[cfg(unix)]
     use crate::git::GitRepo;
@@ -3286,9 +3309,8 @@ mod tests {
                 "the two real worktrees must retain their spawn-time witnesses"
             );
         }
-        broker
-            .store()
-            .conn
+        let mut connection = rusqlite::Connection::open(broker.store().db_path()).unwrap();
+        connection
             .execute(
                 "UPDATE sessions SET status = 'cleaned' WHERE id = ?1",
                 [first.id],
@@ -3297,7 +3319,6 @@ mod tests {
 
         let legacy_path = broker.main_root().parent().unwrap().join("legacy-history");
         std::fs::create_dir_all(&legacy_path).unwrap();
-        let mut connection = rusqlite::Connection::open(broker.store().db_path()).unwrap();
         let tx = connection.transaction().unwrap();
         for index in 0..900 {
             tx.execute(
