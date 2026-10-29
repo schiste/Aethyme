@@ -1631,25 +1631,52 @@ impl BrokerStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        record_lease_releases_in_tx(
-            &tx,
-            session_id,
-            None,
-            Some("implicit"),
-            now,
-            "implicit_lease_replaced",
-            true,
-        )?;
-        tx.execute(
-            "DELETE FROM leases WHERE session_id = ?1 AND kind = 'implicit'",
-            [session_id],
-        )?;
+        let existing: Vec<(i64, String, Option<i64>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, path, released_at FROM leases
+                 WHERE session_id = ?1 AND kind = 'implicit'
+                 ORDER BY id",
+            )?;
+            stmt.query_map([session_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        let desired: std::collections::BTreeSet<&str> = paths.iter().map(String::as_str).collect();
+        let retained: std::collections::BTreeSet<String> = existing
+            .iter()
+            .filter(|(_, path, released_at)| {
+                released_at.is_none() && desired.contains(path.as_str())
+            })
+            .map(|(_, path, _)| path.clone())
+            .collect();
+        for (lease_id, path, released_at) in existing {
+            if retained.contains(&path) {
+                continue;
+            }
+            if released_at.is_none() {
+                record_lease_releases_in_tx(
+                    &tx,
+                    session_id,
+                    Some(&path),
+                    Some("implicit"),
+                    now,
+                    "implicit_lease_replaced",
+                    true,
+                )?;
+            }
+            tx.execute("DELETE FROM leases WHERE id = ?1", [lease_id])?;
+        }
         {
+            let mut inserted = std::collections::BTreeSet::new();
             let mut stmt = tx.prepare(
                 "INSERT INTO leases (session_id, path, kind, created_at)
                  VALUES (?1, ?2, 'implicit', ?3)",
             )?;
             for path in paths {
+                if retained.contains(path) || !inserted.insert(path.as_str()) {
+                    continue;
+                }
                 stmt.execute(params![session_id, path, now])?;
             }
         }
