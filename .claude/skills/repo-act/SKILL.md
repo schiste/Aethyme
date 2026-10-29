@@ -95,6 +95,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   crate's Cargo edition, including workspace inheritance, and pass that edition.
   Formatting rules vary by edition even when the source compiles in both; a
   successful check with a guessed edition can fail workspace CI.
+  When adding a Rust module, include its parent declaration file in formatting
+  validation: formatting only the new file misses reordered `mod` declarations.
+  For scoped checks, use `--config skip_children=true` on the parent; retain
+  the repository's required formatting check before publishing.
 - Keep latency budgets in versioned machine-readable data. Validate the warning
   policy with deterministic tests; assess elapsed time in dedicated performance
   runs rather than wall-clock assertions in ordinary tests. Match the recorded
