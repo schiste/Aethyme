@@ -3565,18 +3565,10 @@ impl GitRepo {
         }
         let args = owned_args.iter().map(String::as_str).collect::<Vec<_>>();
         let output = self.run_git_output_limited(&args, 64 * 1024)?;
-        if !output.stdout.is_empty() && output.stdout.last() != Some(&0) {
-            return Err(GitError::UntrustedOutput {
-                detail: format!("git {} returned an unterminated tree entry", args.join(" ")),
-            });
-        }
+        let records = Self::strict_config_tree_records(&output.stdout, &args)?;
 
         let mut objects = BTreeMap::new();
-        for record in output
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|record| !record.is_empty())
-        {
+        for record in records {
             let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
                 return Err(GitError::UntrustedOutput {
                     detail: format!("git {} returned a malformed tree entry", args.join(" ")),
@@ -3617,6 +3609,32 @@ impl GitRepo {
             }
         }
         Ok(objects)
+    }
+
+    fn strict_config_tree_records<'a>(
+        stdout: &'a [u8],
+        args: &[&str],
+    ) -> Result<Vec<&'a [u8]>, GitError> {
+        if stdout.is_empty() {
+            return Ok(Vec::new());
+        }
+        if stdout.last() != Some(&0) {
+            return Err(GitError::UntrustedOutput {
+                detail: format!("git {} returned an unterminated tree entry", args.join(" ")),
+            });
+        }
+
+        // Consume exactly one framing NUL. Any remaining empty record indicates
+        // malformed nonempty output, not an absent configuration path.
+        let records = stdout[..stdout.len() - 1]
+            .split(|byte| *byte == 0)
+            .collect::<Vec<_>>();
+        if records.iter().any(|record| record.is_empty()) {
+            return Err(GitError::UntrustedOutput {
+                detail: format!("git {} returned an empty tree entry", args.join(" ")),
+            });
+        }
+        Ok(records)
     }
 
     fn config_blob_checked(&self, object: &str, path: &str) -> Result<String, GitError> {
@@ -10482,5 +10500,38 @@ mod working_tree_hash_process_group_tests {
             matches!(error, GitError::Git { ref args, .. } if args.contains("add")),
             "a completed nonzero Git child keeps the ordinary Git error: {error:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod config_tree_record_tests {
+    use super::*;
+
+    #[test]
+    fn checked_tree_records_accept_only_empty_output_or_nonempty_nul_records() {
+        let args = ["ls-tree", "-z"];
+        assert!(
+            GitRepo::strict_config_tree_records(b"", &args)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            GitRepo::strict_config_tree_records(b"entry\0", &args).unwrap(),
+            vec![b"entry".as_slice()]
+        );
+
+        for malformed in [b"\0".as_slice(), b"entry\0\0", b"\0entry\0"] {
+            assert!(
+                matches!(
+                    GitRepo::strict_config_tree_records(malformed, &args),
+                    Err(GitError::UntrustedOutput { .. })
+                ),
+                "malformed output {malformed:?} must not mean absence"
+            );
+        }
+        assert!(matches!(
+            GitRepo::strict_config_tree_records(b"unterminated", &args),
+            Err(GitError::UntrustedOutput { .. })
+        ));
     }
 }
