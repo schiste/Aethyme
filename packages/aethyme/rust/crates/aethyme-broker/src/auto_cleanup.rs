@@ -214,6 +214,7 @@ fn checkout_group_cursor_session_id(group: &AutoCleanupCheckoutGroup) -> i64 {
 /// suffix of the current lap. The fixed high-water mark keeps new sessions
 /// from extending a lap forever; a completed lap starts again from the
 /// beginning and includes arrivals since the prior snapshot.
+#[cfg(test)]
 fn auto_cleanup_lap_range<T>(
     candidates: &mut [T],
     cursor: &mut AutoCleanupCursor,
@@ -795,6 +796,7 @@ impl AutoCleanupCandidate {
 
 /// Group all extant retained rows by canonical checkout path. This pass is
 /// intentionally complete: a partial cohort is never deletion authority.
+#[cfg(test)]
 fn group_closed_checkout_sessions(
     closed: Vec<Session>,
     deadline: Option<Instant>,
@@ -2805,17 +2807,17 @@ impl Broker {
         // it is as close to removal as it can be. No snapshot keeps all.
         let open_file_snapshot = crate::reclaim::open_file_snapshot_under(Path::new("/"));
         let records = crate::measurement::load_size_records(self.main_root());
-        if let Some(alias_generation) = alias_refresh_generation {
-            if !self.cleanup_cohort_filesystem_aliases_match(alias_generation, deadline)? {
-                report.deferred = report.deferred.saturating_add(selected.len());
-                report.kept.push(AutoKeptCheckout {
-                    worktree: "<session checkout inventory>".into(),
-                    sessions: Vec::new(),
-                    reason: "registered checkout paths changed during filesystem alias verification; cleanup requires a fresh pass".into(),
-                });
-                self.record_auto_cleanup_report(&report)?;
-                return Ok(report);
-            }
+        if let Some(alias_generation) = alias_refresh_generation
+            && !self.cleanup_cohort_filesystem_aliases_match(alias_generation, deadline)?
+        {
+            report.deferred = report.deferred.saturating_add(selected.len());
+            report.kept.push(AutoKeptCheckout {
+                worktree: "<session checkout inventory>".into(),
+                sessions: Vec::new(),
+                reason: "registered checkout paths changed during filesystem alias verification; cleanup requires a fresh pass".into(),
+            });
+            self.record_auto_cleanup_report(&report)?;
+            return Ok(report);
         }
         let mut attempted_any = false;
         for (candidate, selected_proof) in selected {
@@ -3433,7 +3435,7 @@ mod tests {
             .unwrap()
             .join("ordinary-checkout");
         std::fs::create_dir_all(&unrelated_path).unwrap();
-        let mut connection = rusqlite::Connection::open(broker.store().db_path()).unwrap();
+        let connection = rusqlite::Connection::open(broker.store().db_path()).unwrap();
         connection
             .execute(
                 "INSERT INTO sessions (

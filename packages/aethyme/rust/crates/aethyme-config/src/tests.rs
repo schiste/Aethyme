@@ -348,6 +348,22 @@ fn two_twins_in_a_directory_is_an_error_naming_both() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn dangling_config_twin_is_not_treated_as_missing_or_fallback() {
+    use std::os::unix::fs::symlink;
+
+    let dir = scratch();
+    let dangling = dir.join("gates.yaml");
+    symlink("missing-target", &dangling).unwrap();
+    std::fs::write(dir.join("gates.toml"), "schema = 1").unwrap();
+
+    let error = load_config(&dir, "gates").unwrap_err();
+    assert_eq!(error.code(), "config_read_failed");
+    assert_eq!(error.path(), Some(dangling.as_path()));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn reader_based_loading_serves_commit_reads() {
     let files = [
