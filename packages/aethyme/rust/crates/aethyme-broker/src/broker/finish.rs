@@ -299,7 +299,15 @@ impl Broker {
                     .into(),
             );
             self.finalize_finish_report(report);
-            self.record_finished_handoff(report)?;
+            let handoff_result = self.record_finished_handoff(report);
+            drop(_lifecycle_claim);
+            if checkout_cleanup_request.is_some() {
+                crate::warn_unrecorded(
+                    "wake post-close checkout cleanup",
+                    self.request_checkout_cleanup_after_close(report.session_id),
+                );
+            }
+            handoff_result?;
             return Ok(());
         }
         let worktree_present = worktree_path.exists();
