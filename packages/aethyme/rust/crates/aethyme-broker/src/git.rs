@@ -249,8 +249,15 @@ pub enum GitError {
     WorktreeListParse { reason: String },
 
     /// A committed `.aethyme` configuration file is ambiguous or invalid.
+    /// Boxed so the error enum stays small.
     #[error("{0}")]
-    Config(#[from] aethyme_config::ConfigSourceError),
+    Config(Box<aethyme_config::ConfigSourceError>),
+}
+
+impl From<aethyme_config::ConfigSourceError> for GitError {
+    fn from(error: aethyme_config::ConfigSourceError) -> Self {
+        Self::Config(Box::new(error))
+    }
 }
 
 /// Overrides [`DEFAULT_GIT_TIMEOUT`], in whole seconds.

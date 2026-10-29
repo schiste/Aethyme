@@ -159,7 +159,7 @@ pub enum ReviewReportingError {
     },
     /// The configuration is ambiguous (two format twins) or invalid YAML.
     #[error("{0}")]
-    Config(#[from] aethyme_config::ConfigSourceError),
+    Config(Box<aethyme_config::ConfigSourceError>),
     #[error(
         "{path}: review.reporting schema_version {found} is newer than this broker understands \
          ({supported}); upgrade aethyme or pin the policy"
@@ -418,6 +418,12 @@ fn join_with_or(labels: &[&str]) -> String {
         [] => String::new(),
         [only] => (*only).to_string(),
         [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
+impl From<aethyme_config::ConfigSourceError> for ReviewReportingError {
+    fn from(error: aethyme_config::ConfigSourceError) -> Self {
+        Self::Config(Box::new(error))
     }
 }
 

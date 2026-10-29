@@ -58,7 +58,7 @@ pub enum GateConfigError {
     Parse(String),
     /// Two format twins, or a YAML file outside the strict subset (#1223).
     #[error("{0}")]
-    Config(aethyme_config::ConfigSourceError),
+    Config(Box<aethyme_config::ConfigSourceError>),
     #[error("gate {gate:?}: invalid trigger glob {glob:?}: {message}")]
     BadGlob {
         gate: String,
@@ -219,7 +219,7 @@ pub fn load_gates(main_root: &Path) -> Result<Vec<Gate>, GateConfigError> {
         Err(aethyme_config::ConfigSourceError::Read { path, .. }) => {
             Err(GateConfigError::Missing(path))
         }
-        Err(error) => Err(GateConfigError::Config(error)),
+        Err(error) => Err(GateConfigError::Config(Box::new(error))),
     }
 }
 

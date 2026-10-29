@@ -253,7 +253,7 @@ pub enum PrProjectionError {
     },
     /// The configuration is ambiguous (two format twins) or invalid YAML.
     #[error("{0}")]
-    Config(#[from] aethyme_config::ConfigSourceError),
+    Config(Box<aethyme_config::ConfigSourceError>),
     #[error(
         "{path}: review.projection schema_version {found} is newer than this broker understands \
          ({supported}); upgrade aethyme or pin the policy"
@@ -770,6 +770,12 @@ pub fn render_comment(projection: &ReviewProjection) -> String {
     }
 
     out
+}
+
+impl From<aethyme_config::ConfigSourceError> for PrProjectionError {
+    fn from(error: aethyme_config::ConfigSourceError) -> Self {
+        Self::Config(Box::new(error))
+    }
 }
 
 #[cfg(test)]

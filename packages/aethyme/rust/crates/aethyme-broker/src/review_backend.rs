@@ -223,7 +223,7 @@ pub enum ReviewRoutingError {
     },
     /// The configuration is ambiguous (two format twins) or invalid YAML.
     #[error("{0}")]
-    Config(#[from] aethyme_config::ConfigSourceError),
+    Config(Box<aethyme_config::ConfigSourceError>),
     #[error(
         "{path}: review.routing schema_version {found} is newer than this broker understands \
          ({supported}); upgrade aethyme or pin the policy"
@@ -826,6 +826,12 @@ pub fn review_prompt(
         prompt.push('\n');
     }
     prompt
+}
+
+impl From<aethyme_config::ConfigSourceError> for ReviewRoutingError {
+    fn from(error: aethyme_config::ConfigSourceError) -> Self {
+        Self::Config(Box::new(error))
+    }
 }
 
 #[cfg(test)]

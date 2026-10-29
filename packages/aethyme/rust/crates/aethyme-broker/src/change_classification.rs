@@ -202,7 +202,7 @@ pub enum ChangeClassificationError {
     },
     /// The configuration is ambiguous (two format twins) or invalid YAML.
     #[error("{0}")]
-    Config(#[from] aethyme_config::ConfigSourceError),
+    Config(Box<aethyme_config::ConfigSourceError>),
     #[error(
         "{path}: review.classification schema_version {found} is newer than this broker \
          understands ({supported}); upgrade aethyme or pin the policy"
@@ -1136,6 +1136,12 @@ fn add_error_context(
     match cleanup {
         Ok(()) => error,
         Err(cleanup) => std::io::Error::other(format!("{error}; could not {action}: {cleanup}")),
+    }
+}
+
+impl From<aethyme_config::ConfigSourceError> for ChangeClassificationError {
+    fn from(error: aethyme_config::ConfigSourceError) -> Self {
+        Self::Config(Box::new(error))
     }
 }
 

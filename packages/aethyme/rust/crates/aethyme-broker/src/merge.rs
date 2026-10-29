@@ -315,17 +315,12 @@ pub(crate) fn repository_config_checked(
         if let Some(text) = committed_config_text(main_root)? {
             return Ok(Some((text, "committed")));
         }
-        Ok(
-            aethyme_config::read_config_text(
-                &main_root.join(aethyme_config::CONFIG_DIR),
-                "config",
-            )?
+        aethyme_config::read_config_text(&main_root.join(aethyme_config::CONFIG_DIR), "config")?
             .map(|text| {
                 text.toml_text()
                     .map(|toml| (toml.into_owned(), "working_copy"))
             })
-            .transpose()?,
-        )
+            .transpose()
     })
 }
 
@@ -343,7 +338,7 @@ fn committed_config_text(
     match repo.config_at_commit(&commit, "config") {
         Ok(Some(text)) => Ok(Some(text.toml_text()?.into_owned())),
         Ok(None) => Ok(None),
-        Err(crate::GitError::Config(error)) => Err(error),
+        Err(crate::GitError::Config(error)) => Err(*error),
         Err(_) => Ok(None),
     }
 }

@@ -509,7 +509,7 @@ pub enum ReviewTriggerError {
     },
     /// The configuration is ambiguous (two format twins) or invalid YAML.
     #[error("{0}")]
-    Config(#[from] aethyme_config::ConfigSourceError),
+    Config(Box<aethyme_config::ConfigSourceError>),
     #[error(
         "{path}: review.trigger schema_version {found} is newer than this broker understands \
          ({supported}); upgrade aethyme or pin the policy"
@@ -1359,6 +1359,12 @@ pub fn decide(
         base,
         now_ms,
     )
+}
+
+impl From<aethyme_config::ConfigSourceError> for ReviewTriggerError {
+    fn from(error: aethyme_config::ConfigSourceError) -> Self {
+        Self::Config(Box::new(error))
+    }
 }
 
 #[cfg(test)]
