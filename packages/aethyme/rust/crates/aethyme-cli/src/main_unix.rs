@@ -706,6 +706,8 @@ Environments (declared in .aethyme/environments.toml):
   env exec <id> -- <cmd>      run a command against the environment; never
                               parked while it runs (env touch|pin|unpin)
   env infer [--range R]       minimum profile these changes need (path rules)
+  env shared up|redeploy|destroy|list
+                              host-wide [[shared]] environments owned by a ref
   env routes                  hostnames the loopback proxy (127.0.0.1:4180)
                               serves; a request to a parked one wakes it
   env status|list|history|logs

@@ -908,7 +908,7 @@ impl Lifecycle {
 
 /// Export `commit` from the repository at `main_root` into `into` without
 /// registering a worktree.
-fn export_commit(main_root: &Path, commit: &str, into: &Path) -> Result<(), String> {
+pub(super) fn export_commit(main_root: &Path, commit: &str, into: &Path) -> Result<(), String> {
     use std::process::{Command, Stdio};
     let mut archive = Command::new("git")
         .args(["archive", "--format=tar", commit])

@@ -165,6 +165,14 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
     let replaced =
         replace_below_minimum(&mut lifecycle, &workspace.worktree_root, file, &inference)?;
     let main_root = workspace.repo.main_root().ok();
+    let mut snapshot = snapshot;
+    attach_shared(
+        &mut lifecycle,
+        &mut snapshot,
+        main_root.as_deref(),
+        &checked.host,
+        options,
+    )?;
     let record = lifecycle
         .up(
             &snapshot,
@@ -637,6 +645,132 @@ pub(super) fn run_infer(options: &Options) -> Result<Output, Failure> {
     ))
 }
 
+/// Bring up every shared environment `snapshot` uses and give each of its
+/// components that environment's `AETHYME_SHARED_*` variables.
+fn attach_shared(
+    lifecycle: &mut Lifecycle,
+    snapshot: &mut super::compile::CompiledEnvironment,
+    main_root: Option<&std::path::Path>,
+    host: &super::spec::HostEnvironmentsFile,
+    options: &Options,
+) -> Result<(), Failure> {
+    if snapshot.uses_shared.is_empty() {
+        return Ok(());
+    }
+    let main_root = main_root.ok_or_else(|| {
+        environment_failure("shared environments need the repository's main checkout".into())
+    })?;
+    let mut variables = Vec::new();
+    for name in snapshot.uses_shared.clone() {
+        let record = lifecycle
+            .shared_up(
+                main_root,
+                &snapshot.repository,
+                &name,
+                host,
+                Duration::from_secs(options.wait_seconds),
+            )
+            .map_err(lifecycle_failure)?;
+        variables.extend(super::shared::consumer_variables(
+            &lifecycle.root,
+            &name,
+            &record,
+        ));
+    }
+    for component in &mut snapshot.components {
+        for (key, value) in &variables {
+            component.env.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn run_shared(options: &Options) -> Result<Output, Failure> {
+    let usage = || Failure {
+        code: "usage",
+        message: "env shared needs up|redeploy|destroy <name>, or list".into(),
+        next_action: "run `aethyme env --help`".into(),
+        exit: exit_status::USAGE,
+    };
+    let action = options
+        .positional
+        .first()
+        .map(String::as_str)
+        .ok_or_else(usage)?;
+    let workspace = workspace(options)?;
+    let main_root = workspace
+        .repo
+        .main_root()
+        .map_err(|error| environment_failure(error.to_string()))?;
+    let repository = crate::gates::git_origin_fingerprint(&workspace.repo);
+    let (_, host) =
+        super::load_host_file().map_err(|error| environment_failure(error.to_string()))?;
+    let host = host.value.map_err(|d| environment_failure(d.render()))?;
+    let (mut lifecycle, warning) = open("env shared", action == "up" || action == "redeploy")?;
+    let wait = Duration::from_secs(options.wait_seconds);
+    let (value, text) = match (action, options.positional.get(1)) {
+        ("list", None) => {
+            let records: Vec<EnvironmentRecord> = lifecycle
+                .store
+                .list(Some(&repository))
+                .map_err(|error| environment_failure(error.to_string()))?
+                .into_iter()
+                .filter(|r| matches!(r.owner, super::compile::EnvironmentOwner::Ref { .. }))
+                .collect();
+            let mut text = String::new();
+            for record in &records {
+                text.push_str(&format!(
+                    "  {} {:?} {} at {}\n",
+                    record.env_id,
+                    record.owner,
+                    record.phase.as_str(),
+                    record.snapshot.source.commit.as_deref().unwrap_or("?")
+                ));
+            }
+            let shared: Vec<Value> = records
+                .iter()
+                .map(|r| {
+                    json!({
+                        "env_id": r.env_id,
+                        "owner": r.owner,
+                        "phase": r.phase,
+                        "deployed_commit": r.snapshot.source.commit,
+                    })
+                })
+                .collect();
+            (json!({ "shared": shared }), text)
+        }
+        ("up", Some(name)) => {
+            let record = lifecycle
+                .shared_up(&main_root, &repository, name, &host, wait)
+                .map_err(lifecycle_failure)?;
+            let (mut value, text) = describe(&lifecycle, &record);
+            value["deployed_commit"] = json!(record.snapshot.source.commit);
+            (value, text)
+        }
+        ("redeploy", Some(name)) => {
+            let outcome = lifecycle
+                .shared_redeploy(&main_root, &repository, name, &host, wait, options.force)
+                .map_err(lifecycle_failure)?;
+            let text = format!("{outcome:?}\n");
+            (json!({ "result": outcome }), text)
+        }
+        ("destroy", Some(name)) => {
+            let record = lifecycle
+                .shared_destroy(&main_root, &repository, name)
+                .map_err(lifecycle_failure)?;
+            describe(&lifecycle, &record)
+        }
+        _ => return Err(usage()),
+    };
+    let mut value = value;
+    value["schema"] = json!(super::cli::SHARED_SCHEMA);
+    if let Some(warning) = warning {
+        value["warning"] = json!(warning);
+    }
+    Ok((value, text, exit_status::SUCCESS))
+}
+
 pub(super) fn run_sweep(_: &Options) -> Result<Output, Failure> {
     let (mut lifecycle, _) = open("env sweep", false)?;
     lifecycle.renew_leases().map_err(lifecycle_failure)?;
@@ -651,6 +785,39 @@ pub(super) fn run_sweep(_: &Options) -> Result<Output, Failure> {
         text,
         exit_status::SUCCESS,
     ))
+}
+
+/// Redeploy shared environments whose ref moved, once per repository that
+/// has any.
+fn sync_shared_environments(lifecycle: &mut Lifecycle) {
+    let Ok(records) = lifecycle.store.list(None) else {
+        return;
+    };
+    let mut repositories: Vec<(String, std::path::PathBuf)> = records
+        .iter()
+        .filter(|r| matches!(r.owner, super::compile::EnvironmentOwner::Ref { .. }))
+        .filter_map(|r| {
+            r.main_root
+                .clone()
+                .map(|root| (r.repository.clone(), root.into()))
+        })
+        .collect();
+    repositories.sort();
+    repositories.dedup();
+    let host = super::load_host_file()
+        .ok()
+        .and_then(|(_, loaded)| loaded.value.ok())
+        .unwrap_or_default();
+    for (repository, main_root) in repositories {
+        match lifecycle.sync_shared(&main_root, &repository, &host) {
+            Ok(actions) => {
+                for action in actions {
+                    eprintln!("aethyme env supervisor: {action}");
+                }
+            }
+            Err(error) => crate::warn_unrecorded("sync shared environments", Err::<(), _>(error)),
+        }
+    }
 }
 
 /// Supervisor work for the lifecycle: renew leases, sweep orphans, and stay
@@ -718,6 +885,7 @@ impl super::supervisor::SupervisorWork for LifecycleWork {
                 "park idle environments",
                 lifecycle.park_idle(super::activity::now_ms()),
             );
+            sync_shared_environments(&mut lifecycle);
             // Live environments need renewal even when nothing is moving.
             let live = lifecycle
                 .store

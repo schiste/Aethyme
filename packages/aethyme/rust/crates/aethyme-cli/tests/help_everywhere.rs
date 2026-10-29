@@ -118,6 +118,7 @@ const COMMANDS: &[&str] = &[
     "env unpin",
     "env routes",
     "env infer",
+    "env shared",
     "certify",
     "init",
     "deploy",
