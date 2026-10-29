@@ -372,7 +372,7 @@ health = {{ command = 'test ! -f "$MARKERS/orphan-on-wake" || false', timeout_se
     );
     assert_eq!(
         quarantined.last_error.as_ref().unwrap()["rollback_errors"][0]["code"],
-        "unproven"
+        "identity_unproven"
     );
 
     let api = lifecycle
