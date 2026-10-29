@@ -7127,8 +7127,7 @@ impl Broker {
                     cleanup_grace_hours,
                 )?;
             }
-            session.origin == crate::SessionOrigin::Spawned
-                && cleanup_grace_hours.is_some()
+            session.origin == crate::SessionOrigin::Spawned && cleanup_grace_hours.is_some()
         };
         // The terminal row and owed cleanup request commit together. Waking
         // the global worker happens only after releasing the lifecycle claim;
