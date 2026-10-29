@@ -745,6 +745,18 @@ until an explicit fetch makes ancestry verification possible.
 - `aethyme broker advanced console plan [--allow-parallel] [--json]`
 - `aethyme broker advanced console run [--wait <duration>] [--allow-parallel] [--json] -- <command> ...`
 
+Successful `resources run --json` and `console run --json` reports include
+`phase_timings_ms`; the command-metrics row records the same map as each phase
+finishes, including partial timings when a later phase fails. Values are
+wall-clock milliseconds: `resource_acquisition` includes waiting for the
+resource lease, `environment_preparation` prepares child variables,
+`child_spawn` starts the main command, `child_execution` includes supervised
+execution and lease renewal, `cleanup_execution` covers a requested cleanup
+command when it runs, and `lease_finalization` releases or quarantines the
+lease. Missing phases were not reached or were skipped (for example, cleanup
+when none was requested). The command-level `duration_ms` remains the
+end-to-end CLI time; phase timings are components and need not sum to it.
+
 `gc reap --dry-run` opens the host registry read-only and projects dead-holder
 capacity reconciliation. Its JSON uses `aethyme.host-resource-reap-preview/v1`:
 `evaluated_at_ms`, `would_reclaim_capacity_units`, `candidates[]` (lease id,
