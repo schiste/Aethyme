@@ -71,6 +71,15 @@ fn archive_root(repo: &Path) -> PathBuf {
 /// Close a session holding one unlanded commit and, when `dirty`, an
 /// uncommitted edit; archive it through the reviewed resolve path.
 fn archived_session(repo: &Path, name: &str, dirty: bool) -> (i64, String, PathBuf) {
+    archived_session_with_mode(repo, name, dirty, false)
+}
+
+fn archived_session_with_mode(
+    repo: &Path,
+    name: &str,
+    dirty: bool,
+    retirement: bool,
+) -> (i64, String, PathBuf) {
     let session = {
         let mut broker = common::open_fixture_repository_path_broker(repo).unwrap();
         let session = broker.start_worktree(name, None).unwrap();
@@ -85,24 +94,14 @@ fn archived_session(repo: &Path, name: &str, dirty: bool) -> (i64, String, PathB
         session
     };
     let id = session.id.to_string();
-    let reviewed = json(&run(
-        repo,
-        &["finish", "cleanup", "resolve", &id, "--archive", "--json"],
-    ));
+    let mut args = vec!["finish", "cleanup", "resolve", &id, "--archive", "--json"];
+    if retirement {
+        args.push("--retire");
+    }
+    let reviewed = json(&run(repo, &args));
     let digest = reviewed["digest"].as_str().unwrap().to_owned();
-    let outcome = json(&run(
-        repo,
-        &[
-            "finish",
-            "cleanup",
-            "resolve",
-            &id,
-            "--archive",
-            "--confirm",
-            &digest,
-            "--json",
-        ],
-    ));
+    args.extend(["--confirm", &digest]);
+    let outcome = json(&run(repo, &args));
     let head = reviewed["head"].as_str().unwrap().to_owned();
     (
         session.id,
@@ -330,4 +329,52 @@ fn a_digest_reviewed_before_another_archive_expired_is_refused() {
     );
     assert!(!output.status.success(), "a stale digest must be refused");
     assert!(first.exists() && second.exists(), "nothing was removed");
+}
+
+#[test]
+fn retirement_archive_floor_survives_landing_and_a_shorter_current_policy() {
+    for dirty in [false, true] {
+        let tmp = repo();
+        let (_, head, archive) = archived_session_with_mode(tmp.path(), "retirement", dirty, true);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(archive.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["schema_version"], 5);
+        assert!(manifest["minimum_archive_retention_ms"].as_u64().unwrap() >= 15 * DAY_MS as u64);
+        if !dirty {
+            git(tmp.path(), &["merge", "-q", "--ff-only", &head]);
+        }
+        std::fs::write(
+            tmp.path().join(".aethyme/broker.toml"),
+            "[retention]\nrecovery_archive_days = 1\n",
+        )
+        .unwrap();
+        age(&archive, 2);
+        let protected = plan(tmp.path());
+        assert!(proposed(&protected).is_empty(), "{protected}");
+        assert!(
+            unowned(&protected).is_empty(),
+            "a valid protected archive remains owned: {protected}"
+        );
+        assert!(archive.exists());
+
+        age(&archive, 14);
+        let expired = plan(tmp.path());
+        let candidates = proposed(&expired);
+        assert_eq!(candidates.len(), 1, "{expired}");
+        assert_eq!(candidates[0]["landed"], !dirty);
+        let digest = expired["digest"].as_str().unwrap();
+        let applied = json(&run(
+            tmp.path(),
+            &["gc", "apply", "--confirm", digest, "--full-scan", "--json"],
+        ));
+        assert_eq!(
+            applied["recovery_archives_removed"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "{applied}"
+        );
+        assert!(!archive.exists());
+    }
 }

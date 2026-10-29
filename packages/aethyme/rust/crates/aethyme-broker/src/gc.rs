@@ -1251,6 +1251,52 @@ fn declined_reason(path: &Path, extras: &[String]) -> &'static str {
     }
 }
 
+fn recovery_archive_minimum_age_elapsed(
+    archive: &crate::cleanup_resolve::OwnedRecoveryArchive,
+    now: i64,
+) -> bool {
+    let Some(minimum_age_ms) = archive.minimum_archive_retention_ms else {
+        return true;
+    };
+    now.checked_sub(archive.created_at_ms)
+        .and_then(|age| u64::try_from(age).ok())
+        .is_some_and(|age| age >= minimum_age_ms)
+}
+
+#[cfg(test)]
+mod recovery_archive_minimum_age_tests {
+    use super::recovery_archive_minimum_age_elapsed;
+    use crate::cleanup_resolve::OwnedRecoveryArchive;
+
+    #[test]
+    fn immutable_age_uses_exact_boundary_and_fails_closed_on_clock_overflow() {
+        let mut archive = OwnedRecoveryArchive {
+            path: "/fixture/archive".into(),
+            session_id: 1,
+            head: "a".repeat(40),
+            created_at_ms: 100,
+            minimum_archive_retention_ms: Some(1_296_000_000),
+            holds_uncommitted: false,
+        };
+        assert!(!recovery_archive_minimum_age_elapsed(&archive, 99));
+        assert!(!recovery_archive_minimum_age_elapsed(
+            &archive,
+            1_296_000_099
+        ));
+        assert!(recovery_archive_minimum_age_elapsed(
+            &archive,
+            1_296_000_100
+        ));
+        archive.created_at_ms = i64::MIN;
+        assert!(!recovery_archive_minimum_age_elapsed(&archive, i64::MAX));
+        archive.created_at_ms = 0;
+        archive.minimum_archive_retention_ms = Some(u64::MAX);
+        assert!(!recovery_archive_minimum_age_elapsed(&archive, i64::MAX));
+        archive.minimum_archive_retention_ms = None;
+        assert!(recovery_archive_minimum_age_elapsed(&archive, 0));
+    }
+}
+
 /// Whether `archive` is a removal candidate now, and why: `(landed, reason)`.
 /// Shared by planning and apply so the rule is re-proved, not remembered.
 fn recovery_archive_disposition(
@@ -1259,7 +1305,9 @@ fn recovery_archive_disposition(
     policy: &RetentionPolicy,
     now: i64,
 ) -> Option<(bool, String)> {
-    if policy.recovery_archive_days == 0 {
+    // The archive carries this promise independently of current policy or
+    // landing. The same helper guards both planning and journal replay.
+    if !recovery_archive_minimum_age_elapsed(archive, now) || policy.recovery_archive_days == 0 {
         return None;
     }
     if broker.recovery_archive_landed(archive) {
@@ -8248,8 +8296,9 @@ impl Broker {
                 if archive.session_id != candidate.session_id || archive.head != candidate.head {
                     return Err("names a different session or head than the reviewed plan".into());
                 }
-                recovery_archive_disposition(self, &archive, &journal.policy, now_ms())
-                    .ok_or_else(|| "is no longer old enough and has not landed".to_string())
+                recovery_archive_disposition(self, &archive, &journal.policy, now_ms()).ok_or_else(
+                    || "no longer meets recovery retention or landing requirements".to_string(),
+                )
             });
             if let Err(reason) = evidence {
                 failures.push(format!(
