@@ -170,16 +170,15 @@ pub fn requests(
 
     let mut resolutions = outcome_resolutions.clone();
     let mut held_by_request = HashMap::<i64, bool>::new();
+    let mut release_resolutions = HashMap::<i64, RequestResolution>::new();
     let mut release_scan_after = HashMap::<i64, i64>::new();
     let mut release_scan_before = HashMap::<i64, Option<i64>>::new();
     let mut closure_scan_after = HashMap::<i64, i64>::new();
     for request in &requests {
-        if !outcome_resolutions.contains_key(&request.request_id) {
-            held_by_request.insert(
-                request.request_id,
-                holds(request.holder_session_id, &request.path),
-            );
-        }
+        held_by_request.insert(
+            request.request_id,
+            holds(request.holder_session_id, &request.path),
+        );
         let outcome_event_id = outcome_resolutions
             .get(&request.request_id)
             .map(|outcome| outcome.event_id);
@@ -241,23 +240,41 @@ pub fn requests(
                 if paired_outcome {
                     continue;
                 }
-                record_resolution(
-                    &mut resolutions,
-                    request.request_id,
-                    RequestResolution {
-                        event_id: event.id,
-                        resolved_at: event.ts,
-                        state: RequestState::Released,
-                        reason: Some(
-                            released
-                                .reason
-                                .clone()
-                                .unwrap_or_else(|| "lease_released".to_string()),
-                        ),
-                    },
-                );
+                // A request can cover several leases. Keep the final
+                // overlapping release as its resolution only when the
+                // holder no longer has any active lease for the requested
+                // path; an earlier partial release must leave it pending.
+                if held_by_request.get(&request.request_id) != Some(&false) {
+                    continue;
+                }
+                let candidate = RequestResolution {
+                    event_id: event.id,
+                    resolved_at: event.ts,
+                    state: RequestState::Released,
+                    reason: Some(
+                        released
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "lease_released".to_string()),
+                    ),
+                };
+                match release_resolutions.entry(request.request_id) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(candidate);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry)
+                        if candidate.event_id > entry.get().event_id =>
+                    {
+                        entry.insert(candidate);
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {}
+                }
             }
         }
+    }
+
+    for (request_id, resolution) in release_resolutions {
+        record_resolution(&mut resolutions, request_id, resolution);
     }
 
     for (requester_session_id, first_request_id) in closure_scan_after {
