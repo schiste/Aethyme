@@ -850,7 +850,7 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker advanced representation record --session <id> --confirm <sha256> [--json]`
 - `aethyme broker finish cleanup <session-id> [--force] [--json]`
 - `aethyme broker finish cleanup --all-cleaned [--apply --confirm <sha256>] [--json]`
-- `aethyme broker finish cleanup resolve <session-id> --archive [--confirm <sha256>] [--json]`
+- `aethyme broker finish cleanup resolve <session-id>... --archive [--batch] [--retire] [--allow-adopted] [--confirm <sha256>] [--json]`
 - `aethyme broker finish cleanup audit [--repo <path>] [--detail] [--json]`
 - `aethyme broker advanced main reconcile plan [--detail] [--resolution-file <path>] [--write-resolution-template <path>] [--json]`
 - `aethyme broker advanced main reconcile apply --session <id> --confirm <sha256> [--resolution-file <path>] [--json]`

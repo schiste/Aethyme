@@ -5196,15 +5196,19 @@ mod tests {
         let (_owner, repository, _storage, broker, session, worktree, base, head, branch_ref) =
             closed_unique_commit_fixture("recovery archive mismatched branch tip");
         git(&worktree, &["checkout", "--detach", &base]);
-        let error = broker
-            .cleanup_resolve_plan(session.id)
-            .unwrap_err()
-            .to_string();
-
+        let error = broker.cleanup_resolve_plan(session.id).unwrap_err();
+        let BrokerOpError::CleanupResolveRefused { id, reason } = error else {
+            panic!("expected identity refusal, got {error:?}");
+        };
+        assert_eq!(id, session.id);
         assert!(
-            error.contains("session branch tip")
-                && error.contains("differs from the worktree HEAD"),
-            "{error}"
+            reason.contains("registered session branch")
+                && reason.contains("differs from the current worktree branch/HEAD")
+                && reason.contains(&branch_ref)
+                && reason.contains(&head)
+                && reason.contains(&base)
+                && reason.contains("(detached)"),
+            "{reason}"
         );
         assert!(worktree.is_dir());
         assert_eq!(

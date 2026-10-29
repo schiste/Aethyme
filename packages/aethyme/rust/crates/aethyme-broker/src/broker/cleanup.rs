@@ -5525,10 +5525,15 @@ mod registered_removal_failure_tests {
         broker.close(session.id).unwrap();
 
         let closed = broker.store().session(session.id).unwrap();
-        assert_eq!(closed.status, SessionStatus::Cleaned);
+        assert_eq!(closed.status, SessionStatus::Closed);
         assert_eq!(closed.cleanup_state, SessionCleanupState::Closed);
+        assert!(worktree.is_dir());
 
         broker.cleanup(session.id, false).unwrap();
+        let cleaned = broker.store().session(session.id).unwrap();
+        assert_eq!(cleaned.status, SessionStatus::Cleaned);
+        assert_eq!(cleaned.cleanup_state, SessionCleanupState::Cleaned);
+        assert!(!worktree.exists());
         broker.cleanup(session.id, false).unwrap();
         std::fs::create_dir_all(&worktree).unwrap();
         let replacement = worktree.join("new-owner-data.txt");

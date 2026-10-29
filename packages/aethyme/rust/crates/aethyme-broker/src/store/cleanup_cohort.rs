@@ -2163,7 +2163,7 @@ mod tests {
         store
             .conn
             .execute(
-                "UPDATE sessions SET status = 'closed', cleanup_state = 'closed', closed_at = 3000
+                "UPDATE sessions SET status = 'cleaned', cleanup_state = 'closed', closed_at = 3000
                  WHERE id = ?1",
                 [kept_id],
             )
