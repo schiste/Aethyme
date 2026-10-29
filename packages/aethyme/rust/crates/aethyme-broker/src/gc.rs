@@ -10095,19 +10095,19 @@ mod tests {
         let storage = crate::test_storage::TestStorage::new();
         let mut broker = storage.open(root).unwrap();
         let connection = rusqlite::Connection::open(broker.store().db_path()).unwrap();
-        let last_activity_at = now_ms();
-        for index in 0..129 {
-            let worktree = root.join(format!("active-checkout-{index}"));
+        let closed_at = now_ms();
+        for index in 0..289 {
+            let worktree = root.join(format!("retained-checkout-{index}"));
             std::fs::create_dir_all(&worktree).unwrap();
             connection
                 .execute(
                     "INSERT INTO sessions (worktree_path, branch, origin, status,
-                     cleanup_state, created_at, updated_at, last_activity_at)
-                 VALUES (?1, ?2, 'spawned', 'active', 'open', ?3, ?3, ?3)",
+                     cleanup_state, closed_at, created_at, updated_at, last_activity_at)
+                 VALUES (?1, ?2, 'adopted', 'cleaned', 'closed', ?3, ?3, ?3, ?3)",
                     rusqlite::params![
                         worktree.to_string_lossy(),
                         format!("agent/history-{index}"),
-                        last_activity_at,
+                        closed_at,
                     ],
                 )
                 .unwrap();
@@ -10124,7 +10124,7 @@ mod tests {
         broker
             .run_auto_checkout_cleanup_recovery_worker_loop(
                 1,
-                Some(64),
+                Some(AUTO_CHECKOUT_CLEANUP_WORKER_MAX_PASSES),
                 Some(Duration::from_secs(60)),
                 |broker, generation, remaining| {
                     passes += 1;
@@ -10146,7 +10146,33 @@ mod tests {
             passes > ARTIFACT_SWEEP_WORKER_NO_PROGRESS_PASSES,
             "discovery must continue beyond the old zero-removal backoff threshold"
         );
+        assert!(
+            passes > 8,
+            "worker must continue past the former eight-pass worker limit"
+        );
         assert_eq!(removed, 0, "the fixture must exercise discovery only");
+        let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
+        let group_count = broker
+            .store()
+            .cleanup_cohort_group_count(namespace, 0, i64::MAX)
+            .unwrap();
+        assert_eq!(group_count, 289, "the fixture must produce 289 groups");
+        let group_cursor = broker
+            .store()
+            .meta_get("auto_cleanup.cursor")
+            .unwrap()
+            .expect("the production planner must persist its group cursor");
+        let group_cursor: serde_json::Value = serde_json::from_str(&group_cursor).unwrap();
+        let group_cursor_after = group_cursor["after_session_id"].as_i64().unwrap();
+        let group_cursor_high_water = group_cursor["high_water_session_id"].as_i64().unwrap();
+        assert!(
+            group_cursor_high_water > 256,
+            "the group page limit is 32, so this must cover more than eight pages"
+        );
+        assert_eq!(
+            group_cursor_after, group_cursor_high_water,
+            "the group cursor must reach the last of more than eight planner pages"
+        );
         assert_eq!(
             broker
                 .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY)
@@ -10157,7 +10183,7 @@ mod tests {
         );
         let state = broker
             .store()
-            .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)
+            .cleanup_cohort_scan_state(namespace)
             .unwrap()
             .unwrap();
         assert!(state.complete, "all history rows must be discovered");
