@@ -6475,6 +6475,88 @@ mod tests {
     }
 
     #[test]
+    fn retirement_partial_preserves_checkout_when_source_content_changes() {
+        let (_owner, _repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("retirement partial source change");
+        let reviewed_plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        let interrupted = broker
+            .cleanup_resolve_apply_with_bundle_writer_mode(
+                session.id,
+                &reviewed_plan.digest,
+                || panic!("interrupted staging must fail before archive verification"),
+                sync_archive_directory,
+                |_, _| {
+                    Some(crate::disk_headroom::DiskHeadroom {
+                        bytes: u64::MAX,
+                        inodes: None,
+                    })
+                },
+                true,
+                false,
+                None,
+                None,
+                None,
+                RecoveryBundleWriter {
+                    max_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+                    write_to: interrupt_retirement_bundle_write,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            interrupted.contains("simulated interrupted retirement bundle write"),
+            "{interrupted}"
+        );
+
+        let partial = reviewed_plan
+            .archive_root
+            .join(format!("{}.retirement-v6.partial", session.id));
+        let receipt_before = std::fs::read(partial.join(RETIREMENT_ARCHIVE_RECORD_FILE)).unwrap();
+        let bundle_before = std::fs::read(partial.join(BUNDLE_FILE)).unwrap();
+        assert_eq!(bundle_before, b"interrupted bundle staging");
+        std::fs::write(worktree.join("preserve.txt"), "changed after review\n").unwrap();
+
+        let stale = broker
+            .cleanup_resolve_retirement_apply(session.id, &reviewed_plan.digest, false)
+            .unwrap_err();
+        assert!(
+            matches!(
+                &stale,
+                BrokerOpError::CleanupResolveConfirmationMismatch { .. }
+            ),
+            "the old confirmation must be refused before touching staging: {stale}"
+        );
+        let changed_plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        assert_ne!(reviewed_plan.digest, changed_plan.digest);
+        let restart = broker
+            .cleanup_resolve_retirement_apply(session.id, &changed_plan.digest, false)
+            .unwrap_err();
+        assert!(
+            matches!(&restart, BrokerOpError::RecoveryArchiveUnverified { .. }),
+            "a new confirmation must not replace staging for changed source content: {restart}"
+        );
+
+        assert!(worktree.is_dir());
+        assert_eq!(
+            std::fs::read(worktree.join("preserve.txt")).unwrap(),
+            b"changed after review\n"
+        );
+        assert!(partial.is_dir());
+        assert_eq!(
+            std::fs::read(partial.join(RETIREMENT_ARCHIVE_RECORD_FILE)).unwrap(),
+            receipt_before
+        );
+        assert_eq!(
+            std::fs::read(partial.join(BUNDLE_FILE)).unwrap(),
+            bundle_before
+        );
+    }
+
+    #[test]
     fn retirement_confirmation_survives_forward_delivery_move_before_apply() {
         let (_owner, repository, _storage, mut broker, session, worktree, _base, _head, _branch) =
             closed_unique_commit_fixture("retirement forward delivery before apply");
