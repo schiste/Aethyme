@@ -1972,6 +1972,8 @@ CREATE TABLE IF NOT EXISTS cleanup_cohort_scans (
     namespace TEXT PRIMARY KEY,
     revision INTEGER NOT NULL,
     generation INTEGER NOT NULL,
+    alias_refresh_generation INTEGER NOT NULL DEFAULT 0,
+    progress_sequence INTEGER NOT NULL DEFAULT 0,
     high_water_session_id INTEGER NOT NULL,
     after_session_id INTEGER NOT NULL,
     complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
@@ -1989,6 +1991,9 @@ CREATE TABLE IF NOT EXISTS cleanup_cohort_scan_rows (
 );
 CREATE INDEX IF NOT EXISTS cleanup_cohort_scan_rows_path
     ON cleanup_cohort_scan_rows(namespace, canonical_path, cleanup_state, session_id);
+CREATE INDEX IF NOT EXISTS cleanup_cohort_scan_rows_unresolved
+    ON cleanup_cohort_scan_rows(namespace)
+    WHERE resolution_error IS NOT NULL;
 CREATE TABLE IF NOT EXISTS cleanup_cohort_scan_path_ancestors (
     namespace TEXT NOT NULL REFERENCES cleanup_cohort_scans(namespace) ON DELETE CASCADE,
     ancestor_path TEXT NOT NULL,
@@ -2184,6 +2189,33 @@ const TRIGGER_MIGRATIONS: &[(i64, &str, &[&str])] = &[(
     ],
 )];
 
+const INDEX_REPAIRS: &[(i64, &str, &[&str])] = &[(
+    59,
+    "CREATE INDEX IF NOT EXISTS cleanup_cohort_scan_rows_unresolved
+     ON cleanup_cohort_scan_rows(namespace)
+     WHERE resolution_error IS NOT NULL;",
+    &["cleanup_cohort_scan_rows_unresolved"],
+)];
+
+// v59 was published before alias refresh checkpoints gained their own
+// generation and progress sequence. CREATE TABLE IF NOT EXISTS cannot add
+// these columns to an already-v59 database, so repair the additive fields
+// without changing the schema protocol floor.
+const COLUMN_REPAIRS: &[(i64, &str, &str, &str)] = &[
+    (
+        59,
+        "cleanup_cohort_scans",
+        "alias_refresh_generation",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        59,
+        "cleanup_cohort_scans",
+        "progress_sequence",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+];
+
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, BrokerError> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
@@ -2206,6 +2238,15 @@ fn trigger_exists(conn: &Connection, trigger: &str) -> Result<bool, BrokerError>
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
         [trigger],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn index_exists(conn: &Connection, index: &str) -> Result<bool, BrokerError> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+        [index],
         |row| row.get(0),
     )?;
     Ok(count > 0)
@@ -2254,6 +2295,15 @@ fn missing_recorded_objects(conn: &Connection, version: i64) -> Result<bool, Bro
             }
         }
     }
+    for (v, _, indexes) in INDEX_REPAIRS {
+        if version >= *v {
+            for index in *indexes {
+                if !index_exists(conn, index)? {
+                    return Ok(true);
+                }
+            }
+        }
+    }
     for (v, columns) in COLUMN_ONLY_MIGRATIONS {
         if version >= *v {
             for (table, column) in *columns {
@@ -2261,6 +2311,11 @@ fn missing_recorded_objects(conn: &Connection, version: i64) -> Result<bool, Bro
                     return Ok(true);
                 }
             }
+        }
+    }
+    for (v, table, column, _) in COLUMN_REPAIRS {
+        if version >= *v && !column_exists(conn, table, column)? {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -2286,6 +2341,11 @@ fn repair_recorded_migrations(conn: &Connection) -> Result<(), BrokerError> {
                 conn.execute_batch(sql)?;
             }
         }
+        for (v, sql, _) in INDEX_REPAIRS {
+            if version >= *v {
+                conn.execute_batch(sql)?;
+            }
+        }
         for (v, columns) in COLUMN_ONLY_MIGRATIONS {
             if version >= *v {
                 for (table, column) in *columns {
@@ -2295,6 +2355,13 @@ fn repair_recorded_migrations(conn: &Connection) -> Result<(), BrokerError> {
                         ))?;
                     }
                 }
+            }
+        }
+        for (v, table, column, definition) in COLUMN_REPAIRS {
+            if version >= *v && !column_exists(conn, table, column)? {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                ))?;
             }
         }
         Ok(())
@@ -2951,7 +3018,7 @@ mod tests {
 
         migrate(&conn).unwrap();
 
-        assert_eq!(current_version(&conn).unwrap(), 58);
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 58);
         assert_eq!(
             conn.query_row(
@@ -2962,8 +3029,8 @@ mod tests {
             .unwrap(),
             "58"
         );
-        assert!(schema_is_compatible_with(&conn, 58, 58).unwrap());
-        assert!(!schema_is_compatible_with(&conn, 58, 57).unwrap());
+        assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 58).unwrap());
+        assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 57).unwrap());
         assert_eq!(MIGRATIONS[57], MIGRATION_V58);
     }
 
@@ -5085,6 +5152,77 @@ mod tests {
         migrate(&conn).unwrap();
 
         assert!(repository_watch_tables_present(&conn));
+    }
+
+    #[test]
+    fn a_current_database_missing_the_unresolved_cohort_index_is_repaired_on_open() {
+        let conn = migrated();
+        conn.execute_batch("DROP INDEX cleanup_cohort_scan_rows_unresolved")
+            .unwrap();
+        assert!(!index_exists(&conn, "cleanup_cohort_scan_rows_unresolved").unwrap());
+
+        migrate(&conn).unwrap();
+
+        assert!(index_exists(&conn, "cleanup_cohort_scan_rows_unresolved").unwrap());
+    }
+
+    #[test]
+    fn a_v59_database_missing_alias_checkpoint_columns_is_repaired_on_open() {
+        let conn = migrated();
+        conn.execute(
+            "INSERT INTO cleanup_cohort_scans (
+                 namespace, revision, generation, high_water_session_id,
+                 after_session_id, complete, progress_at_ms
+             ) VALUES ('legacy-v59', 7, 3, 19, 11, 0, 1234)",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "ALTER TABLE cleanup_cohort_scans DROP COLUMN alias_refresh_generation;
+             ALTER TABLE cleanup_cohort_scans DROP COLUMN progress_sequence;",
+        )
+        .unwrap();
+        assert!(!column_exists(&conn, "cleanup_cohort_scans", "alias_refresh_generation").unwrap());
+        assert!(!column_exists(&conn, "cleanup_cohort_scans", "progress_sequence").unwrap());
+
+        migrate(&conn).unwrap();
+
+        let (revision, generation, alias_generation, progress_sequence, after, progress): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT revision, generation, alias_refresh_generation,
+                        progress_sequence, after_session_id, progress_at_ms
+                 FROM cleanup_cohort_scans WHERE namespace = 'legacy-v59'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                revision,
+                generation,
+                alias_generation,
+                progress_sequence,
+                after,
+                progress
+            ),
+            (7, 3, 0, 0, 11, 1234)
+        );
     }
 
     #[test]
