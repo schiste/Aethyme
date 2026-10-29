@@ -1625,7 +1625,9 @@ impl BrokerStore {
         paths: &[String],
     ) -> Result<(), BrokerError> {
         let now = now_ms();
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         record_lease_releases_in_tx(
             &tx,
             session_id,
@@ -1697,7 +1699,9 @@ impl BrokerStore {
         reason: &str,
     ) -> Result<Vec<i64>, BrokerError> {
         let now = now_ms();
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let ids =
             record_lease_releases_in_tx(&tx, session_id, Some(path), None, now, reason, true)?;
         tx.execute(
@@ -1713,7 +1717,9 @@ impl BrokerStore {
     /// This path-wide helper is retained for internal lifecycle operations.
     pub fn release_lease(&mut self, session_id: i64, path: &str) -> Result<(), BrokerError> {
         let now = now_ms();
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         record_lease_releases_in_tx(
             &tx,
             session_id,
