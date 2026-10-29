@@ -46,6 +46,7 @@ const RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION: u32 = 1;
 const RETIREMENT_ARCHIVE_RECORD_FILE: &str = "retirement.json";
 const MAX_RETIREMENT_ARCHIVE_RECORD_BYTES: u64 = 64 * 1024;
 const MIN_RECOVERY_ARCHIVE_RETENTION_MS: u64 = 15 * 24 * 60 * 60 * 1_000;
+const AUTO_COMPACTION_STAGING_RESERVE: Duration = Duration::from_secs(10);
 const MAX_RECOVERY_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_RECOVERY_BUNDLE_STDERR_BYTES: usize = 64 * 1024;
 const MAX_RECOVERY_BUNDLE_METADATA_OUTPUT_BYTES: usize = 64 * 1024;
@@ -101,18 +102,19 @@ pub struct ArchivedFile {
 }
 
 /// What a confirmed resolve would preserve, and the digest that authorizes it.
-#[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct CleanupResolveRetirementContext {
     delivery_targets: Vec<String>,
     live_checkouts: Vec<(i64, crate::auto_cleanup::ResolvedWorktreePath)>,
     deadline: Option<Instant>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CleanupResolvePlan {
     pub schema_version: u32,
-    /// Binds repository, branch, checkout and preserved content. Delivery
-    /// targets and landing evidence are snapshots in the archive manifest,
-    /// not part of the stable content confirmation. Replan on upgrade.
+    /// Binds repository, branch, checkout and preserved content. Ordinary
+    /// schema-4 confirmations leave delivery snapshots outside this stable
+    /// content digest; retirement confirmations additionally bind the exact
+    /// delivery-target vector and root-availability proof. Replan on upgrade.
     pub digest: String,
     pub session_id: i64,
     /// Current recorded origin of this exact cleanup target. Batch retirement
@@ -318,6 +320,7 @@ struct RetirementArchiveRecord {
     target_origin: String,
     allow_adopted: bool,
     minimum_archive_retention_ms: u64,
+    archive_created_at_ms: i64,
     owner_witness_sha256: Option<String>,
     delivery_targets_sha256: String,
     worktree_path: String,
@@ -366,6 +369,8 @@ struct RecoveryManifest<'a> {
     checkout_branch_tip: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recovery_root_proofs_sha256: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_root_proofs: Option<&'a [RecoveryRootProof]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     delivery_targets_sha256: Option<&'a str>,
     disposition: &'a str,
@@ -504,6 +509,47 @@ fn legacy_v4_cleanup_resolve_digest(
 
 /// The portable mode field is intentionally absent where Unix mode bits are
 /// unavailable. Never guess a mode on another platform.
+fn check_archive_deadline(deadline: Option<Instant>, label: &str) -> Result<(), String> {
+    if effective_archive_deadline(deadline).is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(format!("{label} exceeded its bounded background deadline"));
+    }
+    Ok(())
+}
+
+fn check_archive_deadline_io(deadline: Option<Instant>) -> std::io::Result<()> {
+    if effective_archive_deadline(deadline).is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "bounded archive operation deadline expired",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_auto_retirement_staging_reserve(
+    deadline: Option<Instant>,
+    session_id: i64,
+) -> Result<(), BrokerOpError> {
+    if deadline.is_some_and(|deadline| {
+        deadline.saturating_duration_since(Instant::now()) < AUTO_COMPACTION_STAGING_RESERVE
+    }) {
+        return Err(BrokerOpError::CleanupResolveRefused {
+            id: session_id,
+            reason: "automatic retirement reached its bounded staging reserve; retry in a later background pass".into(),
+        });
+    }
+    Ok(())
+}
+
+fn effective_archive_deadline(deadline: Option<Instant>) -> Option<Instant> {
+    match (deadline, crate::git::active_git_deadline()) {
+        (Some(explicit), Some(active)) => Some(explicit.min(active)),
+        (Some(explicit), None) => Some(explicit),
+        (None, Some(active)) => Some(active),
+        (None, None) => None,
+    }
+}
+
 fn permission_mode(metadata: &std::fs::Metadata) -> Option<u32> {
     #[cfg(unix)]
     {
@@ -563,6 +609,14 @@ fn read_regular_file_no_follow(path: &Path, max_bytes: u64) -> std::io::Result<V
 }
 
 fn hash_regular_file_no_follow(path: &Path, max_bytes: u64) -> std::io::Result<(u64, String)> {
+    hash_regular_file_no_follow_until(path, max_bytes, None)
+}
+
+fn hash_regular_file_no_follow_until(
+    path: &Path,
+    max_bytes: u64,
+    deadline: Option<Instant>,
+) -> std::io::Result<(u64, String)> {
     let (mut file, metadata) = open_regular_file_no_follow(path)?;
     if metadata.len() > max_bytes {
         return Err(std::io::Error::new(
@@ -575,6 +629,7 @@ fn hash_regular_file_no_follow(path: &Path, max_bytes: u64) -> std::io::Result<(
     let mut bytes = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        check_archive_deadline_io(deadline)?;
         let count = file.read(&mut buffer)?;
         if count == 0 {
             break;
@@ -590,6 +645,7 @@ fn hash_regular_file_no_follow(path: &Path, max_bytes: u64) -> std::io::Result<(
         }
         hasher.update(&buffer[..count]);
     }
+    check_archive_deadline_io(deadline)?;
     if bytes != expected_len || file.metadata()?.len() != expected_len {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -616,9 +672,20 @@ fn now_ms() -> i64 {
 
 /// Hash what an untracked path is, without following a link.
 fn describe_untracked(full: &Path, relative: &str) -> std::io::Result<Option<ArchivedFile>> {
+    describe_untracked_until(full, relative, None)
+}
+
+fn describe_untracked_until(
+    full: &Path,
+    relative: &str,
+    deadline: Option<Instant>,
+) -> std::io::Result<Option<ArchivedFile>> {
+    check_archive_deadline_io(deadline)?;
     let metadata = std::fs::symlink_metadata(full)?;
     if metadata.file_type().is_symlink() {
+        check_archive_deadline_io(deadline)?;
         let target = std::fs::read_link(full)?;
+        check_archive_deadline_io(deadline)?;
         let mut hashed = b"symlink\0".to_vec();
         hashed.extend_from_slice(target.as_os_str().as_encoded_bytes());
         return Ok(Some(ArchivedFile {
@@ -638,6 +705,7 @@ fn describe_untracked(full: &Path, relative: &str) -> std::io::Result<Option<Arc
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut bytes = 0_u64;
     loop {
+        check_archive_deadline_io(deadline)?;
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -650,6 +718,7 @@ fn describe_untracked(full: &Path, relative: &str) -> std::io::Result<Option<Arc
         })?;
         hasher.update(&buffer[..read]);
     }
+    check_archive_deadline_io(deadline)?;
     let final_metadata = file.metadata()?;
     if final_metadata.len() != bytes || permission_mode(&final_metadata) != mode {
         return Err(std::io::Error::new(
@@ -671,6 +740,7 @@ fn ignored_inventory(
     worktree: &Path,
     policy: &crate::AutoCleanupPolicy,
     session_id: i64,
+    deadline: Option<Instant>,
 ) -> Result<(Vec<IgnoredPath>, Vec<ArchivedFile>), BrokerOpError> {
     let refuse = |reason: String| BrokerOpError::CleanupResolveRefused {
         id: session_id,
@@ -678,7 +748,9 @@ fn ignored_inventory(
     };
     let mut roots = Vec::new();
     let mut files = Vec::new();
+    check_archive_deadline(deadline, "ignored-path inventory").map_err(refuse)?;
     for relative in checkout.ignored_paths_readonly()? {
+        check_archive_deadline(deadline, "ignored-path inventory").map_err(refuse)?;
         let trimmed = relative.trim_end_matches('/');
         if !is_contained_relative(trimmed) {
             return Err(refuse(format!(
@@ -719,8 +791,8 @@ fn ignored_inventory(
                 }
             }
             crate::auto_cleanup::RecoveryIgnoredClassification::Preserve(_) => {
-                let Some(file) =
-                    describe_untracked(&full, &relative).map_err(|error| io_error(&full, error))?
+                let Some(file) = describe_untracked_until(&full, &relative, deadline)
+                    .map_err(|error| io_error(&full, error))?
                 else {
                     return Err(refuse(format!(
                         "ignored path {relative} is neither a regular file nor a symbolic link"
@@ -747,7 +819,7 @@ fn ignored_inventory(
         .filter(|root| root.classification == IgnoredPathClassification::DisposableDirectory)
         .map(|root| root.path.trim_end_matches('/').to_owned())
         .collect::<std::collections::BTreeSet<_>>();
-    reject_unarchivable_special_nodes(worktree, &opaque_directories).map_err(refuse)?;
+    reject_unarchivable_special_nodes(worktree, &opaque_directories, deadline).map_err(refuse)?;
     Ok((roots, files))
 }
 
@@ -758,6 +830,7 @@ fn ignored_inventory(
 fn reject_unarchivable_special_nodes(
     worktree: &Path,
     opaque_directories: &std::collections::BTreeSet<String>,
+    deadline: Option<Instant>,
 ) -> Result<(), String> {
     let root_metadata = std::fs::symlink_metadata(worktree)
         .map_err(|error| format!("cannot inspect worktree root: {error}"))?;
@@ -768,6 +841,7 @@ fn reject_unarchivable_special_nodes(
     let mut pending = vec![(PathBuf::new(), String::new(), 0_usize)];
     let mut visited = 0_usize;
     while let Some((relative_dir, relative_dir_string, depth)) = pending.pop() {
+        check_archive_deadline(deadline, "worktree special-file scan")?;
         if depth > MAX_WORKTREE_SPECIAL_SCAN_DEPTH {
             return Err(format!(
                 "worktree directory depth exceeds the special-file scan bound of {MAX_WORKTREE_SPECIAL_SCAN_DEPTH}"
@@ -785,6 +859,7 @@ fn reject_unarchivable_special_nodes(
         let entries = std::fs::read_dir(&directory)
             .map_err(|error| format!("cannot read {}: {error}", directory.display()))?;
         for entry in entries {
+            check_archive_deadline(deadline, "worktree special-file scan")?;
             let entry = entry.map_err(|error| {
                 format!(
                     "cannot read worktree entry under {}: {error}",
@@ -917,6 +992,7 @@ impl Broker {
         allow_adopted: bool,
         context: &CleanupResolveRetirementContext,
     ) -> Result<CleanupResolvePlan, BrokerOpError> {
+        let _git_deadline = context.deadline.map(crate::git::limit_git_until);
         self.cleanup_resolve_plan_with_limits_and_eligibility(
             session_id,
             crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
@@ -927,6 +1003,27 @@ impl Broker {
             allow_adopted,
             true,
             None,
+            Some(context),
+        )
+    }
+
+    pub(crate) fn cleanup_resolve_retirement_plan_with_witness_and_context(
+        &self,
+        session_id: i64,
+        witness_sha256: &str,
+        context: &CleanupResolveRetirementContext,
+    ) -> Result<CleanupResolvePlan, BrokerOpError> {
+        let _git_deadline = context.deadline.map(crate::git::limit_git_until);
+        self.cleanup_resolve_plan_with_limits_and_eligibility(
+            session_id,
+            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+            crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
+            crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+            true,
+            false,
+            true,
+            Some(witness_sha256),
             Some(context),
         )
     }
@@ -1240,7 +1337,9 @@ impl Broker {
                 )));
             }
             let full = worktree.join(&relative);
-            match describe_untracked(&full, &relative).map_err(|error| io_error(&full, error))? {
+            match describe_untracked_until(&full, &relative, context.deadline)
+                .map_err(|error| io_error(&full, error))?
+            {
                 Some(file) => untracked_files.push(file),
                 None => {
                     return Err(refuse(format!(
@@ -1260,8 +1359,13 @@ impl Broker {
             strict: ignored_policy.strict,
             regenerable: &ignored_policy.regenerable,
         };
-        let (ignored_paths, ignored_files) =
-            ignored_inventory(&checkout, &worktree, &ignored_policy, session_id)?;
+        let (ignored_paths, ignored_files) = ignored_inventory(
+            &checkout,
+            &worktree,
+            &ignored_policy,
+            session_id,
+            context.deadline,
+        )?;
         let ignored_bytes = checked_archived_file_bytes(&ignored_files)
             .ok_or_else(|| refuse("the total ignored archive size overflows u64".into()))?;
         let ignored_policy_bytes =
@@ -1299,12 +1403,13 @@ impl Broker {
         let content_digest = format!("{:x}", hasher.finalize());
         let recovery_root_proofs = if retirement_mode {
             recovery_root_proofs_for_plan_parts(
+                self.repo_handle(),
                 &head,
                 &item.branch_ref,
                 branch_tip.as_deref(),
                 checkout_branch_ref.as_deref(),
                 checkout_branch_tip.as_deref(),
-                &unlanded_commits,
+                delivery_targets,
             )?
         } else {
             Vec::new()
@@ -1440,6 +1545,7 @@ impl Broker {
             allow_adopted,
             None,
             None,
+            None,
             RecoveryBundleWriter {
                 max_bytes: MAX_RECOVERY_BUNDLE_BYTES,
                 write_to: write_recovery_bundle_to_file,
@@ -1462,13 +1568,22 @@ impl Broker {
         }
         let session_id = expected_cohort.owner_session_id();
         let worktree = expected_cohort.worktree();
-        if deadline.saturating_duration_since(Instant::now())
+        let started = Instant::now();
+        if deadline.saturating_duration_since(started)
             < crate::auto_cleanup::AUTO_COMPACTION_MIN_BUDGET
         {
             return Ok(None);
         }
-        let current =
-            self.closed_artifact_checkout_cohort_for_session(session_id, worktree, Some(deadline))?;
+        let attempt_deadline = deadline.min(
+            started
+                .checked_add(crate::auto_cleanup::AUTO_COMPACTION_MIN_BUDGET)
+                .unwrap_or(deadline),
+        );
+        let current = self.closed_artifact_checkout_cohort_for_session(
+            session_id,
+            worktree,
+            Some(attempt_deadline),
+        )?;
         if current.as_ref() != Some(expected_cohort) {
             return Ok(None);
         }
@@ -1481,9 +1596,18 @@ impl Broker {
                 reason: format!("cannot encode checkout owner witness: {error}"),
             })?;
         let witness_sha256 = sha256_hex(&witness_bytes);
-        let _git_deadline = crate::git::limit_git_until(deadline);
-        let plan =
-            self.cleanup_resolve_retirement_plan_with_witness(session_id, &witness_sha256)?;
+        let _git_deadline = crate::git::limit_git_until(attempt_deadline);
+        let context = self.cleanup_resolve_retirement_context_until(Some(attempt_deadline))?;
+        let plan = self.cleanup_resolve_retirement_plan_with_witness_and_context(
+            session_id,
+            &witness_sha256,
+            &context,
+        )?;
+        if attempt_deadline.saturating_duration_since(Instant::now())
+            < AUTO_COMPACTION_STAGING_RESERVE
+        {
+            return Ok(None);
+        }
         if plan.target_origin != SessionOrigin::Spawned
             || Path::new(&plan.worktree_path) != worktree
             || plan.retirement_witness_sha256.as_deref() != Some(witness_sha256.as_str())
@@ -1502,6 +1626,7 @@ impl Broker {
             false,
             Some(&witness_sha256),
             Some(expected_cohort),
+            Some(attempt_deadline),
             RecoveryBundleWriter {
                 max_bytes: MAX_RECOVERY_BUNDLE_BYTES,
                 write_to: write_recovery_bundle_to_file,
@@ -1588,6 +1713,7 @@ impl Broker {
             false,
             None,
             None,
+            None,
             bundle,
         )
     }
@@ -1603,6 +1729,7 @@ impl Broker {
         allow_adopted: bool,
         retirement_witness_sha256: Option<&str>,
         expected_cohort: Option<&crate::auto_cleanup::ClosedArtifactCheckoutCohort>,
+        operation_deadline: Option<Instant>,
         bundle: RecoveryBundleWriter<B>,
     ) -> Result<CleanupResolveOutcome, BrokerOpError>
     where
@@ -1618,6 +1745,7 @@ impl Broker {
             &mut std::fs::File,
         ) -> Result<u64, String>,
     {
+        let _git_deadline = operation_deadline.map(crate::git::limit_git_until);
         let _retirement_lock = if retirement_mode {
             Some(
                 crate::file_lock::try_acquire_retirement_archive_lock(self.main_root(), session_id)
@@ -1636,14 +1764,27 @@ impl Broker {
         if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BrokerOpError::CleanupResolveConfirmationNotSha256);
         }
+        let retirement_context = if retirement_mode {
+            Some(self.cleanup_resolve_retirement_context_until(operation_deadline)?)
+        } else {
+            None
+        };
         let plan = if retirement_mode {
+            let context = retirement_context
+                .as_ref()
+                .expect("retirement mode has context");
             if let Some(witness_sha256) = retirement_witness_sha256 {
-                self.cleanup_resolve_retirement_revalidation_plan_with_witness(
+                self.cleanup_resolve_retirement_plan_with_witness_and_context(
                     session_id,
                     witness_sha256,
+                    context,
                 )?
             } else {
-                self.cleanup_resolve_retirement_revalidation_plan(session_id, allow_adopted)?
+                self.cleanup_resolve_retirement_plan_with_context(
+                    session_id,
+                    allow_adopted,
+                    context,
+                )?
             }
         } else {
             self.cleanup_resolve_revalidation_plan(session_id)?
@@ -1654,6 +1795,7 @@ impl Broker {
                 actual: confirm.to_owned(),
             });
         }
+        ensure_auto_retirement_staging_reserve(operation_deadline, session_id)?;
         let session = self.store_ref().session(session_id)?;
         let archive_root = prepare_archive_root(&plan.archive_root).map_err(|reason| {
             BrokerOpError::RecoveryArchiveUnverified {
@@ -1719,12 +1861,18 @@ impl Broker {
                         &plan,
                     ) {
                         Ok(()) => {
-                            sync_archive_directories_bottom_up(&partial_path, &sync_directory)
-                                .map_err(|reason| BrokerOpError::RecoveryArchiveUnverified {
+                            sync_archive_directories_bottom_up_until(
+                                &partial_path,
+                                &sync_directory,
+                                operation_deadline,
+                            )
+                            .map_err(|reason| {
+                                BrokerOpError::RecoveryArchiveUnverified {
                                     id: session_id,
                                     path: partial_path.to_string_lossy().into_owned(),
                                     reason,
-                                })?;
+                                }
+                            })?;
                             std::fs::rename(&partial_path, &archive)
                                 .map_err(|error| io_error(&archive, error))?;
                         }
@@ -1737,16 +1885,20 @@ impl Broker {
                                         "incomplete retirement staging is not proven to belong to the current plan; it was retained: {verification_error}; {marker_error}"
                                     ),
                                 })?;
+                            let revalidation_context =
+                                self.cleanup_resolve_retirement_context_until(operation_deadline)?;
                             let current_plan =
                                 if let Some(witness_sha256) = retirement_witness_sha256 {
-                                    self.cleanup_resolve_retirement_revalidation_plan_with_witness(
+                                    self.cleanup_resolve_retirement_plan_with_witness_and_context(
                                         session_id,
                                         witness_sha256,
+                                        &revalidation_context,
                                     )?
                                 } else {
-                                    self.cleanup_resolve_retirement_revalidation_plan(
+                                    self.cleanup_resolve_retirement_plan_with_context(
                                         session_id,
                                         allow_adopted,
+                                        &revalidation_context,
                                     )?
                                 };
                             if current_plan.digest != plan.digest {
@@ -1755,6 +1907,7 @@ impl Broker {
                                     actual: confirm.to_owned(),
                                 });
                             }
+                            ensure_auto_retirement_staging_reserve(operation_deadline, session_id)?;
                             std::fs::remove_dir_all(&partial_path).map_err(|error| {
                                 BrokerOpError::RecoveryArchiveUnverified {
                                     id: session_id,
@@ -1764,6 +1917,7 @@ impl Broker {
                                     ),
                                 }
                             })?;
+                            ensure_auto_retirement_staging_reserve(operation_deadline, session_id)?;
                             let partial =
                                 create_exclusive_archive_directory(&archive_root, &partial_name)
                                     .map_err(|reason| BrokerOpError::RecoveryArchiveUnverified {
@@ -1793,6 +1947,7 @@ impl Broker {
                                 &partial,
                                 &bundle,
                                 &sync_directory,
+                                operation_deadline,
                             ) {
                                 return Err(BrokerOpError::RecoveryArchiveUnverified {
                                     id: session_id,
@@ -1827,6 +1982,7 @@ impl Broker {
                             id: session_id,
                             reason: format!("archive capacity preflight failed: {reason}"),
                         })?;
+                    ensure_auto_retirement_staging_reserve(operation_deadline, session_id)?;
                     let partial = create_exclusive_archive_directory(&archive_root, &partial_name)
                         .map_err(|reason| BrokerOpError::RecoveryArchiveUnverified {
                             id: session_id,
@@ -1857,6 +2013,7 @@ impl Broker {
                         &partial,
                         &bundle,
                         &sync_directory,
+                        operation_deadline,
                     ) {
                         return Err(BrokerOpError::RecoveryArchiveUnverified {
                             id: session_id,
@@ -1896,6 +2053,14 @@ impl Broker {
                 path: path.to_string_lossy().into_owned(),
                 reason: format!("cannot sync {label} before worktree removal: {error}"),
             })?;
+        }
+        if operation_deadline.is_some_and(|deadline| {
+            deadline.saturating_duration_since(Instant::now()) < AUTO_COMPACTION_STAGING_RESERVE
+        }) {
+            return Err(BrokerOpError::CleanupResolveRefused {
+                id: session_id,
+                reason: "automatic retirement finished archive verification without the reserved time for cleanup; the verified archive is retained for a later pass".into(),
+            });
         }
         after_archive_verified();
 
@@ -1965,6 +2130,8 @@ struct StoredManifest {
     #[serde(default)]
     recovery_root_proofs_sha256: Option<String>,
     #[serde(default)]
+    recovery_root_proofs: Option<Vec<RecoveryRootProof>>,
+    #[serde(default)]
     delivery_targets_sha256: Option<String>,
     disposition: String,
     head: String,
@@ -2009,6 +2176,8 @@ pub(crate) struct OwnedRecoveryArchive {
     pub path: PathBuf,
     pub session_id: i64,
     pub head: String,
+    /// Every exact recovery root that must reach a current delivery target before GC can call the archive redundant.
+    pub recovery_roots: Vec<RecoveryRootProof>,
     pub created_at_ms: i64,
     /// Immutable minimum archive age copied from the reviewed retirement plan.
     pub minimum_archive_retention_ms: Option<u64>,
@@ -2097,6 +2266,7 @@ fn known_recovery_archive_payload_bytes(plan: &CleanupResolvePlan) -> Result<u64
 
 fn retirement_archive_record_for_plan(
     plan: &CleanupResolvePlan,
+    archive_created_at_ms: i64,
 ) -> Result<RetirementArchiveRecord, String> {
     let minimum_archive_retention_ms = plan
         .minimum_archive_retention_ms
@@ -2111,6 +2281,7 @@ fn retirement_archive_record_for_plan(
         target_origin: plan.target_origin.as_str().to_owned(),
         allow_adopted,
         minimum_archive_retention_ms,
+        archive_created_at_ms,
         owner_witness_sha256: plan.retirement_witness_sha256.clone(),
         delivery_targets_sha256: delivery_targets_sha256(&plan.delivery_targets)?,
         worktree_path: plan.worktree_path.clone(),
@@ -2125,17 +2296,25 @@ fn retirement_archive_record_for_plan(
     Ok(record)
 }
 
-fn retirement_archive_record_bytes(plan: &CleanupResolvePlan) -> Result<Vec<u8>, String> {
-    let record = retirement_archive_record_for_plan(plan)?;
+fn retirement_archive_record_bytes(
+    plan: &CleanupResolvePlan,
+    archive_created_at_ms: i64,
+) -> Result<Vec<u8>, String> {
+    let record = retirement_archive_record_for_plan(plan, archive_created_at_ms)?;
     serde_json::to_vec(&record).map_err(|error| format!("cannot encode retirement record: {error}"))
 }
 
-fn retirement_archive_record_sha256(plan: &CleanupResolvePlan) -> Result<String, String> {
-    Ok(sha256_hex(&retirement_archive_record_bytes(plan)?))
+fn retirement_archive_record_sha256(
+    root: &Path,
+    plan: &CleanupResolvePlan,
+) -> Result<String, String> {
+    verify_retirement_archive_record_for_plan(root, plan)?;
+    let (_, bytes) = read_retirement_archive_record(root)?;
+    Ok(sha256_hex(&bytes))
 }
 
 fn create_retirement_archive_record(root: &Path, plan: &CleanupResolvePlan) -> Result<(), String> {
-    let bytes = retirement_archive_record_bytes(plan)?;
+    let bytes = retirement_archive_record_bytes(plan, now_ms())?;
     create_new_archive_file(root, RETIREMENT_ARCHIVE_RECORD_FILE, &bytes).map(|_| ())
 }
 
@@ -2148,6 +2327,7 @@ fn validate_retirement_archive_record_fields(
         || !matches!(record.target_origin.as_str(), "spawned" | "adopted")
         || (record.target_origin == "adopted" && !record.allow_adopted)
         || record.minimum_archive_retention_ms < MIN_RECOVERY_ARCHIVE_RETENTION_MS
+        || record.archive_created_at_ms < 0
         || record
             .owner_witness_sha256
             .as_deref()
@@ -2193,8 +2373,8 @@ fn verify_retirement_archive_record_for_plan(
     root: &Path,
     plan: &CleanupResolvePlan,
 ) -> Result<(), String> {
-    let expected = retirement_archive_record_for_plan(plan)?;
     let (actual, _) = read_retirement_archive_record(root)?;
+    let expected = retirement_archive_record_for_plan(plan, actual.archive_created_at_ms)?;
     if actual != expected {
         return Err("retirement record does not match the reviewed plan".into());
     }
@@ -2211,6 +2391,7 @@ fn verify_retirement_archive_record_for_manifest(
         || Some(record.session_id) != Some(manifest.session_id)
         || Some(record.plan_digest.as_str()) != manifest.plan_digest.as_deref()
         || Some(record.minimum_archive_retention_ms) != manifest.minimum_archive_retention_ms
+        || record.archive_created_at_ms != manifest.created_at_ms
         || record.worktree_path != manifest.worktree_path
         || record.branch_ref != manifest.branch_ref
         || record.branch_tip != manifest.branch_tip
@@ -2231,14 +2412,13 @@ fn recovery_bundle_required(plan: &CleanupResolvePlan) -> bool {
     !recovery_bundle_roots(plan).is_empty()
 }
 
-fn recovery_root_proofs_for_plan_parts(
+fn recovery_root_identities_for_plan_parts(
     head: &str,
     branch_ref: &str,
     branch_tip: Option<&str>,
     checkout_branch_ref: Option<&str>,
     checkout_branch_tip: Option<&str>,
-    unlanded_commits: &[String],
-) -> Result<Vec<RecoveryRootProof>, String> {
+) -> Result<Vec<(String, String)>, String> {
     let mut roots = std::collections::BTreeMap::from([("HEAD".to_owned(), head.to_owned())]);
     if let Some(tip) = branch_tip {
         match roots.insert(branch_ref.to_owned(), tip.to_owned()) {
@@ -2256,14 +2436,94 @@ fn recovery_root_proofs_for_plan_parts(
             _ => {}
         }
     }
-    Ok(roots
-        .into_iter()
-        .map(|(ref_name, object_id)| RecoveryRootProof {
-            available_from_delivery: !unlanded_commits.contains(&object_id),
+    Ok(roots.into_iter().collect())
+}
+
+fn root_available_from_delivery(
+    repository: &GitRepo,
+    object_id: &str,
+    delivery_targets: &[String],
+) -> Result<bool, String> {
+    for target in delivery_targets {
+        match repository.is_ancestor_checked(object_id, target) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot check recovery root {object_id} against delivery target {target}: {error}"
+                ));
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn recovery_root_proofs_for_plan_parts(
+    repository: &GitRepo,
+    head: &str,
+    branch_ref: &str,
+    branch_tip: Option<&str>,
+    checkout_branch_ref: Option<&str>,
+    checkout_branch_tip: Option<&str>,
+    delivery_targets: &[String],
+) -> Result<Vec<RecoveryRootProof>, String> {
+    recovery_root_identities_for_plan_parts(
+        head,
+        branch_ref,
+        branch_tip,
+        checkout_branch_ref,
+        checkout_branch_tip,
+    )?
+    .into_iter()
+    .map(|(ref_name, object_id)| {
+        Ok(RecoveryRootProof {
+            available_from_delivery: root_available_from_delivery(
+                repository,
+                &object_id,
+                delivery_targets,
+            )?,
             ref_name,
             object_id,
         })
-        .collect())
+    })
+    .collect()
+}
+
+fn validate_root_proof_identities(
+    proofs: &[RecoveryRootProof],
+    identities: &[(String, String)],
+) -> Result<(), String> {
+    if proofs.len() != identities.len()
+        || proofs
+            .iter()
+            .zip(identities)
+            .any(|(proof, (reference, object_id))| {
+                proof.ref_name != reference.as_str()
+                    || proof.object_id != object_id.as_str()
+                    || !valid_git_object_id(&proof.object_id)
+            })
+    {
+        return Err("schema v5 recovery root proof does not match its branch identities".into());
+    }
+    Ok(())
+}
+
+fn validate_root_proof_delivery_availability(
+    repository: &GitRepo,
+    delivery_targets: &[String],
+    proofs: &[RecoveryRootProof],
+) -> Result<(), String> {
+    for proof in proofs {
+        let available =
+            root_available_from_delivery(repository, &proof.object_id, delivery_targets)?;
+        if available != proof.available_from_delivery {
+            return Err(format!(
+                "schema v5 recovery root {} has an incorrect delivery-availability proof",
+                proof.ref_name
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn recovery_root_proofs_sha256(proofs: &[RecoveryRootProof]) -> Result<String, String> {
@@ -2305,24 +2565,20 @@ fn recovery_bundle_roots_from_manifest(
     manifest: &StoredManifest,
 ) -> Result<Vec<(String, String)>, String> {
     if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
-        let proofs = recovery_root_proofs_for_plan_parts(
-            &manifest.head,
-            &manifest.branch_ref,
-            manifest.branch_tip.as_deref(),
-            manifest.checkout_branch_ref.as_deref(),
-            manifest.checkout_branch_tip.as_deref(),
-            &manifest.unlanded_commits,
-        )?;
-        let digest = recovery_root_proofs_sha256(&proofs)?;
+        let proofs = manifest
+            .recovery_root_proofs
+            .as_ref()
+            .ok_or_else(|| "schema v5 archive is missing its recovery root proofs".to_owned())?;
+        let digest = recovery_root_proofs_sha256(proofs)?;
         if Some(digest.as_str()) != manifest.recovery_root_proofs_sha256.as_deref() {
             return Err(
                 "recovery roots or their delivery availability changed in the manifest".into(),
             );
         }
         return Ok(proofs
-            .into_iter()
+            .iter()
             .filter(|proof| !proof.available_from_delivery)
-            .map(|proof| (proof.ref_name, proof.object_id))
+            .map(|proof| (proof.ref_name.clone(), proof.object_id.clone()))
             .collect());
     }
     if manifest.unlanded_commits.is_empty() {
@@ -2409,6 +2665,7 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
                 .recovery_root_proofs_sha256
                 .as_deref()
                 .is_some_and(valid_sha256)
+            || manifest.recovery_root_proofs.is_none()
             || !manifest
                 .delivery_targets_sha256
                 .as_deref()
@@ -2436,15 +2693,19 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
                 "schema v5 delivery target roots do not match their recorded identity".into(),
             );
         }
-        let proofs = recovery_root_proofs_for_plan_parts(
+        let identities = recovery_root_identities_for_plan_parts(
             &manifest.head,
             &manifest.branch_ref,
             manifest.branch_tip.as_deref(),
             manifest.checkout_branch_ref.as_deref(),
             manifest.checkout_branch_tip.as_deref(),
-            &manifest.unlanded_commits,
         )?;
-        let root_proofs_hash = recovery_root_proofs_sha256(&proofs)?;
+        let proofs = manifest
+            .recovery_root_proofs
+            .as_deref()
+            .ok_or_else(|| "schema v5 archive is missing its recovery root proofs".to_owned())?;
+        validate_root_proof_identities(proofs, &identities)?;
+        let root_proofs_hash = recovery_root_proofs_sha256(proofs)?;
         if Some(root_proofs_hash.as_str()) != manifest.recovery_root_proofs_sha256.as_deref() {
             return Err(
                 "schema v5 manifest root proof does not match its branch identities".into(),
@@ -2455,6 +2716,7 @@ fn validate_manifest_identity(manifest: &StoredManifest) -> Result<(), String> {
         || manifest.checkout_branch_ref.is_some()
         || manifest.checkout_branch_tip.is_some()
         || manifest.recovery_root_proofs_sha256.is_some()
+        || manifest.recovery_root_proofs.is_some()
         || manifest.delivery_targets_sha256.is_some()
     {
         return Err("only schema v5 archives may declare retirement metadata".into());
@@ -2720,10 +2982,19 @@ fn recovery_archive_expected_files(
 /// Enumerate archive files without following links. Incomplete or unexpectedly
 /// large trees stay unowned so retention never assumes their contents away.
 fn recovery_archive_file_set(root: &Path) -> Result<std::collections::BTreeSet<PathBuf>, String> {
+    recovery_archive_file_set_until(root, None)
+}
+
+fn recovery_archive_file_set_until(
+    root: &Path,
+    deadline: Option<Instant>,
+) -> Result<std::collections::BTreeSet<PathBuf>, String> {
+    let deadline = effective_archive_deadline(deadline);
     let mut files = std::collections::BTreeSet::new();
     let mut pending = vec![(PathBuf::new(), 0_usize)];
     let mut visited = 0_usize;
     while let Some((relative_dir, depth)) = pending.pop() {
+        check_archive_deadline(deadline, "archive inventory")?;
         if depth > MAX_RECOVERY_ARCHIVE_TREE_DEPTH {
             return Err("archive directory depth exceeds the ownership check bound".into());
         }
@@ -2731,6 +3002,7 @@ fn recovery_archive_file_set(root: &Path) -> Result<std::collections::BTreeSet<P
         let entries = std::fs::read_dir(&directory)
             .map_err(|error| format!("cannot read {}: {error}", directory.display()))?;
         for entry in entries {
+            check_archive_deadline(deadline, "archive durability scan")?;
             let entry = entry.map_err(|error| format!("cannot read archive entry: {error}"))?;
             visited += 1;
             if visited > MAX_RECOVERY_ARCHIVE_TREE_ENTRIES {
@@ -2756,9 +3028,19 @@ fn recovery_archive_file_set(root: &Path) -> Result<std::collections::BTreeSet<P
 }
 
 fn verify_recovery_archive_tree(root: &Path, manifest: &StoredManifest) -> Result<(), String> {
+    verify_recovery_archive_tree_until(root, manifest, None)
+}
+
+fn verify_recovery_archive_tree_until(
+    root: &Path,
+    manifest: &StoredManifest,
+    deadline: Option<Instant>,
+) -> Result<(), String> {
+    let deadline = effective_archive_deadline(deadline);
+    check_archive_deadline(deadline, "archive verification")?;
     validate_manifest_identity(manifest)?;
     let expected = recovery_archive_expected_files(manifest)?;
-    let actual = recovery_archive_file_set(root)?;
+    let actual = recovery_archive_file_set_until(root, deadline)?;
     if actual != expected {
         let unexpected = actual.difference(&expected).next();
         let missing = expected.difference(&actual).next();
@@ -2777,6 +3059,7 @@ fn verify_recovery_archive_tree(root: &Path, manifest: &StoredManifest) -> Resul
     .into_iter()
     .chain(manifest.bundle.as_deref())
     {
+        check_archive_deadline(deadline, "archive verification")?;
         let path = root.join(path);
         let metadata = std::fs::symlink_metadata(&path)
             .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
@@ -2808,6 +3091,7 @@ fn verify_recovery_archive_tree(root: &Path, manifest: &StoredManifest) -> Resul
         ),
     ] {
         for file in files {
+            check_archive_deadline(deadline, "archive payload verification")?;
             let path = root.join(directory).join(&file.path);
             let metadata = std::fs::symlink_metadata(&path)
                 .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
@@ -2850,8 +3134,9 @@ fn verify_recovery_archive_tree(root: &Path, manifest: &StoredManifest) -> Resul
     ) && let Some(bundle) = manifest.bundle.as_deref()
     {
         let path = root.join(bundle);
-        let (bytes, sha256) = hash_regular_file_no_follow(&path, MAX_RECOVERY_BUNDLE_BYTES)
-            .map_err(|error| format!("cannot verify {BUNDLE_FILE} integrity: {error}"))?;
+        let (bytes, sha256) =
+            hash_regular_file_no_follow_until(&path, MAX_RECOVERY_BUNDLE_BYTES, deadline)
+                .map_err(|error| format!("cannot verify {BUNDLE_FILE} integrity: {error}"))?;
         if Some(bytes) != manifest.bundle_bytes
             || Some(sha256.as_str()) != manifest.bundle_sha256.as_deref()
         {
@@ -2888,7 +3173,12 @@ pub(crate) fn verify_recovery_archive_for_plan(
     {
         return Err("archive is outside the reviewed archive root".into());
     }
-    verify_recovery_archive_payload_for_plan(repository, root, plan)
+    verify_recovery_archive_payload_for_plan_until(
+        repository,
+        root,
+        plan,
+        effective_archive_deadline(None),
+    )
 }
 
 /// Verify archive payload and manifest against a plan without imposing a
@@ -2899,13 +3189,37 @@ fn verify_recovery_archive_payload_for_plan(
     root: &Path,
     plan: &CleanupResolvePlan,
 ) -> Result<(), String> {
+    verify_recovery_archive_payload_for_plan_until(
+        repository,
+        root,
+        plan,
+        effective_archive_deadline(None),
+    )
+}
+
+fn verify_recovery_archive_payload_for_plan_until(
+    repository: &GitRepo,
+    root: &Path,
+    plan: &CleanupResolvePlan,
+    deadline: Option<Instant>,
+) -> Result<(), String> {
+    let deadline = effective_archive_deadline(deadline);
+    check_archive_deadline(deadline, "archive verification")?;
     let bytes = read_recovery_manifest(&root.join(MANIFEST_FILE))?;
     let manifest: StoredManifest = serde_json::from_slice(&bytes)
         .map_err(|error| format!("unreadable {MANIFEST_FILE}: {error}"))?;
     validate_manifest_identity(&manifest)?;
-    verify_recovery_archive_tree(root, &manifest)?;
+    verify_recovery_archive_tree_until(root, &manifest, deadline)?;
     if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
         verify_retirement_archive_record_for_manifest(root, &manifest)?;
+        let proofs = manifest
+            .recovery_root_proofs
+            .as_deref()
+            .ok_or_else(|| "schema v5 archive is missing its recovery root proofs".to_owned())?;
+        validate_root_proof_delivery_availability(repository, &manifest.delivery_targets, proofs)?;
+        if proofs != plan.recovery_root_proofs.as_slice() {
+            return Err("archive recovery root proofs differ from the reviewed plan".into());
+        }
     }
     let mut informational_ignored_directories = false;
     let expected_plan_digest = match manifest.schema_version {
@@ -2962,7 +3276,7 @@ fn verify_recovery_archive_payload_for_plan(
         .map_err(|error| format!("cannot encode reviewed landing verdict: {error}"))?;
     let expected_retirement_record_sha256 =
         if plan.recovery_archive_schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
-            Some(retirement_archive_record_sha256(plan)?)
+            Some(retirement_archive_record_sha256(root, plan)?)
         } else {
             None
         };
@@ -3047,7 +3361,7 @@ fn verify_recovery_archive_payload_for_plan(
         ),
     ] {
         let path = root.join(name);
-        let actual = describe_untracked(&path, name)
+        let actual = describe_untracked_until(&path, name, deadline)
             .map_err(|error| format!("cannot verify {name}: {error}"))?
             .ok_or_else(|| format!("{name} is not a regular file"))?;
         if actual.bytes != expected_bytes || actual.sha256 != expected_sha256 {
@@ -3059,8 +3373,9 @@ fn verify_recovery_archive_payload_for_plan(
         (IGNORED_DIRECTORY, plan.ignored_files.as_slice()),
     ] {
         for expected in files {
+            check_archive_deadline(deadline, "archive payload verification")?;
             let path = root.join(directory).join(&expected.path);
-            let actual = describe_untracked(&path, &expected.path)
+            let actual = describe_untracked_until(&path, &expected.path, deadline)
                 .map_err(|error| format!("cannot verify {}: {error}", path.display()))?
                 .ok_or_else(|| format!("{} is not a regular file or symlink", path.display()))?;
             if &actual != expected {
@@ -3070,7 +3385,8 @@ fn verify_recovery_archive_payload_for_plan(
     }
     if manifest.bundle.is_some() {
         let bundle = root.join(BUNDLE_FILE);
-        let deadline = recovery_bundle_deadline()?;
+        let bundle_deadline = recovery_bundle_deadline()?;
+        let deadline = deadline.map_or(bundle_deadline, |operation| operation.min(bundle_deadline));
         verify_recovery_bundle(
             repository,
             &bundle,
@@ -3147,6 +3463,13 @@ impl Broker {
         verify_recovery_archive_tree(dir, &manifest)?;
         if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
             verify_retirement_archive_record_for_manifest(dir, &manifest)?;
+            validate_root_proof_delivery_availability(
+                self.repo_handle(),
+                &manifest.delivery_targets,
+                manifest.recovery_root_proofs.as_deref().ok_or_else(|| {
+                    "schema v5 archive is missing its recovery root proofs".to_owned()
+                })?,
+            )?;
         }
         if !same_path(Path::new(&manifest.repository), self.main_root()) {
             return Err(format!(
@@ -3165,10 +3488,23 @@ impl Broker {
                 manifest.session_id, session.branch, manifest.branch_ref
             ));
         }
+        let recovery_roots =
+            if manifest.schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
+                manifest.recovery_root_proofs.clone().ok_or_else(|| {
+                    "schema v5 archive is missing its recovery root proofs".to_owned()
+                })?
+            } else {
+                vec![RecoveryRootProof {
+                    ref_name: "HEAD".into(),
+                    object_id: manifest.head.clone(),
+                    available_from_delivery: !manifest.unlanded_commits.contains(&manifest.head),
+                }]
+            };
         Ok(OwnedRecoveryArchive {
             path: dir.to_path_buf(),
             session_id: manifest.session_id,
             head: manifest.head,
+            recovery_roots,
             created_at_ms: manifest.created_at_ms,
             minimum_archive_retention_ms: manifest.minimum_archive_retention_ms,
             holds_uncommitted: manifest.staged_patch.bytes > 0
@@ -3181,10 +3517,9 @@ impl Broker {
         })
     }
 
-    /// Whether nothing in `archive` exists only in it: its head reached the
-    /// primary checkout or the upstream branch, and it holds no uncommitted
-    /// changes. A head whose objects are gone cannot be shown to have landed,
-    /// so it has not.
+    /// Whether every preserved root reached the primary checkout or upstream,
+    /// and the archive holds no uncommitted changes. Schema-4 and older archives
+    /// expose only HEAD; schema-5 archives also include recorded/current branch roots.
     pub(crate) fn recovery_archive_landed(&self, archive: &OwnedRecoveryArchive) -> bool {
         if archive.holds_uncommitted {
             return false;
@@ -3197,12 +3532,15 @@ impl Broker {
         if let Some((_upstream, head)) = repo.tracking_upstream() {
             targets.push(head);
         }
-        targets.iter().any(|target| {
-            matches!(
-                crate::work_landed(repo, &archive.head, target),
-                Ok(crate::LandingVerdict::Landed { .. })
-            )
-        })
+        !archive.recovery_roots.is_empty()
+            && archive.recovery_roots.iter().all(|root| {
+                targets.iter().any(|target| {
+                    matches!(
+                        crate::work_landed(repo, &root.object_id, target),
+                        Ok(crate::LandingVerdict::Landed { .. })
+                    )
+                })
+            })
     }
 
     /// Every archive under this repository's recovery archive directory,
@@ -3710,10 +4048,20 @@ fn copy_expected_bytes_with_probe<R: Read, W: Write>(
     target: &mut W,
     expected_bytes: u64,
 ) -> std::io::Result<String> {
+    copy_expected_bytes_with_probe_until(source, target, expected_bytes, None)
+}
+
+fn copy_expected_bytes_with_probe_until<R: Read, W: Write>(
+    source: &mut R,
+    target: &mut W,
+    expected_bytes: u64,
+    deadline: Option<Instant>,
+) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut remaining = expected_bytes;
     while remaining > 0 {
+        check_archive_deadline_io(deadline)?;
         let limit = remaining.min(buffer.len() as u64) as usize;
         let read = source.read(&mut buffer[..limit])?;
         if read == 0 {
@@ -3727,6 +4075,7 @@ fn copy_expected_bytes_with_probe<R: Read, W: Write>(
         remaining -= read as u64;
     }
 
+    check_archive_deadline_io(deadline)?;
     let mut probe = [0_u8; 1];
     if source.read(&mut probe)? != 0 {
         return Err(std::io::Error::new(
@@ -3743,6 +4092,17 @@ fn copy_regular_archive_file(
     relative: &str,
     expected: &ArchivedFile,
 ) -> Result<(), String> {
+    copy_regular_archive_file_until(source, archive_root, relative, expected, None)
+}
+
+fn copy_regular_archive_file_until(
+    source: &Path,
+    archive_root: &Path,
+    relative: &str,
+    expected: &ArchivedFile,
+    deadline: Option<Instant>,
+) -> Result<(), String> {
+    check_archive_deadline(deadline, "recovery archive file copy")?;
     let (mut source_file, source_metadata) =
         open_regular_file_no_follow(source).map_err(|error| {
             format!(
@@ -3771,9 +4131,13 @@ fn copy_regular_archive_file(
     let mut target_file = options
         .open(&target)
         .map_err(|error| format!("cannot create archive file {}: {error}", target.display()))?;
-    let copied_sha256 =
-        copy_expected_bytes_with_probe(&mut source_file, &mut target_file, expected.bytes)
-            .map_err(|error| format!("cannot copy {}: {error}", expected.path))?;
+    let copied_sha256 = copy_expected_bytes_with_probe_until(
+        &mut source_file,
+        &mut target_file,
+        expected.bytes,
+        deadline,
+    )
+    .map_err(|error| format!("cannot copy {}: {error}", expected.path))?;
     let source_after = source_file
         .metadata()
         .map_err(|error| format!("cannot recheck {}: {error}", expected.path))?;
@@ -3836,10 +4200,23 @@ fn sync_archive_directories_bottom_up<S>(root: &Path, sync_directory: &S) -> Res
 where
     S: Fn(&Path) -> std::io::Result<()>,
 {
+    sync_archive_directories_bottom_up_until(root, sync_directory, None)
+}
+
+fn sync_archive_directories_bottom_up_until<S>(
+    root: &Path,
+    sync_directory: &S,
+    deadline: Option<Instant>,
+) -> Result<(), String>
+where
+    S: Fn(&Path) -> std::io::Result<()>,
+{
+    let deadline = effective_archive_deadline(deadline);
     let mut pending = vec![(root.to_path_buf(), 0_usize)];
     let mut directories = Vec::new();
     let mut visited = 0_usize;
     while let Some((directory, depth)) = pending.pop() {
+        check_archive_deadline(deadline, "archive durability scan")?;
         if depth > MAX_RECOVERY_ARCHIVE_TREE_DEPTH {
             return Err("archive directory depth exceeds the durability bound".into());
         }
@@ -3863,6 +4240,7 @@ where
             )
         })?;
         for entry in entries {
+            check_archive_deadline(deadline, "archive durability scan")?;
             let entry = entry.map_err(|error| format!("cannot read archive entry: {error}"))?;
             visited += 1;
             if visited > MAX_RECOVERY_ARCHIVE_TREE_ENTRIES {
@@ -3884,6 +4262,7 @@ where
     }
     directories.sort_by_key(|(depth, _)| std::cmp::Reverse(*depth));
     for (_, directory) in directories {
+        check_archive_deadline(deadline, "archive durability sync")?;
         sync_directory(&directory).map_err(|error| {
             format!(
                 "cannot sync archive directory {}: {error}",
@@ -3937,6 +4316,7 @@ where
             write_to: write_recovery_bundle_to_file,
         },
         sync_directory,
+        None,
     )
 }
 
@@ -3953,30 +4333,28 @@ fn write_verified_archive_with_bundle_writer<S, B>(
     dir: &Path,
     bundle: &RecoveryBundleWriter<B>,
     sync_directory: &S,
+    deadline: Option<Instant>,
 ) -> Result<(), String>
 where
     S: Fn(&Path) -> std::io::Result<()>,
     B: Fn(&GitRepo, &[String], &[String], u64, Instant, &mut std::fs::File) -> Result<u64, String>,
 {
+    check_archive_deadline(deadline, "recovery archive write")?;
     require_real_directory(dir)?;
     let dir = dir
         .canonicalize()
         .map_err(|error| format!("cannot resolve archive staging directory: {error}"))?;
     require_real_directory(&dir)?;
-    let retirement_record_sha256 =
+    let (retirement_record_sha256, archive_created_at_ms) =
         if plan.recovery_archive_schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
-            let record = retirement_archive_record_for_plan(plan)?;
-            let bytes = serde_json::to_vec(&record)
-                .map_err(|error| format!("cannot encode retirement record: {error}"))?;
-            let path = dir.join(RETIREMENT_ARCHIVE_RECORD_FILE);
-            let stored = read_regular_file_no_follow(&path, MAX_RETIREMENT_ARCHIVE_RECORD_BYTES)
-                .map_err(|error| format!("cannot read retirement staging record: {error}"))?;
-            if stored != bytes {
+            let (record, bytes) = read_retirement_archive_record(&dir)?;
+            let expected = retirement_archive_record_for_plan(plan, record.archive_created_at_ms)?;
+            if record != expected {
                 return Err("retirement staging record does not match the reviewed plan".into());
             }
-            Some(sha256_hex(&bytes))
+            (Some(sha256_hex(&bytes)), record.archive_created_at_ms)
         } else {
-            None
+            (None, now_ms())
         };
 
     // Patches are taken again rather than trusted from the plan: the digest
@@ -3987,11 +4365,12 @@ where
         (true, STAGED_PATCH_FILE, &plan.staged_patch_sha256),
         (false, UNSTAGED_PATCH_FILE, &plan.unstaged_patch_sha256),
     ] {
+        check_archive_deadline(deadline, "recovery patch capture")?;
         let bytes = checkout
             .recovery_patch(cached)
             .map_err(|error| format!("cannot take {file}: {error}"))?;
         let path = create_new_archive_file(&dir, file, &bytes)?;
-        let written = describe_untracked(&path, file)
+        let written = describe_untracked_until(&path, file, deadline)
             .map_err(|error| format!("cannot safely read {file}: {error}"))?
             .ok_or_else(|| format!("{file} is not a regular file"))?;
         if written.bytes != bytes.len() as u64 || written.sha256 != *expected {
@@ -4000,10 +4379,13 @@ where
         patches.push((written.bytes != 0).then_some(path));
     }
 
+    check_archive_deadline(deadline, "recovery bundle preparation")?;
     let bundle_integrity = if !recovery_bundle_required(plan) {
         None
     } else {
-        let deadline = recovery_bundle_deadline()?;
+        let bundle_deadline = recovery_bundle_deadline()?;
+        let bundle_deadline =
+            deadline.map_or(bundle_deadline, |operation| operation.min(bundle_deadline));
         let (path, mut bundle_file) = create_new_archive_file_handle(&dir, BUNDLE_FILE)?;
         let additional_roots = recovery_bundle_refs(plan);
         let streamed_bytes = match (bundle.write_to)(
@@ -4011,7 +4393,7 @@ where
             &plan.delivery_targets,
             &additional_roots,
             bundle.max_bytes,
-            deadline,
+            bundle_deadline,
             &mut bundle_file,
         ) {
             Ok(bytes) => bytes,
@@ -4028,12 +4410,17 @@ where
             .sync_all()
             .map_err(|error| format!("cannot sync {BUNDLE_FILE}: {error}"))?;
         drop(bundle_file);
-        let (bytes, sha256) = hash_regular_file_no_follow(&path, bundle.max_bytes)
+        let (bytes, sha256) = hash_regular_file_no_follow_until(&path, bundle.max_bytes, deadline)
             .map_err(|error| format!("cannot read back {BUNDLE_FILE}: {error}"))?;
         if bytes != streamed_bytes {
             return Err(format!("{BUNDLE_FILE} byte count changed after streaming"));
         }
-        verify_recovery_bundle(repository, &path, &recovery_bundle_roots(plan), deadline)?;
+        verify_recovery_bundle(
+            repository,
+            &path,
+            &recovery_bundle_roots(plan),
+            bundle_deadline,
+        )?;
         Some(RecoveryBundleIntegrity { bytes, sha256 })
     };
     let bundle = bundle_integrity.as_ref().map(|_| BUNDLE_FILE);
@@ -4051,6 +4438,7 @@ where
     let worktree = Path::new(&plan.worktree_path);
     let untracked_root = create_exclusive_archive_directory(&dir, UNTRACKED_DIRECTORY)?;
     for file in &plan.untracked_files {
+        check_archive_deadline(deadline, "untracked recovery copy")?;
         if !is_contained_relative(&file.path) {
             return Err(format!(
                 "untracked archive path is invalid: {:?}",
@@ -4071,9 +4459,9 @@ where
             std::os::unix::fs::symlink(link, &target)
                 .map_err(|error| format!("cannot preserve link {}: {error}", file.path))?;
         } else {
-            copy_regular_archive_file(&source, &untracked_root, &file.path, file)?;
+            copy_regular_archive_file_until(&source, &untracked_root, &file.path, file, deadline)?;
         }
-        let archived = describe_untracked(&target, &file.path)
+        let archived = describe_untracked_until(&target, &file.path, deadline)
             .map_err(|error| format!("cannot read back {}: {error}", file.path))?;
         if archived.as_ref() != Some(file) {
             return Err(format!(
@@ -4085,6 +4473,7 @@ where
 
     let ignored_root = create_exclusive_archive_directory(&dir, IGNORED_DIRECTORY)?;
     for file in &plan.ignored_files {
+        check_archive_deadline(deadline, "ignored recovery copy")?;
         if !is_contained_relative(&file.path) {
             return Err(format!("ignored archive path is invalid: {:?}", file.path));
         }
@@ -4103,9 +4492,9 @@ where
             std::os::unix::fs::symlink(link, &target)
                 .map_err(|error| format!("cannot preserve ignored link {}: {error}", file.path))?;
         } else {
-            copy_regular_archive_file(&source, &ignored_root, &file.path, file)?;
+            copy_regular_archive_file_until(&source, &ignored_root, &file.path, file, deadline)?;
         }
-        let archived = describe_untracked(&target, &file.path)
+        let archived = describe_untracked_until(&target, &file.path, deadline)
             .map_err(|error| format!("cannot read back ignored {}: {error}", file.path))?;
         if archived.as_ref() != Some(file) {
             return Err(format!(
@@ -4115,6 +4504,7 @@ where
         }
     }
 
+    check_archive_deadline(deadline, "recovery manifest write")?;
     let manifest_root_proofs_sha256 =
         if plan.recovery_archive_schema_version == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION {
             Some(recovery_root_proofs_sha256(&plan.recovery_root_proofs)?)
@@ -4130,8 +4520,14 @@ where
     let manifest = RecoveryManifest {
         schema_version: plan.recovery_archive_schema_version,
         plan_digest: &plan.digest,
-        created_at_ms: now_ms(),
-        minimum_archive_retention_ms: plan.minimum_archive_retention_ms,
+        created_at_ms: archive_created_at_ms,
+        minimum_archive_retention_ms: if plan.recovery_archive_schema_version
+            == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+        {
+            plan.minimum_archive_retention_ms
+        } else {
+            None
+        },
         retirement_record_sha256: retirement_record_sha256.as_deref(),
         aethyme_version: env!("CARGO_PKG_VERSION"),
         repository: repository.root().to_string_lossy().into_owned(),
@@ -4140,9 +4536,18 @@ where
         worktree_path: &plan.worktree_path,
         branch_ref: &plan.branch_ref,
         branch_tip: plan.branch_tip.as_deref(),
-        checkout_branch_ref: plan.checkout_branch_ref.as_deref(),
-        checkout_branch_tip: plan.checkout_branch_tip.as_deref(),
+        checkout_branch_ref: (plan.recovery_archive_schema_version
+            == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION)
+            .then_some(plan.checkout_branch_ref.as_deref())
+            .flatten(),
+        checkout_branch_tip: (plan.recovery_archive_schema_version
+            == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION)
+            .then_some(plan.checkout_branch_tip.as_deref())
+            .flatten(),
         recovery_root_proofs_sha256: manifest_root_proofs_sha256.as_deref(),
+        recovery_root_proofs: (plan.recovery_archive_schema_version
+            == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION)
+            .then_some(plan.recovery_root_proofs.as_slice()),
         delivery_targets_sha256: manifest_delivery_targets_sha256.as_deref(),
         disposition: plan.disposition.as_str(),
         head: &plan.head,
@@ -4185,7 +4590,8 @@ where
     }
     create_new_archive_file(&dir, README_FILE, readme.as_bytes())?;
     verify_recovery_archive_payload_for_plan(repository, &dir, plan)?;
-    sync_archive_directories_bottom_up(&dir, sync_directory)?;
+    check_archive_deadline(deadline, "recovery archive durability sync")?;
+    sync_archive_directories_bottom_up_until(&dir, sync_directory, deadline)?;
     Ok(())
 }
 
@@ -4202,8 +4608,25 @@ fn restore_readme(plan: &CleanupResolvePlan, has_bundle: bool) -> String {
             plan.head
         )
     };
+    let branch_roots_note = if plan.recovery_archive_schema_version
+        == RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION
+    {
+        let recorded_tip = plan.branch_tip.as_deref().unwrap_or("unknown");
+        let checkout_branch = plan
+            .checkout_branch_ref
+            .as_deref()
+            .unwrap_or("detached checkout");
+        let checkout_tip = plan.checkout_branch_tip.as_deref().unwrap_or("unknown");
+        format!(
+            "`HEAD` is the captured checkout. The manifest records the session branch `{}` at `{recorded_tip}` and the branch actually checked out `{checkout_branch}` at `{checkout_tip}`. If those identities differ, retirement preserves the distinct branch refs; restore the intended root explicitly instead of substituting one for another.\n\n",
+            plan.branch_ref
+        )
+    } else {
+        String::new()
+    };
     format!(
         "# Recovery archive for broker session {id}\n\n\
+         {branch_roots_note}\
          Written by `aethyme broker finish cleanup resolve {id} --archive` before the worktree\n\
          `{path}` was removed. `{MANIFEST_FILE}` lists every part with its SHA-256.\n\
          Policy-approved ignored output was not archived; reinstall generated dependencies if needed.\n\
@@ -4251,6 +4674,80 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?}");
+    }
+
+    fn git_output(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn schema_v5_proofs_bundle_a_unique_recorded_root_even_when_head_is_delivered() {
+        let (_tmp, repository, mut plan) = staged_checkout();
+        let head = repository.head_commit().unwrap();
+        let tree = format!("{head}^{{tree}}");
+        let unique_branch_tip = git_output(
+            repository.root(),
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &head,
+                "-m",
+                "session-only commit",
+            ],
+        );
+        plan.recovery_archive_schema_version = RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION;
+        plan.head = head.clone();
+        plan.delivery_targets = vec![head.clone()];
+        plan.unlanded_commits.clear();
+        plan.branch_ref = "refs/heads/recorded-session".into();
+        git(
+            repository.root(),
+            &["update-ref", &plan.branch_ref, &unique_branch_tip],
+        );
+        plan.branch_tip = Some(unique_branch_tip.clone());
+        plan.checkout_branch_ref = Some("refs/heads/main".into());
+        plan.checkout_branch_tip = Some(head.clone());
+        plan.recovery_root_proofs = recovery_root_proofs_for_plan_parts(
+            &repository,
+            &head,
+            &plan.branch_ref,
+            plan.branch_tip.as_deref(),
+            plan.checkout_branch_ref.as_deref(),
+            plan.checkout_branch_tip.as_deref(),
+            &plan.delivery_targets,
+        )
+        .unwrap();
+
+        assert!(
+            plan.recovery_root_proofs
+                .iter()
+                .find(|root| root.ref_name == "HEAD")
+                .unwrap()
+                .available_from_delivery
+        );
+        assert!(
+            !plan
+                .recovery_root_proofs
+                .iter()
+                .find(|root| root.ref_name == "refs/heads/recorded-session")
+                .unwrap()
+                .available_from_delivery
+        );
+        assert_eq!(
+            recovery_bundle_roots(&plan),
+            vec![("refs/heads/recorded-session".into(), unique_branch_tip)]
+        );
     }
 
     /// A checkout with one staged edit and one untracked file, and the plan
@@ -4624,6 +5121,64 @@ mod tests {
     }
 
     #[test]
+    fn a_retirement_archive_is_not_landed_until_every_root_is_delivered() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join("README.md"), "base\n").unwrap();
+        git(&repository, &["add", "README.md"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+        let delivered_head = GitRepo::discover(&repository)
+            .unwrap()
+            .head_commit()
+            .unwrap();
+
+        git(&repository, &["checkout", "-qb", "session-root"]);
+        std::fs::write(repository.join("private.txt"), "unique branch history\n").unwrap();
+        git(&repository, &["add", "private.txt"]);
+        git(&repository, &["commit", "-qm", "unique branch commit"]);
+        let undelivered_branch_root = GitRepo::discover(&repository)
+            .unwrap()
+            .head_commit()
+            .unwrap();
+        git(&repository, &["checkout", "main"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let broker = storage.open(&repository).unwrap();
+        let archive = |recovery_roots| OwnedRecoveryArchive {
+            path: PathBuf::new(),
+            session_id: 9,
+            head: delivered_head.clone(),
+            recovery_roots,
+            created_at_ms: now_ms(),
+            minimum_archive_retention_ms: Some(MIN_RECOVERY_ARCHIVE_RETENTION_MS),
+            holds_uncommitted: false,
+        };
+
+        let retirement_archive = archive(vec![
+            RecoveryRootProof {
+                ref_name: "HEAD".into(),
+                object_id: delivered_head.clone(),
+                available_from_delivery: true,
+            },
+            RecoveryRootProof {
+                ref_name: "refs/heads/session-root".into(),
+                object_id: undelivered_branch_root,
+                available_from_delivery: false,
+            },
+        ]);
+        assert!(!broker.recovery_archive_landed(&retirement_archive));
+
+        let legacy_archive = archive(vec![RecoveryRootProof {
+            ref_name: "HEAD".into(),
+            object_id: delivered_head,
+            available_from_delivery: true,
+        }]);
+        assert!(broker.recovery_archive_landed(&legacy_archive));
+    }
+
+    #[test]
     fn an_archive_matching_its_plan_verifies() {
         let (_tmp, repo, plan) = staged_checkout();
         let dir = tempfile::tempdir().unwrap();
@@ -4716,6 +5271,66 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn schema_v5_receipt_binds_the_archive_creation_time() {
+        let (_tmp, repo, mut plan) = staged_checkout();
+        plan.recovery_archive_schema_version = RETIREMENT_RECOVERY_ARCHIVE_SCHEMA_VERSION;
+        plan.minimum_archive_retention_ms = Some(MIN_RECOVERY_ARCHIVE_RETENTION_MS);
+        plan.retirement_allow_adopted = Some(false);
+        plan.branch_tip = Some(plan.head.clone());
+        plan.checkout_branch_ref = Some("refs/heads/main".into());
+        plan.checkout_branch_tip = Some(plan.head.clone());
+        plan.recovery_root_proofs = recovery_root_proofs_for_plan_parts(
+            &repo,
+            &plan.head,
+            &plan.branch_ref,
+            plan.branch_tip.as_deref(),
+            plan.checkout_branch_ref.as_deref(),
+            plan.checkout_branch_tip.as_deref(),
+            &plan.delivery_targets,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        plan.archive_root = dir.path().parent().unwrap().to_path_buf();
+        create_retirement_archive_record(dir.path(), &plan).unwrap();
+        write_verified_archive(&repo, &repo, &plan, None, dir.path()).unwrap();
+
+        let manifest_path = dir.path().join(MANIFEST_FILE);
+        let receipt_path = dir.path().join(RETIREMENT_ARCHIVE_RECORD_FILE);
+        let original_manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let original_record: RetirementArchiveRecord =
+            serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+        assert_eq!(
+            original_manifest["created_at_ms"],
+            original_record.archive_created_at_ms
+        );
+        verify_recovery_archive_payload_for_plan(&repo, dir.path(), &plan).unwrap();
+
+        let mut changed_manifest = original_manifest.clone();
+        changed_manifest["created_at_ms"] =
+            serde_json::json!(original_record.archive_created_at_ms + 1);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&changed_manifest).unwrap(),
+        )
+        .unwrap();
+        let error = verify_recovery_archive_payload_for_plan(&repo, dir.path(), &plan).unwrap_err();
+        assert!(error.contains("retirement record does not match its archive manifest"));
+
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&original_manifest).unwrap(),
+        )
+        .unwrap();
+        let mut changed_record = original_record;
+        changed_record.archive_created_at_ms += 1;
+        std::fs::write(&receipt_path, serde_json::to_vec(&changed_record).unwrap()).unwrap();
+        let error = verify_recovery_archive_payload_for_plan(&repo, dir.path(), &plan).unwrap_err();
+        assert!(error.contains("retirement record does not match its archive manifest"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn schema_v4_bundle_manifest_hashes_the_streamed_bundle() {
         let tmp = tempfile::tempdir().unwrap();
         git(tmp.path(), &["init", "-q", "-b", "main"]);
@@ -4747,8 +5362,8 @@ mod tests {
             worktree_path: tmp.path().to_string_lossy().into_owned(),
             branch_ref: "refs/heads/main".into(),
             branch_tip: Some(head.clone()),
-            checkout_branch_ref: None,
-            checkout_branch_tip: None,
+            checkout_branch_ref: Some("refs/heads/main".into()),
+            checkout_branch_tip: Some(head.clone()),
             recovery_root_proofs: Vec::new(),
             disposition: CleanupDisposition::Dirty,
             reason: "fixture".into(),
@@ -4781,6 +5396,10 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
         assert_eq!(value["schema_version"], RECOVERY_ARCHIVE_SCHEMA_VERSION);
         assert_eq!(value["bundle"], BUNDLE_FILE);
+        // Schema-4 output stays parseable by released strict readers that reject unknown fields.
+        assert!(value.get("checkout_branch_ref").is_none());
+        assert!(value.get("checkout_branch_tip").is_none());
+        assert!(value.get("recovery_root_proofs").is_none());
         assert!(
             value["bundle_bytes"]
                 .as_u64()
@@ -4821,6 +5440,16 @@ mod tests {
 
         let manifest_v4: StoredManifest = serde_json::from_value(value.clone()).unwrap();
         verify_recovery_archive_payload_for_plan(&repo, dir.path(), &plan).unwrap();
+        let mut v4_with_v5_only_fields = value.clone();
+        v4_with_v5_only_fields["checkout_branch_ref"] = serde_json::json!("refs/heads/main");
+        v4_with_v5_only_fields["recovery_root_proofs"] = serde_json::json!([]);
+        let v4_with_v5_only_fields: StoredManifest =
+            serde_json::from_value(v4_with_v5_only_fields).unwrap();
+        assert!(
+            validate_manifest_identity(&v4_with_v5_only_fields)
+                .unwrap_err()
+                .contains("only schema v5 archives may declare retirement metadata")
+        );
 
         let legacy_digest = legacy_v2_cleanup_resolve_digest(&plan, &proof).unwrap();
         let mut legacy_value = value.clone();
