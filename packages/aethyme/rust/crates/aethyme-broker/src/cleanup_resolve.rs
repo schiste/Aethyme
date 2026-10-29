@@ -1524,8 +1524,10 @@ impl Broker {
                 &head,
                 &item.branch_ref,
                 branch_tip.as_deref(),
-                checkout_branch_ref.as_deref(),
-                checkout_branch_tip.as_deref(),
+                (
+                    checkout_branch_ref.as_deref(),
+                    checkout_branch_tip.as_deref(),
+                ),
                 delivery_targets,
                 &context.ancestry_memo,
             )
@@ -2901,11 +2903,11 @@ fn recovery_root_proofs_for_plan_parts(
     head: &str,
     branch_ref: &str,
     branch_tip: Option<&str>,
-    checkout_branch_ref: Option<&str>,
-    checkout_branch_tip: Option<&str>,
+    checkout_branch: (Option<&str>, Option<&str>),
     delivery_targets: &[String],
     ancestry_memo: &PlanAncestryMemo,
 ) -> Result<Vec<RecoveryRootProof>, String> {
+    let (checkout_branch_ref, checkout_branch_tip) = checkout_branch;
     recovery_root_identities_for_plan_parts(
         head,
         branch_ref,
@@ -4931,16 +4933,15 @@ fn ensure_recovery_prerequisite_refs_installed(
         .filter(|reference| !actual.contains_key(&reference.ref_name))
         .map(|reference| ("create", reference))
         .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        if let Err(first_error) =
+    if !missing.is_empty()
+        && let Err(first_error) =
             recovery_prerequisite_ref_transaction(repository, &missing, deadline)
-        {
-            // Another writer may have installed the same complete set in the
-            // meantime. Accept only that exact result; never overwrite it.
-            let after = list_recovery_prerequisite_refs(repository, expected, deadline)?;
-            if after != expected_map {
-                return Err(first_error);
-            }
+    {
+        // Another writer may have installed the same complete set in the
+        // meantime. Accept only that exact result; never overwrite it.
+        let after = list_recovery_prerequisite_refs(repository, expected, deadline)?;
+        if after != expected_map {
+            return Err(first_error);
         }
     }
     let installed = list_recovery_prerequisite_refs(repository, expected, deadline)?;
@@ -6031,8 +6032,10 @@ mod tests {
             &head,
             &plan.branch_ref,
             plan.branch_tip.as_deref(),
-            plan.checkout_branch_ref.as_deref(),
-            plan.checkout_branch_tip.as_deref(),
+            (
+                plan.checkout_branch_ref.as_deref(),
+                plan.checkout_branch_tip.as_deref(),
+            ),
             &plan.delivery_targets,
             &PlanAncestryMemo::for_delivery_targets(&plan.delivery_targets, None),
         )
@@ -6986,7 +6989,10 @@ mod tests {
         assert_eq!(owned.prerequisite_targets, captured_targets);
         assert_eq!(
             owned.prerequisite_refs,
-            serde_json::from_value(manifest["prerequisite_refs"].clone()).unwrap()
+            serde_json::from_value::<Vec<RecoveryArchivePrerequisiteRef>>(
+                manifest["prerequisite_refs"].clone()
+            )
+            .unwrap()
         );
         assert!(
             recovery_bundle_required(&plan),
@@ -7391,8 +7397,10 @@ mod tests {
             &plan.head,
             &plan.branch_ref,
             plan.branch_tip.as_deref(),
-            plan.checkout_branch_ref.as_deref(),
-            plan.checkout_branch_tip.as_deref(),
+            (
+                plan.checkout_branch_ref.as_deref(),
+                plan.checkout_branch_tip.as_deref(),
+            ),
             &plan.delivery_targets,
             &PlanAncestryMemo::for_delivery_targets(&plan.delivery_targets, None),
         )

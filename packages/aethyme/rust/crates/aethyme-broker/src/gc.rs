@@ -1330,6 +1330,9 @@ mod recovery_archive_minimum_age_tests {
             }],
             created_at_ms: 100,
             minimum_archive_retention_ms: Some(1_296_000_000),
+            prerequisite_refs: Vec::new(),
+            retirement_digest: None,
+            prerequisite_targets: Vec::new(),
             holds_uncommitted: false,
         };
         assert!(!recovery_archive_minimum_age_elapsed(&archive, 99));
