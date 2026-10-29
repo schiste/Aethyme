@@ -72,7 +72,12 @@ impl DriverContext<'_> {
     }
 
     pub fn vars(&self) -> BTreeMap<String, String> {
-        exec::environment_variables(self.environment, self.component, self.bindings, self.attempt)
+        exec::environment_variables(
+            self.environment,
+            self.component,
+            self.bindings,
+            self.attempt,
+        )
     }
 
     fn cwd(&self) -> &Path {
@@ -105,7 +110,11 @@ impl DriverContext<'_> {
     }
 
     fn container_name(&self) -> String {
-        format!("{}-{}", project_name(&self.bindings.namespace), self.component.name)
+        format!(
+            "{}-{}",
+            project_name(&self.bindings.namespace),
+            self.component.name
+        )
     }
 }
 
@@ -126,7 +135,11 @@ pub trait Driver {
     /// Start and return the identity to record before anything else happens.
     fn start(&self, ctx: &DriverContext<'_>) -> Result<ComponentIdentity, DriverError>;
     /// Stop what `identity` names, releasing its memory but keeping its data.
-    fn stop(&self, ctx: &DriverContext<'_>, identity: &ComponentIdentity) -> Result<(), DriverError>;
+    fn stop(
+        &self,
+        ctx: &DriverContext<'_>,
+        identity: &ComponentIdentity,
+    ) -> Result<(), DriverError>;
     /// Remove everything this component created. Idempotent.
     fn destroy(
         &self,
@@ -164,7 +177,9 @@ fn probe_spec(ctx: &DriverContext<'_>, spec: &HealthSpec) -> Health {
             PROBE_TIMEOUT.max(Duration::from_millis(spec.interval_ms)),
             64 * 1024,
         ) {
-            Ok(crate::bounded_output::LimitedOutput::Completed(output)) if output.status.success() => {
+            Ok(crate::bounded_output::LimitedOutput::Completed(output))
+                if output.status.success() =>
+            {
                 Health::Healthy
             }
             Ok(crate::bounded_output::LimitedOutput::Completed(output)) => {
@@ -194,7 +209,11 @@ fn probe_spec(ctx: &DriverContext<'_>, spec: &HealthSpec) -> Health {
     let mut head = [0u8; 64];
     let read = stream.read(&mut head).unwrap_or(0);
     let line = String::from_utf8_lossy(&head[..read]);
-    match line.split_whitespace().nth(1).and_then(|code| code.parse::<u16>().ok()) {
+    match line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+    {
         Some(code) if (200..400).contains(&code) => Health::Healthy,
         Some(code) => Health::NotYet(format!("GET {path} answered {code}")),
         None => Health::NotYet(format!("GET {path}: no HTTP status line")),
@@ -211,7 +230,12 @@ pub fn wait_healthy(
         .component
         .health
         .as_ref()
-        .map(|h| (Duration::from_secs(h.timeout_seconds), Duration::from_millis(h.interval_ms)))
+        .map(|h| {
+            (
+                Duration::from_secs(h.timeout_seconds),
+                Duration::from_millis(h.interval_ms),
+            )
+        })
         .unwrap_or((Duration::from_secs(0), Duration::from_millis(100)));
     let deadline = Instant::now() + timeout;
     loop {
@@ -257,8 +281,13 @@ impl Driver for ProcessDriver {
             // Its own group, so stop signals exactly what this start created.
             command.process_group(0);
         }
-        append_log(&ctx.log(), &format!("[aethyme] {}: start\n", ctx.component.name));
-        let mut child = command.spawn().map_err(io(format!("start {}", ctx.component.name)))?;
+        append_log(
+            &ctx.log(),
+            &format!("[aethyme] {}: start\n", ctx.component.name),
+        );
+        let mut child = command
+            .spawn()
+            .map_err(io(format!("start {}", ctx.component.name)))?;
         let pid = child.id() as i32;
         let identity = ProcessIdentity::capture(pid);
         // Reap the child whenever it exits so it never lingers as a zombie of
@@ -275,7 +304,11 @@ impl Driver for ProcessDriver {
         }
     }
 
-    fn stop(&self, ctx: &DriverContext<'_>, identity: &ComponentIdentity) -> Result<(), DriverError> {
+    fn stop(
+        &self,
+        ctx: &DriverContext<'_>,
+        identity: &ComponentIdentity,
+    ) -> Result<(), DriverError> {
         let ComponentIdentity::Process(process) = identity else {
             return Err(mismatched(ctx, identity));
         };
@@ -293,14 +326,20 @@ impl Driver for ProcessDriver {
             // A declared stop runs first; signals follow only if it did not
             // finish the job.
             if let Err(error) = ctx.hook("stop", text) {
-                append_log(&ctx.log(), &format!("[aethyme] stop hook failed: {error}\n"));
+                append_log(
+                    &ctx.log(),
+                    &format!("[aethyme] stop hook failed: {error}\n"),
+                );
             }
         }
-        terminate_group(process.pgid, Duration::from_secs(ctx.component.stop_grace_seconds))
-            .map_err(|detail| DriverError::Unproven {
-                component: ctx.component.name.clone(),
-                detail,
-            })
+        terminate_group(
+            process.pgid,
+            Duration::from_secs(ctx.component.stop_grace_seconds),
+        )
+        .map_err(|detail| DriverError::Unproven {
+            component: ctx.component.name.clone(),
+            detail,
+        })
     }
 
     fn destroy(
@@ -462,18 +501,33 @@ impl ComposeDriver {
 
     /// Container ids carrying the project's label, under either the Docker
     /// Compose or the podman-compose label.
-    fn project_ids(engine: &EngineCli, ctx: &DriverContext<'_>, project: &str) -> Result<Vec<String>, DriverError> {
+    fn project_ids(
+        engine: &EngineCli,
+        ctx: &DriverContext<'_>,
+        project: &str,
+    ) -> Result<Vec<String>, DriverError> {
         let mut ids = Vec::new();
         for label in ["com.docker.compose.project", "io.podman.compose.project"] {
             let filter = format!("label={label}={project}");
             let out = engine.run(
-                &["ps", "-a", "--no-trunc", "--filter", &filter, "--format", "{{.ID}}"],
+                &[
+                    "ps",
+                    "-a",
+                    "--no-trunc",
+                    "--filter",
+                    &filter,
+                    "--format",
+                    "{{.ID}}",
+                ],
                 ctx.cwd(),
                 &BTreeMap::new(),
             )?;
             for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
                 let id = FullContainerId::parse(line).ok_or_else(|| {
-                    DriverError::Engine(format!("{} printed a non-full container id {line:?}", engine.engine.as_str()))
+                    DriverError::Engine(format!(
+                        "{} printed a non-full container id {line:?}",
+                        engine.engine.as_str()
+                    ))
                 })?;
                 if !ids.contains(&id.as_str().to_string()) {
                     ids.push(id.as_str().to_string());
@@ -485,7 +539,11 @@ impl ComposeDriver {
 
     /// An override file adding Aethyme's labels to every service, so leaked
     /// containers stay discoverable by `broker doctor`.
-    fn labels_override(compose: &ComposeCli, ctx: &DriverContext<'_>, project: &str) -> Result<PathBuf, DriverError> {
+    fn labels_override(
+        compose: &ComposeCli,
+        ctx: &DriverContext<'_>,
+        project: &str,
+    ) -> Result<PathBuf, DriverError> {
         let mut args: Vec<String> = vec!["-p".into(), project.into()];
         args.extend(Self::file_args(ctx));
         args.extend(["config".into(), "--services".into()]);
@@ -495,10 +553,16 @@ impl ComposeDriver {
         for service in services.lines().map(str::trim).filter(|s| !s.is_empty()) {
             yaml.push_str(&format!("  {}:\n    labels:\n", yaml_scalar(service)));
             for (key, value) in ctx.labels() {
-                yaml.push_str(&format!("      {}: {}\n", yaml_scalar(key), yaml_scalar(&value)));
+                yaml.push_str(&format!(
+                    "      {}: {}\n",
+                    yaml_scalar(key),
+                    yaml_scalar(&value)
+                ));
             }
         }
-        let path = ctx.directory.join(format!("{}.compose-labels.yml", ctx.component.name));
+        let path = ctx
+            .directory
+            .join(format!("{}.compose-labels.yml", ctx.component.name));
         std::fs::create_dir_all(&ctx.directory).map_err(io("create environment directory"))?;
         std::fs::write(&path, yaml).map_err(io("write compose label override"))?;
         Ok(path)
@@ -520,7 +584,14 @@ impl Driver for ComposeDriver {
         args.extend(["up".into(), "-d".into()]);
         args.extend(ctx.component.services.iter().cloned());
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        append_log(&ctx.log(), &format!("[aethyme] {}: compose {}\n", ctx.component.name, args.join(" ")));
+        append_log(
+            &ctx.log(),
+            &format!(
+                "[aethyme] {}: compose {}\n",
+                ctx.component.name,
+                args.join(" ")
+            ),
+        );
         let started = compose.run(&refs, ctx.cwd(), &ctx.vars());
         // Record whatever exists even if `up` failed half-way: destroy must
         // be able to find it.
@@ -533,8 +604,16 @@ impl Driver for ComposeDriver {
         })
     }
 
-    fn stop(&self, ctx: &DriverContext<'_>, identity: &ComponentIdentity) -> Result<(), DriverError> {
-        let ComponentIdentity::Containers { project: Some(project), .. } = identity else {
+    fn stop(
+        &self,
+        ctx: &DriverContext<'_>,
+        identity: &ComponentIdentity,
+    ) -> Result<(), DriverError> {
+        let ComponentIdentity::Containers {
+            project: Some(project),
+            ..
+        } = identity
+        else {
             return Err(mismatched(ctx, identity));
         };
         let (_, compose) = Self::engine(ctx)?;
@@ -548,7 +627,10 @@ impl Driver for ComposeDriver {
         identity: Option<&ComponentIdentity>,
     ) -> Result<(), DriverError> {
         let project = match identity {
-            Some(ComponentIdentity::Containers { project: Some(project), .. }) => project.clone(),
+            Some(ComponentIdentity::Containers {
+                project: Some(project),
+                ..
+            }) => project.clone(),
             _ => project_name(&ctx.bindings.namespace),
         };
         let (engine, compose) = Self::engine(ctx)?;
@@ -569,12 +651,19 @@ impl Driver for ComposeDriver {
         if let Some(text) = &ctx.component.commands.destroy {
             ctx.hook("destroy", text)?;
         }
-        let _ = std::fs::remove_file(ctx.directory.join(format!("{}.compose-labels.yml", ctx.component.name)));
+        let _ = std::fs::remove_file(
+            ctx.directory
+                .join(format!("{}.compose-labels.yml", ctx.component.name)),
+        );
         Ok(())
     }
 
     fn observe(&self, ctx: &DriverContext<'_>, identity: &ComponentIdentity) -> Observation {
-        let ComponentIdentity::Containers { project: Some(project), .. } = identity else {
+        let ComponentIdentity::Containers {
+            project: Some(project),
+            ..
+        } = identity
+        else {
             return Observation::Unproven;
         };
         match Self::engine(ctx).and_then(|(engine, _)| Self::project_ids(&engine, ctx, project)) {
@@ -619,14 +708,26 @@ impl Driver for ContainerDriver {
             .map(|(k, v)| format!("{k}={v}\n"))
             .collect();
         std::fs::write(&env_file, body).map_err(io("write container env file"))?;
-        crate::host_state::protect_host_state_path(&env_file, false).map_err(io("protect env file"))?;
+        crate::host_state::protect_host_state_path(&env_file, false)
+            .map_err(io("protect env file"))?;
         args.extend(["--env-file".into(), env_file.to_string_lossy().into_owned()]);
         args.push(image.to_string());
         args.extend(ctx.component.args.iter().cloned());
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        append_log(&ctx.log(), &format!("[aethyme] {}: {} run {image}\n", ctx.component.name, engine.engine.as_str()));
+        append_log(
+            &ctx.log(),
+            &format!(
+                "[aethyme] {}: {} run {image}\n",
+                ctx.component.name,
+                engine.engine.as_str()
+            ),
+        );
         let out = engine.run(&refs, ctx.cwd(), &BTreeMap::new())?;
-        let printed = out.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or_default();
+        let printed = out
+            .lines()
+            .map(str::trim)
+            .rfind(|l| !l.is_empty())
+            .unwrap_or_default();
         let id = match engine.engine {
             // Apple's `container` identifies containers by name.
             Engine::Container => printed.to_string(),
@@ -646,7 +747,11 @@ impl Driver for ContainerDriver {
         })
     }
 
-    fn stop(&self, ctx: &DriverContext<'_>, identity: &ComponentIdentity) -> Result<(), DriverError> {
+    fn stop(
+        &self,
+        ctx: &DriverContext<'_>,
+        identity: &ComponentIdentity,
+    ) -> Result<(), DriverError> {
         let ComponentIdentity::Containers { engine, ids, .. } = identity else {
             return Err(mismatched(ctx, identity));
         };
@@ -665,7 +770,15 @@ impl Driver for ContainerDriver {
         if let Some(ComponentIdentity::Containers { engine, ids, .. }) = identity {
             let engine = resolve(Some(*engine))?;
             for id in ids {
-                if self.observe(ctx, &ComponentIdentity::Containers { engine: engine.engine, project: None, ids: vec![id.clone()] }) != Observation::Gone {
+                if self.observe(
+                    ctx,
+                    &ComponentIdentity::Containers {
+                        engine: engine.engine,
+                        project: None,
+                        ids: vec![id.clone()],
+                    },
+                ) != Observation::Gone
+                {
                     engine.run(&engine.remove_args(id), ctx.cwd(), &BTreeMap::new())?;
                 }
             }
@@ -694,6 +807,10 @@ impl Driver for ContainerDriver {
                 Err(_) => return Observation::Unproven,
             }
         }
-        if any { Observation::Alive } else { Observation::Gone }
+        if any {
+            Observation::Alive
+        } else {
+            Observation::Gone
+        }
     }
 }

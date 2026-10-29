@@ -45,9 +45,7 @@ pub fn resolve(declared: Option<Engine>) -> Result<EngineCli, DriverError> {
     if let Some(engine) = declared {
         return find_on_path(engine.as_str())
             .map(|program| EngineCli { engine, program })
-            .ok_or_else(|| {
-                DriverError::Engine(format!("{} is not on PATH", engine.as_str()))
-            });
+            .ok_or_else(|| DriverError::Engine(format!("{} is not on PATH", engine.as_str())));
     }
     if let Ok(requested) = std::env::var(CONTAINER_RUNTIME_ENV) {
         let requested = requested.trim();
@@ -59,7 +57,9 @@ pub fn resolve(declared: Option<Engine>) -> Result<EngineCli, DriverError> {
                 find_on_path(requested)
             }
             .ok_or_else(|| {
-                DriverError::Engine(format!("{CONTAINER_RUNTIME_ENV}={requested} is not executable"))
+                DriverError::Engine(format!(
+                    "{CONTAINER_RUNTIME_ENV}={requested} is not executable"
+                ))
             })?;
             let name = program
                 .file_name()
@@ -108,7 +108,10 @@ impl EngineCli {
             program: self.program.clone(),
             prefix: vec!["compose".into()],
         };
-        if plugin.run(&["version"], Path::new("/"), &BTreeMap::new()).is_ok() {
+        if plugin
+            .run(&["version"], Path::new("/"), &BTreeMap::new())
+            .is_ok()
+        {
             return Ok(plugin);
         }
         let standalone = match self.engine {
@@ -147,44 +150,46 @@ fn run_program(
     cwd: &Path,
     vars: &BTreeMap<String, String>,
 ) -> Result<String, DriverError> {
-        let mut command = Command::new(program);
-        command.args(args).current_dir(cwd).env_clear();
-        for variable in super::exec::INHERITED_VARIABLES
-            .iter()
-            .copied()
-            .chain(["DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "CONTAINER_HOST", "XDG_RUNTIME_DIR"])
-        {
-            if let Some(value) = std::env::var_os(variable) {
-                command.env(variable, value);
-            }
+    let mut command = Command::new(program);
+    command.args(args).current_dir(cwd).env_clear();
+    for variable in super::exec::INHERITED_VARIABLES.iter().copied().chain([
+        "DOCKER_HOST",
+        "DOCKER_CONTEXT",
+        "DOCKER_CONFIG",
+        "CONTAINER_HOST",
+        "XDG_RUNTIME_DIR",
+    ]) {
+        if let Some(value) = std::env::var_os(variable) {
+            command.env(variable, value);
         }
-        command.envs(vars);
-        let label = format!("{name} {}", args.join(" "));
-        let outcome = crate::bounded_output::output_limited_in_owned_group(
-            &mut command,
-            ENGINE_BUDGET,
-            ENGINE_OUTPUT_LIMIT,
-        )
-        .map_err(|error| DriverError::Engine(format!("{label}: {error}")))?;
-        match outcome {
-            crate::bounded_output::LimitedOutput::Completed(output) if output.status.success() => {
-                Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-            }
-            crate::bounded_output::LimitedOutput::Completed(output) => Err(DriverError::Engine(
-                format!(
-                    "{label} failed ({}): {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-            )),
-            crate::bounded_output::LimitedOutput::Deadline => Err(DriverError::Engine(format!(
-                "{label} did not answer within {}s",
-                ENGINE_BUDGET.as_secs()
-            ))),
-            crate::bounded_output::LimitedOutput::OutputLimit => {
-                Err(DriverError::Engine(format!("{label}: output limit exceeded")))
-            }
+    }
+    command.envs(vars);
+    let label = format!("{name} {}", args.join(" "));
+    let outcome = crate::bounded_output::output_limited_in_owned_group(
+        &mut command,
+        ENGINE_BUDGET,
+        ENGINE_OUTPUT_LIMIT,
+    )
+    .map_err(|error| DriverError::Engine(format!("{label}: {error}")))?;
+    match outcome {
+        crate::bounded_output::LimitedOutput::Completed(output) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
         }
+        crate::bounded_output::LimitedOutput::Completed(output) => {
+            Err(DriverError::Engine(format!(
+                "{label} failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+        crate::bounded_output::LimitedOutput::Deadline => Err(DriverError::Engine(format!(
+            "{label} did not answer within {}s",
+            ENGINE_BUDGET.as_secs()
+        ))),
+        crate::bounded_output::LimitedOutput::OutputLimit => Err(DriverError::Engine(format!(
+            "{label}: output limit exceeded"
+        ))),
+    }
 }
 
 impl ComposeCli {

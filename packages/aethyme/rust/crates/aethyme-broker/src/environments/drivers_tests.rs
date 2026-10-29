@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::compile::{CompileContext, CompiledEnvironment, EnvironmentOwner, compile};
-use super::drivers::{ComponentIdentity, DriverContext, Health, driver_for, probe, project_name, wait_healthy};
+use super::drivers::{
+    ComponentIdentity, DriverContext, Health, driver_for, probe, project_name, wait_healthy,
+};
 use super::engine::resolve;
 use super::exec::{Bindings, DriverError, environment_variables, parse_receipt};
 use super::identity::{Observation, ProcessIdentity};
@@ -124,7 +126,10 @@ fn process_conformance_start_health_stop_start_destroy_leaves_nothing() {
     assert_eq!(driver.observe(&ctx, &first), Observation::Alive);
     driver.stop(&ctx, &first).unwrap();
     assert_eq!(driver.observe(&ctx, &first), Observation::Gone);
-    assert!(matches!(probe(&ctx), Health::NotYet(_)), "nothing listens after stop");
+    assert!(
+        matches!(probe(&ctx), Health::NotYet(_)),
+        "nothing listens after stop"
+    );
 
     let second = driver.start(&ctx).unwrap();
     wait_healthy(driver.as_ref(), &ctx, &second).unwrap();
@@ -154,7 +159,10 @@ start = "trap '' TERM; while :; do sleep 1; done"
     std::thread::sleep(Duration::from_millis(200));
     let started = std::time::Instant::now();
     driver.stop(&ctx, &identity).unwrap();
-    assert!(started.elapsed() >= Duration::from_secs(1), "SIGTERM grace was honoured");
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "SIGTERM grace was honoured"
+    );
     assert_eq!(driver.observe(&ctx, &identity), Observation::Gone);
 }
 
@@ -180,7 +188,10 @@ fn an_unproven_identity_is_never_signalled() {
         Err(error @ DriverError::Unproven { .. }) => assert_eq!(error.code(), "identity_unproven"),
         other => panic!("{other:?}"),
     }
-    assert!(victim.try_wait().unwrap().is_none(), "the unrelated process is untouched");
+    assert!(
+        victim.try_wait().unwrap().is_none(),
+        "the unrelated process is untouched"
+    );
     victim.kill().unwrap();
     victim.wait().unwrap();
 }
@@ -204,7 +215,9 @@ health = { command = "false", timeout_seconds = 5, interval_ms = 50 }
         .start(&ctx)
         .and_then(|identity| wait_healthy(driver.as_ref(), &ctx, &identity));
     match result {
-        Err(DriverError::StartExited { tail, .. }) => assert!(tail.contains("boom-from-start"), "{tail}"),
+        Err(DriverError::StartExited { tail, .. }) => {
+            assert!(tail.contains("boom-from-start"), "{tail}")
+        }
         other => panic!("{other:?}"),
     }
 }
@@ -234,10 +247,16 @@ destroy = "rm -f db.created"
     let driver = driver_for(ctx.component.runtime);
     let receipt = driver.provision(&ctx).unwrap().expect("receipt");
     assert_eq!(receipt["database"], "env_1");
-    assert_eq!(receipt["leak"], "none", "only allowlisted and pass_env variables are inherited");
+    assert_eq!(
+        receipt["leak"], "none",
+        "only allowlisted and pass_env variables are inherited"
+    );
     assert_eq!(receipt["passed"], "through");
     assert_eq!(receipt["literal"], "yes");
-    assert!(harness.worktree.path().join("db.created").exists(), "hooks run from the worktree root");
+    assert!(
+        harness.worktree.path().join("db.created").exists(),
+        "hooks run from the worktree root"
+    );
     driver.destroy(&ctx, None).unwrap();
     assert!(!harness.worktree.path().join("db.created").exists());
 }
@@ -312,7 +331,10 @@ fn variables_name_the_environment_ports_urls_and_receipts() {
     let ctx = harness.ctx("srv");
     let vars = environment_variables(ctx.environment, ctx.component, ctx.bindings, 2);
     assert_eq!(vars["AETHYME_ENV_PORT_SRV"], port.to_string());
-    assert_eq!(vars["AETHYME_ENV_URL_SRV"], format!("http://127.0.0.1:{port}"));
+    assert_eq!(
+        vars["AETHYME_ENV_URL_SRV"],
+        format!("http://127.0.0.1:{port}")
+    );
     assert_eq!(vars["AETHYME_ENV_RECEIPT_SRV"], "{\"k\":\"v\"}");
     assert_eq!(vars["AETHYME_ENV_HOOK_ATTEMPT"], "2");
     assert_eq!(vars["AETHYME_ENV_NAMESPACE"], ctx.bindings.namespace);
@@ -331,7 +353,9 @@ fn engine_tests_enabled() -> bool {
 #[test]
 fn container_conformance_when_an_engine_is_enabled() {
     if !engine_tests_enabled() {
-        eprintln!("SKIP container conformance: set AETHYME_ENV_ENGINE_TESTS=1 with docker or podman running");
+        eprintln!(
+            "SKIP container conformance: set AETHYME_ENV_ENGINE_TESTS=1 with docker or podman running"
+        );
         return;
     }
     let Ok(engine) = resolve(None) else {
@@ -339,7 +363,10 @@ fn container_conformance_when_an_engine_is_enabled() {
         return;
     };
     if !engine.available() {
-        eprintln!("SKIP container conformance: {} is not answering", engine.engine.as_str());
+        eprintln!(
+            "SKIP container conformance: {} is not answering",
+            engine.engine.as_str()
+        );
         return;
     }
     let text = r#"
@@ -365,7 +392,9 @@ args = ["sleep", "300"]
 #[test]
 fn compose_conformance_when_an_engine_is_enabled() {
     if !engine_tests_enabled() {
-        eprintln!("SKIP compose conformance: set AETHYME_ENV_ENGINE_TESTS=1 with docker or podman running");
+        eprintln!(
+            "SKIP compose conformance: set AETHYME_ENV_ENGINE_TESTS=1 with docker or podman running"
+        );
         return;
     }
     let Ok(engine) = resolve(None) else {
@@ -373,7 +402,10 @@ fn compose_conformance_when_an_engine_is_enabled() {
         return;
     };
     if !engine.available() {
-        eprintln!("SKIP compose conformance: {} is not answering", engine.engine.as_str());
+        eprintln!(
+            "SKIP compose conformance: {} is not answering",
+            engine.engine.as_str()
+        );
         return;
     }
     let text = r#"
@@ -400,4 +432,3 @@ file = "compose.yml"
     driver.destroy(&ctx, Some(&second)).unwrap();
     assert_eq!(driver.observe(&ctx, &second), Observation::Gone);
 }
-

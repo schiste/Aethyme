@@ -120,7 +120,10 @@ pub fn environment_variables(
         bindings.worktree.to_string_lossy().into_owned(),
     );
     vars.insert("AETHYME_ENV_COMPONENT".into(), component.name.clone());
-    vars.insert("AETHYME_ENV_HOOK_ATTEMPT".into(), attempt.max(1).to_string());
+    vars.insert(
+        "AETHYME_ENV_HOOK_ATTEMPT".into(),
+        attempt.max(1).to_string(),
+    );
     for (name, port) in &bindings.ports {
         let suffix = env_suffix(name);
         vars.insert(format!("AETHYME_ENV_PORT_{suffix}"), port.to_string());
@@ -143,7 +146,12 @@ pub fn environment_variables(
 
 /// `sh -c <text>` from `cwd` with a cleared environment: the inherited
 /// allowlist, then `pass_env`, then `vars`.
-pub fn command(text: &str, cwd: &Path, pass_env: &[String], vars: &BTreeMap<String, String>) -> Command {
+pub fn command(
+    text: &str,
+    cwd: &Path,
+    pass_env: &[String],
+    vars: &BTreeMap<String, String>,
+) -> Command {
     let mut command = Command::new("/bin/sh");
     command.arg("-c").arg(text).current_dir(cwd).env_clear();
     for name in INHERITED_VARIABLES
@@ -176,20 +184,32 @@ pub fn run_hook(
     timeout: Duration,
 ) -> Result<HookOutcome, DriverError> {
     let mut command = command(text, cwd, pass_env, vars);
-    let outcome =
-        crate::bounded_output::output_limited_in_owned_group(&mut command, timeout, HOOK_OUTPUT_LIMIT)
-            .map_err(io(format!("run {label}")))?;
+    let outcome = crate::bounded_output::output_limited_in_owned_group(
+        &mut command,
+        timeout,
+        HOOK_OUTPUT_LIMIT,
+    )
+    .map_err(io(format!("run {label}")))?;
     let output = match outcome {
         crate::bounded_output::LimitedOutput::Completed(output) => output,
         crate::bounded_output::LimitedOutput::Deadline => {
-            append_log(log, &format!("[aethyme] {label}: timed out after {}s\n", timeout.as_secs()));
+            append_log(
+                log,
+                &format!(
+                    "[aethyme] {label}: timed out after {}s\n",
+                    timeout.as_secs()
+                ),
+            );
             return Err(DriverError::Timeout {
                 label: label.into(),
                 seconds: timeout.as_secs(),
             });
         }
         crate::bounded_output::LimitedOutput::OutputLimit => {
-            append_log(log, &format!("[aethyme] {label}: output exceeded {HOOK_OUTPUT_LIMIT} bytes\n"));
+            append_log(
+                log,
+                &format!("[aethyme] {label}: output exceeded {HOOK_OUTPUT_LIMIT} bytes\n"),
+            );
             return Err(DriverError::HookFailed {
                 label: label.into(),
                 exit: "output limit".into(),
