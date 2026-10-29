@@ -6363,6 +6363,7 @@ impl Broker {
         let mut passes = 0usize;
         let mut no_progress_passes = 0usize;
         let mut removed_checkouts = 0usize;
+        let mut seen_progress_markers = BTreeSet::new();
         loop {
             let remaining = max_duration.map(|limit| limit.saturating_sub(started_at.elapsed()));
             if remaining.is_some_and(|remaining| remaining.is_zero()) {
@@ -6375,10 +6376,8 @@ impl Broker {
             let pass_budget = remaining
                 .map(|remaining| remaining.min(AUTO_CHECKOUT_CLEANUP_WORKER_PASS_BUDGET))
                 .or(Some(AUTO_CHECKOUT_CLEANUP_WORKER_PASS_BUDGET));
-            let progress_before = self
-                .store()
-                .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)?
-                .map_or(0, |state| state.progress_sequence);
+            let progress_before = self.auto_cleanup_progress_marker()?;
+            seen_progress_markers.insert(progress_before);
             let pass = match cleanup_pass(self, request_generation, pass_budget) {
                 Ok(pass) => pass,
                 Err(error) => {
@@ -6388,11 +6387,9 @@ impl Broker {
                     return Ok(());
                 }
             };
-            let progress_after = self
-                .store()
-                .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)?
-                .map_or(0, |state| state.progress_sequence);
-            let discovery_progressed = progress_after > progress_before;
+            let progress_after = self.auto_cleanup_progress_marker()?;
+            let discovery_progressed =
+                progress_after != progress_before && seen_progress_markers.insert(progress_after);
             let Some((report, generation_completed)) = pass else {
                 no_progress_passes = no_progress_passes.saturating_add(1);
                 if no_progress_passes >= ARTIFACT_SWEEP_WORKER_NO_PROGRESS_PASSES {
@@ -10098,44 +10095,65 @@ mod tests {
         let storage = crate::test_storage::TestStorage::new();
         let mut broker = storage.open(root).unwrap();
         let connection = rusqlite::Connection::open(broker.store().db_path()).unwrap();
+        let last_activity_at = now_ms();
         for index in 0..129 {
+            let worktree = root.join(format!("active-checkout-{index}"));
+            std::fs::create_dir_all(&worktree).unwrap();
             connection
                 .execute(
                     "INSERT INTO sessions (worktree_path, branch, origin, status,
-                     created_at, updated_at, last_activity_at)
-                 VALUES (?1, ?2, 'spawned', 'active', 1, 1, 1)",
+                     cleanup_state, created_at, updated_at, last_activity_at)
+                 VALUES (?1, ?2, 'spawned', 'active', 'open', ?3, ?3, ?3)",
                     rusqlite::params![
-                        root.join(format!("unmaterialized-{index}"))
-                            .to_string_lossy(),
+                        worktree.to_string_lossy(),
                         format!("agent/history-{index}"),
+                        last_activity_at,
                     ],
                 )
                 .unwrap();
         }
         drop(connection);
+        broker
+            .artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY, "1")
+            .unwrap();
+        broker
+            .artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY, "0")
+            .unwrap();
         let mut passes = 0;
+        let mut removed = 0usize;
         broker
             .run_auto_checkout_cleanup_recovery_worker_loop(
                 1,
                 Some(64),
                 Some(Duration::from_secs(60)),
-                |broker, _, remaining| {
+                |broker, generation, remaining| {
                     passes += 1;
-                    let state = broker
-                        .refresh_cleanup_cohort_aliases(Some(
-                            Instant::now() + remaining.unwrap_or(Duration::from_secs(30)),
-                        ))?
-                        .expect("the inventory has a persisted checkpoint");
-                    Ok(Some((
-                        crate::auto_cleanup::AutoCleanupReport::default(),
-                        state.complete,
-                    )))
+                    let Some(remaining) = remaining else {
+                        return Ok(None);
+                    };
+                    let pass = broker.auto_checkout_cleanup_recovery_pass(
+                        generation,
+                        Instant::now() + remaining,
+                    )?;
+                    if let Some((report, _)) = &pass {
+                        removed = removed.saturating_add(report.removed.len());
+                    }
+                    Ok(pass)
                 },
             )
             .unwrap();
         assert!(
             passes > ARTIFACT_SWEEP_WORKER_NO_PROGRESS_PASSES,
             "discovery must continue beyond the old zero-removal backoff threshold"
+        );
+        assert_eq!(removed, 0, "the fixture must exercise discovery only");
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("1"),
+            "the production cleanup planner must reach the end of all group pages"
         );
         let state = broker
             .store()
