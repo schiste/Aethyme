@@ -497,7 +497,7 @@ fn a_profile_compiles_to_a_reservation_and_a_separate_capacity_request() {
     let file = parse(NODE_COMPOSE);
     let host = HostEnvironmentsFile::default();
     let isolated = compile(&file, &host, "isolated", "env.toml", &context()).unwrap();
-    let reservation = isolated.reservation_request(None);
+    let reservation = isolated.reservation_request(None, 0);
     let kinds: Vec<(&str, &str)> = reservation
         .resources
         .iter()
@@ -524,7 +524,7 @@ fn a_profile_compiles_to_a_reservation_and_a_separate_capacity_request() {
             .any(|r| matches!(r.resource, HostResourceKind::Capacity { .. })),
         "parking must be able to release capacity without touching the reservation"
     );
-    let capacity = isolated.capacity_request(None).expect("capacity");
+    let capacity = isolated.capacity_request(None, 0).expect("capacity");
     assert_eq!(capacity.resources.len(), 1);
     assert_eq!(capacity.resources[0].key, CAPACITY_KEY);
     match &capacity.resources[0].resource {
@@ -538,7 +538,7 @@ fn a_profile_compiles_to_a_reservation_and_a_separate_capacity_request() {
 
     let zero = compile(&file, &host, "static", "env.toml", &context()).unwrap();
     assert!(
-        zero.capacity_request(None).is_none(),
+        zero.capacity_request(None, 0).is_none(),
         "zero units never waits for capacity"
     );
 }
@@ -558,7 +558,7 @@ fn compiled_requests_are_accepted_and_planned_by_the_coordinator() {
         &context(),
     )
     .unwrap();
-    let reservation = compiled.reservation_request(None);
+    let reservation = compiled.reservation_request(None, 0);
     let first = coordinator.plan(&reservation).expect("valid reservation");
     let again = coordinator.plan(&reservation).unwrap();
     assert!(first.available, "{first:?}");
@@ -576,7 +576,7 @@ fn compiled_requests_are_accepted_and_planned_by_the_coordinator() {
         "{namespace:?}"
     );
     let capacity = coordinator
-        .plan(&compiled.capacity_request(None).unwrap())
+        .plan(&compiled.capacity_request(None, 0).unwrap())
         .expect("valid capacity");
     assert!(capacity.available);
     crate::resources::validate_host_resource_requirements(

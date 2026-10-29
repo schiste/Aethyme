@@ -357,7 +357,15 @@ fn snapshot_digest(compiled: &CompiledEnvironment) -> String {
 impl CompiledEnvironment {
     /// Namespace plus one port per listening component. Held from creation
     /// until destroy is confirmed.
-    pub fn reservation_request(&self, holder_pid: Option<u32>) -> HostResourceRequest {
+    ///
+    /// `instance` makes the request id unique per acquisition: the
+    /// coordinator never reuses a request id once its lease is released, so
+    /// a re-created environment (or a second wake) needs a new one.
+    pub fn reservation_request(
+        &self,
+        holder_pid: Option<u32>,
+        instance: u64,
+    ) -> HostResourceRequest {
         let mut resources = vec![HostResourceRequirement {
             key: NAMESPACE_KEY.into(),
             resource: HostResourceKind::Namespace {
@@ -377,7 +385,7 @@ impl CompiledEnvironment {
         }
         HostResourceRequest {
             schema_version: HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
-            request_id: format!("{}:reservation", self.env_id),
+            request_id: format!("{}:reservation:{instance}", self.env_id),
             repository: self.repository.clone(),
             worktree_fingerprint: self.worktree_fingerprint.clone(),
             run_id: self.env_id.clone(),
@@ -389,11 +397,15 @@ impl CompiledEnvironment {
 
     /// Pool units, held only while the environment runs. `None` for a
     /// zero-unit profile, which never waits for capacity.
-    pub fn capacity_request(&self, holder_pid: Option<u32>) -> Option<HostResourceRequest> {
+    pub fn capacity_request(
+        &self,
+        holder_pid: Option<u32>,
+        instance: u64,
+    ) -> Option<HostResourceRequest> {
         let pool = self.pool.as_ref()?;
         Some(HostResourceRequest {
             schema_version: HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
-            request_id: format!("{}:capacity", self.env_id),
+            request_id: format!("{}:capacity:{instance}", self.env_id),
             repository: self.repository.clone(),
             worktree_fingerprint: self.worktree_fingerprint.clone(),
             run_id: self.env_id.clone(),

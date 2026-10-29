@@ -1167,6 +1167,9 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                 )));
             }
             let mut grant: crate::HostResourceGrant = read_resource_json(&path)?;
+            if action == "release" {
+                refuse_environment_owned(&grant.lease.lease_id, "release")?;
+            }
             grant.lease = if action == "renew" {
                 let ttl = parsed.ttl_seconds.ok_or_else(|| {
                     UsageError::Message("resources renew requires --ttl <seconds>".into())
@@ -1412,6 +1415,7 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                         "--confirm must be the full numeric generation; {RESOURCES_RECONCILE_USAGE}"
                     ))
                 })?;
+            refuse_environment_owned(lease_id, "reconcile")?;
             let lease = coordinator.reconcile(lease_id, generation)?;
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&lease)?);
@@ -1426,6 +1430,26 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
     Ok(())
+}
+
+/// Leases an environment owns are released only through the environment,
+/// after its destroy succeeded (#1211). Releasing or reconciling one here
+/// would mark its namespace and ports free while its database or containers
+/// may still exist.
+fn refuse_environment_owned(lease_id: &str, action: &str) -> Result<(), UsageError> {
+    let Ok(store) = crate::environments::store::default_store_path() else {
+        return Ok(());
+    };
+    match crate::environments::lifecycle::environment_owning_lease(&store, lease_id) {
+        Some(env_id) => Err(UsageError::Message(format!(
+            "environment_owned: lease {lease_id} belongs to environment {env_id}; resources {action} \
+             would free it without destroying what the environment created. Run \
+             `aethyme env down {env_id}` (or `aethyme env destroy {env_id} --retry`); if its \
+             resources are already gone, `aethyme env destroy {env_id} --abandon --reason \"...\"` \
+             records that and releases the leases."
+        ))),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]

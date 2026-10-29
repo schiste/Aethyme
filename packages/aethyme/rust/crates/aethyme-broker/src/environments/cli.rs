@@ -29,6 +29,14 @@ pub const LIST_SCHEMA: &str = "aethyme.env-list/v1";
 pub const HISTORY_SCHEMA: &str = "aethyme.env-history/v1";
 pub const LOGS_SCHEMA: &str = "aethyme.env-logs/v1";
 pub const SUPERVISE_SCHEMA: &str = "aethyme.env-supervise/v1";
+pub const UP_SCHEMA: &str = "aethyme.env-up/v1";
+pub const DOWN_SCHEMA: &str = "aethyme.env-down/v1";
+pub const SWEEP_SCHEMA: &str = "aethyme.env-sweep/v1";
+pub const PARK_SCHEMA: &str = "aethyme.env-park/v1";
+pub const WAKE_SCHEMA: &str = "aethyme.env-wake/v1";
+pub const TOUCH_SCHEMA: &str = "aethyme.env-touch/v1";
+pub const PIN_SCHEMA: &str = "aethyme.env-pin/v1";
+pub const ROUTES_SCHEMA: &str = "aethyme.env-routes/v1";
 
 pub const USAGE: &str = "\
 aethyme env — declared runnable environments per worktree
@@ -59,6 +67,52 @@ Usage:
       The environment's recorded phase transitions, oldest first.
   aethyme env logs <id> [<component>] [--tail N] [--json]
       The last N (default 50) lines of each component log, or of one.
+  aethyme env up [--profile <name>] [--wait <seconds>] [--reconfigure] [--json]
+      Make sure this worktree's environment is up: create it, or return it
+      if already active. Reserves its namespace and ports, waits up to
+      --wait (default 300) for pool capacity, provisions, starts and
+      health-checks every component in dependency order, and prints its
+      ports, URLs and the AETHYME_ENV_* variables. A failure rolls back and
+      leaves the environment `failed` with its error. A changed profile
+      needs --reconfigure (destroy, then recreate).
+  aethyme env down <id> [--json]
+      Destroy the environment (reverse dependency order) and release its
+      leases only after every destroy hook succeeded. A failing destroy
+      leaves it `destroy_failed` with its leases held.
+  aethyme env destroy <id> --retry | --abandon --reason <text> [--json]
+      --retry runs destroy again. --abandon releases the leases without
+      running destroy and records what may have leaked; use it only for
+      resources that are already gone.
+  aethyme env park <id> [--json]
+      Stop every component and return the environment's capacity units to
+      its pool, keeping its namespace, ports and provisioned data. Only an
+      active environment parks; parking a parked one does nothing.
+  aethyme env wake <id> [--wait <seconds>] [--json]
+      Acquire capacity (waiting up to --wait, default 300), start every
+      component and wait for health. Without capacity it stays parked with
+      capacity_timeout; a failed start rolls back to parked. `env up` on a
+      parked environment wakes it.
+  aethyme env exec <id> -- <command> [args...]
+      Run a command against the environment: it wakes a parked environment,
+      sets the AETHYME_ENV_* variables (namespace, ports, URLs, receipts),
+      and marks the environment busy for the command's whole life, so it is
+      never parked under a running test. Exits with the command's status.
+  aethyme env touch <id> [--json]
+      Record activity now (an mtime update; no database lock).
+  aethyme env pin <id> --for <seconds> --reason <text> [--json]
+      Keep the environment awake (up to 24 h). `env unpin <id>` ends it.
+      Pins are recorded in the environment's history.
+  aethyme env routes [--json]
+      The route table the built-in proxy serves on 127.0.0.1:4180
+      (AETHYME_ENV_PROXY_PORT): <component>.<namespace>.<route_domain> and
+      <namespace>.<route_domain> per routed component, with the upstream port
+      while active. A request to a parked environment's host wakes it and is
+      held until it is healthy. Reach a host with your browser
+      (*.localhost) or with `curl -H 'Host: <host>' http://127.0.0.1:4180/`.
+  aethyme env sweep [--json]
+      Destroy environments whose worktree no longer exists (from a
+      temporary export of their recorded commit) and retry failed destroys
+      (at most 5 times). The supervisor runs this on its own.
   aethyme env supervise [--ensure] [--json]
       Run the host supervisor in the foreground (one per host user; a second
       exits at once). --ensure instead starts one in the background if none
@@ -83,6 +137,12 @@ pub(super) struct Options {
     pub(super) ensure: bool,
     pub(super) tail: usize,
     pub(super) limit: usize,
+    pub(super) wait_seconds: u64,
+    pub(super) reconfigure: bool,
+    pub(super) retry: bool,
+    pub(super) abandon: bool,
+    pub(super) reason: Option<String>,
+    pub(super) pin_seconds: Option<u64>,
 }
 
 pub fn run(args: &[String]) -> u8 {
@@ -92,9 +152,17 @@ pub fn run(args: &[String]) -> u8 {
     };
     // Help anywhere answers help and does nothing else, so the router can
     // pass any `env ... --help` line through unchanged.
-    if command == "help" || args.iter().any(|arg| arg == "-h" || arg == "--help") {
+    if command == "help"
+        || args
+            .iter()
+            .take_while(|arg| *arg != "--")
+            .any(|arg| arg == "-h" || arg == "--help")
+    {
         print!("{USAGE}");
         return exit_status::SUCCESS;
+    }
+    if command == "exec" {
+        return super::operate::run_exec(rest);
     }
     let options = match parse_options(command, rest) {
         Ok(options) => options,
@@ -109,6 +177,16 @@ pub fn run(args: &[String]) -> u8 {
         "history" => super::inspect::run_history(&options),
         "logs" => super::inspect::run_logs(&options),
         "supervise" => super::inspect::run_supervise(&options),
+        "up" => super::operate::run_up(&options),
+        "down" => super::operate::run_down(&options),
+        "destroy" => super::operate::run_destroy(&options),
+        "sweep" => super::operate::run_sweep(&options),
+        "park" => super::operate::run_park(&options),
+        "wake" => super::operate::run_wake(&options),
+        "touch" => super::operate::run_touch(&options),
+        "pin" => super::operate::run_pin(&options),
+        "unpin" => super::operate::run_unpin(&options),
+        "routes" => super::operate::run_routes(&options),
         other => Err(Failure {
             code: "unknown_subcommand",
             message: format!("unknown env subcommand {other:?}"),
@@ -148,6 +226,12 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
         ensure: false,
         tail: 50,
         limit: 200,
+        wait_seconds: 300,
+        reconfigure: false,
+        retry: false,
+        abandon: false,
+        reason: None,
+        pin_seconds: None,
     };
     let number = |value: Option<&String>, flag: &str| -> Result<usize, Failure> {
         value
@@ -165,7 +249,28 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
                         .ok_or_else(|| usage("--repo needs a path".into()))?,
                 ))
             }
-            "--profile" if command == "plan" => {
+            "--wait" if matches!(command, "up" | "wake") => {
+                options.wait_seconds = number(args.next(), "--wait")? as u64
+            }
+            "--reconfigure" if command == "up" => options.reconfigure = true,
+            "--retry" if command == "destroy" => options.retry = true,
+            "--abandon" if command == "destroy" => options.abandon = true,
+            "--for" if command == "pin" => {
+                options.pin_seconds = Some(
+                    args.next()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|n| (60..=86_400).contains(n))
+                        .ok_or_else(|| usage("--for needs seconds from 60 to 86400".into()))?,
+                )
+            }
+            "--reason" if matches!(command, "destroy" | "pin") => {
+                options.reason = Some(
+                    args.next()
+                        .ok_or_else(|| usage("--reason needs text".into()))?
+                        .clone(),
+                )
+            }
+            "--profile" if matches!(command, "plan" | "up") => {
                 options.profile = Some(
                     args.next()
                         .ok_or_else(|| usage("--profile needs a name".into()))?
@@ -178,7 +283,19 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
             "--limit" if command == "history" => options.limit = number(args.next(), "--limit")?,
             positional
                 if !positional.starts_with('-')
-                    && matches!(command, "status" | "history" | "logs")
+                    && matches!(
+                        command,
+                        "status"
+                            | "history"
+                            | "logs"
+                            | "down"
+                            | "destroy"
+                            | "park"
+                            | "wake"
+                            | "touch"
+                            | "pin"
+                            | "unpin"
+                    )
                     && options.positional.len() < if command == "logs" { 2 } else { 1 } =>
             {
                 options.positional.push(positional.to_string())
@@ -244,15 +361,15 @@ pub(super) fn environment_failure(message: String) -> Failure {
 }
 
 /// Everything `validate` and `plan` share: both files parsed and checked.
-struct Checked {
-    file: Option<EnvironmentsFile>,
-    host: HostEnvironmentsFile,
-    host_label: String,
-    digest: String,
-    diagnostics: Vec<Diagnostic>,
+pub(super) struct Checked {
+    pub(super) file: Option<EnvironmentsFile>,
+    pub(super) host: HostEnvironmentsFile,
+    pub(super) host_label: String,
+    pub(super) digest: String,
+    pub(super) diagnostics: Vec<Diagnostic>,
 }
 
-fn check(workspace: &Workspace) -> Result<Checked, Failure> {
+pub(super) fn check(workspace: &Workspace) -> Result<Checked, Failure> {
     let loaded = load_repository_file(&workspace.worktree_root)
         .map_err(|error| environment_failure(format!("{ENVIRONMENTS_FILE}: {error}")))?
         .ok_or_else(|| Failure {
@@ -392,7 +509,7 @@ fn run_plan(options: &Options) -> Result<Output, Failure> {
     Ok(render_plan(&compiled, plans))
 }
 
-fn compile_context(workspace_root: &Workspace, file_digest: &str) -> CompileContext {
+pub(super) fn compile_context(workspace_root: &Workspace, file_digest: &str) -> CompileContext {
     let repo = &workspace_root.repo;
     let fingerprint = crate::console::worktree_fingerprint(&workspace_root.worktree_root);
     let commit = repo.head_commit().ok();
@@ -429,8 +546,8 @@ struct AdvisoryPlans {
 /// Plans come from the coordinator itself, never recomputed here. When host
 /// state does not exist yet the plan is unknown, not "available".
 fn advisory_plans(compiled: &CompiledEnvironment) -> Result<AdvisoryPlans, Failure> {
-    let reservation = compiled.reservation_request(None);
-    let capacity = compiled.capacity_request(None);
+    let reservation = compiled.reservation_request(None, 0);
+    let capacity = compiled.capacity_request(None, 0);
     let path = crate::resources::default_host_resource_db_path().map_err(|error| Failure {
         code: "host_state_unavailable",
         message: error.to_string(),
@@ -487,8 +604,8 @@ fn render_plan(compiled: &CompiledEnvironment, plans: AdvisoryPlans) -> Output {
             })
         })
         .collect();
-    let reservation = compiled.reservation_request(None);
-    let capacity = compiled.capacity_request(None);
+    let reservation = compiled.reservation_request(None, 0);
+    let capacity = compiled.capacity_request(None, 0);
     let value = json!({
         "schema": PLAN_SCHEMA,
         "env_id": compiled.env_id,
