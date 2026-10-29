@@ -99,8 +99,13 @@ fn up_options() -> UpOptions {
     }
 }
 
+// Tests have separate host databases, so the coordinator cannot keep
+// parallel tests off each other's ports; each test file uses its own range.
 const ONE_UNIT: &str = r#"
 schema = 1
+[ports]
+start = 43300
+end = 43399
 [pools.envs]
 limit = 2
 [[profiles]]

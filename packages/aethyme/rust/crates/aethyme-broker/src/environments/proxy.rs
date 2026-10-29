@@ -116,6 +116,15 @@ pub fn serve(
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
+                // Accepted sockets inherit the listener's non-blocking mode on
+                // macOS; handlers read and copy with blocking I/O.
+                if let Err(error) = stream.set_nonblocking(false) {
+                    crate::warn_unrecorded(
+                        "make a proxied connection blocking",
+                        Err::<(), _>(error),
+                    );
+                    continue;
+                }
                 let config = config.clone();
                 std::thread::spawn(move || {
                     crate::warn_unrecorded("serve a proxied connection", handle(stream, &config));
