@@ -4823,10 +4823,10 @@ impl Broker {
                             .into(),
                     });
                 }
-                let current_cohort = self.closed_artifact_checkout_cohort_snapshot(
+                let current_cohort = self.closed_artifact_checkout_cohort_for_session(
                     expected_cohort.owner_session_id(),
                     archived_worktree,
-                    status_limits.deadline,
+                    Some(status_limits.deadline),
                 )?;
                 if current_cohort.as_ref() != Some(expected_cohort) {
                     return Err(BrokerOpError::CleanupResolveRefused {
