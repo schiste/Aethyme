@@ -87,7 +87,7 @@ fn process_exists(pid: i32) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-fn group_exists(pgid: i32) -> bool {
+pub(crate) fn group_exists(pgid: i32) -> bool {
     if pgid <= 0 {
         return false;
     }

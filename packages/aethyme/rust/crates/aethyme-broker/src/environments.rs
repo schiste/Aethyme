@@ -6,7 +6,8 @@
 //!
 //! It also holds the durable layer every lifecycle step builds on (#1222):
 //! the environment store (`environments.db`), process identities, component
-//! logs and the host supervisor.
+//! logs and the host supervisor, and the runtime drivers that provision,
+//! start, stop and destroy components (#1210).
 //!
 //! Aethyme supplies lifecycle, admission and routing; the repository supplies
 //! commands. Nothing here knows any stack: a profile is components with
@@ -19,6 +20,9 @@ use sha2::{Digest, Sha256};
 
 pub mod cli;
 pub mod compile;
+pub mod drivers;
+pub mod engine;
+pub mod exec;
 pub mod identity;
 mod inspect;
 pub mod logs;
@@ -27,6 +31,8 @@ pub mod store;
 pub mod supervisor;
 pub mod validate;
 
+#[cfg(test)]
+mod drivers_tests;
 #[cfg(test)]
 mod store_tests;
 #[cfg(test)]
