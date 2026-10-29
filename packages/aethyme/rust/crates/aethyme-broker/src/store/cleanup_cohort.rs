@@ -510,22 +510,6 @@ impl BrokerStore {
         )?)
     }
 
-    /// Ensure a legacy or already-full-cleanup-completed Spawned checkout has
-    /// a separate compact request. The original close timestamp determines
-    /// the full-removal grace; enabling compaction never shortens it.
-    pub(crate) fn request_closed_spawned_checkout_compaction(
-        &mut self,
-        session_id: i64,
-        grace_hours: u32,
-        requested_at_ms: i64,
-    ) -> Result<bool, BrokerError> {
-        Ok(self.request_closed_spawned_checkout_compactions(
-            &[session_id],
-            grace_hours,
-            requested_at_ms,
-        )? > 0)
-    }
-
     /// Add compact requests for a bounded set of currently retained Spawned
     /// rows. The caller supplies IDs from the keyset path index; this method
     /// rechecks the authoritative session rows in the same write transaction.
@@ -1384,26 +1368,6 @@ impl BrokerStore {
                     cleanup_state: row.get(5)?,
                 })
             },
-        )?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(BrokerError::from)
-    }
-
-    pub(crate) fn cleanup_cohort_unresolved_session_ids_page(
-        &self,
-        namespace: &str,
-        after_session_id: i64,
-        limit: usize,
-    ) -> Result<Vec<i64>, BrokerError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT session_id FROM cleanup_cohort_scan_rows
-             WHERE namespace = ?1 AND resolution_error IS NOT NULL
-               AND session_id > ?2
-             ORDER BY session_id LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(
-            params![namespace, after_session_id, limit.clamp(1, 128) as i64],
-            |row| row.get::<_, i64>(0),
         )?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(BrokerError::from)
