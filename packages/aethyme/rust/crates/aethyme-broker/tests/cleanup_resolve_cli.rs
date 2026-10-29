@@ -5,6 +5,7 @@
 mod isolation;
 
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -797,6 +798,140 @@ fn recovery_batch_retires_closed_targets_without_removing_a_live_target() {
             );
         }
     }
+}
+
+#[test]
+fn recovery_batch_memoizes_ancestry_within_plan_and_rechecks_delivery_before_apply() {
+    let tmp = repo();
+    let (first, first_path) = dirty_closed_session(tmp.path());
+    let (second, second_path) = dirty_closed_session(tmp.path());
+    let (delivered, delivered_path) = {
+        let mut broker = isolation::open(tmp.path());
+        let session = broker
+            .start_worktree("dirty delivered checkout", None)
+            .unwrap();
+        let path = PathBuf::from(&session.worktree_path);
+        std::fs::write(path.join("pending.txt"), "uncommitted\n").unwrap();
+        broker.close(session.id).unwrap();
+        (session.id.to_string(), path)
+    };
+    let main_head = git(tmp.path(), &["rev-parse", "HEAD"]);
+    let first_head = git(&first_path, &["rev-parse", "HEAD"]);
+    let second_head = git(&second_path, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        git_output(
+            tmp.path(),
+            &["merge-base", "--is-ancestor", &main_head, &main_head]
+        )
+        .status
+        .code(),
+        Some(0),
+        "the delivered checkout head must exercise a positive ancestry result"
+    );
+    assert_eq!(
+        git_output(
+            tmp.path(),
+            &["merge-base", "--is-ancestor", &first_head, &main_head]
+        )
+        .status
+        .code(),
+        Some(1),
+        "the closed checkout head must exercise a negative ancestry result"
+    );
+
+    let args = [
+        "finish",
+        "cleanup",
+        "resolve",
+        &first,
+        &second,
+        &delivered,
+        "--batch",
+        "--archive",
+        "--json",
+    ];
+    let test_root = tmp.path().parent().unwrap();
+    let git_bin = test_root.join("counting-git");
+    std::fs::create_dir(&git_bin).unwrap();
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("git"))
+        .find(|path| path.is_file())
+        .expect("the fixture needs an installed Git binary");
+    std::os::unix::fs::symlink(real_git, git_bin.join("git.real")).unwrap();
+    let wrapper = git_bin.join("git");
+    let wrapper_script = r#"#!/bin/sh
+previous=''
+penultimate=''
+last=''
+found=0
+for argument do
+    if [ "$previous" = merge-base ] && [ "$argument" = --is-ancestor ]; then
+        found=1
+    fi
+    penultimate=$last
+    last=$argument
+    previous=$argument
+done
+if [ "$found" -eq 1 ]; then
+    printf '%s\t%s\n' "$penultimate" "$last" >> "$AETHYME_TEST_MERGE_BASE_LOG"
+fi
+exec "$(dirname "$0")/git.real" "$@"
+"#;
+    std::fs::write(&wrapper, wrapper_script).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let invocation_log = test_root.join("merge-base-invocations.tsv");
+    let mut search_path = vec![git_bin];
+    search_path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let search_path = std::env::join_paths(search_path).unwrap();
+    let traced_plan = isolation::command(CLI, tmp.path(), &args)
+        .env("PATH", search_path)
+        .env("AETHYME_TEST_MERGE_BASE_LOG", &invocation_log)
+        .output()
+        .unwrap();
+    let plan = json(&traced_plan);
+    assert_eq!(plan["targets"].as_array().unwrap().len(), 3);
+
+    let ancestry_calls = std::fs::read_to_string(invocation_log)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let (ancestor, descendant) = line.split_once('\t')?;
+            Some((ancestor.to_owned(), descendant.to_owned()))
+        })
+        .fold(std::collections::BTreeMap::new(), |mut calls, pair| {
+            *calls.entry(pair).or_insert(0_usize) += 1;
+            calls
+        });
+    for head in [&first_head, &second_head] {
+        assert_eq!(
+            ancestry_calls.get(&(head.to_string(), main_head.clone())),
+            Some(&1),
+            "negative ancestry pair should be checked once across eligibility and root proofs"
+        );
+    }
+    assert_eq!(
+        ancestry_calls.get(&(main_head.clone(), main_head.clone())),
+        Some(&1),
+        "positive ancestry pair should also be reused across eligibility and root proofs"
+    );
+
+    // The memo belongs to the captured plan context. A changed delivery ref
+    // must be observed by apply's fresh plan before it can remove any target.
+    git(
+        tmp.path(),
+        &["update-ref", "refs/heads/aethyme/integration", &first_head],
+    );
+    let mut apply_args = args.to_vec();
+    apply_args.extend(["--confirm", plan["digest"].as_str().unwrap()]);
+    let stale_apply = run(tmp.path(), &apply_args);
+    assert!(!stale_apply.status.success());
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stale_apply.stdout),
+        String::from_utf8_lossy(&stale_apply.stderr)
+    );
+    assert!(diagnostic.contains("confirmation changed"), "{diagnostic}");
+    assert!(first_path.exists() && second_path.exists() && delivered_path.exists());
 }
 
 #[test]

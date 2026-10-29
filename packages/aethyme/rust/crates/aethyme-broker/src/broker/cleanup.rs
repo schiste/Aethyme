@@ -44,7 +44,10 @@ enum CleanupDeliveryTargets<'a> {
     Snapshot(&'a [String]),
     /// Recovery preserves every commit absent from these targets. It needs
     /// complete checkout inspection, not an exact-content landing search.
-    ArchivePreservation(&'a [String]),
+    ArchivePreservation {
+        targets: &'a [String],
+        ancestry_memo: Option<&'a crate::cleanup_resolve::PlanAncestryMemo>,
+    },
     /// The plan's initial primary HEAD lookup failed, so its target set is not
     /// suitable for proving that any session's work is represented.
     SnapshotUnavailable,
@@ -2421,7 +2424,7 @@ impl Broker {
     ) -> Result<(CleanupDisposition, String, Option<CleanupProvenance>), BrokerOpError> {
         let owned_delivery_targets;
         let delivery_targets = match delivery_targets {
-            CleanupDeliveryTargets::ArchivePreservation(_) => {
+            CleanupDeliveryTargets::ArchivePreservation { .. } => {
                 return Ok((
                     CleanupDisposition::UnprovenProvenance,
                     "recovery requires a complete readable checkout inventory".into(),
@@ -2524,6 +2527,7 @@ impl Broker {
         status_output_bytes: usize,
         status_path_fields: usize,
         delivery_targets: &[String],
+        ancestry_memo: &crate::cleanup_resolve::PlanAncestryMemo,
         allow_adopted_path: bool,
         live_checkouts: &[(i64, crate::auto_cleanup::ResolvedWorktreePath)],
     ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
@@ -2537,6 +2541,7 @@ impl Broker {
                 status_path_fields,
             ),
             delivery_targets,
+            Some(ancestry_memo),
             allow_adopted_path,
             live_checkouts,
         )
@@ -2558,6 +2563,7 @@ impl Broker {
             records,
             status_limits,
             delivery_targets,
+            None,
             allow_adopted_path,
             &live_checkouts,
         )
@@ -2572,6 +2578,7 @@ impl Broker {
         records: &mut crate::measurement::SizeRecords,
         status_limits: CleanupStatusLimits,
         delivery_targets: &[String],
+        ancestry_memo: Option<&crate::cleanup_resolve::PlanAncestryMemo>,
         allow_adopted_path: bool,
         live_checkouts: &[(i64, crate::auto_cleanup::ResolvedWorktreePath)],
     ) -> Result<Option<CleanupWorktreePlan>, BrokerOpError> {
@@ -2583,7 +2590,10 @@ impl Broker {
             CleanupInspectionContext {
                 branch_tips: None,
                 live_checkouts,
-                delivery_targets: CleanupDeliveryTargets::ArchivePreservation(delivery_targets),
+                delivery_targets: CleanupDeliveryTargets::ArchivePreservation {
+                    targets: delivery_targets,
+                    ancestry_memo,
+                },
                 landing_cache: &mut landing_cache,
                 status_limits,
                 size_deadline: None,
@@ -2690,12 +2700,20 @@ impl Broker {
         &self,
         head: &str,
         delivery_targets: &[String],
+        ancestry_memo: Option<&crate::cleanup_resolve::PlanAncestryMemo>,
         deadline: std::time::Instant,
     ) -> Result<CleanupProvenanceAssessment, BrokerOpError> {
         let _deadline = crate::git::limit_git_until(deadline);
         let mut unavailable = None;
         for target in delivery_targets {
-            match self.repo_handle().is_ancestor_checked(head, target) {
+            let checked = match ancestry_memo {
+                Some(memo) => memo.check_until(self.repo_handle(), head, target, Some(deadline)),
+                None => self
+                    .repo_handle()
+                    .is_ancestor_checked(head, target)
+                    .map_err(|error| error.to_string()),
+            };
+            match checked {
                 Ok(true) => {
                     return Ok(CleanupProvenanceAssessment::ArchivePreservation {
                         ancestry_proven: true,
@@ -2858,12 +2876,21 @@ impl Broker {
                     ),
                     Ok(false) => {
                         let eligibility = match delivery_targets {
-                            CleanupDeliveryTargets::ArchivePreservation(targets) => self
-                                .cleanup_eligibility_with_provenance(
-                                    &worktree_path,
-                                    status_limits,
-                                    |head| self.archive_preservation_ancestry(head, targets, status_limits.deadline),
-                                ),
+                            CleanupDeliveryTargets::ArchivePreservation {
+                                targets,
+                                ancestry_memo,
+                            } => self.cleanup_eligibility_with_provenance(
+                                &worktree_path,
+                                status_limits,
+                                |head| {
+                                    self.archive_preservation_ancestry(
+                                        head,
+                                        targets,
+                                        ancestry_memo,
+                                        status_limits.deadline,
+                                    )
+                                },
+                            ),
                             CleanupDeliveryTargets::Snapshot(targets) => self
                                 .cleanup_eligibility_with_status_limits(
                                     session.id,
