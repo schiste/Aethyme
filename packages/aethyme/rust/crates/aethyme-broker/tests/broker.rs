@@ -445,6 +445,20 @@ fn cleanup_refuses_dirty_and_unmerged_then_force_discards() {
 
     let session = broker.start_agent("doomed", "true", None).unwrap();
     let wt = std::path::PathBuf::from(&session.worktree_path);
+    wait_for_agent_pid_exit(&broker, session.id);
+    broker.close(session.id).unwrap();
+    assert!(
+        broker
+            .store()
+            .session(session.id)
+            .unwrap()
+            .status
+            .is_closed()
+    );
+    assert_eq!(
+        broker.store().session(session.id).unwrap().cleanup_state,
+        aethyme_broker::SessionCleanupState::Closed
+    );
 
     // Uncommitted file → refuse.
     std::fs::write(wt.join("wip.rs"), "x\n").unwrap();
