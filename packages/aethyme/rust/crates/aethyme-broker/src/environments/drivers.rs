@@ -803,14 +803,26 @@ impl Driver for ContainerDriver {
                 }
             }
         }
-        remove_file_if_present(
+        let cleanup_result = remove_file_if_present(
             &ctx.directory.join(format!("{}.env", ctx.component.name)),
             format!("remove environment secrets for {}", ctx.component.name),
-        )?;
-        if let Some(text) = &ctx.component.commands.destroy {
-            ctx.hook("destroy", text)?;
+        );
+        let hook_result = match &ctx.component.commands.destroy {
+            Some(text) => ctx.hook("destroy", text).map(|_| ()),
+            None => Ok(()),
+        };
+        match (cleanup_result, hook_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(cleanup_error), Ok(())) => Err(cleanup_error),
+            (Ok(()), Err(hook_error)) => Err(hook_error),
+            (Err(cleanup_error), Err(hook_error)) => {
+                crate::warn_unrecorded(
+                    "remove environment secrets while destroy hook failed",
+                    Err::<(), _>(cleanup_error),
+                );
+                Err(hook_error)
+            }
         }
-        Ok(())
     }
 
     fn observe(&self, ctx: &DriverContext<'_>, identity: &ComponentIdentity) -> Observation {

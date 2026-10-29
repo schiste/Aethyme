@@ -427,6 +427,81 @@ image = "alpine:3.20"
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn container_destroy_attempts_hook_when_secret_cleanup_fails() {
+    let text = r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "box"
+runtime = "container"
+image = "alpine:3.20"
+destroy = "echo hook-ran > destroy-hook-sentinel"
+"#;
+    let harness = Harness::new(text, "p");
+    let ctx = harness.ctx("box");
+    std::fs::create_dir_all(&ctx.directory).unwrap();
+    let secret_path = ctx.directory.join("box.env");
+    std::fs::create_dir(&secret_path).unwrap();
+
+    let error = driver_for(ctx.component.runtime)
+        .destroy(&ctx, None)
+        .expect_err("failed secret cleanup must be reported");
+    assert!(matches!(error, DriverError::Io { .. }), "{error:?}");
+    assert!(
+        secret_path.is_dir(),
+        "the blocked secret path remains visible"
+    );
+    assert_eq!(
+        std::fs::read_to_string(harness.worktree.path().join("destroy-hook-sentinel"))
+            .unwrap()
+            .trim(),
+        "hook-ran",
+        "the destroy hook still runs after generated-secret cleanup fails"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn container_destroy_preserves_hook_error_when_secret_cleanup_also_fails() {
+    let text = r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "box"
+runtime = "container"
+image = "alpine:3.20"
+destroy = "echo hook-ran > destroy-hook-sentinel; echo hook-failed >&2; exit 7"
+"#;
+    let harness = Harness::new(text, "p");
+    let ctx = harness.ctx("box");
+    std::fs::create_dir_all(&ctx.directory).unwrap();
+    let secret_path = ctx.directory.join("box.env");
+    std::fs::create_dir(&secret_path).unwrap();
+
+    let error = driver_for(ctx.component.runtime)
+        .destroy(&ctx, None)
+        .expect_err("neither cleanup nor hook failure may report success");
+    assert!(
+        matches!(error, DriverError::HookFailed { .. }),
+        "the hook failure remains the primary error: {error:?}"
+    );
+    assert!(error.to_string().contains("hook-failed"), "{error}");
+    assert!(
+        secret_path.is_dir(),
+        "the failed generated-secret path remains"
+    );
+    assert_eq!(
+        std::fs::read_to_string(harness.worktree.path().join("destroy-hook-sentinel"))
+            .unwrap()
+            .trim(),
+        "hook-ran"
+    );
+}
+
 #[test]
 fn compose_conformance_when_an_engine_is_enabled() {
     if !engine_tests_enabled() {
