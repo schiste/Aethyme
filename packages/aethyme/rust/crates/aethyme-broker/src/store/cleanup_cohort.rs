@@ -99,6 +99,24 @@ pub(crate) fn enqueue_checkout_cleanup_in_tx(
     grace_hours: u32,
     compact_checkout: bool,
 ) -> Result<usize, BrokerError> {
+    enqueue_checkout_cleanup_in_tx_at(
+        tx,
+        session_id,
+        closed_at_ms,
+        closed_at_ms,
+        grace_hours,
+        compact_checkout,
+    )
+}
+
+fn enqueue_checkout_cleanup_in_tx_at(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: i64,
+    closed_at_ms: i64,
+    requested_at_ms: i64,
+    grace_hours: u32,
+    compact_checkout: bool,
+) -> Result<usize, BrokerError> {
     let not_before_ms =
         closed_at_ms.saturating_add(i64::from(grace_hours).saturating_mul(3_600_000));
     Ok(tx.execute(
@@ -133,9 +151,9 @@ pub(crate) fn enqueue_checkout_cleanup_in_tx(
          WHERE closed_checkout_cleanup_requests.completed_at_ms IS NULL",
         params![
             session_id,
-            closed_at_ms,
+            requested_at_ms,
             not_before_ms,
-            compact_checkout.then_some(closed_at_ms)
+            compact_checkout.then_some(requested_at_ms)
         ],
     )?)
 }
@@ -614,8 +632,14 @@ impl BrokerStore {
             if latest_session_finish_marked_kept(&tx, session_id)? {
                 continue;
             }
-            scheduled +=
-                enqueue_checkout_cleanup_in_tx(&tx, session_id, closed_at_ms, grace_hours, false)?;
+            scheduled += enqueue_checkout_cleanup_in_tx_at(
+                &tx,
+                session_id,
+                closed_at_ms,
+                requested_at_ms,
+                grace_hours,
+                false,
+            )?;
         }
         tx.commit()?;
         Ok(scheduled)
@@ -746,7 +770,7 @@ impl BrokerStore {
         let (
             scan_revision,
             generation,
-            mut alias_refresh_generation,
+            alias_refresh_generation,
             mut progress_sequence,
             high_water,
             mut after_session_id,
@@ -791,7 +815,7 @@ impl BrokerStore {
                     [namespace],
                 )?;
                 let generation = generation.saturating_add(1).max(1);
-                alias_refresh_generation = alias_generation.saturating_add(1).max(1);
+                let alias_refresh_generation = alias_generation.saturating_add(1).max(1);
                 let complete = current_high_water == 0 && dirty_count == 0;
                 tx.execute(
                     "INSERT INTO cleanup_cohort_scans (
@@ -823,8 +847,8 @@ impl BrokerStore {
             }
             None => {
                 let generation = 1;
-                alias_refresh_generation = 1;
-                progress_sequence = 0;
+                let alias_refresh_generation = 1;
+                let progress_sequence = 0;
                 let complete = current_high_water == 0 && dirty_count == 0;
                 tx.execute(
                     "INSERT INTO cleanup_cohort_scans (
@@ -1469,7 +1493,7 @@ impl BrokerStore {
         let mut rows = BTreeMap::<i64, CleanupCohortIndexedRow>::new();
         if !path_ancestors.is_empty() || !candidate_paths.is_empty() {
             let mut bind_values = Vec::<rusqlite::types::Value>::new();
-            bind_values.push(namespace.into());
+            bind_values.push(namespace.to_owned().into());
             bind_values.extend(path_ancestors.iter().cloned().map(Into::into));
             let ancestor_placeholders = (2..=path_ancestors.len() + 1)
                 .map(|index| format!("?{index}"))
@@ -2169,7 +2193,7 @@ mod tests {
             .pending_checkout_cleanup_request(closed_id)
             .unwrap()
             .unwrap();
-        assert_eq!(request.requested_at_ms, 2000);
+        assert_eq!(request.requested_at_ms, 9000);
         assert_eq!(request.not_before_ms, 2000 + 360 * 3_600_000);
         assert!(
             store
@@ -2187,12 +2211,13 @@ mod tests {
         store
             .request_closed_spawned_checkout_cleanups(&[closed_id], 24, 10_000)
             .unwrap();
+        let repeated = store
+            .pending_checkout_cleanup_request(closed_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeated.requested_at_ms, 9000);
         assert_eq!(
-            store
-                .pending_checkout_cleanup_request(closed_id)
-                .unwrap()
-                .unwrap()
-                .not_before_ms,
+            repeated.not_before_ms,
             2000 + 360 * 3_600_000,
             "reconciliation keeps the original due time and cannot shorten its grace"
         );
