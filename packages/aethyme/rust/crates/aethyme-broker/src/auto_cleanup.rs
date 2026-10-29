@@ -93,6 +93,9 @@ const AUTO_CLEANUP_CURSOR_KEY: &str = "auto_cleanup.cursor";
 const AUTO_CLEANUP_CURSOR_VERSION: u32 = 3;
 const CLEANUP_COHORT_SCAN_PAGE_SIZE: usize = 16;
 const CLEANUP_COHORT_UNBOUNDED_PAGE_CAP: usize = 128;
+/// The background compact lane admits an archive attempt only when it can
+/// reserve this much time after the alias snapshot and ownership proof.
+pub(crate) const AUTO_COMPACTION_MIN_BUDGET: Duration = Duration::from_secs(60);
 const SESSION_RETIREMENT_CURSOR_KEY: &str = "auto_cleanup.session_retirement_cursor";
 const SESSION_RETIREMENT_CURSOR_VERSION: u32 = 1;
 const SESSION_RETIREMENT_PAGE_SIZE: usize = 128;
@@ -712,11 +715,16 @@ pub(crate) struct ClosedArtifactCheckoutCohort {
     worktree: PathBuf,
     sessions: Vec<ClosedArtifactSessionSnapshot>,
     owner_session_id: i64,
+    alias_refresh_generation: i64,
 }
 
 impl ClosedArtifactCheckoutCohort {
     pub(crate) fn owner_session_id(&self) -> i64 {
         self.owner_session_id
+    }
+
+    pub(crate) fn alias_refresh_generation(&self) -> i64 {
+        self.alias_refresh_generation
     }
 
     pub(crate) fn worktree(&self) -> &Path {
@@ -752,6 +760,7 @@ struct AutoCleanupGroupScan {
     live: Vec<Session>,
     live_worktrees: Vec<ResolvedWorktreePath>,
     unresolved_rows: i64,
+    alias_refresh_generation: i64,
 }
 
 enum AutoCleanupGroupInspection {
@@ -826,6 +835,8 @@ pub struct AutoCleanupPlan {
     /// The selection's deadline, which removal honors too: a pass inside a
     /// broker open must not pay unbounded removals after a bounded selection.
     deadline: Option<Instant>,
+    /// The complete filesystem alias lap used for selection.
+    alias_refresh_generation: Option<i64>,
 }
 
 impl AutoCleanupPlan {
@@ -836,6 +847,7 @@ impl AutoCleanupPlan {
             upstream: None,
             selected: Vec::new(),
             deadline: None,
+            alias_refresh_generation: None,
         }
     }
 
@@ -1299,6 +1311,7 @@ impl Broker {
             let outcome = self.store().persist_cleanup_cohort_dirty_page(
                 crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
                 page.state.generation,
+                page.state.alias_refresh_generation,
                 &dirty_rows,
                 now_ms(),
             )?;
@@ -1357,6 +1370,7 @@ impl Broker {
             crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
             page.state.revision,
             page.state.generation,
+            page.state.alias_refresh_generation,
             expected_after,
             &resolved_rows,
             reached_high_water,
@@ -1383,13 +1397,99 @@ impl Broker {
             };
             pages += 1;
             if state.complete
-                || deadline.is_some()
                 || deadline_expired(deadline)
                 || pages >= CLEANUP_COHORT_UNBOUNDED_PAGE_CAP
             {
                 return Ok(Some(state));
             }
         }
+    }
+
+    /// Start or resume one complete, bounded-by-deadline filesystem alias
+    /// refresh. This is called once per maintenance pass; proof lookups only
+    /// consume the resulting lap and never rewind it.
+    pub(crate) fn refresh_cleanup_cohort_aliases(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<Option<crate::store::cleanup_cohort::CleanupCohortScanState>, BrokerOpError> {
+        self.store().begin_cleanup_cohort_alias_refresh(
+            crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+            now_ms(),
+        )?;
+        self.complete_cleanup_cohort_scan(deadline)
+    }
+
+    /// Recheck every registered raw session path with filesystem-only
+    /// canonical and Git-directory resolution while the lifecycle lock is
+    /// held. A symlink retarget does not change SQLite revisions, so a cached
+    /// alias index alone cannot authorize a destructive pass.
+    pub(crate) fn cleanup_cohort_filesystem_aliases_match(
+        &mut self,
+        expected_alias_refresh_generation: i64,
+        deadline: Option<Instant>,
+    ) -> Result<bool, BrokerOpError> {
+        let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
+        let Some(before) = self.store().cleanup_cohort_scan_state(namespace)? else {
+            return Ok(false);
+        };
+        if !before.complete
+            || before.unresolved_rows != 0
+            || before.pending_dirty_rows != 0
+            || before.alias_refresh_generation != expected_alias_refresh_generation
+            || deadline_expired(deadline)
+        {
+            return Ok(false);
+        }
+        let authority_before = self.store().cleanup_authority_revisions()?;
+        let mut after_session_id = 0;
+        let mut resolved_paths = std::collections::HashMap::<String, ResolvedWorktreePath>::new();
+        loop {
+            if deadline_expired(deadline) {
+                return Ok(false);
+            }
+            let rows =
+                self.store()
+                    .cleanup_cohort_indexed_rows_page(namespace, after_session_id, 32)?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                if deadline_expired(deadline) {
+                    return Ok(false);
+                }
+                if row.resolution_error.is_some() {
+                    self.store()
+                        .mark_cleanup_cohort_rows_dirty(namespace, &[row.session_id])?;
+                    return Ok(false);
+                }
+                let current = resolved_paths
+                    .entry(row.raw_path.clone())
+                    .or_insert_with(|| ResolvedWorktreePath::resolve(Path::new(&row.raw_path)));
+                if !current.resolution_errors.is_empty()
+                    || current.canonical_or_raw.to_str() != Some(row.canonical_path.as_str())
+                    || current.git_dir.as_deref().and_then(Path::to_str) != row.git_dir.as_deref()
+                {
+                    self.store()
+                        .mark_cleanup_cohort_rows_dirty(namespace, &[row.session_id])?;
+                    return Ok(false);
+                }
+                after_session_id = row.session_id;
+            }
+        }
+        if deadline_expired(deadline)
+            || self.store().cleanup_authority_revisions()? != authority_before
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .store()
+            .cleanup_cohort_scan_state(namespace)?
+            .is_some_and(|current| {
+                current.complete
+                    && current.unresolved_rows == 0
+                    && current.pending_dirty_rows == 0
+                    && current.alias_refresh_generation == expected_alias_refresh_generation
+            }))
     }
 
     /// Construct one complete cohort from the persisted path index. The full
@@ -1401,20 +1501,33 @@ impl Broker {
         worktree: &Path,
         deadline: Option<Instant>,
     ) -> Result<Option<ClosedArtifactCheckoutCohort>, BrokerOpError> {
-        let Some(index_state) = self
+        let Some(mut index_state) = self
             .store()
             .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)?
         else {
             return Ok(None);
         };
+        // Successful removals and concurrent authority changes enqueue only
+        // their affected rows. Drain those deltas in place; do not restart the
+        // full filesystem lap between candidates in one pass.
+        while !index_state.complete
+            && index_state.after_session_id >= index_state.high_water_session_id
+            && index_state.pending_dirty_rows > 0
+        {
+            if deadline_expired(deadline) {
+                return Ok(None);
+            }
+            let Some(next) = self.advance_cleanup_cohort_scan(deadline)? else {
+                return Ok(None);
+            };
+            index_state = next;
+        }
         if !index_state.complete || index_state.unresolved_rows != 0 || deadline_expired(deadline) {
             return Ok(None);
         }
         let witness_revision = self.store().cleanup_witness_revision()?;
         let selected = self.store().session(session_id)?;
-        if selected.status != crate::types::SessionStatus::Closed
-            || selected.cleanup_state != SessionCleanupState::Closed
-        {
+        if !selected.status.is_closed() || selected.cleanup_state != SessionCleanupState::Closed {
             return Ok(None);
         }
         let resolved = ResolvedWorktreePath::resolve(worktree);
@@ -1432,8 +1545,7 @@ impl Broker {
             || !sessions.iter().any(|session| session.id == session_id)
             || sessions.is_empty()
             || sessions.iter().any(|session| {
-                session.status != crate::types::SessionStatus::Closed
-                    || session.cleanup_state != SessionCleanupState::Closed
+                !session.status.is_closed() || session.cleanup_state != SessionCleanupState::Closed
             })
         {
             return Ok(None);
@@ -1498,6 +1610,14 @@ impl Broker {
             } else {
                 None
             };
+            if session.origin == SessionOrigin::Spawned
+                && !spawned_instance_witness.as_ref().is_some_and(|witness| {
+                    witness.worktree_path == canonical_path
+                        && current_witness.as_ref() == Some(witness)
+                })
+            {
+                return Ok(None);
+            }
             if owner_session_id.is_none()
                 && session.origin == SessionOrigin::Spawned
                 && spawned_instance_witness
@@ -1520,7 +1640,11 @@ impl Broker {
         if self
             .store()
             .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)?
-            .is_none_or(|current| current.revision != index_state.revision || !current.complete)
+            .is_none_or(|current| {
+                current.revision != index_state.revision
+                    || current.alias_refresh_generation != index_state.alias_refresh_generation
+                    || !current.complete
+            })
             || self.store().cleanup_witness_revision()? != witness_revision
         {
             return Ok(None);
@@ -1529,6 +1653,7 @@ impl Broker {
             worktree: resolved_candidate.canonical_or_raw,
             sessions: snapshots,
             owner_session_id,
+            alias_refresh_generation: index_state.alias_refresh_generation,
         }))
     }
 
@@ -1541,136 +1666,15 @@ impl Broker {
         worktree: &Path,
         deadline: Option<Instant>,
     ) -> Result<Option<ClosedArtifactCheckoutCohort>, BrokerOpError> {
-        if deadline_expired(deadline) {
-            return Ok(None);
-        }
-        let authority_revisions = self.store().cleanup_authority_revisions()?;
-        let expected_path = worktree.to_string_lossy().into_owned();
-        let current = self.store().session(session_id)?;
-        if current.status != crate::types::SessionStatus::Closed
-            || current.cleanup_state != SessionCleanupState::Closed
-            || current.origin != SessionOrigin::Spawned
-            || current.worktree_path != expected_path
-        {
-            return Ok(None);
-        }
-
-        let resolved = ResolvedWorktreePath::resolve(worktree);
-        if !resolved.resolution_errors.is_empty() || deadline_expired(deadline) {
-            return Ok(None);
-        }
-        let closed = self.store().cleaned_sessions()?;
-        let all_rows = closed
-            .iter()
-            .cloned()
-            .chain(self.store().live_sessions()?)
-            .collect::<Vec<_>>();
-        let Some(groups) = group_closed_checkout_sessions(closed, deadline) else {
-            return Ok(None);
-        };
-        let Some(group) = groups
-            .into_iter()
-            .find(|group| group.worktree == resolved.canonical_or_raw)
+        let Some(cohort) =
+            self.closed_artifact_checkout_cohort_for_session(session_id, worktree, deadline)?
         else {
             return Ok(None);
         };
-        if group.sessions.is_empty()
-            || group.sessions.iter().any(|session| {
-                session.status != crate::types::SessionStatus::Closed
-                    || session.cleanup_state != SessionCleanupState::Closed
-            })
-        {
+        if cohort.owner_session_id() != session_id {
             return Ok(None);
         }
-        // Every session row that can name this canonical checkout participates
-        // in the proof. A live, non-closed, or unresolvable alias blocks the
-        // cohort even if the selected row itself is clean and closed.
-        let group_ids = group
-            .sessions
-            .iter()
-            .map(|session| session.id)
-            .collect::<std::collections::BTreeSet<_>>();
-        for row in &all_rows {
-            if deadline_expired(deadline) {
-                return Ok(None);
-            }
-            let row_path = ResolvedWorktreePath::resolve(Path::new(&row.worktree_path));
-            match live_worktree_overlap(&resolved, &row_path) {
-                LiveOverlapEvidence::Disjoint => {}
-                LiveOverlapEvidence::Overlap
-                    if row.status == crate::types::SessionStatus::Closed
-                        && row.cleanup_state == SessionCleanupState::Closed
-                        && group_ids.contains(&row.id) => {}
-                LiveOverlapEvidence::Overlap | LiveOverlapEvidence::Unknown => {
-                    return Ok(None);
-                }
-            }
-        }
-        let Some(selected) = group
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
-        else {
-            return Ok(None);
-        };
-        if selected.worktree_path != current.worktree_path
-            || selected.branch != current.branch
-            || selected.origin != current.origin
-        {
-            return Ok(None);
-        }
-
-        let _git_deadline = deadline.map(crate::git::limit_git_until);
-        let checkout = GitRepo::discover(&group.worktree)?;
-        let current_witness = checkout.spawned_worktree_instance_witness();
-        let mut sessions = Vec::with_capacity(group.sessions.len());
-        for session in &group.sessions {
-            if deadline_expired(deadline) {
-                return Ok(None);
-            }
-            let spawned_instance_witness = if session.origin == SessionOrigin::Spawned {
-                self.store().spawned_worktree_instance_witness(session.id)?
-            } else {
-                None
-            };
-            if session.id == session_id {
-                let Some(expected_witness) = spawned_instance_witness.as_ref() else {
-                    return Ok(None);
-                };
-                if expected_witness.worktree_path != group.worktree.to_string_lossy()
-                    || current_witness.as_ref() != Some(expected_witness)
-                    || !self.is_broker_owned_worktree_checked(session, &group.worktree)?
-                {
-                    return Ok(None);
-                }
-            }
-            sessions.push(ClosedArtifactSessionSnapshot {
-                id: session.id,
-                worktree_path: session.worktree_path.clone(),
-                branch: session.branch.clone(),
-                origin: session.origin,
-                spawned_instance_witness,
-            });
-        }
-        if deadline_expired(deadline) {
-            return Ok(None);
-        }
-        let current_after = self.store().session(session_id)?;
-        if current_after.status != crate::types::SessionStatus::Closed
-            || current_after.cleanup_state != SessionCleanupState::Closed
-            || current_after.worktree_path != current.worktree_path
-            || current_after.branch != current.branch
-            || current_after.origin != current.origin
-            || self.store().cleanup_authority_revisions()? != authority_revisions
-        {
-            return Ok(None);
-        }
-
-        Ok(Some(ClosedArtifactCheckoutCohort {
-            worktree: group.worktree,
-            sessions,
-            owner_session_id: session_id,
-        }))
+        Ok(Some(cohort))
     }
 
     /// Collect one bounded page of complete canonical cohorts from the
@@ -1682,8 +1686,18 @@ impl Broker {
         cursor: &mut AutoCleanupCursor,
         deadline: Option<Instant>,
     ) -> Result<Option<AutoCleanupGroupScan>, BrokerOpError> {
-        let Some(index_state) = self.complete_cleanup_cohort_scan(deadline)? else {
-            return Ok(None);
+        let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
+        // A completed, revision-current path index remains useful for planning.
+        // The destructive apply path performs a fresh filesystem-only audit of
+        // every registered raw path under the lifecycle lock, so routine opens
+        // do not needlessly canonicalize the entire history again.
+        let existing = self.store().cleanup_cohort_scan_state(namespace)?;
+        let index_state = match existing {
+            Some(state) if state.complete => state,
+            _ => match self.refresh_cleanup_cohort_aliases(deadline)? {
+                Some(state) => state,
+                None => return Ok(None),
+            },
         };
         if !index_state.complete {
             return Ok(None);
@@ -1694,9 +1708,9 @@ impl Broker {
                 live: Vec::new(),
                 live_worktrees: Vec::new(),
                 unresolved_rows: index_state.unresolved_rows,
+                alias_refresh_generation: index_state.alias_refresh_generation,
             }));
         }
-        let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
         let maximum_group_id = self
             .store()
             .cleanup_cohort_group_max_session_id(namespace)?;
@@ -1759,6 +1773,7 @@ impl Broker {
             live,
             live_worktrees,
             unresolved_rows: 0,
+            alias_refresh_generation: index_state.alias_refresh_generation,
         }))
     }
 
@@ -2014,30 +2029,25 @@ impl Broker {
         }
         let mut expected_session_ids = candidate.session_ids();
         expected_session_ids.sort_unstable();
-        let mut current_session_ids = self
-            .store()
-            .cleaned_sessions()
-            .map_err(|error| keep(format!("closed sessions unreadable: {error}")))?
-            .into_iter()
-            .filter(|session| {
-                session.cleanup_state == SessionCleanupState::Closed
-                    && canonical(Path::new(&session.worktree_path)) == candidate.worktree
-            })
-            .map(|session| session.id)
-            .collect::<Vec<_>>();
+        let owner = current_spawned_owner.ok_or_else(|| keep("no recorded owner".into()))?;
+        let current_cohort = self
+            .closed_artifact_checkout_cohort_for_session(
+                owner.id,
+                &candidate.worktree,
+                options.deadline,
+            )
+            .map_err(|error| keep(format!("closed checkout cohort unreadable: {error}")))?
+            .ok_or_else(|| keep("closed checkout cohort or ownership witness changed".into()))?;
+        let mut current_session_ids = current_cohort.session_ids();
         current_session_ids.sort_unstable();
         if current_session_ids != expected_session_ids {
             return Err(keep("closed session set changed".into()));
         }
-        let owner = current_spawned_owner.ok_or_else(|| keep("no recorded owner".into()))?;
         if owner.origin != SessionOrigin::Spawned || owner.branch != candidate.spawned_owner.branch
         {
             return Err(keep("spawned ownership record changed".into()));
         }
-        let persisted_witness = self
-            .store()
-            .spawned_worktree_instance_witness(owner.id)
-            .map_err(|error| keep(format!("spawn-time worktree identity unreadable: {error}")))?;
+        let persisted_witness = current_cohort.owner_witness().cloned();
         if persisted_witness.as_ref() != candidate.spawned_instance_witness.as_ref() {
             return Err(keep(
                 "spawn-time worktree identity changed or is missing".into(),
@@ -2509,6 +2519,13 @@ impl Broker {
         if !policy.auto_remove {
             return Ok(AutoCleanupPlan::nothing(report));
         }
+        let cleanup_grace_hours = match crate::load_retention_policy(self.main_root()) {
+            Ok(policy) => policy.closed_worktree_grace_hours,
+            Err(error) => {
+                report.config_error = Some(format!("retention policy unreadable: {error}"));
+                return Ok(AutoCleanupPlan::nothing(report));
+            }
+        };
         let (mut cursor, mut expected_cursor) = self.auto_cleanup_cursor()?;
         let cursor_before_scan = cursor;
         let Some(scan) = self.auto_cleanup_checkout_groups(&mut cursor, deadline)? else {
@@ -2529,6 +2546,28 @@ impl Broker {
         if cursor != cursor_before_scan {
             self.persist_auto_cleanup_cursor(&cursor, &mut expected_cursor)?;
         }
+        // Older installed routers do not write the close outbox atomically.
+        // Reconcile only this rotating, bounded cohort page so a closure made
+        // by one of those clients eventually receives its original grace
+        // without turning routine maintenance into a full-history query.
+        let legacy_closed_spawned_ids = scan
+            .groups
+            .iter()
+            .filter(|group| !policy.is_pinned(&group.worktree))
+            .flat_map(|group| group.sessions.iter())
+            .filter(|session| {
+                session.origin == SessionOrigin::Spawned
+                    && session.status.is_closed()
+                    && session.cleanup_state == SessionCleanupState::Closed
+            })
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        self.store().request_closed_spawned_checkout_cleanups(
+            &legacy_closed_spawned_ids,
+            cleanup_grace_hours,
+            now_ms(),
+        )?;
+        let alias_refresh_generation = scan.alias_refresh_generation;
 
         let mut upstream_checked = false;
         let mut upstream = None;
@@ -2649,6 +2688,7 @@ impl Broker {
             upstream,
             selected,
             deadline,
+            alias_refresh_generation: Some(alias_refresh_generation),
         })
     }
 
@@ -2664,15 +2704,61 @@ impl Broker {
             upstream,
             selected,
             deadline,
+            alias_refresh_generation,
         } = plan;
+        if let Some(expected_alias_generation) = alias_refresh_generation {
+            let alias_snapshot_current = self
+                .store()
+                .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)?
+                .is_some_and(|state| {
+                    state.complete
+                        && state.unresolved_rows == 0
+                        && state.alias_refresh_generation == expected_alias_generation
+                });
+            if !alias_snapshot_current {
+                report.deferred = report.deferred.saturating_add(selected.len());
+                self.record_auto_cleanup_report(&report)?;
+                return Ok(report);
+            }
+        }
         let Some(upstream) = upstream.filter(|_| !selected.is_empty()) else {
             self.record_auto_cleanup_report(&report)?;
             return Ok(report);
+        };
+        let _lifecycle_claim = match self.try_claim_worktree_lifecycle() {
+            Ok(Some(claim)) => claim,
+            Ok(None) => {
+                report.deferred = report.deferred.saturating_add(selected.len());
+                self.record_auto_cleanup_report(&report)?;
+                return Ok(report);
+            }
+            Err(error) => {
+                report.deferred = report.deferred.saturating_add(selected.len());
+                report.kept.push(AutoKeptCheckout {
+                    worktree: "<session checkout inventory>".into(),
+                    sessions: Vec::new(),
+                    reason: format!("could not claim the worktree lifecycle: {error}"),
+                });
+                self.record_auto_cleanup_report(&report)?;
+                return Ok(report);
+            }
         };
         // One process snapshot for the whole batch, taken after selection so
         // it is as close to removal as it can be. No snapshot keeps all.
         let open_file_snapshot = crate::reclaim::open_file_snapshot_under(Path::new("/"));
         let records = crate::measurement::load_size_records(self.main_root());
+        if let Some(alias_generation) = alias_refresh_generation {
+            if !self.cleanup_cohort_filesystem_aliases_match(alias_generation, deadline)? {
+                report.deferred = report.deferred.saturating_add(selected.len());
+                report.kept.push(AutoKeptCheckout {
+                    worktree: "<session checkout inventory>".into(),
+                    sessions: Vec::new(),
+                    reason: "registered checkout paths changed during filesystem alias verification; cleanup requires a fresh pass".into(),
+                });
+                self.record_auto_cleanup_report(&report)?;
+                return Ok(report);
+            }
+        }
         let mut attempted_any = false;
         for (candidate, selected_proof) in selected {
             // The first selected checkout always goes, so a pass whose
@@ -2690,16 +2776,6 @@ impl Broker {
                     sessions: candidate.session_ids(),
                     reason,
                 });
-            };
-            let _lifecycle_claim = match self.claim_worktree_lifecycle() {
-                Ok(claim) => claim,
-                Err(error) => {
-                    keep_it(
-                        &mut report,
-                        format!("could not claim the worktree lifecycle: {error}"),
-                    );
-                    continue;
-                }
             };
             let artifact_use_reclaimer =
                 match crate::file_lock::artifact_use::try_artifact_use_reclaimer(
@@ -3144,6 +3220,277 @@ mod tests {
         let mut broker = storage.open(&root).unwrap();
         let session = broker.start_worktree("retirement fixture", None).unwrap();
         (owner, storage, broker, session)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn indexed_alias_lap_reuses_900_history_and_drains_removed_checkout_delta() {
+        let (_owner, _storage, mut broker, first) = retirement_fixture();
+        let first_path = PathBuf::from(&first.worktree_path);
+        broker
+            .close_abandoning_unpushed(first.id, "bounded cohort fixture")
+            .unwrap();
+        let second = broker
+            .start_worktree("second bounded cohort fixture", None)
+            .unwrap();
+        let second_path = PathBuf::from(&second.worktree_path);
+        broker
+            .close_abandoning_unpushed(second.id, "bounded cohort fixture")
+            .unwrap();
+
+        for session_id in [first.id, second.id] {
+            assert!(
+                broker
+                    .store()
+                    .spawned_worktree_instance_witness(session_id)
+                    .unwrap()
+                    .is_some(),
+                "the two real worktrees must retain their spawn-time witnesses"
+            );
+        }
+        broker
+            .store()
+            .conn
+            .execute(
+                "UPDATE sessions SET status = 'cleaned' WHERE id = ?1",
+                [first.id],
+            )
+            .unwrap();
+
+        let legacy_path = broker.main_root().parent().unwrap().join("legacy-history");
+        std::fs::create_dir_all(&legacy_path).unwrap();
+        let mut connection = rusqlite::Connection::open(broker.store().db_path()).unwrap();
+        let tx = connection.transaction().unwrap();
+        for index in 0..900 {
+            tx.execute(
+                "INSERT INTO sessions (
+                     worktree_path, branch, origin, status, cleanup_state, closed_at,
+                     created_at, updated_at, last_activity_at
+                 ) VALUES (?1, ?2, 'adopted', 'closed', 'closed', 1, 1, 1, 1)",
+                rusqlite::params![
+                    legacy_path.to_string_lossy(),
+                    format!("agent/legacy-{index}")
+                ],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        // Model rows that predate the index: the first lap must walk the
+        // complete high-water set rather than treating trigger dirties as it.
+        connection
+            .execute("DELETE FROM cleanup_cohort_dirty_sessions", [])
+            .unwrap();
+
+        let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
+        let initial = broker
+            .refresh_cleanup_cohort_aliases(None)
+            .unwrap()
+            .unwrap();
+        assert!(initial.complete);
+        assert_eq!(initial.high_water_session_id - initial.after_session_id, 0);
+        assert_eq!(initial.alias_refresh_generation, 1);
+        let indexed_row_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM cleanup_cohort_scan_rows WHERE namespace = ?1",
+                [namespace],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            indexed_row_count, 902,
+            "900 history rows plus two live fixtures"
+        );
+        assert_eq!(
+            broker
+                .store()
+                .cleanup_cohort_scan_state(namespace)
+                .unwrap()
+                .unwrap()
+                .pending_dirty_rows,
+            0
+        );
+
+        let first_cohort = broker
+            .closed_artifact_checkout_cohort_for_session(first.id, &first_path, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_cohort.session_ids(), vec![first.id]);
+        let second_cohort = broker
+            .closed_artifact_checkout_cohort_for_session(second.id, &second_path, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_cohort.session_ids(), vec![second.id]);
+        let before_delta = broker
+            .store()
+            .cleanup_cohort_scan_state(namespace)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before_delta.alias_refresh_generation, initial.alias_refresh_generation,
+            "per-candidate proofs consume the same completed alias lap"
+        );
+
+        connection
+            .execute(
+                "UPDATE sessions SET status = 'cleaned', cleanup_state = 'cleaned'
+                 WHERE id = ?1",
+                [first.id],
+            )
+            .unwrap();
+        let after_removal = broker
+            .refresh_cleanup_cohort_aliases(None)
+            .unwrap()
+            .unwrap();
+        assert!(after_removal.complete);
+        assert_eq!(
+            after_removal.generation, initial.generation,
+            "a successful removal refreshes only dirty rows, not 900 historical rows"
+        );
+        assert_eq!(
+            after_removal.alias_refresh_generation,
+            initial.alias_refresh_generation
+        );
+        assert!(after_removal.progress_sequence > before_delta.progress_sequence);
+        let still_retained = broker
+            .closed_artifact_checkout_cohort_for_session(second.id, &second_path, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_retained.session_ids(), vec![second.id]);
+        assert!(still_retained.owner_witness().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_refuses_raw_checkout_path_retargeted_to_candidate_without_db_change() {
+        use std::os::unix::fs::symlink;
+
+        let (_owner, _storage, mut broker, session) = retirement_fixture();
+        let candidate_path = PathBuf::from(&session.worktree_path);
+        broker
+            .close_abandoning_unpushed(session.id, "filesystem alias fixture")
+            .unwrap();
+        let unrelated_path = broker
+            .main_root()
+            .parent()
+            .unwrap()
+            .join("ordinary-checkout");
+        std::fs::create_dir_all(&unrelated_path).unwrap();
+        let mut connection = rusqlite::Connection::open(broker.store().db_path()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (
+                     worktree_path, branch, origin, status, cleanup_state, closed_at,
+                     created_at, updated_at, last_activity_at
+                 ) VALUES (?1, 'agent/unrelated', 'adopted', 'closed', 'closed', 1, 1, 1, 1)",
+                [unrelated_path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        let unrelated_id = connection.last_insert_rowid();
+        let initial = broker
+            .refresh_cleanup_cohort_aliases(None)
+            .unwrap()
+            .unwrap();
+        assert!(initial.complete);
+        let indexed_identity = broker
+            .store()
+            .cleanup_cohort_indexed_rows_page(
+                crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+                0,
+                32,
+            )
+            .unwrap();
+        let unrelated_text = unrelated_path.to_string_lossy();
+        assert!(indexed_identity.iter().any(|row| {
+            row.raw_path.as_str() == unrelated_text.as_ref()
+                && row.canonical_path.as_str() == unrelated_text.as_ref()
+        }));
+
+        let moved_path = unrelated_path.with_file_name("ordinary-checkout-moved");
+        std::fs::rename(&unrelated_path, &moved_path).unwrap();
+        symlink(&candidate_path, &unrelated_path).unwrap();
+
+        let owner = broker.store().session(session.id).unwrap();
+        let witness = broker
+            .store()
+            .spawned_worktree_instance_witness(session.id)
+            .unwrap();
+        let candidate = AutoCleanupCandidate {
+            worktree: candidate_path.clone(),
+            spawned_owner: owner.clone(),
+            spawned_instance_witness: witness,
+            sessions: vec![owner],
+        };
+        let plan = AutoCleanupPlan {
+            report: AutoCleanupReport {
+                enabled: true,
+                ..AutoCleanupReport::default()
+            },
+            policy: AutoCleanupPolicy::default(),
+            upstream: Some(("origin/main".into(), "fixture-head".into())),
+            selected: vec![(
+                candidate,
+                ContainmentProof {
+                    head: "fixture-head".into(),
+                    containing_commit: "fixture-head".into(),
+                    proof: "test proof, never reached".into(),
+                },
+            )],
+            deadline: None,
+            alias_refresh_generation: Some(initial.alias_refresh_generation),
+        };
+        let report = broker.auto_cleanup_apply(plan).unwrap();
+        assert_eq!(report.removed.len(), 0);
+        assert_eq!(report.deferred, 1);
+        assert!(
+            candidate_path.is_dir(),
+            "unexpected alias must keep the checkout"
+        );
+        assert!(
+            report
+                .kept
+                .iter()
+                .any(|kept| kept.reason.contains("registered checkout paths changed")),
+            "the apply report should explain why the selected checkout was retained"
+        );
+        let invalidated = broker
+            .store()
+            .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)
+            .unwrap()
+            .unwrap();
+        assert!(!invalidated.complete);
+        assert_eq!(
+            invalidated.pending_dirty_rows, 1,
+            "a real filesystem mismatch must durably dirty the affected row so a later pass can converge"
+        );
+
+        let refreshed = broker
+            .refresh_cleanup_cohort_aliases(None)
+            .unwrap()
+            .unwrap();
+        assert!(refreshed.complete);
+        assert_eq!(refreshed.generation, initial.generation);
+        let refreshed_alias = broker
+            .store()
+            .cleanup_cohort_indexed_rows_page(
+                crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+                unrelated_id - 1,
+                1,
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(refreshed_alias.session_id, unrelated_id);
+        assert_eq!(
+            refreshed_alias.canonical_path,
+            candidate_path.to_string_lossy()
+        );
+        let current_cohort = broker
+            .closed_artifact_checkout_cohort_for_session(session.id, &candidate_path, None)
+            .unwrap()
+            .unwrap();
+        let mut current_ids = current_cohort.session_ids();
+        current_ids.sort_unstable();
+        assert_eq!(current_ids, vec![session.id, unrelated_id]);
     }
 
     #[cfg(unix)]

@@ -7330,7 +7330,7 @@ impl Broker {
                     }
                 };
                 let current_session = self.store().session(session.id)?;
-                if current_session.status != crate::SessionStatus::Closed
+                if !current_session.status.is_closed()
                     || current_session.cleanup_state != crate::SessionCleanupState::Closed
                     || current_session.worktree_path != session.worktree_path
                     || current_session.branch != session.branch
