@@ -539,10 +539,10 @@ impl Drop for OwnedEnsuredService {
         while self.0.observe() == Observation::Alive && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
-        assert_ne!(
+        assert_eq!(
             self.0.observe(),
-            Observation::Alive,
-            "owned service did not exit"
+            Observation::Gone,
+            "owned service exit could not be proved"
         );
     }
 }
@@ -570,7 +570,7 @@ fn concurrent_ensure_starts_one_service_and_reuses_its_repository_identity() {
         .filter(|o| o.status.success())
         .map(|o| serde_json::from_slice(&o.stdout).unwrap())
         .collect();
-    let _owned = successful.first().map(|value| {
+    let owned = successful.first().map(|value| {
         OwnedEnsuredService(
             aethyme_broker::environments::identity::ProcessIdentity::capture(
                 value["pid"].as_i64().unwrap() as i32,
@@ -636,6 +636,32 @@ fn concurrent_ensure_starts_one_service_and_reuses_its_repository_identity() {
         serde_json::from_slice::<serde_json::Value>(&plan.stdout)
             .unwrap()
             .is_object()
+    );
+    let before = cli_json(
+        &fixture,
+        &["lookup", directory.to_str().unwrap(), "ensured-plan"],
+    );
+    drop(owned);
+    let restarted = ensure_command(&fixture, &root).output().unwrap();
+    assert!(
+        restarted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    let restarted: serde_json::Value = serde_json::from_slice(&restarted.stdout).unwrap();
+    let _restarted = OwnedEnsuredService(
+        aethyme_broker::environments::identity::ProcessIdentity::capture(
+            restarted["pid"].as_i64().unwrap() as i32,
+        )
+        .expect("capture our restarted service identity"),
+    );
+    assert_eq!(restarted["started"], true);
+    assert_eq!(
+        cli_json(
+            &fixture,
+            &["lookup", directory.to_str().unwrap(), "ensured-plan"]
+        ),
+        before
     );
 }
 

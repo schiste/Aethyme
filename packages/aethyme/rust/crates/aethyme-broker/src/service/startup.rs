@@ -245,3 +245,33 @@ pub fn ensure(root: &Path, repository: &Path, executable: &Path) -> io::Result<E
         thread::sleep(POLL);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_startup_guard_stops_and_reaps_its_owned_child() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        drop(StartingChild(Some(child)));
+        let mut status = 0;
+        // SAFETY: wait only for this test's exact child, without blocking. An
+        // unreaped live child yields 0; an unreaped exited child yields its pid.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+}
