@@ -195,7 +195,7 @@ const AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE: Duration = Duration::from_secs(60);
 const AUTO_COMPACT_CHECKOUT_WORKER_RESERVE: Duration = Duration::from_secs(90);
 const AUTO_COMPACT_CHECKOUT_RETRY_MS: i64 = 10 * 60_000;
 const AUTO_COMPACT_BACKFILL_RETRY_MS: i64 = 60_000;
-const AUTO_COMPACT_CHECKOUT_BATCH_SIZE: usize = 1;
+const AUTO_COMPACT_CHECKOUT_BATCH_SIZE: usize = 8;
 const AUTO_COMPACT_BACKFILL_PAGE_SIZE: usize = 32;
 
 fn artifact_worker_cache_lane_duration(
@@ -210,6 +210,22 @@ fn artifact_worker_cache_lane_duration(
         reserve = reserve.saturating_add(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE);
     }
     ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(reserve)
+}
+
+/// Spend one worker admission on several fresh candidate checks, while keeping
+/// the full archive reserve before each attempt. `false` leaves later rows due.
+fn run_compact_checkout_candidates<T, E>(
+    candidates: &[T],
+    mut remaining: impl FnMut() -> Duration,
+    mut attempt: impl FnMut(&T) -> Result<(), E>,
+) -> Result<bool, E> {
+    for candidate in candidates.iter().take(AUTO_COMPACT_CHECKOUT_BATCH_SIZE) {
+        if remaining() < crate::auto_cleanup::AUTO_COMPACTION_MIN_BUDGET {
+            return Ok(false);
+        }
+        attempt(candidate)?;
+    }
+    Ok(true)
 }
 
 fn compact_checkout_worker_has_admission_budget(remaining: Duration) -> bool {
@@ -5785,8 +5801,9 @@ impl Broker {
 
     /// Run one detached compact-maintenance pass. The alias index gets one
     /// resumable full refresh; the indexed inventory and candidate cursor are
-    /// then consumed within the same reserved pass. Each worker attempts at
-    /// most one archive/removal, so its final lifecycle audit remains bounded.
+    /// then consumed within the same reserved pass. Each attempt rebuilds its
+    /// cohort and keeps the full archive reserve; the batch and worker lifetime
+    /// remain bounded independently.
     fn auto_compact_checkout_recovery_pass(
         &mut self,
         deadline: Instant,
@@ -5889,7 +5906,7 @@ impl Broker {
         let due = self
             .store()
             .due_checkout_cleanup_compactions(now_ms(), AUTO_COMPACT_CHECKOUT_BATCH_SIZE)?;
-        let Some(session_id) = due.first().copied() else {
+        if due.is_empty() {
             let status = if backfill_complete {
                 format!("compact_checkout_seeded={scheduled} no_due_candidates")
             } else {
@@ -5897,8 +5914,42 @@ impl Broker {
             };
             self.write_artifact_sweep_worker_status(&status)?;
             return Ok(());
-        };
+        }
 
+        let complete = run_compact_checkout_candidates(
+            &due,
+            || deadline.saturating_duration_since(Instant::now()),
+            |session_id| match self.auto_compact_checkout_candidate(*session_id, deadline) {
+                Ok(()) => Ok(()),
+                Err(error @ BrokerOpError::Store(_)) => Err(error),
+                Err(error) => {
+                    self.store().defer_checkout_cleanup_compactions(
+                        &[*session_id],
+                        now_ms().saturating_add(AUTO_COMPACT_CHECKOUT_RETRY_MS),
+                        now_ms(),
+                    )?;
+                    self.write_artifact_sweep_worker_status(&format!(
+                        "compact_checkout_candidate_failed session={session_id}: {error}"
+                    ))
+                }
+            },
+        )?;
+        if !complete {
+            self.defer_auto_compact_checkout_worker(
+                "compact_checkout_batch_budget_exhausted",
+                AUTO_COMPACT_BACKFILL_RETRY_MS,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild and verify ownership for each candidate; never reuse a prior
+    /// checkout's cohort, liveness result, archive proof or lifecycle claim.
+    fn auto_compact_checkout_candidate(
+        &mut self,
+        session_id: i64,
+        deadline: Instant,
+    ) -> Result<(), BrokerOpError> {
         let session = self.store().session(session_id)?;
         if session.origin != crate::SessionOrigin::Spawned
             || !session.status.is_closed()
@@ -9481,6 +9532,75 @@ mod tests {
     }
 
     #[test]
+    fn compact_batch_visits_multiple_candidates_without_another_worker() {
+        let mut seen = Vec::new();
+        let complete = run_compact_checkout_candidates(
+            &[10, 11, 12],
+            || AUTO_COMPACT_CHECKOUT_WORKER_RESERVE,
+            |id| {
+                seen.push(*id);
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap();
+        assert!(complete);
+        assert_eq!(seen, vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn compact_batch_preserves_archive_reserve_before_each_attempt() {
+        let remaining = std::cell::Cell::new(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE);
+        let mut seen = Vec::new();
+        let complete = run_compact_checkout_candidates(
+            &[10, 11, 12],
+            || remaining.get(),
+            |id| {
+                seen.push(*id);
+                remaining
+                    .set(crate::auto_cleanup::AUTO_COMPACTION_MIN_BUDGET - Duration::from_nanos(1));
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap();
+        assert!(!complete);
+        assert_eq!(seen, vec![10]);
+        let complete = run_compact_checkout_candidates(
+            &[11],
+            || Duration::ZERO,
+            |_| -> Result<(), ()> { panic!("expired reserve must not dispatch an attempt") },
+        )
+        .unwrap();
+        assert!(!complete);
+    }
+
+    #[test]
+    fn compact_batch_stops_on_store_error_and_bounds_candidate_count() {
+        let mut seen = Vec::new();
+        let error = run_compact_checkout_candidates(
+            &[10, 11],
+            || AUTO_COMPACT_CHECKOUT_WORKER_RESERVE,
+            |id| {
+                seen.push(*id);
+                Err("database unavailable")
+            },
+        );
+        assert_eq!(error, Err("database unavailable"));
+        assert_eq!(seen, vec![10]);
+        let candidates = (0..AUTO_COMPACT_CHECKOUT_BATCH_SIZE + 3).collect::<Vec<_>>();
+        let mut seen = Vec::new();
+        run_compact_checkout_candidates(
+            &candidates,
+            || AUTO_COMPACT_CHECKOUT_WORKER_RESERVE,
+            |id| {
+                seen.push(*id);
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, candidates[..AUTO_COMPACT_CHECKOUT_BATCH_SIZE]);
+    }
+
+    #[test]
     fn compact_worker_has_separate_reserve_and_due_admission() {
         assert_eq!(
             artifact_worker_cache_lane_duration(false, false),
@@ -9526,6 +9646,96 @@ mod tests {
             Some(101),
             100
         ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn compact_pass_removes_two_checkouts_with_fresh_cohorts_and_valid_archives() {
+        let (_temporary, _storage, mut broker, root) = closed_artifact_sweep_fixture();
+        let (first, first_path, _) = closed_artifact_cache(&mut broker, "compact batch first");
+        let (second, second_path, _) = closed_artifact_cache(&mut broker, "compact batch second");
+        for (path, payload) in [
+            (&first_path, "first unique work"),
+            (&second_path, "second unique work"),
+        ] {
+            std::fs::write(path.join("unique-commit.txt"), payload).unwrap();
+            git(path, &["add", "unique-commit.txt"]);
+            git(path, &["commit", "-qm", "preserved batch work"]);
+            std::fs::write(path.join("recover-me.txt"), payload).unwrap();
+        }
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[cleanup]\nauto_remove = true\nstrict = false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\ncompact_closed_worktrees = true\nclosed_worktree_grace_hours = 360\nauto_cleanup_worktrees_on_finish = false\nartifact_sweep_budget_ms = 0\n",
+        ).unwrap();
+        assert_eq!(
+            broker
+                .store()
+                .request_closed_spawned_checkout_compactions(&[first, second], 360, now_ms(),)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            broker
+                .store()
+                .due_checkout_cleanup_compactions(now_ms(), 8)
+                .unwrap(),
+            vec![first, second]
+        );
+
+        broker
+            .auto_compact_checkout_recovery_pass(
+                Instant::now() + AUTO_COMPACT_CHECKOUT_WORKER_RESERVE,
+            )
+            .unwrap();
+
+        assert!(
+            !first_path.exists(),
+            "first native checkout must be retired"
+        );
+        assert!(
+            !second_path.exists(),
+            "second proof must refresh after the first removal dirties the alias index"
+        );
+        assert!(
+            broker
+                .store()
+                .due_checkout_cleanup_compactions(now_ms(), 8)
+                .unwrap()
+                .is_empty()
+        );
+        let archives = broker.recovery_archives().unwrap();
+        assert!(archives.unowned.is_empty(), "{:?}", archives.unowned);
+        assert_eq!(archives.owned.len(), 2);
+        for id in [first, second] {
+            let archive = archives.owned.iter().find(|a| a.session_id == id).unwrap();
+            assert!(
+                archive.holds_uncommitted,
+                "untracked work must remain recoverable"
+            );
+            assert!(
+                !archive.prerequisite_refs.is_empty(),
+                "incremental archive roots must remain pinned"
+            );
+            assert!(archive.minimum_archive_retention_ms.unwrap() >= 15 * 24 * 60 * 60 * 1_000);
+            for pin in &archive.prerequisite_refs {
+                let output = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(["rev-parse", "--verify", &pin.ref_name])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stdout).trim(),
+                    pin.object_id
+                );
+            }
+        }
     }
 
     #[test]
