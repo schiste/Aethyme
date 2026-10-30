@@ -29,6 +29,23 @@ use super::store::{EnvironmentPhase, EnvironmentRecord, StoreError};
 use super::{ENVIRONMENTS_FILE, parse_loaded};
 
 pub const SHARED_DIRECTORY: &str = "shared";
+/// Written into every shared export: the commit it was exported from. An
+/// export carries no Git metadata, so this is how destroy proves the
+/// directory is the one Aethyme made for the recorded revision.
+pub const EXPORT_MARKER: &str = ".aethyme-export-commit";
+
+/// Whether `directory` is an Aethyme-made shared export of `commit` under
+/// `root`.
+pub fn is_shared_export_of(root: &Path, directory: &Path, commit: &str) -> bool {
+    let inside = directory
+        .canonicalize()
+        .ok()
+        .zip(root.join(SHARED_DIRECTORY).canonicalize().ok())
+        .is_some_and(|(directory, shared)| directory.starts_with(shared));
+    inside
+        && std::fs::read_to_string(directory.join(EXPORT_MARKER))
+            .is_ok_and(|marker| marker.trim() == commit)
+}
 /// Present in an environment's directory while a redeploy swaps it; the
 /// proxy holds requests (and never wakes the old revision) meanwhile.
 pub const SWAP_MARKER: &str = "swap.in-progress";
@@ -182,6 +199,7 @@ impl Lifecycle {
         if !export.join(ENVIRONMENTS_FILE).is_file() {
             std::fs::create_dir_all(&export).map_err(io)?;
             export_commit(main_root, sha, &export).map_err(io)?;
+            std::fs::write(export.join(EXPORT_MARKER), sha).map_err(io)?;
         }
         let text = std::fs::read_to_string(export.join(ENVIRONMENTS_FILE)).map_err(io)?;
         let file = parse_loaded::<EnvironmentsFile>(
