@@ -3,7 +3,7 @@
 use super::*;
 use crate::service::{job_protocol as wire, jobs::JobOperation};
 
-pub(super) const SERVICE_USAGE: &str = "  aethyme broker advanced service serve <private-runtime-directory> [--jobs-for <repository>]\n  aethyme broker advanced service ping <private-runtime-directory> [--json]\n  aethyme broker advanced service submit <private-runtime-directory> --request-key <key> --deadline-ms <utc-ms> [--full-scan] [--include-active-gate-cache] [--json]\n  aethyme broker advanced service lookup <private-runtime-directory> <request-key> [--json]\n  aethyme broker advanced service status <private-runtime-directory> <job-id> [--json]\n  aethyme broker advanced service cancel <private-runtime-directory> <job-id> [--json]\n  aethyme broker advanced service result <private-runtime-directory> <job-id> [--json]\n      Explicit foreground service; existing broker operations stay local.\n      Create an absolute canonical directory owned by this user, mode 0700.\n      Jobs require an initialized repository and only plan GC; they never apply it.\n      Keep the request key and exact deadline for durable retry or lookup.\n      Stop with Ctrl-C or your process supervisor; no implicit activation.\n";
+pub(super) const SERVICE_USAGE: &str = "  aethyme broker advanced service serve <private-runtime-directory> [--jobs-for <repository>]\n  aethyme broker advanced service ping <private-runtime-directory> [--json]\n  aethyme broker advanced service repository <private-runtime-directory> [--json]\n  aethyme broker advanced service submit <private-runtime-directory> --request-key <key> --deadline-ms <utc-ms> [--full-scan] [--include-active-gate-cache] [--json]\n  aethyme broker advanced service lookup <private-runtime-directory> <request-key> [--json]\n  aethyme broker advanced service status <private-runtime-directory> <job-id> [--json]\n  aethyme broker advanced service cancel <private-runtime-directory> <job-id> [--json]\n  aethyme broker advanced service result <private-runtime-directory> <job-id> [--json]\n      Explicit foreground service; existing broker operations stay local.\n      Create an absolute canonical directory owned by this user, mode 0700.\n      Jobs require an initialized repository and only plan GC; they never apply it.\n      Keep the request key and exact deadline for durable retry or lookup.\n      Stop with Ctrl-C or your process supervisor; no implicit activation.\n";
 
 enum Command {
     Serve { repository: Option<PathBuf> },
@@ -27,6 +27,7 @@ fn parse(args: &[String]) -> Option<Command> {
             })
         }
         ("ping", []) => Some(Command::Ping),
+        ("repository", []) => Some(Command::Job(wire::Method::Repository {})),
         ("lookup", [key]) if !key.is_empty() => Some(Command::Job(wire::Method::Lookup {
             idempotency_key: key.clone(),
         })),
@@ -195,6 +196,8 @@ mod tests {
             "serve /tmp --jobs-for",
             "serve /tmp --jobs-for repo --unknown",
             "ping /tmp --unknown",
+            "repository /tmp --unknown",
+            "repository /tmp extra",
             "status /tmp 0",
             "cancel /tmp -1",
             "result /tmp invalid",
@@ -210,6 +213,7 @@ mod tests {
             "serve /tmp",
             "serve /tmp --jobs-for repo",
             "ping /tmp --json",
+            "repository /tmp --json",
             "status /tmp 1",
             "lookup /tmp key --json",
             "submit /tmp --request-key key --deadline-ms 100 --full-scan --include-active-gate-cache --json",

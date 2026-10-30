@@ -263,9 +263,34 @@ impl JobRuntime {
         Ok(store)
     }
 
+    pub(crate) fn handle_scoped(
+        &self,
+        method: &Method,
+        repository_key: Option<&str>,
+    ) -> Result<Reply, Error> {
+        // This identity is immutable for the retained runtime capability.
+        // Check every request, rather than trusting a prior handshake which
+        // could have described a service that has since been replaced.
+        if repository_key.is_some_and(|key| key != self.repository_key) {
+            return Err(error(
+                ErrorCode::RepositoryMismatch,
+                "service repository identity differs",
+            ));
+        }
+        self.handle(method)
+    }
+
     pub(crate) fn handle(&self, method: &Method) -> Result<Reply, Error> {
         let mut store = self.store().map_err(|e| error(ErrorCode::Unavailable, e))?;
         match method {
+            Method::Repository {} => Ok(Reply::Repository {
+                identity: wire::RepositoryIdentity {
+                    key: self.repository_key.clone(),
+                    repository_uuid: self.repository.uuid.clone(),
+                    root: self.repository.root.clone(),
+                    common_dir: self.repository.common_dir.clone(),
+                },
+            }),
             Method::Submit {
                 idempotency_key,
                 operation,
