@@ -220,13 +220,41 @@ pub fn observe_holder(
     table: Option<&crate::session_holder::ProcessTable>,
     now_ms: i64,
 ) -> Result<(HolderObservation, Option<i64>), crate::BrokerOpError> {
+    observe_holder_for_cleanup(store, session_id, table, now_ms, false)
+}
+
+fn observe_holder_for_cleanup(
+    store: &crate::BrokerStore,
+    session_id: i64,
+    table: Option<&crate::session_holder::ProcessTable>,
+    now_ms: i64,
+    abandoned_session: bool,
+) -> Result<(HolderObservation, Option<i64>), crate::BrokerOpError> {
     let Some(holder) = crate::session_holder::recorded_holder(store, session_id)? else {
         return Ok((HolderObservation::NoRecordedHolder, None));
     };
     if crate::session_holder::is_shared_agent_service(&holder.command) {
         // A legacy shared-service binding remains an ownership record, but
         // service uptime proves neither this task's activity nor its death.
-        return Ok((HolderObservation::NoRecordedHolder, Some(holder.pid)));
+        if !abandoned_session {
+            return Ok((HolderObservation::NoRecordedHolder, Some(holder.pid)));
+        }
+        let Some(table) = table else {
+            return Ok((HolderObservation::ProcessTableUnavailable, Some(holder.pid)));
+        };
+        // An absent daemon alone is not evidence that this task is abandoned.
+        // Require a persisted gone event for this exact binding, then apply
+        // the ordinary lease grace below through `classify`.
+        if table.is_alive(&holder) {
+            return Ok((HolderObservation::NoRecordedHolder, Some(holder.pid)));
+        }
+        return Ok((
+            match recorded_gone_since(store, session_id, &holder)? {
+                Some(since) => HolderObservation::Gone { since },
+                None => HolderObservation::NoRecordedHolder,
+            },
+            Some(holder.pid),
+        ));
     }
     let Some(table) = table else {
         return Ok((HolderObservation::ProcessTableUnavailable, Some(holder.pid)));
@@ -297,13 +325,42 @@ pub fn assess(
     now_ms: i64,
     policy: LeaseLivenessPolicy,
 ) -> Result<Vec<LeaseLivenessView>, crate::BrokerOpError> {
+    assess_for_cleanup(store, leases, table, now_ms, policy, false)
+}
+
+/// Only the automatic abandonment path may use exact dead shared-service
+/// evidence. Ordinary claim/status consumers retain conservative semantics.
+pub(crate) fn assess_for_abandonment(
+    store: &crate::BrokerStore,
+    leases: &[crate::Lease],
+    table: Option<&crate::session_holder::ProcessTable>,
+    now_ms: i64,
+    policy: LeaseLivenessPolicy,
+) -> Result<Vec<LeaseLivenessView>, crate::BrokerOpError> {
+    assess_for_cleanup(store, leases, table, now_ms, policy, true)
+}
+
+fn assess_for_cleanup(
+    store: &crate::BrokerStore,
+    leases: &[crate::Lease],
+    table: Option<&crate::session_holder::ProcessTable>,
+    now_ms: i64,
+    policy: LeaseLivenessPolicy,
+    abandoned_session: bool,
+) -> Result<Vec<LeaseLivenessView>, crate::BrokerOpError> {
     let mut holders = std::collections::HashMap::new();
     let mut views = Vec::with_capacity(leases.len());
     for lease in leases {
         let ((observation, pid), activity) = match holders.entry(lease.session_id) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => entry.insert((
-                observe_holder(store, lease.session_id, table, now_ms)?,
+                observe_holder_for_cleanup(
+                    store,
+                    lease.session_id,
+                    table,
+                    now_ms,
+                    abandoned_session,
+                )?,
                 store.session(lease.session_id)?.last_activity_at,
             )),
         };
@@ -348,6 +405,167 @@ mod tests {
             idle_ms: 30 * MINUTE,
             stale_grace_ms: 15 * MINUTE,
         }
+    }
+
+    fn shared_holder_fixture() -> (
+        tempfile::TempDir,
+        crate::BrokerStore,
+        i64,
+        crate::session_holder::AgentProcess,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::BrokerStore::open(&dir.path().join("broker.db")).unwrap();
+        let session = store
+            .register_session(&crate::NewSession {
+                worktree_path: "/tmp/shared-holder-fixture".into(),
+                branch: "agent/shared-holder-fixture".into(),
+                origin: crate::SessionOrigin::Adopted,
+                task: None,
+                diff_base: None,
+                adoption_base: None,
+                adopted_head: None,
+                repository_contract: None,
+                pid: None,
+                command: None,
+                log_path: None,
+                agent_identity: None,
+            })
+            .unwrap();
+        let holder = crate::session_holder::AgentProcess {
+            pid: 3731,
+            started: "Fri Oct 23 08:42:41 2026".into(),
+            command: "/opt/codex app-server --listen local".into(),
+        };
+        store
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session.id),
+                Some(&crate::events::session_holder_bound_payload(
+                    &holder,
+                    "registered",
+                    None,
+                )),
+            )
+            .unwrap();
+        (dir, store, session.id, holder)
+    }
+
+    #[test]
+    fn abandonment_shared_holder_needs_exact_persisted_gone_and_complete_absent_snapshot() {
+        let (_dir, mut store, id, holder) = shared_holder_fixture();
+        let absent = crate::session_holder::ProcessTable::default();
+        let live = crate::session_holder::ProcessTable::parse(
+            "3731 1 Fri Oct 23 08:42:41 2026 /opt/codex app-server --listen local\n",
+        );
+        assert_eq!(
+            observe_holder_for_cleanup(&store, id, Some(&absent), 0, true)
+                .unwrap()
+                .0,
+            HolderObservation::NoRecordedHolder
+        );
+        let mut wrong = holder.clone();
+        wrong.started = "different start".into();
+        store
+            .append_event(
+                crate::events::SESSION_HOLDER_GONE,
+                Some(id),
+                Some(&crate::events::session_holder_gone_payload(&wrong)),
+            )
+            .unwrap();
+        assert_eq!(
+            observe_holder_for_cleanup(&store, id, Some(&absent), 0, true)
+                .unwrap()
+                .0,
+            HolderObservation::NoRecordedHolder
+        );
+        store
+            .append_event(
+                crate::events::SESSION_HOLDER_GONE,
+                Some(id),
+                Some(&crate::events::session_holder_gone_payload(&holder)),
+            )
+            .unwrap();
+        let since = store
+            .latest_session_holder_gone_event(id)
+            .unwrap()
+            .unwrap()
+            .ts;
+        assert_eq!(
+            observe_holder_for_cleanup(&store, id, None, since, true)
+                .unwrap()
+                .0,
+            HolderObservation::ProcessTableUnavailable
+        );
+        assert_eq!(
+            observe_holder_for_cleanup(&store, id, Some(&live), since, true)
+                .unwrap()
+                .0,
+            HolderObservation::NoRecordedHolder
+        );
+        let observation = observe_holder_for_cleanup(&store, id, Some(&absent), since, true)
+            .unwrap()
+            .0;
+        assert_eq!(observation, HolderObservation::Gone { since });
+        assert!(
+            classify(false, &observation, Some(holder.pid), 0, since, policy())
+                .1
+                .holds
+        );
+        assert!(
+            !classify(
+                false,
+                &observation,
+                Some(holder.pid),
+                0,
+                since + policy().stale_grace_ms,
+                policy()
+            )
+            .1
+            .holds
+        );
+        let lease = store.claim_lease(id, "source.rs", None).unwrap();
+        assert!(
+            assess(
+                &store,
+                std::slice::from_ref(&lease),
+                Some(&absent),
+                since + policy().stale_grace_ms,
+                policy()
+            )
+            .unwrap()[0]
+                .liveness_evidence
+                .holds
+        );
+        assert!(
+            !assess_for_abandonment(
+                &store,
+                &[lease],
+                Some(&absent),
+                since + policy().stale_grace_ms,
+                policy()
+            )
+            .unwrap()[0]
+                .liveness_evidence
+                .holds
+        );
+        // Rebinding even the same PID/start requires a newer gone event.
+        store
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(id),
+                Some(&crate::events::session_holder_bound_payload(
+                    &holder,
+                    "registered",
+                    None,
+                )),
+            )
+            .unwrap();
+        assert_eq!(
+            observe_holder_for_cleanup(&store, id, Some(&absent), since, true)
+                .unwrap()
+                .0,
+            HolderObservation::NoRecordedHolder
+        );
     }
 
     #[test]
