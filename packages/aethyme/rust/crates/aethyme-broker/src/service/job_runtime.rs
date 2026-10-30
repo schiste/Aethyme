@@ -765,7 +765,13 @@ mod tests {
     fn status_identity_checks_preserve_live_sqlite_locks() {
         let fixture = Fixture::new();
         let (_server, jobs) = fixture.open(Arc::new(|_, _, _| Ok(serde_json::json!({}))));
-        let probe = || {
+        // Hold a real SQLite read snapshot, rather than assuming an idle
+        // connection still owns a lock after its last statement completed.
+        jobs.store()
+            .unwrap()
+            .begin_read_snapshot_for_test()
+            .unwrap();
+        let probe = |phase| {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -780,17 +786,17 @@ mod tests {
             assert_eq!(
                 output.status.code(),
                 Some(24),
-                "a separate process acquired a live database's exclusive lock: stdout={} stderr={}",
+                "a separate process acquired a live database's exclusive lock {phase}: stdout={} stderr={}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
         };
-        probe();
+        probe("before identity check");
         jobs.handle(&Method::Lookup {
             idempotency_key: "missing".into(),
         })
         .unwrap();
-        probe();
+        probe("after identity check");
     }
 
     #[test]

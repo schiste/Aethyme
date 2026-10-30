@@ -105,6 +105,13 @@ impl JobStore {
             .query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?)
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn begin_read_snapshot_for_test(&self) -> Result<(), JobError> {
+        self.conn
+            .execute_batch("BEGIN; SELECT id FROM service_jobs;")?;
+        Ok(())
+    }
+
     #[cfg(unix)]
     pub(crate) fn outstanding_count(&self, repository: &str) -> Result<usize, JobError> {
         Ok(self.conn.query_row(
