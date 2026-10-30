@@ -5658,12 +5658,6 @@ where
         if bytes != streamed_bytes {
             return Err(format!("{BUNDLE_FILE} byte count changed after streaming"));
         }
-        verify_recovery_bundle(
-            repository,
-            &path,
-            &recovery_bundle_roots(plan),
-            bundle_deadline,
-        )?;
         Some(RecoveryBundleIntegrity { bytes, sha256 })
     };
     let bundle = bundle_integrity.as_ref().map(|_| BUNDLE_FILE);
@@ -5984,6 +5978,21 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", "printf 123456789"]);
         stream_recovery_command_stdout(&mut command, file, max_bytes, deadline)
+    }
+
+    #[cfg(unix)]
+    fn write_invalid_bundle(
+        _checkout: &GitRepo,
+        _delivery_targets: &[String],
+        _additional_roots: &[String],
+        _max_bytes: u64,
+        _deadline: Instant,
+        file: &mut std::fs::File,
+    ) -> Result<u64, String> {
+        const INVALID_BUNDLE: &[u8] = b"not a Git bundle\n";
+        file.write_all(INVALID_BUNDLE)
+            .map_err(|error| format!("cannot write invalid test bundle: {error}"))?;
+        Ok(INVALID_BUNDLE.len() as u64)
     }
 
     fn git(dir: &Path, args: &[&str]) {
@@ -8531,6 +8540,80 @@ mod tests {
         assert_eq!(std::fs::metadata(&partial_bundle).unwrap().len(), 8);
         assert_eq!(std::fs::read(partial_bundle).unwrap(), b"12345678");
         assert!(!entries[0].join(MANIFEST_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_bundle_fails_payload_verification_after_manifest_and_keeps_checkout() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("invalid bundle verification fixture", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        let committed = worktree.join("pending.txt");
+        std::fs::write(&committed, "pending commit data\n").unwrap();
+        git(&worktree, &["add", "pending.txt"]);
+        git(&worktree, &["commit", "-qm", "pending"]);
+        broker.close(session.id).unwrap();
+
+        let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+        assert!(!plan.unlanded_commits.is_empty());
+        let error = broker
+            .cleanup_resolve_apply_with_bundle_writer(
+                session.id,
+                &plan.digest,
+                || panic!("an invalid bundle must fail before archive publication"),
+                sync_archive_directory,
+                |_, _| {
+                    Some(crate::disk_headroom::DiskHeadroom {
+                        bytes: u64::MAX,
+                        inodes: None,
+                    })
+                },
+                RecoveryBundleWriter {
+                    max_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+                    write_to: write_invalid_bundle,
+                },
+            )
+            .unwrap_err();
+        let reason = match error {
+            BrokerOpError::RecoveryArchiveUnverified { reason, .. } => reason,
+            other => panic!("unexpected invalid-bundle refusal: {other}"),
+        };
+        assert!(reason.contains("Git bundle verify failed"), "{reason}");
+
+        let entries = std::fs::read_dir(&plan.archive_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1, "no final archive should be published");
+        let partial = &entries[0];
+        assert_eq!(
+            partial.extension().and_then(|extension| extension.to_str()),
+            Some("partial")
+        );
+        assert!(partial.join(MANIFEST_FILE).is_file());
+        assert_eq!(
+            std::fs::read(partial.join(BUNDLE_FILE)).unwrap(),
+            b"not a Git bundle\n"
+        );
+        assert!(worktree.is_dir(), "the checkout must remain in place");
+        assert_eq!(std::fs::read(&committed).unwrap(), b"pending commit data\n");
+        assert_eq!(
+            GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref(&plan.branch_ref),
+            plan.branch_tip
+        );
     }
 
     #[cfg(unix)]
