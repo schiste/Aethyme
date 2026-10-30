@@ -2364,7 +2364,7 @@ mod tests {
         let second_checkout = checkout(primary.path(), "second");
         let mut producer = begin(primary.path(), &first_checkout, 12, "prepare:12:deps");
         use std::os::unix::process::CommandExt;
-        let mut command = Command::new("/bin/true");
+        let mut command = Command::new("true");
         command.process_group(0);
         let mut child = command.spawn().unwrap();
         let process_group = i32::try_from(child.id()).unwrap();

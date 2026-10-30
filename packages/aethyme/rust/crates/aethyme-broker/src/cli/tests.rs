@@ -1800,3 +1800,32 @@ fn service_lifecycle_confirmation_and_flag_scope_precede_broker_discovery() {
         assert!(super::validate_flags("watch", &parsed).is_err());
     }
 }
+
+#[test]
+fn scheduled_gc_flags_require_specific_actions_and_confirmation_format() {
+    for action in ["install", "activate", "deactivate", "uninstall"] {
+        let parsed = super::parse(&strings(&[
+            "service",
+            action,
+            "--confirm",
+            &"a".repeat(64),
+            "--json",
+        ]))
+        .unwrap_or_else(|_| panic!("service confirmation parses"));
+        assert!(super::validate_flags("gc", &parsed).is_ok());
+        assert!(super::gc_storage::service_confirmation(&parsed).is_ok());
+    }
+    for action in ["plan", "status"] {
+        let parsed = super::parse(&strings(&["service", action, "--confirm", &"a".repeat(64)]))
+            .unwrap_or_else(|_| panic!("parse before action validation"));
+        assert!(super::validate_flags("gc", &parsed).is_err());
+    }
+    let parsed = super::parse(&strings(&[
+        "service",
+        "install",
+        "--confirm",
+        "not-a-digest",
+    ]))
+    .unwrap_or_else(|_| panic!("parse before digest validation"));
+    assert!(super::gc_storage::service_confirmation(&parsed).is_err());
+}

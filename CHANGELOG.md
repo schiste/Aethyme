@@ -4,6 +4,20 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.51] - 2026-10-30
+
+### Added
+
+- An opt-in macOS cleanup service pins the installed router and engine and schedules bounded public GC sweeps every 15 minutes, subject to broker eligibility and retention. Installation is inert; activation and control changes require exact reviewed plans.
+
+### Fixed
+
+- Fresh worktree-root recovery completes on APFS after interrupted Cargo-config publication while preserving exact file and inventory checks.
+- Session retirement has a separate durable request and retry lane, so cache pressure and future closed-checkout grace periods cannot postpone abandoned-session checks indefinitely. Existing holder and lease proofs remain required.
+- Checkout cleanup distinguishes a proven removed historical checkout from a new checkout at the same path using complete repository, generation and filesystem identity evidence.
+- Final recovery-archive revalidation receives a bounded proof budget, and cleanup reports specific retained-cohort blockers.
+- Recovery archives without a recorded minimum age retain the 15-day minimum. Clean preparation journals can recover a changed root identity only when root-wide durable debt is absent.
+
 ## [0.8.50] - 2026-10-30
 
 ### Fixed

@@ -185,28 +185,48 @@ fn a_shared_environment_is_ref_owned_and_survives_worktree_cleanup() {
         vars.iter()
             .any(|(k, v)| k == "AETHYME_SHARED_BASELINE_URL" && v.starts_with("http://127.0.0.1:"))
     );
-    // #1274: with the proxy, consumers go through the route host (held
-    // during a swap, woken on request); the direct URL stays available.
+    let direct_url = vars
+        .iter()
+        .find(|(k, _)| k == "AETHYME_SHARED_BASELINE_URL")
+        .map(|(_, v)| v.as_str())
+        .unwrap();
+    let alias = super::shared::alias_host(REPOSITORY, "baseline", "localhost");
+    assert_eq!(
+        super::routes::route_alias(&host.root(), &after.env_id),
+        Some(alias.clone()),
+        "the ref-owned environment advertises its stable alias"
+    );
+    let alias_file = host
+        .root()
+        .join(&after.env_id)
+        .join(super::routes::ROUTE_ALIAS_FILE);
+    // #1274: consumers use a loopback route through the proxy while keeping
+    // the direct endpoint. Literal addresses make both branches independent
+    // of the host's wildcard-localhost DNS support.
+    std::fs::write(&alias_file, "127.0.0.1").unwrap();
     let proxied = consumer_variables(&host.root(), "baseline", &after, Some(4180));
     let url = proxied
         .iter()
         .find(|(k, _)| k == "AETHYME_SHARED_BASELINE_URL")
         .map(|(_, v)| v.clone())
         .unwrap();
-    assert_eq!(
-        url,
-        format!(
-            "http://{}:4180",
-            super::shared::alias_host(REPOSITORY, "baseline", "localhost")
-        ),
-        "the alias survives blue/green flips"
-    );
+    assert_eq!(url, "http://127.0.0.1:4180", "use the loopback proxy route");
     assert!(
         proxied
             .iter()
-            .any(|(k, v)| k == "AETHYME_SHARED_BASELINE_DIRECT_URL"
-                && v.starts_with("http://127.0.0.1:"))
+            .any(|(k, v)| k == "AETHYME_SHARED_BASELINE_DIRECT_URL" && v == direct_url)
     );
+    // A non-loopback literal must keep consumers on their direct endpoint;
+    // this address is parsed locally and no connection is attempted.
+    std::fs::write(&alias_file, "192.0.2.1").unwrap();
+    let fallback = consumer_variables(&host.root(), "baseline", &after, Some(4180));
+    assert!(
+        fallback
+            .iter()
+            .any(|(k, v)| k == "AETHYME_SHARED_BASELINE_URL" && v == direct_url),
+        "a non-loopback alias must fall back to the direct endpoint"
+    );
+    std::fs::write(&alias_file, &alias).unwrap();
     assert!(
         vars.iter()
             .any(|(k, _)| k == "AETHYME_SHARED_BASELINE_PORT_API")
