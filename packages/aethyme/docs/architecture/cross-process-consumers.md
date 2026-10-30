@@ -96,6 +96,16 @@ shortened directory name is an address only; consumers must still verify the
 full repository identity before requests. Read-only discovery is specified in
 [broker-service.md](broker-service.md).
 
+The dependent startup phase adds `service ensure <private-service-root>
+--jobs-for <repository> [--json]`. Its JSON flattens the discovery object and
+adds `pid`, `version`, and `started`. Explicit ensure creates only the private
+leaf and service coordination files, serializes startup, and reuses only a
+version-compatible service with the complete verified repository identity.
+Failed owned children are stopped and reaped; existing incompatible endpoints
+are preserved. It submits no work and enables no default routing. Startup
+budgets, log behavior and lifecycle limits are specified in
+[broker-service.md](broker-service.md).
+
 ## Automatic checkout maintenance (v0.8.44)
 
 `AutoCleanupReport` adds optional `sessions_retired` and

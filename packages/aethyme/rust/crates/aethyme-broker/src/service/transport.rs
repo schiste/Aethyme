@@ -3,7 +3,7 @@
 use super::protocol::{self, Pong, Request, Response};
 use super::{job_protocol, job_runtime::JobRuntime};
 use crate::file_lock::ExclusiveFileLock;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -23,6 +23,29 @@ fn refusal(message: &str) -> io::Error {
 pub(crate) fn owner() -> u32 {
     // SAFETY: geteuid takes no pointers and has no preconditions.
     unsafe { libc::geteuid() }
+}
+
+/// Open a private permanent coordination file without following a symlink.
+pub(crate) fn private_coordination_file(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let opened = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    if !opened.is_file()
+        || opened.uid() != owner()
+        || opened.mode() & 0o077 != 0
+        || opened.nlink() != 1
+        || (opened.dev(), opened.ino()) != (named.dev(), named.ino())
+    {
+        return Err(refusal("unsafe service coordination file"));
+    }
+    Ok(file)
 }
 
 pub(crate) fn private_directory(path: &Path) -> io::Result<fs::Metadata> {
@@ -100,22 +123,8 @@ impl Server {
     pub fn bind(directory: &Path) -> io::Result<Self> {
         let directory_metadata = private_directory(directory)?;
         let lock_path = directory.join("broker-service.lock");
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&lock_path)?;
+        let file = private_coordination_file(&lock_path)?;
         let opened = file.metadata()?;
-        if !opened.is_file()
-            || opened.uid() != owner()
-            || opened.mode() & 0o077 != 0
-            || opened.nlink() != 1
-        {
-            return Err(refusal("unsafe service lock file"));
-        }
         let lock = ExclusiveFileLock::try_acquire(file)?.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::AddrInUse,
