@@ -1109,8 +1109,8 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
         }
         "sweep" => {
             let sweep = broker.gc_sweep_artifacts();
+            #[cfg(target_os = "macos")]
             if let Err(error) = &sweep {
-                #[cfg(target_os = "macos")]
                 if let Some(tick) = managed_tick.as_ref() {
                     crate::gc_sweep_service::record_managed_tick(tick, None, Some(&error.to_string()))
                         .map_err(|receipt_error| {

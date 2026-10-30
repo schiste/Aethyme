@@ -337,7 +337,8 @@ fn current_repository() -> io::Result<(PathBuf, String)> {
     let repo = crate::GitRepo::discover(&cwd).map_err(io::Error::other)?;
     let repository = repo.main_root().map_err(io::Error::other)?;
     let common = repo.git_common_dir().map_err(io::Error::other)?;
-    let uuid = crate::store::repository_identity::read_repository_uuid_marker(&common)?
+    let uuid = crate::store::repository_identity::read_repository_uuid_marker(&common)
+        .map_err(io::Error::other)?
         .ok_or_else(|| invalid("repository has no initialized Aethyme UUID marker"))?;
     Ok((fs::canonicalize(repository)?, uuid))
 }
@@ -677,7 +678,8 @@ pub(crate) fn preflight_managed_tick(snapshot: &crate::Broker) -> io::Result<Opt
         .repo_handle()
         .git_common_dir()
         .map_err(io::Error::other)?;
-    let actual_uuid = crate::store::repository_identity::read_repository_uuid_marker(&common)?
+    let actual_uuid = crate::store::repository_identity::read_repository_uuid_marker(&common)
+        .map_err(io::Error::other)?
         .ok_or_else(|| invalid("managed GC repository UUID marker is missing"))?;
     if actual_uuid != uuid {
         return Err(invalid(

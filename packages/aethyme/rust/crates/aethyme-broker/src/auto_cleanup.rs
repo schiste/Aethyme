@@ -1908,14 +1908,17 @@ impl Broker {
         owner: &Session,
         current_witness: &crate::events::SpawnedWorktreeInstanceWitness,
     ) -> Result<bool, BrokerOpError> {
-        let alias = self.store().session(alias_id)?;
+        let alias = self.store_ref().session(alias_id)?;
         if alias.origin != SessionOrigin::Spawned
             || alias.status != crate::types::SessionStatus::Cleaned
             || alias.cleanup_state != SessionCleanupState::Cleaned
         {
             return Ok(false);
         }
-        let Some(old_witness) = self.store().spawned_worktree_instance_witness(alias_id)? else {
+        let Some(old_witness) = self
+            .store_ref()
+            .spawned_worktree_instance_witness(alias_id)?
+        else {
             return Ok(false);
         };
         let handoff = match self.latest_handoff_for_session(alias_id) {
@@ -3264,10 +3267,15 @@ mod tests {
         group_closed_checkout_sessions, ignored_content_reason, resolve_worktree_paths_until,
     };
     #[cfg(unix)]
-    use super::{AutoCleanupCandidate, AutoCleanupPlan, AutoCleanupReport, ContainmentProof};
+    use super::{
+        AutoCleanupCandidate, AutoCleanupPlan, AutoCleanupReport, ContainmentProof,
+        proves_removed_historical_instance,
+    };
     use super::{SESSION_RETIREMENT_CURSOR_KEY, now_ms};
     #[cfg(unix)]
     use crate::git::GitRepo;
+    #[cfg(unix)]
+    use crate::{Session, SessionOrigin};
     use std::path::Path;
     #[cfg(unix)]
     use std::path::PathBuf;
