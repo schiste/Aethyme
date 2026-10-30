@@ -29,6 +29,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - During issue-status audits, treat plan and architecture prose as a claim:
   map each acceptance criterion to current implementation and test assertions
   at the audited commit before marking it absent or complete.
+- Before extending ancestry-check deadlines, time the exact Git object pairs
+  and compare commit-graph coverage with reachable history. If measured graph
+  staleness is causal, refresh derived metadata through coordinated Git, repeat
+  the same probes, and then verify the native operation succeeds. Configure
+  incremental graph maintenance separately; faster raw Git alone does not prove
+  successful cleanup or authorize deletion.
 - Inspect caution zones before changing generated or vendored areas.
 
 ## Validation Checklist
@@ -189,6 +195,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   invalid metadata on a later page; keep corruption fixtures within database
   constraints so they reach the intended read path. Inspect background pressure
   sampling too: a bounded foreground loop can still leave eager worker reads.
+  For cleanup regressions, inspect an immutable snapshot of the exact tested
+  commit, seed terminal rows with database-valid raw states, and exercise more
+  eligible groups than one page or pass can cover. Assert durable cursor or
+  high-water progress and retain exact no-removal and ownership assertions;
+  counts or activity timestamps alone do not prove discovery progress. If a
+  fresh guard preempts the expected refusal, update that reason only after
+  tracing the guard, without weakening the safety assertions.
 
 - When a managed output is also an input to generated context or freshness
   digests, update it before deriving those artifacts. Verify first deployment
