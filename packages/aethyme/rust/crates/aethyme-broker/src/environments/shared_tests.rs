@@ -437,3 +437,37 @@ fn only_removal_on_the_default_branch_destroys_it() {
         EnvironmentPhase::Destroyed
     );
 }
+
+/// Destroy trusts an export only when it is Aethyme's own export of the
+/// recorded commit; anything else is re-exported from the commit instead.
+#[test]
+fn only_aethymes_own_export_of_the_recorded_commit_is_trusted() {
+    let root = tempfile::tempdir().unwrap();
+    let export = root.path().join("shared/repo/baseline/abc123");
+    std::fs::create_dir_all(&export).unwrap();
+    std::fs::write(export.join(super::shared::EXPORT_MARKER), "abc123def").unwrap();
+    assert!(super::shared::is_shared_export_of(
+        root.path(),
+        &export,
+        "abc123def"
+    ));
+    assert!(
+        !super::shared::is_shared_export_of(root.path(), &export, "fffffff"),
+        "a different recorded commit"
+    );
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::write(
+        elsewhere.path().join(super::shared::EXPORT_MARKER),
+        "abc123def",
+    )
+    .unwrap();
+    assert!(
+        !super::shared::is_shared_export_of(root.path(), elsewhere.path(), "abc123def"),
+        "outside Aethyme's shared directory"
+    );
+    std::fs::remove_file(export.join(super::shared::EXPORT_MARKER)).unwrap();
+    assert!(
+        !super::shared::is_shared_export_of(root.path(), &export, "abc123def"),
+        "no marker"
+    );
+}
