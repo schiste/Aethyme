@@ -149,6 +149,7 @@ pub(crate) struct ArtifactUseReconcileMarker {
 pub(crate) enum ArtifactUseReconcileDisposition {
     RemoveIfConfirmed,
     Retain { reason: String },
+    Unknown { reason: String },
 }
 
 /// Complete reviewed evidence for one closed session's canonical checkout
@@ -169,13 +170,66 @@ pub(crate) struct ArtifactUseReconcilePlan {
     pub(crate) digest: String,
 }
 
-/// Result of applying one exact marker plan. Retained markers continue to
-/// block the normal checkout reclaimer.
+/// Per-marker result from a digest-confirmed apply. An unconfirmed directory
+/// sync means the unlink returned success but its crash durability is unknown.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ArtifactUseReconcileMarkerOutcome {
+    pub(crate) filename: String,
+    pub(crate) bytes_sha256: String,
+    pub(crate) outcome: ArtifactUseReconcileOutcomeKind,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub(crate) enum ArtifactUseReconcileOutcomeKind {
+    Removed {
+        directory_sync: ArtifactUseReconcileDirectorySync,
+    },
+    Retained {
+        reason: String,
+    },
+    Unknown {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ArtifactUseReconcileDirectorySync {
+    Synced,
+    Unconfirmed,
+}
+
+/// A stopped apply still returns every marker's outcome. The stop kind says
+/// why later candidates were retained as unknown and whether an unlink had
+/// already succeeded before the failure.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ArtifactUseReconcileApplyStop {
+    pub(crate) kind: ArtifactUseReconcileApplyStopKind,
+    pub(crate) marker_filename: String,
+    pub(crate) reason: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ArtifactUseReconcileApplyStopKind {
+    InventoryChanged,
+    MarkerChanged,
+    ProducerStillActive,
+    ProcessProofUnknown,
+    RegistryChanged,
+    LayoutChanged,
+    MarkerRemovalFailed,
+    MarkerDirectorySyncFailed,
+}
+
+/// Result of applying one exact marker plan. A stopped result records safe
+/// per-marker progress instead of hiding earlier unlinks behind an error.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ArtifactUseReconcileReport {
     pub(crate) plan_digest: String,
-    pub(crate) removed_markers: Vec<String>,
-    pub(crate) retained_markers: Vec<ArtifactUseReconcileMarker>,
+    pub(crate) outcomes: Vec<ArtifactUseReconcileMarkerOutcome>,
+    pub(crate) stopped: Option<ArtifactUseReconcileApplyStop>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -697,7 +751,8 @@ pub(crate) fn plan_artifact_use_marker_reconciliation(
 /// Apply one explicit plan only after rebuilding its complete digest under the
 /// lifecycle, registry, layout, and checkout claims. Each candidate is
 /// re-read and its PID/start token and group absence are rechecked immediately
-/// before unlink. No process is signalled and no checkout is removed.
+/// before unlink. Later evidence or sync failures return typed per-marker
+/// progress; no process is signalled and no checkout is removed.
 pub(crate) fn apply_artifact_use_marker_reconciliation(
     primary_root: &Path,
     checkout_root: &Path,
@@ -706,6 +761,53 @@ pub(crate) fn apply_artifact_use_marker_reconciliation(
     registry: &crate::worktree_registry::ArtifactUsePrimaryRootWitnessGuard,
     confirmed_digest: &str,
 ) -> io::Result<ArtifactUseReconcileReport> {
+    apply_artifact_use_marker_reconciliation_impl(
+        primary_root,
+        checkout_root,
+        selected_session_id,
+        cohort,
+        registry,
+        confirmed_digest,
+        |_, _| {},
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn apply_artifact_use_marker_reconciliation_with_after_unlink<F>(
+    primary_root: &Path,
+    checkout_root: &Path,
+    selected_session_id: i64,
+    cohort: &crate::auto_cleanup::ClosedArtifactCheckoutCohort,
+    registry: &crate::worktree_registry::ArtifactUsePrimaryRootWitnessGuard,
+    confirmed_digest: &str,
+    after_unlink: F,
+) -> io::Result<ArtifactUseReconcileReport>
+where
+    F: FnMut(&Path, &str),
+{
+    apply_artifact_use_marker_reconciliation_impl(
+        primary_root,
+        checkout_root,
+        selected_session_id,
+        cohort,
+        registry,
+        confirmed_digest,
+        after_unlink,
+    )
+}
+
+fn apply_artifact_use_marker_reconciliation_impl<F>(
+    primary_root: &Path,
+    checkout_root: &Path,
+    selected_session_id: i64,
+    cohort: &crate::auto_cleanup::ClosedArtifactCheckoutCohort,
+    registry: &crate::worktree_registry::ArtifactUsePrimaryRootWitnessGuard,
+    confirmed_digest: &str,
+    mut after_unlink: F,
+) -> io::Result<ArtifactUseReconcileReport>
+where
+    F: FnMut(&Path, &str),
+{
     let claim = ArtifactUseReconcileClaim::acquire(primary_root, checkout_root)?;
     let (plan, records) = claim.plan(selected_session_id, cohort, registry)?;
     if plan.digest != confirmed_digest {
@@ -719,81 +821,335 @@ pub(crate) fn apply_artifact_use_marker_reconciliation(
     }
 
     let mut expected_remaining = records;
-    let mut removed_markers = Vec::new();
-    for planned in &plan.markers {
+    let mut outcomes = plan
+        .markers
+        .iter()
+        .map(initial_reconcile_outcome)
+        .collect::<Vec<_>>();
+    for (planned_index, planned) in plan.markers.iter().enumerate() {
         if !matches!(
             &planned.disposition,
             ArtifactUseReconcileDisposition::RemoveIfConfirmed
         ) {
             continue;
         }
-        claim.verify_inventory(&expected_remaining)?;
-        let index = expected_remaining
-            .iter()
-            .position(|record| record.filename == planned.filename)
-            .ok_or_else(|| invalid_marker("planned marker disappeared before removal"))?;
-        let record = expected_remaining[index].clone();
-        let (current, mut current_file) =
-            read_reconcile_marker_file_with_handle(&claim.locations.marker_dir, &record.filename)?;
-        if current != record {
-            return Err(invalid_marker(
-                "artifact-use marker bytes or file identity changed before removal",
-            ));
-        }
-        if !matches!(
-            reconciliation_disposition(
-                &claim.locations,
-                selected_session_id,
-                cohort,
-                registry,
-                &current,
-            ),
-            ArtifactUseReconcileDisposition::RemoveIfConfirmed
+        match attempt_reconcile_marker_removal(
+            &claim,
+            selected_session_id,
+            cohort,
+            registry,
+            &expected_remaining,
+            &planned.filename,
+            &mut after_unlink,
         ) {
-            return Err(invalid_marker(
-                "artifact-use producer is no longer proven quiescent",
-            ));
+            Ok(()) => {
+                if let Some(index) = expected_remaining
+                    .iter()
+                    .position(|record| record.filename == planned.filename)
+                {
+                    expected_remaining.remove(index);
+                }
+                outcomes[planned_index] = Some(ArtifactUseReconcileMarkerOutcome {
+                    filename: planned.filename.clone(),
+                    bytes_sha256: planned.bytes_sha256.clone(),
+                    outcome: ArtifactUseReconcileOutcomeKind::Removed {
+                        directory_sync: ArtifactUseReconcileDirectorySync::Synced,
+                    },
+                });
+            }
+            Err(ArtifactUseReconcileAttemptError::MarkerDirectorySyncFailed(reason)) => {
+                outcomes[planned_index] = Some(ArtifactUseReconcileMarkerOutcome {
+                    filename: planned.filename.clone(),
+                    bytes_sha256: planned.bytes_sha256.clone(),
+                    outcome: ArtifactUseReconcileOutcomeKind::Removed {
+                        directory_sync: ArtifactUseReconcileDirectorySync::Unconfirmed,
+                    },
+                });
+                mark_remaining_candidates_unknown(
+                    &plan.markers,
+                    &mut outcomes,
+                    planned_index + 1,
+                    "apply stopped after a marker-directory sync failure",
+                );
+                return Ok(ArtifactUseReconcileReport {
+                    plan_digest: plan.digest,
+                    outcomes: finish_reconcile_outcomes(outcomes),
+                    stopped: Some(ArtifactUseReconcileApplyStop {
+                        kind: ArtifactUseReconcileApplyStopKind::MarkerDirectorySyncFailed,
+                        marker_filename: planned.filename.clone(),
+                        reason,
+                    }),
+                });
+            }
+            Err(error) => {
+                let (kind, outcome, reason) = error.into_stop_and_outcome();
+                outcomes[planned_index] = Some(ArtifactUseReconcileMarkerOutcome {
+                    filename: planned.filename.clone(),
+                    bytes_sha256: planned.bytes_sha256.clone(),
+                    outcome,
+                });
+                mark_remaining_candidates_unknown(
+                    &plan.markers,
+                    &mut outcomes,
+                    planned_index + 1,
+                    "apply stopped before this candidate was re-proven",
+                );
+                return Ok(ArtifactUseReconcileReport {
+                    plan_digest: plan.digest,
+                    outcomes: finish_reconcile_outcomes(outcomes),
+                    stopped: Some(ArtifactUseReconcileApplyStop {
+                        kind,
+                        marker_filename: planned.filename.clone(),
+                        reason,
+                    }),
+                });
+            }
         }
-        registry.revalidate()?;
-        claim.locations.require_existing_unchanged()?;
-        super::verify_named_lock_file(&claim.locations.lock_path, &claim.checkout_lock_file)?;
-        super::verify_named_lock_file(&claim.locations.layout_lock_path, &claim.layout_lock_file)?;
-        let marker_path = claim.locations.marker_dir.join(&record.filename);
-        let before_recheck = current_file.metadata()?;
-        if metadata_identity(&before_recheck)? != current.file_identity {
-            return Err(invalid_marker(
-                "artifact-use marker file identity changed before removal",
-            ));
-        }
-        current_file.seek(SeekFrom::Start(0))?;
-        let mut rechecked_bytes = Vec::new();
-        (&mut current_file)
-            .take(MAX_MARKER_BYTES + 1)
-            .read_to_end(&mut rechecked_bytes)?;
-        super::verify_named_lock_file(&marker_path, &current_file)?;
-        if rechecked_bytes != record.bytes
-            || metadata_identity(&current_file.metadata()?)? != current.file_identity
-        {
-            return Err(invalid_marker(
-                "artifact-use marker bytes changed immediately before removal",
-            ));
-        }
-        fs::remove_file(&marker_path)?;
-        sync_directory(&claim.locations.marker_dir)?;
-        expected_remaining.remove(index);
-        removed_markers.push(record.filename);
     }
 
-    let retained_markers = plan
-        .markers
-        .into_iter()
-        .filter(|marker| !removed_markers.contains(&marker.filename))
-        .collect();
     Ok(ArtifactUseReconcileReport {
-        plan_digest: confirmed_digest.to_owned(),
-        removed_markers,
-        retained_markers,
+        plan_digest: plan.digest,
+        outcomes: finish_reconcile_outcomes(outcomes),
+        stopped: None,
     })
+}
+
+fn initial_reconcile_outcome(
+    marker: &ArtifactUseReconcileMarker,
+) -> Option<ArtifactUseReconcileMarkerOutcome> {
+    let outcome = match &marker.disposition {
+        ArtifactUseReconcileDisposition::RemoveIfConfirmed => return None,
+        ArtifactUseReconcileDisposition::Retain { reason } => {
+            ArtifactUseReconcileOutcomeKind::Retained {
+                reason: reason.clone(),
+            }
+        }
+        ArtifactUseReconcileDisposition::Unknown { reason } => {
+            ArtifactUseReconcileOutcomeKind::Unknown {
+                reason: reason.clone(),
+            }
+        }
+    };
+    Some(ArtifactUseReconcileMarkerOutcome {
+        filename: marker.filename.clone(),
+        bytes_sha256: marker.bytes_sha256.clone(),
+        outcome,
+    })
+}
+
+fn finish_reconcile_outcomes(
+    outcomes: Vec<Option<ArtifactUseReconcileMarkerOutcome>>,
+) -> Vec<ArtifactUseReconcileMarkerOutcome> {
+    outcomes
+        .into_iter()
+        .map(|outcome| outcome.expect("every planned marker receives an apply outcome"))
+        .collect()
+}
+
+fn mark_remaining_candidates_unknown(
+    markers: &[ArtifactUseReconcileMarker],
+    outcomes: &mut [Option<ArtifactUseReconcileMarkerOutcome>],
+    start: usize,
+    reason: &str,
+) {
+    for (marker, outcome) in markers.iter().zip(outcomes).skip(start) {
+        if outcome.is_none() {
+            *outcome = Some(ArtifactUseReconcileMarkerOutcome {
+                filename: marker.filename.clone(),
+                bytes_sha256: marker.bytes_sha256.clone(),
+                outcome: ArtifactUseReconcileOutcomeKind::Unknown {
+                    reason: reason.to_owned(),
+                },
+            });
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ArtifactUseReconcileAttemptError {
+    InventoryChanged(String),
+    MarkerChanged(String),
+    ProducerStillActive(String),
+    ProcessProofUnknown(String),
+    RegistryChanged(String),
+    LayoutChanged(String),
+    MarkerRemovalFailed(String),
+    MarkerDirectorySyncFailed(String),
+}
+
+impl ArtifactUseReconcileAttemptError {
+    fn into_stop_and_outcome(
+        self,
+    ) -> (
+        ArtifactUseReconcileApplyStopKind,
+        ArtifactUseReconcileOutcomeKind,
+        String,
+    ) {
+        match self {
+            Self::InventoryChanged(reason) => (
+                ArtifactUseReconcileApplyStopKind::InventoryChanged,
+                ArtifactUseReconcileOutcomeKind::Unknown {
+                    reason: reason.clone(),
+                },
+                reason,
+            ),
+            Self::MarkerChanged(reason) => (
+                ArtifactUseReconcileApplyStopKind::MarkerChanged,
+                ArtifactUseReconcileOutcomeKind::Unknown {
+                    reason: reason.clone(),
+                },
+                reason,
+            ),
+            Self::ProducerStillActive(reason) => (
+                ArtifactUseReconcileApplyStopKind::ProducerStillActive,
+                ArtifactUseReconcileOutcomeKind::Retained {
+                    reason: reason.clone(),
+                },
+                reason,
+            ),
+            Self::ProcessProofUnknown(reason) => (
+                ArtifactUseReconcileApplyStopKind::ProcessProofUnknown,
+                ArtifactUseReconcileOutcomeKind::Unknown {
+                    reason: reason.clone(),
+                },
+                reason,
+            ),
+            Self::RegistryChanged(reason) => (
+                ArtifactUseReconcileApplyStopKind::RegistryChanged,
+                ArtifactUseReconcileOutcomeKind::Unknown {
+                    reason: reason.clone(),
+                },
+                reason,
+            ),
+            Self::LayoutChanged(reason) => (
+                ArtifactUseReconcileApplyStopKind::LayoutChanged,
+                ArtifactUseReconcileOutcomeKind::Unknown {
+                    reason: reason.clone(),
+                },
+                reason,
+            ),
+            Self::MarkerRemovalFailed(reason) => (
+                ArtifactUseReconcileApplyStopKind::MarkerRemovalFailed,
+                ArtifactUseReconcileOutcomeKind::Unknown {
+                    reason: reason.clone(),
+                },
+                reason,
+            ),
+            Self::MarkerDirectorySyncFailed(reason) => (
+                ArtifactUseReconcileApplyStopKind::MarkerDirectorySyncFailed,
+                ArtifactUseReconcileOutcomeKind::Unknown {
+                    reason: reason.clone(),
+                },
+                reason,
+            ),
+        }
+    }
+}
+
+fn attempt_reconcile_marker_removal<F>(
+    claim: &ArtifactUseReconcileClaim,
+    selected_session_id: i64,
+    cohort: &crate::auto_cleanup::ClosedArtifactCheckoutCohort,
+    registry: &crate::worktree_registry::ArtifactUsePrimaryRootWitnessGuard,
+    expected_remaining: &[ReconcileMarkerRecord],
+    filename: &str,
+    after_unlink: &mut F,
+) -> Result<(), ArtifactUseReconcileAttemptError>
+where
+    F: FnMut(&Path, &str),
+{
+    claim
+        .verify_inventory(expected_remaining)
+        .map_err(|error| ArtifactUseReconcileAttemptError::InventoryChanged(error.to_string()))?;
+    let record = expected_remaining
+        .iter()
+        .find(|record| record.filename == filename)
+        .ok_or_else(|| {
+            ArtifactUseReconcileAttemptError::InventoryChanged(
+                "planned marker disappeared before removal".into(),
+            )
+        })?;
+    let (current, mut current_file) =
+        read_reconcile_marker_file_with_handle(&claim.locations.marker_dir, filename)
+            .map_err(|error| ArtifactUseReconcileAttemptError::MarkerChanged(error.to_string()))?;
+    if &current != record {
+        return Err(ArtifactUseReconcileAttemptError::MarkerChanged(
+            "artifact-use marker bytes or file identity changed before removal".into(),
+        ));
+    }
+    match reconciliation_disposition(
+        &claim.locations,
+        selected_session_id,
+        cohort,
+        registry,
+        &current,
+    ) {
+        ArtifactUseReconcileDisposition::RemoveIfConfirmed => {}
+        ArtifactUseReconcileDisposition::Retain { reason } => {
+            return Err(ArtifactUseReconcileAttemptError::ProducerStillActive(
+                reason,
+            ));
+        }
+        ArtifactUseReconcileDisposition::Unknown { reason } => {
+            return Err(ArtifactUseReconcileAttemptError::ProcessProofUnknown(
+                reason,
+            ));
+        }
+    }
+    registry
+        .revalidate()
+        .map_err(|error| ArtifactUseReconcileAttemptError::RegistryChanged(error.to_string()))?;
+    claim
+        .locations
+        .require_existing_unchanged()
+        .map_err(|error| ArtifactUseReconcileAttemptError::LayoutChanged(error.to_string()))?;
+    super::verify_named_lock_file(&claim.locations.lock_path, &claim.checkout_lock_file)
+        .map_err(|error| ArtifactUseReconcileAttemptError::LayoutChanged(error.to_string()))?;
+    super::verify_named_lock_file(&claim.locations.layout_lock_path, &claim.layout_lock_file)
+        .map_err(|error| ArtifactUseReconcileAttemptError::LayoutChanged(error.to_string()))?;
+    let marker_path = claim.locations.marker_dir.join(filename);
+    let before_recheck = current_file
+        .metadata()
+        .map_err(|error| ArtifactUseReconcileAttemptError::MarkerChanged(error.to_string()))?;
+    if metadata_identity(&before_recheck)
+        .map_err(|error| ArtifactUseReconcileAttemptError::MarkerChanged(error.to_string()))?
+        != current.file_identity
+    {
+        return Err(ArtifactUseReconcileAttemptError::MarkerChanged(
+            "artifact-use marker file identity changed before removal".into(),
+        ));
+    }
+    current_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| ArtifactUseReconcileAttemptError::MarkerChanged(error.to_string()))?;
+    let mut rechecked_bytes = Vec::new();
+    (&mut current_file)
+        .take(MAX_MARKER_BYTES + 1)
+        .read_to_end(&mut rechecked_bytes)
+        .map_err(|error| ArtifactUseReconcileAttemptError::MarkerChanged(error.to_string()))?;
+    super::verify_named_lock_file(&marker_path, &current_file)
+        .map_err(|error| ArtifactUseReconcileAttemptError::MarkerChanged(error.to_string()))?;
+    if rechecked_bytes != record.bytes
+        || metadata_identity(
+            &current_file.metadata().map_err(|error| {
+                ArtifactUseReconcileAttemptError::MarkerChanged(error.to_string())
+            })?,
+        )
+        .map_err(|error| ArtifactUseReconcileAttemptError::MarkerChanged(error.to_string()))?
+            != current.file_identity
+    {
+        return Err(ArtifactUseReconcileAttemptError::MarkerChanged(
+            "artifact-use marker bytes changed immediately before removal".into(),
+        ));
+    }
+    fs::remove_file(&marker_path).map_err(|error| {
+        ArtifactUseReconcileAttemptError::MarkerRemovalFailed(error.to_string())
+    })?;
+    after_unlink(&claim.locations.marker_dir, filename);
+    sync_directory(&claim.locations.marker_dir).map_err(|error| {
+        ArtifactUseReconcileAttemptError::MarkerDirectorySyncFailed(error.to_string())
+    })?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1119,6 +1475,9 @@ fn reconciliation_disposition(
     let retain = |reason: &str| ArtifactUseReconcileDisposition::Retain {
         reason: reason.to_owned(),
     };
+    let unknown = |reason: &str| ArtifactUseReconcileDisposition::Unknown {
+        reason: reason.to_owned(),
+    };
     let primary_path = match path_text(&locations.primary_root) {
         Ok(path) => path,
         Err(_) => return retain("primary root path is not representable as UTF-8"),
@@ -1157,10 +1516,10 @@ fn reconciliation_disposition(
         return retain("pre-dispatch marker has no process absence proof");
     }
     let Some(process) = marker.process.as_ref() else {
-        return retain("running marker has no process identity");
+        return unknown("running marker has no process identity");
     };
     if let Err(reason) = validate_reconciliation_process_identity(process) {
-        return retain(reason);
+        return unknown(reason);
     }
     #[cfg(unix)]
     {
@@ -1169,13 +1528,13 @@ fn reconciliation_disposition(
                 return retain("recorded producer PID and start token are still present");
             }
             ProcessIdentityObservation::Unknown => {
-                return retain("producer PID/start identity could not be inspected");
+                return unknown("producer PID/start identity could not be inspected");
             }
             ProcessIdentityObservation::Absent | ProcessIdentityObservation::Reused => {}
         }
         let process_group_absent = crate::gates::gate_process_group_absent(process.process_group);
         if !process_group_absent {
-            return retain("recorded process group is present or could not be proven absent");
+            return unknown("recorded process group is present or could not be proven absent");
         }
         let final_identity = observe_process_identity(process);
         if process_and_group_proof_allows_removal(final_identity, process_group_absent) {
@@ -1186,7 +1545,7 @@ fn reconciliation_disposition(
                     retain("recorded producer PID/start token reappeared during proof")
                 }
                 ProcessIdentityObservation::Unknown => {
-                    retain("producer PID/start identity became unknown during proof")
+                    unknown("producer PID/start identity became unknown during proof")
                 }
                 ProcessIdentityObservation::Absent | ProcessIdentityObservation::Reused => {
                     unreachable!("absent/reused identities with an absent group are removable")
@@ -1196,8 +1555,7 @@ fn reconciliation_disposition(
     }
     #[cfg(not(unix))]
     {
-        let _ = process;
-        retain("process absence proof is unavailable on this platform")
+        unknown("process absence proof is unavailable on this platform")
     }
 }
 
@@ -1279,7 +1637,10 @@ fn classify_process_start_observation(
     }
 }
 
-fn metadata_identity(metadata: &fs::Metadata) -> io::Result<DirectoryIdentity> {
+fn metadata_identity(
+    #[cfg(any(unix, windows))] metadata: &fs::Metadata,
+    #[cfg(not(any(unix, windows)))] _metadata: &fs::Metadata,
+) -> io::Result<DirectoryIdentity> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1310,7 +1671,6 @@ fn metadata_identity(metadata: &fs::Metadata) -> io::Result<DirectoryIdentity> {
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = metadata;
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "artifact-use file identity is unavailable",

@@ -3362,6 +3362,22 @@ mod tests {
             child
         }
 
+        fn start_predispatch_marker(&self, invocation_id: &str) {
+            let admission = crate::file_lock::artifact_use::begin_artifact_use(
+                &self.primary_root,
+                &self.checkout_root,
+                self.session.id,
+                invocation_id,
+            )
+            .unwrap();
+            let crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer) =
+                admission
+            else {
+                panic!("artifact-use protocol should be available for this test");
+            };
+            drop(producer);
+        }
+
         fn close_and_bind(
             &mut self,
         ) -> (
@@ -3469,6 +3485,27 @@ mod tests {
                 digest,
             )
         }
+
+        fn apply_with_after_unlink<F>(
+            &self,
+            cohort: &super::ClosedArtifactCheckoutCohort,
+            registry: &crate::worktree_registry::ArtifactUsePrimaryRootWitnessGuard,
+            digest: &str,
+            after_unlink: F,
+        ) -> std::io::Result<crate::file_lock::artifact_use::ArtifactUseReconcileReport>
+        where
+            F: FnMut(&Path, &str),
+        {
+            crate::file_lock::artifact_use::apply_artifact_use_marker_reconciliation_with_after_unlink(
+                &self.primary_root,
+                &self.checkout_root,
+                self.session.id,
+                cohort,
+                registry,
+                digest,
+                after_unlink,
+            )
+        }
     }
 
     #[cfg(unix)]
@@ -3533,11 +3570,15 @@ mod tests {
 
         let report = fixture.apply(&cohort, &registry, &plan.digest).unwrap();
         assert_eq!(report.plan_digest, plan.digest);
-        assert_eq!(
-            report.removed_markers,
-            vec![plan.markers[0].filename.clone()]
-        );
-        assert!(report.retained_markers.is_empty());
+        assert_eq!(report.outcomes.len(), 1);
+        assert!(matches!(
+            &report.outcomes[0].outcome,
+            crate::file_lock::artifact_use::ArtifactUseReconcileOutcomeKind::Removed {
+                directory_sync:
+                    crate::file_lock::artifact_use::ArtifactUseReconcileDirectorySync::Synced
+            }
+        ));
+        assert!(report.stopped.is_none());
         assert!(!marker_path.exists());
     }
 
@@ -3627,14 +3668,141 @@ mod tests {
         let plan = fixture.plan(&cohort, &registry);
         assert!(matches!(
             &plan.markers[0].disposition,
-            crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::Retain { reason }
+            crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::Unknown { reason }
                 if reason.contains("start token")
         ));
         let report = fixture.apply(&cohort, &registry, &plan.digest).unwrap();
-        assert!(report.removed_markers.is_empty());
-        assert_eq!(report.retained_markers.len(), 1);
+        assert_eq!(report.outcomes.len(), 1);
+        assert!(matches!(
+            &report.outcomes[0].outcome,
+            crate::file_lock::artifact_use::ArtifactUseReconcileOutcomeKind::Unknown { reason }
+                if reason.contains("start token")
+        ));
+        assert!(report.stopped.is_none());
         assert!(marker_path.exists());
         child.wait().unwrap();
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn explicit_artifact_use_apply_returns_prior_progress_when_later_marker_changes() {
+        let mut fixture = ArtifactUseReconcileFixture::new();
+        let mut first_child = fixture.start_running_marker("reconcile-mid-sequence-first");
+        first_child.wait().unwrap();
+        let mut later_child = fixture.start_running_marker("reconcile-mid-sequence-later");
+        later_child.wait().unwrap();
+        let (cohort, registry) = fixture.close_and_bind();
+        let plan = fixture.plan(&cohort, &registry);
+        assert_eq!(plan.markers.len(), 2);
+        assert!(plan.markers.iter().all(|marker| matches!(
+            &marker.disposition,
+            crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::RemoveIfConfirmed
+        )));
+
+        let first_filename = plan.markers[0].filename.clone();
+        let later_filename = plan.markers[1].filename.clone();
+        let first_path = fixture.marker_path(&plan.markers[0].invocation_id);
+        let later_path = fixture.marker_path(&plan.markers[1].invocation_id);
+        let mut changed_later_marker = false;
+        let report = fixture
+            .apply_with_after_unlink(&cohort, &registry, &plan.digest, |_, removed_filename| {
+                if removed_filename == first_filename {
+                    let mut replacement = std::fs::read(&later_path).unwrap();
+                    replacement.push(b'\n');
+                    let replacement_path = later_path.with_extension("json-replacement");
+                    std::fs::write(&replacement_path, replacement).unwrap();
+                    std::fs::rename(replacement_path, &later_path).unwrap();
+                    changed_later_marker = true;
+                }
+            })
+            .unwrap();
+
+        assert!(changed_later_marker);
+        assert_eq!(report.outcomes.len(), 2);
+        assert_eq!(report.outcomes[0].filename, first_filename);
+        assert!(matches!(
+            &report.outcomes[0].outcome,
+            crate::file_lock::artifact_use::ArtifactUseReconcileOutcomeKind::Removed {
+                directory_sync:
+                    crate::file_lock::artifact_use::ArtifactUseReconcileDirectorySync::Synced
+            }
+        ));
+        assert_eq!(report.outcomes[1].filename, later_filename);
+        assert!(matches!(
+            &report.outcomes[1].outcome,
+            crate::file_lock::artifact_use::ArtifactUseReconcileOutcomeKind::Unknown { .. }
+        ));
+        let stop = report.stopped.unwrap();
+        assert!(matches!(
+            stop.kind,
+            crate::file_lock::artifact_use::ArtifactUseReconcileApplyStopKind::InventoryChanged
+        ));
+        assert_eq!(stop.marker_filename, later_filename);
+        assert!(!first_path.exists());
+        assert!(later_path.exists());
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn explicit_artifact_use_apply_reports_unconfirmed_unlink_when_directory_sync_fails() {
+        let mut fixture = ArtifactUseReconcileFixture::new();
+        let invocation_id = "reconcile-directory-sync-fixture";
+        let mut child = fixture.start_running_marker(invocation_id);
+        child.wait().unwrap();
+        let (cohort, registry) = fixture.close_and_bind();
+        let plan = fixture.plan(&cohort, &registry);
+        assert_eq!(plan.markers.len(), 1);
+        let marker_path = fixture.marker_path(invocation_id);
+        let moved_directory = marker_path
+            .parent()
+            .unwrap()
+            .with_extension("markers-moved");
+
+        let report = fixture
+            .apply_with_after_unlink(&cohort, &registry, &plan.digest, |marker_dir, filename| {
+                if filename == plan.markers[0].filename {
+                    std::fs::rename(marker_dir, &moved_directory).unwrap();
+                }
+            })
+            .unwrap();
+
+        assert_eq!(report.outcomes.len(), 1);
+        assert!(matches!(
+            &report.outcomes[0].outcome,
+            crate::file_lock::artifact_use::ArtifactUseReconcileOutcomeKind::Removed {
+                directory_sync:
+                    crate::file_lock::artifact_use::ArtifactUseReconcileDirectorySync::Unconfirmed
+            }
+        ));
+        let stop = report.stopped.unwrap();
+        assert!(matches!(
+            stop.kind,
+            crate::file_lock::artifact_use::ArtifactUseReconcileApplyStopKind::MarkerDirectorySyncFailed
+        ));
+        assert!(!marker_path.exists());
+        assert!(moved_directory.is_dir());
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn explicit_artifact_use_apply_reports_known_retained_marker() {
+        let mut fixture = ArtifactUseReconcileFixture::new();
+        let invocation_id = "reconcile-predispatch-fixture";
+        fixture.start_predispatch_marker(invocation_id);
+        let (cohort, registry) = fixture.close_and_bind();
+        let marker_path = fixture.marker_path(invocation_id);
+        let plan = fixture.plan(&cohort, &registry);
+
+        let report = fixture.apply(&cohort, &registry, &plan.digest).unwrap();
+
+        assert_eq!(report.outcomes.len(), 1);
+        assert!(matches!(
+            &report.outcomes[0].outcome,
+            crate::file_lock::artifact_use::ArtifactUseReconcileOutcomeKind::Retained { reason }
+                if reason.contains("pre-dispatch")
+        ));
+        assert!(report.stopped.is_none());
+        assert!(marker_path.exists());
     }
 
     #[cfg(unix)]

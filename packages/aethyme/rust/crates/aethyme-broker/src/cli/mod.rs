@@ -918,7 +918,8 @@ Usage:
   aethyme broker gc artifact-use reconcile apply <exact-session-id> --confirm <sha256> [--json]
       Remove only markers re-proven quiescent against the exact plan digest.
       Uncertain processes and unmatched historical identities remain blocked;
-      this never removes the checkout or its broker records.
+      stopped applies report removed, retained and unknown markers; this never
+      removes the checkout or its broker records.
   aethyme broker gc sweep [--json]
       Run the unattended build-artifact sweep now with its full budget
       (scaled up when disk is below the gate headroom), ignoring its daily

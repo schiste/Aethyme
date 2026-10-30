@@ -1189,27 +1189,21 @@ fn run_gc_artifact_use_reconcile(parsed: Parsed) -> Result<(), UsageError> {
                 &registry,
                 confirmed_digest.as_deref().expect("validated above"),
             )?;
+            let stopped = report.stopped.as_ref().map(|stop| {
+                format!(
+                    "artifact-use reconciliation stopped at {} ({:?}): {}",
+                    stop.marker_filename, stop.kind, stop.reason
+                )
+            });
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                out!(
-                    "Reconciled {} artifact-use marker(s) from plan {}.",
-                    report.removed_markers.len(),
-                    report.plan_digest
-                );
-                for marker in &report.removed_markers {
-                    out!("  removed: {marker}");
-                }
-                for marker in &report.retained_markers {
-                    let crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::Retain {
-                        reason,
-                    } = &marker.disposition
-                    else {
-                        continue;
-                    };
-                    out!("  retained: {} ({reason})", marker.filename);
-                }
-                out!("  checkout and broker records were not removed");
+                render_artifact_use_reconcile_report(&report);
+            }
+            if let Some(message) = stopped {
+                return Err(UsageError::Message(format!(
+                    "{message}; per-marker outcomes were emitted above"
+                )));
             }
         }
         _ => unreachable!("action was validated above"),
@@ -1248,6 +1242,9 @@ fn render_artifact_use_reconcile_plan(
             crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::Retain { reason } => {
                 out!("  retained: {} ({reason})", marker.filename);
             }
+            crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::Unknown { reason } => {
+                out!("  unknown: {} ({reason})", marker.filename);
+            }
         }
     }
     out!(
@@ -1255,6 +1252,47 @@ fn render_artifact_use_reconcile_plan(
         plan.selected_session_id,
         plan.digest
     );
+}
+
+fn render_artifact_use_reconcile_report(
+    report: &crate::file_lock::artifact_use::ArtifactUseReconcileReport,
+) {
+    out!(
+        "Artifact-use reconciliation apply for plan {}:",
+        report.plan_digest
+    );
+    for outcome in &report.outcomes {
+        match &outcome.outcome {
+            crate::file_lock::artifact_use::ArtifactUseReconcileOutcomeKind::Removed {
+                directory_sync:
+                    crate::file_lock::artifact_use::ArtifactUseReconcileDirectorySync::Synced,
+            } => out!("  removed: {} (directory sync confirmed)", outcome.filename),
+            crate::file_lock::artifact_use::ArtifactUseReconcileOutcomeKind::Removed {
+                directory_sync:
+                    crate::file_lock::artifact_use::ArtifactUseReconcileDirectorySync::Unconfirmed,
+            } => out!(
+                "  removed: {} (directory sync unconfirmed)",
+                outcome.filename
+            ),
+            crate::file_lock::artifact_use::ArtifactUseReconcileOutcomeKind::Retained {
+                reason,
+            } => {
+                out!("  retained: {} ({reason})", outcome.filename);
+            }
+            crate::file_lock::artifact_use::ArtifactUseReconcileOutcomeKind::Unknown { reason } => {
+                out!("  unknown: {} ({reason})", outcome.filename);
+            }
+        }
+    }
+    if let Some(stop) = &report.stopped {
+        out!(
+            "  stopped at {} ({:?}): {}",
+            stop.marker_filename,
+            stop.kind,
+            stop.reason
+        );
+    }
+    out!("  checkout and broker records were not removed");
 }
 
 /// Private detached-worker entry point. It is absent from help and refuses to
