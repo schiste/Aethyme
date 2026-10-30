@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 pub const BROKER_CONFIG_RELPATH: &str = ".aethyme/broker.toml";
 pub const RETENTION_POLICY_SCHEMA_VERSION: u32 = 1;
+pub(crate) const MIN_RECOVERY_ARCHIVE_RETENTION_MS: u64 = 15 * 24 * 60 * 60 * 1_000;
 
 const RETENTION_POLICY_FIELDS: &[&str] = &[
     "schema_version",
@@ -200,8 +201,7 @@ impl RetentionPolicy {
     /// copied into each archive so a later policy reduction cannot shorten
     /// already-promised recovery.
     pub(crate) fn compact_archive_minimum_retention_ms(&self) -> u64 {
-        const FIFTEEN_DAYS_MS: u64 = 15 * 24 * 60 * 60 * 1_000;
-        FIFTEEN_DAYS_MS
+        MIN_RECOVERY_ARCHIVE_RETENTION_MS
             .max(u64::from(self.closed_worktree_grace_hours).saturating_mul(60 * 60 * 1_000))
     }
 

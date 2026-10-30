@@ -34,6 +34,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::BrokerError;
 use crate::git::GitRepo;
+use crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS;
 use crate::types::SessionOrigin;
 use crate::{Broker, BrokerOpError, CleanupDisposition};
 
@@ -49,7 +50,6 @@ const RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION: u32 = 2;
 const PINNED_RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION: u32 = 3;
 const RETIREMENT_ARCHIVE_RECORD_FILE: &str = "retirement.json";
 const MAX_RETIREMENT_ARCHIVE_RECORD_BYTES: u64 = 64 * 1024;
-const MIN_RECOVERY_ARCHIVE_RETENTION_MS: u64 = 15 * 24 * 60 * 60 * 1_000;
 const AUTO_COMPACTION_STAGING_RESERVE: Duration = Duration::from_secs(10);
 const MAX_RECOVERY_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_RECOVERY_BUNDLE_STDERR_BYTES: usize = 64 * 1024;

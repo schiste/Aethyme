@@ -31,9 +31,6 @@ pub(crate) use tree_removal::{
 pub const GC_PLAN_SCHEMA_VERSION: u32 = 4;
 const GC_LEGACY_PLAN_SCHEMA_VERSION: u32 = 3;
 const MILLIS_PER_DAY: i64 = 86_400_000;
-// Older manifests do not record an immutable minimum age. Preserve their
-// readable format without treating the missing floor as already elapsed.
-const LEGACY_RECOVERY_ARCHIVE_MINIMUM_AGE_MS: u64 = 15 * MILLIS_PER_DAY as u64;
 const GC_JOURNAL_ARCHIVE_DIRECTORY: &str = "gc-journal-archives";
 const GC_JOURNAL_ARCHIVE_PREFIX: &str = "gc-journal-abandoned-";
 const GC_JOURNAL_ARCHIVE_SUFFIX: &str = ".json";
@@ -1341,7 +1338,7 @@ fn recovery_archive_minimum_age_elapsed(
 ) -> bool {
     let minimum_age_ms = archive
         .minimum_archive_retention_ms
-        .unwrap_or(LEGACY_RECOVERY_ARCHIVE_MINIMUM_AGE_MS);
+        .unwrap_or(crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS);
     now.checked_sub(archive.created_at_ms)
         .and_then(|age| u64::try_from(age).ok())
         .is_some_and(|age| age >= minimum_age_ms)
@@ -1349,8 +1346,9 @@ fn recovery_archive_minimum_age_elapsed(
 
 #[cfg(test)]
 mod recovery_archive_minimum_age_tests {
-    use super::{LEGACY_RECOVERY_ARCHIVE_MINIMUM_AGE_MS, recovery_archive_minimum_age_elapsed};
+    use super::recovery_archive_minimum_age_elapsed;
     use crate::cleanup_resolve::OwnedRecoveryArchive;
+    use crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS;
 
     #[test]
     fn immutable_and_legacy_age_use_exact_boundary_and_fail_closed_on_clock_overflow() {
@@ -1364,13 +1362,13 @@ mod recovery_archive_minimum_age_tests {
                 available_from_delivery: false,
             }],
             created_at_ms: 100,
-            minimum_archive_retention_ms: Some(LEGACY_RECOVERY_ARCHIVE_MINIMUM_AGE_MS),
+            minimum_archive_retention_ms: Some(MIN_RECOVERY_ARCHIVE_RETENTION_MS),
             prerequisite_refs: Vec::new(),
             retirement_digest: None,
             prerequisite_targets: Vec::new(),
             holds_uncommitted: false,
         };
-        let minimum_age_ms = i64::try_from(LEGACY_RECOVERY_ARCHIVE_MINIMUM_AGE_MS).unwrap();
+        let minimum_age_ms = i64::try_from(MIN_RECOVERY_ARCHIVE_RETENTION_MS).unwrap();
         assert!(!recovery_archive_minimum_age_elapsed(&archive, 99));
         assert!(!recovery_archive_minimum_age_elapsed(
             &archive,
@@ -1387,6 +1385,7 @@ mod recovery_archive_minimum_age_tests {
         assert!(!recovery_archive_minimum_age_elapsed(&archive, i64::MAX));
         archive.created_at_ms = 100;
         archive.minimum_archive_retention_ms = None;
+        assert!(!recovery_archive_minimum_age_elapsed(&archive, 99));
         assert!(!recovery_archive_minimum_age_elapsed(
             &archive,
             100 + minimum_age_ms - 1
@@ -1395,6 +1394,8 @@ mod recovery_archive_minimum_age_tests {
             &archive,
             100 + minimum_age_ms
         ));
+        archive.created_at_ms = i64::MIN;
+        assert!(!recovery_archive_minimum_age_elapsed(&archive, i64::MAX));
     }
 }
 
