@@ -21,9 +21,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const MARKER_SCHEMA_VERSION: u32 = 1;
-// B1 exercises the fail-closed reclaimer surface in tests but has no production
-// cleanup caller yet. These item-scoped allowances cover only that surface.
-#[cfg_attr(not(test), allow(dead_code))]
+// B1's fail-closed reclaimer allowances below stay item-scoped. The same
+// inventory bound also caps explicit marker reconciliation.
 const MAX_MARKERS_PER_CHECKOUT: usize = 256;
 const MAX_MARKER_BYTES: u64 = 16 * 1024;
 const ARTIFACT_LAYOUT_LOCK_WAIT: Duration = Duration::from_secs(1);
@@ -125,10 +124,58 @@ pub(crate) enum ArtifactUseScopeAdmission {
     ProtocolUnavailable,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct DirectoryIdentity {
     device: u64,
     inode: u64,
+}
+
+/// One exact marker entry in an explicit, checkout-scoped reconciliation plan.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ArtifactUseReconcileMarker {
+    pub(crate) filename: String,
+    pub(crate) session_id: i64,
+    pub(crate) invocation_id: String,
+    pub(crate) bytes_sha256: String,
+    pub(crate) file_device: u64,
+    pub(crate) file_inode: u64,
+    pub(crate) disposition: ArtifactUseReconcileDisposition,
+}
+
+/// A marker is removable only when both its PID identity and its recorded
+/// process group were observed absent during the current plan/apply pass.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ArtifactUseReconcileDisposition {
+    RemoveIfConfirmed,
+    Retain { reason: String },
+}
+
+/// Complete reviewed evidence for one closed session's canonical checkout
+/// cohort. This grants marker-removal authority only.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ArtifactUseReconcilePlan {
+    pub(crate) schema_version: u32,
+    pub(crate) selected_session_id: i64,
+    pub(crate) cohort: crate::auto_cleanup::ClosedArtifactCheckoutCohort,
+    pub(crate) primary_root: PathBuf,
+    pub(crate) checkout_root: PathBuf,
+    checkout_key: String,
+    primary_identity: DirectoryIdentity,
+    checkout_identity: DirectoryIdentity,
+    marker_directory_identity: DirectoryIdentity,
+    registry_witness: crate::worktree_registry::ArtifactUsePrimaryRootWitness,
+    pub(crate) markers: Vec<ArtifactUseReconcileMarker>,
+    pub(crate) digest: String,
+}
+
+/// Result of applying one exact marker plan. Retained markers continue to
+/// block the normal checkout reclaimer.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ArtifactUseReconcileReport {
+    pub(crate) plan_digest: String,
+    pub(crate) removed_markers: Vec<String>,
+    pub(crate) retained_markers: Vec<ArtifactUseReconcileMarker>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -633,6 +680,648 @@ pub(crate) fn begin_artifact_use_scope(
     }))
 }
 
+/// Read-only plan for explicit reconciliation of one closed checkout cohort.
+/// The normal reclaimer remains strict and continues to block on every marker.
+pub(crate) fn plan_artifact_use_marker_reconciliation(
+    primary_root: &Path,
+    checkout_root: &Path,
+    selected_session_id: i64,
+    cohort: &crate::auto_cleanup::ClosedArtifactCheckoutCohort,
+    registry: &crate::worktree_registry::ArtifactUsePrimaryRootWitnessGuard,
+) -> io::Result<ArtifactUseReconcilePlan> {
+    let claim = ArtifactUseReconcileClaim::acquire(primary_root, checkout_root)?;
+    let (plan, _) = claim.plan(selected_session_id, cohort, registry)?;
+    Ok(plan)
+}
+
+/// Apply one explicit plan only after rebuilding its complete digest under the
+/// lifecycle, registry, layout, and checkout claims. Each candidate is
+/// re-read and its PID/start token and group absence are rechecked immediately
+/// before unlink. No process is signalled and no checkout is removed.
+pub(crate) fn apply_artifact_use_marker_reconciliation(
+    primary_root: &Path,
+    checkout_root: &Path,
+    selected_session_id: i64,
+    cohort: &crate::auto_cleanup::ClosedArtifactCheckoutCohort,
+    registry: &crate::worktree_registry::ArtifactUsePrimaryRootWitnessGuard,
+    confirmed_digest: &str,
+) -> io::Result<ArtifactUseReconcileReport> {
+    let claim = ArtifactUseReconcileClaim::acquire(primary_root, checkout_root)?;
+    let (plan, records) = claim.plan(selected_session_id, cohort, registry)?;
+    if plan.digest != confirmed_digest {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "artifact-use reconciliation plan changed; review digest {} before applying",
+                plan.digest
+            ),
+        ));
+    }
+
+    let mut expected_remaining = records;
+    let mut removed_markers = Vec::new();
+    for planned in &plan.markers {
+        if !matches!(
+            &planned.disposition,
+            ArtifactUseReconcileDisposition::RemoveIfConfirmed
+        ) {
+            continue;
+        }
+        claim.verify_inventory(&expected_remaining)?;
+        let index = expected_remaining
+            .iter()
+            .position(|record| record.filename == planned.filename)
+            .ok_or_else(|| invalid_marker("planned marker disappeared before removal"))?;
+        let record = expected_remaining[index].clone();
+        let (current, mut current_file) =
+            read_reconcile_marker_file_with_handle(&claim.locations.marker_dir, &record.filename)?;
+        if current != record {
+            return Err(invalid_marker(
+                "artifact-use marker bytes or file identity changed before removal",
+            ));
+        }
+        if !matches!(
+            reconciliation_disposition(
+                &claim.locations,
+                selected_session_id,
+                cohort,
+                registry,
+                &current,
+            ),
+            ArtifactUseReconcileDisposition::RemoveIfConfirmed
+        ) {
+            return Err(invalid_marker(
+                "artifact-use producer is no longer proven quiescent",
+            ));
+        }
+        registry.revalidate()?;
+        claim.locations.require_existing_unchanged()?;
+        super::verify_named_lock_file(&claim.locations.lock_path, &claim.checkout_lock_file)?;
+        super::verify_named_lock_file(&claim.locations.layout_lock_path, &claim.layout_lock_file)?;
+        let marker_path = claim.locations.marker_dir.join(&record.filename);
+        let before_recheck = current_file.metadata()?;
+        if metadata_identity(&before_recheck)? != current.file_identity {
+            return Err(invalid_marker(
+                "artifact-use marker file identity changed before removal",
+            ));
+        }
+        current_file.seek(SeekFrom::Start(0))?;
+        let mut rechecked_bytes = Vec::new();
+        (&mut current_file)
+            .take(MAX_MARKER_BYTES + 1)
+            .read_to_end(&mut rechecked_bytes)?;
+        super::verify_named_lock_file(&marker_path, &current_file)?;
+        if rechecked_bytes != record.bytes
+            || metadata_identity(&current_file.metadata()?)? != current.file_identity
+        {
+            return Err(invalid_marker(
+                "artifact-use marker bytes changed immediately before removal",
+            ));
+        }
+        fs::remove_file(&marker_path)?;
+        sync_directory(&claim.locations.marker_dir)?;
+        expected_remaining.remove(index);
+        removed_markers.push(record.filename);
+    }
+
+    let retained_markers = plan
+        .markers
+        .into_iter()
+        .filter(|marker| !removed_markers.contains(&marker.filename))
+        .collect();
+    Ok(ArtifactUseReconcileReport {
+        plan_digest: confirmed_digest.to_owned(),
+        removed_markers,
+        retained_markers,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReconcileMarkerRecord {
+    filename: String,
+    marker: ArtifactUseMarker,
+    bytes: Vec<u8>,
+    bytes_sha256: String,
+    file_identity: DirectoryIdentity,
+}
+
+struct ArtifactUseReconcileClaim {
+    locations: ArtifactUseLocations,
+    marker_directory_identity: DirectoryIdentity,
+    layout_lock_file: File,
+    checkout_lock_file: File,
+    _layout_lock: super::ExclusiveFileLock,
+    _checkout_lock: super::ExclusiveFileLock,
+}
+
+impl ArtifactUseReconcileClaim {
+    fn acquire(primary_root: &Path, checkout_root: &Path) -> io::Result<Self> {
+        if !cfg!(unix) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "artifact-use marker reconciliation is unavailable on this platform",
+            ));
+        }
+        let locations = resolve_existing_locations(primary_root, checkout_root)?;
+        let layout_lock_file = open_existing_lock_readwrite(&locations.layout_lock_path)?;
+        let layout_lock =
+            super::ExclusiveFileLock::try_acquire(layout_lock_file)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::WouldBlock, "artifact-use layout is busy")
+            })?;
+        super::verify_named_lock_file(&locations.layout_lock_path, &layout_lock.file)?;
+        locations.require_existing_unchanged()?;
+
+        let checkout_lock_file = open_existing_lock_readwrite(&locations.lock_path)?;
+        let checkout_lock =
+            super::ExclusiveFileLock::try_acquire(checkout_lock_file)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::WouldBlock, "artifact-use checkout is busy")
+            })?;
+        super::verify_named_lock_file(&locations.lock_path, &checkout_lock.file)?;
+        locations.require_existing_unchanged()?;
+
+        let (marker_directory_identity, _) = read_reconcile_marker_inventory(&locations)?;
+        Ok(Self {
+            locations,
+            marker_directory_identity,
+            layout_lock_file: layout_lock.file.try_clone()?,
+            checkout_lock_file: checkout_lock.file.try_clone()?,
+            _layout_lock: layout_lock,
+            _checkout_lock: checkout_lock,
+        })
+    }
+
+    fn plan(
+        &self,
+        selected_session_id: i64,
+        cohort: &crate::auto_cleanup::ClosedArtifactCheckoutCohort,
+        registry: &crate::worktree_registry::ArtifactUsePrimaryRootWitnessGuard,
+    ) -> io::Result<(ArtifactUseReconcilePlan, Vec<ReconcileMarkerRecord>)> {
+        self.locations.require_existing_unchanged()?;
+        if cohort.worktree() != self.locations.checkout_root.as_path()
+            || !cohort.session_ids().contains(&selected_session_id)
+        {
+            return Err(invalid_marker(
+                "selected session is not in the exact closed checkout cohort",
+            ));
+        }
+        if !registry.matches_marker_identity(
+            &self.locations.primary_root,
+            self.locations.primary_identity.device,
+            self.locations.primary_identity.inode,
+        ) {
+            return Err(invalid_marker(
+                "validated root registry witness does not bind the current primary root",
+            ));
+        }
+        registry.revalidate()?;
+        let (marker_directory_identity, records) =
+            read_reconcile_marker_inventory(&self.locations)?;
+        if marker_directory_identity != self.marker_directory_identity {
+            return Err(invalid_marker(
+                "artifact-use marker directory changed during reconciliation",
+            ));
+        }
+        let mut markers = records
+            .iter()
+            .map(|record| ArtifactUseReconcileMarker {
+                filename: record.filename.clone(),
+                session_id: record.marker.session_id,
+                invocation_id: record.marker.invocation_id.clone(),
+                bytes_sha256: record.bytes_sha256.clone(),
+                file_device: record.file_identity.device,
+                file_inode: record.file_identity.inode,
+                disposition: reconciliation_disposition(
+                    &self.locations,
+                    selected_session_id,
+                    cohort,
+                    registry,
+                    record,
+                ),
+            })
+            .collect::<Vec<_>>();
+        markers.sort_by(|left, right| left.filename.cmp(&right.filename));
+        let mut plan = ArtifactUseReconcilePlan {
+            schema_version: 1,
+            selected_session_id,
+            cohort: cohort.clone(),
+            primary_root: self.locations.primary_root.clone(),
+            checkout_root: self.locations.checkout_root.clone(),
+            checkout_key: self.locations.checkout_key.clone(),
+            primary_identity: self.locations.primary_identity.clone(),
+            checkout_identity: self.locations.checkout_identity.clone(),
+            marker_directory_identity: marker_directory_identity.clone(),
+            registry_witness: registry.witness().clone(),
+            markers,
+            digest: String::new(),
+        };
+        let serialized = serde_json::to_vec(&plan)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        plan.digest = format!("{:x}", Sha256::digest(serialized));
+        Ok((plan, records))
+    }
+
+    fn verify_inventory(&self, expected: &[ReconcileMarkerRecord]) -> io::Result<()> {
+        self.locations.require_existing_unchanged()?;
+        let (directory_identity, current) = read_reconcile_marker_inventory(&self.locations)?;
+        if directory_identity != self.marker_directory_identity || current != expected {
+            return Err(invalid_marker(
+                "artifact-use marker inventory changed during apply",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn resolve_existing_locations(
+    primary_root: &Path,
+    checkout_root: &Path,
+) -> io::Result<ArtifactUseLocations> {
+    let primary_root = primary_root.canonicalize()?;
+    let checkout_root = checkout_root.canonicalize()?;
+    let primary_identity = directory_identity(&primary_root)?;
+    let checkout_identity = directory_identity(&checkout_root)?;
+    let checkout_key = checkout_key(&checkout_root)?;
+    let state_dir = primary_root.join(".aethyme");
+    let run_dir = state_dir.join("run");
+    let runtime_dir = run_dir.join("artifact-use");
+    for (path, label) in [
+        (&state_dir, "repository state"),
+        (&run_dir, "repository runtime"),
+        (&runtime_dir, "artifact-use runtime"),
+    ] {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_dir() {
+            return Err(invalid_marker(format!(
+                "{label} is not an existing real directory: {}",
+                path.display()
+            )));
+        }
+        if path.canonicalize()? != *path {
+            return Err(invalid_marker(format!(
+                "{label} path changed or contains a symlink: {}",
+                path.display()
+            )));
+        }
+    }
+    let marker_dir = runtime_dir.join(format!("{checkout_key}.markers"));
+    let marker_metadata = fs::symlink_metadata(&marker_dir)?;
+    if !marker_metadata.file_type().is_dir()
+        || marker_dir.canonicalize()? != marker_dir
+        || !marker_dir.starts_with(&runtime_dir)
+    {
+        return Err(invalid_marker(
+            "artifact-use marker path is not an existing real child of the runtime directory",
+        ));
+    }
+    Ok(ArtifactUseLocations {
+        primary_root,
+        primary_identity,
+        checkout_root,
+        checkout_identity,
+        checkout_key,
+        runtime_dir: runtime_dir.clone(),
+        layout_lock_path: runtime_dir.join(format!("{checkout_key}.init.lock")),
+        lock_path: runtime_dir.join(format!("{checkout_key}.lock")),
+        marker_dir,
+    })
+}
+
+impl ArtifactUseLocations {
+    fn require_existing_unchanged(&self) -> io::Result<()> {
+        let current = resolve_existing_locations(&self.primary_root, &self.checkout_root)?;
+        if current != *self {
+            return Err(invalid_marker(
+                "artifact-use primary, checkout, or marker layout changed while claims were held",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn open_existing_lock_readwrite(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    configure_nofollow(&mut options);
+    let file = options.open(path)?;
+    super::verify_named_lock_file(path, &file)?;
+    Ok(file)
+}
+
+fn read_reconcile_marker_inventory(
+    locations: &ArtifactUseLocations,
+) -> io::Result<(DirectoryIdentity, Vec<ReconcileMarkerRecord>)> {
+    let directory_metadata = fs::symlink_metadata(&locations.marker_dir)?;
+    if !directory_metadata.file_type().is_dir()
+        || locations.marker_dir.canonicalize()? != locations.marker_dir
+    {
+        return Err(invalid_marker(
+            "artifact-use marker directory is not a real directory",
+        ));
+    }
+    let directory_identity = metadata_identity(&directory_metadata)?;
+    let mut names = Vec::new();
+    for entry in fs::read_dir(&locations.marker_dir)? {
+        let entry = entry?;
+        if names.len() >= MAX_MARKERS_PER_CHECKOUT {
+            return Err(invalid_marker(
+                "artifact-use marker inventory exceeded its cap; retain the checkout",
+            ));
+        }
+        let name = entry.file_name().into_string().map_err(|_| {
+            invalid_marker("artifact-use marker inventory contains a non-UTF-8 name")
+        })?;
+        if !name.ends_with(".json") {
+            return Err(invalid_marker(format!(
+                "unexpected artifact-use marker entry {name:?}"
+            )));
+        }
+        names.push(name);
+    }
+    names.sort_unstable();
+    let mut records = Vec::with_capacity(names.len());
+    for name in names {
+        records.push(read_reconcile_marker_file(&locations.marker_dir, &name)?);
+    }
+    let after = fs::symlink_metadata(&locations.marker_dir)?;
+    if metadata_identity(&after)? != directory_identity {
+        return Err(invalid_marker(
+            "artifact-use marker directory changed while it was inventoried",
+        ));
+    }
+    Ok((directory_identity, records))
+}
+
+fn read_reconcile_marker_file(
+    marker_dir: &Path,
+    filename: &str,
+) -> io::Result<ReconcileMarkerRecord> {
+    read_reconcile_marker_file_with_handle(marker_dir, filename).map(|(record, _file)| record)
+}
+
+fn read_reconcile_marker_file_with_handle(
+    marker_dir: &Path,
+    filename: &str,
+) -> io::Result<(ReconcileMarkerRecord, File)> {
+    let nonce = filename
+        .strip_suffix(".json")
+        .ok_or_else(|| invalid_marker("artifact-use marker has an invalid filename"))?;
+    if nonce.is_empty() || nonce.contains('/') || nonce.contains('\\') {
+        return Err(invalid_marker(
+            "artifact-use marker has an invalid nonce filename",
+        ));
+    }
+    let path = marker_dir.join(filename);
+    let mut file = open_existing_nofollow(&path)?;
+    super::verify_named_lock_file(&path, &file)?;
+    let before = file.metadata()?;
+    if !before.is_file() || before.len() > MAX_MARKER_BYTES {
+        return Err(invalid_marker(
+            "artifact-use marker is not a bounded regular file",
+        ));
+    }
+    let before_identity = metadata_identity(&before)?;
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    (&mut file)
+        .take(MAX_MARKER_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    super::verify_named_lock_file(&path, &file)?;
+    if before.len() != after.len()
+        || bytes.len() as u64 != after.len()
+        || metadata_identity(&after)? != before_identity
+    {
+        return Err(invalid_marker(
+            "artifact-use marker changed while it was read",
+        ));
+    }
+    let marker = serde_json::from_slice(&bytes)
+        .map_err(|error| invalid_marker(format!("malformed artifact-use marker: {error}")))?;
+    Ok((
+        ReconcileMarkerRecord {
+            filename: filename.to_owned(),
+            marker,
+            bytes_sha256: format!("{:x}", Sha256::digest(&bytes)),
+            bytes,
+            file_identity: before_identity,
+        },
+        file,
+    ))
+}
+
+fn reconciliation_disposition(
+    locations: &ArtifactUseLocations,
+    selected_session_id: i64,
+    cohort: &crate::auto_cleanup::ClosedArtifactCheckoutCohort,
+    registry: &crate::worktree_registry::ArtifactUsePrimaryRootWitnessGuard,
+    record: &ReconcileMarkerRecord,
+) -> ArtifactUseReconcileDisposition {
+    let marker = &record.marker;
+    let retain = |reason: &str| ArtifactUseReconcileDisposition::Retain {
+        reason: reason.to_owned(),
+    };
+    let primary_path = match path_text(&locations.primary_root) {
+        Ok(path) => path,
+        Err(_) => return retain("primary root path is not representable as UTF-8"),
+    };
+    let checkout_path = match path_text(&locations.checkout_root) {
+        Ok(path) => path,
+        Err(_) => return retain("checkout path is not representable as UTF-8"),
+    };
+    if marker.schema_version != MARKER_SCHEMA_VERSION
+        || marker.primary_root != primary_path
+        || marker.checkout_root != checkout_path
+        || marker.checkout_device != locations.checkout_identity.device
+        || marker.checkout_inode != locations.checkout_identity.inode
+        || marker.checkout_key != locations.checkout_key
+        || marker.session_id < 0
+        || marker.invocation_id.is_empty()
+        || marker.nonce.is_empty()
+    {
+        return retain("marker does not match the exact primary and checkout identities");
+    }
+    if record.filename != format!("{}.json", marker.nonce) {
+        return retain("marker nonce does not match its filename");
+    }
+    let session_ids = cohort.session_ids();
+    if !session_ids.contains(&marker.session_id) || !session_ids.contains(&selected_session_id) {
+        return retain("marker session is not in the exact closed checkout cohort");
+    }
+    if !registry.matches_marker_identity(
+        Path::new(&marker.primary_root),
+        marker.primary_device,
+        marker.primary_inode,
+    ) {
+        return retain("primary device identity has no validated registry witness");
+    }
+    if marker.phase != ArtifactUsePhase::Running {
+        return retain("pre-dispatch marker has no process absence proof");
+    }
+    let Some(process) = marker.process.as_ref() else {
+        return retain("running marker has no process identity");
+    };
+    if let Err(reason) = validate_reconciliation_process_identity(process) {
+        return retain(reason);
+    }
+    #[cfg(unix)]
+    {
+        match observe_process_identity(process) {
+            ProcessIdentityObservation::Same => {
+                return retain("recorded producer PID and start token are still present");
+            }
+            ProcessIdentityObservation::Unknown => {
+                return retain("producer PID/start identity could not be inspected");
+            }
+            ProcessIdentityObservation::Absent | ProcessIdentityObservation::Reused => {}
+        }
+        let process_group_absent = crate::gates::gate_process_group_absent(process.process_group);
+        if !process_group_absent {
+            return retain("recorded process group is present or could not be proven absent");
+        }
+        let final_identity = observe_process_identity(process);
+        if process_and_group_proof_allows_removal(final_identity, process_group_absent) {
+            ArtifactUseReconcileDisposition::RemoveIfConfirmed
+        } else {
+            match final_identity {
+                ProcessIdentityObservation::Same => {
+                    retain("recorded producer PID/start token reappeared during proof")
+                }
+                ProcessIdentityObservation::Unknown => {
+                    retain("producer PID/start identity became unknown during proof")
+                }
+                ProcessIdentityObservation::Absent | ProcessIdentityObservation::Reused => {
+                    unreachable!("absent/reused identities with an absent group are removable")
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = process;
+        retain("process absence proof is unavailable on this platform")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessIdentityObservation {
+    Absent,
+    Same,
+    Reused,
+    Unknown,
+}
+
+fn process_and_group_proof_allows_removal(
+    process: ProcessIdentityObservation,
+    process_group_absent: bool,
+) -> bool {
+    process_group_absent
+        && matches!(
+            process,
+            ProcessIdentityObservation::Absent | ProcessIdentityObservation::Reused
+        )
+}
+
+fn validate_reconciliation_process_identity(
+    process: &ProcessStartIdentity,
+) -> Result<(), &'static str> {
+    if process.pid <= 1 || process.process_group <= 1 {
+        return Err("recorded PID or process group is invalid");
+    }
+    if process.start_time.is_none() {
+        return Err("recorded process start token is unavailable");
+    }
+    let expected_clock = if cfg!(target_os = "macos") {
+        Some("macos_epoch_microseconds")
+    } else if cfg!(target_os = "linux") {
+        Some("linux_clock_ticks")
+    } else {
+        None
+    };
+    if expected_clock != Some(process.start_time_clock.as_str()) {
+        return Err("recorded process start-token clock is unsupported");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn observe_process_identity(process: &ProcessStartIdentity) -> ProcessIdentityObservation {
+    // Callers validate PID and clock before reaching this non-signalling probe.
+    // SAFETY: signal zero observes the process id and sends no signal.
+    let result = unsafe { libc::kill(process.pid, 0) };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ESRCH) => return ProcessIdentityObservation::Absent,
+            Some(libc::EPERM) => {}
+            _ => return ProcessIdentityObservation::Unknown,
+        }
+    }
+    classify_process_start_observation(
+        process.start_time,
+        &process.start_time_clock,
+        process_start_token(process.pid),
+    )
+}
+
+fn classify_process_start_observation(
+    expected_start_time: Option<u64>,
+    expected_clock: &str,
+    observed: io::Result<(Option<u64>, &'static str)>,
+) -> ProcessIdentityObservation {
+    match (expected_start_time, observed) {
+        (Some(expected), Ok((Some(start_time), clock))) if clock == expected_clock => {
+            if start_time == expected {
+                ProcessIdentityObservation::Same
+            } else {
+                ProcessIdentityObservation::Reused
+            }
+        }
+        _ => ProcessIdentityObservation::Unknown,
+    }
+}
+
+fn metadata_identity(metadata: &fs::Metadata) -> io::Result<DirectoryIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(DirectoryIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let device = metadata.volume_serial_number().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "artifact-use volume identity is unavailable",
+            )
+        })?;
+        let inode = metadata.file_index().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "artifact-use file identity is unavailable",
+            )
+        })?;
+        Ok(DirectoryIdentity {
+            device: u64::from(device),
+            inode,
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "artifact-use file identity is unavailable",
+        ))
+    }
+}
+
+fn invalid_marker(message: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.to_string())
+}
+
 /// Make a bounded, nonblocking exclusive attempt for a future reclaimer. Any
 /// marker, malformed entry, cap overflow, or I/O error must retain the
 /// checkout; this function never deletes or repairs markers. Non-Unix
@@ -999,6 +1688,86 @@ mod tests {
         let path = primary.join(name);
         fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn reconciliation_plan_refuses_missing_layout_without_creating_it() {
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = checkout(primary.path(), "checkout");
+        assert!(resolve_existing_locations(primary.path(), &checkout).is_err());
+        assert!(!primary.path().join(".aethyme").exists());
+    }
+
+    #[test]
+    fn reconciliation_process_identity_rejects_invalid_or_unavailable_fields() {
+        if !cfg!(any(target_os = "macos", target_os = "linux")) {
+            return;
+        }
+        let valid_clock = if cfg!(target_os = "macos") {
+            "macos_epoch_microseconds"
+        } else {
+            "linux_clock_ticks"
+        };
+        let mut process = ProcessStartIdentity {
+            pid: 42,
+            process_group: 42,
+            start_time: Some(123),
+            start_time_clock: valid_clock.into(),
+        };
+        assert!(validate_reconciliation_process_identity(&process).is_ok());
+        process.process_group = 0;
+        assert!(validate_reconciliation_process_identity(&process).is_err());
+        process.process_group = 42;
+        process.start_time = None;
+        assert!(validate_reconciliation_process_identity(&process).is_err());
+        process.start_time = Some(123);
+        process.start_time_clock = "unavailable".into();
+        assert!(validate_reconciliation_process_identity(&process).is_err());
+    }
+
+    #[test]
+    fn reconciliation_start_token_and_group_proof_fail_closed() {
+        let clock = "linux_clock_ticks";
+        assert_eq!(
+            classify_process_start_observation(Some(123), clock, Ok((Some(123), clock))),
+            ProcessIdentityObservation::Same
+        );
+        assert_eq!(
+            classify_process_start_observation(Some(123), clock, Ok((Some(124), clock))),
+            ProcessIdentityObservation::Reused
+        );
+        assert_eq!(
+            classify_process_start_observation(Some(123), clock, Ok((None, clock))),
+            ProcessIdentityObservation::Unknown
+        );
+        assert_eq!(
+            classify_process_start_observation(
+                Some(123),
+                clock,
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+            ),
+            ProcessIdentityObservation::Unknown
+        );
+        assert!(process_and_group_proof_allows_removal(
+            ProcessIdentityObservation::Absent,
+            true
+        ));
+        assert!(process_and_group_proof_allows_removal(
+            ProcessIdentityObservation::Reused,
+            true
+        ));
+        assert!(!process_and_group_proof_allows_removal(
+            ProcessIdentityObservation::Same,
+            true
+        ));
+        assert!(!process_and_group_proof_allows_removal(
+            ProcessIdentityObservation::Unknown,
+            true
+        ));
+        assert!(!process_and_group_proof_allows_removal(
+            ProcessIdentityObservation::Absent,
+            false
+        ));
     }
 
     fn begin(

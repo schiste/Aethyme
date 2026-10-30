@@ -713,7 +713,7 @@ struct AutoCleanupCheckoutGroup {
     cursor_session_id: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 struct ClosedArtifactSessionSnapshot {
     id: i64,
     worktree_path: String,
@@ -725,7 +725,7 @@ struct ClosedArtifactSessionSnapshot {
 /// Complete retained-session identity for one artifact-reclamation checkout.
 /// Equality pins the closed canonical cohort and spawn-time owner across the
 /// discovery-to-removal window.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct ClosedArtifactCheckoutCohort {
     worktree: PathBuf,
     sessions: Vec<ClosedArtifactSessionSnapshot>,
@@ -1540,6 +1540,28 @@ impl Broker {
         worktree: &Path,
         deadline: Option<Instant>,
     ) -> Result<Option<ClosedArtifactCheckoutCohort>, BrokerOpError> {
+        self.closed_artifact_checkout_cohort_for_session_mode(session_id, worktree, deadline, true)
+    }
+
+    /// Read-only variant for explicit artifact-use marker review. An
+    /// incomplete path index is a refusal here: planning must not advance or
+    /// otherwise mutate the cleanup cohort index.
+    pub(crate) fn closed_artifact_checkout_cohort_for_session_readonly(
+        &mut self,
+        session_id: i64,
+        worktree: &Path,
+        deadline: Option<Instant>,
+    ) -> Result<Option<ClosedArtifactCheckoutCohort>, BrokerOpError> {
+        self.closed_artifact_checkout_cohort_for_session_mode(session_id, worktree, deadline, false)
+    }
+
+    fn closed_artifact_checkout_cohort_for_session_mode(
+        &mut self,
+        session_id: i64,
+        worktree: &Path,
+        deadline: Option<Instant>,
+        advance_incomplete_index: bool,
+    ) -> Result<Option<ClosedArtifactCheckoutCohort>, BrokerOpError> {
         let Some(mut index_state) = self
             .store()
             .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)?
@@ -1549,7 +1571,8 @@ impl Broker {
         // Successful removals and concurrent authority changes enqueue only
         // their affected rows. Drain those deltas in place; do not restart the
         // full filesystem lap between candidates in one pass.
-        while !index_state.complete
+        while advance_incomplete_index
+            && !index_state.complete
             && index_state.after_session_id >= index_state.high_water_session_id
             && index_state.pending_dirty_rows > 0
         {
@@ -3283,6 +3306,335 @@ mod tests {
         let mut broker = storage.open(&root).unwrap();
         let session = broker.start_worktree("retirement fixture", None).unwrap();
         (owner, storage, broker, session)
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    struct ArtifactUseReconcileFixture {
+        _owner: tempfile::TempDir,
+        _storage: crate::test_storage::TestStorage,
+        broker: crate::Broker,
+        session: crate::Session,
+        primary_root: PathBuf,
+        checkout_root: PathBuf,
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    impl ArtifactUseReconcileFixture {
+        fn new() -> Self {
+            let (owner, storage, broker, session) = retirement_fixture();
+            let primary_root = broker.main_root().to_path_buf();
+            let checkout_root = PathBuf::from(&session.worktree_path);
+            Self {
+                _owner: owner,
+                _storage: storage,
+                broker,
+                session,
+                primary_root,
+                checkout_root,
+            }
+        }
+
+        fn start_running_marker(&self, invocation_id: &str) -> std::process::Child {
+            use std::os::unix::process::CommandExt;
+
+            let admission = crate::file_lock::artifact_use::begin_artifact_use(
+                &self.primary_root,
+                &self.checkout_root,
+                self.session.id,
+                invocation_id,
+            )
+            .unwrap();
+            let crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(mut producer) =
+                admission
+            else {
+                panic!("artifact-use protocol should be available for this test");
+            };
+
+            let mut command = Command::new("sh");
+            command.args(["-c", "exec sleep 2"]);
+            command.process_group(0);
+            let child = command.spawn().unwrap();
+            let process_group = i32::try_from(child.id()).unwrap();
+            producer
+                .mark_process_started(&child, process_group)
+                .unwrap();
+            drop(producer);
+            child
+        }
+
+        fn close_and_bind(
+            &mut self,
+        ) -> (
+            super::ClosedArtifactCheckoutCohort,
+            crate::worktree_registry::ArtifactUsePrimaryRootWitnessGuard,
+        ) {
+            self.broker
+                .close_abandoning_unpushed(
+                    self.session.id,
+                    "explicit artifact-use reconciliation fixture",
+                )
+                .unwrap();
+
+            let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
+            let deadline = Instant::now() + Duration::from_secs(15);
+            for _ in 0..32 {
+                let state = self
+                    .broker
+                    .store()
+                    .cleanup_cohort_scan_state(namespace)
+                    .unwrap();
+                if state.as_ref().is_some_and(|state| {
+                    state.complete && state.unresolved_rows == 0 && state.pending_dirty_rows == 0
+                }) {
+                    break;
+                }
+                self.broker
+                    .advance_cleanup_cohort_scan(Some(deadline))
+                    .unwrap();
+            }
+            let cohort = self
+                .broker
+                .closed_artifact_checkout_cohort_for_session_readonly(
+                    self.session.id,
+                    &self.checkout_root,
+                    Some(deadline),
+                )
+                .unwrap()
+                .expect("fixture should produce a complete closed checkout cohort");
+
+            let repository = GitRepo::discover(&self.primary_root).unwrap();
+            let git_common_dir = repository.git_common_dir().unwrap();
+            let repository_key =
+                crate::host_state::repository_key(&self.primary_root, Some(&git_common_dir));
+            let host_database = self.broker.host_operation_database_path().unwrap();
+            let registry = crate::worktree_registry::artifact_use_primary_root_witness_guard(
+                &host_database,
+                &self.primary_root,
+                &repository_key,
+            )
+            .unwrap();
+            (cohort, registry)
+        }
+
+        fn marker_path(&self, invocation_id: &str) -> PathBuf {
+            let runtime = self.primary_root.join(".aethyme/run/artifact-use");
+            for entry in std::fs::read_dir(runtime).unwrap() {
+                let entry = entry.unwrap();
+                if !entry.file_type().unwrap().is_dir()
+                    || !entry.file_name().to_string_lossy().ends_with(".markers")
+                {
+                    continue;
+                }
+                for marker_entry in std::fs::read_dir(entry.path()).unwrap() {
+                    let marker_entry = marker_entry.unwrap();
+                    let bytes = std::fs::read(marker_entry.path()).unwrap();
+                    let marker: crate::file_lock::artifact_use::ArtifactUseMarker =
+                        serde_json::from_slice(&bytes).unwrap();
+                    if marker.session_id == self.session.id && marker.invocation_id == invocation_id
+                    {
+                        return marker_entry.path();
+                    }
+                }
+            }
+            panic!("fixture artifact-use marker was not found");
+        }
+
+        fn plan(
+            &self,
+            cohort: &super::ClosedArtifactCheckoutCohort,
+            registry: &crate::worktree_registry::ArtifactUsePrimaryRootWitnessGuard,
+        ) -> crate::file_lock::artifact_use::ArtifactUseReconcilePlan {
+            crate::file_lock::artifact_use::plan_artifact_use_marker_reconciliation(
+                &self.primary_root,
+                &self.checkout_root,
+                self.session.id,
+                cohort,
+                registry,
+            )
+            .unwrap()
+        }
+
+        fn apply(
+            &self,
+            cohort: &super::ClosedArtifactCheckoutCohort,
+            registry: &crate::worktree_registry::ArtifactUsePrimaryRootWitnessGuard,
+            digest: &str,
+        ) -> std::io::Result<crate::file_lock::artifact_use::ArtifactUseReconcileReport> {
+            crate::file_lock::artifact_use::apply_artifact_use_marker_reconciliation(
+                &self.primary_root,
+                &self.checkout_root,
+                self.session.id,
+                cohort,
+                registry,
+                digest,
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_artifact_cohort_lookup_does_not_advance_the_index() {
+        let (_owner, _storage, mut broker, session) = retirement_fixture();
+        let worktree = PathBuf::from(&session.worktree_path);
+        broker
+            .close_abandoning_unpushed(session.id, "read-only cohort fixture")
+            .unwrap();
+
+        let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
+        let before = broker
+            .store()
+            .cleanup_cohort_scan_state(namespace)
+            .unwrap()
+            .map(|state| {
+                (
+                    state.revision,
+                    state.after_session_id,
+                    state.complete,
+                    state.alias_refresh_generation,
+                )
+            });
+        let result = broker
+            .closed_artifact_checkout_cohort_for_session_readonly(session.id, &worktree, None)
+            .unwrap();
+        if before.as_ref().map(|state| state.2) != Some(true) {
+            assert!(result.is_none());
+        }
+        let after = broker
+            .store()
+            .cleanup_cohort_scan_state(namespace)
+            .unwrap()
+            .map(|state| {
+                (
+                    state.revision,
+                    state.after_session_id,
+                    state.complete,
+                    state.alias_refresh_generation,
+                )
+            });
+        assert_eq!(after, before);
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn explicit_artifact_use_plan_then_apply_removes_only_proven_quiescent_marker() {
+        let mut fixture = ArtifactUseReconcileFixture::new();
+        let invocation_id = "reconcile-positive-fixture";
+        let mut child = fixture.start_running_marker(invocation_id);
+        child.wait().unwrap();
+        let (cohort, registry) = fixture.close_and_bind();
+        let marker_path = fixture.marker_path(invocation_id);
+
+        let plan = fixture.plan(&cohort, &registry);
+        assert_eq!(plan.markers.len(), 1);
+        assert!(matches!(
+            &plan.markers[0].disposition,
+            crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::RemoveIfConfirmed
+        ));
+
+        let report = fixture.apply(&cohort, &registry, &plan.digest).unwrap();
+        assert_eq!(report.plan_digest, plan.digest);
+        assert_eq!(
+            report.removed_markers,
+            vec![plan.markers[0].filename.clone()]
+        );
+        assert!(report.retained_markers.is_empty());
+        assert!(!marker_path.exists());
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn explicit_artifact_use_apply_refuses_atomic_marker_replacement() {
+        let mut fixture = ArtifactUseReconcileFixture::new();
+        let invocation_id = "reconcile-marker-replacement-fixture";
+        let mut child = fixture.start_running_marker(invocation_id);
+        child.wait().unwrap();
+        let (cohort, registry) = fixture.close_and_bind();
+        let marker_path = fixture.marker_path(invocation_id);
+        let plan = fixture.plan(&cohort, &registry);
+
+        let mut replacement = std::fs::read(&marker_path).unwrap();
+        replacement.push(b'\n');
+        let replacement_path = marker_path.with_extension("json-replacement");
+        std::fs::write(&replacement_path, &replacement).unwrap();
+        std::fs::rename(&replacement_path, &marker_path).unwrap();
+
+        assert!(fixture.apply(&cohort, &registry, &plan.digest).is_err());
+        assert_eq!(std::fs::read(&marker_path).unwrap(), replacement);
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn explicit_artifact_use_apply_refuses_changed_session_alias_set() {
+        let mut fixture = ArtifactUseReconcileFixture::new();
+        let invocation_id = "reconcile-alias-fixture";
+        let mut child = fixture.start_running_marker(invocation_id);
+        child.wait().unwrap();
+        let (cohort, registry) = fixture.close_and_bind();
+        let marker_path = fixture.marker_path(invocation_id);
+        let plan = fixture.plan(&cohort, &registry);
+
+        let mut changed_aliases = cohort.clone();
+        let mut alias = changed_aliases.sessions[0].clone();
+        alias.id = fixture.session.id + 1;
+        changed_aliases.sessions.push(alias);
+
+        assert!(
+            fixture
+                .apply(&changed_aliases, &registry, &plan.digest)
+                .is_err()
+        );
+        assert!(marker_path.exists());
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn explicit_artifact_use_apply_refuses_changed_closed_cohort_snapshot() {
+        let mut fixture = ArtifactUseReconcileFixture::new();
+        let invocation_id = "reconcile-cohort-fixture";
+        let mut child = fixture.start_running_marker(invocation_id);
+        child.wait().unwrap();
+        let (cohort, registry) = fixture.close_and_bind();
+        let marker_path = fixture.marker_path(invocation_id);
+        let plan = fixture.plan(&cohort, &registry);
+
+        let mut changed_cohort = cohort.clone();
+        changed_cohort.sessions[0]
+            .branch
+            .push_str("-changed-after-review");
+
+        assert!(
+            fixture
+                .apply(&changed_cohort, &registry, &plan.digest)
+                .is_err()
+        );
+        assert!(marker_path.exists());
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn explicit_artifact_use_apply_retains_marker_with_unavailable_start_token() {
+        let mut fixture = ArtifactUseReconcileFixture::new();
+        let invocation_id = "reconcile-unknown-process-fixture";
+        let mut child = fixture.start_running_marker(invocation_id);
+        let (cohort, registry) = fixture.close_and_bind();
+        let marker_path = fixture.marker_path(invocation_id);
+        let bytes = std::fs::read(&marker_path).unwrap();
+        let mut marker: crate::file_lock::artifact_use::ArtifactUseMarker =
+            serde_json::from_slice(&bytes).unwrap();
+        marker.process.as_mut().unwrap().start_time = None;
+        std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+
+        let plan = fixture.plan(&cohort, &registry);
+        assert!(matches!(
+            &plan.markers[0].disposition,
+            crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::Retain { reason }
+                if reason.contains("start token")
+        ));
+        let report = fixture.apply(&cohort, &registry, &plan.digest).unwrap();
+        assert!(report.removed_markers.is_empty());
+        assert_eq!(report.retained_markers.len(), 1);
+        assert!(marker_path.exists());
+        child.wait().unwrap();
     }
 
     #[cfg(unix)]
