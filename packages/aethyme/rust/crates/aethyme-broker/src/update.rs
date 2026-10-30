@@ -200,7 +200,10 @@ fn find_managed_install_receipt(
 
     let mut searched = Vec::new();
     for base in [original_executable, resolved_executable] {
-        for ancestor in base.ancestors().take(8) {
+        let Some(base_directory) = base.parent() else {
+            continue;
+        };
+        for ancestor in base_directory.ancestors().take(8) {
             if searched
                 .iter()
                 .any(|path: &PathBuf| path.as_path() == ancestor)
@@ -208,8 +211,34 @@ fn find_managed_install_receipt(
                 continue;
             }
             searched.push(ancestor.to_path_buf());
-            let canonical_ancestor =
-                fs::canonicalize(ancestor).unwrap_or_else(|_| ancestor.to_path_buf());
+            let canonical_ancestor = match fs::canonicalize(ancestor) {
+                Ok(path) => path,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "resolve executable parent directory {}: {error}",
+                        ancestor.display()
+                    ));
+                }
+            };
+            if !fs::metadata(&canonical_ancestor)
+                .map_err(|error| {
+                    format!(
+                        "inspect executable parent directory {}: {error}",
+                        canonical_ancestor.display()
+                    )
+                })?
+                .is_dir()
+            {
+                continue;
+            }
             let receipt_paths = [
                 canonical_ancestor.join(INSTALL_RECEIPT_FILENAME),
                 canonical_ancestor
@@ -2455,6 +2484,25 @@ mod tests {
             &receipt.engine_path,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn managed_receipt_lookup_starts_from_an_executable_parent_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = temp.path().join("bin");
+        let receipt = create_test_install_receipt(&install_dir);
+        let bundle = receipt.versions_dir.join("v0.8.51-0123456789ab");
+        fs::create_dir(&bundle).unwrap();
+        let executable = bundle.join("aethyme");
+        fs::write(&executable, b"runtime executable fixture").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let resolved = fs::canonicalize(&executable).unwrap();
+
+        let found = find_managed_install_receipt(&executable, &resolved)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found, receipt);
     }
 
     fn acquire_test_update_lock(receipt: &InstallReceipt) -> RuntimeUpdateLock {

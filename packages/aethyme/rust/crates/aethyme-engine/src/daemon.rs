@@ -1194,6 +1194,11 @@ pub fn start_detached(
 /// Spawn a detached daemon and, when managed, transfer the exact bundle pin
 /// through stdin. The daemon takes ownership before the launcher releases its
 /// copy, so updater pruning never sees a pin gap.
+fn clear_runtime_pin_handoff_environment(command: &mut Command) {
+    command.env_remove(RUNTIME_PIN_STDIN_ENV);
+    command.env_remove(RUNTIME_PIN_PATH_ENV);
+}
+
 pub fn start_detached_with_runtime_pin(
     repo: &Path,
     serve_exe: &Path,
@@ -1239,6 +1244,7 @@ pub fn start_detached_with_runtime_pin(
         .map_err(|e| format!("clone log fd: {e}"))?;
 
     let mut cmd = std::process::Command::new(serve_exe);
+    clear_runtime_pin_handoff_environment(&mut cmd);
     cmd.arg("daemon").arg("serve").arg("--repo").arg(repo);
     if let Some(idle) = &opts.idle_timeout {
         cmd.arg("--idle-timeout").arg(idle);
@@ -1915,6 +1921,24 @@ mod tests {
             "aethyme",
             identity
         ));
+    }
+
+    #[test]
+    fn daemon_start_clears_caller_pin_markers_before_launch_mode_selection() {
+        let mut command = Command::new("aethyme-engine-cli");
+        command
+            .env(RUNTIME_PIN_STDIN_ENV, "1")
+            .env(RUNTIME_PIN_PATH_ENV, "/tmp/untrusted-runtime-pin");
+
+        clear_runtime_pin_handoff_environment(&mut command);
+
+        for name in [RUNTIME_PIN_STDIN_ENV, RUNTIME_PIN_PATH_ENV] {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| { key == std::ffi::OsStr::new(name) && value.is_none() })
+            );
+        }
     }
 
     #[test]
