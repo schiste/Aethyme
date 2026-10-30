@@ -397,7 +397,7 @@ fn read_message<T: serde::de::DeserializeOwned>(stream: &mut UnixStream) -> io::
 fn read_bytes(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
     protocol::read_frame_bytes(&mut BufReader::new(super::socket_io::DeadlineIo::new(
         stream, IO_TIMEOUT,
-    )))
+    )?))
 }
 
 #[cfg(test)]
