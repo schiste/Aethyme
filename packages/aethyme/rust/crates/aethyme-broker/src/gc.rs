@@ -1330,6 +1330,9 @@ mod recovery_archive_minimum_age_tests {
             }],
             created_at_ms: 100,
             minimum_archive_retention_ms: Some(1_296_000_000),
+            prerequisite_refs: Vec::new(),
+            retirement_digest: None,
+            prerequisite_targets: Vec::new(),
             holds_uncommitted: false,
         };
         assert!(!recovery_archive_minimum_age_elapsed(&archive, 99));
@@ -9048,22 +9051,48 @@ impl Broker {
                 if archive.session_id != candidate.session_id || archive.head != candidate.head {
                     return Err("names a different session or head than the reviewed plan".into());
                 }
-                recovery_archive_disposition(self, &archive, &journal.policy, now_ms()).ok_or_else(
-                    || "no longer meets recovery retention or landing requirements".to_string(),
-                )
+                recovery_archive_disposition(self, &archive, &journal.policy, now_ms())
+                    .ok_or_else(|| {
+                        "no longer meets recovery retention or landing requirements".to_string()
+                    })?;
+                Ok(archive)
             });
-            if let Err(reason) = evidence {
-                failures.push(format!(
-                    "{}: {reason}; review a new GC plan",
-                    candidate.path
-                ));
-                journal.remaining_recovery_archives.remove(0);
-                write_journal(&journal_path, &journal)?;
-                continue;
-            }
+            let archive = match evidence {
+                Ok(archive) => archive,
+                Err(reason) => {
+                    failures.push(format!(
+                        "{}: {reason}; review a new GC plan",
+                        candidate.path
+                    ));
+                    journal.remaining_recovery_archives.remove(0);
+                    write_journal(&journal_path, &journal)?;
+                    continue;
+                }
+            };
             // The manifest is the ownership evidence, so it goes last.
-            match remove_condemned_tree(&dir, Some(crate::cleanup_resolve::MANIFEST_FILE), deadline)
-            {
+            let removal = {
+                #[cfg(test)]
+                {
+                    let mut before_mutation = || tests::before_gc_artifact_removal_mutation(&dir);
+                    remove_condemned_tree_with_progress_and_guard(
+                        &dir,
+                        Some(crate::cleanup_resolve::MANIFEST_FILE),
+                        deadline,
+                        &mut before_mutation,
+                    )
+                    .map(|(outcome, _entries_reclaimed)| outcome)
+                    .map_err(|error| error.source)
+                }
+                #[cfg(not(test))]
+                {
+                    remove_condemned_tree(
+                        &dir,
+                        Some(crate::cleanup_resolve::MANIFEST_FILE),
+                        deadline,
+                    )
+                }
+            };
+            match removal {
                 Ok(TreeRemoval::Complete) => {}
                 Ok(TreeRemoval::Interrupted) => break,
                 Err(error) => {
@@ -9071,6 +9100,33 @@ impl Broker {
                     journal.remaining_recovery_archives.remove(0);
                     write_journal(&journal_path, &journal)?;
                     continue;
+                }
+            }
+            match std::fs::symlink_metadata(&dir) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match self.release_recovery_archive_prerequisite_refs_after_removal(&archive) {
+                        Ok(()) => {}
+                        Err(error) => {
+                            failures.push(format!(
+                                "{}: archive was removed but its prerequisite refs could not be released ({error}); refs were retained for safety",
+                                candidate.path
+                            ));
+                        }
+                    }
+                }
+                Ok(_) => {
+                    failures.push(format!(
+                        "{}: archive removal could not be verified; prerequisite refs were retained",
+                        candidate.path
+                    ));
+                    break;
+                }
+                Err(error) => {
+                    failures.push(format!(
+                        "{}: could not verify archive removal ({error}); prerequisite refs were retained",
+                        candidate.path
+                    ));
+                    break;
                 }
             }
             let payload = serde_json::json!({
@@ -9293,6 +9349,112 @@ mod tests {
                 _ => Ok(()),
             }
         })
+    }
+
+    #[test]
+    fn interrupted_v6_archive_removal_keeps_its_prerequisite_refs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "/.aethyme/\n").unwrap();
+        git(&root, &["add", "README.md", ".gitignore"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nrecovery_archive_days = 1\n",
+        )
+        .unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let session = broker
+            .start_worktree("archive prerequisite fixture", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        std::fs::write(worktree.join("unique.txt"), "archive prerequisite\n").unwrap();
+        git(&worktree, &["add", "unique.txt"]);
+        git(&worktree, &["commit", "-qm", "unique archive work"]);
+        broker.close(session.id).unwrap();
+        let resolve_plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        let archived = broker
+            .cleanup_resolve_retirement_apply(session.id, &resolve_plan.digest, false)
+            .unwrap();
+        assert!(archived.worktree_removed);
+        let archive = archived.archive;
+        let initial_archive = broker.owned_recovery_archive(&archive).unwrap();
+        assert!(!initial_archive.prerequisite_refs.is_empty());
+        let pin_refs = initial_archive.prerequisite_refs.clone();
+
+        let manifest_path = archive.join(crate::cleanup_resolve::MANIFEST_FILE);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["schema_version"], 6, "{manifest}");
+        let created_at_ms = manifest["created_at_ms"].as_i64().unwrap();
+        let aged_at_ms = created_at_ms - 16 * MILLIS_PER_DAY;
+        let retirement_path = archive.join("retirement.json");
+        let mut retirement: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&retirement_path).unwrap()).unwrap();
+        assert_eq!(retirement["archive_created_at_ms"], created_at_ms);
+        retirement["archive_created_at_ms"] = serde_json::json!(aged_at_ms);
+        let retirement_bytes = serde_json::to_vec(&retirement).unwrap();
+        manifest["retirement_record_sha256"] =
+            serde_json::json!(format!("{:x}", Sha256::digest(&retirement_bytes)));
+        manifest["created_at_ms"] = serde_json::json!(aged_at_ms);
+        std::fs::write(&retirement_path, retirement_bytes).unwrap();
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let reviewed = broker.gc_plan().unwrap();
+        assert_eq!(reviewed.recovery_archives.len(), 1, "{reviewed:?}");
+        for prerequisite in &pin_refs {
+            let output = Command::new("git")
+                .args(["rev-parse", "--verify", &prerequisite.ref_name])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", prerequisite.ref_name);
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                prerequisite.object_id
+            );
+        }
+
+        let _interrupt_after_first_unlink =
+            ArtifactSweepTestMutationInterrupt::after_first_unlink(&archive);
+        let applied = broker.gc_apply(&reviewed.digest).unwrap();
+
+        assert!(
+            archive.exists(),
+            "interrupted deletion leaves a partial archive"
+        );
+        assert!(
+            applied.recovery_archives_removed.is_empty(),
+            "partial deletion is not reported as complete: {applied:?}"
+        );
+        assert!(
+            applied.failures.iter().any(|failure| {
+                failure.contains("test hook stopped after the first cache unlink")
+            })
+        );
+        for prerequisite in &pin_refs {
+            let output = Command::new("git")
+                .args(["rev-parse", "--verify", &prerequisite.ref_name])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", prerequisite.ref_name);
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                prerequisite.object_id
+            );
+        }
     }
 
     fn test_worker_retry_pending(broker: &mut Broker, now: i64) -> Result<bool, BrokerOpError> {

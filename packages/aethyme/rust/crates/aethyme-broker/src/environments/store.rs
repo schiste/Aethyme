@@ -376,8 +376,24 @@ impl EnvironmentStore {
     /// Open for reading without creating anything. `None` when no
     /// environment has ever been recorded on this host.
     pub fn open_read_only(path: &Path) -> Result<Option<Self>, StoreError> {
-        if !path.exists() {
-            return Ok(None);
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(StoreError::Io {
+                    path: path.into(),
+                    source,
+                });
+            }
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(StoreError::Io {
+                    path: path.into(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "environments database path is not a regular file",
+                    ),
+                });
+            }
         }
         let conn = Connection::open_with_flags(
             path,

@@ -1437,10 +1437,11 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
 /// would mark its namespace and ports free while its database or containers
 /// may still exist.
 fn refuse_environment_owned(lease_id: &str, action: &str) -> Result<(), UsageError> {
-    let Ok(store) = crate::environments::store::default_store_path() else {
-        return Ok(());
-    };
-    match crate::environments::lifecycle::environment_owning_lease(&store, lease_id) {
+    let store = crate::environments::store::default_store_path()
+        .map_err(|error| UsageError::Message(error.to_string()))?;
+    match crate::environments::lifecycle::environment_owning_lease(&store, lease_id)
+        .map_err(|error| UsageError::Message(error.to_string()))?
+    {
         Some(env_id) => Err(UsageError::Message(format!(
             "environment_owned: lease {lease_id} belongs to environment {env_id}; resources {action} \
              would free it without destroying what the environment created. Run \
