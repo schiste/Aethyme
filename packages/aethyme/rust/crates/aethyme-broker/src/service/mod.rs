@@ -16,3 +16,6 @@ pub(crate) mod job_runtime;
 
 #[cfg(unix)]
 pub mod transport;
+
+#[cfg(unix)]
+mod socket_io;
