@@ -471,3 +471,193 @@ fn only_aethymes_own_export_of_the_recorded_commit_is_trusted() {
         "no marker"
     );
 }
+
+fn up_baseline(lifecycle: &mut Lifecycle, repo: &Path) -> super::store::EnvironmentRecord {
+    lifecycle
+        .shared_up(
+            repo,
+            REPOSITORY,
+            "baseline",
+            &HostEnvironmentsFile::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+}
+
+/// A revision whose build fails never interrupts the serving one: it is
+/// built in its own export first, so nothing is parked.
+#[test]
+fn a_failed_build_never_parks_the_serving_revision() {
+    if !python_available() {
+        eprintln!("SKIP failed build: python3 not available");
+        return;
+    }
+    let host = Host::new();
+    let repo = repository(43600);
+    let mut lifecycle = host.lifecycle();
+    let before = up_baseline(&mut lifecycle, repo.path());
+    let broken = commit(
+        repo.path(),
+        ".aethyme/environments.toml",
+        &environments(43600, SERVE).replace(
+            "route = true\n",
+            "route = true\nbuild = \"echo cannot build >&2; exit 4\"\n",
+        ),
+        "broken build",
+    );
+    let outcome = lifecycle
+        .shared_redeploy(
+            repo.path(),
+            REPOSITORY,
+            "baseline",
+            &HostEnvironmentsFile::default(),
+            Duration::from_secs(10),
+            true,
+        )
+        .unwrap();
+    assert!(
+        matches!(&outcome, Redeploy::RolledBack { failed, .. } if *failed == broken),
+        "{outcome:?}"
+    );
+    let transitions = lifecycle.store.transitions(&before.env_id, 50).unwrap();
+    assert!(
+        !transitions.iter().any(|t| t.to == EnvironmentPhase::Parked),
+        "never parked: {transitions:?}"
+    );
+    assert!(
+        transitions
+            .iter()
+            .any(|t| t.reason == "redeploy build failed")
+    );
+    let after = lifecycle.store.get(&before.env_id).unwrap().unwrap();
+    assert_eq!(after.phase, EnvironmentPhase::Active);
+    assert_eq!(after.snapshot.source.commit, before.snapshot.source.commit);
+    lifecycle
+        .shared_destroy(repo.path(), REPOSITORY, "baseline")
+        .unwrap();
+}
+
+/// A default-branch file that cannot be read is not "nothing declared".
+#[test]
+fn an_unreadable_declaration_destroys_nothing() {
+    if !python_available() {
+        eprintln!("SKIP unreadable declaration: python3 not available");
+        return;
+    }
+    let host = Host::new();
+    let repo = repository(43650);
+    let mut lifecycle = host.lifecycle();
+    let record = up_baseline(&mut lifecycle, repo.path());
+    commit(
+        repo.path(),
+        ".aethyme/environments.toml",
+        "schema = 1\n[[profiles]\nthis is not toml",
+        "typo on main",
+    );
+    let actions = lifecycle
+        .sync_shared(repo.path(), REPOSITORY, &HostEnvironmentsFile::default())
+        .unwrap();
+    assert!(
+        actions.iter().any(|a| a.starts_with("skipped")),
+        "{actions:?}"
+    );
+    assert_eq!(
+        lifecycle.store.get(&record.env_id).unwrap().unwrap().phase,
+        EnvironmentPhase::Active
+    );
+    lifecycle.down(&record.env_id, None).unwrap();
+}
+
+/// A swap marker left by a redeployer that died no longer holds requests.
+#[test]
+fn a_dead_redeployers_swap_marker_is_ignored() {
+    let root = tempfile::tempdir().unwrap();
+    let env_id = "env-0123456789ab";
+    let directory = super::logs::environment_directory(root.path(), env_id).unwrap();
+    std::fs::create_dir_all(&directory).unwrap();
+    let marker = directory.join(super::shared::SWAP_MARKER);
+    let me = std::process::id() as i32;
+    let alive = crate::gates::process_start_time(me);
+    std::fs::write(
+        &marker,
+        format!(
+            r#"{{"pid":{me},"start_time":{},"at":0}}"#,
+            alive.unwrap_or(0)
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        super::shared::swap_in_progress(root.path(), env_id),
+        alive.is_some(),
+        "a live owner holds"
+    );
+    std::fs::write(
+        &marker,
+        format!(
+            r#"{{"pid":{me},"start_time":{},"at":0}}"#,
+            alive.unwrap_or(0) + 1
+        ),
+    )
+    .unwrap();
+    assert!(
+        !super::shared::swap_in_progress(root.path(), env_id),
+        "a recycled pid does not"
+    );
+    std::fs::write(&marker, r#"{"pid":1,"start_time":null,"at":0}"#).unwrap();
+    assert!(
+        !super::shared::swap_in_progress(root.path(), env_id),
+        "an unidentifiable owner expires"
+    );
+}
+
+/// Changing a shared environment's profile on the default branch replaces
+/// it; the old one is not kept forever beside the new one.
+#[test]
+fn a_profile_change_replaces_the_shared_environment() {
+    if !python_available() {
+        eprintln!("SKIP profile change: python3 not available");
+        return;
+    }
+    let host = Host::new();
+    let repo = repository(43700);
+    let mut lifecycle = host.lifecycle();
+    let old = up_baseline(&mut lifecycle, repo.path());
+    let changed = environments(43700, SERVE).replace(
+        "[[profiles]]\nname = \"frontend\"",
+        &format!(
+            "[[profiles]]\nname = \"backend2\"\n[[profiles.components]]\nname = \"api\"\nruntime = \"process\"\nlisten = true\nroute = true\nstart = '{SERVE}'\nhealth = {{ http = \"/version.txt\", timeout_seconds = 20, interval_ms = 100 }}\n[[profiles]]\nname = \"frontend\""
+        ),
+    );
+    let changed = changed.replace("profile = \"backend\"", "profile = \"backend2\"");
+    commit(
+        repo.path(),
+        ".aethyme/environments.toml",
+        &changed,
+        "new profile",
+    );
+    let actions = lifecycle
+        .sync_shared(repo.path(), REPOSITORY, &HostEnvironmentsFile::default())
+        .unwrap();
+    assert!(
+        actions.iter().any(|a| a.contains("profile changed")),
+        "{actions:?}"
+    );
+    assert!(
+        !lifecycle
+            .store
+            .get(&old.env_id)
+            .unwrap()
+            .unwrap()
+            .phase
+            .retains_worktree()
+    );
+    let new = lifecycle
+        .shared_record(repo.path(), REPOSITORY, "baseline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(new.profile, "backend2");
+    assert_eq!(new.phase, EnvironmentPhase::Active);
+    lifecycle
+        .shared_destroy(repo.path(), REPOSITORY, "baseline")
+        .unwrap();
+}

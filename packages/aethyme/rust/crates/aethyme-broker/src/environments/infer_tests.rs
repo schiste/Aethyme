@@ -202,3 +202,143 @@ fn a_range_replay_counts_profiles_quickly() {
         Some("schema")
     );
 }
+
+/// Paths Git would C-quote (non-ASCII here) still match their rules.
+#[test]
+fn unusual_paths_are_matched_verbatim() {
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    git(dir, &["init", "-q", "-b", "main"]);
+    write(dir, "README", "x\n");
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-qm", "base"]);
+    git(dir, &["branch", "aethyme/integration"]);
+    write(dir, "db/schema/café.sql", "create table t();\n");
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-qm", "schema"]);
+
+    let (_, changed) = changed_paths(dir).unwrap();
+    assert!(
+        changed.iter().any(|p| p == "db/schema/café.sql"),
+        "{changed:?}"
+    );
+    assert_eq!(infer(&file(), &changed).unwrap().minimum, "isolated");
+}
+
+/// Without any base, uncommitted changes to tracked files still count.
+#[test]
+fn without_a_base_uncommitted_changes_still_count() {
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    git(dir, &["init", "-q", "-b", "trunk"]);
+    write(dir, "server/api.py", "x = 1\n");
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-qm", "base"]);
+    write(dir, "server/api.py", "x = 2\n");
+
+    let (base, changed) = changed_paths(dir).unwrap();
+    assert!(base.is_none());
+    assert_eq!(changed, vec!["server/api.py".to_string()]);
+    assert_eq!(infer(&file(), &changed).unwrap().minimum, "backend");
+}
+
+/// A merge commit counts what it brought in, compared with its first parent.
+#[test]
+fn a_range_replay_counts_what_a_merge_brought_in() {
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    git(dir, &["init", "-q", "-b", "main"]);
+    write(dir, "README", "x\n");
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-qm", "base"]);
+    git(dir, &["checkout", "-qb", "topic"]);
+    write(dir, "app/migrations/0001.sql", "x\n");
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-qm", "migration"]);
+    git(dir, &["checkout", "-q", "main"]);
+    git(
+        dir,
+        &["merge", "-q", "--no-ff", "-m", "merge topic", "topic"],
+    );
+
+    let report = infer_range(dir, &file(), "HEAD^1..HEAD").unwrap();
+    assert_eq!(report.commits, 2, "{report:?}");
+    assert_eq!(report.profiles.get("isolated"), Some(&2), "{report:?}");
+}
+
+/// A raised minimum retires a cheaper environment only after the new one is
+/// up, and never a pinned one.
+#[test]
+fn replacing_below_minimum_keeps_pinned_environments() {
+    use super::compile::{CompileContext, EnvironmentOwner, compile};
+    use super::lifecycle::{Lifecycle, UpOptions};
+    use super::spec::HostEnvironmentsFile;
+    use super::store::EnvironmentStore;
+    use std::time::Duration;
+
+    let host = tempfile::tempdir().unwrap();
+    let worktree = tempfile::tempdir().unwrap();
+    let mut lifecycle = Lifecycle {
+        store: EnvironmentStore::open(&host.path().join("environments.db")).unwrap(),
+        coordinator: crate::resources::HostResourceCoordinator::open(&host.path().join("host.db"))
+            .unwrap(),
+        root: host.path().join("environments"),
+        holder_pid: None,
+        hook_timeout: Duration::from_secs(20),
+        actor: "test".into(),
+    };
+    let file = file();
+    let fingerprint = crate::console::worktree_fingerprint(worktree.path());
+    let up = |lifecycle: &mut Lifecycle, profile: &str| {
+        let snapshot = compile(
+            &file,
+            &HostEnvironmentsFile::default(),
+            profile,
+            "t",
+            &CompileContext {
+                repository: "repo-infer".into(),
+                owner: EnvironmentOwner::Worktree {
+                    fingerprint: fingerprint.clone(),
+                },
+                worktree_fingerprint: fingerprint.clone(),
+                source_commit: None,
+                source_dirty: false,
+                source_digest: String::new(),
+            },
+        )
+        .unwrap();
+        lifecycle
+            .up(
+                &snapshot,
+                worktree.path(),
+                None,
+                None,
+                &UpOptions {
+                    wait: Duration::from_secs(5),
+                    reconfigure: false,
+                },
+            )
+            .unwrap()
+            .env_id
+    };
+    let pinned = up(&mut lifecycle, "static");
+    lifecycle
+        .pin(&pinned, Duration::from_secs(3600), "demo")
+        .unwrap();
+    let plain = up(&mut lifecycle, "backend");
+    let inference = infer(&file, &paths(&["db/schema/a.sql"])).unwrap();
+
+    let (replaced, kept) =
+        super::operate::replace_below_minimum(&mut lifecycle, worktree.path(), &file, &inference);
+    assert_eq!(replaced, vec![plain.clone()]);
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].0, pinned);
+    assert!(
+        lifecycle
+            .store
+            .get(&plain)
+            .unwrap()
+            .is_none_or(|r| !r.phase.retains_worktree())
+    );
+    lifecycle.down(&pinned, None).unwrap();
+}
