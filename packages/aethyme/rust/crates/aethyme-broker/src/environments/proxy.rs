@@ -352,7 +352,7 @@ fn handle(mut client: TcpStream, config: &ProxyConfig) -> io::Result<()> {
         );
     };
     if let Some(directory) = &route.static_dir {
-        return serve_static(&mut client, &head, directory);
+        return serve_static(&mut client, &head, directory, route.spa_fallback);
     }
     let Some(port) = route.upstream else {
         return respond(
@@ -418,7 +418,12 @@ fn content_type(path: &Path) -> &'static str {
     }
 }
 
-fn serve_static(client: &mut TcpStream, head: &Head, directory: &Path) -> io::Result<()> {
+fn serve_static(
+    client: &mut TcpStream,
+    head: &Head,
+    directory: &Path,
+    spa_fallback: bool,
+) -> io::Result<()> {
     if head.method != "GET" && head.method != "HEAD" {
         return respond(
             client,
@@ -440,18 +445,15 @@ fn serve_static(client: &mut TcpStream, head: &Head, directory: &Path) -> io::Re
     if path.is_dir() {
         path = path.join("index.html");
     }
-    // Resolve symlinks and refuse anything outside the served directory.
-    let inside = path
-        .canonicalize()
-        .ok()
-        .zip(directory.canonicalize().ok())
-        .is_some_and(|(file, root)| file.starts_with(root));
-    let size = std::fs::metadata(&path)
-        .map(|m| m.len())
-        .unwrap_or(u64::MAX);
-    if !inside || size > STATIC_LIMIT {
+    let found = servable(directory, &path).or_else(|| {
+        // A client-side route: no extension, so not a missing asset.
+        (spa_fallback && relative.extension().is_none())
+            .then(|| servable(directory, &directory.join("index.html")))
+            .flatten()
+    });
+    let Some((path, size)) = found else {
         return respond(client, "404 Not Found", "text/plain", &[], b"not found\n");
-    }
+    };
     let body = std::fs::read(&path)?;
     let body: &[u8] = if head.method == "HEAD" { &[] } else { &body };
     let mut response = format!(
@@ -462,6 +464,19 @@ fn serve_static(client: &mut TcpStream, head: &Head, directory: &Path) -> io::Re
     response.extend_from_slice(body);
     client.write_all(&response)?;
     client.flush()
+}
+
+/// `path` and its size when it is a file inside `directory` (symlinks
+/// resolved) small enough to serve.
+fn servable(directory: &Path, path: &Path) -> Option<(PathBuf, u64)> {
+    let inside = path
+        .canonicalize()
+        .ok()
+        .zip(directory.canonicalize().ok())
+        .is_some_and(|(file, root)| file.starts_with(root));
+    let metadata = std::fs::metadata(path).ok()?;
+    (inside && metadata.is_file() && metadata.len() <= STATIC_LIMIT)
+        .then(|| (path.to_path_buf(), metadata.len()))
 }
 
 fn authorized(head: &Head, token: &str) -> bool {
