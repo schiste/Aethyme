@@ -217,6 +217,14 @@ fn every_rule_has_a_located_diagnostic() {
             field: "serve_dir",
         },
         Case {
+            name: "entry path without a leading slash",
+            toml: profile("{ name = \"a\", runtime = \"process\", start = \"x\", entry_path = \"o/\" }"),
+            code: "invalid_path",
+            profile: Some("p"),
+            component: Some("a"),
+            field: "entry_path",
+        },
+        Case {
             name: "process without start",
             toml: profile("{ name = \"a\", runtime = \"process\" }"),
             code: "missing_field",
@@ -615,4 +623,27 @@ fn variables_name_every_port_and_receipt_and_nothing_inherited() {
         !names.iter().any(|n| n == "AETHYME_ENV_PORT_DB"),
         "db does not listen"
     );
+}
+
+/// #1292: a component's `entry_path` is appended to its URL variable, and
+/// only to its own.
+#[test]
+fn an_entry_path_is_appended_to_the_component_url() {
+    let file =
+        parse(&PYTHON_SQLITE.replace("listen = true\n", "listen = true\nentry_path = \"/o/\"\n"));
+    let compiled = compile(
+        &file,
+        &HostEnvironmentsFile::default(),
+        "backend",
+        "env.toml",
+        &context(),
+    )
+    .unwrap();
+    let bindings = super::exec::Bindings {
+        ports: [("api".to_string(), 4000)].into(),
+        ..Default::default()
+    };
+    let vars = super::exec::environment_variables(&compiled, &compiled.components[0], &bindings, 1);
+    assert_eq!(vars["AETHYME_ENV_URL_API"], "http://127.0.0.1:4000/o/");
+    assert_eq!(vars["AETHYME_ENV_PORT_API"], "4000");
 }
