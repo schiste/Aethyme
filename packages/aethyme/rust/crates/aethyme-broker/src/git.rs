@@ -6853,12 +6853,9 @@ mod ignored_path_listing_tests {
         std::fs::write(root.path().join(".gitignore"), "bad-*\n").unwrap();
         git(root.path(), &["add", ".gitignore"]);
         git(root.path(), &["commit", "-qm", "ignore malformed filename"]);
-        let Some(_path) = aethyme_testkit::filesystem::write_non_utf8_file(
-            root.path(),
-            b"bad-\xff",
-            b"ignored",
-        )
-        .unwrap()
+        let Some(_path) =
+            aethyme_testkit::filesystem::write_non_utf8_file(root.path(), b"bad-\xff", b"ignored")
+                .unwrap()
         else {
             return;
         };
@@ -7782,12 +7779,9 @@ mod ignored_paths_readonly_tests {
     #[test]
     fn non_utf8_ignored_standalone_path_fails_closed() {
         let (root, repo) = ignored_repo();
-        let Some(_path) = aethyme_testkit::filesystem::write_non_utf8_file(
-            root.path(),
-            b"ignored-\xff",
-            b"data",
-        )
-        .unwrap()
+        let Some(_path) =
+            aethyme_testkit::filesystem::write_non_utf8_file(root.path(), b"ignored-\xff", b"data")
+                .unwrap()
         else {
             return;
         };
@@ -9698,8 +9692,7 @@ mod batched_commit_tests {
             b"invalid-\xff-name.txt",
             b"tracked\n",
         )
-        .expect("write invalid UTF-8 path")
-        else {
+        .expect("write invalid UTF-8 path") else {
             return;
         };
         run(root, &["add", "-A"]);

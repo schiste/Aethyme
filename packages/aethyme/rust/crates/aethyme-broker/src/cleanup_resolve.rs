@@ -8941,8 +8941,7 @@ mod tests {
             b"private-\xff",
             b"preserve or refuse\n",
         )
-        .unwrap()
-        else {
+        .unwrap() else {
             return;
         };
         broker.close(session.id).unwrap();

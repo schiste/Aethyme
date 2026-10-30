@@ -353,8 +353,7 @@ fn non_utf8_untracked_path_refuses_archive_resolution_before_cleanup() {
         b"untracked-\xff.txt",
         b"must remain",
     )
-    .unwrap()
-    else {
+    .unwrap() else {
         return;
     };
 

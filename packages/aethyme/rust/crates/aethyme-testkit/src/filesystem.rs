@@ -29,11 +29,7 @@ pub fn write_non_utf8_file(
     }
 
     let path = directory.join(std::ffi::OsStr::from_bytes(filename));
-    let mut file = match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(file) => file,
         Err(error) if macos_rejects_invalid_path(&error) => {
             for entry in fs::read_dir(directory)? {
