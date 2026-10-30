@@ -95,6 +95,36 @@ fn v2_nullable_fields_require_keys_and_accept_explicit_nulls() {
 }
 
 #[test]
+fn empty_v2_variants_refuse_extra_fields_without_changing_valid_json() {
+    let repository = serde_json::json!({"kind": "repository"});
+    let method: wire::Method = serde_json::from_value(repository.clone()).unwrap();
+    assert_eq!(serde_json::to_value(method).unwrap(), repository);
+    assert!(
+        serde_json::from_value::<wire::Method>(
+            serde_json::json!({"kind": "repository", "extra": null})
+        )
+        .is_err()
+    );
+    for kind in ["succeeded", "cancelled"] {
+        let value = serde_json::json!({"kind": kind});
+        let completion: wire::Completion = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(completion).unwrap(), value);
+        assert!(
+            serde_json::from_value::<wire::Completion>(
+                serde_json::json!({"kind": kind, "extra": null})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<wire::Completion>(&format!(
+                r#"{{"kind":"{kind}","extra":1,"extra":2}}"#
+            ))
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn result_chunks_preserve_utf8_and_bound_even_maximally_escaped_frames() {
     for encoded in ["é🎉".repeat(10000), "\u{0000}".repeat(10000)] {
         let mut reconstructed = String::new();

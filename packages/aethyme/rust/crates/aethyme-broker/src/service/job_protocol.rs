@@ -139,9 +139,9 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Completion {
-    Succeeded,
+    Succeeded {},
     Failed { message: String },
-    Cancelled,
+    Cancelled {},
 }
 
 impl From<&JobRecord> for Status {
@@ -160,11 +160,11 @@ impl From<&JobRecord> for Status {
                 message: progress.message.clone(),
             }),
             completion: job.completion.as_ref().map(|completion| match completion {
-                JobCompletion::Succeeded { .. } => Completion::Succeeded,
+                JobCompletion::Succeeded { .. } => Completion::Succeeded {},
                 JobCompletion::Failed { message } => Completion::Failed {
                     message: message.clone(),
                 },
-                JobCompletion::Cancelled => Completion::Cancelled,
+                JobCompletion::Cancelled => Completion::Cancelled {},
             }),
         }
     }

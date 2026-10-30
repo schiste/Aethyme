@@ -93,7 +93,7 @@ impl Client {
             }
             match job.state {
                 JobState::Succeeded => {
-                    if job.completion != Some(wire::Completion::Succeeded) {
+                    if job.completion != Some(wire::Completion::Succeeded {}) {
                         return Err(invalid("shared job has inconsistent completion"));
                     }
                     let result = read_result(
