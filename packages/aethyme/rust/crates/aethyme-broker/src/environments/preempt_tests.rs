@@ -358,3 +358,30 @@ fn preempt_none_keeps_todays_waiting_behaviour() {
         lifecycle.down(&env.id, None).unwrap();
     }
 }
+
+/// `Lifecycle::exclusive` admits one holder of a key at a time, even when
+/// several threads of one process ask in the same millisecond.
+#[test]
+fn an_exclusive_key_admits_one_holder_at_a_time() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let host = Host::new();
+    drop(host.lifecycle());
+    let active = AtomicUsize::new(0);
+    let most = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                let mut lifecycle = host.lifecycle();
+                lifecycle
+                    .exclusive("repo-preempt", "test-key", Duration::from_secs(20), |_| {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(100));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    })
+                    .expect("acquired within the wait");
+            });
+        }
+    });
+    assert_eq!(most.load(Ordering::SeqCst), 1);
+}
