@@ -610,9 +610,9 @@ mod classifier_tests {
     #[test]
     fn overlapping_patterns_and_ascii_folding_match_the_reference() {
         for input in [
-            b"x: COMMAND NOT FOUND; command not found",
-            b"prefix TARGET/DEBUG suffix",
-            b"NO SPACE LEFT ON DEVICE and no space left on device",
+            &b"x: COMMAND NOT FOUND; command not found"[..],
+            &b"prefix TARGET/DEBUG suffix"[..],
+            &b"NO SPACE LEFT ON DEVICE and no space left on device"[..],
         ] {
             let expected = oracle_mask(input);
             assert_eq!(matcher_mask_with_chunks(input, &[1, 2, 3, 5]), expected);
