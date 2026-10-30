@@ -7,11 +7,13 @@
 //! only then starts components. No lease ever holds a partial allocation and
 //! `HostLeaseState` is unchanged.
 //!
-//! Neither direction leaves an environment half-up. A wake whose start or
-//! health check fails stops what it started, releases capacity and returns
-//! to `parked` with the error. A wake that gets no capacity within `--wait`
-//! stays `parked` with `capacity_timeout` and starts nothing. A park whose
-//! stop cannot be proven goes to `quarantined` and keeps its capacity.
+//! A wake whose start or health check fails stops what it started, releases
+//! capacity and returns to `parked` when every stop succeeds. If rollback
+//! cannot prove a component stopped, its identity and capacity stay recorded
+//! in `quarantined` so `down` can retry safely. A wake that gets no capacity
+//! within `--wait` stays `parked` with `capacity_timeout` and starts nothing.
+//! A park whose stop cannot be proven also goes to `quarantined` and keeps
+//! its capacity.
 //!
 //! Ports stay reserved while parked, but only Aethyme respects the
 //! reservation: another process may bind one in the meantime. A wake checks
@@ -70,6 +72,16 @@ impl Lifecycle {
         reason: &str,
     ) -> Result<EnvironmentRecord, LifecycleError> {
         let record = self.store.resolve(env_id)?;
+        let _operation = self.operation_lock(&record.env_id)?;
+        self.park_locked(&record.env_id, reason)
+    }
+
+    pub(super) fn park_locked(
+        &mut self,
+        env_id: &str,
+        reason: &str,
+    ) -> Result<EnvironmentRecord, LifecycleError> {
+        let record = self.store.resolve(env_id)?;
         let env_id = record.env_id.clone();
         match record.phase {
             EnvironmentPhase::Parked => return Ok(record),
@@ -122,6 +134,16 @@ impl Lifecycle {
 
     /// Re-acquire capacity, start every component and wait for health.
     pub fn wake(
+        &mut self,
+        env_id: &str,
+        wait: Duration,
+    ) -> Result<EnvironmentRecord, LifecycleError> {
+        let record = self.store.resolve(env_id)?;
+        let _operation = self.operation_lock(&record.env_id)?;
+        self.wake_locked(&record.env_id, wait)
+    }
+
+    pub(super) fn wake_locked(
         &mut self,
         env_id: &str,
         wait: Duration,
@@ -212,34 +234,43 @@ impl Lifecycle {
             self.store.record_activity(&env_id, now_ms())?;
             return self.advance(&record, EnvironmentPhase::Active, "healthy", None);
         };
-        // Roll back: never active with dead components.
+        // Roll back each started component independently. A failed stop must
+        // retain its identity and Running phase for a later `down` retry.
+        let mut rollback_errors = Vec::new();
         for (name, identity) in started.iter().rev() {
             if let Some(component) = snapshot.components.iter().find(|c| &c.name == name) {
                 let ctx = self.context(&snapshot, component, &bindings, 1);
-                crate::warn_unrecorded(
-                    &format!("stop {name} after a failed wake"),
-                    driver_for(component.runtime).stop(&ctx, identity),
-                );
+                match driver_for(component.runtime).stop(&ctx, identity) {
+                    Ok(()) => self.component_to(&env_id, name, &SETTLE, None, None)?,
+                    Err(stop) => rollback_errors.push(json!({
+                        "component": name,
+                        "code": stop.code(),
+                        "message": stop.to_string(),
+                    })),
+                }
             }
-            self.component_to(&env_id, name, &SETTLE, None, None)?;
         }
         if !started.iter().any(|(name, _)| name == &failed) {
-            crate::warn_unrecorded(
-                &format!("record {failed} as stopped"),
-                self.component_to(&env_id, &failed, &SETTLE, None, None),
-            );
+            self.component_to(&env_id, &failed, &SETTLE, None, None)?;
         }
-        self.release_capacity(&env_id)?;
-        let detail =
-            json!({"code": error.code(), "component": failed, "message": error.to_string()});
+        let rollback_failed = !rollback_errors.is_empty();
+        if !rollback_failed {
+            self.release_capacity(&env_id)?;
+        }
+        let detail = json!({
+            "code": error.code(),
+            "component": failed,
+            "message": error.to_string(),
+            "rollback_errors": rollback_errors,
+        });
         self.store.set_error(&env_id, Some(&detail))?;
         let current = self.current(&env_id)?;
-        self.advance(
-            &current,
-            EnvironmentPhase::Parked,
-            "wake failed",
-            Some(detail),
-        )?;
+        let (phase, reason) = if !rollback_failed {
+            (EnvironmentPhase::Parked, "wake failed")
+        } else {
+            (EnvironmentPhase::Quarantined, "wake rollback stop unproven")
+        };
+        self.advance(&current, phase, reason, Some(detail))?;
         Err(error.into())
     }
 }

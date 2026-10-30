@@ -24,6 +24,34 @@ struct Host {
     markers: PathBuf,
 }
 
+struct ProcessGroupCleanup {
+    pgid: i32,
+    armed: bool,
+}
+
+impl ProcessGroupCleanup {
+    fn new(pgid: i32) -> Self {
+        Self { pgid, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessGroupCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // SAFETY: this group is read from the exact ProcessIdentity created
+        // by the component under test; it cannot be the test process group.
+        unsafe {
+            libc::killpg(self.pgid, libc::SIGKILL);
+        }
+    }
+}
+
 impl Host {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -361,6 +389,142 @@ health = {{ command = "false", timeout_seconds = 1, interval_ms = 50 }}
 }
 
 #[test]
+fn a_failed_rollback_stop_keeps_identity_and_capacity_for_down_retry() {
+    let host = Host::new();
+    let text = format!(
+        r#"
+schema = 1
+[pools.envs]
+limit = 2
+[[profiles]]
+name = "p"
+units = 1
+[[profiles.components]]
+name = "worker"
+runtime = "process"
+env = {{ MARKERS = "{m}" }}
+start = 'sleep 300 & echo "$$" > "$MARKERS/worker-leader.pid"; echo "$!" > "$MARKERS/worker-child.pid"; sleep 0.2'
+health = {{ command = 'test -s "$MARKERS/worker-leader.pid" && test -s "$MARKERS/worker-child.pid"', timeout_seconds = 2, interval_ms = 50 }}
+[[profiles.components]]
+name = "failed"
+runtime = "process"
+depends_on = ["worker"]
+env = {{ MARKERS = "{m}" }}
+start = 'leader=$(cat "$MARKERS/worker-leader.pid"); while kill -0 "$leader" 2>/dev/null; do sleep 0.01; done; exit 9'
+health = {{ command = "false", timeout_seconds = 2, interval_ms = 50 }}
+"#,
+        m = host.markers.display()
+    );
+    let worktree = tempfile::tempdir().unwrap();
+    let snapshot = snapshot(&text, "p", worktree.path(), None);
+    let mut lifecycle = host.lifecycle();
+    let up = lifecycle.up(&snapshot, worktree.path(), None, None, &options());
+
+    let child_pid: i32 = std::fs::read_to_string(host.markers.join("worker-child.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: the PID came from the background child started by this fixture.
+    let process_group = unsafe { libc::getpgid(child_pid) };
+    assert!(process_group > 0, "fixture child has no process group");
+    let mut cleanup = ProcessGroupCleanup::new(process_group);
+
+    let failed_start = match up {
+        Err(LifecycleError::Driver(error)) => error,
+        other => panic!("expected the second start to fail, got {other:?}"),
+    };
+    assert_eq!(failed_start.code(), "start_exited");
+    let record = lifecycle.store.get(&snapshot.env_id).unwrap().unwrap();
+    assert_eq!(record.phase, EnvironmentPhase::Failed);
+    assert!(
+        record.capacity_lease_id.is_some(),
+        "capacity remains leased"
+    );
+    assert_eq!(host.active_leases(&record.env_id), 2);
+    let start_error = record.last_error.as_ref().unwrap();
+    assert_eq!(start_error["component"], "failed");
+    assert_eq!(start_error["rollback_errors"][0]["component"], "worker");
+    assert_eq!(
+        start_error["rollback_errors"][0]["code"],
+        "identity_unproven"
+    );
+
+    let worker = lifecycle
+        .store
+        .components(&record.env_id)
+        .unwrap()
+        .into_iter()
+        .find(|component| component.component == "worker")
+        .unwrap();
+    assert_eq!(worker.phase, ManagedServicePhase::Running);
+    let saved_identity = worker.identity.clone().expect("running identity retained");
+    let identity: super::drivers::ComponentIdentity =
+        serde_json::from_value(saved_identity.clone()).unwrap();
+    let super::drivers::ComponentIdentity::Process(process) = identity else {
+        panic!("worker should have a process identity");
+    };
+    assert_eq!(process.pgid, process_group);
+    assert_eq!(process.observe(), super::identity::Observation::Unproven);
+
+    assert!(matches!(
+        lifecycle.up(&snapshot, worktree.path(), None, None, &options()),
+        Err(LifecycleError::WrongPhase {
+            phase: "failed",
+            ..
+        })
+    ));
+    let refused_retry = lifecycle.store.get(&record.env_id).unwrap().unwrap();
+    assert_eq!(refused_retry.phase_generation, record.phase_generation);
+    assert_eq!(refused_retry.capacity_lease_id, record.capacity_lease_id);
+    assert_eq!(host.active_leases(&record.env_id), 2);
+    assert_eq!(
+        lifecycle
+            .store
+            .components(&record.env_id)
+            .unwrap()
+            .into_iter()
+            .find(|component| component.component == "worker")
+            .unwrap()
+            .identity,
+        Some(saved_identity.clone())
+    );
+
+    let first_down = lifecycle.down(&record.env_id, None);
+    assert!(first_down.is_err(), "down must retry the retained identity");
+    let after_failed_down = lifecycle.store.get(&record.env_id).unwrap().unwrap();
+    assert_eq!(after_failed_down.phase, EnvironmentPhase::DestroyFailed);
+    assert_eq!(host.active_leases(&record.env_id), 2);
+    let worker_after_down = lifecycle
+        .store
+        .components(&record.env_id)
+        .unwrap()
+        .into_iter()
+        .find(|component| component.component == "worker")
+        .unwrap();
+    assert_eq!(worker_after_down.phase, ManagedServicePhase::Running);
+    assert_eq!(worker_after_down.identity, Some(saved_identity));
+
+    // Resolve the test's deliberately orphaned child; the same retained
+    // identity is now provably gone, so a second down can finish cleanup.
+    // SAFETY: this is the process group verified from the stored identity.
+    unsafe {
+        libc::killpg(process_group, libc::SIGKILL);
+    }
+    for _ in 0..80 {
+        if !super::identity::group_exists(process_group) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(!super::identity::group_exists(process_group));
+    cleanup.disarm();
+    let destroyed = lifecycle.down(&record.env_id, None).unwrap();
+    assert_eq!(destroyed.phase, EnvironmentPhase::Destroyed);
+    assert_eq!(host.active_leases(&record.env_id), 0);
+}
+
+#[test]
 fn a_failed_destroy_keeps_the_leases_and_generic_release_is_refused() {
     let host = Host::new();
     let gate = host.markers.join("allow-destroy");
@@ -399,7 +563,9 @@ destroy = 'test -f "{gate}" || {{ echo destroy-blocked >&2; exit 4; }}'
     );
     let lease = failed.reservation_lease_id.unwrap();
     assert_eq!(
-        environment_owning_lease(&host.store, &lease).as_deref(),
+        environment_owning_lease(&host.store, &lease)
+            .unwrap()
+            .as_deref(),
         Some(record.env_id.as_str()),
         "resources release/reconcile can see the owner and refuse"
     );
@@ -408,7 +574,7 @@ destroy = 'test -f "{gate}" || {{ echo destroy-blocked >&2; exit 4; }}'
     let retried = lifecycle.down(&record.env_id, None).unwrap();
     assert_eq!(retried.phase, EnvironmentPhase::Destroyed);
     assert_eq!(host.active_leases(&record.env_id), 0);
-    assert_eq!(environment_owning_lease(&host.store, &lease), None);
+    assert_eq!(environment_owning_lease(&host.store, &lease).unwrap(), None);
 }
 
 #[test]
@@ -532,6 +698,61 @@ destroy = 'test -f "{gate}"'
 }
 
 #[test]
+fn ownership_and_worktree_removal_fail_closed_for_unreadable_environment_store() {
+    let worktree = tempfile::tempdir().unwrap();
+
+    let missing = Host::new();
+    assert_eq!(
+        environment_owning_lease(&missing.store, "lease").unwrap(),
+        None
+    );
+    assert!(
+        destroy_for_worktree_with(&missing.store, &missing.db, &missing.root, worktree.path())
+            .unwrap()
+            .is_empty(),
+        "a confirmed-absent store remains a no-op"
+    );
+
+    let corrupt = Host::new();
+    std::fs::write(&corrupt.store, b"not a SQLite database").unwrap();
+    assert!(environment_owning_lease(&corrupt.store, "lease").is_err());
+    assert!(
+        destroy_for_worktree_with(&corrupt.store, &corrupt.db, &corrupt.root, worktree.path(),)
+            .is_err()
+    );
+
+    let incompatible = Host::new();
+    let connection = rusqlite::Connection::open(&incompatible.store).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); \
+             INSERT INTO meta(key, value) VALUES ('schema_version', '999');",
+        )
+        .unwrap();
+    drop(connection);
+    assert!(environment_owning_lease(&incompatible.store, "lease").is_err());
+    assert!(
+        destroy_for_worktree_with(
+            &incompatible.store,
+            &incompatible.db,
+            &incompatible.root,
+            worktree.path(),
+        )
+        .is_err()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_environment_store_rejects_symlink_paths() {
+    let host = Host::new();
+    let _lifecycle = host.lifecycle();
+    let alias = host._dir.path().join("environments-alias.db");
+    std::os::unix::fs::symlink(&host.store, &alias).unwrap();
+    assert!(EnvironmentStore::open_read_only(&alias).is_err());
+}
+
+#[test]
 fn a_changed_profile_needs_reconfigure() {
     let host = Host::new();
     let text = r#"
@@ -576,4 +797,102 @@ destroy = "true"
         .unwrap();
     assert_eq!(reconfigured.profile_digest, changed.digest);
     lifecycle.down(&reconfigured.env_id, None).unwrap();
+}
+
+#[test]
+fn a_live_operation_fences_destroy_resume_until_its_lock_is_released() {
+    let host = Host::new();
+    let (repo, head) = repository(&host.markers, STACK);
+    let text = std::fs::read_to_string(repo.path().join(".aethyme/environments.toml")).unwrap();
+    let snapshot = snapshot(&text, "backend", repo.path(), Some(head));
+    let mut lifecycle = host.lifecycle();
+    let record = lifecycle
+        .up(&snapshot, repo.path(), Some(repo.path()), None, &options())
+        .unwrap();
+    lifecycle
+        .store
+        .transition(
+            &record.env_id,
+            record.phase_generation,
+            EnvironmentPhase::Destroying,
+            "fixture interrupted destroy",
+            "test",
+            None,
+        )
+        .unwrap();
+    let operation =
+        crate::file_lock::try_acquire_environment_operation_lock(&host.root, &record.env_id)
+            .unwrap();
+    let before = host.active_leases(&record.env_id);
+    let error = lifecycle.down(&record.env_id, None).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("lifecycle operation in progress"),
+        "{error}"
+    );
+    assert_eq!(host.active_leases(&record.env_id), before);
+    assert!(host.markers.join("db.provisioned").exists());
+    assert_eq!(
+        lifecycle.store.get(&record.env_id).unwrap().unwrap().phase,
+        EnvironmentPhase::Destroying
+    );
+    drop(operation);
+    assert_eq!(
+        lifecycle.down(&record.env_id, None).unwrap().phase,
+        EnvironmentPhase::Destroyed
+    );
+    assert_eq!(host.active_leases(&record.env_id), 0);
+    assert!(!host.markers.join("db.provisioned").exists());
+}
+
+#[test]
+fn destroy_refuses_a_replacement_repository_at_the_recorded_worktree_path() {
+    let host = Host::new();
+    let (repo, head) = repository(&host.markers, STACK);
+    let worktrees = tempfile::tempdir().unwrap();
+    let linked = worktrees.path().join("wt");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            &linked.to_string_lossy(),
+            &head,
+        ],
+    );
+    let text = std::fs::read_to_string(linked.join(".aethyme/environments.toml")).unwrap();
+    let snapshot = snapshot(&text, "backend", &linked, Some(head));
+    let mut lifecycle = host.lifecycle();
+    let record = lifecycle
+        .up(&snapshot, &linked, Some(repo.path()), None, &options())
+        .unwrap();
+    let leases = host.active_leases(&record.env_id);
+    let original = worktrees.path().join("original");
+    std::fs::rename(&linked, &original).unwrap();
+    std::fs::create_dir(&linked).unwrap();
+    git(&linked, &["init", "-q", "-b", "main"]);
+    std::fs::create_dir(linked.join("scripts")).unwrap();
+    std::fs::write(
+        linked.join("scripts/drop.sh"),
+        "touch \"$MARKERS/replacement-hook-ran\"\n",
+    )
+    .unwrap();
+    assert!(lifecycle.down(&record.env_id, None).is_err());
+    assert!(!host.markers.join("replacement-hook-ran").exists());
+    assert!(host.markers.join("db.provisioned").exists());
+    assert_eq!(host.active_leases(&record.env_id), leases);
+    assert_eq!(
+        lifecycle.store.get(&record.env_id).unwrap().unwrap().phase,
+        EnvironmentPhase::DestroyFailed
+    );
+    std::fs::remove_dir_all(&linked).unwrap();
+    std::fs::rename(original, &linked).unwrap();
+    assert_eq!(
+        lifecycle.down(&record.env_id, None).unwrap().phase,
+        EnvironmentPhase::Destroyed
+    );
+    assert_eq!(host.active_leases(&record.env_id), 0);
 }
