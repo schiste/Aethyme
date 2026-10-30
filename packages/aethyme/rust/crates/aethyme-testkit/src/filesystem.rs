@@ -38,8 +38,7 @@ pub fn write_non_utf8_file(
         Err(error) if macos_rejects_invalid_path(&error) => {
             for entry in fs::read_dir(directory)? {
                 if entry?.file_name().as_bytes() == filename {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
+                    return Err(io::Error::other(
                         "filesystem returned EILSEQ but created the invalid-byte entry",
                     ));
                 }
