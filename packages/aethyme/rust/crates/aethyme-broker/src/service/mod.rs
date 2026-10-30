@@ -6,6 +6,9 @@ pub mod jobs;
 pub mod protocol;
 
 #[cfg(unix)]
+pub(crate) mod client;
+
+#[cfg(unix)]
 pub(crate) mod job_runtime;
 
 #[cfg(unix)]

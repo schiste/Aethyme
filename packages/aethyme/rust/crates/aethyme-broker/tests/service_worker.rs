@@ -351,8 +351,7 @@ fn cli_json(fixture: &common::FixtureRepository, args: &[&str]) -> serde_json::V
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-#[test]
-fn public_cli_plans_gc_and_recovers_a_disconnected_submission_after_restart() {
+fn planning_fixture() -> common::FixtureRepository {
     let fixture = common::FixtureRepository::new();
     for args in [
         vec!["init", "-q", "-b", "main"],
@@ -379,6 +378,236 @@ fn public_cli_plans_gc_and_recovers_a_disconnected_submission_after_restart() {
     let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
     broker.start_worktree("service fixture", None).unwrap();
     drop(broker);
+    fixture
+}
+
+fn gc_plan_command(fixture: &common::FixtureRepository) -> Command {
+    let mut command = common::broker_cli_for_fixture(
+        env!("CARGO_BIN_EXE_broker-cli-shim"),
+        &["gc", "plan"],
+        fixture.path(),
+    );
+    isolated(&mut command, fixture);
+    command
+}
+
+#[test]
+fn opted_in_gc_plan_uses_the_verified_service_and_replays_the_same_json() {
+    let fixture = planning_fixture();
+    let runtime = runtime_directory();
+    let path = runtime.path().canonicalize().unwrap();
+    let _child = start(&fixture, &path);
+    let deadline = (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        + 120_000)
+        .to_string();
+    let invoke = || {
+        gc_plan_command(&fixture)
+            .args([
+                "--service-directory",
+                path.to_str().unwrap(),
+                "--request-key",
+                "gc-plan-cli",
+                "--deadline-ms",
+                &deadline,
+                "--json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let first = invoke();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert!(plan["schema_version"].is_number());
+    assert!(plan["digest"].is_string());
+    assert!(plan.get("result").is_none());
+    let lookup = cli_json(
+        &fixture,
+        &["lookup", path.to_str().unwrap(), "gc-plan-cli", "--json"],
+    );
+    let job_id = lookup["result"]["Ok"]["job"]["id"]
+        .as_i64()
+        .unwrap()
+        .to_string();
+    let stored = cli_json(
+        &fixture,
+        &["result", path.to_str().unwrap(), &job_id, "--json"],
+    );
+    assert_eq!(plan, stored);
+    let second = invoke();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&second.stdout).unwrap(),
+        plan
+    );
+    assert_eq!(
+        cli_json(
+            &fixture,
+            &["lookup", path.to_str().unwrap(), "gc-plan-cli", "--json"]
+        ),
+        lookup
+    );
+}
+
+#[test]
+fn opted_in_gc_plan_refuses_another_repository_without_accepting_work() {
+    let owner = planning_fixture();
+    let other = planning_fixture();
+    let runtime = runtime_directory();
+    let path = runtime.path().canonicalize().unwrap();
+    let _child = start(&owner, &path);
+    let deadline = (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        + 120_000)
+        .to_string();
+    let output = gc_plan_command(&other)
+        .args([
+            "--service-directory",
+            path.to_str().unwrap(),
+            "--request-key",
+            "wrong-repository-sentinel",
+            "--deadline-ms",
+            &deadline,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        transport::job_request(
+            &path,
+            wire::Method::Lookup {
+                idempotency_key: "wrong-repository-sentinel".into(),
+            }
+        )
+        .unwrap()
+        .result
+        .unwrap(),
+        wire::Reply::Lookup { job: None }
+    );
+    assert!(!output.status.success());
+    let failure: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        failure.to_string().contains("RepositoryMismatch"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn invalid_or_unavailable_shared_gc_never_initializes_a_local_broker() {
+    let fixture = common::FixtureRepository::new();
+    let runtime = runtime_directory();
+    let missing = runtime.path().canonicalize().unwrap().join("missing");
+    let deadline = (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        + 120_000)
+        .to_string();
+    for action in [
+        "apply",
+        "abandon",
+        "forget-abandoned",
+        "sweep",
+        "__continue-artifacts",
+        "storage",
+    ] {
+        for (flag, value) in [
+            ("--service-directory", missing.to_str().unwrap()),
+            ("--request-key", "key"),
+            ("--deadline-ms", deadline.as_str()),
+        ] {
+            let mut command = common::broker_cli_for_fixture(
+                env!("CARGO_BIN_EXE_broker-cli-shim"),
+                &["gc", action],
+                fixture.path(),
+            );
+            isolated(&mut command, &fixture);
+            let output = command.args([flag, value]).output().unwrap();
+            assert!(!output.status.success(), "gc {action} accepted {flag}");
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                error.contains("is not valid"),
+                "gc {action} {flag}: {error}"
+            );
+            assert!(!fixture.path().join(".aethyme/broker.db").exists());
+            assert!(!missing.exists());
+        }
+    }
+    // Unknown GC actions reach the handler rather than an action-specific flag rule.
+    let mut unknown = common::broker_cli_for_fixture(
+        env!("CARGO_BIN_EXE_broker-cli-shim"),
+        &["gc", "not-an-action"],
+        fixture.path(),
+    );
+    isolated(&mut unknown, &fixture);
+    let output = unknown.args(["--request-key", "key"]).output().unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("require gc plan"), "{error}");
+    assert!(!fixture.path().join(".aethyme/broker.db").exists());
+    assert!(!missing.exists());
+    for args in [
+        vec!["--service-directory", missing.to_str().unwrap(), "--json"],
+        vec!["--request-key", "key", "--deadline-ms", &deadline, "--json"],
+        vec![
+            "--service-directory",
+            missing.to_str().unwrap(),
+            "--request-key",
+            "key",
+            "--deadline-ms",
+            "0",
+            "--json",
+        ],
+        vec![
+            "--service-directory",
+            missing.to_str().unwrap(),
+            "--request-key",
+            "key",
+            "--deadline-ms",
+            &deadline,
+            "--json",
+        ],
+    ] {
+        let output = gc_plan_command(&fixture).args(args).output().unwrap();
+        assert!(!output.status.success());
+        assert!(!fixture.path().join(".aethyme/broker.db").exists());
+        assert!(!missing.exists());
+    }
+    let initialized = planning_fixture();
+    let output = gc_plan_command(&initialized)
+        .args([
+            "--service-directory",
+            missing.to_str().unwrap(),
+            "--request-key",
+            "unavailable",
+            "--deadline-ms",
+            &deadline,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "unavailable service must not fall back to a successful local plan"
+    );
+    assert!(!missing.exists());
+}
+
+#[test]
+fn public_cli_plans_gc_and_recovers_a_disconnected_submission_after_restart() {
+    let fixture = planning_fixture();
     let runtime = runtime_directory();
     let path: PathBuf = runtime.path().canonicalize().unwrap();
     let child = start(&fixture, &path);

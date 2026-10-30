@@ -306,8 +306,46 @@ The library's `transport::scoped_job_request` requires the 64-character lowercas
 key before connecting. Legacy `job_request` omits the new field entirely. Older
 v2 servers reject the unknown field or method; scoped callers must surface that
 refusal without downgrading to an unscoped request or executing locally. This
-phase supplies the identity contract for subsequent caller migration; existing
-GC commands retain their current direct path.
+phase supplies the identity contract for caller migration.
+
+### Opted-in GC plan client
+
+The dependent client phase adds an explicit form of the existing GC command:
+
+```sh
+aethyme broker gc plan --service-directory /absolute/private/runtime \
+  --request-key reviewed-plan-1 --deadline-ms <future-UTC-milliseconds> --json
+```
+
+All three options are required together and are accepted only by `gc plan`.
+The deadline must be in the future and at most 30 minutes away. Reuse the exact
+key, deadline, `--full-scan` and `--include-active-gate-cache` inputs for a retry;
+a key reused with different inputs is refused. The service's existing durable
+deduplication and outstanding-job joining remain authoritative.
+
+Before contacting the service, the client opens a read-only snapshot of the
+independently selected repository and reuses the worker's canonical owner and
+UUID validation. It computes the expected key locally, requests repository
+identity with that scope, compares every returned identity field, and pins
+submit, status and every result chunk to the same key. It never initializes a
+repository, runs normal broker startup maintenance, starts a service, downgrades
+an unsupported protocol or falls back to local planning.
+
+The command waits for the durable job and prints the plan using the existing
+human renderer or plain plan JSON, without the job envelope. JSON retains the
+original result fields, including fields unknown to the client's typed renderer.
+Each status must retain the accepted job ID, operation and deadline; chunks
+retain the existing byte, offset and total-size checks. An I/O call can take its
+existing two-second socket timeout; the client checks its monotonic wait deadline
+between calls. Timeout, disconnect, failed, expired, cancelled or interrupted
+work is reported without automatically cancelling, retrying or replacing a job.
+On an ambiguous submission, retain the reported key and deadline and use
+`service lookup` before creating new work. Other waiters may still own the job.
+
+Without the three options, GC planning retains its direct execution path. GC
+apply and automatic maintenance are not routed in this phase. Rollback is to
+stop choosing the explicit service form; no default or database migration is
+introduced.
 
 ### Durable ownership, restart and rollback
 

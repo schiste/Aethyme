@@ -77,6 +77,15 @@ scope retains the legacy wire format. `transport::scoped_job_request` pins every
 operation to the verified service owner before dispatch. Identity fields and
 mixed-version refusal behavior are specified in [broker-service.md](broker-service.md).
 
+The dependent GC client phase adds `broker gc plan --service-directory <directory>
+--request-key <key> --deadline-ms <utc-ms>`. These three options are required
+together and are refused by other actions. This explicit path verifies the
+locally selected repository, pins all requests, and returns the existing plan
+JSON or human output. With none of these options, planning retains its direct
+path. Ambiguous outcomes
+never trigger a local fallback or an automatic retry; recovery and deadline
+semantics are specified in [broker-service.md](broker-service.md).
+
 ## Automatic checkout maintenance (v0.8.44)
 
 `AutoCleanupReport` adds optional `sessions_retired` and

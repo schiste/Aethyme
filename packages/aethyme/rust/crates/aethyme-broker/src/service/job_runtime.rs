@@ -130,6 +130,17 @@ struct Context {
     worker_generation: String,
 }
 
+pub(crate) fn selected_repository_identity(path: &Path) -> io::Result<wire::RepositoryIdentity> {
+    let (repository, broker) = Repository::open(path)?;
+    drop(broker);
+    Ok(wire::RepositoryIdentity {
+        key: repository.key()?,
+        repository_uuid: repository.uuid,
+        root: repository.root,
+        common_dir: repository.common_dir,
+    })
+}
+
 type Planner =
     dyn Fn(&Repository, &JobOperation, Instant) -> Result<serde_json::Value, String> + Send + Sync;
 
