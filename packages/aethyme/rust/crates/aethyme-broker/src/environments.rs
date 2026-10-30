@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+pub mod activity;
 pub mod cli;
 pub mod compile;
 pub mod drivers;
@@ -25,14 +26,27 @@ pub mod engine;
 pub mod exec;
 pub mod identity;
 mod inspect;
+pub mod lifecycle;
 pub mod logs;
+mod operate;
+mod park;
+pub mod proxy;
+pub mod routes;
 pub mod spec;
 pub mod store;
 pub mod supervisor;
 pub mod validate;
 
 #[cfg(test)]
+mod activity_tests;
+#[cfg(test)]
 mod drivers_tests;
+#[cfg(test)]
+mod lifecycle_tests;
+#[cfg(test)]
+mod park_tests;
+#[cfg(test)]
+mod proxy_tests;
 #[cfg(test)]
 mod store_tests;
 #[cfg(test)]
