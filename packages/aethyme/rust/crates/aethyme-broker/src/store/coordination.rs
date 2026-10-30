@@ -1212,51 +1212,6 @@ impl BrokerStore {
         Ok(leases)
     }
 
-    /// Return only page candidate IDs that have an active explicit lease.
-    /// Each correlated existence check stops at its first match; the unique
-    /// lease index begins with `session_id`, and result rows are capped by the
-    /// candidate count.
-    pub(crate) fn explicit_lease_sessions_for_sessions_at(
-        &self,
-        session_ids: &[i64],
-        now: i64,
-    ) -> Result<BTreeSet<i64>, BrokerError> {
-        const SESSION_ID_CHUNK: usize = 900;
-
-        let mut session_ids = session_ids.to_vec();
-        session_ids.sort_unstable();
-        session_ids.dedup();
-        let mut lease_sessions = BTreeSet::new();
-        for session_ids in session_ids.chunks(SESSION_ID_CHUNK) {
-            let candidates = (1..=session_ids.len())
-                .map(|parameter| format!("(?{parameter})"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let now_parameter = session_ids.len() + 1;
-            let sql = format!(
-                "WITH candidates(session_id) AS (VALUES {candidates})
-                 SELECT candidate.session_id FROM candidates AS candidate
-                 WHERE EXISTS (
-                     SELECT 1 FROM leases
-                     WHERE session_id = candidate.session_id
-                       AND kind = 'explicit'
-                       AND released_at IS NULL
-                       AND (expires_at IS NULL OR expires_at > ?{now_parameter})
-                 )
-                 ORDER BY candidate.session_id"
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let parameters = session_ids.iter().copied().chain(std::iter::once(now));
-            let rows = stmt.query_map(rusqlite::params_from_iter(parameters), |row| {
-                row.get::<_, i64>(0)
-            })?;
-            for row in rows {
-                lease_sessions.insert(row?);
-            }
-        }
-        Ok(lease_sessions)
-    }
-
     /// Record exact-holder absence only if the binding is still current and
     /// no gone event has already been recorded for it. The immediate
     /// transaction makes the binding check and event append one conditional
@@ -1266,7 +1221,7 @@ impl BrokerStore {
         &mut self,
         session_id: i64,
         binding_event_id: i64,
-        payload_json: &str,
+        holder: &crate::session_holder::AgentProcess,
     ) -> Result<bool, BrokerError> {
         self.conn.busy_timeout(std::time::Duration::ZERO)?;
         let result = (|| {
@@ -1296,17 +1251,25 @@ impl BrokerStore {
                 )
                 .optional()?;
             if latest_gone.is_some_and(|(id, payload)| {
-                id > binding_event_id && payload.as_deref() == Some(payload_json)
+                id > binding_event_id
+                    && payload
+                        .as_deref()
+                        .and_then(|payload| {
+                            serde_json::from_str::<crate::session_holder::AgentProcess>(payload)
+                                .ok()
+                        })
+                        .is_some_and(|recorded| &recorded == holder)
             }) {
                 tx.commit()?;
                 return Ok(false);
             }
+            let payload_json = crate::events::session_holder_gone_payload(holder);
             insert_event(
                 &tx,
                 now_ms(),
                 "session.holder_gone",
                 Some(session_id),
-                Some(payload_json),
+                Some(&payload_json),
             )?;
             tx.commit()?;
             Ok(true)

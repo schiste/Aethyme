@@ -325,29 +325,6 @@ impl RecordedHolderProcessTable {
         }
     }
 
-    /// Return a process snapshot proven against this exact holder binding,
-    /// capturing one only when the caller's remaining budget allows it.
-    pub(crate) fn table_for_binding(
-        &mut self,
-        session_id: i64,
-        event_id: i64,
-        allow_snapshot: bool,
-    ) -> Option<&ProcessTable> {
-        self.get_or_snapshot(session_id, event_id, allow_snapshot)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn install_snapshot_for_test(
-        &mut self,
-        session_id: i64,
-        event_id: i64,
-        snapshot: Option<ProcessTable>,
-    ) {
-        self.prefetched_event_ids.insert(session_id, event_id);
-        self.observed_event_ids.insert(session_id, event_id);
-        self.snapshot = Some(snapshot);
-    }
-
     fn get_or_snapshot(
         &mut self,
         session_id: i64,
