@@ -2,6 +2,7 @@
 //! in bounded chunks; a status response never includes an unbounded plan.
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 use super::jobs::{JobCompletion, JobOperation, JobRecord, JobState};
 
@@ -13,12 +14,20 @@ pub const RESULT_CHUNK_BYTES: usize = 8192;
 pub struct Request {
     pub protocol_version: u32,
     pub request_id: u64,
+    /// Absent for legacy manual requests; explicit null is invalid.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "provided_repository_key"
+    )]
+    pub repository_key: Option<String>,
     pub method: Method,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Method {
+    Repository {},
     Submit {
         idempotency_key: String,
         operation: JobOperation,
@@ -50,6 +59,9 @@ pub struct Response {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reply {
+    Repository {
+        identity: RepositoryIdentity,
+    },
     Submitted {
         job: Status,
         joined: bool,
@@ -71,6 +83,22 @@ pub enum Reply {
         complete: bool,
         data: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryIdentity {
+    pub key: String,
+    pub repository_uuid: String,
+    pub root: PathBuf,
+    pub common_dir: PathBuf,
+}
+
+fn provided_repository_key<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +182,7 @@ pub struct Error {
 pub enum ErrorCode {
     UnsupportedProtocol,
     JobsDisabled,
+    RepositoryMismatch,
     InvalidRequest,
     IdempotencyConflict,
     NotFound,

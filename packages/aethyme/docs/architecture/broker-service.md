@@ -232,7 +232,9 @@ pruning in this phase.
 
 V1 health remains unchanged. V2 uses the same 65,536-byte JSON-line framing,
 absolute read deadlines and one request/response per connection. Every field
-shown is required; unknown or duplicate fields and unknown methods are refused.
+shown below is required, except the explicitly optional `repository_key`
+request field described later. Unknown or duplicate fields and unknown methods
+are refused.
 
 ```json
 {"protocol_version":2,"request_id":42,"method":{"kind":"submit","idempotency_key":"my-plan-1","operation":{"kind":"gc_plan","include_active_gate_cache":false,"full_scan":false},"deadline_ms":1793376000000}}
@@ -271,7 +273,7 @@ serialized plan. An empty final chunk is valid at the exact end. Invalid offsets
 are refused; a nonsuccessful job returns `not_ready`. Clients validate reply
 version, correlation, job ID, contiguous offsets and total size (one MiB).
 
-V2 error codes are `jobs_disabled`, `invalid_request`, `idempotency_conflict`,
+V2 error codes are `jobs_disabled`, `repository_mismatch`, `invalid_request`, `idempotency_conflict`,
 `not_found`, `not_ready`, `unavailable` and `internal`; diagnostic messages are
 not discriminators. A valid v2 method on plain health-only serve receives
 `jobs_disabled`. Unsupported versions still receive the v1
@@ -279,6 +281,33 @@ not discriminators. A valid v2 method on plain health-only serve receives
 Malformed v2 method bodies with a readable header receive `invalid_request`;
 malformed framing or headers close the connection without execution. Overload
 or a lost response never proves whether a submission committed.
+
+### Repository identity and scoped requests
+
+The dependent identity phase adds `service repository <directory> [--json]`.
+It sends `{"kind":"repository"}` and prints the v2 response envelope. A jobs
+service replies with `{"kind":"repository","identity":{"key":"<64 lowercase hex characters>","repository_uuid":"<UUID>","root":"<canonical repository path>","common_dir":"<canonical Git common directory>"}}`.
+All identity fields are required. A health-only service returns `jobs_disabled`.
+This observes the owner captured and verified at service startup; it does not
+initialize a repository or enqueue work. The opaque key excludes the worker
+generation and remains stable across restarts of the same repository. Clients
+must verify the returned owner against their independently selected repository
+before trusting its key; learning a key alone is not owner verification.
+
+A request may additionally carry a top-level `repository_key` string. Missing
+means the legacy manually selected endpoint behavior; explicit null and
+non-string values are invalid. The service compares a provided key with its
+immutable repository identity before dispatching any method, including submit,
+lookup, status, cancellation and result chunks. A mismatch returns
+`repository_mismatch` without accepting or changing a job. Pin every request:
+a handshake alone cannot exclude endpoint replacement between calls.
+
+The library's `transport::scoped_job_request` requires the 64-character lowercase
+key before connecting. Legacy `job_request` omits the new field entirely. Older
+v2 servers reject the unknown field or method; scoped callers must surface that
+refusal without downgrading to an unscoped request or executing locally. This
+phase supplies the identity contract for subsequent caller migration; existing
+GC commands retain their current direct path.
 
 ### Durable ownership, restart and rollback
 

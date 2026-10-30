@@ -70,6 +70,13 @@ semantics, bounds, restart fencing and ambiguous-response handling are specified
 in [broker-service.md](broker-service.md). These are
 manual operator surfaces; existing scripts and automatic jobs are not migrated.
 
+The dependent identity phase adds `service repository <directory> [--json]`,
+the v2 `repository` method/reply, an optional top-level `repository_key` request
+string and the `repository_mismatch` error. Explicit null is refused; absent
+scope retains the legacy wire format. `transport::scoped_job_request` pins every
+operation to the verified service owner before dispatch. Identity fields and
+mixed-version refusal behavior are specified in [broker-service.md](broker-service.md).
+
 ## Automatic checkout maintenance (v0.8.44)
 
 `AutoCleanupReport` adds optional `sessions_retired` and

@@ -279,6 +279,9 @@ fn join_worker(worker: JoinHandle<()>) {
 }
 
 fn respond(mut stream: UnixStream, jobs: Option<&JobRuntime>) -> io::Result<()> {
+    // Accepted sockets can inherit the nonblocking listener's mode on Unix.
+    // Each handler uses bounded blocking I/O, independently of the listener.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let bytes = read_bytes(&mut stream)?;
@@ -291,7 +294,9 @@ fn respond(mut stream: UnixStream, jobs: Option<&JobRuntime>) -> io::Result<()> 
     if header.protocol_version == job_protocol::VERSION {
         let result = match serde_json::from_slice::<job_protocol::Request>(&bytes) {
             Ok(request) => match jobs {
-                Some(jobs) => jobs.handle(&request.method),
+                Some(jobs) => {
+                    jobs.handle_scoped(&request.method, request.repository_key.as_deref())
+                }
                 None => Err(job_protocol::Error {
                     code: job_protocol::ErrorCode::JobsDisabled,
                     message: "job service is not enabled".into(),
@@ -349,10 +354,39 @@ pub fn job_request(
     directory: &Path,
     method: job_protocol::Method,
 ) -> io::Result<job_protocol::Response> {
+    send_job_request(directory, method, None)
+}
+
+/// Pin every request to a previously verified repository identity. An older
+/// server may refuse the new field; this client never downgrades or falls back.
+pub fn scoped_job_request(
+    directory: &Path,
+    repository_key: &str,
+    method: job_protocol::Method,
+) -> io::Result<job_protocol::Response> {
+    if repository_key.len() != 64
+        || !repository_key
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid repository identity key",
+        ));
+    }
+    send_job_request(directory, method, Some(repository_key.to_owned()))
+}
+
+fn send_job_request(
+    directory: &Path,
+    method: job_protocol::Method,
+    repository_key: Option<String>,
+) -> io::Result<job_protocol::Response> {
     let mut stream = connect(directory)?;
     let request = job_protocol::Request {
         protocol_version: job_protocol::VERSION,
         request_id: 1,
+        repository_key,
         method,
     };
     protocol::write_frame(&mut stream, &request)?;
@@ -413,4 +447,37 @@ fn read_bytes(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
         stream,
         deadline: Instant::now() + IO_TIMEOUT,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn nonblocking_client_is_reset_before_reading_its_frame() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let inspection = server.try_clone().unwrap();
+        let worker = thread::spawn(move || respond(server, None));
+        let flags = || {
+            // SAFETY: inspection owns this live descriptor; F_GETFL takes no pointer.
+            let flags = unsafe { libc::fcntl(inspection.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0);
+            flags
+        };
+        let deadline = Instant::now() + IO_TIMEOUT;
+        while flags() & libc::O_NONBLOCK != 0 && !worker.is_finished() && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Duplicates share the open-file description, so this observes the
+        // actual handler mode before the client sends any request bytes.
+        assert_eq!(flags() & libc::O_NONBLOCK, 0);
+        protocol::write_frame(&mut client, &Request::ping(91)).unwrap();
+        let response: Response = read_message(&mut client).unwrap();
+        worker.join().unwrap().unwrap();
+        assert_eq!(response.request_id, 91);
+        assert!(response.result.is_ok());
+    }
 }

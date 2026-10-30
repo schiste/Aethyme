@@ -30,6 +30,30 @@ fn runtime_directory() -> tempfile::TempDir {
 }
 
 #[test]
+fn repository_scope_preserves_legacy_frames_and_refuses_explicit_null() {
+    let legacy = serde_json::json!({"protocol_version": 2, "request_id": 1,
+        "method": {"kind": "lookup", "idempotency_key": "key"}});
+    let decoded: wire::Request = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(decoded.repository_key.is_none());
+    assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+    for invalid in [serde_json::Value::Null, serde_json::json!(42)] {
+        let mut scoped = legacy.clone();
+        scoped["repository_key"] = invalid;
+        assert!(serde_json::from_value::<wire::Request>(scoped).is_err());
+    }
+    assert!(serde_json::from_str::<wire::Request>(
+        r#"{"protocol_version":2,"request_id":1,"repository_key":"a","repository_key":"b","method":{"kind":"repository"}}"#
+    ).is_err());
+    let root = runtime_directory();
+    assert_eq!(
+        transport::scoped_job_request(root.path(), "invalid", wire::Method::Repository {})
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+}
+
+#[test]
 fn v2_nullable_fields_require_keys_and_accept_explicit_nulls() {
     let status = serde_json::json!({
         "id": 1,
@@ -138,10 +162,19 @@ fn health_only_service_refuses_jobs_and_strictly_decodes_v2_requests() {
         reply.result.unwrap_err().code,
         wire::ErrorCode::JobsDisabled
     );
+    assert_eq!(
+        transport::job_request(&path, wire::Method::Repository {})
+            .unwrap()
+            .result
+            .unwrap_err()
+            .code,
+        wire::ErrorCode::JobsDisabled
+    );
     for method in [
         r#"{"kind":"lookup","idempotency_key":"x","argv":[]}"#,
         r#"{"kind":"lookup","idempotency_key":"x","idempotency_key":"y"}"#,
         r#"{"kind":"apply","job_id":1}"#,
+        r#"{"kind":"repository","argv":[]}"#,
     ] {
         let mut stream = UnixStream::connect(path.join("broker-service.sock")).unwrap();
         stream
@@ -318,6 +351,30 @@ fn public_cli_plans_gc_and_recovers_a_disconnected_submission_after_restart() {
     let runtime = runtime_directory();
     let path: PathBuf = runtime.path().canonicalize().unwrap();
     let child = start(&fixture, &path);
+    let repository: wire::Response = serde_json::from_value(cli_json(
+        &fixture,
+        &["repository", path.to_str().unwrap(), "--json"],
+    ))
+    .unwrap();
+    let wire::Reply::Repository { identity } = repository.result.unwrap() else {
+        panic!("expected repository identity reply");
+    };
+    assert_eq!(identity.root, fixture.path().canonicalize().unwrap());
+    assert_eq!(
+        identity.common_dir,
+        fixture.path().join(".git").canonicalize().unwrap()
+    );
+    assert!(!identity.repository_uuid.is_empty());
+    assert_eq!(identity.key.len(), 64);
+    let mut wrong_key = identity.key.clone();
+    wrong_key.replace_range(
+        ..1,
+        if identity.key.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        },
+    );
     let deadline = i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -334,6 +391,47 @@ fn public_cli_plans_gc_and_recovers_a_disconnected_submission_after_restart() {
             full_scan: false,
         },
     };
+    // The real transport must reject the wrong repository before even a
+    // submit is accepted. Exercise every operation through the same fence.
+    let mut refusals = Vec::new();
+    for operation in [
+        method.clone(),
+        wire::Method::Repository {},
+        wire::Method::Lookup {
+            idempotency_key: "lost-reply".into(),
+        },
+        wire::Method::Status { job_id: 1 },
+        wire::Method::Cancel { job_id: 1 },
+        wire::Method::ResultChunk {
+            job_id: 1,
+            offset: 0,
+        },
+    ] {
+        refusals.push(
+            transport::scoped_job_request(&path, &wrong_key, operation)
+                .unwrap()
+                .result,
+        );
+    }
+    assert_eq!(
+        transport::scoped_job_request(
+            &path,
+            &identity.key,
+            wire::Method::Lookup {
+                idempotency_key: "lost-reply".into()
+            }
+        )
+        .unwrap()
+        .result
+        .unwrap(),
+        wire::Reply::Lookup { job: None }
+    );
+    for refusal in refusals {
+        assert_eq!(
+            refusal.unwrap_err().code,
+            wire::ErrorCode::RepositoryMismatch
+        );
+    }
     // Never consume the acknowledgement. Keep the peer open until lookup
     // proves durable acceptance: writing bytes alone does not prove acceptance,
     // and an already disconnected peer may be refused before frame dispatch.
@@ -343,6 +441,7 @@ fn public_cli_plans_gc_and_recovers_a_disconnected_submission_after_restart() {
         &wire::Request {
             protocol_version: wire::VERSION,
             request_id: 37,
+            repository_key: Some(identity.key.clone()),
             method: method.clone(),
         },
     )
@@ -408,6 +507,13 @@ fn public_cli_plans_gc_and_recovers_a_disconnected_submission_after_restart() {
     assert_eq!(retried["result"]["Ok"]["joined"], true);
     drop(child);
     let _restarted = start(&fixture, &path);
+    assert_eq!(
+        transport::scoped_job_request(&path, &identity.key, wire::Method::Repository {})
+            .unwrap()
+            .result
+            .unwrap(),
+        wire::Reply::Repository { identity }
+    );
     let lookup = cli_json(&fixture, &["lookup", path_text, "lost-reply", "--json"]);
     assert_eq!(lookup["result"]["Ok"]["job"]["id"], job_id);
     assert_eq!(lookup["result"]["Ok"]["job"]["state"], "succeeded");
