@@ -21,10 +21,14 @@
 //! - **Recorded** on both sides: a victim's park transition carries the
 //!   beneficiary as actor, its `preempted` note names the beneficiary and the
 //!   shortfall, and the beneficiary gets a note listing its victims and
-//!   whether the shortfall was met.
+//!   whether the shortfall was met. Every repository involved (each victim's
+//!   and the beneficiary's) also gets one `environment.preempted` broker
+//!   event, so a victim's owning session sees it in its own repository.
 //!
 //! Admission itself is unchanged; this runs before it.
 
+use std::collections::BTreeSet;
+use std::path::Path;
 use std::time::Duration;
 
 use serde_json::json;
@@ -35,6 +39,9 @@ use super::lifecycle::{Lifecycle, LifecycleError};
 use super::spec::Preempt;
 use super::store::{EnvironmentPhase, EnvironmentRecord};
 use crate::resources::HostLeaseState;
+
+/// The broker event kind a preemption appends to each repository involved.
+pub const PREEMPTED_EVENT: &str = "environment.preempted";
 
 /// How long a requester waits for another preempter of its pool.
 const POOL_LOCK_WAIT: Duration = Duration::from_secs(60);
@@ -133,6 +140,7 @@ impl Lifecycle {
         candidates.sort_by_key(|(priority, last, _)| (*priority, *last));
         let mut freed = 0u32;
         let mut parked = Vec::new();
+        let mut victims = Vec::new();
         for (_, _, record) in candidates {
             if freed >= shortfall {
                 break;
@@ -151,7 +159,11 @@ impl Lifecycle {
                     "pool": pool.name,
                 })),
             )?;
-            parked.push(record.env_id);
+            parked.push(record.env_id.clone());
+            victims.push(record);
+        }
+        if !victims.is_empty() {
+            self.mirror_preemption(requester, &pool.name, shortfall, &victims);
         }
         if !parked.is_empty() && self.store.get(&requester.env_id)?.is_some() {
             self.store.note(
@@ -167,6 +179,57 @@ impl Lifecycle {
             )?;
         }
         Ok(parked)
+    }
+
+    /// Append an [`PREEMPTED_EVENT`] to the broker events of every repository
+    /// involved (each victim's and the beneficiary's, once each), so a
+    /// victim's owning session learns from its own repository that it was
+    /// preempted and by whom. Best effort: the environments store already
+    /// holds the authoritative notes, so a repository whose broker database is
+    /// missing, or at another schema, is skipped with a warning rather than
+    /// failing a preemption that has already happened.
+    fn mirror_preemption(
+        &self,
+        requester: &CompiledEnvironment,
+        pool: &str,
+        shortfall: u32,
+        victims: &[EnvironmentRecord],
+    ) {
+        let beneficiary_root = self
+            .store
+            .get(&requester.env_id)
+            .ok()
+            .flatten()
+            .and_then(|record| record.main_root);
+        let mut roots: BTreeSet<String> =
+            victims.iter().filter_map(|v| v.main_root.clone()).collect();
+        roots.extend(beneficiary_root);
+        let payload = json!({
+            "beneficiary": requester.env_id,
+            "beneficiary_repository": requester.repository,
+            "victims": victims
+                .iter()
+                .map(|v| json!({ "env_id": v.env_id, "repository": v.repository, "units": v.snapshot.units }))
+                .collect::<Vec<_>>(),
+            "pool": pool,
+            "shortfall_units": shortfall,
+        })
+        .to_string();
+        for root in roots {
+            let recorded =
+                crate::BrokerStore::open_current_in_repo(Path::new(&root)).and_then(|store| {
+                    match store {
+                        Some(mut store) => store
+                            .append_event(PREEMPTED_EVENT, None, Some(&payload))
+                            .map(drop),
+                        None => Ok(()),
+                    }
+                });
+            crate::warn_unrecorded(
+                &format!("record the preemption in {root}'s broker events"),
+                recorded,
+            );
+        }
     }
 
     /// Park one victim under its own operation lock, re-checking there that
