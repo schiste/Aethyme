@@ -271,7 +271,8 @@ fn public_cli_plans_gc_and_recovers_a_disconnected_submission_after_restart() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    let broker = common::open_fixture_repository_broker(&fixture).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
+    broker.start_worktree("service fixture", None).unwrap();
     drop(broker);
     let runtime = runtime_directory();
     let path: PathBuf = runtime.path().canonicalize().unwrap();

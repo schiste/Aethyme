@@ -75,6 +75,17 @@ impl Repository {
             .binding_scope
             .clone()
             .ok_or_else(|| io::Error::other("repository identity unavailable"))?;
+        // Reuse the selected-owner snapshot validation, including canonical
+        // repository/common/database paths, rather than treating a UUID alone
+        // as proof that this database belongs to the selected repository.
+        let verified = crate::BrokerStore::open_snapshot_at_in_repo(
+            &scope.repository_root,
+            &scope.broker_db_path,
+        )
+        .map_err(other)?;
+        if verified.repository_worktree_binding().map_err(other)? != binding {
+            return Err(io::Error::other("repository binding changed during open"));
+        }
         let uuid = scope
             .repository_uuid
             .filter(|uuid| Some(uuid) == binding.repository_uuid.as_ref())
@@ -523,7 +534,9 @@ mod tests {
                 .with_worktree_root(root.join("worktrees"))
                 .with_host_operation_database(state.join("operations.db"))
                 .with_collaboration_state(state.join("collaboration"));
-            drop(Broker::open_with_options(&repository, options).unwrap());
+            let mut broker = Broker::open_with_options(&repository, options).unwrap();
+            broker.start_worktree("service fixture", None).unwrap();
+            drop(broker);
             Self {
                 _owner: owner,
                 root,
@@ -715,6 +728,40 @@ mod tests {
         );
         drop(store);
         drop(server);
+    }
+
+    #[test]
+    fn uuid_does_not_authorize_a_foreign_binding_or_incomplete_bootstrap() {
+        let fixture = Fixture::new();
+        let server = Server::bind(&fixture.runtime).unwrap();
+        let database = crate::broker_db_path(&fixture.repository).unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE repository_worktree_binding SET repository_key = 'foreign-owner'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let planner: Arc<Planner> = Arc::new(|_, _, _| panic!("refused startup must not plan"));
+        assert!(
+            JobRuntime::open_with_planner(&server, &fixture.repository, planner.clone()).is_err()
+        );
+        assert!(!fixture.runtime.join(DATABASE).exists());
+        assert!(!fixture.runtime.join(CONTEXT).exists());
+        drop(server);
+
+        let fresh = Fixture::new();
+        let server = Server::bind(&fresh.runtime).unwrap();
+        let orphan = fresh.runtime.join(DATABASE);
+        fs::write(&orphan, b"preserved incomplete bootstrap").unwrap();
+        fs::set_permissions(&orphan, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(JobRuntime::open_with_planner(&server, &fresh.repository, planner).is_err());
+        assert_eq!(
+            fs::read(&orphan).unwrap(),
+            b"preserved incomplete bootstrap"
+        );
+        assert!(!fresh.runtime.join(CONTEXT).exists());
     }
 
     #[test]
