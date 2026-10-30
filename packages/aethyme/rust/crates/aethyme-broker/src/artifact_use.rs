@@ -1334,11 +1334,11 @@ fn resolve_existing_locations(
         primary_identity,
         checkout_root,
         checkout_identity,
-        checkout_key,
         runtime_dir: runtime_dir.clone(),
         layout_lock_path: runtime_dir.join(format!("{checkout_key}.init.lock")),
         lock_path: runtime_dir.join(format!("{checkout_key}.lock")),
         marker_dir,
+        checkout_key,
     })
 }
 
