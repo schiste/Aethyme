@@ -867,9 +867,12 @@ fn proves_removed_historical_instance(
         && valid_generation(&old.root_generation_sha256)
         && valid_generation(&current.root_generation_sha256)
         && old.root_generation_sha256 != current.root_generation_sha256
-        && (old.worktree_inode != current.worktree_inode
-            || old.git_pointer_inode != current.git_pointer_inode
-            || old.git_admin_inode != current.git_admin_inode)
+        && ((old.worktree_device, old.worktree_inode)
+            != (current.worktree_device, current.worktree_inode)
+            || (old.git_pointer_device, old.git_pointer_inode)
+                != (current.git_pointer_device, current.git_pointer_inode)
+            || (old.git_admin_device, old.git_admin_inode)
+                != (current.git_admin_device, current.git_admin_inode))
 }
 
 struct AutoCleanupGroupScan {
@@ -3522,6 +3525,29 @@ mod tests {
             .unwrap()
             .spawned_worktree_instance_witness()
             .unwrap();
+        // Recycled filesystem identities must remain blocked. Do not make
+        // this regression depend on a filesystem's inode allocator.
+        let reused_all_identities = (old_witness.worktree_device, old_witness.worktree_inode)
+            == (fresh.worktree_device, fresh.worktree_inode)
+            && (
+                old_witness.git_pointer_device,
+                old_witness.git_pointer_inode,
+            ) == (fresh.git_pointer_device, fresh.git_pointer_inode)
+            && (old_witness.git_admin_device, old_witness.git_admin_inode)
+                == (fresh.git_admin_device, fresh.git_admin_inode);
+        broker.refresh_cleanup_cohort_aliases(None).unwrap();
+        let cohort = broker
+            .closed_artifact_checkout_cohort_for_session(current.id, &path, None)
+            .unwrap();
+        assert_eq!(cohort.is_some(), !reused_all_identities);
+        if let Some(cohort) = cohort {
+            assert_eq!(cohort.session_ids(), vec![current.id]);
+            assert!(cohort.matches_checkout_instance(&GitRepo::discover(&path).unwrap()));
+        }
+        // Declare a distinct old inode for the pure proof matrix, independent
+        // of the allocator behavior exercised by the integration fixture.
+        let mut old_witness = old_witness;
+        old_witness.worktree_inode = fresh.worktree_inode ^ 1;
         assert!(proves_removed_historical_instance(
             &alias,
             &current,
@@ -3529,13 +3555,6 @@ mod tests {
             &fresh,
             &handoff
         ));
-        broker.refresh_cleanup_cohort_aliases(None).unwrap();
-        let cohort = broker
-            .closed_artifact_checkout_cohort_for_session(current.id, &path, None)
-            .unwrap()
-            .expect("a proven removed older instance is historical, not a live alias");
-        assert_eq!(cohort.session_ids(), vec![current.id]);
-        assert!(cohort.matches_checkout_instance(&GitRepo::discover(&path).unwrap()));
 
         let rejects = |old: &Session,
                        new: &Session,
@@ -3587,6 +3606,11 @@ mod tests {
         bad.git_pointer_inode = fresh.git_pointer_inode;
         bad.worktree_inode = fresh.worktree_inode;
         rejects(&alias, &current, &bad, &fresh, &handoff);
+        bad.worktree_device = fresh.worktree_device + 1;
+        assert!(
+            proves_removed_historical_instance(&alias, &current, &bad, &fresh, &handoff),
+            "a device change is part of the instance identity even if inode numbers are reused"
+        );
     }
 
     #[cfg(unix)]
