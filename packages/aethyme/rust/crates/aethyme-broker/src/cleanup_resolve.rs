@@ -2879,12 +2879,44 @@ fn recovery_root_identities_for_plan_parts(
     Ok(roots.into_iter().collect())
 }
 
+/// Prefer an exact captured commit before walking unrelated delivery histories.
+/// This only orders witnesses: callers still ask Git to validate ancestry, even
+/// for identical strings, so malformed or missing objects remain refusals.
+pub(crate) fn delivery_targets_prefer_exact<'a>(
+    object_id: &'a str,
+    delivery_targets: &'a [String],
+) -> impl Iterator<Item = &'a String> {
+    delivery_targets
+        .iter()
+        .filter(move |target| target.as_str() == object_id)
+        .chain(
+            delivery_targets
+                .iter()
+                .filter(move |target| target.as_str() != object_id),
+        )
+}
+
+/// An exact bundled root needs no additional current-delivery ancestry proof.
+/// The caller still verifies the archive payload and advertised bundle roots.
+fn recovery_root_is_available(
+    reference: &str,
+    object_id: &str,
+    bundled_roots: &std::collections::BTreeSet<(String, String)>,
+    check_delivery: impl FnOnce() -> Result<bool, String>,
+) -> Result<bool, String> {
+    if bundled_roots.contains(&(reference.to_owned(), object_id.to_owned())) {
+        Ok(true)
+    } else {
+        check_delivery()
+    }
+}
+
 fn root_available_from_delivery(
     repository: &GitRepo,
     object_id: &str,
     delivery_targets: &[String],
 ) -> Result<bool, String> {
-    for target in delivery_targets {
+    for target in delivery_targets_prefer_exact(object_id, delivery_targets) {
         match repository.is_ancestor_checked(object_id, target) {
             Ok(true) => return Ok(true),
             Ok(false) => {}
@@ -2937,7 +2969,7 @@ fn root_available_from_delivery_during_plan(
     delivery_targets: &[String],
     ancestry_memo: &PlanAncestryMemo,
 ) -> Result<bool, String> {
-    for target in delivery_targets {
+    for target in delivery_targets_prefer_exact(object_id, delivery_targets) {
         match ancestry_memo.check(repository, object_id, target) {
             Ok(true) => return Ok(true),
             Ok(false) => {}
@@ -3012,7 +3044,7 @@ fn validate_delivery_prerequisites_remain_current(
     for prerequisite in captured_targets {
         let mut retained = false;
         let mut error_detail = None;
-        for target in current_targets {
+        for target in delivery_targets_prefer_exact(prerequisite, current_targets) {
             match repository.is_ancestor_checked(prerequisite, target) {
                 Ok(true) => {
                     retained = true;
@@ -3892,9 +3924,9 @@ fn verify_recovery_archive_payload_for_plan_until(
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
         for (reference, object_id) in &identities {
-            if !root_available_from_delivery(repository, object_id, &plan.delivery_targets)?
-                && !bundled_roots.contains(&(reference.clone(), object_id.clone()))
-            {
+            if !recovery_root_is_available(reference, object_id, &bundled_roots, || {
+                root_available_from_delivery(repository, object_id, &plan.delivery_targets)
+            })? {
                 return Err(format!(
                     "schema v6 archive neither currently delivers nor bundles required root {reference} at {object_id}"
                 ));
@@ -5626,12 +5658,6 @@ where
         if bytes != streamed_bytes {
             return Err(format!("{BUNDLE_FILE} byte count changed after streaming"));
         }
-        verify_recovery_bundle(
-            repository,
-            &path,
-            &recovery_bundle_roots(plan),
-            bundle_deadline,
-        )?;
         Some(RecoveryBundleIntegrity { bytes, sha256 })
     };
     let bundle = bundle_integrity.as_ref().map(|_| BUNDLE_FILE);
@@ -5860,6 +5886,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exact_bundled_root_skips_even_a_failing_delivery_probe() {
+        let roots = [("refs/heads/session".into(), "session-oid".into())].into();
+        assert_eq!(
+            recovery_root_is_available("refs/heads/session", "session-oid", &roots, || {
+                panic!("an exact bundled root must not need a delivery ancestry probe")
+            }),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn bundled_root_fast_path_requires_both_ref_and_object_identity() {
+        let roots = [("refs/heads/session".into(), "session-oid".into())].into();
+        for (reference, object_id) in [
+            ("refs/heads/other", "session-oid"),
+            ("refs/heads/session", "different-oid"),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            assert_eq!(
+                recovery_root_is_available(reference, object_id, &roots, || {
+                    calls.set(calls.get() + 1);
+                    Ok(false)
+                }),
+                Ok(false)
+            );
+            assert_eq!(calls.get(), 1);
+        }
+    }
+
+    #[test]
+    fn unbundled_root_preserves_delivery_success_and_probe_failure() {
+        let roots = std::collections::BTreeSet::new();
+        assert_eq!(
+            recovery_root_is_available("ref", "oid", &roots, || Ok(true)),
+            Ok(true)
+        );
+        assert_eq!(
+            recovery_root_is_available("ref", "oid", &roots, || Err("Git unavailable".into())),
+            Err("Git unavailable".into())
+        );
+    }
+
+    #[test]
     fn plan_ancestry_memo_caches_verdicts_but_retries_errors() {
         let memo = PlanAncestryMemo::default();
         let errors = std::cell::Cell::new(0);
@@ -5909,6 +5978,21 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", "printf 123456789"]);
         stream_recovery_command_stdout(&mut command, file, max_bytes, deadline)
+    }
+
+    #[cfg(unix)]
+    fn write_invalid_bundle(
+        _checkout: &GitRepo,
+        _delivery_targets: &[String],
+        _additional_roots: &[String],
+        _max_bytes: u64,
+        _deadline: Instant,
+        file: &mut std::fs::File,
+    ) -> Result<u64, String> {
+        const INVALID_BUNDLE: &[u8] = b"not a Git bundle\n";
+        file.write_all(INVALID_BUNDLE)
+            .map_err(|error| format!("cannot write invalid test bundle: {error}"))?;
+        Ok(INVALID_BUNDLE.len() as u64)
     }
 
     fn git(dir: &Path, args: &[&str]) {
@@ -6066,6 +6150,48 @@ mod tests {
             recovery_bundle_roots(&plan),
             vec![("refs/heads/recorded-session".into(), unique_branch_tip)]
         );
+    }
+
+    #[test]
+    fn exact_delivery_root_is_checked_before_unrelated_failed_history() {
+        let (_tmp, repo, plan) = staged_checkout();
+        let mut targets = vec!["missing-delivery-ref".to_owned(); 1_000];
+        targets.push(plan.head.clone());
+        assert!(root_available_from_delivery(&repo, &plan.head, &targets).unwrap());
+    }
+
+    #[test]
+    fn exact_delivery_root_is_preferred_by_plan_ancestry_memo() {
+        let (_tmp, repo, plan) = staged_checkout();
+        let targets = vec!["missing-delivery-ref".to_owned(), plan.head.clone()];
+        let memo = PlanAncestryMemo::for_delivery_targets(&targets, None);
+        assert!(
+            root_available_from_delivery_during_plan(&repo, &plan.head, &targets, &memo).unwrap()
+        );
+        let results = memo.results.borrow();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results.get(&(plan.head.clone(), plan.head.clone())),
+            Some(&true)
+        );
+    }
+
+    #[test]
+    fn exact_delivery_match_still_requires_a_real_git_object() {
+        let (_tmp, repo, _plan) = staged_checkout();
+        let absent = "0".repeat(40);
+        let targets = vec![absent.clone()];
+        assert!(root_available_from_delivery(&repo, &absent, &targets).is_err());
+        assert!(
+            root_available_from_delivery_during_plan(
+                &repo,
+                &absent,
+                &targets,
+                &PlanAncestryMemo::default(),
+            )
+            .is_err()
+        );
+        assert!(validate_delivery_prerequisites_remain_current(&repo, &targets, &targets).is_err());
     }
 
     /// A checkout with one staged edit and one untracked file, and the plan
@@ -6896,6 +7022,43 @@ mod tests {
                 object_id
             );
         }
+    }
+
+    #[test]
+    fn v6_bundled_root_still_requires_the_verified_bundle_to_hold_it() {
+        let (_owner, repository, _storage, mut broker, session, _worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("v6 bundled root membership remains required");
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        let outcome = broker
+            .cleanup_resolve_retirement_apply(session.id, &plan.digest, false)
+            .unwrap();
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        broker.owned_recovery_archive(&outcome.archive).unwrap();
+
+        let replacement = _owner.path().join("bundle-without-session-root");
+        let bundle = isolated_git_output(
+            &repository,
+            &["bundle", "create", replacement.to_str().unwrap(), "HEAD"],
+        );
+        assert!(bundle.status.success(), "{bundle:?}");
+        let bundle_path = outcome.archive.join(BUNDLE_FILE);
+        std::fs::copy(replacement, &bundle_path).unwrap();
+        let bytes = std::fs::read(&bundle_path).unwrap();
+        let manifest_path = outcome.archive.join(MANIFEST_FILE);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["schema_version"], serde_json::json!(6));
+        manifest["bundle_bytes"] = serde_json::json!(bytes.len() as u64);
+        manifest["bundle_sha256"] = serde_json::json!(sha256_hex(&bytes));
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = broker.owned_recovery_archive(&outcome.archive).unwrap_err();
+        assert!(error.contains("does not hold"), "{error}");
     }
 
     #[test]
@@ -8377,6 +8540,80 @@ mod tests {
         assert_eq!(std::fs::metadata(&partial_bundle).unwrap().len(), 8);
         assert_eq!(std::fs::read(partial_bundle).unwrap(), b"12345678");
         assert!(!entries[0].join(MANIFEST_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_bundle_fails_payload_verification_after_manifest_and_keeps_checkout() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = owner.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-qm", "initial"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let session = broker
+            .start_worktree("invalid bundle verification fixture", None)
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        let committed = worktree.join("pending.txt");
+        std::fs::write(&committed, "pending commit data\n").unwrap();
+        git(&worktree, &["add", "pending.txt"]);
+        git(&worktree, &["commit", "-qm", "pending"]);
+        broker.close(session.id).unwrap();
+
+        let plan = broker.cleanup_resolve_plan(session.id).unwrap();
+        assert!(!plan.unlanded_commits.is_empty());
+        let error = broker
+            .cleanup_resolve_apply_with_bundle_writer(
+                session.id,
+                &plan.digest,
+                || panic!("an invalid bundle must fail before archive publication"),
+                sync_archive_directory,
+                |_, _| {
+                    Some(crate::disk_headroom::DiskHeadroom {
+                        bytes: u64::MAX,
+                        inodes: None,
+                    })
+                },
+                RecoveryBundleWriter {
+                    max_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+                    write_to: write_invalid_bundle,
+                },
+            )
+            .unwrap_err();
+        let reason = match error {
+            BrokerOpError::RecoveryArchiveUnverified { reason, .. } => reason,
+            other => panic!("unexpected invalid-bundle refusal: {other}"),
+        };
+        assert!(reason.contains("Git bundle verify failed"), "{reason}");
+
+        let entries = std::fs::read_dir(&plan.archive_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1, "no final archive should be published");
+        let partial = &entries[0];
+        assert_eq!(
+            partial.extension().and_then(|extension| extension.to_str()),
+            Some("partial")
+        );
+        assert!(partial.join(MANIFEST_FILE).is_file());
+        assert_eq!(
+            std::fs::read(partial.join(BUNDLE_FILE)).unwrap(),
+            b"not a Git bundle\n"
+        );
+        assert!(worktree.is_dir(), "the checkout must remain in place");
+        assert_eq!(std::fs::read(&committed).unwrap(), b"pending commit data\n");
+        assert_eq!(
+            GitRepo::discover(&repository)
+                .unwrap()
+                .resolve_ref(&plan.branch_ref),
+            plan.branch_tip
+        );
     }
 
     #[cfg(unix)]
