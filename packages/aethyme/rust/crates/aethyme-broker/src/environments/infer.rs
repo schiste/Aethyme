@@ -274,3 +274,80 @@ pub fn infer_range(
         top_rule,
     })
 }
+
+/// A session's live environment ranked below the profile its changes now
+/// require (#1273), for `broker status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BelowMinimum {
+    pub session_id: i64,
+    pub env_id: String,
+    pub profile: String,
+    pub minimum: String,
+    /// `rule -> min_profile (paths)` for each rule that fired.
+    pub rules: Vec<String>,
+}
+
+/// Every live environment of `sessions` (id, worktree) ranked below the
+/// minimum its worktree's changes infer. Only sessions with a live
+/// environment are inferred, so the cost is one diff per such session.
+/// Best effort: a worktree whose environments file is missing or invalid, or
+/// whose diff cannot be read, is skipped (`env status` reports those).
+pub fn below_minimum(
+    store: &super::store::EnvironmentStore,
+    sessions: &[(i64, std::path::PathBuf)],
+) -> Vec<BelowMinimum> {
+    let Ok(records) = store.list(None) else {
+        return Vec::new();
+    };
+    let live: Vec<_> = records
+        .into_iter()
+        .filter(|r| r.phase.retains_worktree())
+        .filter(|r| matches!(r.owner, super::compile::EnvironmentOwner::Worktree { .. }))
+        .collect();
+    let mut found = Vec::new();
+    for (session_id, worktree) in sessions {
+        let fingerprint = crate::console::worktree_fingerprint(worktree);
+        let mine: Vec<_> = live
+            .iter()
+            .filter(|r| r.worktree_fingerprint == fingerprint)
+            .collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let Ok(Some(loaded)) = super::load_repository_file(worktree) else {
+            continue;
+        };
+        let Ok(file) = loaded.value else {
+            continue;
+        };
+        let Ok((_, changed)) = changed_paths(worktree) else {
+            continue;
+        };
+        let Ok(inference) = infer(&file, &changed) else {
+            continue;
+        };
+        // Each worktree is judged by its best environment: a cheaper one kept
+        // beside one that meets the minimum is not a problem to report.
+        let best = mine
+            .iter()
+            .filter_map(|r| profile_rank(&file, &r.profile).map(|rank| (rank, *r)))
+            .max_by_key(|(rank, _)| *rank);
+        let Some((rank, record)) = best else {
+            continue;
+        };
+        if rank < inference.rank {
+            found.push(BelowMinimum {
+                session_id: *session_id,
+                env_id: record.env_id.clone(),
+                profile: record.profile.clone(),
+                minimum: inference.minimum.clone(),
+                rules: inference
+                    .fired
+                    .iter()
+                    .map(|f| format!("{} -> {} ({})", f.rule, f.min_profile, f.paths.join(", ")))
+                    .collect(),
+            });
+        }
+    }
+    found
+}
