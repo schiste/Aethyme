@@ -733,6 +733,59 @@ pub(crate) struct ClosedArtifactCheckoutCohort {
     alias_refresh_generation: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClosedArtifactCheckoutCohortUnavailableReason {
+    IndexMissing,
+    IndexIncomplete,
+    DeadlineExceeded,
+    SessionChanged,
+    PathResolutionFailed,
+    PathNotUtf8,
+    CohortTruncated,
+    CohortMembershipChanged,
+    NonClosedAlias,
+    AliasResolutionFailed,
+    AliasOverlapOutsideCohort,
+    LiveAliasUnknown,
+    CheckoutMissing,
+    GitCheckoutUnavailable,
+    SpawnedWitnessMismatch,
+    SpawnedOwnerMissing,
+    IndexChanged,
+    WitnessChanged,
+}
+
+impl ClosedArtifactCheckoutCohortUnavailableReason {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::IndexMissing => "index_missing",
+            Self::IndexIncomplete => "index_incomplete",
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::SessionChanged => "session_changed",
+            Self::PathResolutionFailed => "path_resolution_failed",
+            Self::PathNotUtf8 => "path_not_utf8",
+            Self::CohortTruncated => "cohort_truncated",
+            Self::CohortMembershipChanged => "cohort_membership_changed",
+            Self::NonClosedAlias => "non_closed_alias",
+            Self::AliasResolutionFailed => "alias_resolution_failed",
+            Self::AliasOverlapOutsideCohort => "alias_overlap_outside_cohort",
+            Self::LiveAliasUnknown => "live_alias_unknown",
+            Self::CheckoutMissing => "checkout_missing",
+            Self::GitCheckoutUnavailable => "git_checkout_unavailable",
+            Self::SpawnedWitnessMismatch => "spawned_witness_mismatch",
+            Self::SpawnedOwnerMissing => "spawned_owner_missing",
+            Self::IndexChanged => "index_changed",
+            Self::WitnessChanged => "witness_changed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClosedArtifactCheckoutCohortResolution {
+    Available(ClosedArtifactCheckoutCohort),
+    Unavailable(ClosedArtifactCheckoutCohortUnavailableReason),
+}
+
 impl ClosedArtifactCheckoutCohort {
     pub(crate) fn owner_session_id(&self) -> i64 {
         self.owner_session_id
@@ -1540,11 +1593,34 @@ impl Broker {
         worktree: &Path,
         deadline: Option<Instant>,
     ) -> Result<Option<ClosedArtifactCheckoutCohort>, BrokerOpError> {
+        Ok(
+            match self.closed_artifact_checkout_cohort_for_session_detailed(
+                session_id, worktree, deadline,
+            )? {
+                ClosedArtifactCheckoutCohortResolution::Available(cohort) => Some(cohort),
+                ClosedArtifactCheckoutCohortResolution::Unavailable(_) => None,
+            },
+        )
+    }
+
+    /// Construct one complete cohort and retain the first failed proof as a
+    /// typed reason for bounded worker diagnostics. The apply-time snapshot
+    /// remains authoritative and detects any change since this lookup.
+    pub(crate) fn closed_artifact_checkout_cohort_for_session_detailed(
+        &mut self,
+        session_id: i64,
+        worktree: &Path,
+        deadline: Option<Instant>,
+    ) -> Result<ClosedArtifactCheckoutCohortResolution, BrokerOpError> {
+        use self::ClosedArtifactCheckoutCohortResolution::{Available, Unavailable};
+        use self::ClosedArtifactCheckoutCohortUnavailableReason as Reason;
+
+        let unavailable = Unavailable;
         let Some(mut index_state) = self
             .store()
             .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)?
         else {
-            return Ok(None);
+            return Ok(unavailable(Reason::IndexMissing));
         };
         // Successful removals and concurrent authority changes enqueue only
         // their affected rows. Drain those deltas in place; do not restart the
@@ -1554,40 +1630,52 @@ impl Broker {
             && index_state.pending_dirty_rows > 0
         {
             if deadline_expired(deadline) {
-                return Ok(None);
+                return Ok(unavailable(Reason::DeadlineExceeded));
             }
             let Some(next) = self.advance_cleanup_cohort_scan(deadline)? else {
-                return Ok(None);
+                return Ok(unavailable(if deadline_expired(deadline) {
+                    Reason::DeadlineExceeded
+                } else {
+                    Reason::IndexIncomplete
+                }));
             };
             index_state = next;
         }
-        if !index_state.complete || index_state.unresolved_rows != 0 || deadline_expired(deadline) {
-            return Ok(None);
+        if deadline_expired(deadline) {
+            return Ok(unavailable(Reason::DeadlineExceeded));
+        }
+        if !index_state.complete || index_state.unresolved_rows != 0 {
+            return Ok(unavailable(Reason::IndexIncomplete));
         }
         let witness_revision = self.store().cleanup_witness_revision()?;
         let selected = self.store().session(session_id)?;
         if !selected.status.is_closed() || selected.cleanup_state != SessionCleanupState::Closed {
-            return Ok(None);
+            return Ok(unavailable(Reason::SessionChanged));
         }
         let resolved = ResolvedWorktreePath::resolve(worktree);
-        if !resolved.resolution_errors.is_empty() || deadline_expired(deadline) {
-            return Ok(None);
+        if !resolved.resolution_errors.is_empty() {
+            return Ok(unavailable(Reason::PathResolutionFailed));
+        }
+        if deadline_expired(deadline) {
+            return Ok(unavailable(Reason::DeadlineExceeded));
         }
         let Some(canonical_path) = resolved.canonical_or_raw.to_str().map(str::to_owned) else {
-            return Ok(None);
+            return Ok(unavailable(Reason::PathNotUtf8));
         };
         let (sessions, group_truncated) = self.store().cleanup_cohort_sessions_for_path(
             crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
             &canonical_path,
         )?;
-        if group_truncated
-            || !sessions.iter().any(|session| session.id == session_id)
-            || sessions.is_empty()
-            || sessions.iter().any(|session| {
-                !session.status.is_closed() || session.cleanup_state != SessionCleanupState::Closed
-            })
-        {
-            return Ok(None);
+        if group_truncated {
+            return Ok(unavailable(Reason::CohortTruncated));
+        }
+        if sessions.is_empty() || !sessions.iter().any(|session| session.id == session_id) {
+            return Ok(unavailable(Reason::CohortMembershipChanged));
+        }
+        if sessions.iter().any(|session| {
+            !session.status.is_closed() || session.cleanup_state != SessionCleanupState::Closed
+        }) {
+            return Ok(unavailable(Reason::NonClosedAlias));
         }
         let group_ids = sessions
             .iter()
@@ -1598,12 +1686,12 @@ impl Broker {
         let mut candidate_ancestors = std::collections::BTreeSet::new();
         for path in [&resolved.raw, &resolved.canonical_or_raw] {
             let Some(text) = path.to_str() else {
-                return Ok(None);
+                return Ok(unavailable(Reason::PathNotUtf8));
             };
             candidate_paths.insert(text.to_owned());
             for ancestor in path.ancestors() {
                 let Some(text) = ancestor.to_str() else {
-                    return Ok(None);
+                    return Ok(unavailable(Reason::PathNotUtf8));
                 };
                 candidate_ancestors.insert(text.to_owned());
             }
@@ -1619,8 +1707,11 @@ impl Broker {
         )?;
         let resolved_candidate = resolved;
         for row in alias_rows {
-            if deadline_expired(deadline) || row.resolution_error.is_some() {
-                return Ok(None);
+            if deadline_expired(deadline) {
+                return Ok(unavailable(Reason::DeadlineExceeded));
+            }
+            if row.resolution_error.is_some() {
+                return Ok(unavailable(Reason::AliasResolutionFailed));
             }
             let row_path = ResolvedWorktreePath {
                 raw: PathBuf::from(&row.raw_path),
@@ -1632,8 +1723,11 @@ impl Broker {
                 LiveOverlapEvidence::Disjoint => {}
                 LiveOverlapEvidence::Overlap
                     if row.cleanup_state == "closed" && group_ids.contains(&row.session_id) => {}
-                LiveOverlapEvidence::Overlap | LiveOverlapEvidence::Unknown => {
-                    return Ok(None);
+                LiveOverlapEvidence::Overlap => {
+                    return Ok(unavailable(Reason::AliasOverlapOutsideCohort));
+                }
+                LiveOverlapEvidence::Unknown => {
+                    return Ok(unavailable(Reason::LiveAliasUnknown));
                 }
             }
         }
@@ -1643,24 +1737,37 @@ impl Broker {
             .any(|session| session.origin == SessionOrigin::Spawned)
         {
             if deadline_expired(deadline) {
-                return Ok(None);
+                return Ok(unavailable(Reason::DeadlineExceeded));
             }
             let checkout_result = {
                 let _git_deadline = deadline.map(crate::git::limit_git_until);
                 GitRepo::discover(&resolved_candidate.canonical_or_raw)
             };
-            let Ok(checkout) = checkout_result else {
-                return Ok(None);
+            let checkout = match checkout_result {
+                Ok(checkout) => checkout,
+                Err(_) => {
+                    let reason = if deadline_expired(deadline) {
+                        Reason::DeadlineExceeded
+                    } else if matches!(
+                        std::fs::symlink_metadata(&resolved_candidate.canonical_or_raw),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                    ) {
+                        Reason::CheckoutMissing
+                    } else {
+                        Reason::GitCheckoutUnavailable
+                    };
+                    return Ok(unavailable(reason));
+                }
             };
             if deadline_expired(deadline) {
-                return Ok(None);
+                return Ok(unavailable(Reason::DeadlineExceeded));
             }
             let witness = {
                 let _git_deadline = deadline.map(crate::git::limit_git_until);
                 checkout.spawned_worktree_instance_witness()
             };
             if deadline_expired(deadline) {
-                return Ok(None);
+                return Ok(unavailable(Reason::DeadlineExceeded));
             }
             witness
         } else {
@@ -1671,7 +1778,7 @@ impl Broker {
         let mut owner_session_id = None;
         for session in &sessions {
             if deadline_expired(deadline) {
-                return Ok(None);
+                return Ok(unavailable(Reason::DeadlineExceeded));
             }
             let spawned_instance_witness = if session.origin == SessionOrigin::Spawned {
                 self.store().spawned_worktree_instance_witness(session.id)?
@@ -1684,7 +1791,7 @@ impl Broker {
                         && current_witness.as_ref() == Some(witness)
                 })
             {
-                return Ok(None);
+                return Ok(unavailable(Reason::SpawnedWitnessMismatch));
             }
             if owner_session_id.is_none()
                 && session.origin == SessionOrigin::Spawned
@@ -1703,7 +1810,7 @@ impl Broker {
             });
         }
         let Some(owner_session_id) = owner_session_id else {
-            return Ok(None);
+            return Ok(unavailable(Reason::SpawnedOwnerMissing));
         };
         if self
             .store()
@@ -1713,11 +1820,13 @@ impl Broker {
                     || current.alias_refresh_generation != index_state.alias_refresh_generation
                     || !current.complete
             })
-            || self.store().cleanup_witness_revision()? != witness_revision
         {
-            return Ok(None);
+            return Ok(unavailable(Reason::IndexChanged));
         }
-        Ok(Some(ClosedArtifactCheckoutCohort {
+        if self.store().cleanup_witness_revision()? != witness_revision {
+            return Ok(unavailable(Reason::WitnessChanged));
+        }
+        Ok(Available(ClosedArtifactCheckoutCohort {
             worktree: resolved_candidate.canonical_or_raw,
             sessions: snapshots,
             owner_session_id,
