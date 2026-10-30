@@ -36,6 +36,19 @@ consumer. This file exists so that doesn't happen again.
    `scripts/eval/verify-playground.sh` against any deployed
    playground; it asserts a subset of the contracts below.
 
+## Opt-in broker service transport
+
+`aethyme broker advanced service serve <private-runtime-directory>` runs a
+foreground Unix health service. `service ping <private-runtime-directory>
+[--json]` emits the versioned JSON health response. No service is started
+implicitly and existing broker commands keep their direct execution path.
+Neither command opens or upgrades repository state. The directory is explicit,
+canonical and private to the current user. Frames are bounded to 65,536 bytes,
+versions and request IDs are checked, and unavailable endpoints fail visibly.
+The exact wire schema, permission rules and staged migration are documented in
+[broker-service.md](broker-service.md). Initial external consumers are manual
+operators; no installed hook, scheduled task or application is migrated yet.
+
 ## Automatic checkout maintenance (v0.8.44)
 
 `AutoCleanupReport` adds optional `sessions_retired` and

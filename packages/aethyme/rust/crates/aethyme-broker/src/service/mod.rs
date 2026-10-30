@@ -2,3 +2,9 @@
 //! until explicitly migrated; protocol availability never enables routing.
 
 pub mod protocol;
+
+#[cfg(unix)]
+pub mod transport;
+
+#[cfg(unix)]
+mod socket_io;
