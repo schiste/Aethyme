@@ -252,12 +252,48 @@ fn touch_debounced(root: &Path, env_id: &str) {
 }
 
 /// Wake `env_id` if it is parked. `Err` carries the reason for the 503.
+/// The environment's current phase, read fresh from the store.
+fn phase_of(config: &ProxyConfig, env_id: &str) -> Option<&'static str> {
+    let store = EnvironmentStore::open_read_only(&config.store_path).ok()??;
+    store.get(env_id).ok()?.map(|record| record.phase.as_str())
+}
+
+/// Hold the request while the environment is mid-transition: a redeploy
+/// swap in progress (#1217), or stopping, waking or starting. Returns the
+/// phase it settled in, or `None` if it did not settle in time.
+fn settle(config: &ProxyConfig, route: &Route) -> Option<&'static str> {
+    let deadline = Instant::now() + Duration::from_secs(route.wake_timeout_seconds);
+    loop {
+        let swapping = super::shared::swap_in_progress(&config.root, &route.env_id);
+        let phase = phase_of(config, &route.env_id)?;
+        if !swapping && !matches!(phase, "stopping" | "waking" | "starting" | "provisioning") {
+            return Some(phase);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn ensure_awake(config: &ProxyConfig, route: &Route) -> Result<(), String> {
-    if route.state == "active" {
+    let state = if route.state == "active"
+        && !super::shared::swap_in_progress(&config.root, &route.env_id)
+    {
+        "active"
+    } else {
+        settle(config, route).ok_or_else(|| {
+            format!(
+                "environment {} did not settle within {}s",
+                route.env_id, route.wake_timeout_seconds
+            )
+        })?
+    };
+    if state == "active" {
         return Ok(());
     }
-    if route.state != "parked" {
-        return Err(format!("environment {} is {}", route.env_id, route.state));
+    if state != "parked" {
+        return Err(format!("environment {} is {state}", route.env_id));
     }
     let lock = wake_lock(&route.env_id);
     let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());

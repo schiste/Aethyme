@@ -34,6 +34,7 @@ mod park;
 mod preempt;
 pub mod proxy;
 pub mod routes;
+pub mod shared;
 pub mod spec;
 pub mod store;
 pub mod supervisor;
@@ -53,6 +54,8 @@ mod park_tests;
 mod preempt_tests;
 #[cfg(test)]
 mod proxy_tests;
+#[cfg(test)]
+mod shared_tests;
 #[cfg(test)]
 mod store_tests;
 #[cfg(test)]

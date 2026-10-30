@@ -784,6 +784,64 @@ impl EnvironmentStore {
         Ok(())
     }
 
+    /// Swap the recorded snapshot and source of a stopped environment, keeping
+    /// its id, reservation, namespace and ports (#1217 hold-and-swap). Only a
+    /// `parked` or `planned` environment can be swapped: nothing may be
+    /// running from the old commands.
+    pub fn replace_snapshot(
+        &mut self,
+        env_id: &str,
+        snapshot: &CompiledEnvironment,
+        worktree_root: &Path,
+    ) -> Result<EnvironmentRecord, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record =
+            load_record(&tx, env_id)?.ok_or_else(|| StoreError::NotFound(env_id.into()))?;
+        if !matches!(
+            record.phase,
+            EnvironmentPhase::Parked | EnvironmentPhase::Planned
+        ) {
+            return Err(StoreError::IllegalTransition {
+                env_id: env_id.into(),
+                from: record.phase.as_str(),
+                to: "snapshot swap",
+            });
+        }
+        let snapshot_json = serde_json::to_string(snapshot)
+            .map_err(|error| StoreError::Corrupt(error.to_string()))?;
+        tx.execute(
+            "UPDATE environments SET profile_digest = ?2, spec_snapshot_json = ?3,
+               worktree_root = ?4, updated_at = ?5 WHERE env_id = ?1",
+            params![
+                env_id,
+                snapshot.digest,
+                snapshot_json,
+                worktree_root.to_string_lossy(),
+                now_ms()
+            ],
+        )?;
+        for component in &snapshot.components {
+            tx.execute(
+                "INSERT INTO environment_components (env_id, component, runtime, phase, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(env_id, component) DO NOTHING",
+                params![
+                    env_id,
+                    component.name,
+                    component.runtime.as_str(),
+                    ManagedServicePhase::Intent.as_str(),
+                    now_ms()
+                ],
+            )?;
+        }
+        let updated =
+            load_record(&tx, env_id)?.ok_or_else(|| StoreError::NotFound(env_id.into()))?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
     pub fn set_pin(
         &mut self,
         env_id: &str,

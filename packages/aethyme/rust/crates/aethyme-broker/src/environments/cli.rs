@@ -38,6 +38,7 @@ pub const TOUCH_SCHEMA: &str = "aethyme.env-touch/v1";
 pub const PIN_SCHEMA: &str = "aethyme.env-pin/v1";
 pub const ROUTES_SCHEMA: &str = "aethyme.env-routes/v1";
 pub const INFER_SCHEMA: &str = "aethyme.env-infer/v1";
+pub const SHARED_SCHEMA: &str = "aethyme.env-shared/v1";
 
 pub const USAGE: &str = "\
 aethyme env — declared runnable environments per worktree
@@ -113,6 +114,16 @@ Usage:
   aethyme env pin <id> --for <seconds> --reason <text> [--json]
       Keep the environment awake (up to 24 h). `env unpin <id>` ends it.
       Pins are recorded in the environment's history.
+  aethyme env shared up|redeploy|destroy <name> [--force] [--json]
+  aethyme env shared list [--json]
+      Host-scoped [[shared]] environments, owned by a ref instead of a
+      session: never removed by session or worktree cleanup. `up` creates or
+      wakes one at its ref's commit (an export, not a worktree); `redeploy`
+      moves it to the ref's current commit by hold-and-swap (park, swap,
+      wake: same ports and URLs, requests held meanwhile), rolling back if
+      the new revision fails; the supervisor does this when the ref moves,
+      at most every min_redeploy_interval_seconds (--force ignores it).
+      Profiles with uses_shared get AETHYME_SHARED_<NAME>_URL/_PORT_<C>.
   aethyme env routes [--json]
       The route table the built-in proxy serves on 127.0.0.1:4180
       (AETHYME_ENV_PROXY_PORT): <component>.<namespace>.<route_domain> and
@@ -155,6 +166,7 @@ pub(super) struct Options {
     pub(super) reason: Option<String>,
     pub(super) pin_seconds: Option<u64>,
     pub(super) range: Option<String>,
+    pub(super) force: bool,
 }
 
 pub fn run(args: &[String]) -> u8 {
@@ -200,6 +212,7 @@ pub fn run(args: &[String]) -> u8 {
         "unpin" => super::operate::run_unpin(&options),
         "routes" => super::operate::run_routes(&options),
         "infer" => super::operate::run_infer(&options),
+        "shared" => super::operate::run_shared(&options),
         other => Err(Failure {
             code: "unknown_subcommand",
             message: format!("unknown env subcommand {other:?}"),
@@ -246,6 +259,7 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
         reason: None,
         pin_seconds: None,
         range: None,
+        force: false,
     };
     let number = |value: Option<&String>, flag: &str| -> Result<usize, Failure> {
         value
@@ -277,6 +291,7 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
                         .ok_or_else(|| usage("--for needs seconds from 60 to 86400".into()))?,
                 )
             }
+            "--force" if command == "shared" => options.force = true,
             "--range" if command == "infer" => {
                 options.range = Some(
                     args.next()
@@ -316,8 +331,14 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
                             | "touch"
                             | "pin"
                             | "unpin"
+                            | "shared"
                     )
-                    && options.positional.len() < if command == "logs" { 2 } else { 1 } =>
+                    && options.positional.len()
+                        < if matches!(command, "logs" | "shared") {
+                            2
+                        } else {
+                            1
+                        } =>
             {
                 options.positional.push(positional.to_string())
             }
