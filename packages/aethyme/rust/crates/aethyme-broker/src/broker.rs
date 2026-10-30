@@ -3251,6 +3251,53 @@ fn push_auto_cleanup_advice(view: &mut StatusView, report: Option<crate::AutoCle
     });
 }
 
+/// `environment.below_inferred_minimum` (#1273): a live session's environment
+/// is ranked below the profile its changes now require, e.g. after it
+/// committed a migration, so an agent that never runs `env status` still sees
+/// it. Skipped, and listed in `deferred_checks`, once the status budget is
+/// spent: inference reads one diff per session with a live environment.
+fn push_environment_minimum_advice(view: &mut StatusView, deadline: std::time::Instant) {
+    if std::time::Instant::now() >= deadline {
+        if !view
+            .deferred_checks
+            .iter()
+            .any(|c| c == "environment_inference")
+        {
+            view.deferred_checks.push("environment_inference".into());
+        }
+        return;
+    }
+    let Ok(Some(store)) = crate::environments::store::EnvironmentStore::open_default_read_only()
+    else {
+        return;
+    };
+    let sessions: Vec<(i64, std::path::PathBuf)> = view
+        .agents
+        .iter()
+        .map(|agent| {
+            (
+                agent.session.id,
+                std::path::PathBuf::from(&agent.session.worktree_path),
+            )
+        })
+        .collect();
+    for below in crate::environments::infer::below_minimum(&store, &sessions) {
+        view.advice.push(StatusAdvice {
+            id: "environment.below_inferred_minimum",
+            severity: StatusAdviceSeverity::Warning,
+            reason: "the session's changes require a higher environment profile than the one running, so its tests may pass against too little",
+            summary: format!(
+                "session {}: environment {} runs profile {}, below the inferred minimum {}",
+                below.session_id, below.env_id, below.profile, below.minimum
+            ),
+            session_id: Some(below.session_id),
+            queue_entry_id: None,
+            evidence: below.rules,
+            commands: vec![format!("aethyme env up --profile {}", below.minimum)],
+        });
+    }
+}
+
 /// The `status` row for an integration branch this very call advanced (#352):
 /// the action the old `fast-forward-available` notice asked an operator for,
 /// reported as done.
