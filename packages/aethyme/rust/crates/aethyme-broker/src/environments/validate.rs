@@ -724,6 +724,9 @@ fn validate_component(
             );
         }
     };
+    if component.runtime != Runtime::Static {
+        forbid(c, "spa_fallback", component.spa_fallback);
+    }
     match component.runtime {
         Runtime::Process => {
             require(c, "start", component.start.is_some());
