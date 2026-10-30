@@ -150,7 +150,16 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
     let (base, changed) =
         super::infer::changed_paths(&workspace.worktree_root).map_err(environment_failure)?;
     let inference = super::infer::infer(file, &changed).map_err(environment_failure)?;
-    let profile = choose_profile(file, &inference, options)?;
+    let (mut lifecycle, warning) = open("env up", true)?;
+    let mut profile = choose_profile(file, &inference, options)?;
+    if options.profile.is_none()
+        && let Some(higher) =
+            existing_at_or_above(&lifecycle, &workspace.worktree_root, file, &inference)?
+    {
+        // Reuse a deliberately higher environment rather than start a second,
+        // cheaper one beside it.
+        profile = higher;
+    }
     let context = compile_context(&workspace, &checked.digest);
     let snapshot =
         compile(file, &checked.host, &profile, ENVIRONMENTS_FILE, &context).map_err(|error| {
@@ -161,9 +170,6 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
                 exit: exit_status::USAGE,
             }
         })?;
-    let (mut lifecycle, warning) = open("env up", true)?;
-    let replaced =
-        replace_below_minimum(&mut lifecycle, &workspace.worktree_root, file, &inference)?;
     let main_root = workspace.repo.main_root().ok();
     let record = lifecycle
         .up(
@@ -177,10 +183,26 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
             },
         )
         .map_err(lifecycle_failure)?;
+    // Only now that the new environment is up are cheaper ones retired.
+    let (replaced, kept) =
+        replace_below_minimum(&mut lifecycle, &workspace.worktree_root, file, &inference);
     let (mut value, mut text) = describe(&lifecycle, &record);
     if let Some(warning) = &warning {
         value["warning"] = json!(warning);
         text.push_str(&format!("warning: {warning}\n"));
+    }
+    if base.is_none() {
+        let warning = "no diff base (aethyme/integration or the remote default branch): only uncommitted changes were inferred";
+        value["inference_warning"] = json!(warning);
+        text.push_str(&format!("warning: {warning}\n"));
+    }
+    if !kept.is_empty() {
+        value["kept_below_minimum"] = json!(kept);
+        for (env_id, why) in &kept {
+            text.push_str(&format!(
+                "kept below-minimum environment {env_id}: {why}; `env down {env_id}` when done\n"
+            ));
+        }
     }
     if let Some(reason) = options.reason.as_deref()
         && super::infer::profile_rank(file, &record.profile).is_some_and(|r| r > inference.rank)
@@ -548,31 +570,82 @@ fn choose_profile(
     Ok(requested.to_string())
 }
 
-/// Destroy this worktree's live environments whose profile ranks below the
-/// inferred minimum, so a raised minimum replaces them instead of leaving a
-/// too-cheap environment running beside the new one.
-fn replace_below_minimum(
-    lifecycle: &mut Lifecycle,
+/// This worktree's environments that keep their worktree, with their rank.
+fn worktree_environments(
+    lifecycle: &Lifecycle,
     worktree: &std::path::Path,
     file: &super::spec::EnvironmentsFile,
-    inference: &super::infer::Inference,
-) -> Result<Vec<String>, Failure> {
+) -> Result<Vec<(super::store::EnvironmentRecord, u32)>, Failure> {
     let fingerprint = crate::console::worktree_fingerprint(worktree);
-    let below: Vec<String> = lifecycle
+    Ok(lifecycle
         .store
         .list(None)
         .map_err(|error| environment_failure(error.to_string()))?
         .into_iter()
         .filter(|r| r.worktree_fingerprint == fingerprint && r.phase.retains_worktree())
-        .filter(|r| {
-            super::infer::profile_rank(file, &r.profile).is_some_and(|rank| rank < inference.rank)
-        })
-        .map(|r| r.env_id)
-        .collect();
-    for env_id in &below {
-        lifecycle.down(env_id, None).map_err(lifecycle_failure)?;
+        .filter_map(|r| super::infer::profile_rank(file, &r.profile).map(|rank| (r, rank)))
+        .collect())
+}
+
+/// The highest profile among this worktree's environments, when it already
+/// meets the inferred minimum.
+fn existing_at_or_above(
+    lifecycle: &Lifecycle,
+    worktree: &std::path::Path,
+    file: &super::spec::EnvironmentsFile,
+    inference: &super::infer::Inference,
+) -> Result<Option<String>, Failure> {
+    Ok(worktree_environments(lifecycle, worktree, file)?
+        .into_iter()
+        .filter(|(_, rank)| *rank >= inference.rank)
+        .max_by_key(|(_, rank)| *rank)
+        .map(|(record, _)| record.profile))
+}
+
+/// Retire this worktree's environments ranked below the inferred minimum,
+/// once the new one is up. A pinned or busy environment, or one mid
+/// transition, is kept and reported, never torn down under its user.
+pub(super) fn replace_below_minimum(
+    lifecycle: &mut Lifecycle,
+    worktree: &std::path::Path,
+    file: &super::spec::EnvironmentsFile,
+    inference: &super::infer::Inference,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let below = match worktree_environments(lifecycle, worktree, file) {
+        Ok(found) => found,
+        Err(failure) => {
+            return (Vec::new(), vec![("*".into(), failure.message)]);
+        }
+    };
+    let now = super::activity::now_ms();
+    let mut replaced = Vec::new();
+    let mut kept = Vec::new();
+    for (record, rank) in below {
+        if rank >= inference.rank {
+            continue;
+        }
+        let why = if record.pinned_until.is_some_and(|until| until > now) {
+            Some("pinned".to_string())
+        } else if super::activity::has_live_busy_marker(&lifecycle.root, &record.env_id) {
+            Some("busy (`env exec` running)".to_string())
+        } else if !matches!(
+            record.phase,
+            super::store::EnvironmentPhase::Active | super::store::EnvironmentPhase::Parked
+        ) {
+            Some(format!("{} (mid transition)", record.phase.as_str()))
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            kept.push((record.env_id, why));
+            continue;
+        }
+        match lifecycle.down(&record.env_id, None) {
+            Ok(_) => replaced.push(record.env_id),
+            Err(error) => kept.push((record.env_id, error.to_string())),
+        }
     }
-    Ok(below)
+    (replaced, kept)
 }
 
 pub(super) fn run_infer(options: &Options) -> Result<Output, Failure> {

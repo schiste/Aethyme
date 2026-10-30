@@ -17,7 +17,6 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::Command;
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Serialize;
@@ -126,7 +125,8 @@ pub fn infer(file: &EnvironmentsFile, paths: &[String]) -> Result<Inference, Str
 }
 
 fn git(worktree: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    // The probed honest binary: a PATH wrapper may rewrite `git diff` (#176).
+    let output = crate::git::git_command()
         .args(args)
         .current_dir(worktree)
         .output()
@@ -141,19 +141,19 @@ fn git(worktree: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Paths from `git diff --name-status -M` output: both sides of a rename or
-/// copy, one path otherwise.
+/// Paths from `git diff --name-status -z -M` output: both sides of a rename
+/// or copy, one path otherwise. `-z` keeps paths verbatim; without it Git
+/// C-quotes non-ASCII and special characters and no rule would match them.
 fn name_status_paths(text: &str) -> Vec<String> {
     let mut paths = Vec::new();
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let mut fields = line.split('\t');
-        let status = fields.next().unwrap_or_default();
-        let rest: Vec<&str> = fields.collect();
-        if status.starts_with('R') || status.starts_with('C') {
-            paths.extend(rest.iter().map(|p| p.to_string()));
-        } else if let Some(path) = rest.first() {
-            paths.push(path.to_string());
-        }
+    let mut fields = text.split('\0').filter(|f| !f.is_empty());
+    while let Some(status) = fields.next() {
+        let count = if status.starts_with('R') || status.starts_with('C') {
+            2
+        } else {
+            1
+        };
+        paths.extend(fields.by_ref().take(count).map(str::to_string));
     }
     paths
 }
@@ -178,18 +178,33 @@ pub fn diff_base(worktree: &Path) -> Option<String> {
 }
 
 /// Every path the session changed: committed and uncommitted changes
-/// against the base (both sides of renames) plus untracked files.
+/// against the base (both sides of renames) plus untracked files. Without a
+/// base (no integration branch or remote default branch), only uncommitted
+/// changes against `HEAD` count; the caller warns, since committed changes
+/// are then invisible.
 pub fn changed_paths(worktree: &Path) -> Result<(Option<String>, Vec<String>), String> {
     let base = diff_base(worktree);
-    let mut paths = match &base {
-        Some(base) => name_status_paths(&git(worktree, &["diff", "--name-status", "-M", base])?),
+    let against = match &base {
+        Some(base) => Some(base.as_str()),
+        None => git(worktree, &["rev-parse", "--verify", "-q", "HEAD"])
+            .ok()
+            .map(|_| "HEAD"),
+    };
+    let mut paths = match against {
+        Some(against) => name_status_paths(&git(
+            worktree,
+            &["diff", "--name-status", "-z", "-M", against],
+        )?),
         None => Vec::new(),
     };
     paths.extend(
-        git(worktree, &["ls-files", "--others", "--exclude-standard"])?
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(str::to_string),
+        git(
+            worktree,
+            &["ls-files", "-z", "--others", "--exclude-standard"],
+        )?
+        .split('\0')
+        .filter(|l| !l.is_empty())
+        .map(str::to_string),
     );
     paths.sort();
     paths.dedup();
@@ -223,8 +238,13 @@ pub fn infer_range(
                 "--root",
                 "--no-commit-id",
                 "--name-status",
+                "-z",
                 "-r",
                 "-M",
+                // A merge is compared with its first parent, so it counts
+                // what it brought in rather than nothing.
+                "-m",
+                "--first-parent",
                 commit,
             ],
         )?);
