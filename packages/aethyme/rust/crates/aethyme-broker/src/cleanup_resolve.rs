@@ -6904,8 +6904,10 @@ mod tests {
         let plan = broker
             .cleanup_resolve_retirement_plan(session.id, false)
             .unwrap();
+        assert_eq!(plan.head, head);
+        assert_eq!(plan.branch_tip.as_deref(), Some(head.as_str()));
         assert!(plan.checkout_branch_ref.is_none());
-        assert_eq!(plan.checkout_branch_tip.as_deref(), Some(head.as_str()));
+        assert!(plan.checkout_branch_tip.is_none());
 
         let late_change = worktree.join("preserve.txt");
         let outcome = broker
@@ -6961,8 +6963,10 @@ mod tests {
         let plan = broker
             .cleanup_resolve_retirement_plan(session.id, false)
             .unwrap();
+        assert_eq!(plan.head, head);
+        assert_eq!(plan.branch_tip.as_deref(), Some(head.as_str()));
         assert!(plan.checkout_branch_ref.is_none());
-        assert_eq!(plan.checkout_branch_tip.as_deref(), Some(head.as_str()));
+        assert!(plan.checkout_branch_tip.is_none());
 
         let outcome = broker
             .cleanup_resolve_retirement_apply(session.id, &plan.digest, false)
