@@ -1212,6 +1212,121 @@ impl BrokerStore {
         Ok(leases)
     }
 
+    /// Return only page candidate IDs that have an active explicit lease.
+    /// Each correlated existence check stops at its first match; the unique
+    /// lease index begins with `session_id`, and result rows are capped by the
+    /// candidate count.
+    pub(crate) fn explicit_lease_sessions_for_sessions_at(
+        &self,
+        session_ids: &[i64],
+        now: i64,
+    ) -> Result<BTreeSet<i64>, BrokerError> {
+        const SESSION_ID_CHUNK: usize = 900;
+
+        let mut session_ids = session_ids.to_vec();
+        session_ids.sort_unstable();
+        session_ids.dedup();
+        let mut lease_sessions = BTreeSet::new();
+        for session_ids in session_ids.chunks(SESSION_ID_CHUNK) {
+            let candidates = (1..=session_ids.len())
+                .map(|parameter| format!("(?{parameter})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let now_parameter = session_ids.len() + 1;
+            let sql = format!(
+                "WITH candidates(session_id) AS (VALUES {candidates})
+                 SELECT candidate.session_id FROM candidates AS candidate
+                 WHERE EXISTS (
+                     SELECT 1 FROM leases
+                     WHERE session_id = candidate.session_id
+                       AND kind = 'explicit'
+                       AND released_at IS NULL
+                       AND (expires_at IS NULL OR expires_at > ?{now_parameter})
+                 )
+                 ORDER BY candidate.session_id"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let parameters = session_ids.iter().copied().chain(std::iter::once(now));
+            let rows = stmt.query_map(rusqlite::params_from_iter(parameters), |row| {
+                row.get::<_, i64>(0)
+            })?;
+            for row in rows {
+                lease_sessions.insert(row?);
+            }
+        }
+        Ok(lease_sessions)
+    }
+
+    /// Record exact-holder absence only if the binding is still current and
+    /// no gone event has already been recorded for it. The immediate
+    /// transaction makes the binding check and event append one conditional
+    /// write; zero busy timeout lets maintenance defer instead of waiting on
+    /// another writer.
+    pub(crate) fn record_session_holder_gone_for_binding(
+        &mut self,
+        session_id: i64,
+        binding_event_id: i64,
+        payload_json: &str,
+    ) -> Result<bool, BrokerError> {
+        self.conn.busy_timeout(std::time::Duration::ZERO)?;
+        let result = (|| {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current_binding: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM events
+                     WHERE session_id = ?1 AND kind = 'session.holder_bound'
+                     ORDER BY id DESC LIMIT 1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if current_binding != Some(binding_event_id) {
+                tx.commit()?;
+                return Ok(false);
+            }
+            let latest_gone: Option<(i64, Option<String>)> = tx
+                .query_row(
+                    "SELECT id, payload_json FROM events
+                     WHERE session_id = ?1 AND kind = 'session.holder_gone'
+                     ORDER BY id DESC LIMIT 1",
+                    [session_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if latest_gone.is_some_and(|(id, payload)| {
+                id > binding_event_id && payload.as_deref() == Some(payload_json)
+            }) {
+                tx.commit()?;
+                return Ok(false);
+            }
+            insert_event(
+                &tx,
+                now_ms(),
+                "session.holder_gone",
+                Some(session_id),
+                Some(payload_json),
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })();
+        let result = match result {
+            Err(BrokerError::Sqlite(error))
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                ) =>
+            {
+                Err(BrokerError::SessionRetirementDatabaseBusy)
+            }
+            result => result,
+        };
+        self.conn
+            .busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        result
+    }
+
     /// Resolve publication advisories only after their affected session no
     /// longer has a live lease overlapping the advisory paths. Acknowledged
     /// advisories still complete their lifecycle once the condition clears.
