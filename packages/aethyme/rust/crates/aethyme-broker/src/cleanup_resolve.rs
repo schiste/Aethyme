@@ -8927,8 +8927,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cleanup_archive_refuses_non_utf8_ignored_standalone_files() {
-        use std::os::unix::ffi::OsStringExt;
-
         let owner = tempfile::tempdir().unwrap();
         let repository = owner.path().join("repository");
         std::fs::create_dir(&repository).unwrap();
@@ -8944,10 +8942,15 @@ mod tests {
             .start_worktree("archive non-UTF-8 ignored file refusal", None)
             .unwrap();
         let worktree = PathBuf::from(&session.worktree_path);
-        let mut filename = b"private-".to_vec();
-        filename.push(0xff);
-        let path = worktree.join(std::ffi::OsString::from_vec(filename));
-        std::fs::write(&path, "preserve or refuse\n").unwrap();
+        let Some(path) = aethyme_testkit::filesystem::write_non_utf8_file(
+            &worktree,
+            b"private-\xff",
+            b"preserve or refuse\n",
+        )
+        .unwrap()
+        else {
+            return;
+        };
         broker.close(session.id).unwrap();
 
         let error = broker

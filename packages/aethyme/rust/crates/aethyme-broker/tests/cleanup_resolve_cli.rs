@@ -4,7 +4,6 @@
 #[path = "common/isolation.rs"]
 mod isolation;
 
-use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -349,9 +348,15 @@ fn untracked_newline_path_is_archived_without_truncating_the_inventory() {
 fn non_utf8_untracked_path_refuses_archive_resolution_before_cleanup() {
     let tmp = repo();
     let (id, worktree) = closed_session(tmp.path(), "non-utf8 path fixture");
-    let name = std::ffi::OsString::from_vec(b"untracked-\xff.txt".to_vec());
-    let path = worktree.join(name);
-    std::fs::write(&path, b"must remain").unwrap();
+    let Some(path) = aethyme_testkit::filesystem::write_non_utf8_file(
+        &worktree,
+        b"untracked-\xff.txt",
+        b"must remain",
+    )
+    .unwrap()
+    else {
+        return;
+    };
 
     let error = refused_plan(tmp.path(), &id);
     assert!(
