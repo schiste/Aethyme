@@ -4,14 +4,14 @@ use super::protocol::{self, Pong, Request, Response};
 use super::{job_protocol, job_runtime::JobRuntime};
 use crate::file_lock::ExclusiveFileLock;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CLIENTS: usize = 16;
@@ -279,11 +279,6 @@ fn join_worker(worker: JoinHandle<()>) {
 }
 
 fn respond(mut stream: UnixStream, jobs: Option<&JobRuntime>) -> io::Result<()> {
-    // Accepted sockets can inherit the nonblocking listener's mode on Unix.
-    // Each handler uses bounded blocking I/O, independently of the listener.
-    stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let bytes = read_bytes(&mut stream)?;
     #[derive(serde::Deserialize)]
     struct Header {
@@ -307,7 +302,7 @@ fn respond(mut stream: UnixStream, jobs: Option<&JobRuntime>) -> io::Result<()> 
                 message: "invalid job request".into(),
             }),
         };
-        return protocol::write_frame(
+        return write_message(
             &mut stream,
             &job_protocol::Response {
                 protocol_version: job_protocol::VERSION,
@@ -328,7 +323,7 @@ fn respond(mut stream: UnixStream, jobs: Option<&JobRuntime>) -> io::Result<()> 
         pid: std::process::id(),
         version: env!("CARGO_PKG_VERSION").into(),
     });
-    protocol::write_frame(
+    write_message(
         &mut stream,
         &Response {
             protocol_version: protocol::PROTOCOL_VERSION,
@@ -342,7 +337,7 @@ fn respond(mut stream: UnixStream, jobs: Option<&JobRuntime>) -> io::Result<()> 
 pub fn ping(directory: &Path) -> io::Result<Response> {
     let mut stream = connect(directory)?;
     let request = Request::ping(1);
-    protocol::write_frame(&mut stream, &request)?;
+    write_message(&mut stream, &request)?;
     let response: Response = read_message(&mut stream)?;
     response.validate_for(&request)?;
     Ok(response)
@@ -389,7 +384,7 @@ fn send_job_request(
         repository_key,
         method,
     };
-    protocol::write_frame(&mut stream, &request)?;
+    write_message(&mut stream, &request)?;
     let response: job_protocol::Response = read_message(&mut stream)?;
     if response.protocol_version != request.protocol_version
         || response.request_id != request.request_id
@@ -413,40 +408,27 @@ fn connect(directory: &Path) -> io::Result<UnixStream> {
         return Err(refusal("unsafe service socket"));
     }
     let stream = UnixStream::connect(&socket)?;
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
     Ok(stream)
 }
 
 // Resetting SO_RCVTIMEO after each successful byte would allow a trickling
 // client to retain a worker indefinitely. Bound the entire frame instead.
+fn write_message<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> io::Result<()> {
+    protocol::write_frame(
+        &mut super::socket_io::DeadlineIo::new(stream, IO_TIMEOUT)?,
+        value,
+    )
+}
+
 fn read_message<T: serde::de::DeserializeOwned>(stream: &mut UnixStream) -> io::Result<T> {
     serde_json::from_slice(&read_bytes(stream)?)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn read_bytes(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
-    struct DeadlineReader<'a> {
-        stream: &'a mut UnixStream,
-        deadline: Instant,
-    }
-    impl Read for DeadlineReader<'_> {
-        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-            let remaining = self
-                .deadline
-                .checked_duration_since(Instant::now())
-                .filter(|duration| !duration.is_zero())
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::TimedOut, "service frame deadline expired")
-                })?;
-            self.stream.set_read_timeout(Some(remaining))?;
-            self.stream.read(buffer)
-        }
-    }
-    protocol::read_frame_bytes(&mut BufReader::new(DeadlineReader {
-        stream,
-        deadline: Instant::now() + IO_TIMEOUT,
-    }))
+    protocol::read_frame_bytes(&mut BufReader::new(super::socket_io::DeadlineIo::new(
+        stream, IO_TIMEOUT,
+    )))
 }
 
 #[cfg(test)]
@@ -455,7 +437,7 @@ mod tests {
     use std::os::fd::AsRawFd;
 
     #[test]
-    fn nonblocking_client_is_reset_before_reading_its_frame() {
+    fn nonblocking_client_completes_a_bounded_frame() {
         let (server, mut client) = UnixStream::pair().unwrap();
         server.set_nonblocking(true).unwrap();
         let inspection = server.try_clone().unwrap();
@@ -466,17 +448,13 @@ mod tests {
             assert!(flags >= 0);
             flags
         };
-        let deadline = Instant::now() + IO_TIMEOUT;
-        while flags() & libc::O_NONBLOCK != 0 && !worker.is_finished() && Instant::now() < deadline
-        {
-            thread::sleep(Duration::from_millis(1));
-        }
-        // Duplicates share the open-file description, so this observes the
-        // actual handler mode before the client sends any request bytes.
-        assert_eq!(flags() & libc::O_NONBLOCK, 0);
+        // The deadline adapter keeps nonblocking I/O even on platforms where
+        // MSG_DONTWAIT alone does not bound a partially buffered send.
+        assert_ne!(flags() & libc::O_NONBLOCK, 0);
         protocol::write_frame(&mut client, &Request::ping(91)).unwrap();
         let response: Response = read_message(&mut client).unwrap();
         worker.join().unwrap().unwrap();
+        assert_ne!(flags() & libc::O_NONBLOCK, 0);
         assert_eq!(response.request_id, 91);
         assert!(response.result.is_ok());
     }
