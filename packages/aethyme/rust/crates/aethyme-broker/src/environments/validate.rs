@@ -928,6 +928,16 @@ fn validate_component(
             );
         }
     }
+    if component.build_output.is_some() && component.build.is_none() {
+        c.push(
+            "field_not_supported",
+            p,
+            n,
+            Some("build_output"),
+            "build_output without build",
+            "set build or remove build_output",
+        );
+    }
     if !component.cache_inputs.is_empty() && component.build.is_none() {
         c.push(
             "field_not_supported",

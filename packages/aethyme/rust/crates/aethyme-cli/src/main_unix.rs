@@ -706,6 +706,7 @@ Environments (declared in .aethyme/environments.toml):
   env exec <id> -- <cmd>      run a command against the environment; never
                               parked while it runs (env touch|pin|unpin)
   env infer [--range R]       minimum profile these changes need (path rules)
+  env cache list|prune        content-addressed builds and database templates
   env calibrate               propose units and pool limits from measured
                               footprints (a diff; never written)
   env shared up|redeploy|destroy|list

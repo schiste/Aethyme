@@ -861,6 +861,52 @@ pub(super) fn run_calibrate(options: &Options) -> Result<Output, Failure> {
     ))
 }
 
+pub(super) fn run_cache(options: &Options) -> Result<Output, Failure> {
+    let (mut lifecycle, _) = open("env cache", false)?;
+    match options.positional.first().map(String::as_str) {
+        Some("list") | None => {
+            let entries = lifecycle.cache_entries();
+            let mut text = String::new();
+            for entry in &entries {
+                text.push_str(&format!(
+                    "  {:<8} {:<16} {} {:>10} bytes{}\n",
+                    entry.kind,
+                    entry.component,
+                    entry.digest,
+                    entry.bytes,
+                    if entry.in_use { "  (in use)" } else { "" }
+                ));
+            }
+            if entries.is_empty() {
+                text.push_str("cache is empty\n");
+            }
+            Ok((
+                json!({ "schema": super::cli::CACHE_SCHEMA, "entries": entries }),
+                text,
+                exit_status::SUCCESS,
+            ))
+        }
+        Some("prune") => {
+            let report = lifecycle.prune_cache(options.all);
+            let mut text = format!("evicted {} entr(ies)\n", report.evicted.len());
+            for (path, reason) in &report.kept {
+                text.push_str(&format!("  kept {}: {reason}\n", path.display()));
+            }
+            Ok((
+                json!({ "schema": super::cli::CACHE_SCHEMA, "prune": report }),
+                text,
+                exit_status::SUCCESS,
+            ))
+        }
+        Some(other) => Err(Failure {
+            code: "usage",
+            message: format!("unknown env cache action {other:?}"),
+            next_action: "use `env cache list` or `env cache prune [--all]`".into(),
+            exit: exit_status::USAGE,
+        }),
+    }
+}
+
 pub(super) fn run_sweep(_: &Options) -> Result<Output, Failure> {
     let (mut lifecycle, _) = open("env sweep", false)?;
     lifecycle.renew_leases().map_err(lifecycle_failure)?;

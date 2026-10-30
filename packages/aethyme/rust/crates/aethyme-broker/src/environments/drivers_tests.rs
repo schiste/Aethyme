@@ -58,6 +58,7 @@ impl Harness {
             worktree: worktree.path().to_path_buf(),
             ports: BTreeMap::new(),
             receipts: BTreeMap::new(),
+            template_ids: BTreeMap::new(),
         };
         Self {
             worktree,

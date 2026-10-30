@@ -368,6 +368,7 @@ impl Lifecycle {
         // receipt is replayed with an incremented attempt; hooks must be
         // idempotent and can see the replay.
         let mut provisioned: Vec<String> = Vec::new();
+        let mut cache_uses: Vec<PathBuf> = Vec::new();
         let mut receipts = bindings.receipts.clone();
         for component in &snapshot.components {
             let previous = self
@@ -405,18 +406,34 @@ impl Lifecycle {
                 None,
             )?;
             let attempt = if replay { 2 } else { 1 };
-            let current = Bindings {
+            let mut current = Bindings {
                 receipts: receipts.clone(),
                 ..bindings.clone()
             };
-            let ctx = self.context(&snapshot, component, &current, attempt);
             let driver = driver_for(component.runtime);
-            let outcome = (|| -> Result<Option<Value>, DriverError> {
-                if let Some(build) = &component.commands.build {
-                    ctx.hook("build", build)?;
+            // Template first (its id reaches provision), then the build from
+            // the cache when its inputs are unchanged (#1219).
+            let template = {
+                let ctx = self.context(&snapshot, component, &current, attempt);
+                self.ensure_template(&ctx)
+            };
+            let outcome = match template {
+                Err(error) => Err(error),
+                Ok(template) => {
+                    if let Some((id, marker)) = template {
+                        current.template_ids.insert(component.name.clone(), id);
+                        cache_uses.push(marker);
+                    }
+                    let ctx = self.context(&snapshot, component, &current, attempt);
+                    match self.cached_build(&ctx) {
+                        Err(error) => Err(error),
+                        Ok(entry) => {
+                            cache_uses.extend(entry);
+                            driver.provision(&ctx)
+                        }
+                    }
                 }
-                driver.provision(&ctx)
-            })();
+            };
             match outcome {
                 Ok(receipt) => {
                     if let Some(receipt) = &receipt {
@@ -444,6 +461,7 @@ impl Lifecycle {
             }
         }
 
+        self.record_cache_uses(&env_id, cache_uses);
         let record = self
             .store
             .get(&env_id)?
