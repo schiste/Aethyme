@@ -126,13 +126,16 @@ fn up_options() -> UpOptions {
     }
 }
 
-// Tests have separate host databases, so the coordinator cannot keep
-// parallel tests off each other's ports; each test file uses its own range.
-const ONE_UNIT: &str = r#"
+/// One 1-unit environment with a listening component, on its own port
+/// range. Tests have separate host databases, so the coordinator cannot keep
+/// parallel tests off each other's ports: every test gets its own range.
+fn one_unit(port_start: u16) -> String {
+    format!(
+        r#"
 schema = 1
 [ports]
-start = 43300
-end = 43399
+start = {port_start}
+end = {end}
 [pools.envs]
 limit = 2
 [[profiles]]
@@ -143,8 +146,11 @@ name = "api"
 runtime = "process"
 listen = true
 start = "exec sleep 300"
-health = { command = "true", timeout_seconds = 5, interval_ms = 50 }
-"#;
+health = {{ command = "true", timeout_seconds = 5, interval_ms = 50 }}
+"#,
+        end = port_start + 19
+    )
+}
 
 fn process_identity(lifecycle: &Lifecycle, env_id: &str) -> Option<ComponentIdentity> {
     lifecycle
@@ -169,9 +175,9 @@ fn parking_returns_units_so_a_third_environment_fits() {
         tempfile::tempdir().unwrap(),
     );
     let (a, b, c) = (
-        snapshot(ONE_UNIT, a_dir.path()),
-        snapshot(ONE_UNIT, b_dir.path()),
-        snapshot(ONE_UNIT, c_dir.path()),
+        snapshot(&one_unit(43300), a_dir.path()),
+        snapshot(&one_unit(43300), b_dir.path()),
+        snapshot(&one_unit(43300), c_dir.path()),
     );
     let mut lifecycle = host.lifecycle();
     let a_up = lifecycle
@@ -432,7 +438,7 @@ health = {{ command = 'test ! -f "$MARKERS/orphan-on-wake" || false', timeout_se
 fn a_port_taken_while_parked_fails_the_wake_by_name() {
     let host = Host::new();
     let worktree = tempfile::tempdir().unwrap();
-    let snapshot = snapshot(ONE_UNIT, worktree.path());
+    let snapshot = snapshot(&one_unit(43320), worktree.path());
     let mut lifecycle = host.lifecycle();
     lifecycle
         .up(&snapshot, worktree.path(), None, None, &up_options())
@@ -481,7 +487,7 @@ fn a_port_taken_while_parked_fails_the_wake_by_name() {
 fn up_on_a_parked_environment_wakes_it_and_park_is_idempotent() {
     let host = Host::new();
     let worktree = tempfile::tempdir().unwrap();
-    let snapshot = snapshot(ONE_UNIT, worktree.path());
+    let snapshot = snapshot(&one_unit(43340), worktree.path());
     let mut lifecycle = host.lifecycle();
     lifecycle
         .up(&snapshot, worktree.path(), None, None, &up_options())
