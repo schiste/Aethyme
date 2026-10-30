@@ -700,8 +700,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   flag allowlist through to the handler. A handler alone may not describe the
   accepted public spelling. Exercise the emitted command through the real CLI
   entrypoint and run the deprecated-spelling caller ratchet before publication.
-- When adding action-specific CLI flags, enumerate every valid action from the
-  dispatcher and verify each has an explicit allowlist. A missing leaf can
+- When adding action-specific CLI flags, resolve public aliases, enumerate every
+  valid action from the dispatcher and verify each has an explicit allowlist. A missing leaf can
   inherit a union of sibling flags. Test refusal through the public CLI before
   state initialization; test unknown actions separately from recognized leaves.
 - Before changing a default CLI display, find existing consumer assertions
