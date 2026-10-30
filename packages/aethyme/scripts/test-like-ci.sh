@@ -98,6 +98,20 @@ for arg in "${extra[@]+"${extra[@]}"}"; do
 done
 
 
+# Rust and tempfile helpers compare paths literally. Normalize the effective
+# inherited temp root so symlinked aliases (for example /var vs /private/var)
+# agree with filesystem canonicalization on macOS.
+effective_tmpdir="${TMPDIR:-/tmp}"
+if [ ! -d "$effective_tmpdir" ]; then
+    echo "error: TMPDIR must name an existing directory" >&2
+    exit 2
+fi
+if ! canonical_tmpdir="$(CDPATH= cd -P -- "$effective_tmpdir" 2>/dev/null && pwd -P)"; then
+    echo "error: TMPDIR could not be resolved to a canonical directory" >&2
+    exit 2
+fi
+export TMPDIR="$canonical_tmpdir"
+
 root="$(git rev-parse --show-toplevel)"
 rust="$root/packages/aethyme/rust"
 command -v cargo-nextest >/dev/null 2>&1 || {

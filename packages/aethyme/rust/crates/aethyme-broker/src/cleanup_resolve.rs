@@ -34,6 +34,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::BrokerError;
 use crate::git::GitRepo;
+use crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS;
 use crate::types::SessionOrigin;
 use crate::{Broker, BrokerOpError, CleanupDisposition};
 
@@ -49,7 +50,6 @@ const RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION: u32 = 2;
 const PINNED_RETIREMENT_ARCHIVE_RECORD_SCHEMA_VERSION: u32 = 3;
 const RETIREMENT_ARCHIVE_RECORD_FILE: &str = "retirement.json";
 const MAX_RETIREMENT_ARCHIVE_RECORD_BYTES: u64 = 64 * 1024;
-const MIN_RECOVERY_ARCHIVE_RETENTION_MS: u64 = 15 * 24 * 60 * 60 * 1_000;
 const AUTO_COMPACTION_STAGING_RESERVE: Duration = Duration::from_secs(10);
 const MAX_RECOVERY_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_RECOVERY_BUNDLE_STDERR_BYTES: usize = 64 * 1024;
@@ -8419,12 +8419,9 @@ mod tests {
             .unwrap();
 
         assert!(!outcome.worktree_removed);
-        assert!(
-            outcome
-                .cleanup_error
-                .as_deref()
-                .is_some_and(|error| { error.contains("archive changed before worktree removal") })
-        );
+        assert!(outcome.cleanup_error.as_deref().is_some_and(|error| {
+            error.contains("archive could not be reverified before worktree removal")
+        }));
         assert!(worktree.is_dir());
         assert_eq!(
             std::fs::read(worktree.join("private.txt")).unwrap(),
@@ -8476,12 +8473,9 @@ mod tests {
             .unwrap();
 
         assert!(!outcome.worktree_removed);
-        assert!(
-            outcome
-                .cleanup_error
-                .as_deref()
-                .is_some_and(|error| error.contains("archive changed before worktree removal"))
-        );
+        assert!(outcome.cleanup_error.as_deref().is_some_and(|error| {
+            error.contains("archive could not be reverified before worktree removal")
+        }));
         assert!(worktree.is_dir());
         assert_eq!(
             std::fs::metadata(protected).unwrap().permissions().mode() & 0o7777,
@@ -8927,8 +8921,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cleanup_archive_refuses_non_utf8_ignored_standalone_files() {
-        use std::os::unix::ffi::OsStringExt;
-
         let owner = tempfile::tempdir().unwrap();
         let repository = owner.path().join("repository");
         std::fs::create_dir(&repository).unwrap();
@@ -8944,10 +8936,14 @@ mod tests {
             .start_worktree("archive non-UTF-8 ignored file refusal", None)
             .unwrap();
         let worktree = PathBuf::from(&session.worktree_path);
-        let mut filename = b"private-".to_vec();
-        filename.push(0xff);
-        let path = worktree.join(std::ffi::OsString::from_vec(filename));
-        std::fs::write(&path, "preserve or refuse\n").unwrap();
+        let Some(path) = aethyme_testkit::filesystem::write_non_utf8_file(
+            &worktree,
+            b"private-\xff",
+            b"preserve or refuse\n",
+        )
+        .unwrap() else {
+            return;
+        };
         broker.close(session.id).unwrap();
 
         let error = broker

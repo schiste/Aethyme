@@ -37,6 +37,8 @@
 
 pub mod bins;
 pub mod composition_fixtures;
+#[cfg(unix)]
+pub mod filesystem;
 pub mod invoke;
 pub mod paths;
 pub mod release_notes;
