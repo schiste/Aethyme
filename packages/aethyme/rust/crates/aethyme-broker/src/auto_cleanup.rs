@@ -823,6 +823,55 @@ impl ClosedArtifactCheckoutCohort {
     }
 }
 
+fn proves_removed_historical_instance(
+    alias: &Session,
+    owner: &Session,
+    old: &crate::events::SpawnedWorktreeInstanceWitness,
+    current: &crate::events::SpawnedWorktreeInstanceWitness,
+    handoff: &crate::SessionHandoffReport,
+) -> bool {
+    let valid_generation = |value: &Option<String>| {
+        value.as_ref().is_some_and(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    };
+    alias.id != owner.id
+        && alias.origin == SessionOrigin::Spawned
+        && owner.origin == SessionOrigin::Spawned
+        && alias.status == crate::types::SessionStatus::Cleaned
+        && alias.cleanup_state == SessionCleanupState::Cleaned
+        && handoff.handoff.session_id == alias.id
+        && matches!(
+            handoff.handoff.status,
+            crate::FinishStatus::Cleaned | crate::FinishStatus::AlreadyCleaned
+        )
+        && handoff.handoff.cleanup.completed
+        && handoff.handoff.cleanup.worktree_removed
+        && !handoff.handoff.cleanup.kept
+        && handoff.handoff.cleanup.recovery_action.is_none()
+        && alias
+            .cleanup_completed_at
+            .is_some_and(|at| at >= alias.created_at && at <= handoff.recorded_at)
+        && handoff.recorded_at < owner.created_at
+        && old.schema_version == 2
+        && current.schema_version == 2
+        && old.worktree_path == current.worktree_path
+        && old.worktree_path == alias.worktree_path
+        && current.worktree_path == owner.worktree_path
+        && old.git_common_path == current.git_common_path
+        && old.git_common_device == current.git_common_device
+        && old.git_common_inode == current.git_common_inode
+        && valid_generation(&old.root_generation_sha256)
+        && valid_generation(&current.root_generation_sha256)
+        && old.root_generation_sha256 != current.root_generation_sha256
+        && (old.worktree_inode != current.worktree_inode
+            || old.git_pointer_inode != current.git_pointer_inode
+            || old.git_admin_inode != current.git_admin_inode)
+}
+
 struct AutoCleanupGroupScan {
     groups: Vec<AutoCleanupCheckoutGroup>,
     live: Vec<Session>,
@@ -1706,31 +1755,6 @@ impl Broker {
             git_dir,
         )?;
         let resolved_candidate = resolved;
-        for row in alias_rows {
-            if deadline_expired(deadline) {
-                return Ok(unavailable(Reason::DeadlineExceeded));
-            }
-            if row.resolution_error.is_some() {
-                return Ok(unavailable(Reason::AliasResolutionFailed));
-            }
-            let row_path = ResolvedWorktreePath {
-                raw: PathBuf::from(&row.raw_path),
-                canonical_or_raw: PathBuf::from(&row.canonical_path),
-                git_dir: row.git_dir.map(PathBuf::from),
-                resolution_errors: Vec::new(),
-            };
-            match live_worktree_overlap(&resolved_candidate, &row_path) {
-                LiveOverlapEvidence::Disjoint => {}
-                LiveOverlapEvidence::Overlap
-                    if row.cleanup_state == "closed" && group_ids.contains(&row.session_id) => {}
-                LiveOverlapEvidence::Overlap => {
-                    return Ok(unavailable(Reason::AliasOverlapOutsideCohort));
-                }
-                LiveOverlapEvidence::Unknown => {
-                    return Ok(unavailable(Reason::LiveAliasUnknown));
-                }
-            }
-        }
 
         let current_witness = if sessions
             .iter()
@@ -1812,6 +1836,45 @@ impl Broker {
         let Some(owner_session_id) = owner_session_id else {
             return Ok(unavailable(Reason::SpawnedOwnerMissing));
         };
+        for row in alias_rows {
+            if deadline_expired(deadline) {
+                return Ok(unavailable(Reason::DeadlineExceeded));
+            }
+            if row.resolution_error.is_some() {
+                return Ok(unavailable(Reason::AliasResolutionFailed));
+            }
+            let row_path = ResolvedWorktreePath {
+                raw: PathBuf::from(&row.raw_path),
+                canonical_or_raw: PathBuf::from(&row.canonical_path),
+                git_dir: row.git_dir.map(PathBuf::from),
+                resolution_errors: Vec::new(),
+            };
+            match live_worktree_overlap(&resolved_candidate, &row_path) {
+                LiveOverlapEvidence::Disjoint => {}
+                LiveOverlapEvidence::Overlap
+                    if row.cleanup_state == "closed" && group_ids.contains(&row.session_id) => {}
+                LiveOverlapEvidence::Overlap => {
+                    if let Some(current_witness) = current_witness.as_ref() {
+                        let owner = sessions
+                            .iter()
+                            .find(|session| session.id == owner_session_id)
+                            .expect("validated cohort owner");
+                        if self.removed_historical_checkout_alias(
+                            row.session_id,
+                            owner,
+                            current_witness,
+                        )? {
+                            continue;
+                        }
+                    }
+                    return Ok(unavailable(Reason::AliasOverlapOutsideCohort));
+                }
+                LiveOverlapEvidence::Unknown => {
+                    return Ok(unavailable(Reason::LiveAliasUnknown));
+                }
+            }
+        }
+
         if self
             .store()
             .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)?
@@ -1832,6 +1895,38 @@ impl Broker {
             owner_session_id,
             alias_refresh_generation: index_state.alias_refresh_generation,
         }))
+    }
+
+    /// Exclude a removed spawn's historical alias only after proving that its
+    /// cleanup preceded the current, freshly witnessed checkout instance.
+    fn removed_historical_checkout_alias(
+        &self,
+        alias_id: i64,
+        owner: &Session,
+        current_witness: &crate::events::SpawnedWorktreeInstanceWitness,
+    ) -> Result<bool, BrokerOpError> {
+        let alias = self.store().session(alias_id)?;
+        if alias.origin != SessionOrigin::Spawned
+            || alias.status != crate::types::SessionStatus::Cleaned
+            || alias.cleanup_state != SessionCleanupState::Cleaned
+        {
+            return Ok(false);
+        }
+        let Some(old_witness) = self.store().spawned_worktree_instance_witness(alias_id)? else {
+            return Ok(false);
+        };
+        let handoff = match self.latest_handoff_for_session(alias_id) {
+            Ok(handoff) => handoff,
+            Err(BrokerOpError::HandoffNotFoundForSession { .. }) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok(proves_removed_historical_instance(
+            &alias,
+            owner,
+            &old_witness,
+            current_witness,
+            &handoff,
+        ))
     }
 
     /// Snapshot one retained checkout's full canonical cohort and its
@@ -3392,6 +3487,106 @@ mod tests {
         let mut broker = storage.open(&root).unwrap();
         let session = broker.start_worktree("retirement fixture", None).unwrap();
         (owner, storage, broker, session)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removed_spawn_history_does_not_block_a_fresh_instance_at_the_same_path() {
+        let (_owner, _storage, mut broker, first) = retirement_fixture();
+        let old_witness = broker
+            .store()
+            .spawned_worktree_instance_witness(first.id)
+            .unwrap()
+            .unwrap();
+        let report = broker.finish(first.id).unwrap();
+        assert!(report.cleanup.completed && report.cleanup.worktree_removed);
+        let alias = broker.store().session(first.id).unwrap();
+        let handoff = broker.latest_handoff_for_session(first.id).unwrap();
+        let mut current = broker.start_worktree("retirement fixture", None).unwrap();
+        assert_eq!(current.worktree_path, first.worktree_path);
+        // Declare strict temporal ordering without relying on clock resolution.
+        // Real handoffs at a tied timestamp conservatively remain blockers.
+        current.created_at = current.created_at.max(handoff.recorded_at + 1);
+        let connection = rusqlite::Connection::open(broker.store().db_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE sessions SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![current.created_at, current.id],
+            )
+            .unwrap();
+        broker
+            .close_abandoning_unpushed(current.id, "path reuse regression fixture")
+            .unwrap();
+        let path = PathBuf::from(&current.worktree_path);
+        let fresh = GitRepo::discover(&path)
+            .unwrap()
+            .spawned_worktree_instance_witness()
+            .unwrap();
+        assert!(proves_removed_historical_instance(
+            &alias,
+            &current,
+            &old_witness,
+            &fresh,
+            &handoff
+        ));
+        broker.refresh_cleanup_cohort_aliases(None).unwrap();
+        let cohort = broker
+            .closed_artifact_checkout_cohort_for_session(current.id, &path, None)
+            .unwrap()
+            .expect("a proven removed older instance is historical, not a live alias");
+        assert_eq!(cohort.session_ids(), vec![current.id]);
+        assert!(cohort.matches_checkout_instance(&GitRepo::discover(&path).unwrap()));
+
+        let rejects = |old: &Session,
+                       new: &Session,
+                       previous: &crate::events::SpawnedWorktreeInstanceWitness,
+                       fresh: &crate::events::SpawnedWorktreeInstanceWitness,
+                       proof: &crate::SessionHandoffReport| {
+            assert!(!proves_removed_historical_instance(
+                old, new, previous, fresh, proof
+            ));
+        };
+        let mut bad = alias.clone();
+        bad.cleanup_state = SessionCleanupState::Closed;
+        rejects(&bad, &current, &old_witness, &fresh, &handoff);
+        let mut bad = alias.clone();
+        bad.origin = SessionOrigin::Adopted;
+        rejects(&bad, &current, &old_witness, &fresh, &handoff);
+        let mut bad = current.clone();
+        bad.created_at = handoff.recorded_at;
+        rejects(&alias, &bad, &old_witness, &fresh, &handoff);
+        let mut bad = handoff.clone();
+        bad.handoff.cleanup.worktree_removed = false;
+        rejects(&alias, &current, &old_witness, &fresh, &bad);
+        let mut bad = handoff.clone();
+        bad.handoff.cleanup.completed = false;
+        rejects(&alias, &current, &old_witness, &fresh, &bad);
+        let mut bad = handoff.clone();
+        bad.handoff.cleanup.kept = true;
+        rejects(&alias, &current, &old_witness, &fresh, &bad);
+        let mut bad = handoff.clone();
+        bad.handoff.cleanup.recovery_action = Some("inspect residue".into());
+        rejects(&alias, &current, &old_witness, &fresh, &bad);
+        let mut bad = old_witness.clone();
+        bad.schema_version = 1;
+        rejects(&alias, &current, &bad, &fresh, &handoff);
+        let mut bad = old_witness.clone();
+        bad.root_generation_sha256 = Some("A".repeat(64));
+        rejects(&alias, &current, &bad, &fresh, &handoff);
+        let mut bad = old_witness.clone();
+        bad.root_generation_sha256 = None;
+        rejects(&alias, &current, &bad, &fresh, &handoff);
+        let mut bad = old_witness.clone();
+        bad.root_generation_sha256 = fresh.root_generation_sha256.clone();
+        rejects(&alias, &current, &bad, &fresh, &handoff);
+        let mut bad = old_witness.clone();
+        bad.git_common_inode += 1;
+        rejects(&alias, &current, &bad, &fresh, &handoff);
+        let mut bad = old_witness.clone();
+        bad.git_admin_inode = fresh.git_admin_inode;
+        bad.git_pointer_inode = fresh.git_pointer_inode;
+        bad.worktree_inode = fresh.worktree_inode;
+        rejects(&alias, &current, &bad, &fresh, &handoff);
     }
 
     #[cfg(unix)]
