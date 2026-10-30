@@ -638,6 +638,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   numeric value). Avoid changing profile settings on a warm target. Expand to
   verbose or workspace-wide runs only when explicitly needed or after a
   focused failure.
+- For path-identity fixture failures on macOS, inspect the inherited `TMPDIR`
+  and its canonical path. Reproduce the exact named cases at the unchanged
+  base, then rerun with an existing writable canonical temporary root (for
+  example `TMPDIR=/private/tmp`). Preserve both logs and the effective argv;
+  a successful environment-only rerun does not classify other failures or
+  justify weakening path assertions or marking the full gate passed.
 - Before a long or frozen Rust inventory, verify each selected
   `--package`/`--test` pair against the owning package's effective Cargo
   targets: the `tests/` defaults and any `[[test]]` or `autotests` settings
