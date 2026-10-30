@@ -341,3 +341,71 @@ health = { command = "true", timeout_seconds = 10, interval_ms = 50 }
     let (code, _) = fixture.json(&["env", "down", &env_id]);
     assert_eq!(code, 0);
 }
+
+/// #1216 through the router: changes raise the minimum profile; a lower one
+/// is refused with the rules, a higher one needs a reason.
+#[test]
+fn inferred_minimum_is_raise_only_through_the_cli() {
+    let environments = r#"
+schema = 1
+default_profile = "static"
+[[profiles]]
+name = "static"
+[[profiles.components]]
+name = "web"
+runtime = "hooks"
+provision = "true"
+destroy = "true"
+[[profiles]]
+name = "isolated"
+[[profiles.components]]
+name = "db"
+runtime = "hooks"
+provision = "true"
+destroy = "true"
+[[profiles]]
+name = "huge"
+[[profiles.components]]
+name = "all"
+runtime = "hooks"
+provision = "true"
+destroy = "true"
+[[rules]]
+name = "schema"
+paths = ["**/migrations/**"]
+min_profile = "isolated"
+"#;
+    let fixture = Fixture::new(Some(environments));
+    std::fs::create_dir_all(fixture.repo.path().join("app/migrations")).unwrap();
+    std::fs::write(
+        fixture.repo.path().join("app/migrations/0001.sql"),
+        "create table t();\n",
+    )
+    .unwrap();
+    let (code, inferred) = fixture.json(&["env", "infer"]);
+    assert_eq!(code, 0, "{inferred}");
+    assert_eq!(inferred["schema"], "aethyme.env-infer/v1");
+    assert_eq!(inferred["inference"]["minimum"], "isolated");
+    assert_eq!(
+        inferred["inference"]["fired"][0]["paths"][0],
+        "app/migrations/0001.sql"
+    );
+
+    let (code, refused) = fixture.json(&["env", "up", "--profile", "static"]);
+    assert_eq!(code, 3, "{refused}");
+    assert_eq!(refused["code"], "below_inferred_minimum");
+    assert!(refused["message"].as_str().unwrap().contains("schema"));
+
+    let (code, unexplained) = fixture.json(&["env", "up", "--profile", "huge"]);
+    assert_eq!(code, 2, "{unexplained}");
+    assert_eq!(unexplained["code"], "reason_required");
+
+    let (code, up) = fixture.json(&["env", "up"]);
+    assert_eq!(code, 0, "{up}");
+    assert_eq!(
+        up["profile"], "isolated",
+        "no --profile means the inferred minimum"
+    );
+    let (code, _) = fixture.json(&["env", "down", up["env_id"].as_str().unwrap()]);
+    assert_eq!(code, 0);
+}

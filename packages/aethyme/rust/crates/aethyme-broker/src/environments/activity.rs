@@ -175,6 +175,23 @@ impl super::lifecycle::Lifecycle {
         if has_live_busy_marker(&self.root, &record.env_id) {
             return Idleness::Busy;
         }
+        // A shared environment is in use while any environment that uses it
+        // is active (#1217).
+        if let super::compile::EnvironmentOwner::Ref { name } = &record.owner {
+            let shared = name.split('@').next().unwrap_or_default();
+            let consumed = self
+                .store
+                .list(Some(&record.repository))
+                .is_ok_and(|records| {
+                    records.iter().any(|other| {
+                        other.phase == super::store::EnvironmentPhase::Active
+                            && other.snapshot.uses_shared.iter().any(|used| used == shared)
+                    })
+                });
+            if consumed {
+                return Idleness::Busy;
+            }
+        }
         let last = record
             .last_activity_at
             .unwrap_or(record.updated_at)

@@ -139,7 +139,31 @@ impl EngineCli {
         cwd: &Path,
         vars: &BTreeMap<String, String>,
     ) -> Result<String, DriverError> {
-        run_program(&self.program, self.engine.as_str(), args, cwd, vars)
+        run_program(
+            &self.program,
+            self.engine.as_str(),
+            args,
+            cwd,
+            vars,
+            ENGINE_BUDGET,
+        )
+    }
+
+    /// [`Self::run`] with a shorter budget, for best-effort queries.
+    pub fn run_within(
+        &self,
+        args: &[&str],
+        cwd: &Path,
+        budget: Duration,
+    ) -> Result<String, DriverError> {
+        run_program(
+            &self.program,
+            self.engine.as_str(),
+            args,
+            cwd,
+            &BTreeMap::new(),
+            budget,
+        )
     }
 }
 
@@ -149,6 +173,7 @@ fn run_program(
     args: &[&str],
     cwd: &Path,
     vars: &BTreeMap<String, String>,
+    budget: Duration,
 ) -> Result<String, DriverError> {
     let mut command = Command::new(program);
     command.args(args).current_dir(cwd).env_clear();
@@ -167,7 +192,7 @@ fn run_program(
     let label = format!("{name} {}", args.join(" "));
     let outcome = crate::bounded_output::output_limited_in_owned_group(
         &mut command,
-        ENGINE_BUDGET,
+        budget,
         ENGINE_OUTPUT_LIMIT,
     )
     .map_err(|error| DriverError::Engine(format!("{label}: {error}")))?;
@@ -184,7 +209,7 @@ fn run_program(
         }
         crate::bounded_output::LimitedOutput::Deadline => Err(DriverError::Engine(format!(
             "{label} did not answer within {}s",
-            ENGINE_BUDGET.as_secs()
+            budget.as_secs()
         ))),
         crate::bounded_output::LimitedOutput::OutputLimit => Err(DriverError::Engine(format!(
             "{label}: output limit exceeded"
@@ -206,7 +231,7 @@ impl ComposeCli {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        run_program(&self.program, &name, &full, cwd, vars)
+        run_program(&self.program, &name, &full, cwd, vars, ENGINE_BUDGET)
     }
 }
 
