@@ -120,6 +120,7 @@ const COMMANDS: &[&str] = &[
     "env infer",
     "env shared",
     "env calibrate",
+    "env cache",
     "certify",
     "init",
     "deploy",

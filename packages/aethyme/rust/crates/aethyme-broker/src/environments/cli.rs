@@ -40,6 +40,7 @@ pub const ROUTES_SCHEMA: &str = "aethyme.env-routes/v1";
 pub const INFER_SCHEMA: &str = "aethyme.env-infer/v1";
 pub const SHARED_SCHEMA: &str = "aethyme.env-shared/v1";
 pub const CALIBRATE_SCHEMA: &str = "aethyme.env-calibrate/v1";
+pub const CACHE_SCHEMA: &str = "aethyme.env-cache/v1";
 
 pub const USAGE: &str = "\
 aethyme env — declared runnable environments per worktree
@@ -132,6 +133,13 @@ Usage:
       within --ram-fraction (default 0.5) of RAM minus any container-engine
       VM reservation. Prints a diff of environments.toml; never writes it.
       Profiles with fewer than 10 samples are reported as insufficient.
+  aethyme env cache list|prune [--all] [--json]
+      Content-addressed build outputs (build + cache_inputs, output in
+      build_output or serve_dir) shared across worktrees, and database
+      templates (template + template_inputs, AETHYME_ENV_TEMPLATE_ID to
+      provision). `prune` evicts unused entries, least recently used first,
+      down to AETHYME_ENV_CACHE_MAX_BYTES (default 8 GiB), or all unused ones
+      with --all; templates go only through their template_destroy.
   aethyme env routes [--json]
       The route table the built-in proxy serves on 127.0.0.1:4180
       (AETHYME_ENV_PROXY_PORT): <component>.<namespace>.<route_domain> and
@@ -223,6 +231,7 @@ pub fn run(args: &[String]) -> u8 {
         "infer" => super::operate::run_infer(&options),
         "shared" => super::operate::run_shared(&options),
         "calibrate" => super::operate::run_calibrate(&options),
+        "cache" => super::operate::run_cache(&options),
         other => Err(Failure {
             code: "unknown_subcommand",
             message: format!("unknown env subcommand {other:?}"),
@@ -303,6 +312,7 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
                 )
             }
             "--force" if command == "shared" => options.force = true,
+            "--all" if command == "cache" => options.all = true,
             "--ram-fraction" if command == "calibrate" => {
                 options.ram_fraction = args
                     .next()
@@ -350,6 +360,7 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
                             | "pin"
                             | "unpin"
                             | "shared"
+                            | "cache"
                     )
                     && options.positional.len()
                         < if matches!(command, "logs" | "shared") {
