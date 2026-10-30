@@ -139,8 +139,42 @@ impl Lifecycle {
         wait: Duration,
     ) -> Result<EnvironmentRecord, LifecycleError> {
         let record = self.store.resolve(env_id)?;
+        self.wake_shared_dependencies(&record, wait)?;
         let _operation = self.operation_lock(&record.env_id)?;
         self.wake_locked(&record.env_id, wait)
+    }
+
+    /// A consumer's shared environments may have parked while it was parked
+    /// (#1274): bring each up (creating or waking it) before the consumer
+    /// starts, so the URLs it was given answer.
+    fn wake_shared_dependencies(
+        &mut self,
+        record: &EnvironmentRecord,
+        wait: Duration,
+    ) -> Result<(), LifecycleError> {
+        if record.snapshot.uses_shared.is_empty() {
+            return Ok(());
+        }
+        let main_root = record.main_root.clone().ok_or_else(|| {
+            LifecycleError::Io(format!(
+                "{}: shared environments need the repository's main checkout, which was not recorded",
+                record.env_id
+            ))
+        })?;
+        let host = super::load_host_file()
+            .ok()
+            .and_then(|(_, loaded)| loaded.value.ok())
+            .unwrap_or_default();
+        for name in &record.snapshot.uses_shared {
+            self.shared_up(
+                std::path::Path::new(&main_root),
+                &record.repository,
+                name,
+                &host,
+                wait,
+            )?;
+        }
+        Ok(())
     }
 
     pub(super) fn wake_locked(

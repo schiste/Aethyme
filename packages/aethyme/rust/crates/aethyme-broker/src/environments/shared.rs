@@ -21,6 +21,18 @@
 //! component set differs from the serving one cannot be swapped in place
 //! (new components would never be provisioned) and is recreated instead.
 //!
+//! **Blue/green (#1274).** A shared environment alternates between two
+//! slots, `<name>@<ref>` and `<name>@<ref>#b`, each with its own ports and
+//! namespace; `<host state>/environments/shared/<repo>/<name>/serving` names
+//! the serving one. Consumers reach it through a stable alias route
+//! (`<name>.<repo>.shared.<route_domain>` on the proxy), which only the
+//! serving slot answers. A redeploy of an active environment brings the idle
+//! slot up at the new revision (build, provision, start, health) while the
+//! serving one keeps answering, then moves the pointer and the alias and
+//! destroys the old slot: no request is held. When the pool has no room for
+//! a second slot, the redeploy falls back to hold-and-swap above. A new slot
+//! that fails is destroyed and the serving one is never touched.
+//!
 //! The declaration is read from the default branch. When it cannot be read
 //! (Git fails, the file does not parse), nothing is destroyed; only a file
 //! absent from the default branch, or a `[[shared]]` entry removed from it,
@@ -194,6 +206,41 @@ fn owner_name(spec: &SharedSpec) -> String {
     format!("{}@{}", spec.name, spec.reference)
 }
 
+/// The second blue/green slot's owner suffix.
+const SECOND_SLOT: &str = "#b";
+/// In a shared environment's home: the serving slot's owner name.
+const SERVING_FILE: &str = "serving";
+/// How long a blue/green redeploy waits for pool capacity for the second
+/// slot before falling back to hold-and-swap.
+const BLUE_GREEN_CAPACITY_WAIT: Duration = Duration::from_secs(2);
+
+/// The declared owner (`<name>@<ref>`) a slot's owner belongs to.
+fn declared_owner(owner: &str) -> &str {
+    owner.strip_suffix(SECOND_SLOT).unwrap_or(owner)
+}
+
+/// The other slot's owner name.
+fn other_slot(owner: &str) -> String {
+    match owner.strip_suffix(SECOND_SLOT) {
+        Some(first) => first.to_string(),
+        None => format!("{owner}{SECOND_SLOT}"),
+    }
+}
+
+/// The stable alias host consumers use: the serving slot answers on it.
+pub fn alias_host(repository: &str, name: &str, route_domain: &str) -> String {
+    let repository: String = repository
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(12)
+        .collect();
+    format!(
+        "{}.{repository}.shared.{route_domain}",
+        name.replace('_', "-")
+    )
+    .to_ascii_lowercase()
+}
+
 /// Stable per (repository, name): the shared environment's identity and its
 /// worktree fingerprint survive redeploys to new exports.
 fn home(root: &Path, repository: &str, name: &str) -> PathBuf {
@@ -251,6 +298,7 @@ impl Lifecycle {
         name: &str,
         sha: &str,
         host: &HostEnvironmentsFile,
+        owner: &str,
     ) -> Result<(CompiledEnvironment, PathBuf), LifecycleError> {
         let export = export_for(&self.root, repository, name, sha);
         // Complete only once the marker is in place: export into a staging
@@ -285,7 +333,7 @@ impl Lifecycle {
             &CompileContext {
                 repository: repository.to_string(),
                 owner: EnvironmentOwner::Ref {
-                    name: owner_name(&spec),
+                    name: owner.to_string(),
                 },
                 worktree_fingerprint: fingerprint,
                 source_commit: Some(sha.to_string()),
@@ -300,6 +348,62 @@ impl Lifecycle {
         Ok((snapshot, export))
     }
 
+    /// The serving slot's owner name.
+    fn serving_owner(&self, repository: &str, spec: &SharedSpec) -> String {
+        let first = owner_name(spec);
+        let pointer =
+            std::fs::read_to_string(home(&self.root, repository, &spec.name).join(SERVING_FILE))
+                .unwrap_or_default();
+        if pointer.trim() == other_slot(&first) {
+            other_slot(&first)
+        } else {
+            first
+        }
+    }
+
+    fn set_serving(&self, repository: &str, name: &str, owner: &str) -> Result<(), LifecycleError> {
+        let directory = home(&self.root, repository, name);
+        std::fs::create_dir_all(&directory).map_err(io)?;
+        let staging = directory.join(format!("{SERVING_FILE}.next"));
+        std::fs::write(&staging, owner).map_err(io)?;
+        std::fs::rename(&staging, directory.join(SERVING_FILE)).map_err(io)
+    }
+
+    /// Record (or with `None` remove) the alias host `env_id` answers on.
+    fn set_alias(&self, env_id: &str, alias: Option<&str>) -> Result<(), LifecycleError> {
+        let path = self.root.join(env_id).join(super::routes::ROUTE_ALIAS_FILE);
+        match alias {
+            Some(alias) => {
+                std::fs::create_dir_all(self.root.join(env_id)).map_err(io)?;
+                std::fs::write(&path, alias).map_err(io)
+            }
+            None => match std::fs::remove_file(&path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(io(error)),
+                _ => Ok(()),
+            },
+        }
+    }
+
+    /// The serving slot's environment id for `spec`.
+    fn serving_env_id(&self, repository: &str, spec: &SharedSpec) -> String {
+        super::compile::environment_id(
+            repository,
+            &EnvironmentOwner::Ref {
+                name: self.serving_owner(repository, spec),
+            },
+            &spec.profile,
+        )
+    }
+
+    /// Destroy a slot that is not serving, if it holds anything.
+    fn retire_slot(&mut self, env_id: &str) {
+        if let Ok(Some(record)) = self.store.get(env_id)
+            && record.phase != EnvironmentPhase::Destroyed
+        {
+            crate::warn_unrecorded("retire a shared environment slot", self.down(env_id, None));
+        }
+    }
+
     /// The shared environment's record, if it has been created.
     pub fn shared_record(
         &self,
@@ -310,11 +414,7 @@ impl Lifecycle {
         let file = default_branch_file(main_root)
             .ok_or_else(|| io("the default branch has no environments file"))?;
         let spec = Self::shared_spec(&file, name)?;
-        let owner = EnvironmentOwner::Ref {
-            name: owner_name(&spec),
-        };
-        let env_id = super::compile::environment_id(repository, &owner, &spec.profile);
-        Ok(self.store.get(&env_id)?)
+        Ok(self.store.get(&self.serving_env_id(repository, &spec))?)
     }
 
     /// Make sure the shared environment exists and is up: create it at its
@@ -331,25 +431,28 @@ impl Lifecycle {
             .ok_or_else(|| io("the default branch has no environments file"))?;
         let spec = Self::shared_spec(&file, name)?;
         let sha = resolve_ref(main_root, &spec.reference).map_err(io)?;
-        let (snapshot, export) = self.shared_snapshot(main_root, repository, name, &sha, host)?;
-        if let Some(record) = self.store.get(&snapshot.env_id)?
-            && record.phase.retains_worktree()
-        {
-            return match record.phase {
-                EnvironmentPhase::Parked => self.wake(&record.env_id, wait),
-                _ => Ok(record),
-            };
-        }
-        self.up(
-            &snapshot,
-            &export,
-            Some(main_root),
-            None,
-            &UpOptions {
-                wait,
-                reconfigure: false,
+        let owner = self.serving_owner(repository, &spec);
+        let (snapshot, export) =
+            self.shared_snapshot(main_root, repository, name, &sha, host, &owner)?;
+        let record = match self.store.get(&snapshot.env_id)? {
+            Some(record) if record.phase.retains_worktree() => match record.phase {
+                EnvironmentPhase::Parked => self.wake(&record.env_id, wait)?,
+                _ => record,
             },
-        )
+            _ => self.up(
+                &snapshot,
+                &export,
+                Some(main_root),
+                None,
+                &UpOptions {
+                    wait,
+                    reconfigure: false,
+                },
+            )?,
+        };
+        let alias = alias_host(repository, name, &record.snapshot.route_domain);
+        self.set_alias(&record.env_id, Some(&alias))?;
+        Ok(record)
     }
 
     /// Bring the shared environment to its ref's current commit by
@@ -368,13 +471,7 @@ impl Lifecycle {
             .ok_or_else(|| io("the default branch has no environments file"))?;
         let spec = Self::shared_spec(&file, name)?;
         let sha = resolve_ref(main_root, &spec.reference).map_err(io)?;
-        let env_id = super::compile::environment_id(
-            repository,
-            &EnvironmentOwner::Ref {
-                name: owner_name(&spec),
-            },
-            &spec.profile,
-        );
+        let env_id = self.serving_env_id(repository, &spec);
         let Some(current) = self.store.get(&env_id)? else {
             self.shared_up(main_root, repository, name, host, wait)?;
             return Ok(Redeploy::Redeployed {
@@ -441,7 +538,12 @@ impl Lifecycle {
                 commit: sha.to_string(),
             });
         }
-        let (snapshot, export) = self.shared_snapshot(main_root, repository, name, sha, host)?;
+        let current_owner = match &current.owner {
+            EnvironmentOwner::Ref { name } => name.clone(),
+            EnvironmentOwner::Worktree { .. } => return Err(io("not a shared environment")),
+        };
+        let (snapshot, export) =
+            self.shared_snapshot(main_root, repository, name, sha, host, &current_owner)?;
         let previous_snapshot = current.snapshot.clone();
         let previous_export = current.worktree_root.clone().map(PathBuf::from);
         let from = previous_snapshot.source.commit.clone();
@@ -451,6 +553,26 @@ impl Lifecycle {
                 .map(|c| (c.name.clone(), format!("{:?}", c.runtime)))
                 .collect()
         };
+        // Build the new revision in its own export while the old one serves.
+        if let Err(error) = self.build_export(&current, &snapshot, &export) {
+            let message = error.to_string();
+            let detail = json!({ "code": "redeploy_failed", "failed_commit": sha, "serving": from, "message": message });
+            self.store.set_error(env_id, Some(&detail))?;
+            self.store
+                .note(env_id, "redeploy build failed", &self.actor, Some(&detail))?;
+            return Ok(Redeploy::RolledBack {
+                failed: sha.to_string(),
+                serving: from,
+                error: message,
+            });
+        }
+        // Blue/green when the environment serves: nothing is held.
+        if current.phase == EnvironmentPhase::Active
+            && let Some(outcome) =
+                self.blue_green(main_root, repository, name, host, &current, sha)?
+        {
+            return Ok(outcome);
+        }
         if names(&snapshot) != names(&previous_snapshot) {
             // Components added, removed or changed runtime: an in-place swap
             // would never provision them. Recreate at the new revision.
@@ -475,19 +597,6 @@ impl Lifecycle {
             return Ok(Redeploy::Redeployed {
                 from,
                 to: sha.to_string(),
-            });
-        }
-        // Build the new revision in its own export while the old one serves.
-        if let Err(error) = self.build_export(&current, &snapshot, &export) {
-            let message = error.to_string();
-            let detail = json!({ "code": "redeploy_failed", "failed_commit": sha, "serving": from, "message": message });
-            self.store.set_error(env_id, Some(&detail))?;
-            self.store
-                .note(env_id, "redeploy build failed", &self.actor, Some(&detail))?;
-            return Ok(Redeploy::RolledBack {
-                failed: sha.to_string(),
-                serving: from,
-                error: message,
             });
         }
         let was_active = current.phase == EnvironmentPhase::Active;
@@ -565,6 +674,89 @@ impl Lifecycle {
         }
     }
 
+    /// Bring the idle slot up at `sha` while `current` serves, then move the
+    /// serving pointer and the alias to it and destroy `current`. `None` when
+    /// the pool has no room for a second slot (the caller holds and swaps
+    /// instead). A slot that fails to come up is destroyed; `current` is
+    /// never touched.
+    fn blue_green(
+        &mut self,
+        main_root: &Path,
+        repository: &str,
+        name: &str,
+        host: &HostEnvironmentsFile,
+        current: &EnvironmentRecord,
+        sha: &str,
+    ) -> Result<Option<Redeploy>, LifecycleError> {
+        let EnvironmentOwner::Ref {
+            name: current_owner,
+        } = &current.owner
+        else {
+            return Ok(None);
+        };
+        let next_owner = other_slot(current_owner);
+        let (snapshot, export) =
+            self.shared_snapshot(main_root, repository, name, sha, host, &next_owner)?;
+        // A slot left by an interrupted redeploy.
+        self.retire_slot(&snapshot.env_id);
+        let from = current.snapshot.source.commit.clone();
+        let started = self.up(
+            &snapshot,
+            &export,
+            Some(main_root),
+            None,
+            &UpOptions {
+                wait: BLUE_GREEN_CAPACITY_WAIT,
+                reconfigure: false,
+            },
+        );
+        let next = match started {
+            Ok(next) => next,
+            Err(error) if error.code() == "capacity_timeout" => {
+                self.retire_slot(&snapshot.env_id);
+                return Ok(None);
+            }
+            Err(error) => {
+                self.retire_slot(&snapshot.env_id);
+                let message = error.to_string();
+                let detail = json!({ "code": "redeploy_failed", "failed_commit": sha, "serving": from, "message": message, "strategy": "blue_green" });
+                self.store.set_error(&current.env_id, Some(&detail))?;
+                self.store.note(
+                    &current.env_id,
+                    "redeploy rolled back",
+                    &self.actor,
+                    Some(&detail),
+                )?;
+                return Ok(Some(Redeploy::RolledBack {
+                    failed: sha.to_string(),
+                    serving: from,
+                    error: message,
+                }));
+            }
+        };
+        // Flip: the alias moves before the pointer, so the new slot answers
+        // first; the old slot keeps answering its own hosts until destroyed.
+        let alias = alias_host(repository, name, &next.snapshot.route_domain);
+        self.set_alias(&next.env_id, Some(&alias))?;
+        self.set_serving(repository, name, &next_owner)?;
+        self.set_alias(&current.env_id, None)?;
+        crate::warn_unrecorded(
+            "destroy the previous shared slot",
+            self.down(&current.env_id, None),
+        );
+        self.store.note(
+            &next.env_id,
+            "redeployed",
+            &self.actor,
+            Some(&json!({ "from": from, "to": sha, "strategy": "blue_green", "previous": current.env_id })),
+        )?;
+        remove_previous_export(current.worktree_root.clone().map(PathBuf::from), &export);
+        Ok(Some(Redeploy::Redeployed {
+            from,
+            to: sha.to_string(),
+        }))
+    }
+
     /// Run every component's `build` hook in the new export.
     fn build_export(
         &self,
@@ -610,7 +802,8 @@ impl Lifecycle {
                 continue;
             }
             let shared = name.split('@').next().unwrap_or_default().to_string();
-            let Some(spec) = declared.iter().find(|s| owner_name(s) == *name) else {
+            let declared_name = declared_owner(name);
+            let Some(spec) = declared.iter().find(|s| owner_name(s) == declared_name) else {
                 match self.down(&record.env_id, None) {
                     Ok(_) => actions.push(format!(
                         "destroyed {shared}: no longer declared on the default branch"
@@ -619,6 +812,24 @@ impl Lifecycle {
                 }
                 continue;
             };
+            if *name != self.serving_owner(repository, spec) {
+                // An idle slot left by an interrupted blue/green redeploy.
+                // Only under the redeploy key: a redeploy in progress owns it.
+                let key = format!(
+                    "aethyme-env-shared-redeploy:{}",
+                    self.serving_env_id(repository, spec)
+                );
+                let env_id = record.env_id.clone();
+                if self
+                    .exclusive(repository, &key, Duration::ZERO, |this| {
+                        this.retire_slot(&env_id)
+                    })
+                    .is_some()
+                {
+                    actions.push(format!("retired an idle {shared} slot ({env_id})"));
+                }
+                continue;
+            }
             if spec.profile != record.profile {
                 // Its id is per profile: without this the old one would be
                 // kept forever beside the new one.
@@ -669,9 +880,23 @@ impl Lifecycle {
         repository: &str,
         name: &str,
     ) -> Result<EnvironmentRecord, LifecycleError> {
+        let file = default_branch_file(main_root)
+            .ok_or_else(|| io("the default branch has no environments file"))?;
+        let spec = Self::shared_spec(&file, name)?;
         let record = self
             .shared_record(main_root, repository, name)?
             .ok_or_else(|| StoreError::NotFound(format!("shared environment {name}")))?;
+        let EnvironmentOwner::Ref { name: owner } = &record.owner else {
+            return Err(io("not a shared environment"));
+        };
+        let idle = super::compile::environment_id(
+            repository,
+            &EnvironmentOwner::Ref {
+                name: other_slot(owner),
+            },
+            &spec.profile,
+        );
+        self.retire_slot(&idle);
         self.down(&record.env_id, None)
     }
 }
@@ -687,12 +912,21 @@ fn remove_previous_export(previous: Option<PathBuf>, current: &Path) {
     }
 }
 
-/// `AETHYME_SHARED_<NAME>_URL` / `_PORT_<COMPONENT>` for a consumer, from the
-/// shared environment's reservation.
+/// `AETHYME_SHARED_<NAME>_URL` / `_DIRECT_URL` / `_PORT_<COMPONENT>` for a
+/// consumer, from the shared environment's reservation.
+///
+/// With a proxy port, `_URL` goes through the wake-on-request proxy
+/// (`http://<namespace>.<route_domain>:<proxy port>`), so a consumer's request
+/// during a redeploy is held rather than refused, and a parked shared
+/// environment is woken by the request itself (#1274). That needs the route
+/// host to resolve to loopback here (`*.localhost` does on macOS and most
+/// Linux resolvers); otherwise `_URL` is the direct port, as before.
+/// `_DIRECT_URL` and the ports always address the component directly.
 pub fn consumer_variables(
     root: &Path,
     shared_name: &str,
     record: &EnvironmentRecord,
+    proxy_port: Option<u16>,
 ) -> Vec<(String, String)> {
     let suffix = super::validate::env_suffix(shared_name);
     let mut vars = Vec::new();
@@ -722,7 +956,33 @@ pub fn consumer_variables(
         }
     }
     if let Some(url) = url {
-        vars.push((format!("AETHYME_SHARED_{suffix}_URL"), url));
+        let proxied = proxy_port.and_then(|port| proxied_url(root, record, port));
+        vars.push((format!("AETHYME_SHARED_{suffix}_DIRECT_URL"), url.clone()));
+        vars.push((
+            format!("AETHYME_SHARED_{suffix}_URL"),
+            proxied.unwrap_or(url),
+        ));
     }
     vars
+}
+
+/// The proxy URL of the shared environment's first routed component, when its
+/// route host resolves to loopback on this host.
+fn proxied_url(root: &Path, record: &EnvironmentRecord, proxy_port: u16) -> Option<String> {
+    use std::net::ToSocketAddrs;
+    record.snapshot.components.iter().find(|c| c.routed)?;
+    // The alias survives blue/green flips; the namespace host is the slot's.
+    let host = match super::routes::route_alias(root, &record.env_id) {
+        Some(alias) => alias,
+        None => format!(
+            "{}.{}",
+            record.namespace.as_deref()?,
+            record.snapshot.route_domain
+        ),
+    };
+    let loopback = (host.as_str(), proxy_port)
+        .to_socket_addrs()
+        .ok()?
+        .any(|address| address.ip().is_loopback());
+    loopback.then(|| format!("http://{host}:{proxy_port}"))
 }
