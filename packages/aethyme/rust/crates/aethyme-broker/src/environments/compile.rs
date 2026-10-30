@@ -123,6 +123,12 @@ pub struct CompiledPool {
     pub scope: PoolScope,
     pub limit: u32,
     pub preempt: Preempt,
+    #[serde(default = "default_min_active_seconds")]
+    pub min_active_seconds: u64,
+}
+
+fn default_min_active_seconds() -> u64 {
+    super::spec::DEFAULT_MIN_ACTIVE_SECONDS
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,6 +249,7 @@ pub fn compile(
             scope: spec.scope,
             limit,
             preempt: spec.preempt,
+            min_active_seconds: spec.min_active_seconds,
         })
     } else {
         None
