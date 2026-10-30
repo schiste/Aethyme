@@ -107,6 +107,15 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   crate's Cargo edition, including workspace inheritance, and pass that edition.
   Formatting rules vary by edition even when the source compiles in both; a
   successful check with a guessed edition can fail workspace CI.
+  When adding a Rust module, include its parent declaration file in formatting
+  validation: formatting only the new file misses reordered `mod` declarations.
+  For scoped checks, use `--config skip_children=true` on the parent; retain
+  the repository's required formatting check before publishing.
+- New broker modules also affect repository-wide checks beyond their feature
+  tests. Include the testkit's `broker_discarded_results` and `docs_hygiene`
+  targets; report or propagate failures rather than raising discard baselines,
+  and date new maintained docs. Added CLI verbs need reviewed help snapshots
+  and the CLI's `help_snapshots` target, even when command-specific tests pass.
 - Keep latency budgets in versioned machine-readable data. Validate the warning
   policy with deterministic tests; assess elapsed time in dedicated performance
   runs rather than wall-clock assertions in ordinary tests. Match the recorded
@@ -393,6 +402,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   temporary root before deriving its database and cache paths. Platform aliases
   such as macOS `/var` must not turn a valid fixture into a symlink traversal;
   keep the production no-follow check intact.
+  Scope stricter private-runtime opens explicitly to that runtime; preserve
+  existing shared-store path semantics unless changing that contract is intended.
+  Run predecessor path tests as well as the new runtime's refusal cases.
 - Give background-writer tests an independent, fixture-owned stop condition
   and a finite write limit. Deliberately breaking production cleanup must not
   leave the test itself writing indefinitely after an assertion fails.
@@ -594,6 +606,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   then query structured broker status by task or short name. An empty filtered
   result or truncated response is not proof that no session was created; retry
   only after a complete status confirms there is no registered session.
+- Synchronize an authorized PR stack from its lowest prerequisite upward.
+  Bringing main into a child while its declared base remains stale can expose
+  unrelated main commits in that child's PR. After updating each prerequisite,
+  align its dependents and inspect every PR's changed-file list and diff against
+  its declared base. Verify the exact resulting trees and current-head checks;
+  a clean worktree or successful push does not prove the review scope is clean.
 - When resolving stacked merges, preserve the stronger assertions from both
   parents. Adapt tests to the merged API; do not replace explicit failure or
   completeness checks with weaker count-only assertions.
@@ -635,6 +653,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   numeric value). Avoid changing profile settings on a warm target. Expand to
   verbose or workspace-wide runs only when explicitly needed or after a
   focused failure.
+- For path-identity fixture failures on macOS, inspect the inherited `TMPDIR`
+  and its canonical path. Reproduce the exact named cases at the unchanged
+  base, then rerun with an existing writable canonical temporary root (for
+  example `TMPDIR=/private/tmp`). Preserve both logs and the effective argv;
+  a successful environment-only rerun does not classify other failures or
+  justify weakening path assertions or marking the full gate passed.
 - Before a long or frozen Rust inventory, verify each selected
   `--package`/`--test` pair against the owning package's effective Cargo
   targets: the `tests/` defaults and any `[[test]]` or `autotests` settings
@@ -700,6 +724,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   flag allowlist through to the handler. A handler alone may not describe the
   accepted public spelling. Exercise the emitted command through the real CLI
   entrypoint and run the deprecated-spelling caller ratchet before publication.
+- When adding action-specific CLI flags, resolve public aliases, enumerate every
+  valid action from the dispatcher and verify each has an explicit allowlist. A missing leaf can
+  inherit a union of sibling flags. Test refusal through the public CLI before
+  state initialization; test unknown actions separately from recognized leaves.
 - Before changing a default CLI display, find existing consumer assertions
   as well as new feature tests. Include safety fences, session attribution,
   waiter/holder relationships, pending operations and help snapshots in the

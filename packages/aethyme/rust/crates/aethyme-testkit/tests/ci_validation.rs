@@ -564,6 +564,12 @@ fn contract_check_reads_the_same_sources_on_prs_and_on_main() {
         contract_cache.contains(&"          save-if: false"),
         "PR checks may restore the main cache but must not write shared compiler artifacts"
     );
+    assert!(
+        pr_check.contains(
+            "if: github.event.action != 'edited' || github.event.changes.body || github.event.changes.base"
+        ),
+        "a retargeted PR is judged on a new diff, so a base change must rerun the check"
+    );
     assert!(pr_check.contains("fetch-depth: 0"));
     assert!(pr_check.contains("ref: ${{ github.event.pull_request.head.sha }}"));
     assert!(pr_check.contains("BASE_REF: ${{ github.base_ref }}"));
