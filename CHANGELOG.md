@@ -10,6 +10,7 @@ artifacts and their exact source revision are recorded in each signed
 
 - Automatic retirement persists first verified holder-absence evidence for its bounded candidate page, so lease grace can advance without a status refresh. Live, unknown and rebound holders remain protected.
 - Compact cleanup admits its archive lane after cache handoff overhead while preserving the full archive minimum, any due whole-checkout cleanup reserve and the existing worker time limit.
+- Explicit artifact sweeps report incomplete when another GC holds the namespace lock, leaving skipped work visibly retryable.
 
 ## [0.8.49] - 2026-10-30
 

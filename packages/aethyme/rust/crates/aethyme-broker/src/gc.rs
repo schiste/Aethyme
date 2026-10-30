@@ -7355,8 +7355,13 @@ impl Broker {
             return Ok((
                 ArtifactSweepOutcome {
                     directories_reclaimed: 0,
+                    // An explicit sweep did not inspect the namespace and
+                    // must remain retryable while another GC owns its lock.
                     complete: closed_session_id.is_none()
-                        && scope != ArtifactSweepScope::AutomaticContinuation,
+                        && !matches!(
+                            scope,
+                            ArtifactSweepScope::AutomaticContinuation | ArtifactSweepScope::Drain
+                        ),
                     auto_cleanup: None,
                 },
                 0,
@@ -9853,6 +9858,48 @@ mod tests {
             ARTIFACT_WORKER_ADMISSION_ATTEMPTS.with(|attempts| attempts.borrow().clone()),
             vec![false],
             "a compact-only backlog must reach the real worker admission boundary"
+        );
+    }
+
+    #[test]
+    fn explicit_sweep_reports_incomplete_until_gc_lock_is_released() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
+            .unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
+            .unwrap();
+
+        let held = GcLock::acquire(root).unwrap();
+        let report = broker.gc_sweep_artifacts().unwrap();
+        assert!(
+            !report.complete,
+            "lock contention skipped inspection: {report:?}"
+        );
+        assert_eq!(report.directories_reclaimed, 0);
+        assert!(report.auto_cleanup.is_none());
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("3"),
+            "a skipped pass must not acknowledge pending recovery"
+        );
+        drop(held);
+
+        let retry = broker.gc_sweep_artifacts().unwrap();
+        assert!(
+            retry.complete,
+            "the unlocked namespace can be inspected: {retry:?}"
         );
     }
 
