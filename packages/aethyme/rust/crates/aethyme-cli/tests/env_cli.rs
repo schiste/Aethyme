@@ -409,3 +409,22 @@ min_profile = "isolated"
     let (code, _) = fixture.json(&["env", "down", up["env_id"].as_str().unwrap()]);
     assert_eq!(code, 0);
 }
+
+/// #1293 acceptance: the host's `max_pin_seconds` refuses a longer pin.
+#[test]
+fn a_pin_longer_than_the_host_cap_is_refused() {
+    let fixture = Fixture::new(Some(ENVIRONMENTS));
+    std::fs::write(
+        fixture.state.path().join("environments.toml"),
+        "max_pin_seconds = 7200\n",
+    )
+    .unwrap();
+    let (code, refused) =
+        fixture.json(&["env", "pin", "e-none", "--for", "10800", "--reason", "demo"]);
+    assert_eq!(code, 2, "{refused}");
+    assert_eq!(refused["code"], "pin_too_long", "{refused}");
+    let (code, within) =
+        fixture.json(&["env", "pin", "e-none", "--for", "3600", "--reason", "demo"]);
+    assert_ne!(within["code"], "pin_too_long", "{within}");
+    assert_ne!(code, 0, "{within}");
+}

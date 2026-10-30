@@ -235,3 +235,49 @@ fn the_supervisor_tick_parks_only_idle_environments() {
     lifecycle.down(&idle, None).unwrap();
     lifecycle.down(&busy, None).unwrap();
 }
+
+/// #1293 acceptance: with `max_exec_busy_seconds`, a command running longer
+/// than the cap no longer keeps its environment awake; the park records it,
+/// and the command (and its marker) are left alone.
+#[test]
+fn an_exec_past_the_busy_cap_no_longer_prevents_parking() {
+    let host = Host::new();
+    let (mut lifecycle, id, _w) = up(&host, &profile(None));
+    let mut command = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let marker = BusyMarker::register(&host.root(), &id, command.id() as i32).unwrap();
+    let record = lifecycle.store.get(&id).unwrap().unwrap();
+    assert_eq!(
+        lifecycle.idleness(&record, now_ms() + LATER, true),
+        Idleness::Busy,
+        "uncapped by default"
+    );
+    std::fs::write(
+        host.dir.path().join("environments.toml"),
+        "max_exec_busy_seconds = 1\n",
+    )
+    .unwrap();
+    assert!(matches!(
+        lifecycle.idleness(&record, now_ms() + LATER, true),
+        Idleness::Idle {
+            busy_capped: true,
+            ..
+        }
+    ));
+    assert_eq!(
+        lifecycle.park_idle(now_ms() + LATER).unwrap(),
+        vec![id.clone()]
+    );
+    let history = lifecycle.store.transitions(&id, 50).unwrap();
+    assert!(history.iter().any(|t| t.reason == "exec busy cap reached"));
+    assert!(
+        has_live_busy_marker(&host.root(), &id),
+        "the command still runs"
+    );
+    command.kill().unwrap();
+    command.wait().unwrap();
+    drop(marker);
+    lifecycle.down(&id, None).unwrap();
+}

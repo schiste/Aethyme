@@ -338,6 +338,23 @@ pub(super) fn run_pin(options: &Options) -> Result<Output, Failure> {
             exit: exit_status::USAGE,
         });
     };
+    // The host may cap pins below the 24 h ceiling (#1293).
+    let cap = super::load_host_file()
+        .ok()
+        .and_then(|(_, loaded)| loaded.value.ok())
+        .and_then(|host| host.max_pin_seconds)
+        .unwrap_or(86_400)
+        .min(86_400);
+    if seconds > cap {
+        return Err(Failure {
+            code: "pin_too_long",
+            message: format!("env pin --for {seconds} exceeds this host's max_pin_seconds ({cap})"),
+            next_action: format!(
+                "pin for at most {cap} seconds, or raise max_pin_seconds in the host environments.toml"
+            ),
+            exit: exit_status::USAGE,
+        });
+    }
     let (mut lifecycle, _) = open("env pin", false)?;
     let record = lifecycle
         .pin(&id, Duration::from_secs(seconds), reason)
