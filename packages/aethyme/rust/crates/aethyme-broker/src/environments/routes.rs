@@ -7,6 +7,10 @@
 //! upstream port only while the environment is `active`, and that port is
 //! always the one its reservation lease allocated, so a route never points
 //! at a port the environment does not hold.
+//!
+//! A shared environment's serving slot also answers on a stable alias host
+//! (#1274), recorded in its [`ROUTE_ALIAS_FILE`], so a blue/green redeploy
+//! moves consumers to the new slot by moving the alias.
 
 use std::path::{Path, PathBuf};
 
@@ -16,6 +20,19 @@ use sha2::{Digest, Sha256};
 use super::lifecycle::{RESERVATION_GRANT, read_grant};
 use super::spec::Runtime;
 use super::store::{EnvironmentPhase, EnvironmentStore, StoreError};
+
+/// In an environment's directory: the alias host its first routed
+/// component also answers on, while it is a shared environment's serving
+/// slot.
+pub const ROUTE_ALIAS_FILE: &str = "route-alias";
+
+/// The alias host recorded for `env_id`, if any.
+pub fn route_alias(root: &Path, env_id: &str) -> Option<String> {
+    std::fs::read_to_string(root.join(env_id).join(ROUTE_ALIAS_FILE))
+        .ok()
+        .map(|alias| alias.trim().to_ascii_lowercase())
+        .filter(|alias| !alias.is_empty())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Route {
@@ -54,6 +71,7 @@ pub fn route_table(store: &EnvironmentStore, root: &Path) -> Result<Vec<Route>, 
             .sum::<u64>()
             .max(30);
         let mut first = true;
+        let alias = route_alias(root, &record.env_id);
         for component in record.snapshot.components.iter().filter(|c| c.routed) {
             let upstream = (record.phase == EnvironmentPhase::Active
                 && component.runtime != Runtime::Static)
@@ -80,6 +98,7 @@ pub fn route_table(store: &EnvironmentStore, root: &Path) -> Result<Vec<Route>, 
             let mut hosts = vec![format!("{}.{namespace}.{domain}", component.name)];
             if first {
                 hosts.push(format!("{namespace}.{domain}"));
+                hosts.extend(alias.clone());
                 first = false;
             }
             for host in hosts {

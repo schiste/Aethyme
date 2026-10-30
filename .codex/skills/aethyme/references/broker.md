@@ -50,18 +50,33 @@ Checkout capacity is configured with `[worktrees] max_checkouts = <count>` in
 may not change the effective cap: land the configuration and refresh upstream
 before claiming it is active. Keep a finite limit while reclaiming a backlog;
 raising capacity does not reclaim storage. For closed checkouts, targeted
-`broker finish cleanup <session-id> --json` avoids the bulk plan's recursive
-size inventory while retaining fresh delivery and live-owner checks. From v0.8.33, default cleanup treats every Git-ignored directory as disposable
+`broker finish cleanup <session-id> --json` immediately applies cleanup; it is
+not a preview, and `--json` changes only the output format. It avoids the bulk
+plan's recursive size inventory while retaining fresh delivery and live-owner
+checks. Use the bulk plan below when only inspecting eligibility. From v0.8.33, default cleanup treats every Git-ignored directory as disposable
 without inspecting its contents, including saved records and datasets. Preserve
 irreplaceable evidence outside disposable checkouts before closing them, or set
 `[cleanup] strict = true` in the primary checkout to retain ignored leftovers and
 pause automatic artifact sweeps. `auto_remove = false` only disables whole-checkout
 removal. Never use `--force` merely to clear a capacity refusal.
-For `finish cleanup resolve --archive --json`, exit status zero can mean the
-archive succeeded while checkout removal failed. Check `worktree_removed` and
+`finish cleanup resolve <session-id> --archive --json` previews the archive
+resolution without creating an archive or removing a checkout; apply only with
+the reviewed plan's full `--confirm <sha256>`. On an applied archive resolution,
+exit status zero can mean the archive succeeded while checkout removal failed. Check `worktree_removed` and
 `cleanup_error`, verify the checkout is absent, and retain the archive before
 reporting reclaimed storage. A partial removal needs inspection, not a blind
 retry or forced deletion.
+
+At the checkout cap, an already-closed, retained checkout owned by your task
+can be reused without allocating or deleting a worktree. Verify that no live
+session owns its exact path, its previous HEAD is fully pushed, and tracked,
+untracked and ignored paths contain no pending work or unpreserved evidence.
+Preserve the previous local and remote branches; create a fresh task branch
+at the intended base, then run `broker start --adopt` from that checkout with
+explicit planned paths. Do not use this to take over another task's checkout
+or to bypass the requirement to keep an unmerged PR session live unless the
+user has authorized that exception. Re-adoption invalidates old cleanup plans;
+never apply a retirement plan made for the previous owner of that path.
 
 When investigating retained worktrees, distinguish task identity from shared
 service uptime. A shared agent daemon can outlive many tasks; its PID alone
@@ -451,7 +466,9 @@ blocked.
    `aethyme broker finish cleanup <id>`. Operators can periodically review all
    retained broker-owned worktrees with
    `aethyme broker finish cleanup --all-cleaned` and apply the unchanged plan
-   explicitly with `aethyme broker finish cleanup --all-cleaned --apply`.
+   explicitly with `aethyme broker finish cleanup --all-cleaned --apply --confirm
+   <sha256>` using the reviewed plan's full digest. Omitting `--apply` is the
+   bulk preview; single-session cleanup applies immediately.
 
    For a storage audit, reconcile broker session paths, `git worktree list
    --porcelain`, and directories under current and historical roots on every
