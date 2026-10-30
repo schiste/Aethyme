@@ -929,8 +929,18 @@ impl Lifecycle {
         &self,
         record: &EnvironmentRecord,
     ) -> Result<(PathBuf, Option<tempfile::TempDir>), String> {
+        // A shared environment runs from an Aethyme-made export, which has no
+        // Git metadata; its marker proves it is the export of the recorded
+        // commit (#1217).
+        if let (Some(root), Some(commit)) = (&record.worktree_root, &record.snapshot.source.commit)
+            && matches!(record.owner, super::compile::EnvironmentOwner::Ref { .. })
+            && super::shared::is_shared_export_of(&self.root, Path::new(root), commit)
+        {
+            return Ok((PathBuf::from(root), None));
+        }
         if let Some(root) = &record.worktree_root
             && Path::new(root).is_dir()
+            && !matches!(record.owner, super::compile::EnvironmentOwner::Ref { .. })
         {
             // A path can be reused after manual checkout removal. Never run
             // recorded hooks in a replacement repository at the same name.
@@ -1040,7 +1050,7 @@ impl Lifecycle {
 
 /// Export `commit` from the repository at `main_root` into `into` without
 /// registering a worktree.
-fn export_commit(main_root: &Path, commit: &str, into: &Path) -> Result<(), String> {
+pub(super) fn export_commit(main_root: &Path, commit: &str, into: &Path) -> Result<(), String> {
     use std::process::{Command, Stdio};
     let mut archive = Command::new("git")
         .args(["archive", "--format=tar", commit])
