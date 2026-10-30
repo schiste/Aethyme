@@ -940,7 +940,7 @@ fn validate_component(
                 p,
                 n,
                 Some(field),
-                &format!("{field} {value:?} must be a subdirectory of the worktree"),
+                format!("{field} {value:?} must be a subdirectory of the worktree"),
                 "use a relative path without `.` or `..`, e.g. \"dist\"",
             );
         }
