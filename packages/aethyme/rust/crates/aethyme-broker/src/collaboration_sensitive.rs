@@ -3609,6 +3609,25 @@ pub fn purge(
 mod tests {
     use super::*;
 
+    // Another test thread can fork while a lock descriptor is open; its Git
+    // child briefly inherits that descriptor until exec. Retry only transient
+    // contention, leaving every semantic error and production refusal intact.
+    fn purge_after_transient_contention(
+        store: &mut CollaborationStore,
+        incident_id: &str,
+        confirmation: &str,
+    ) -> Result<PurgeOutcome, SensitiveError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match super::purge(store, incident_id, confirmation) {
+                Err(SensitiveError::Busy) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                result => return result,
+            }
+        }
+    }
+
     struct ResetDatabaseCleanupInterruption;
 
     impl Drop for ResetDatabaseCleanupInterruption {
@@ -3709,7 +3728,8 @@ mod tests {
                 "stale cleanup interruption control"
             );
         });
-        let interrupted = purge(store, &incident_id, &quarantined.request_digest);
+        let interrupted =
+            purge_after_transient_contention(store, &incident_id, &quarantined.request_digest);
         assert!(matches!(
             interrupted,
             Err(SensitiveError::Invalid(ref message))
@@ -3748,7 +3768,9 @@ mod tests {
             .unwrap();
         assert_eq!(remaining_waves, 0);
 
-        let retried = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        let retried =
+            purge_after_transient_contention(store, &incident_id, &quarantined.request_digest)
+                .unwrap();
         assert!(retried.status.database_cleanup_completed_ms.is_some());
         assert!(retried.status.managed_cleanup_complete);
     }
@@ -3857,7 +3879,9 @@ mod tests {
         std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
         std::fs::write(&lock, b"unclassified bytes").unwrap();
 
-        let refused = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        let refused =
+            purge_after_transient_contention(store, &incident_id, &quarantined.request_digest)
+                .unwrap();
         assert!(!refused.completed);
         assert_eq!(refused.status.database_cleanup_completed_ms, None);
         assert!(!refused.status.managed_cleanup_complete);
@@ -4314,7 +4338,9 @@ mod tests {
         )
         .unwrap();
 
-        let held = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        let held =
+            purge_after_transient_contention(store, &incident_id, &quarantined.request_digest)
+                .unwrap();
         assert!(!held.completed);
         assert!(!held.status.managed_cleanup_complete);
         assert!(store.project_dir().join("views").join(&view).exists());
@@ -4366,7 +4392,9 @@ mod tests {
         let after_mutation = view_snapshot_except_path(store, &view, excluded_relative);
         assert_eq!(before, after_mutation);
 
-        let refused = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        let refused =
+            purge_after_transient_contention(store, &incident_id, &quarantined.request_digest)
+                .unwrap();
         assert!(!refused.completed);
         assert!(!refused.status.managed_cleanup_complete);
         assert!(refused.status.residuals.iter().any(|residual| {
@@ -4399,7 +4427,9 @@ mod tests {
             after_mutation
         );
 
-        let retry = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        let retry =
+            purge_after_transient_contention(store, &incident_id, &quarantined.request_digest)
+                .unwrap();
         assert!(!retry.completed);
         assert!(!retry.status.managed_cleanup_complete);
         assert_eq!(
@@ -4498,18 +4528,9 @@ mod tests {
             ReasonCode::SuspectedTestSecretExposure,
         )
         .unwrap();
-        // A concurrently spawned Git child can briefly inherit another test's
-        // lock descriptor before exec. Preserve purge's nonblocking contract,
-        // but allow that transient test-process contention to clear.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let refused = loop {
-            match purge(store, &incident_id, &quarantined.request_digest) {
-                Err(SensitiveError::Busy) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                result => break result.unwrap(),
-            }
-        };
+        let refused =
+            purge_after_transient_contention(store, &incident_id, &quarantined.request_digest)
+                .unwrap();
         assert!(!refused.completed);
         assert!(!refused.status.managed_cleanup_complete);
         assert!(view_root.exists());
@@ -4630,7 +4651,8 @@ mod tests {
         };
         std::fs::set_permissions(&view_root, std::fs::Permissions::from_mode(0o0)).unwrap();
         assert!(std::fs::read_dir(&view_root).is_err());
-        let result = purge(store, &incident_id, &quarantined.request_digest);
+        let result =
+            purge_after_transient_contention(store, &incident_id, &quarantined.request_digest);
         drop(restore_permissions);
 
         let refused = result.unwrap();
@@ -4748,7 +4770,9 @@ mod tests {
             ReasonCode::SuspectedTestSecretExposure,
         )
         .unwrap();
-        let blocked = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        let blocked =
+            purge_after_transient_contention(store, &incident_id, &quarantined.request_digest)
+                .unwrap();
         assert!(!blocked.completed);
         assert!(view_root.exists());
         let expected_code = if case == "expired-hold" {
@@ -4764,7 +4788,9 @@ mod tests {
 
         if case == "expired-hold" {
             assert!(crate::analysis_view::release_view_hold(store, &view, &holder).unwrap());
-            let retry = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+            let retry =
+                purge_after_transient_contention(store, &incident_id, &quarantined.request_digest)
+                    .unwrap();
             assert!(!retry.completed);
             assert!(!view_root.exists());
             assert!(retry.status.residuals.iter().any(|residual| {
@@ -4772,7 +4798,9 @@ mod tests {
             }));
         } else {
             let recorded = std::fs::read(&hold_path).unwrap();
-            let retry = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+            let retry =
+                purge_after_transient_contention(store, &incident_id, &quarantined.request_digest)
+                    .unwrap();
             assert!(!retry.completed);
             assert!(view_root.exists());
             assert_eq!(std::fs::read(&hold_path).unwrap(), recorded);
@@ -4905,7 +4933,9 @@ mod tests {
         drop(_response);
         drop(_archive);
 
-        let resumed = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        let resumed =
+            purge_after_transient_contention(store, &incident_id, &quarantined.request_digest)
+                .unwrap();
         assert!(!resumed.completed);
         let pending_items = resumed
             .status
@@ -5273,7 +5303,7 @@ mod tests {
         assert_eq!(quarantined.state, "quarantined");
 
         assert!(matches!(
-            purge(store, &incident_id, &quarantined.request_digest),
+            purge_after_transient_contention(store, &incident_id, &quarantined.request_digest),
             Err(SensitiveError::UnknownWork)
         ));
         store
@@ -5283,7 +5313,9 @@ mod tests {
                 [synthetic_job],
             )
             .unwrap();
-        let first_purge = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        let first_purge =
+            purge_after_transient_contention(store, &incident_id, &quarantined.request_digest)
+                .unwrap();
         assert!(!first_purge.completed);
         assert!(
             !generation_root.exists(),
@@ -5353,7 +5385,9 @@ mod tests {
         );
         let released_hold_view = view_snapshot(store, &view);
         assert_ne!(held_view, released_hold_view);
-        let pin_busy_purge = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        let pin_busy_purge =
+            purge_after_transient_contention(store, &incident_id, &quarantined.request_digest)
+                .unwrap();
         assert!(!pin_busy_purge.completed);
         assert_eq!(view_snapshot(store, &view), released_hold_view);
         assert!(pin_busy_purge.status.residuals.iter().any(|residual| {
@@ -5362,7 +5396,9 @@ mod tests {
                 && residual.resolved_ms.is_none()
         }));
         drop(reader);
-        let superseded_pin_purge = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        let superseded_pin_purge =
+            purge_after_transient_contention(store, &incident_id, &quarantined.request_digest)
+                .unwrap();
         assert!(!superseded_pin_purge.completed);
         assert_eq!(view_snapshot(store, &view), released_hold_view);
         assert!(
@@ -5377,7 +5413,9 @@ mod tests {
                 })
         );
         drop(superseded_reader);
-        let final_purge = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        let final_purge =
+            purge_after_transient_contention(store, &incident_id, &quarantined.request_digest)
+                .unwrap();
         assert!(!final_purge.completed);
         let final_pending_items = final_purge
             .status
