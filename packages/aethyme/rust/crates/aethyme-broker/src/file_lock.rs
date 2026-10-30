@@ -139,6 +139,31 @@ pub(crate) fn acquire_pr_watch_tick_lock(main_root: &Path) -> io::Result<Exclusi
     Ok(lock)
 }
 
+/// Serialize one environment's external lifecycle effects. The lock lives
+/// outside the removable environment directory and is never unlinked. Process
+/// exit releases ownership, so an interrupted destroy can safely resume.
+pub(crate) fn try_acquire_environment_operation_lock(
+    root: &Path,
+    env_id: &str,
+) -> io::Result<ExclusiveFileLock> {
+    use sha2::{Digest, Sha256};
+    std::fs::create_dir_all(root)?;
+    let root = root.canonicalize()?;
+    let directory = root.join("operation-locks");
+    ensure_real_directory(&directory)?;
+    let name = format!("{:x}.lock", Sha256::digest(env_id.as_bytes()));
+    let path = directory.join(name);
+    let file = open_lock_file_nofollow(&path)?;
+    let lock = ExclusiveFileLock::try_acquire(file)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("environment {env_id} has a lifecycle operation in progress; retry after it finishes"),
+        )
+    })?;
+    verify_named_lock_file(&path, &lock.file)?;
+    Ok(lock)
+}
+
 /// Claim the cooperative commit lane for one session without serializing
 /// commits from other worktrees through the repository-wide Git write lock.
 /// The persistent lock file is never removed, so contenders always lock the

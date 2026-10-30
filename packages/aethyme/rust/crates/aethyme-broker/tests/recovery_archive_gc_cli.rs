@@ -123,7 +123,7 @@ fn age(archive: &Path, days: i64) {
     edit_manifest(archive, |manifest| {
         let created = manifest["created_at_ms"].as_i64().unwrap();
         let aged = created - days * DAY_MS;
-        if manifest["schema_version"] == 5 {
+        if manifest["schema_version"].as_u64().unwrap_or_default() >= 5 {
             // Build a consistently aged fixture, not a one-sided metadata edit.
             let record_path = archive.join("retirement.json");
             let mut record: serde_json::Value =
@@ -352,7 +352,7 @@ fn retirement_archive_floor_survives_landing_and_a_shorter_current_policy() {
         let (_, head, archive) = archived_session_with_mode(tmp.path(), "retirement", dirty, true);
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(archive.join("manifest.json")).unwrap()).unwrap();
-        assert_eq!(manifest["schema_version"], 5);
+        assert_eq!(manifest["schema_version"], 6);
         assert!(manifest["minimum_archive_retention_ms"].as_u64().unwrap() >= 15 * DAY_MS as u64);
         if !dirty {
             git(tmp.path(), &["merge", "-q", "--ff-only", &head]);
@@ -390,6 +390,117 @@ fn retirement_archive_floor_survives_landing_and_a_shorter_current_policy() {
             "{applied}"
         );
         assert!(!archive.exists());
+    }
+}
+
+fn prerequisite_refs(archive: &Path) -> Vec<(String, String)> {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(archive.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["schema_version"], 6, "{manifest}");
+    manifest["prerequisite_refs"]
+        .as_array()
+        .unwrap_or_else(|| panic!("v6 archive has no prerequisite_refs: {manifest}"))
+        .iter()
+        .map(|item| {
+            (
+                item["ref_name"].as_str().unwrap().to_owned(),
+                item["object_id"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+fn set_short_archive_retention(repo: &Path) {
+    std::fs::write(
+        repo.join(".aethyme/broker.toml"),
+        "[retention]\nrecovery_archive_days = 1\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn gc_removes_exact_v6_prerequisite_refs_only_after_archive_removal() {
+    let tmp = repo();
+    let (_, _, archive) = archived_session_with_mode(tmp.path(), "pinned", false, true);
+    let refs = prerequisite_refs(&archive);
+    assert!(!refs.is_empty(), "v6 archive must own prerequisite refs");
+    for (name, oid) in &refs {
+        assert_eq!(git(tmp.path(), &["rev-parse", name]), *oid);
+    }
+    set_short_archive_retention(tmp.path());
+    age(&archive, 16);
+
+    let reviewed = plan(tmp.path());
+    let candidates = proposed(&reviewed);
+    assert_eq!(
+        candidates.len(),
+        1,
+        "pins must not make their own archive landed: {reviewed}"
+    );
+    let digest = reviewed["digest"].as_str().unwrap();
+    let applied = json(&run(
+        tmp.path(),
+        &["gc", "apply", "--confirm", digest, "--full-scan", "--json"],
+    ));
+
+    assert!(!archive.exists(), "the reviewed archive is fully removed");
+    assert_eq!(
+        applied["recovery_archives_removed"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        applied["failures"].as_array().unwrap().len(),
+        0,
+        "{applied}"
+    );
+    for (name, _) in refs {
+        let output = Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", &name])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "prerequisite ref still exists: {name}"
+        );
+    }
+}
+
+#[test]
+fn changed_v6_prerequisite_ref_keeps_archive_and_the_new_ref_target() {
+    let tmp = repo();
+    let (_, replacement, archive) =
+        archived_session_with_mode(tmp.path(), "changed-pin", false, true);
+    let refs = prerequisite_refs(&archive);
+    assert!(!refs.is_empty());
+    set_short_archive_retention(tmp.path());
+    age(&archive, 16);
+
+    let reviewed = plan(tmp.path());
+    assert_eq!(proposed(&reviewed).len(), 1, "{reviewed}");
+    let digest = reviewed["digest"].as_str().unwrap();
+    assert_ne!(replacement, refs[0].1);
+    git(tmp.path(), &["update-ref", &refs[0].0, &replacement]);
+
+    let apply = run(
+        tmp.path(),
+        &["gc", "apply", "--confirm", digest, "--full-scan", "--json"],
+    );
+
+    assert!(
+        !apply.status.success(),
+        "a changed prerequisite ref invalidates the reviewed plan"
+    );
+    assert!(
+        archive.exists(),
+        "changed prerequisite ownership refuses removal"
+    );
+    assert_eq!(git(tmp.path(), &["rev-parse", &refs[0].0]), replacement);
+    for (name, oid) in refs.iter().skip(1) {
+        assert_eq!(git(tmp.path(), &["rev-parse", name]), *oid);
     }
 }
 

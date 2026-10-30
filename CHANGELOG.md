@@ -4,6 +4,22 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.48] - 2026-10-29
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0848).
+
+### Added
+
+- Lease-bound environment up/down, park/wake, activity-aware idle parking and request-triggered wake routes are delivered together.
+- Recovery archive schema 6 retains incremental-bundle prerequisites in repository-local refs before checkout retirement.
+
+### Fixed
+
+- Retirement batches remain confirmable during ordinary forward delivery progress while still refusing changed content or lost prerequisite coverage.
+- Plan-local ancestry queries reuse exact completed results without reusing stale evidence during apply.
+- Archive GC releases prerequisite refs only after verified complete removal and complete sibling-reference inspection; uncertainty retains them.
+- Environment teardown, rollback and generic lease recovery preserve resource ownership when state or completion cannot be verified. Per-environment operation locks serialize lifecycle effects.
+
 ## [0.8.47] - 2026-10-29
 
 **Breaking:** see [UPGRADING.md](UPGRADING.md#v0847).
