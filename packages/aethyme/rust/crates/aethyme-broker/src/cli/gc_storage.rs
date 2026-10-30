@@ -953,6 +953,9 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
                 "gc requires `plan`, `apply --confirm <sha256>`, `abandon --confirm <sha256>`, `forget-abandoned --confirm <sha256>` or `sweep`".into(),
             )
         })?;
+    if action == "service" {
+        return run_gc_sweep_service(parsed);
+    }
     if action == "__continue-artifacts" {
         return run_artifact_sweep_continuation_worker(parsed);
     }
@@ -983,14 +986,52 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
             )));
         }
     }
+    #[cfg(target_os = "macos")]
+    let managed_tick = {
+        if action != "sweep" && crate::gc_sweep_service::managed_tick_requested() {
+            return Err(UsageError::Message(
+                "managed GC service markers are valid only for the fixed `gc sweep --json` tick"
+                    .into(),
+            ));
+        }
+        if action == "sweep" {
+            preflight_managed_gc_tick(&parsed)?
+        } else {
+            None
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    {
+        let requested = std::env::var_os("AETHYME_GC_SWEEP_SERVICE_UUID").is_some()
+            || std::env::var_os("AETHYME_GC_SWEEP_SERVICE_GENERATION").is_some();
+        if requested {
+            return Err(UsageError::Message(
+                "managed GC service ticks are supported only on macOS".into(),
+            ));
+        }
+    }
     // A normal Broker::open resumes confirmed GC maintenance at startup. The
     // journal-recovery commands must operate on the pending journal before
     // any startup maintenance can consume it, so use its read-only DB snapshot
     // while the command itself takes the repository GC lock for file changes.
-    let mut broker = if matches!(action, "abandon" | "forget-abandoned") {
-        open_broker(true)?
+    let broker_result = if matches!(action, "abandon" | "forget-abandoned") {
+        open_broker(true)
     } else {
-        open_broker(parsed.read_only_snapshot)?
+        open_broker(parsed.read_only_snapshot)
+    };
+    let mut broker = match broker_result {
+        Ok(broker) => broker,
+        Err(error) => {
+            #[cfg(target_os = "macos")]
+            if let Some(tick) = managed_tick.as_ref() {
+                crate::gc_sweep_service::record_managed_tick(
+                    tick,
+                    None,
+                    Some(&format!("broker open failed: {error:?}")),
+                )?;
+            }
+            return Err(error);
+        }
     };
     match action {
         "plan" => {
@@ -1067,7 +1108,23 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
             }
         }
         "sweep" => {
-            let report = broker.gc_sweep_artifacts()?;
+            let sweep = broker.gc_sweep_artifacts();
+            if let Err(error) = &sweep {
+                #[cfg(target_os = "macos")]
+                if let Some(tick) = managed_tick.as_ref() {
+                    crate::gc_sweep_service::record_managed_tick(tick, None, Some(&error.to_string()))
+                        .map_err(|receipt_error| {
+                            UsageError::Message(format!(
+                                "GC sweep failed ({error}); writing its managed tick receipt failed: {receipt_error}"
+                            ))
+                        })?;
+                }
+            }
+            let report = sweep?;
+            #[cfg(target_os = "macos")]
+            if let Some(tick) = managed_tick.as_ref() {
+                crate::gc_sweep_service::record_managed_tick(tick, Some(&report), None)?;
+            }
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -1081,6 +1138,161 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_gc_sweep_service(parsed: Parsed) -> Result<(), UsageError> {
+    if parsed.read_only_snapshot {
+        return Err(UsageError::Message(
+            "GC service controls do not accept --read-only-snapshot".into(),
+        ));
+    }
+    if parsed.positional.len() != 2 {
+        return Err(UsageError::Message(
+            "gc service accepts exactly one action: plan, install, status, activate, deactivate, or uninstall".into(),
+        ));
+    }
+    let action = parsed.positional[1].as_str();
+    match action {
+        "plan" => {
+            if parsed.confirm.is_some() {
+                return Err(UsageError::Message(
+                    "gc service plan does not accept --confirm".into(),
+                ));
+            }
+            let plan = crate::gc_sweep_service::service_plan()?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                out!(
+                    "GC sweep service plan {} (generation {})",
+                    plan.digest,
+                    plan.generation
+                );
+                out!(
+                    "  repository: {} ({})",
+                    plan.repository.display(),
+                    plan.repository_uuid
+                );
+                out!(
+                    "  immutable runtime: {} + {} ({}, {})",
+                    plan.router.display(),
+                    plan.engine.display(),
+                    plan.runtime_version,
+                    plan.runtime_build_identity
+                );
+                out!("  cadence: every {} seconds", plan.interval_seconds);
+                out!(
+                    "  unit: {} (install remains inactive)",
+                    plan.unit_path.display()
+                );
+                out!(
+                    "  next: aethyme broker gc service install --confirm {}",
+                    plan.digest
+                );
+            }
+        }
+        "install" => {
+            let confirm = service_confirmation(&parsed)?;
+            let plan = crate::gc_sweep_service::service_plan()?;
+            let installed = crate::gc_sweep_service::install(&plan, confirm)?;
+            let result = serde_json::json!({
+                "schema": "aethyme.gc-sweep-service-install/v1",
+                "action": "install",
+                "plan_digest": plan.digest,
+                "generation": plan.generation,
+                "created_paths": installed,
+                "activated": false
+            });
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                out!(
+                    "Installed the exact GC sweep service files; scheduler activation was not performed."
+                );
+                out!("  plan: {}", plan.digest);
+                for path in installed {
+                    out!("  created: {}", path.display());
+                }
+            }
+        }
+        "status" | "activate" | "deactivate" | "uninstall" => {
+            let confirmation = if action == "status" {
+                if parsed.confirm.is_some() {
+                    return Err(UsageError::Message(
+                        "gc service status does not accept --confirm".into(),
+                    ));
+                }
+                None
+            } else {
+                Some(service_confirmation(&parsed)?)
+            };
+            let home = crate::gc_sweep_service::control_home()?;
+            let uuid = crate::gc_sweep_service::uuid_for_current_repository()?;
+            let result = crate::gc_sweep_service::control(&home, &uuid, action, confirmation)?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                out!("GC sweep service {action}: {}", result);
+            }
+        }
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown GC service action {other:?}; expected plan, install, status, activate, deactivate, or uninstall"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_gc_sweep_service(_parsed: Parsed) -> Result<(), UsageError> {
+    Err(UsageError::Message(
+        "per-repository scheduled GC services are supported only on macOS".into(),
+    ))
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn service_confirmation(parsed: &Parsed) -> Result<&str, UsageError> {
+    let confirm = parsed.confirm.as_deref().ok_or_else(|| {
+        UsageError::Message("GC service state changes require --confirm <plan-sha256>".into())
+    })?;
+    if confirm.len() != 64
+        || !confirm
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(UsageError::Message(
+            "GC service --confirm must be a 64-character lowercase SHA-256".into(),
+        ));
+    }
+    Ok(confirm)
+}
+
+#[cfg(target_os = "macos")]
+fn preflight_managed_gc_tick(
+    parsed: &Parsed,
+) -> Result<Option<crate::gc_sweep_service::ManagedTick>, UsageError> {
+    if !crate::gc_sweep_service::managed_tick_requested() {
+        return Ok(None);
+    }
+    if parsed.positional.as_slice() != ["sweep"]
+        || !parsed.json
+        || parsed.read_only_snapshot
+        || parsed.confirm.is_some()
+        || parsed.include_active_gate_cache
+        || parsed.full_scan
+        || parsed.detail
+    {
+        return Err(UsageError::Message(
+            "managed GC service accepts only the fixed `broker gc sweep --json` invocation".into(),
+        ));
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;
+    let snapshot = Broker::open_snapshot(&cwd)?;
+    crate::gc_sweep_service::preflight_managed_tick(&snapshot)
+        .map_err(|error| UsageError::Message(format!("managed GC tick preflight refused: {error}")))
 }
 
 /// Private detached-worker entry point. It is absent from help and refuses to
