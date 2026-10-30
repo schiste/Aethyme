@@ -61,6 +61,38 @@ contract while protocol-dependent unattended removal stays blocked. See
 [automatic checkout maintenance](../guides/automatic-checkout-maintenance.md)
 for rollout holds, policy restoration and the report field contract.
 
+## Scheduled GC service
+
+The macOS operator commands `broker gc service plan|install|status|activate|deactivate|uninstall`
+introduce a separate `aethyme.gc-sweep-service-plan/v1` plan namespace. Installation
+is inert; each state change requires the exact installed plan digest. The plan
+binds repository UUID, canonical repository/home paths, user identity, immutable
+managed router and engine paths, both binary hashes, build identity, fixed
+900-second interval, generation and LaunchAgent bytes. Changed runtimes require
+explicit deactivation, uninstall and review of a replacement plan.
+
+The LaunchAgent invokes only `broker gc sweep --json`, with
+`AETHYME_GC_SWEEP_SERVICE_UUID` and `AETHYME_GC_SWEEP_SERVICE_GENERATION` markers.
+Before opening a mutating broker it checks the repository snapshot, installed
+generation and both binaries. Native GC policy, singleton admission, bounded
+worker passes and retry backoff remain authoritative. `RunAtLoad` is false;
+intervals missed while asleep are not proof that a tick ran. No agent/model
+calls, retention overrides or automatic recovery-archive purging are added.
+
+`aethyme.gc-sweep-service-control/v1` records acknowledged or unknown scheduler
+operations. Read-only status reports that observation and runtime health.
+Uninstall requires an acknowledged deactivation, checked under the same
+installation lock used by activation and managed ticks; it removes only the
+exact owned generation files. Missing receipts are distinct from unreadable or
+unsafe receipts.
+
+`aethyme.gc-sweep-service-last-pass/v1` is atomically replaced and limited to
+4 KiB. It binds repository UUID/generation and timestamps, with `sweep_complete`,
+`sweep_paused`, `error` or `unknown` outcomes and optional sweep counters. A
+completed sweep is not proof that all checkout cleanup or archive retention
+work has finished. Detached continuation workers keep their own native receipts.
+Existing PR-watch plans, units and health records retain their contract.
+
 ## PR-watch service plan (#887)
 
 `aethyme broker advanced watch pr service plan --broker-bin <absolute-router>`
@@ -293,6 +325,19 @@ new cleanup policy across a repository.
 ### Detached automatic artifact continuation (#818)
 
 The broker starts the private `broker gc __continue-artifacts <canonical-main-root>` child only from the installed router paired with its sibling engine. The child requires `AETHYME_GC_ARTIFACT_SWEEP_WORKER=1`, a writable non-ephemeral main checkout, aligned router/engine build identities, and the OS advisory singleton lock before it opens broker state. Its artifact lane may remove eligible ignored build caches; that lane never removes a checkout or branch. A separate durable request can enable the whole-checkout lane described below. It records completion only after a full eligible cache lap; deadline, lease contention, deletion failure, or repeated no-progress leaves the generation pending with bounded backoff. A new pressure refusal clears that backoff. The command remains hidden from help and is invoked only by the paired installed runtime.
+
+Open-session retirement has its own `gc.artifact_sweep.session_retirement_state`
+metadata row: version 1 stores the requested generation, completed generation
+and retry deadline together as one compare-and-set value. Eligible Inline and
+Drain sweeps may enqueue one idempotent generation, including when the artifact
+budget is zero. The paired worker handles this lane independently of cache
+progress, whole-checkout removal policy and the closed-checkout cleanup
+outbox's grace deadline. It advances only the captured generation while holding
+the GC lock after a complete retirement lap. Busy storage, unknown liveness,
+page limits and deadlines leave work pending with bounded retry. Malformed,
+unsupported or inconsistent state is left untouched and grants no retirement
+authority; other worker lanes remain independently eligible. This row does not
+authorize checkout removal or branch deletion and adds no CLI report field.
 
 Changing the private command, marker, canonical-root argument, runtime-alignment check, or lock handoff without updating both launcher and child can strand cleanup requests or run a mismatched binary. The child must leave incomplete requests retryable and must not report them complete.
 

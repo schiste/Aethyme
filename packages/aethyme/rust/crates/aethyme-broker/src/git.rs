@@ -6849,14 +6849,16 @@ mod ignored_path_listing_tests {
     #[cfg(unix)]
     #[test]
     fn non_utf8_git_filename_makes_the_complete_listing_unknown() {
-        use std::os::unix::ffi::OsStrExt;
-
         let root = repository();
         std::fs::write(root.path().join(".gitignore"), "bad-*\n").unwrap();
         git(root.path(), &["add", ".gitignore"]);
         git(root.path(), &["commit", "-qm", "ignore malformed filename"]);
-        let invalid_name = std::ffi::OsStr::from_bytes(b"bad-\xff");
-        std::fs::write(root.path().join(invalid_name), b"ignored").unwrap();
+        let Some(_path) =
+            aethyme_testkit::filesystem::write_non_utf8_file(root.path(), b"bad-\xff", b"ignored")
+                .unwrap()
+        else {
+            return;
+        };
 
         let repo = GitRepo::discover(root.path()).unwrap();
         assert!(matches!(
@@ -7732,7 +7734,6 @@ mod nul_path_tests {
 #[cfg(all(test, unix))]
 mod ignored_paths_readonly_tests {
     use super::{GitError, GitRepo};
-    use std::os::unix::ffi::OsStringExt;
     use std::process::Command;
 
     fn ignored_repo() -> (tempfile::TempDir, GitRepo) {
@@ -7778,8 +7779,12 @@ mod ignored_paths_readonly_tests {
     #[test]
     fn non_utf8_ignored_standalone_path_fails_closed() {
         let (root, repo) = ignored_repo();
-        let name = std::ffi::OsString::from_vec(b"ignored-\xff".to_vec());
-        std::fs::write(root.path().join(name), "data").unwrap();
+        let Some(_path) =
+            aethyme_testkit::filesystem::write_non_utf8_file(root.path(), b"ignored-\xff", b"data")
+                .unwrap()
+        else {
+            return;
+        };
 
         let error = repo.ignored_paths_readonly().unwrap_err();
         assert!(matches!(error, GitError::UntrustedOutput { .. }), "{error}");
@@ -9673,9 +9678,6 @@ mod batched_commit_tests {
     #[cfg(unix)]
     #[test]
     fn strict_path_evidence_refuses_non_utf8_names_from_real_git() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         run(root, &["init", "-q", "-b", "main"]);
@@ -9685,8 +9687,14 @@ mod batched_commit_tests {
         let base = run(root, &["rev-parse", "HEAD"]);
 
         run(root, &["switch", "-q", "-c", "session"]);
-        let path = OsString::from_vec(b"invalid-\xff-name.txt".to_vec());
-        std::fs::write(root.join(path), "tracked\n").expect("write invalid UTF-8 path");
+        let Some(_path) = aethyme_testkit::filesystem::write_non_utf8_file(
+            root,
+            b"invalid-\xff-name.txt",
+            b"tracked\n",
+        )
+        .expect("write invalid UTF-8 path") else {
+            return;
+        };
         run(root, &["add", "-A"]);
         run(root, &["commit", "-qm", "add non-UTF-8 path"]);
         let head = run(root, &["rev-parse", "HEAD"]);
