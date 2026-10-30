@@ -86,6 +86,16 @@ path. Ambiguous outcomes
 never trigger a local fallback or an automatic retry; recovery and deadline
 semantics are specified in [broker-service.md](broker-service.md).
 
+The dependent discovery phase adds `service directory <private-service-root>
+--jobs-for <repository> [--json]`. Both output modes emit one object:
+`schema_version: 1`, `directory`, and the full `repository` identity (`key`,
+`repository_uuid`, `root`, `common_dir`). It resolves main and linked worktrees
+to one address under an existing caller-selected private root, refuses unsafe
+or overlong paths, and creates no directory, service or broker state. The
+shortened directory name is an address only; consumers must still verify the
+full repository identity before requests. Read-only discovery is specified in
+[broker-service.md](broker-service.md).
+
 ## Automatic checkout maintenance (v0.8.44)
 
 `AutoCleanupReport` adds optional `sessions_retired` and

@@ -380,6 +380,140 @@ fn planning_fixture() -> common::FixtureRepository {
     fixture
 }
 
+fn discover(
+    fixture: &common::FixtureRepository,
+    root: &Path,
+    repository: &Path,
+) -> std::process::Output {
+    shim(fixture)
+        .arg("directory")
+        .arg(root)
+        .arg("--jobs-for")
+        .arg(repository)
+        .arg("--json")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn discovery_unifies_linked_worktrees_and_separates_repositories_without_creating_state() {
+    let fixture = planning_fixture();
+    let other = planning_fixture();
+    let root = runtime_directory();
+    let root = root.path().canonicalize().unwrap();
+    fs::write(root.join("sentinel"), "preserve").unwrap();
+    let linked = fixture.owner_path().join("discovery-linked");
+    let mut git = Command::new("git");
+    isolated(&mut git, &fixture);
+    let output = git
+        .args(["worktree", "add", "--detach", "-q"])
+        .arg(&linked)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let resolve = |repository: &Path| {
+        let output = discover(&fixture, &root, repository);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let main = resolve(fixture.path());
+    assert_eq!(resolve(&linked), main);
+    let different = resolve(other.path());
+    assert_ne!(different["repository"]["key"], main["repository"]["key"]);
+    assert_ne!(different["directory"], main["directory"]);
+    assert_eq!(main["schema_version"], 1);
+    assert_eq!(main["repository"]["key"].as_str().unwrap().len(), 64);
+    let directory = Path::new(main["directory"].as_str().unwrap());
+    assert_eq!(directory.parent(), Some(root.as_path()));
+    assert_eq!(directory.file_name().unwrap().to_str().unwrap().len(), 32);
+    assert!(!directory.exists());
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    assert_eq!(fs::read(root.join("sentinel")).unwrap(), b"preserve");
+}
+
+#[test]
+fn discovery_refuses_unsafe_roots_and_leaves_an_uninitialized_repository_untouched() {
+    let fixture = planning_fixture();
+    let root = runtime_directory();
+    let root = root.path().canonicalize().unwrap();
+    let missing = root.join("missing");
+    assert!(
+        !discover(&fixture, &missing, fixture.path())
+            .status
+            .success()
+    );
+    assert!(!missing.exists());
+    let alias = root.join("alias");
+    std::os::unix::fs::symlink(&root, &alias).unwrap();
+    assert!(!discover(&fixture, &alias, fixture.path()).status.success());
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!discover(&fixture, &root, fixture.path()).status.success());
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let untouched = common::FixtureRepository::new();
+    let mut git = Command::new("git");
+    isolated(&mut git, &untouched);
+    assert!(git.args(["init", "-q"]).status().unwrap().success());
+    assert!(
+        !discover(&untouched, &root, untouched.path())
+            .status
+            .success()
+    );
+    assert!(!untouched.path().join(".aethyme").exists());
+}
+
+#[test]
+fn discovery_validates_existing_leaf_and_socket_path_without_repairing_them() {
+    let fixture = planning_fixture();
+    let root = runtime_directory();
+    let root = root.path().canonicalize().unwrap();
+    let output = discover(&fixture, &root, fixture.path());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let leaf = Path::new(value["directory"].as_str().unwrap());
+    fs::write(leaf, "preserve").unwrap();
+    assert!(!discover(&fixture, &root, fixture.path()).status.success());
+    assert_eq!(fs::read(leaf).unwrap(), b"preserve");
+    fs::remove_file(leaf).unwrap();
+    std::os::unix::fs::symlink(&root, leaf).unwrap();
+    assert!(!discover(&fixture, &root, fixture.path()).status.success());
+    assert_eq!(fs::read_link(leaf).unwrap(), root);
+    fs::remove_file(leaf).unwrap();
+    fs::create_dir(leaf).unwrap();
+    fs::set_permissions(leaf, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!discover(&fixture, &root, fixture.path()).status.success());
+    fs::set_permissions(leaf, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(discover(&fixture, &root, fixture.path()).status.success());
+    assert_eq!(fs::read_dir(leaf).unwrap().count(), 0);
+
+    let too_long = root.join("x".repeat(100));
+    fs::create_dir(&too_long).unwrap();
+    fs::set_permissions(&too_long, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        !discover(&fixture, &too_long, fixture.path())
+            .status
+            .success()
+    );
+    assert_eq!(fs::read_dir(&too_long).unwrap().count(), 0);
+}
+
 fn gc_plan_command(fixture: &common::FixtureRepository) -> Command {
     let mut command = common::broker_cli_for_fixture(
         env!("CARGO_BIN_EXE_broker-cli-shim"),
