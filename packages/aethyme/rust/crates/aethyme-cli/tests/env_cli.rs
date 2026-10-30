@@ -162,6 +162,37 @@ fn status_on_a_fresh_host_reports_nothing_and_an_absent_supervisor() {
     assert_eq!(value["code"], "not_found");
 }
 
+/// #1289: a profile with no components validates, is what an empty diff
+/// infers when it ranks lowest, and `env up` on it registers nothing.
+#[test]
+fn an_empty_profile_needs_no_environment() {
+    let environments = format!(
+        "schema = 1\n[[profiles]]\nname = \"none\"\n{}",
+        ENVIRONMENTS.trim_start_matches("\nschema = 1\n")
+    );
+    let fixture = Fixture::new(Some(&environments));
+    let (code, value) = fixture.json(&["env", "validate"]);
+    assert_eq!(code, 0, "{value}");
+    let (code, plan) = fixture.json(&["env", "plan", "--profile", "none"]);
+    assert_eq!(code, 0, "{plan}");
+    assert_eq!(plan["start_order"], serde_json::json!([]), "{plan}");
+    for args in [&["env", "up"][..], &["env", "up", "--profile", "none"][..]] {
+        let (code, up) = fixture.json(args);
+        assert_eq!(code, 0, "{up}");
+        assert_eq!(up["schema"], "aethyme.env-up/v1");
+        assert_eq!(up["nothing_needed"], true, "{up}");
+        assert_eq!(up["profile"], "none");
+        assert!(up.get("env_id").is_none(), "{up}");
+    }
+    let (code, status) = fixture.json(&["env", "status"]);
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(status["environments"], serde_json::json!([]));
+    assert_eq!(
+        status["supervisor"]["state"], "absent",
+        "an empty profile starts no supervisor"
+    );
+}
+
 /// #1222 acceptance: ten concurrent starters run exactly one supervisor, and
 /// it exits on its own once nothing needs it.
 #[test]
