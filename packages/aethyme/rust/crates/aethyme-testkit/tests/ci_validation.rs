@@ -162,6 +162,47 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
     );
 }
 
+#[test]
+fn main_gate_router_prebuild_reuses_the_managed_debug_target() {
+    let gates = workflow("aethyme-gates.yml");
+    let locate_cache = gates.find("      - name: Locate the gates").unwrap();
+    let cache = gates
+        .find("      - name: Cache the gates' managed build")
+        .unwrap();
+    let build = gates
+        .find("      - name: Build aethyme in the gates' managed cache")
+        .unwrap();
+    let lookup = gates
+        .find("      - name: Look for a pull-request run that tested this tree")
+        .unwrap();
+    let run = gates.find("      - name: Run all gates").unwrap();
+    assert!(locate_cache < cache && cache < build && build < lookup && lookup < run);
+    assert!(
+        !gates.contains("Cache the aethyme release build"),
+        "the gate router must not be built twice in separate targets"
+    );
+
+    let build_step = block(
+        &gates,
+        "      - name: Build aethyme in the gates' managed cache",
+    )
+    .join("\n");
+    for setting in [
+        "CHAU7_CTO_OPTIM_ACTIVE: \"1\"",
+        "CARGO_INCREMENTAL: \"0\"",
+        "CARGO_BUILD_JOBS: \"1\"",
+        "CARGO_PROFILE_DEV_DEBUG: \"1\"",
+        "CARGO_TARGET_DIR: ${{ env.GATE_CACHE_DIR }}",
+        "run: cargo build --locked --manifest-path packages/aethyme/rust/Cargo.toml --bin aethyme",
+    ] {
+        assert!(
+            build_step.contains(setting),
+            "gate-router prebuild must match the cross-process gate profile: missing {setting}"
+        );
+    }
+    assert!(gates[run..].contains("aethyme=\"$GATE_CACHE_DIR/debug/aethyme\""));
+}
+
 /// Failed nextest output must survive later passing doc/example output. The
 /// failure-only step adds diagnostics; it never changes gate selection/results.
 #[test]
