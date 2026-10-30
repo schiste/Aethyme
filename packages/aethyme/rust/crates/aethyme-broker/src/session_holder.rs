@@ -1301,6 +1301,7 @@ mod tests {
             prefetched_event_ids: HashMap::from([(session.id, holder_event_id)]),
             observed_event_ids: HashMap::from([(session.id, holder_event_id)]),
             snapshot: Some(Some(table)),
+            snapshots_taken: 0,
         };
         assert_eq!(
             recorded_holder_liveness(broker.store(), session.id, &mut matching, true).liveness,
@@ -1310,6 +1311,7 @@ mod tests {
             prefetched_event_ids: HashMap::from([(session.id, holder_event_id)]),
             observed_event_ids: HashMap::from([(session.id, holder_event_id)]),
             snapshot: Some(Some(ProcessTable::parse(""))),
+            snapshots_taken: 0,
         };
         assert_eq!(
             recorded_holder_liveness(broker.store(), session.id, &mut missing, true).liveness,
