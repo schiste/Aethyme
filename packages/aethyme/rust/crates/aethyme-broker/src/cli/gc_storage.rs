@@ -950,7 +950,7 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
         .map(String::as_str)
         .ok_or_else(|| {
             UsageError::Message(
-                "gc requires `plan`, `apply --confirm <sha256>`, `abandon --confirm <sha256>`, `forget-abandoned --confirm <sha256>` or `sweep`".into(),
+                "gc requires `plan`, `apply --confirm <sha256>`, `abandon --confirm <sha256>`, `forget-abandoned --confirm <sha256>`, `artifact-use reconcile plan <session-id>`, `artifact-use reconcile apply <session-id> --confirm <sha256>`, or `sweep`".into(),
             )
         })?;
     if action == "service" {
@@ -959,9 +959,12 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     if action == "__continue-artifacts" {
         return run_artifact_sweep_continuation_worker(parsed);
     }
+    if action == "artifact-use" {
+        return run_gc_artifact_use_reconcile(parsed);
+    }
     if parsed.positional.len() != 1 {
         return Err(UsageError::Message(
-            "gc accepts exactly one action: `plan`, `apply --confirm <sha256>`, `abandon --confirm <sha256>`, `forget-abandoned --confirm <sha256>` or `sweep`".into(),
+            "gc accepts one action: `plan`, `apply --confirm <sha256>`, `abandon --confirm <sha256>`, `forget-abandoned --confirm <sha256>`, `artifact-use reconcile <plan|apply> <session-id>`, or `sweep`".into(),
         ));
     }
     if matches!(action, "abandon" | "forget-abandoned") && parsed.include_active_gate_cache {
@@ -1140,6 +1143,131 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+fn run_gc_artifact_use_reconcile(parsed: Parsed) -> Result<(), UsageError> {
+    if parsed.positional.len() != 4 || parsed.positional[1] != "reconcile" {
+        return Err(UsageError::Message(
+            "usage: aethyme broker gc artifact-use reconcile <plan|apply> <exact-session-id> [--confirm <sha256>] [--json]".into(),
+        ));
+    }
+    let action = parsed.positional[2].as_str();
+    let session_id = parsed.positional[3]
+        .parse::<i64>()
+        .ok()
+        .filter(|session_id| *session_id > 0)
+        .ok_or_else(|| {
+            UsageError::Message(
+                "artifact-use reconciliation requires a positive exact session id".into(),
+            )
+        })?;
+    let confirmed_digest = match action {
+        "plan" if parsed.confirm.is_none() => None,
+        "plan" => {
+            return Err(UsageError::Message(
+                "artifact-use reconciliation plan does not accept --confirm".into(),
+            ));
+        }
+        "apply" => {
+            let confirm = parsed.confirm.as_deref().ok_or_else(|| {
+                UsageError::Message(
+                    "artifact-use reconciliation apply requires --confirm <sha256>".into(),
+                )
+            })?;
+            if !crate::reclaim::is_reclaim_plan_digest(confirm) {
+                return Err(UsageError::Message(
+                    "artifact-use reconciliation --confirm must be a 64-character hexadecimal SHA-256".into(),
+                ));
+            }
+            Some(confirm.to_owned())
+        }
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown artifact-use reconciliation action {other:?}; expected plan or apply"
+            )));
+        }
+    };
+
+    let mut broker = open_broker(true)?;
+    let _lifecycle_claim =
+        if action == "apply" {
+            Some(broker.try_claim_worktree_lifecycle()?.ok_or_else(|| {
+                UsageError::Message("worktree lifecycle is busy; retry later".into())
+            })?)
+        } else {
+            None
+        };
+    let session = broker.store().session(session_id)?;
+    let checkout_root = PathBuf::from(&session.worktree_path);
+    let cohort = broker
+        .closed_artifact_checkout_cohort_for_session_readonly(
+            session_id,
+            &checkout_root,
+            None,
+        )?
+        .ok_or_else(|| {
+            UsageError::Message(
+                "the selected session does not have a complete, closed checkout cohort; no markers were changed".into(),
+            )
+        })?;
+
+    let cwd = std::env::current_dir()
+        .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;
+    let repository = crate::GitRepo::discover(&cwd)?;
+    let primary_root = repository.main_root()?;
+    let git_common_dir = repository.git_common_dir()?;
+    let repository_key = crate::host_state::repository_key(&primary_root, Some(&git_common_dir));
+    let host_database = broker.host_operation_database_path()?;
+    let registry = crate::worktree_registry::artifact_use_primary_root_witness_guard(
+        &host_database,
+        &primary_root,
+        &repository_key,
+    )?;
+
+    match action {
+        "plan" => {
+            let plan = crate::file_lock::artifact_use::plan_artifact_use_marker_reconciliation(
+                &primary_root,
+                &checkout_root,
+                session_id,
+                &cohort,
+                &registry,
+            )?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                render_artifact_use_reconcile_plan(&plan);
+            }
+        }
+        "apply" => {
+            let report = crate::file_lock::artifact_use::apply_artifact_use_marker_reconciliation(
+                &primary_root,
+                &checkout_root,
+                session_id,
+                &cohort,
+                &registry,
+                confirmed_digest.as_deref().expect("validated above"),
+            )?;
+            let stopped = report.stopped.as_ref().map(|stop| {
+                format!(
+                    "artifact-use reconciliation stopped at {} ({:?}): {}",
+                    stop.marker_filename, stop.kind, stop.reason
+                )
+            });
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                render_artifact_use_reconcile_report(&report);
+            }
+            if let Some(message) = stopped {
+                return Err(UsageError::Message(format!(
+                    "{message}; per-marker outcomes were emitted above"
+                )));
+            }
+        }
+        _ => unreachable!("action was validated above"),
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn run_gc_sweep_service(parsed: Parsed) -> Result<(), UsageError> {
     if parsed.read_only_snapshot {
@@ -1243,6 +1371,90 @@ fn run_gc_sweep_service(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
     Ok(())
+}
+
+fn render_artifact_use_reconcile_plan(
+    plan: &crate::file_lock::artifact_use::ArtifactUseReconcilePlan,
+) {
+    out!(
+        "Artifact-use marker reconciliation plan {} for session {}:",
+        plan.digest,
+        plan.selected_session_id
+    );
+    out!("  checkout: {}", plan.checkout_root.display());
+    out!(
+        "  closed aliases: {}",
+        plan.cohort
+            .session_ids()
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    for marker in &plan.markers {
+        match &marker.disposition {
+            crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::RemoveIfConfirmed => {
+                out!(
+                    "  candidate: {} (session {}, bytes SHA-256 {})",
+                    marker.filename,
+                    marker.session_id,
+                    marker.bytes_sha256
+                );
+            }
+            crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::Retain { reason } => {
+                out!("  retained: {} ({reason})", marker.filename);
+            }
+            crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::Unknown { reason } => {
+                out!("  unknown: {} ({reason})", marker.filename);
+            }
+        }
+    }
+    out!(
+        "  apply with: aethyme broker gc artifact-use reconcile apply {} --confirm {}",
+        plan.selected_session_id,
+        plan.digest
+    );
+}
+
+fn render_artifact_use_reconcile_report(
+    report: &crate::file_lock::artifact_use::ArtifactUseReconcileReport,
+) {
+    out!(
+        "Artifact-use reconciliation apply for plan {}:",
+        report.plan_digest
+    );
+    for outcome in &report.outcomes {
+        match &outcome.outcome {
+            crate::file_lock::artifact_use::ArtifactUseReconcileOutcomeKind::Removed {
+                directory_sync:
+                    crate::file_lock::artifact_use::ArtifactUseReconcileDirectorySync::Synced,
+            } => out!("  removed: {} (directory sync confirmed)", outcome.filename),
+            crate::file_lock::artifact_use::ArtifactUseReconcileOutcomeKind::Removed {
+                directory_sync:
+                    crate::file_lock::artifact_use::ArtifactUseReconcileDirectorySync::Unconfirmed,
+            } => out!(
+                "  removed: {} (directory sync unconfirmed)",
+                outcome.filename
+            ),
+            crate::file_lock::artifact_use::ArtifactUseReconcileOutcomeKind::Retained {
+                reason,
+            } => {
+                out!("  retained: {} ({reason})", outcome.filename);
+            }
+            crate::file_lock::artifact_use::ArtifactUseReconcileOutcomeKind::Unknown { reason } => {
+                out!("  unknown: {} ({reason})", outcome.filename);
+            }
+        }
+    }
+    if let Some(stop) = &report.stopped {
+        out!(
+            "  stopped at {} ({:?}): {}",
+            stop.marker_filename,
+            stop.kind,
+            stop.reason
+        );
+    }
+    out!("  checkout and broker records were not removed");
 }
 
 #[cfg(not(target_os = "macos"))]
