@@ -101,6 +101,8 @@ pub struct Bindings {
     pub ports: BTreeMap<String, u16>,
     /// Receipt per component that has one.
     pub receipts: BTreeMap<String, Value>,
+    /// Template id per component whose template was ensured (#1219).
+    pub template_ids: BTreeMap<String, String>,
 }
 
 /// The `AETHYME_ENV_*` variables plus the component's own `env`, for one
@@ -137,6 +139,9 @@ pub fn environment_variables(
             format!("AETHYME_ENV_RECEIPT_{}", env_suffix(name)),
             receipt.to_string(),
         );
+    }
+    if let Some(id) = bindings.template_ids.get(&component.name) {
+        vars.insert("AETHYME_ENV_TEMPLATE_ID".into(), id.clone());
     }
     for (key, value) in &component.env {
         vars.insert(key.clone(), value.clone());

@@ -249,6 +249,9 @@ pub struct ComponentSpec {
     /// E11: build cache inputs.
     #[serde(default)]
     pub cache_inputs: Vec<String>,
+    /// E11: the directory `build` produces, cached by input digest.
+    #[serde(default)]
+    pub build_output: Option<String>,
     #[serde(default)]
     pub cache_env: Vec<String>,
     #[serde(default)]
