@@ -319,6 +319,34 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool, full_scan: bool
             );
         });
     }
+    // The host environment build cache, this repository's part (#1275).
+    if let Some(cache) = &plan.environment_cache {
+        out!(
+            "  environment cache: {} in {} {} at {}; {} in use, {} reclaimable; {} {}; budget {} for the whole cache ({} used)",
+            human_bytes(cache.build_bytes),
+            cache.build_entries,
+            crate::broker::plural_word(cache.build_entries, "build", "builds"),
+            cache.root,
+            human_bytes(cache.in_use_bytes),
+            human_bytes(cache.reclaimable_bytes),
+            cache.template_entries,
+            crate::broker::plural_word(cache.template_entries, "template", "templates"),
+            human_bytes(cache.budget_bytes),
+            human_bytes(cache.host_total_bytes),
+        );
+        if let Some(reason) = &cache.refused {
+            out!("    nothing proposed: {reason}");
+        }
+        render_capped(&plan.environment_caches, GC_LIST_CAP, detail, |entry| {
+            out!(
+                "    reclaimable {}/{} ({}) — {}",
+                entry.component,
+                entry.digest,
+                human_bytes(entry.estimated_bytes),
+                entry.reason,
+            );
+        });
+    }
     for warning in &plan.retention_config_warnings {
         out!("  retention warning: {warning}");
     }
@@ -603,6 +631,7 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool, full_scan: bool
         && plan.artifacts.is_empty()
         && plan.orphans.is_empty()
         && plan.gate_caches.is_empty()
+        && plan.environment_caches.is_empty()
         && plan.checkpoint_pin_releases.is_empty()
         && plan.publication_exposure_expiries.is_empty()
         && plan.recovery_archives.is_empty()
@@ -646,6 +675,9 @@ pub(super) fn render_gc_apply(report: &crate::GcApplyReport) {
     );
     for archive in &report.recovery_archives_removed {
         out!("  recovery archive removed: {archive}");
+    }
+    for entry in &report.environment_caches_reclaimed {
+        out!("  environment cache entry evicted: {entry}");
     }
     for failure in &report.failures {
         out!("  retained: {failure}");

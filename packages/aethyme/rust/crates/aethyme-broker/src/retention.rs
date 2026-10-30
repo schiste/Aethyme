@@ -781,6 +781,51 @@ pub struct GcPublicationExposureExpiry {
     pub reason: String,
 }
 
+/// One unused entry of the host's environment build cache that belongs to
+/// this repository and a reviewed `gc apply` may evict (#1275).
+///
+/// Chosen by the rule `env cache prune` applies: least recently used unused
+/// builds while the whole cache is over its budget. Every field is part of
+/// the authorization digest: an entry used between plan and apply has a new
+/// `last_used_at_ms`, and approving the eviction of an idle build is not
+/// approving the eviction of one that just became warm again.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcEnvironmentCacheCandidate {
+    pub path: String,
+    pub component: String,
+    pub digest: String,
+    pub estimated_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_inodes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at_ms: Option<i64>,
+    pub reason: String,
+}
+
+/// This repository's part of the host environment cache, as `gc plan` found
+/// it (#1275). Reporting only: the digest covers
+/// [`GcPlan::environment_caches`], never this.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GcEnvironmentCacheInventory {
+    /// `<host state>/environments/cache/builds/<repository>`.
+    pub root: String,
+    /// The whole cache's budget, shared by every repository.
+    pub budget_bytes: u64,
+    /// Every repository's builds, which the budget is measured against.
+    pub host_total_bytes: u64,
+    pub build_entries: usize,
+    pub build_bytes: u64,
+    pub in_use_entries: usize,
+    pub in_use_bytes: u64,
+    pub reclaimable_bytes: u64,
+    /// Provision templates live outside Aethyme and hold no bytes here; only
+    /// `env cache prune --all` evicts them, through `template_destroy`.
+    pub template_entries: usize,
+    /// Set when nothing is proposed because live use could not be known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+}
+
 /// An aggregate view of the protections in a GC plan.
 ///
 /// The individual blocker list remains the authoritative explanation for each
@@ -846,6 +891,10 @@ pub struct GcPlan {
     /// may remove, least recently used first (#295).
     #[serde(default)]
     pub gate_caches: Vec<GcGateCacheCandidate>,
+    /// Unused entries of the host environment build cache that belong to
+    /// this repository, least recently used first (#1275).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environment_caches: Vec<GcEnvironmentCacheCandidate>,
     pub blockers: Vec<GcBlocker>,
     /// Recovery archives a reviewed `gc apply` may remove. Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -898,6 +947,10 @@ pub struct GcPlan {
     /// per-user cache directory cannot be resolved at all.
     #[serde(default)]
     pub gate_cache: Option<GcGateCacheInventory>,
+    /// This repository's part of the host environment cache. `None` when it
+    /// has none, or the host state directory cannot be resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_cache: Option<GcEnvironmentCacheInventory>,
     /// Regenerable build output this plan would remove: build caches in
     /// finished sessions' worktrees plus gate cache candidates. Already part
     /// of `estimated_reclaimable_bytes`; broken out because it is the figure a
@@ -1054,6 +1107,8 @@ pub struct GcApplyReport {
     pub orphans_removed: Vec<String>,
     /// Gate cache entries removed, as paths.
     pub gate_caches_reclaimed: Vec<String>,
+    /// Environment build cache entries evicted, as paths (#1275).
+    pub environment_caches_reclaimed: Vec<String>,
     pub checkpoint_pins_released: Vec<i64>,
     pub publication_exposures_expired: Vec<i64>,
     /// Recovery archives removed, as paths.
@@ -1151,6 +1206,8 @@ impl GcPlan {
             // Omitted when empty for the same reason as gate caches.
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             recovery_archives: &'a [GcRecoveryArchiveCandidate],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            environment_caches: &'a [GcEnvironmentCacheCandidate],
             blockers: &'a [GcBlocker],
             checkpoint_pin_releases: &'a [GcCheckpointPinRelease],
             publication_exposure_expiries: &'a [GcPublicationExposureExpiry],
@@ -1166,6 +1223,7 @@ impl GcPlan {
             orphans: &self.orphans,
             gate_caches: &self.gate_caches,
             recovery_archives: &self.recovery_archives,
+            environment_caches: &self.environment_caches,
             blockers: &self.blockers,
             checkpoint_pin_releases: &self.checkpoint_pin_releases,
             publication_exposure_expiries: &self.publication_exposure_expiries,
