@@ -50,15 +50,19 @@ Checkout capacity is configured with `[worktrees] max_checkouts = <count>` in
 may not change the effective cap: land the configuration and refresh upstream
 before claiming it is active. Keep a finite limit while reclaiming a backlog;
 raising capacity does not reclaim storage. For closed checkouts, targeted
-`broker finish cleanup <session-id> --json` avoids the bulk plan's recursive
-size inventory while retaining fresh delivery and live-owner checks. From v0.8.33, default cleanup treats every Git-ignored directory as disposable
+`broker finish cleanup <session-id> --json` immediately applies cleanup; it is
+not a preview, and `--json` changes only the output format. It avoids the bulk
+plan's recursive size inventory while retaining fresh delivery and live-owner
+checks. Use the bulk plan below when only inspecting eligibility. From v0.8.33, default cleanup treats every Git-ignored directory as disposable
 without inspecting its contents, including saved records and datasets. Preserve
 irreplaceable evidence outside disposable checkouts before closing them, or set
 `[cleanup] strict = true` in the primary checkout to retain ignored leftovers and
 pause automatic artifact sweeps. `auto_remove = false` only disables whole-checkout
 removal. Never use `--force` merely to clear a capacity refusal.
-For `finish cleanup resolve --archive --json`, exit status zero can mean the
-archive succeeded while checkout removal failed. Check `worktree_removed` and
+`finish cleanup resolve <session-id> --archive --json` previews the archive
+resolution without creating an archive or removing a checkout; apply only with
+the reviewed plan's full `--confirm <sha256>`. On an applied archive resolution,
+exit status zero can mean the archive succeeded while checkout removal failed. Check `worktree_removed` and
 `cleanup_error`, verify the checkout is absent, and retain the archive before
 reporting reclaimed storage. A partial removal needs inspection, not a blind
 retry or forced deletion.
@@ -462,7 +466,9 @@ blocked.
    `aethyme broker finish cleanup <id>`. Operators can periodically review all
    retained broker-owned worktrees with
    `aethyme broker finish cleanup --all-cleaned` and apply the unchanged plan
-   explicitly with `aethyme broker finish cleanup --all-cleaned --apply`.
+   explicitly with `aethyme broker finish cleanup --all-cleaned --apply --confirm
+   <sha256>` using the reviewed plan's full digest. Omitting `--apply` is the
+   bulk preview; single-session cleanup applies immediately.
 
    For a storage audit, reconcile broker session paths, `git worktree list
    --porcelain`, and directories under current and historical roots on every

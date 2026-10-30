@@ -311,6 +311,10 @@ pub struct SharedSpec {
     pub idle_seconds: Option<u64>,
     #[serde(default)]
     pub min_redeploy_interval_seconds: Option<u64>,
+    /// Holds data a second slot would not have (a database): never
+    /// redeployed blue/green, only by the in-place hold-and-swap.
+    #[serde(default)]
+    pub stateful: bool,
 }
 
 /// Host-scoped settings: `<host state>/environments.toml`. Only host pool

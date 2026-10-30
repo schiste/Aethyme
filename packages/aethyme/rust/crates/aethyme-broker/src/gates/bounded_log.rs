@@ -68,10 +68,11 @@ const READ_BUFFER_BYTES: usize = 8 * 1024;
 #[cfg(unix)]
 const POLL_INTERVAL_MS: i32 = 50;
 
+const NON_CACHEABLE_TEST_TIMEOUT_PATTERNS: &[&str] =
+    &["timed out", "timeout exceeded", "command timed out"];
+const TEST_TIMEOUT_EVIDENCE_MARKER: &[u8] = b"aethyme: test timeout text observed in complete ";
+
 const CLASSIFIER_PATTERNS: &[&str] = &[
-    "timed out",
-    "timeout exceeded",
-    "command timed out",
     "no space left on device",
     "database is locked",
     "resource busy",
@@ -99,6 +100,21 @@ const CLASSIFIER_PATTERNS: &[&str] = &[
     "cannot execute",
     "could not compile",
 ];
+
+pub(crate) fn has_test_timeout_text(path: &Path) -> bool {
+    let Ok(mut bytes) = std::fs::read(path) else {
+        return false;
+    };
+    bytes.make_ascii_lowercase();
+
+    NON_CACHEABLE_TEST_TIMEOUT_PATTERNS.iter().any(|pattern| {
+        bytes
+            .windows(pattern.len())
+            .any(|window| window == pattern.as_bytes())
+    }) || bytes
+        .windows(TEST_TIMEOUT_EVIDENCE_MARKER.len())
+        .any(|window| window == TEST_TIMEOUT_EVIDENCE_MARKER)
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct CaptureSummary {
@@ -311,6 +327,11 @@ impl BoundedGateLog {
                 footer.push_str(&matched.join("; "));
                 footer.push('\n');
             }
+            if self.matcher.saw_test_timeout_text() {
+                footer.push_str("aethyme: test timeout text observed in complete ");
+                footer.push_str(self.output_kind);
+                footer.push_str(" stream\n");
+            }
             footer.truncate(footer.len().min(FOOTER_RESERVE_BYTES));
             self.try_write_file_bytes(footer.as_bytes());
             // The reserved space guarantees the complete tail fits unless an
@@ -355,6 +376,7 @@ impl BoundedGateLog {
 
 const DFA_COLUMNS: usize = 128;
 const MAX_DFA_STATES: usize = 475;
+const MAX_TEST_TIMEOUT_DFA_STATES: usize = 64;
 const NO_DFA_STATE: u16 = u16::MAX;
 
 struct DfaNode {
@@ -378,76 +400,92 @@ struct PatternDfa {
 }
 
 static CLASSIFIER_DFA: OnceLock<PatternDfa> = OnceLock::new();
+static NON_CACHEABLE_TEST_TIMEOUT_DFA: OnceLock<PatternDfa> = OnceLock::new();
 
 fn classifier_dfa() -> &'static PatternDfa {
-    CLASSIFIER_DFA.get_or_init(|| {
-        let mut nodes = Vec::with_capacity(MAX_DFA_STATES);
-        nodes.push(DfaNode::new());
+    CLASSIFIER_DFA.get_or_init(|| build_dfa(CLASSIFIER_PATTERNS, MAX_DFA_STATES, "classifier"))
+}
 
-        for (pattern_index, pattern) in CLASSIFIER_PATTERNS.iter().enumerate() {
-            let mut state = 0usize;
-            for byte in pattern.bytes() {
-                let column = byte.to_ascii_lowercase() as usize;
-                debug_assert!(column < DFA_COLUMNS);
-                let next = nodes[state].transitions[column];
-                state = if next == NO_DFA_STATE {
-                    assert!(
-                        nodes.len() < MAX_DFA_STATES,
-                        "classifier DFA state cap exceeded"
-                    );
-                    let next = u16::try_from(nodes.len()).expect("classifier DFA fits in u16");
-                    nodes[state].transitions[column] = next;
-                    nodes.push(DfaNode::new());
-                    next as usize
-                } else {
-                    next as usize
-                };
-            }
-            nodes[state].outputs |= 1u64 << pattern_index;
-        }
+fn non_cacheable_test_timeout_dfa() -> &'static PatternDfa {
+    NON_CACHEABLE_TEST_TIMEOUT_DFA.get_or_init(|| {
+        build_dfa(
+            NON_CACHEABLE_TEST_TIMEOUT_PATTERNS,
+            MAX_TEST_TIMEOUT_DFA_STATES,
+            "non-cacheable test-timeout",
+        )
+    })
+}
 
-        let mut pending = VecDeque::with_capacity(nodes.len());
-        for column in 0..DFA_COLUMNS {
-            let next = nodes[0].transitions[column];
-            if next == NO_DFA_STATE {
-                nodes[0].transitions[column] = 0;
+fn build_dfa(patterns: &[&str], max_states: usize, kind: &str) -> PatternDfa {
+    assert!(
+        patterns.len() <= u64::BITS as usize,
+        "DFA pattern mask is too small"
+    );
+    let mut nodes = Vec::with_capacity(max_states);
+    nodes.push(DfaNode::new());
+
+    for (pattern_index, pattern) in patterns.iter().enumerate() {
+        let mut state = 0usize;
+        for byte in pattern.bytes() {
+            let column = byte.to_ascii_lowercase() as usize;
+            debug_assert!(column < DFA_COLUMNS);
+            let next = nodes[state].transitions[column];
+            state = if next == NO_DFA_STATE {
+                assert!(nodes.len() < max_states, "{kind} DFA state cap exceeded");
+                let next = u16::try_from(nodes.len()).expect("pattern DFA fits in u16");
+                nodes[state].transitions[column] = next;
+                nodes.push(DfaNode::new());
+                next as usize
             } else {
-                nodes[next as usize].failure = 0;
+                next as usize
+            };
+        }
+        nodes[state].outputs |= 1u64 << pattern_index;
+    }
+
+    let mut pending = VecDeque::with_capacity(nodes.len());
+    for column in 0..DFA_COLUMNS {
+        let next = nodes[0].transitions[column];
+        if next == NO_DFA_STATE {
+            nodes[0].transitions[column] = 0;
+        } else {
+            nodes[next as usize].failure = 0;
+            pending.push_back(next);
+        }
+    }
+
+    while let Some(state) = pending.pop_front() {
+        let state_index = state as usize;
+        let failure_index = nodes[state_index].failure as usize;
+        nodes[state_index].outputs |= nodes[failure_index].outputs;
+
+        for column in 0..DFA_COLUMNS {
+            let next = nodes[state_index].transitions[column];
+            if next == NO_DFA_STATE {
+                nodes[state_index].transitions[column] = nodes[failure_index].transitions[column];
+            } else {
+                nodes[next as usize].failure = nodes[failure_index].transitions[column];
                 pending.push_back(next);
             }
         }
+    }
 
-        while let Some(state) = pending.pop_front() {
-            let state_index = state as usize;
-            let failure_index = nodes[state_index].failure as usize;
-            nodes[state_index].outputs |= nodes[failure_index].outputs;
-
-            for column in 0..DFA_COLUMNS {
-                let next = nodes[state_index].transitions[column];
-                if next == NO_DFA_STATE {
-                    nodes[state_index].transitions[column] =
-                        nodes[failure_index].transitions[column];
-                } else {
-                    nodes[next as usize].failure = nodes[failure_index].transitions[column];
-                    pending.push_back(next);
-                }
-            }
-        }
-
-        debug_assert!(nodes.len() <= MAX_DFA_STATES);
-        PatternDfa { nodes }
-    })
+    debug_assert!(nodes.len() <= max_states);
+    PatternDfa { nodes }
 }
 
 #[derive(Default)]
 struct PatternMatcher {
     state: u16,
     matched: u64,
+    timeout_state: u16,
+    saw_test_timeout_text: bool,
 }
 
 impl PatternMatcher {
     fn feed(&mut self, bytes: &[u8]) {
         let dfa = classifier_dfa();
+        let timeout_dfa = non_cacheable_test_timeout_dfa();
         for byte in bytes {
             let folded = byte.to_ascii_lowercase();
             self.state = if folded.is_ascii() {
@@ -456,6 +494,13 @@ impl PatternMatcher {
                 0
             };
             self.matched |= dfa.nodes[self.state as usize].outputs;
+            self.timeout_state = if folded.is_ascii() {
+                timeout_dfa.nodes[self.timeout_state as usize].transitions[folded as usize]
+            } else {
+                0
+            };
+            self.saw_test_timeout_text |=
+                timeout_dfa.nodes[self.timeout_state as usize].outputs != 0;
         }
     }
 
@@ -468,11 +513,19 @@ impl PatternMatcher {
             })
             .collect()
     }
+
+    fn saw_test_timeout_text(&self) -> bool {
+        self.saw_test_timeout_text
+    }
 }
 
 #[cfg(test)]
 mod classifier_tests {
-    use super::{CLASSIFIER_PATTERNS, DFA_COLUMNS, MAX_DFA_STATES, PatternMatcher, classifier_dfa};
+    use super::{
+        CLASSIFIER_PATTERNS, DFA_COLUMNS, MAX_DFA_STATES, MAX_TEST_TIMEOUT_DFA_STATES,
+        NON_CACHEABLE_TEST_TIMEOUT_PATTERNS, PatternMatcher, classifier_dfa,
+        non_cacheable_test_timeout_dfa,
+    };
 
     fn oracle_mask(input: &[u8]) -> u64 {
         let lowered: Vec<u8> = input.iter().map(u8::to_ascii_lowercase).collect();
@@ -529,6 +582,7 @@ mod classifier_tests {
     fn dfa_stays_within_the_fixed_dense_table_bounds() {
         let dfa = classifier_dfa();
         assert!(dfa.nodes.len() <= MAX_DFA_STATES);
+        assert!(non_cacheable_test_timeout_dfa().nodes.len() <= MAX_TEST_TIMEOUT_DFA_STATES);
         assert_eq!(DFA_COLUMNS, 128);
         assert!(
             dfa.nodes
@@ -556,26 +610,13 @@ mod classifier_tests {
     #[test]
     fn overlapping_patterns_and_ascii_folding_match_the_reference() {
         for input in [
-            b"COMMAND TIMED OUT".as_slice(),
-            b"x: COMMAND NOT FOUND; command not found",
-            b"prefix TARGET/DEBUG suffix",
-            b"NO SPACE LEFT ON DEVICE and no space left on device",
+            &b"x: COMMAND NOT FOUND; command not found"[..],
+            &b"prefix TARGET/DEBUG suffix"[..],
+            &b"NO SPACE LEFT ON DEVICE and no space left on device"[..],
         ] {
             let expected = oracle_mask(input);
             assert_eq!(matcher_mask_with_chunks(input, &[1, 2, 3, 5]), expected);
         }
-
-        let overlap = oracle_mask(b"command timed out");
-        let timed_out = CLASSIFIER_PATTERNS
-            .iter()
-            .position(|p| *p == "timed out")
-            .unwrap();
-        let command_timed_out = CLASSIFIER_PATTERNS
-            .iter()
-            .position(|p| *p == "command timed out")
-            .unwrap();
-        assert_ne!(overlap & (1u64 << timed_out), 0);
-        assert_ne!(overlap & (1u64 << command_timed_out), 0);
 
         let nested = oracle_mask(b": command not found");
         let colon_command = CLASSIFIER_PATTERNS
@@ -588,6 +629,24 @@ mod classifier_tests {
             .unwrap();
         assert_ne!(nested & (1u64 << colon_command), 0);
         assert_ne!(nested & (1u64 << command), 0);
+    }
+
+    #[test]
+    fn timeout_text_is_tracked_separately_from_classifier_evidence() {
+        for pattern in NON_CACHEABLE_TEST_TIMEOUT_PATTERNS {
+            for bytes in [pattern.as_bytes().to_vec(), alternating_case(pattern)] {
+                for split in 0..=bytes.len() {
+                    let mut matcher = PatternMatcher::default();
+                    matcher.feed(&bytes[..split]);
+                    matcher.feed(&bytes[split..]);
+                    assert!(matcher.saw_test_timeout_text(), "pattern {pattern:?}");
+                    assert!(
+                        matcher.matched_patterns().is_empty(),
+                        "timeout text appeared as classifier evidence: {pattern:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -824,6 +883,26 @@ mod tests {
             &path
         ));
         assert!(saved.ends_with(&"z".repeat(MAX_TAIL_BYTES)));
+    }
+
+    #[test]
+    fn truncated_timeout_text_is_not_written_as_classifier_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("gate.log");
+        let mut log = BoundedGateLog::create(&path).unwrap();
+        let mut output = vec![b'a'; PREFIX_BUDGET_BYTES + MAX_TAIL_BYTES + 128];
+        let timeout_text = b"Test timed out in 5000ms";
+        let timeout_at = PREFIX_BUDGET_BYTES + 64;
+        output[timeout_at..timeout_at + timeout_text.len()].copy_from_slice(timeout_text);
+        output.extend(std::iter::repeat_n(b'z', MAX_TAIL_BYTES));
+        log.record_output(&output);
+        log.finish();
+
+        let saved = std::fs::read(&path).unwrap();
+        let saved = String::from_utf8_lossy(&saved);
+        assert!(saved.contains("test timeout text observed in complete gate stream"));
+        assert!(!saved.contains("classifier evidence observed in complete gate stream: timed out"));
+        assert!(has_test_timeout_text(&path));
     }
 
     #[test]

@@ -748,6 +748,7 @@ fn attach_shared(
             &lifecycle.root,
             &name,
             &record,
+            Some(super::proxy::proxy_port()),
         ));
     }
     for component in &mut snapshot.components {
@@ -1044,6 +1045,27 @@ pub struct LifecycleWork {
     pub proxy_started: bool,
     /// When the last resource sample was taken (#1218).
     pub last_sample: Option<std::time::Instant>,
+    /// Shared-environment sync runs off the tick (#1274): a redeploy waits
+    /// for health for up to its wake timeout, which must never delay lease
+    /// renewal. At most one runs at a time.
+    pub shared_sync: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LifecycleWork {
+    /// Start `job` on its own thread unless the previous one is still
+    /// running. Returns whether it started.
+    pub fn start_shared_sync(&mut self, job: impl FnOnce() + Send + 'static) -> bool {
+        if self.shared_sync.as_ref().is_some_and(|h| !h.is_finished()) {
+            return false;
+        }
+        if let Some(finished) = self.shared_sync.take()
+            && finished.join().is_err()
+        {
+            eprintln!("warning: aethyme env supervisor: shared environment sync panicked");
+        }
+        self.shared_sync = Some(std::thread::spawn(job));
+        true
+    }
 }
 
 /// Start the wake-on-request proxy on loopback in this (supervisor)
@@ -1102,7 +1124,11 @@ impl super::supervisor::SupervisorWork for LifecycleWork {
                 "park idle environments",
                 lifecycle.park_idle(super::activity::now_ms()),
             );
-            sync_shared_environments(&mut lifecycle);
+            self.start_shared_sync(|| {
+                if let Ok((mut lifecycle, _)) = open("supervisor shared sync", false) {
+                    sync_shared_environments(&mut lifecycle);
+                }
+            });
             if self
                 .last_sample
                 .is_none_or(|at| at.elapsed() >= super::metrics::SAMPLE_INTERVAL)
