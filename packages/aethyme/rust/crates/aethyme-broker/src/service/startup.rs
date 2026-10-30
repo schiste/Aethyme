@@ -84,12 +84,20 @@ fn probe(location: &ServiceDirectory) -> io::Result<Option<Pong>> {
 struct StartingChild(Option<Child>);
 
 impl StartingChild {
-    fn detach(mut self) {
-        if let Some(mut child) = self.0.take() {
-            thread::spawn(move || {
-                crate::warn_unrecorded("reap broker service", child.wait());
-            });
-        }
+    fn detach(self) -> io::Result<()> {
+        // If thread creation fails, dropping the closure also drops the owned
+        // startup guard, stopping and reaping the child rather than leaking it.
+        drop(
+            thread::Builder::new()
+                .name("broker-service-reaper".into())
+                .spawn(move || {
+                    let mut owned = self;
+                    if let Some(child) = &mut owned.0 {
+                        crate::warn_unrecorded("reap broker service", child.wait());
+                    }
+                })?,
+        );
+        Ok(())
     }
 }
 
@@ -202,7 +210,7 @@ pub fn ensure(root: &Path, repository: &Path, executable: &Path) -> io::Result<E
                 validate()?;
                 let started = health.pid == pid;
                 if started {
-                    child.detach();
+                    child.detach()?;
                 }
                 return Ok(EnsureReport {
                     location,
