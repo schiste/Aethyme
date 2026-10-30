@@ -81,6 +81,14 @@ habit that costs one agent a minute costs a fleet an hour.
   and finishes in minutes.** Anything heavier belongs once per merge batch or
   once per release. With one agent an unscoped required check is an annoyance;
   with several it becomes the dominant cost and serialises the fleet.
+
+After importing helper commits or otherwise changing Rust, run the
+repository-configured formatter check on every changed `.rs` file using
+the owning crate's Rust edition. `git diff --check` checks whitespace
+only; it does not validate Rust formatting. Respect declared resource and
+validation limits; list each required check left unrun and why rather than
+implying it passed.
+
 - **Cherry-picking to patch an already-certified release is standard;
   cherry-picking to assemble a release from trunk is not.** Assembling produces
   a combination nobody tested, and hides dependencies between the changes being
