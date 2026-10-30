@@ -2896,6 +2896,21 @@ pub(crate) fn delivery_targets_prefer_exact<'a>(
         )
 }
 
+/// An exact bundled root needs no additional current-delivery ancestry proof.
+/// The caller still verifies the archive payload and advertised bundle roots.
+fn recovery_root_is_available(
+    reference: &str,
+    object_id: &str,
+    bundled_roots: &std::collections::BTreeSet<(String, String)>,
+    check_delivery: impl FnOnce() -> Result<bool, String>,
+) -> Result<bool, String> {
+    if bundled_roots.contains(&(reference.to_owned(), object_id.to_owned())) {
+        Ok(true)
+    } else {
+        check_delivery()
+    }
+}
+
 fn root_available_from_delivery(
     repository: &GitRepo,
     object_id: &str,
@@ -3909,9 +3924,9 @@ fn verify_recovery_archive_payload_for_plan_until(
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
         for (reference, object_id) in &identities {
-            if !root_available_from_delivery(repository, object_id, &plan.delivery_targets)?
-                && !bundled_roots.contains(&(reference.clone(), object_id.clone()))
-            {
+            if !recovery_root_is_available(reference, object_id, &bundled_roots, || {
+                root_available_from_delivery(repository, object_id, &plan.delivery_targets)
+            })? {
                 return Err(format!(
                     "schema v6 archive neither currently delivers nor bundles required root {reference} at {object_id}"
                 ));
@@ -5877,6 +5892,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exact_bundled_root_skips_even_a_failing_delivery_probe() {
+        let roots = [("refs/heads/session".into(), "session-oid".into())].into();
+        assert_eq!(
+            recovery_root_is_available("refs/heads/session", "session-oid", &roots, || {
+                panic!("an exact bundled root must not need a delivery ancestry probe")
+            }),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn bundled_root_fast_path_requires_both_ref_and_object_identity() {
+        let roots = [("refs/heads/session".into(), "session-oid".into())].into();
+        for (reference, object_id) in [
+            ("refs/heads/other", "session-oid"),
+            ("refs/heads/session", "different-oid"),
+        ] {
+            let calls = std::cell::Cell::new(0);
+            assert_eq!(
+                recovery_root_is_available(reference, object_id, &roots, || {
+                    calls.set(calls.get() + 1);
+                    Ok(false)
+                }),
+                Ok(false)
+            );
+            assert_eq!(calls.get(), 1);
+        }
+    }
+
+    #[test]
+    fn unbundled_root_preserves_delivery_success_and_probe_failure() {
+        let roots = std::collections::BTreeSet::new();
+        assert_eq!(
+            recovery_root_is_available("ref", "oid", &roots, || Ok(true)),
+            Ok(true)
+        );
+        assert_eq!(
+            recovery_root_is_available("ref", "oid", &roots, || Err("Git unavailable".into())),
+            Err("Git unavailable".into())
+        );
+    }
+
+    #[test]
     fn plan_ancestry_memo_caches_verdicts_but_retries_errors() {
         let memo = PlanAncestryMemo::default();
         let errors = std::cell::Cell::new(0);
@@ -6955,6 +7013,43 @@ mod tests {
                 object_id
             );
         }
+    }
+
+    #[test]
+    fn v6_bundled_root_still_requires_the_verified_bundle_to_hold_it() {
+        let (_owner, repository, _storage, mut broker, session, _worktree, _base, _head, _branch) =
+            closed_unique_commit_fixture("v6 bundled root membership remains required");
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        let outcome = broker
+            .cleanup_resolve_retirement_apply(session.id, &plan.digest, false)
+            .unwrap();
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        broker.owned_recovery_archive(&outcome.archive).unwrap();
+
+        let replacement = _owner.path().join("bundle-without-session-root");
+        let bundle = isolated_git_output(
+            &repository,
+            &["bundle", "create", replacement.to_str().unwrap(), "HEAD"],
+        );
+        assert!(bundle.status.success(), "{bundle:?}");
+        let bundle_path = outcome.archive.join(BUNDLE_FILE);
+        std::fs::copy(replacement, &bundle_path).unwrap();
+        let bytes = std::fs::read(&bundle_path).unwrap();
+        let manifest_path = outcome.archive.join(MANIFEST_FILE);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["schema_version"], serde_json::json!(6));
+        manifest["bundle_bytes"] = serde_json::json!(bytes.len() as u64);
+        manifest["bundle_sha256"] = serde_json::json!(sha256_hex(&bytes));
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = broker.owned_recovery_archive(&outcome.archive).unwrap_err();
+        assert!(error.contains("does not hold"), "{error}");
     }
 
     #[test]
