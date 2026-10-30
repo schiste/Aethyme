@@ -146,7 +146,8 @@ cross-database claims cannot update progress or completion. Progress is shared,
 bounded and cannot move backwards. Completion persists either a JSON result
 (at most one MiB), failure message or worker-acknowledged cancellation. Messages
 are at most 4096 bytes. These internal records are not the socket v1 response
-schema; large result transport and retention remain follow-up work.
+schema; the dependent worker adds chunked transport below. Retention remains
+follow-up work.
 
 The states are `queued`, `running`, `interrupted`, `succeeded`, `failed`,
 `cancelled` and `expired`. Queued jobs whose deadline elapsed become expired
@@ -175,3 +176,135 @@ execution deadline enforcement and a bounded scheduling policy first.
 - Unknown outcomes are reconciled, never silently retried.
 - Version mismatch fails clearly; rollback cannot produce two authorities.
 - Playground load runs measure process count, latency and resource use.
+
+## Opt-in GC planning worker
+
+The dependent worker phase enables jobs only with:
+
+```sh
+aethyme broker advanced service serve /private/tmp/aethyme-service-example --jobs-for /absolute/repository
+```
+
+The repository must already have a valid broker database and verified repository
+UUID. Startup uses a compatibility snapshot, without initializing the repository
+or running normal startup maintenance. The service resolves the main repository,
+Git common directory and database itself; clients cannot choose those paths or
+supply commands. Linked worktrees resolve to the same configured repository.
+Plain `serve` and v1 `ping` retain their health-only behavior and never open job
+storage. Existing `gc plan`, cleanup continuations, monitoring and other broker
+commands still run directly; default discovery and routing are not enabled.
+
+One scheduler executes GC plans serially while independent bounded handlers serve
+health and job requests. Jobs only inspect and plan: the worker calls the existing
+planner with its cooperative deadline, including its observational size-cache
+updates, and never calls GC apply or startup recovery. `full_scan` uses the job's
+budget instead of the normal ten-second planning budget. Filesystem or SQLite
+calls already in progress may outlive a cooperative deadline; partial plans retain
+the planner's incomplete/deferred fields. No hard operating-system timeout is
+claimed. Running cancellation records intent and is acknowledged only after the
+planner returns. Cancelling affects every joiner. A planner error or unwind is
+recorded as failure; it is never automatically retried.
+
+For example, choose a unique request key and an absolute Unix-millisecond job
+deadline within the next 30 minutes, and retain both exact values:
+
+```sh
+aethyme broker advanced service submit /private/tmp/aethyme-service-example --request-key my-plan-1 --deadline-ms <utc-ms> --json
+aethyme broker advanced service lookup /private/tmp/aethyme-service-example my-plan-1 --json
+aethyme broker advanced service status /private/tmp/aethyme-service-example <job-id> --json
+aethyme broker advanced service result /private/tmp/aethyme-service-example <job-id> --json
+aethyme broker advanced service cancel /private/tmp/aethyme-service-example <job-id> --json
+```
+
+Submit also accepts `--full-scan` and `--include-active-gate-cache`. Submit,
+lookup, status and cancel emit the v2 Response envelope below with or without
+`--json`; result assembles bounded chunks and emits the successful plan JSON
+itself. A refused request or unavailable endpoint exits nonzero. Invalid syntax
+fails before filesystem or socket work. A lost submission reply is ambiguous:
+lookup the same request key or resubmit the exact original inputs. Never create
+new work through a local fallback. A fresh key joins an identical outstanding
+operation and deadline; expired historical keys still recover the original job.
+At most 128 outstanding rows are admitted per service repository; retained
+interrupted jobs count toward this bound. Completed history has no automatic
+pruning in this phase.
+
+### Protocol v2
+
+V1 health remains unchanged. V2 uses the same 65,536-byte JSON-line framing,
+absolute read deadlines and one request/response per connection. Every field
+shown is required; unknown or duplicate fields and unknown methods are refused.
+
+```json
+{"protocol_version":2,"request_id":42,"method":{"kind":"submit","idempotency_key":"my-plan-1","operation":{"kind":"gc_plan","include_active_gate_cache":false,"full_scan":false},"deadline_ms":1793376000000}}
+```
+
+Other method objects are `{"kind":"lookup","idempotency_key":"my-plan-1"}`,
+`{"kind":"status","job_id":1}`, `{"kind":"cancel","job_id":1}` and
+`{"kind":"result_chunk","job_id":1,"offset":0}`. Offsets are UTF-8 byte
+positions in the serialized successful plan. Requests cannot apply a plan.
+
+Every v2 response has `protocol_version: 2`, the original `request_id`, and
+`result: {"Ok": <reply>}` or `result: {"Err": {"code": "...", "message": "..."}}`.
+Reply objects have these exact shapes:
+
+- `{"kind":"submitted","job":<status>,"joined":false}`.
+- `{"kind":"lookup","job":<status-or-null>}`; null means no durable key match.
+- `{"kind":"status","job":<status>}`.
+- `{"kind":"cancel_requested","job":<status>}`; this is not a promise that
+  running work has stopped.
+- `{"kind":"result_chunk","job_id":1,"offset":0,"next_offset":8192,"complete":false,"data":"..."}`.
+
+A status always contains `id`, `operation`, `state`, `deadline_ms`,
+`created_at_ms`, `updated_at_ms`, `cancellation_requested`, `progress` and
+`completion`. Timestamps are Unix milliseconds; operation and state use the
+store contracts above. Progress is null until published, otherwise
+`{"completed":0,"total":null,"message":"..."}`; an unknown total is null.
+Completion is null until a terminal completion, otherwise
+`{"kind":"succeeded"}`, `{"kind":"failed","message":"..."}` or
+`{"kind":"cancelled"}`. Expired/interrupted rows have no completion. Status
+never embeds a successful plan or repository paths. All fields are present,
+including nulls; there are no omission-dependent defaults.
+
+Each result chunk contains at most 8192 bytes of UTF-8 text before JSON escaping.
+`next_offset` equals `offset + data.len()` in bytes; `complete` means end of the
+serialized plan. An empty final chunk is valid at the exact end. Invalid offsets
+are refused; a nonsuccessful job returns `not_ready`. Clients validate reply
+version, correlation, job ID, contiguous offsets and total size (one MiB).
+
+V2 error codes are `jobs_disabled`, `invalid_request`, `idempotency_conflict`,
+`not_found`, `not_ready`, `unavailable` and `internal`; diagnostic messages are
+not discriminators. A valid v2 method on plain health-only serve receives
+`jobs_disabled`. Unsupported versions still receive the v1
+`unsupported_protocol` envelope, and v2 clients refuse the version mismatch.
+Malformed v2 method bodies with a readable header receive `invalid_request`;
+malformed framing or headers close the connection without execution. Overload
+or a lost response never proves whether a submission committed.
+
+### Durable ownership, restart and rollback
+
+Jobs are stored in a separate private `broker-service-jobs.sqlite` file under
+the explicitly selected runtime directory. A private context file binds the
+repository UUID and canonical paths, repository/common-directory filesystem
+identities, job database inode, runtime-directory inode and permanent lock inode
+to a random worker generation. Existing sidecars and context files must be
+private, regular, owned, single-link files. Symlinks and replacements are refused
+without deleting the unexpected data. The directory/lock/database identities
+are rechecked for every store access. The lock remains held through worker and
+client drain, including outstanding runtime handles.
+
+After acquiring that exact retained lock and verifying context, restart marks
+the previous generation's running jobs interrupted before accepting requests.
+Interrupted jobs keep their original IDs and cannot be claimed again. Queued
+jobs may run once; completed results remain readable. A replaced lock or directory
+cannot authorize fencing of the old generation. A crash before initial context
+publication leaves a database without context; startup preserves it and refuses
+until the operator reviews that incomplete bootstrap. This deliberately trades
+automatic bootstrap repair for preserving uncertain ownership evidence.
+
+Use the same runtime directory for all clients that should share work. Separate
+explicit directories are independent service instances in this opt-in phase;
+there is no global singleton or automatic endpoint discovery yet. Rolling back
+to health-only serve does not claim, reconcile or delete jobs. Existing direct
+commands remain usable, but operators must reconcile interrupted work before
+issuing an equivalent fresh plan. Default activation and cleanup application
+remain separate changes.

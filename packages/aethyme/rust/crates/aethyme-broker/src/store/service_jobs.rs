@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 use crate::service::jobs::{
     JobClaim, JobCompletion, JobError, JobOperation, JobProgress, JobRecord, JobRequest, JobState,
@@ -56,7 +56,10 @@ pub struct JobStore {
 
 impl JobStore {
     pub fn open(path: &Path) -> Result<Self, JobError> {
-        let mut conn = Connection::open(path)?;
+        let mut conn = Connection::open_with_flags(
+            path,
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         conn.busy_timeout(Duration::from_secs(2))?;
         // Do not change journal mode or schema before checking identity. In
         // particular, accidentally selecting broker.db must leave it intact.
@@ -85,6 +88,19 @@ impl JobStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         Ok(Self { conn })
+    }
+
+    pub(crate) fn new_worker_generation(&self) -> Result<String, JobError> {
+        Ok(self
+            .conn
+            .query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?)
+    }
+
+    pub(crate) fn outstanding_count(&self, repository: &str) -> Result<usize, JobError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM service_jobs WHERE repository=?1 AND state IN ('queued','running','interrupted')",
+            [repository], |r| r.get(0),
+        )?)
     }
 
     /// Retrying a key always returns its original job, including after a

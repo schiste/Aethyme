@@ -3888,6 +3888,24 @@ impl Broker {
         }
     }
 
+    pub(crate) fn gc_plan_for_service(
+        &mut self,
+        include_active_gate_cache: bool,
+        full_scan: bool,
+        deadline: Instant,
+    ) -> Result<GcPlan, BrokerOpError> {
+        let deadline = if full_scan {
+            deadline
+        } else {
+            deadline.min(Instant::now() + MANUAL_GC_PLAN_BUDGET)
+        };
+        self.gc_plan_scanned_until(
+            crate::SizeScan::Measure,
+            include_active_gate_cache,
+            Some(deadline),
+        )
+    }
+
     /// Retire an ineligible frozen journal after the operator confirms its
     /// exact digest. This archives only the journal bytes: it never resumes,
     /// replans, or removes any retained row, file, worktree, or artifact.

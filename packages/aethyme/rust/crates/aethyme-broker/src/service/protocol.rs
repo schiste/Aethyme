@@ -97,6 +97,10 @@ fn invalid(message: impl Into<String>) -> io::Error {
 /// message, even when the prefix happens to be valid JSON. Callers must set
 /// socket deadlines separately: a byte bound is not a time bound.
 pub fn read_frame<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead) -> io::Result<T> {
+    serde_json::from_slice(&read_frame_bytes(reader)?).map_err(|error| invalid(error.to_string()))
+}
+
+pub(crate) fn read_frame_bytes(reader: &mut impl BufRead) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     loop {
         let available = reader.fill_buf()?;
@@ -117,7 +121,7 @@ pub fn read_frame<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead) -> 
         bytes.extend_from_slice(&available[..count]);
         reader.consume(count);
         if complete {
-            return serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()));
+            return Ok(bytes);
         }
     }
 }
