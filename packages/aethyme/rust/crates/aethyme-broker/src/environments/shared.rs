@@ -9,14 +9,24 @@
 //!
 //! It runs from an export of the ref's commit (`git archive`, no worktree),
 //! kept under `<host state>/environments/shared/`. When the ref moves it is
-//! redeployed by **hold-and-swap**: park (requests to its routes are now held
-//! by the proxy), swap the recorded snapshot and source in place, wake. The
-//! reservation, namespace and ports are kept, so consumers' URLs never
-//! change. A new revision that fails to start is rolled back: the old one
-//! serves again and the failed commit is recorded as the error.
+//! redeployed by **hold-and-swap**: the new revision is exported and its
+//! `build` hooks run in that export while the old one keeps serving; then
+//! park (requests to its routes are now held by the proxy), swap the recorded
+//! snapshot and source in place, wake. The reservation, namespace and ports
+//! are kept, so consumers' URLs never change. A build that fails leaves the
+//! old revision serving untouched; a revision that fails to start is rolled
+//! back. Either way the failed commit is recorded as the error. A redeploy
+//! holds an exclusive host lease for the environment, so the supervisor and
+//! `env shared redeploy` never swap it concurrently. A revision whose
+//! component set differs from the serving one cannot be swapped in place
+//! (new components would never be provisioned) and is recreated instead.
+//!
+//! The declaration is read from the default branch. When it cannot be read
+//! (Git fails, the file does not parse), nothing is destroyed; only a file
+//! absent from the default branch, or a `[[shared]]` entry removed from it,
+//! destroys.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -50,8 +60,35 @@ pub fn is_shared_export_of(root: &Path, directory: &Path, commit: &str) -> bool 
 /// proxy holds requests (and never wakes the old revision) meanwhile.
 pub const SWAP_MARKER: &str = "swap.in-progress";
 
+/// A marker whose owner cannot be identified expires after this long.
+const SWAP_MARKER_TTL_MS: i64 = 15 * 60 * 1000;
+
+#[derive(Serialize, serde::Deserialize)]
+struct SwapOwner {
+    pid: i32,
+    start_time: Option<u64>,
+    at: i64,
+}
+
+/// Whether a live redeploy is swapping the environment. A marker left by a
+/// redeployer that died (crash, SIGKILL, reboot) does not count, so the proxy
+/// never holds requests forever behind it.
 pub fn swap_in_progress(root: &Path, env_id: &str) -> bool {
-    super::logs::environment_directory(root, env_id).is_some_and(|d| d.join(SWAP_MARKER).exists())
+    let Some(directory) = super::logs::environment_directory(root, env_id) else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(directory.join(SWAP_MARKER)) else {
+        return false;
+    };
+    match serde_json::from_slice::<SwapOwner>(&bytes) {
+        Ok(SwapOwner {
+            pid,
+            start_time: Some(start_time),
+            ..
+        }) => crate::gates::process_start_time(pid) == Some(start_time),
+        Ok(owner) => now_ms() - owner.at < SWAP_MARKER_TTL_MS,
+        Err(_) => false,
+    }
 }
 
 /// Creates the swap marker and removes it when dropped, however the redeploy
@@ -66,7 +103,13 @@ impl SwapGuard {
             .ok_or_else(|| io("not an environment id"))?;
         std::fs::create_dir_all(&directory).map_err(io)?;
         let path = directory.join(SWAP_MARKER);
-        std::fs::write(&path, now_ms().to_string()).map_err(io)?;
+        let pid = std::process::id() as i32;
+        let owner = SwapOwner {
+            pid,
+            start_time: crate::gates::process_start_time(pid),
+            at: now_ms(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&owner).map_err(io)?).map_err(io)?;
         Ok(Self { path })
     }
 }
@@ -83,7 +126,7 @@ fn io(error: impl std::fmt::Display) -> LifecycleError {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = crate::git::git_command()
         .args(args)
         .current_dir(dir)
         .output()
@@ -128,11 +171,23 @@ pub fn resolve_ref(main_root: &Path, reference: &str) -> Result<String, String> 
 
 /// The environments file as committed at the default branch, if any.
 pub fn default_branch_file(main_root: &Path) -> Option<EnvironmentsFile> {
-    let sha = resolve_ref(main_root, "default_branch").ok()?;
-    let text = git(main_root, &["show", &format!("{sha}:{ENVIRONMENTS_FILE}")]).ok()?;
+    declared_file(main_root).ok().flatten()
+}
+
+/// The default branch's environments file: `Ok(None)` only when the branch
+/// resolves and has no such file; an error when it cannot be read or parsed,
+/// so callers never mistake a failure for "nothing declared".
+pub fn declared_file(main_root: &Path) -> Result<Option<EnvironmentsFile>, String> {
+    let sha = resolve_ref(main_root, "default_branch")?;
+    let path = format!("{sha}:{ENVIRONMENTS_FILE}");
+    if git(main_root, &["cat-file", "-e", &path]).is_err() {
+        return Ok(None);
+    }
+    let text = git(main_root, &["show", &path])?;
     parse_loaded::<EnvironmentsFile>(PathBuf::from(ENVIRONMENTS_FILE), ENVIRONMENTS_FILE, &text)
         .value
-        .ok()
+        .map(Some)
+        .map_err(|diagnostic| diagnostic.render())
 }
 
 fn owner_name(spec: &SharedSpec) -> String {
@@ -174,6 +229,8 @@ pub enum Redeploy {
     Deferred {
         until_ms: i64,
     },
+    /// Another redeploy of this environment is running.
+    InProgress,
 }
 
 impl Lifecycle {
@@ -196,10 +253,19 @@ impl Lifecycle {
         host: &HostEnvironmentsFile,
     ) -> Result<(CompiledEnvironment, PathBuf), LifecycleError> {
         let export = export_for(&self.root, repository, name, sha);
-        if !export.join(ENVIRONMENTS_FILE).is_file() {
-            std::fs::create_dir_all(&export).map_err(io)?;
-            export_commit(main_root, sha, &export).map_err(io)?;
-            std::fs::write(export.join(EXPORT_MARKER), sha).map_err(io)?;
+        // Complete only once the marker is in place: export into a staging
+        // directory and rename, so an interrupted export is never reused.
+        if !export.join(EXPORT_MARKER).is_file() {
+            let staging = export.with_extension("staging");
+            for stale in [&staging, &export] {
+                if stale.exists() {
+                    std::fs::remove_dir_all(stale).map_err(io)?;
+                }
+            }
+            std::fs::create_dir_all(&staging).map_err(io)?;
+            export_commit(main_root, sha, &staging).map_err(io)?;
+            std::fs::write(staging.join(EXPORT_MARKER), sha).map_err(io)?;
+            std::fs::rename(&staging, &export).map_err(io)?;
         }
         let text = std::fs::read_to_string(export.join(ENVIRONMENTS_FILE)).map_err(io)?;
         let file = parse_loaded::<EnvironmentsFile>(
@@ -302,14 +368,22 @@ impl Lifecycle {
             .ok_or_else(|| io("the default branch has no environments file"))?;
         let spec = Self::shared_spec(&file, name)?;
         let sha = resolve_ref(main_root, &spec.reference).map_err(io)?;
-        let (snapshot, export) = self.shared_snapshot(main_root, repository, name, &sha, host)?;
-        let Some(current) = self.store.get(&snapshot.env_id)? else {
+        let env_id = super::compile::environment_id(
+            repository,
+            &EnvironmentOwner::Ref {
+                name: owner_name(&spec),
+            },
+            &spec.profile,
+        );
+        let Some(current) = self.store.get(&env_id)? else {
             self.shared_up(main_root, repository, name, host, wait)?;
             return Ok(Redeploy::Redeployed {
                 from: None,
                 to: sha,
             });
         };
+        // Both checks before exporting, so skipped revisions leave nothing
+        // on disk.
         if current.snapshot.source.commit.as_deref() == Some(sha.as_str()) {
             return Ok(Redeploy::Unchanged { commit: sha });
         }
@@ -322,7 +396,11 @@ impl Lifecycle {
             .transitions(&current.env_id, 200)?
             .iter()
             .rev()
-            .find(|t| t.reason == "redeployed" || t.reason == "redeploy rolled back")
+            .find(|t| {
+                t.reason == "redeployed"
+                    || t.reason == "redeploy rolled back"
+                    || t.reason == "redeploy build failed"
+            })
             .map(|t| t.at);
         if !force
             && let Some(last) = last
@@ -332,80 +410,177 @@ impl Lifecycle {
                 until_ms: last + interval,
             });
         }
+        let key = format!("aethyme-env-shared-redeploy:{env_id}");
+        let outcome = self.exclusive(repository, &key, Duration::from_secs(5), |this| {
+            this.swap_revision(main_root, repository, name, host, wait, &env_id, &sha)
+        });
+        match outcome {
+            Some(result) => result,
+            None => Ok(Redeploy::InProgress),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn swap_revision(
+        &mut self,
+        main_root: &Path,
+        repository: &str,
+        name: &str,
+        host: &HostEnvironmentsFile,
+        wait: Duration,
+        env_id: &str,
+        sha: &str,
+    ) -> Result<Redeploy, LifecycleError> {
+        // Re-read under the lease: another redeployer may have finished.
+        let current = self
+            .store
+            .get(env_id)?
+            .ok_or_else(|| StoreError::NotFound(env_id.to_string()))?;
+        if current.snapshot.source.commit.as_deref() == Some(sha) {
+            return Ok(Redeploy::Unchanged {
+                commit: sha.to_string(),
+            });
+        }
+        let (snapshot, export) = self.shared_snapshot(main_root, repository, name, sha, host)?;
         let previous_snapshot = current.snapshot.clone();
         let previous_export = current.worktree_root.clone().map(PathBuf::from);
         let from = previous_snapshot.source.commit.clone();
+        let names = |s: &CompiledEnvironment| -> Vec<(String, String)> {
+            s.components
+                .iter()
+                .map(|c| (c.name.clone(), format!("{:?}", c.runtime)))
+                .collect()
+        };
+        if names(&snapshot) != names(&previous_snapshot) {
+            // Components added, removed or changed runtime: an in-place swap
+            // would never provision them. Recreate at the new revision.
+            self.down(env_id, None)?;
+            self.up(
+                &snapshot,
+                &export,
+                Some(main_root),
+                None,
+                &UpOptions {
+                    wait,
+                    reconfigure: false,
+                },
+            )?;
+            self.store.note(
+                env_id,
+                "redeployed",
+                &self.actor,
+                Some(&json!({ "from": from, "to": sha, "recreated": "component set changed" })),
+            )?;
+            remove_previous_export(previous_export, &export);
+            return Ok(Redeploy::Redeployed {
+                from,
+                to: sha.to_string(),
+            });
+        }
+        // Build the new revision in its own export while the old one serves.
+        if let Err(error) = self.build_export(&current, &snapshot, &export) {
+            let message = error.to_string();
+            let detail = json!({ "code": "redeploy_failed", "failed_commit": sha, "serving": from, "message": message });
+            self.store.set_error(env_id, Some(&detail))?;
+            self.store
+                .note(env_id, "redeploy build failed", &self.actor, Some(&detail))?;
+            return Ok(Redeploy::RolledBack {
+                failed: sha.to_string(),
+                serving: from,
+                error: message,
+            });
+        }
         let was_active = current.phase == EnvironmentPhase::Active;
-        let _swap = SwapGuard::begin(&self.root, &current.env_id)?;
+        let _swap = SwapGuard::begin(&self.root, env_id)?;
         if was_active {
-            self.park(&current.env_id, "redeploy")?;
+            self.park(env_id, "redeploy")?;
         }
         // Hold: from here until the wake succeeds, the proxy holds requests to
         // this environment's routes instead of failing them.
-        self.store
-            .replace_snapshot(&current.env_id, &snapshot, &export)?;
+        self.store.replace_snapshot(env_id, &snapshot, &export)?;
         if !was_active {
             // Parked: swap only; the new revision starts on its next wake.
             self.store.note(
-                &current.env_id,
+                env_id,
                 "redeployed",
                 &self.actor,
                 Some(&json!({ "from": from, "to": sha, "while": "parked" })),
             )?;
-            if let Some(old) = previous_export
-                && old != export
-            {
-                crate::warn_unrecorded(
-                    "remove the previous shared export",
-                    std::fs::remove_dir_all(&old),
-                );
-            }
-            return Ok(Redeploy::Redeployed { from, to: sha });
+            remove_previous_export(previous_export, &export);
+            return Ok(Redeploy::Redeployed {
+                from,
+                to: sha.to_string(),
+            });
         }
-        match self.wake(&current.env_id, wait) {
+        match self.wake(env_id, wait) {
             Ok(_) => {
                 self.store.note(
-                    &current.env_id,
+                    env_id,
                     "redeployed",
                     &self.actor,
                     Some(&json!({ "from": from, "to": sha })),
                 )?;
-                if let Some(old) = previous_export
-                    && old != export
-                {
-                    crate::warn_unrecorded(
-                        "remove the previous shared export",
-                        std::fs::remove_dir_all(&old),
-                    );
-                }
-                Ok(Redeploy::Redeployed { from, to: sha })
+                remove_previous_export(previous_export, &export);
+                Ok(Redeploy::Redeployed {
+                    from,
+                    to: sha.to_string(),
+                })
             }
             Err(error) => {
-                // Roll back to the revision that was serving.
-                let message = error.to_string();
+                // Roll back to the revision that was serving, and say so only
+                // if it really serves again.
+                let mut message = error.to_string();
+                let mut serving = None;
                 if let Some(old) = &previous_export {
-                    self.store
-                        .replace_snapshot(&current.env_id, &previous_snapshot, old)?;
+                    let restored = self
+                        .store
+                        .replace_snapshot(env_id, &previous_snapshot, old)
+                        .map_err(LifecycleError::from)
+                        .and_then(|_| self.wake(env_id, wait).map(|_| ()));
+                    match restored {
+                        Ok(()) => serving = from.clone(),
+                        Err(restart) => {
+                            message = format!(
+                                "{message}; restarting the previous revision failed: {restart}"
+                            );
+                        }
+                    }
+                }
+                let detail = json!({ "code": "redeploy_failed", "failed_commit": sha, "serving": serving, "message": message });
+                self.store.set_error(env_id, Some(&detail))?;
+                self.store
+                    .note(env_id, "redeploy rolled back", &self.actor, Some(&detail))?;
+                if serving.is_some() {
                     crate::warn_unrecorded(
-                        "restart the previous shared revision",
-                        self.wake(&current.env_id, wait),
+                        "remove the failed shared export",
+                        std::fs::remove_dir_all(&export),
                     );
                 }
-                let detail = json!({ "code": "redeploy_failed", "failed_commit": sha, "serving": from, "message": message });
-                self.store.set_error(&current.env_id, Some(&detail))?;
-                self.store.note(
-                    &current.env_id,
-                    "redeploy rolled back",
-                    &self.actor,
-                    Some(&detail),
-                )?;
                 Ok(Redeploy::RolledBack {
-                    failed: sha,
-                    serving: from,
+                    failed: sha.to_string(),
+                    serving,
                     error: message,
                 })
             }
         }
+    }
+
+    /// Run every component's `build` hook in the new export.
+    fn build_export(
+        &self,
+        current: &EnvironmentRecord,
+        snapshot: &CompiledEnvironment,
+        export: &Path,
+    ) -> Result<(), LifecycleError> {
+        let mut bindings = self.bindings_for(current)?;
+        bindings.worktree = export.to_path_buf();
+        for component in &snapshot.components {
+            if let Some(build) = &component.commands.build {
+                let ctx = self.context(snapshot, component, &bindings, 1);
+                ctx.hook("build", build)?;
+            }
+        }
+        Ok(())
     }
 
     /// Supervisor work for one repository: redeploy live shared environments
@@ -417,9 +592,15 @@ impl Lifecycle {
         repository: &str,
         host: &HostEnvironmentsFile,
     ) -> Result<Vec<String>, LifecycleError> {
-        let declared: Vec<SharedSpec> = default_branch_file(main_root)
-            .map(|file| file.shared)
-            .unwrap_or_default();
+        let declared: Vec<SharedSpec> = match declared_file(main_root) {
+            Ok(file) => file.map(|file| file.shared).unwrap_or_default(),
+            // Unreadable is not "nothing declared": destroy nothing.
+            Err(error) => {
+                return Ok(vec![format!(
+                    "skipped: the default branch's {ENVIRONMENTS_FILE} cannot be read ({error}); nothing destroyed or redeployed"
+                )]);
+            }
+        };
         let mut actions = Vec::new();
         for record in self.store.list(Some(repository))? {
             let EnvironmentOwner::Ref { name } = &record.owner else {
@@ -429,13 +610,30 @@ impl Lifecycle {
                 continue;
             }
             let shared = name.split('@').next().unwrap_or_default().to_string();
-            if !declared.iter().any(|s| owner_name(s) == *name) {
-                self.down(&record.env_id, None)?;
-                actions.push(format!(
-                    "destroyed {shared}: no longer declared on the default branch"
-                ));
+            let Some(spec) = declared.iter().find(|s| owner_name(s) == *name) else {
+                match self.down(&record.env_id, None) {
+                    Ok(_) => actions.push(format!(
+                        "destroyed {shared}: no longer declared on the default branch"
+                    )),
+                    Err(error) => actions.push(format!("destroying {shared} failed: {error}")),
+                }
                 continue;
+            };
+            if spec.profile != record.profile {
+                // Its id is per profile: without this the old one would be
+                // kept forever beside the new one.
+                match self.down(&record.env_id, None) {
+                    Ok(_) => actions.push(format!(
+                        "destroyed {shared} ({}): its profile changed to {}",
+                        record.profile, spec.profile
+                    )),
+                    Err(error) => {
+                        actions.push(format!("replacing {shared} failed: {error}"));
+                        continue;
+                    }
+                }
             }
+            // One environment's failure never stops the others.
             match self.shared_redeploy(
                 main_root,
                 repository,
@@ -443,14 +641,22 @@ impl Lifecycle {
                 host,
                 Duration::from_secs(300),
                 false,
-            )? {
-                Redeploy::Redeployed { to, .. } => {
+            ) {
+                Ok(Redeploy::Redeployed { to, .. }) => {
                     actions.push(format!("redeployed {shared} to {to}"))
                 }
-                Redeploy::RolledBack { failed, .. } => actions.push(format!(
-                    "redeploy of {shared} to {failed} failed; previous revision serves"
-                )),
-                Redeploy::Unchanged { .. } | Redeploy::Deferred { .. } => {}
+                Ok(Redeploy::RolledBack {
+                    failed, serving, ..
+                }) => actions.push(match serving {
+                    Some(_) => format!(
+                        "redeploy of {shared} to {failed} failed; previous revision serves"
+                    ),
+                    None => format!(
+                        "redeploy of {shared} to {failed} failed and the previous revision did not restart"
+                    ),
+                }),
+                Ok(Redeploy::Unchanged { .. } | Redeploy::Deferred { .. } | Redeploy::InProgress) => {}
+                Err(error) => actions.push(format!("redeploy of {shared} failed: {error}")),
             }
         }
         Ok(actions)
@@ -467,6 +673,17 @@ impl Lifecycle {
             .shared_record(main_root, repository, name)?
             .ok_or_else(|| StoreError::NotFound(format!("shared environment {name}")))?;
         self.down(&record.env_id, None)
+    }
+}
+
+fn remove_previous_export(previous: Option<PathBuf>, current: &Path) {
+    if let Some(old) = previous
+        && old != current
+    {
+        crate::warn_unrecorded(
+            "remove the previous shared export",
+            std::fs::remove_dir_all(&old),
+        );
     }
 }
 

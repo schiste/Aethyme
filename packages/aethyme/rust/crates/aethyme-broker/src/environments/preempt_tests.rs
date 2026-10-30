@@ -168,6 +168,11 @@ fn park_lru_parks_the_least_recently_active_until_the_request_fits() {
             note.detail.as_ref().unwrap()["beneficiary"],
             big.id.as_str()
         );
+        let park = notes
+            .iter()
+            .find(|t| t.to == EnvironmentPhase::Parked)
+            .expect("park transition");
+        assert_eq!(park.actor, big.id, "the beneficiary is the actor");
     }
     assert_eq!(
         phase(&lifecycle, &fleet[3].id),
@@ -181,10 +186,11 @@ fn park_lru_parks_the_least_recently_active_until_the_request_fits() {
     }
 }
 
-/// Pinned, busy and higher-priority environments are never victims; when the
-/// rest cannot free the whole shortfall, nothing is parked.
+/// Pinned, busy and higher-priority environments are never victims. Each
+/// one alone would cover the 1-unit shortfall, so dropping any single
+/// exclusion parks it and fails this test.
 #[test]
-fn exclusions_hold_and_a_partial_preemption_never_happens() {
+fn each_exclusion_alone_keeps_its_environment_running() {
     let host = Host::new();
     let text = file("park_lru", 0);
     let mut lifecycle = host.lifecycle();
@@ -199,14 +205,16 @@ fn exclusions_hold_and_a_partial_preemption_never_happens() {
         .unwrap();
     let _marker = BusyMarker::register(&host.root(), &busy.id, command.id() as i32).unwrap();
     let vip = up(&mut lifecycle, &text, "vip").unwrap();
-    let idle = up(&mut lifecycle, &text, "small").unwrap();
+    let pinned_too = up(&mut lifecycle, &text, "small").unwrap();
+    lifecycle
+        .pin(&pinned_too.id, Duration::from_secs(3600), "demo")
+        .unwrap();
 
-    // Only `idle` is eligible: one unit, short of the three needed.
-    match up(&mut lifecycle, &text, "big") {
+    match up(&mut lifecycle, &text, "small") {
         Err(error) => assert_eq!(error.code(), "capacity_timeout"),
-        Ok(_) => panic!("a 3-unit request cannot fit"),
+        Ok(_) => panic!("every environment in the pool is excluded"),
     }
-    for env in [&pinned, &busy, &vip, &idle] {
+    for env in [&pinned, &busy, &vip, &pinned_too] {
         assert_eq!(
             phase(&lifecycle, &env.id),
             EnvironmentPhase::Active,
@@ -216,7 +224,93 @@ fn exclusions_hold_and_a_partial_preemption_never_happens() {
     }
     command.kill().unwrap();
     command.wait().unwrap();
-    for env in [&pinned, &busy, &vip, &idle] {
+    for env in [&pinned, &busy, &vip, &pinned_too] {
+        lifecycle.down(&env.id, None).unwrap();
+    }
+}
+
+/// When the eligible victims cannot free the whole shortfall, none is parked.
+#[test]
+fn a_partial_preemption_never_happens() {
+    let host = Host::new();
+    let text = file("park_lru", 0);
+    let mut lifecycle = host.lifecycle();
+    let pinned: Vec<Env> = (0..3)
+        .map(|_| up(&mut lifecycle, &text, "small").unwrap())
+        .collect();
+    for env in &pinned {
+        lifecycle
+            .pin(&env.id, Duration::from_secs(3600), "demo")
+            .unwrap();
+    }
+    let idle = up(&mut lifecycle, &text, "small").unwrap();
+    // Only `idle` is eligible: one unit, short of the three needed.
+    match up(&mut lifecycle, &text, "big") {
+        Err(error) => assert_eq!(error.code(), "capacity_timeout"),
+        Ok(_) => panic!("a 3-unit request cannot fit"),
+    }
+    assert_eq!(phase(&lifecycle, &idle.id), EnvironmentPhase::Active);
+    for env in pinned.iter().chain([&idle]) {
+        lifecycle.down(&env.id, None).unwrap();
+    }
+}
+
+/// `min_active_seconds` counts from the latest activation: an environment
+/// woken a moment ago is protected even though it first started long ago.
+/// (Two agents alternately waking must not park each other on every wake.)
+#[test]
+fn a_freshly_woken_environment_is_protected_by_min_active_seconds() {
+    let host = Host::new();
+    let text = file("park_lru", 1);
+    let mut lifecycle = host.lifecycle();
+    let fleet: Vec<Env> = (0..4)
+        .map(|_| up(&mut lifecycle, &text, "small").unwrap())
+        .collect();
+    for env in &fleet[1..] {
+        lifecycle
+            .pin(&env.id, Duration::from_secs(3600), "demo")
+            .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(1200));
+    lifecycle.park(&fleet[0].id, "test").unwrap();
+    lifecycle
+        .wake(&fleet[0].id, Duration::from_secs(5))
+        .unwrap();
+
+    let worktree = tempfile::tempdir().unwrap();
+    let requester = snapshot(&text, "small", worktree.path());
+    let parked = lifecycle
+        .make_room(&requester, super::activity::now_ms())
+        .unwrap();
+    assert!(parked.is_empty(), "re-woken under a second ago: {parked:?}");
+    assert_eq!(phase(&lifecycle, &fleet[0].id), EnvironmentPhase::Active);
+    for env in &fleet {
+        lifecycle.down(&env.id, None).unwrap();
+    }
+}
+
+/// A victim another operation holds is skipped for the next candidate; it
+/// never fails the requester.
+#[test]
+fn a_locked_victim_is_skipped_not_fatal() {
+    let host = Host::new();
+    let text = file("park_lru", 0);
+    let mut lifecycle = host.lifecycle();
+    let fleet: Vec<Env> = (0..4)
+        .map(|_| up(&mut lifecycle, &text, "small").unwrap())
+        .collect();
+    for env in &fleet[1..] {
+        std::thread::sleep(Duration::from_millis(20));
+        super::activity::touch(&host.root(), &env.id).unwrap();
+    }
+    // fleet[0] is least recently active, but busy with another operation.
+    let held = crate::file_lock::try_acquire_environment_operation_lock(&host.root(), &fleet[0].id)
+        .unwrap();
+    let requester = up(&mut lifecycle, &text, "small").expect("the next victim makes room");
+    drop(held);
+    assert_eq!(phase(&lifecycle, &fleet[0].id), EnvironmentPhase::Active);
+    assert_eq!(phase(&lifecycle, &fleet[1].id), EnvironmentPhase::Parked);
+    for env in fleet.iter().chain([&requester]) {
         lifecycle.down(&env.id, None).unwrap();
     }
 }
