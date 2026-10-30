@@ -356,6 +356,15 @@ blocked.
    branch into a published one, and changes nothing if that would conflict.
    Sync is local only: it never pushes, so run `aethyme broker push --session
    <id>` afterwards to publish the caught-up branch.
+   When `sync` hands off an incoming default-branch merge, follow its exact
+   handoff with session-confined Git; use `aethyme broker advanced git` when
+   the operation requires coordination. Do not route the merge through
+   `advanced exec`: its rewrite audit can reject upstream paths outside your
+   leases. Resolve only conflicts in paths leased to this session, and leave
+   all other incoming default-branch changes intact. If the result or a broker
+   operation fence is unknown, inspect the durable operation record, recovery
+   notice and current branch state before retrying; follow the printed recovery
+   step rather than retrying blindly.
    `broker start` and `start --reuse` refresh the default branch first, so a
    new worktree starts from the latest fetched tip. In a repository
    with `[promote] mode = "verify-only"`, `broker submit` is a pre-flight
