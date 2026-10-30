@@ -1221,7 +1221,7 @@ impl BrokerStore {
         &mut self,
         session_id: i64,
         binding_event_id: i64,
-        payload_json: &str,
+        holder: &crate::session_holder::AgentProcess,
     ) -> Result<bool, BrokerError> {
         self.conn.busy_timeout(std::time::Duration::ZERO)?;
         let result = (|| {
@@ -1251,17 +1251,25 @@ impl BrokerStore {
                 )
                 .optional()?;
             if latest_gone.is_some_and(|(id, payload)| {
-                id > binding_event_id && payload.as_deref() == Some(payload_json)
+                id > binding_event_id
+                    && payload
+                        .as_deref()
+                        .and_then(|payload| {
+                            serde_json::from_str::<crate::session_holder::AgentProcess>(payload)
+                                .ok()
+                        })
+                        .is_some_and(|recorded| &recorded == holder)
             }) {
                 tx.commit()?;
                 return Ok(false);
             }
+            let payload_json = crate::events::session_holder_gone_payload(holder);
             insert_event(
                 &tx,
                 now_ms(),
                 "session.holder_gone",
                 Some(session_id),
-                Some(payload_json),
+                Some(&payload_json),
             )?;
             tx.commit()?;
             Ok(true)

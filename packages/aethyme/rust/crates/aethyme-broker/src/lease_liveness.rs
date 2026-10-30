@@ -324,8 +324,8 @@ pub(crate) enum GoneHolderWrite {
     DatabaseBusy,
 }
 
-/// Persist exact absence observed by the final shared-holder lease check.
-/// The caller supplies the fresh process table captured for this binding.
+/// Persist exact absence observed by the final lease check. The caller
+/// supplies the process table captured for this binding.
 pub(crate) fn record_gone_holder_for_abandoned_session(
     store: &mut crate::BrokerStore,
     session_id: i64,
@@ -342,11 +342,7 @@ pub(crate) fn record_gone_holder_for_abandoned_session(
     {
         return Ok(GoneHolderWrite::Skipped);
     }
-    match store.record_session_holder_gone_for_binding(
-        session_id,
-        binding_event_id,
-        &crate::events::session_holder_gone_payload(holder),
-    ) {
+    match store.record_session_holder_gone_for_binding(session_id, binding_event_id, holder) {
         Ok(true) => Ok(GoneHolderWrite::Recorded),
         Ok(false) => Ok(GoneHolderWrite::Skipped),
         Err(crate::BrokerError::SessionRetirementDatabaseBusy) => Ok(GoneHolderWrite::DatabaseBusy),
@@ -532,6 +528,14 @@ mod tests {
         );
         let first_gone = store.latest_session_holder_gone_event(id).unwrap().unwrap();
         assert!(first_gone.id > binding);
+        let alternate_serialization = serde_json::to_string_pretty(&holder).unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE events SET payload_json = ?1 WHERE id = ?2",
+                rusqlite::params![alternate_serialization, first_gone.id],
+            )
+            .unwrap();
         assert_eq!(
             record_gone_holder_for_abandoned_session(
                 &mut store,

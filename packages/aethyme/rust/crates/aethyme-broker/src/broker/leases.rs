@@ -742,23 +742,21 @@ impl Broker {
                     process_table.table_for(session_id, event_id)
                 }
             });
-            if shared_holder {
-                if let (Some(binding_event_id), Some(holder_process)) =
-                    (holder.binding_event_id, bound_holder.as_ref())
-                {
-                    match crate::lease_liveness::record_gone_holder_for_abandoned_session(
-                        self.store(),
-                        session_id,
-                        binding_event_id,
-                        holder_process,
-                        lease_table,
-                        deadline,
-                    )? {
-                        crate::lease_liveness::GoneHolderWrite::Skipped
-                        | crate::lease_liveness::GoneHolderWrite::Recorded => {}
-                        crate::lease_liveness::GoneHolderWrite::DatabaseBusy => {
-                            return Ok(AbandonedSessionCloseOutcome::DatabaseBusy);
-                        }
+            if let (Some(binding_event_id), Some(holder_process)) =
+                (holder.binding_event_id, bound_holder.as_ref())
+            {
+                match crate::lease_liveness::record_gone_holder_for_abandoned_session(
+                    self.store(),
+                    session_id,
+                    binding_event_id,
+                    holder_process,
+                    lease_table,
+                    deadline,
+                )? {
+                    crate::lease_liveness::GoneHolderWrite::Skipped
+                    | crate::lease_liveness::GoneHolderWrite::Recorded => {}
+                    crate::lease_liveness::GoneHolderWrite::DatabaseBusy => {
+                        return Ok(AbandonedSessionCloseOutcome::DatabaseBusy);
                     }
                 }
             }

@@ -4196,6 +4196,73 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn automatic_retirement_records_gone_task_holder_without_status_and_starts_grace_once() {
+        let (_owner, _storage, mut broker, session) = retirement_fixture();
+        age_open_session(&mut broker, &session);
+        let holder = crate::session_holder::AgentProcess {
+            pid: i64::MAX,
+            started: "Mon Oct 26 08:42:41 2026".into(),
+            command: "/opt/codex agent --session ordinary-retirement".into(),
+        };
+        broker
+            .store()
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session.id),
+                Some(&crate::events::session_holder_bound_payload(
+                    &holder,
+                    "registered",
+                    None,
+                )),
+            )
+            .unwrap();
+        broker
+            .store()
+            .claim_lease(session.id, "ordinary-source.rs", None)
+            .unwrap();
+        assert!(
+            broker
+                .store()
+                .latest_session_holder_gone_event(session.id)
+                .unwrap()
+                .is_none()
+        );
+
+        let first = broker.retire_abandoned_sessions(None).unwrap();
+        assert_eq!(first.retired, 0);
+        assert_eq!(first.deferred, 1);
+        let first_gone = broker
+            .store()
+            .latest_session_holder_gone_event(session.id)
+            .unwrap()
+            .expect("maintenance records the absent task holder without status");
+        assert!(
+            first_gone.id
+                > broker
+                    .store()
+                    .latest_session_holder_event(session.id)
+                    .unwrap()
+                    .unwrap()
+                    .id
+        );
+
+        let second = broker.retire_abandoned_sessions(None).unwrap();
+        assert_eq!(second.retired, 0);
+        assert_eq!(second.deferred, 1);
+        let second_gone = broker
+            .store()
+            .latest_session_holder_gone_event(session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (second_gone.id, second_gone.ts),
+            (first_gone.id, first_gone.ts),
+            "repeated maintenance preserves the first gone sighting"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn automatic_retirement_does_not_record_gone_without_an_active_explicit_lease() {
         let (_owner, _storage, mut broker, no_lease) = retirement_fixture();
         let implicit_only = broker
