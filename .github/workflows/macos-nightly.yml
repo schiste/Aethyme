@@ -29,6 +29,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -70,6 +73,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -86,10 +92,15 @@ jobs:
         with:
           tool: cargo-llvm-cov@0.9.1
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-nextest@0.9.146
+
       - name: Generate workspace coverage reports
         run: |
           mkdir -p coverage
-          cargo llvm-cov --locked --workspace --html --output-dir coverage/html
+          cargo llvm-cov nextest --locked --workspace --profile ci --retries 0 --no-tests fail --html --output-dir coverage/html
           cargo llvm-cov report --lcov --output-path coverage/lcov.info
 
       - name: Add per-crate coverage to the job summary
