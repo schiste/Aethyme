@@ -293,7 +293,9 @@ fn public_cli_plans_gc_and_recovers_a_disconnected_submission_after_restart() {
             full_scan: false,
         },
     };
-    // Close after writing a complete frame; never consume its acknowledgement.
+    // Never consume the acknowledgement. Keep the peer open until lookup
+    // proves durable acceptance: writing bytes alone does not prove acceptance,
+    // and an already disconnected peer may be refused before frame dispatch.
     let mut stream = UnixStream::connect(path.join("broker-service.sock")).unwrap();
     protocol::write_frame(
         &mut stream,
@@ -304,7 +306,6 @@ fn public_cli_plans_gc_and_recovers_a_disconnected_submission_after_restart() {
         },
     )
     .unwrap();
-    drop(stream);
     let wait_deadline = Instant::now() + Duration::from_secs(20);
     let job_id = loop {
         let reply = transport::job_request(
@@ -325,6 +326,7 @@ fn public_cli_plans_gc_and_recovers_a_disconnected_submission_after_restart() {
         );
         thread::sleep(Duration::from_millis(20));
     };
+    drop(stream);
     loop {
         let reply = transport::job_request(&path, wire::Method::Status { job_id })
             .unwrap()

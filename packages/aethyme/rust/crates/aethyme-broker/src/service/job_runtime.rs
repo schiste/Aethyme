@@ -52,6 +52,20 @@ fn private_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+// Once SQLite owns a connection, do not open and close another descriptor for
+// its database inode: POSIX closes can release that process's live locks.
+fn named_private_file(path: &Path) -> io::Result<fs::Metadata> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file()
+        || metadata.uid() != owner()
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+    {
+        return Err(io::Error::other("unsafe service job file"));
+    }
+    Ok(metadata)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Repository {
@@ -192,7 +206,7 @@ impl JobRuntime {
         let database = identity(&private_file(&database_path)?.metadata()?);
         let mut store = JobStore::open_private(&database_path).map_err(other)?;
         directory.validate()?;
-        if identity(&private_file(&database_path)?.metadata()?) != database {
+        if identity(&named_private_file(&database_path)?) != database {
             return Err(io::Error::other("service job database changed during open"));
         }
         // The retained directory capability holds the exact permanent lock;
@@ -243,9 +257,7 @@ impl JobRuntime {
             .lock()
             .map_err(|_| io::Error::other("job store worker panicked"))?;
         self.directory.validate()?;
-        if identity(&private_file(&self.directory.path().join(DATABASE))?.metadata()?)
-            != self.database
-        {
+        if identity(&named_private_file(&self.directory.path().join(DATABASE))?) != self.database {
             return Err(io::Error::other("service job database was replaced"));
         }
         Ok(store)
@@ -728,6 +740,57 @@ mod tests {
         );
         drop(store);
         drop(server);
+    }
+
+    #[test]
+    fn service_database_lock_child_helper() {
+        let Some(path) = std::env::var_os("AETHYME_SERVICE_LOCK_TEST_DATABASE") else {
+            return;
+        };
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection.busy_timeout(Duration::from_millis(100)).unwrap();
+        match connection.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; ROLLBACK;")
+        {
+            Ok(()) => std::process::exit(23),
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy =>
+            {
+                std::process::exit(24)
+            }
+            Err(error) => panic!("unexpected lock probe error: {error}"),
+        }
+    }
+
+    #[test]
+    fn status_identity_checks_preserve_live_sqlite_locks() {
+        let fixture = Fixture::new();
+        let (_server, jobs) = fixture.open(Arc::new(|_, _, _| Ok(serde_json::json!({}))));
+        let probe = || {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "service::job_runtime::tests::service_database_lock_child_helper",
+                ])
+                .env(
+                    "AETHYME_SERVICE_LOCK_TEST_DATABASE",
+                    fixture.runtime.join(DATABASE),
+                )
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(24),
+                "a separate process acquired a live database's exclusive lock: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        probe();
+        jobs.handle(&Method::Lookup {
+            idempotency_key: "missing".into(),
+        })
+        .unwrap();
+        probe();
     }
 
     #[test]
