@@ -6,3 +6,6 @@ pub mod protocol;
 
 #[cfg(unix)]
 pub mod transport;
+
+#[cfg(unix)]
+mod socket_io;
