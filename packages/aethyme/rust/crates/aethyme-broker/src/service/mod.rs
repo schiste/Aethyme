@@ -9,6 +9,9 @@ pub mod protocol;
 pub(crate) mod client;
 
 #[cfg(unix)]
+pub mod discovery;
+
+#[cfg(unix)]
 pub(crate) mod job_runtime;
 
 #[cfg(unix)]

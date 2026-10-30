@@ -113,6 +113,39 @@ The runtime directory is explicitly selected in this opt-in phase. Automatic
 per-user discovery, startup, shutdown requests and migration of repository jobs
 are later steps; this phase does not yet reduce existing broker process counts.
 
+## Read-only repository service discovery
+
+The dependent discovery PR adds:
+
+```sh
+aethyme broker advanced service directory <private-service-root> --jobs-for <repository> --json
+```
+
+The root is explicitly selected and must already be an absolute canonical
+directory owned by the current user, with mode 0700. The repository must already
+have a verified broker identity. Main and linked worktrees resolve to the same
+address; distinct repository identities resolve separately. Discovery uses a
+snapshot and does not initialize or maintain the broker, create directories,
+open a service socket or job store, or start a process. This command succeeds
+without a running service. It is available on Unix only.
+
+With or without `--json`, stdout is one JSON object with exactly these fields:
+`schema_version` (1), `directory` (an absolute path), and `repository` (the full
+`RepositoryIdentity` described below: `key`, `repository_uuid`, `root`, and
+`common_dir`). The leaf is the first 32 lowercase hexadecimal characters of
+the full 64-character repository key. This shortened address leaves room for
+the Unix socket filename; the platform's socket pathname limit is checked
+before returning. A caller needing a longer root must select a shorter one.
+
+An existing leaf must also be a canonical private directory owned by this user.
+Symlinks, files and permissive directories are refused and preserved. A missing
+root is refused; a missing leaf is returned without creation. Discovery reports
+no readiness or ownership claim. The full repository handshake and pinned key
+remain mandatory before using the address, including to refuse a prefix
+collision or a service bound to a different repository. Starting and managing
+the discovered service is a subsequent opt-in change; existing commands retain
+their explicit runtime-directory and direct execution behavior.
+
 ## Inactive durable job store
 
 `service::jobs::JobStore` is a library foundation, with no service methods,
