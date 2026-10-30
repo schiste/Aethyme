@@ -45,6 +45,15 @@ floor, so verify which executable resumed agents will use; the repo-local
 selector does not change their PATH. Preserve concurrent work and never
 automatically restore a pre-upgrade database over newer activity.
 
+For scheduled cleanup on macOS, a loaded LaunchAgent proves only scheduler
+registration. Check `broker gc service status --json` and its matching
+`last_pass` before claiming delivery; inspect the pass outcome separately
+before claiming reclamation. A runtime stored on a removable volume can wait
+at a macOS file-access prompt before product code starts. If there is no pass
+receipt, inspect launchd state and a short process sample, then confirm any
+OS permission request through the human operator. Do not bypass macOS privacy
+controls or start duplicate sweep jobs while delivery is unresolved.
+
 Checkout capacity is configured with `[worktrees] max_checkouts = <count>` in
 `.aethyme/config.toml` on the fetched default branch. A working-copy edit alone
 may not change the effective cap: land the configuration and refresh upstream
