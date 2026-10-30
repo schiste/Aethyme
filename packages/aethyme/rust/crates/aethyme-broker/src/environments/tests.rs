@@ -329,6 +329,14 @@ fn every_rule_has_a_located_diagnostic() {
             field: "rules.r.min_profile",
         },
         Case {
+            name: "invalid exclude glob",
+            toml: "schema = 1\n[[profiles]]\nname = \"a\"\ncomponents = [{ name = \"x\", runtime = \"process\", start = \"x\" }]\n[[rules]]\nname = \"r\"\npaths = [\"x/**\"]\nexclude = [\"x/[\"]\nmin_profile = \"a\"\n".into(),
+            code: "invalid_glob",
+            profile: None,
+            component: None,
+            field: "rules.r.exclude",
+        },
+        Case {
             name: "uses unknown shared",
             toml: "schema = 1\n[[profiles]]\nname = \"a\"\nuses_shared = [\"base\"]\ncomponents = [{ name = \"x\", runtime = \"process\", start = \"x\" }]\n".into(),
             code: "unknown_shared",
