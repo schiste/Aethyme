@@ -8,7 +8,7 @@ artifacts and their exact source revision are recorded in each signed
 
 ### Added
 
-- An opt-in macOS cleanup service pins the installed router and engine and schedules bounded public GC sweeps during idle periods. Installation is inert; activation and control changes require exact reviewed plans.
+- An opt-in macOS cleanup service pins the installed router and engine and schedules bounded public GC sweeps every 15 minutes, subject to broker eligibility and retention. Installation is inert; activation and control changes require exact reviewed plans.
 
 ### Fixed
 
