@@ -8419,12 +8419,9 @@ mod tests {
             .unwrap();
 
         assert!(!outcome.worktree_removed);
-        assert!(
-            outcome
-                .cleanup_error
-                .as_deref()
-                .is_some_and(|error| { error.contains("archive changed before worktree removal") })
-        );
+        assert!(outcome.cleanup_error.as_deref().is_some_and(|error| {
+            error.contains("archive could not be reverified before worktree removal")
+        }));
         assert!(worktree.is_dir());
         assert_eq!(
             std::fs::read(worktree.join("private.txt")).unwrap(),
@@ -8476,12 +8473,9 @@ mod tests {
             .unwrap();
 
         assert!(!outcome.worktree_removed);
-        assert!(
-            outcome
-                .cleanup_error
-                .as_deref()
-                .is_some_and(|error| error.contains("archive changed before worktree removal"))
-        );
+        assert!(outcome.cleanup_error.as_deref().is_some_and(|error| {
+            error.contains("archive could not be reverified before worktree removal")
+        }));
         assert!(worktree.is_dir());
         assert_eq!(
             std::fs::metadata(protected).unwrap().permissions().mode() & 0o7777,

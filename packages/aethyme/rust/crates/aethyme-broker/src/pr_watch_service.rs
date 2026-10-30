@@ -212,7 +212,17 @@ mod tests {
             r#"{"schema":"aethyme.pr-watch-service-plan/v1","repository_uuid":"12345678-1234-4123-8123-123456789abc","repository":""#
         ));
 
-        let mut unit = plan.unit.clone();
+        let broker_binding = format!(
+            "<key>AETHYME_BROKER_BIN</key><string>{}</string>",
+            xml(text(&plan.broker).unwrap()).unwrap()
+        );
+        assert_eq!(plan.unit.matches(&broker_binding).count(), 1);
+        // The fixture deliberately uses the same executable for Python and
+        // broker. Normalize this named field before replacing executable paths.
+        let mut unit = plan.unit.replace(
+            &broker_binding,
+            "<key>AETHYME_BROKER_BIN</key><string><BROKER></string>",
+        );
         for (actual, fixture) in [
             (xml(text(&plan.python).unwrap()).unwrap(), "<PYTHON>"),
             (
@@ -224,7 +234,6 @@ mod tests {
                 "<REPOSITORY>",
             ),
             (xml(text(&plan.home).unwrap()).unwrap(), "<HOME>"),
-            (xml(text(&plan.broker).unwrap()).unwrap(), "<BROKER>"),
             (plan.label.clone(), "<LABEL>"),
             (plan.generation.clone(), "<GENERATION>"),
             (plan.broker_sha256.clone(), "<BROKER_SHA256>"),

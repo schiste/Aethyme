@@ -1775,13 +1775,13 @@ fn scheduled_gc_flags_require_specific_actions_and_confirmation_format() {
             "--json",
         ]))
         .unwrap_or_else(|_| panic!("service confirmation parses"));
-        assert!(super::validate_flags(&format!("gc service {action}"), &parsed).is_ok());
+        assert!(super::validate_flags("gc", &parsed).is_ok());
         assert!(super::gc_storage::service_confirmation(&parsed).is_ok());
     }
     for action in ["plan", "status"] {
         let parsed = super::parse(&strings(&["service", action, "--confirm", &"a".repeat(64)]))
             .unwrap_or_else(|_| panic!("parse before action validation"));
-        assert!(super::validate_flags(&format!("gc service {action}"), &parsed).is_err());
+        assert!(super::validate_flags("gc", &parsed).is_err());
     }
     let parsed = super::parse(&strings(&[
         "service",

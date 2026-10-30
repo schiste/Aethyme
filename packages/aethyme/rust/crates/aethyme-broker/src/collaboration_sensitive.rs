@@ -4498,7 +4498,18 @@ mod tests {
             ReasonCode::SuspectedTestSecretExposure,
         )
         .unwrap();
-        let refused = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        // A concurrently spawned Git child can briefly inherit another test's
+        // lock descriptor before exec. Preserve purge's nonblocking contract,
+        // but allow that transient test-process contention to clear.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let refused = loop {
+            match purge(store, &incident_id, &quarantined.request_digest) {
+                Err(SensitiveError::Busy) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                result => break result.unwrap(),
+            }
+        };
         assert!(!refused.completed);
         assert!(!refused.status.managed_cleanup_complete);
         assert!(view_root.exists());
@@ -4508,12 +4519,14 @@ mod tests {
                 && residual.resolved_ms.is_none()
         }));
         match case {
-            "preinventory-symlink-pin" | "preinventory-symlink-current" => assert!(
-                std::fs::symlink_metadata(&fault_path)
-                    .unwrap()
-                    .file_type()
-                    .is_symlink()
-            ),
+            "preinventory-symlink-pin" | "preinventory-symlink-current" => {
+                assert!(
+                    std::fs::symlink_metadata(&fault_path)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                )
+            }
             "preinventory-malformed-current" => {
                 assert_eq!(std::fs::read(&fault_path).unwrap(), b"not-a-generation\n")
             }
