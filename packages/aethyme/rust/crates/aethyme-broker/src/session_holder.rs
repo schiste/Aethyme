@@ -361,8 +361,23 @@ impl RecordedHolderProcessTable {
         if !allow_snapshot {
             return None;
         }
-        self.snapshot = Some(ProcessTable::snapshot());
-        self.observed_event_ids.clear();
+        let snapshot = ProcessTable::snapshot();
+        self.install_refreshed_snapshot(session_id, event_id, snapshot)
+    }
+
+    fn install_refreshed_snapshot(
+        &mut self,
+        session_id: i64,
+        event_id: i64,
+        snapshot: Option<ProcessTable>,
+    ) -> Option<&ProcessTable> {
+        self.snapshot = Some(snapshot);
+        // This is a new complete host snapshot, so all previously observed
+        // bindings remain covered. Preserve the primed cohort too; later
+        // callers still compare their current binding ID before reuse.
+        for (&id, &binding) in &self.prefetched_event_ids {
+            self.observed_event_ids.entry(id).or_insert(binding);
+        }
         self.observed_event_ids.insert(session_id, event_id);
         self.snapshot.as_ref().and_then(Option::as_ref)
     }
@@ -1023,6 +1038,33 @@ mod tests {
                 )),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn abandonment_refresh_preserves_other_primed_and_observed_bindings() {
+        let mut table = RecordedHolderProcessTable::default();
+        table.prefetched_event_ids.insert(8, 12);
+        table.observed_event_ids.insert(9, 13);
+        assert!(
+            table
+                .install_refreshed_snapshot(7, 11, Some(ProcessTable::default()))
+                .is_some()
+        );
+        for (id, binding) in [(7, 11), (8, 12), (9, 13)] {
+            assert!(
+                table.get_or_snapshot(id, binding, false).is_some(),
+                "a fresh global snapshot covers each unchanged binding without another ps"
+            );
+        }
+        assert!(
+            table.get_or_snapshot(8, 99, false).is_none(),
+            "a rebound session cannot borrow an older binding's observation"
+        );
+        assert!(table.install_refreshed_snapshot(7, 11, None).is_none());
+        assert!(
+            table.get_or_snapshot(8, 12, false).is_none(),
+            "a failed fresh snapshot cannot reuse old process rows"
+        );
     }
 
     #[test]

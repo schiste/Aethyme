@@ -3565,6 +3565,8 @@ mod generic_guarded_exec_tests {
             let session = broker
                 .start_worktree("abandoned shared lease", None)
                 .unwrap();
+            let sentinel = Path::new(&session.worktree_path).join("unique-work.txt");
+            std::fs::write(&sentinel, b"preserve this uncommitted work\n").unwrap();
             let holder = crate::session_holder::AgentProcess {
                 pid: i32::MAX as i64,
                 started: "Fri Oct 23 08:42:41 2026".into(),
@@ -3624,6 +3626,10 @@ mod generic_guarded_exec_tests {
             assert!(
                 Path::new(&session.worktree_path).exists(),
                 "closure preserves checkout content"
+            );
+            assert_eq!(
+                std::fs::read(&sentinel).unwrap(),
+                b"preserve this uncommitted work\n"
             );
             assert!(
                 broker
