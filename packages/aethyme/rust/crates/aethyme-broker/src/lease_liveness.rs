@@ -317,6 +317,93 @@ pub fn record_gone_holders(
     Ok(recorded)
 }
 
+/// Persist newly observed gone holders from one bounded abandoned-session page.
+/// Each process table lookup is bound to the holder event it observed, so a
+/// rebind requires a fresh snapshot before it can start lease grace.
+#[derive(Debug, Default)]
+pub(crate) struct GoneHolderPageReport {
+    pub(crate) recorded_session_ids: Vec<i64>,
+    pub(crate) database_busy_session_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoneHolderWrite {
+    Skipped,
+    Recorded,
+    DatabaseBusy,
+}
+
+pub(crate) fn record_gone_holders_for_abandoned_page(
+    store: &mut crate::BrokerStore,
+    session_ids: &[i64],
+    process_table: &mut crate::session_holder::RecordedHolderProcessTable,
+    deadline: Option<std::time::Instant>,
+) -> Result<GoneHolderPageReport, crate::BrokerOpError> {
+    let mut report = GoneHolderPageReport::default();
+    for &session_id in session_ids {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            break;
+        }
+        let Some(event) = store.latest_session_holder_event(session_id)? else {
+            continue;
+        };
+        let Some(payload) = event.payload_json.as_deref() else {
+            continue;
+        };
+        let Ok(holder) = serde_json::from_str::<crate::session_holder::AgentProcess>(payload)
+        else {
+            continue;
+        };
+        let allow_snapshot = match deadline {
+            Some(deadline) => {
+                deadline.saturating_duration_since(std::time::Instant::now())
+                    > crate::session_holder::PROCESS_TABLE_TIMEOUT
+                        + std::time::Duration::from_millis(100)
+            }
+            None => true,
+        };
+        let table = process_table.table_for_binding(session_id, event.id, allow_snapshot);
+        match record_gone_holder_for_binding(store, session_id, event.id, &holder, table, deadline)?
+        {
+            GoneHolderWrite::Skipped => {}
+            GoneHolderWrite::Recorded => report.recorded_session_ids.push(session_id),
+            GoneHolderWrite::DatabaseBusy => {
+                report.database_busy_session_id = Some(session_id);
+                break;
+            }
+        }
+    }
+    Ok(report)
+}
+
+fn record_gone_holder_for_binding(
+    store: &mut crate::BrokerStore,
+    session_id: i64,
+    binding_event_id: i64,
+    holder: &crate::session_holder::AgentProcess,
+    table: Option<&crate::session_holder::ProcessTable>,
+    deadline: Option<std::time::Instant>,
+) -> Result<GoneHolderWrite, crate::BrokerOpError> {
+    let Some(table) = table else {
+        return Ok(GoneHolderWrite::Skipped);
+    };
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        || table.is_alive(holder)
+    {
+        return Ok(GoneHolderWrite::Skipped);
+    }
+    match store.record_session_holder_gone_for_binding(
+        session_id,
+        binding_event_id,
+        &crate::events::session_holder_gone_payload(holder),
+    ) {
+        Ok(true) => Ok(GoneHolderWrite::Recorded),
+        Ok(false) => Ok(GoneHolderWrite::Skipped),
+        Err(crate::BrokerError::SessionRetirementDatabaseBusy) => Ok(GoneHolderWrite::DatabaseBusy),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Liveness of every given lease, one holder lookup per session.
 pub fn assess(
     store: &crate::BrokerStore,
@@ -448,6 +535,245 @@ mod tests {
             )
             .unwrap();
         (dir, store, session.id, holder)
+    }
+
+    fn bind_holder(
+        store: &mut crate::BrokerStore,
+        session_id: i64,
+        holder: &crate::session_holder::AgentProcess,
+    ) -> i64 {
+        store
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session_id),
+                Some(&crate::events::session_holder_bound_payload(
+                    holder,
+                    "registered",
+                    None,
+                )),
+            )
+            .unwrap();
+        store
+            .latest_session_holder_event(session_id)
+            .unwrap()
+            .unwrap()
+            .id
+    }
+
+    fn register_holder_session(store: &mut crate::BrokerStore, name: &str) -> i64 {
+        store
+            .register_session(&crate::NewSession {
+                worktree_path: format!("/tmp/{name}"),
+                branch: format!("agent/{name}"),
+                origin: crate::SessionOrigin::Adopted,
+                task: None,
+                diff_base: None,
+                adoption_base: None,
+                adopted_head: None,
+                repository_contract: None,
+                pid: None,
+                command: None,
+                log_path: None,
+                agent_identity: None,
+            })
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn abandoned_page_records_gone_once_for_each_fresh_binding_and_only_its_candidates() {
+        let (_dir, mut store, first_id, mut first_holder) = shared_holder_fixture();
+        first_holder.pid = i64::MAX;
+        first_holder.started = "Mon Oct 26 08:42:41 2026".into();
+        let first_binding = bind_holder(&mut store, first_id, &first_holder);
+        let second_id = register_holder_session(&mut store, "outside-abandoned-page");
+        let second_holder = crate::session_holder::AgentProcess {
+            pid: i64::MAX - 1,
+            started: "Tue Oct 27 08:42:41 2026".into(),
+            command: first_holder.command.clone(),
+        };
+        bind_holder(&mut store, second_id, &second_holder);
+
+        let candidates = [first_id];
+        let mut process_table = crate::session_holder::RecordedHolderProcessTable::default();
+        process_table.prime(&store, &candidates, None);
+        assert_eq!(
+            record_gone_holders_for_abandoned_page(
+                &mut store,
+                &candidates,
+                &mut process_table,
+                None,
+            )
+            .unwrap()
+            .recorded_session_ids,
+            vec![first_id]
+        );
+        let first_gone = store
+            .latest_session_holder_gone_event(first_id)
+            .unwrap()
+            .unwrap();
+        assert!(first_gone.id > first_binding);
+        assert!(
+            store
+                .latest_session_holder_gone_event(second_id)
+                .unwrap()
+                .is_none(),
+            "recording is limited to the caller's bounded candidate page"
+        );
+
+        let mut repeated_table = crate::session_holder::RecordedHolderProcessTable::default();
+        repeated_table.prime(&store, &candidates, None);
+        assert!(
+            record_gone_holders_for_abandoned_page(
+                &mut store,
+                &candidates,
+                &mut repeated_table,
+                None,
+            )
+            .unwrap()
+            .recorded_session_ids
+            .is_empty(),
+            "the first gone sighting is not rewritten on later maintenance passes"
+        );
+        let repeated_gone = store
+            .latest_session_holder_gone_event(first_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (repeated_gone.id, repeated_gone.ts),
+            (first_gone.id, first_gone.ts)
+        );
+
+        let rebound = crate::session_holder::AgentProcess {
+            pid: i64::MAX - 2,
+            started: "Wed Oct 28 08:42:41 2026".into(),
+            command: first_holder.command.clone(),
+        };
+        let rebound_binding = bind_holder(&mut store, first_id, &rebound);
+        let mut rebound_table = crate::session_holder::RecordedHolderProcessTable::default();
+        rebound_table.prime(&store, &candidates, None);
+        assert_eq!(
+            record_gone_holders_for_abandoned_page(
+                &mut store,
+                &candidates,
+                &mut rebound_table,
+                None,
+            )
+            .unwrap()
+            .recorded_session_ids,
+            vec![first_id]
+        );
+        let rebound_gone = store
+            .latest_session_holder_gone_event(first_id)
+            .unwrap()
+            .unwrap();
+        assert!(rebound_gone.id > rebound_binding);
+        assert_eq!(
+            recorded_gone_since(&store, first_id, &rebound).unwrap(),
+            Some(rebound_gone.ts)
+        );
+        assert_eq!(
+            recorded_gone_since(&store, first_id, &first_holder).unwrap(),
+            None,
+            "the previous binding's gone evidence does not survive a rebind"
+        );
+    }
+
+    #[test]
+    fn gone_holder_recorder_preserves_unknown_live_and_unavailable_observations() {
+        let (_dir, mut store, id, mut holder) = shared_holder_fixture();
+        holder.pid = i64::MAX;
+        holder.started = "Mon Oct 26 08:42:41 2026".into();
+        let binding = bind_holder(&mut store, id, &holder);
+
+        assert_eq!(
+            record_gone_holder_for_binding(&mut store, id, binding, &holder, None, None,).unwrap(),
+            GoneHolderWrite::Skipped
+        );
+        assert!(
+            store
+                .latest_session_holder_gone_event(id)
+                .unwrap()
+                .is_none(),
+            "an unavailable process snapshot cannot start lease grace"
+        );
+
+        let mut failed_snapshot = crate::session_holder::RecordedHolderProcessTable::default();
+        failed_snapshot.prime(&store, &[id], None);
+        failed_snapshot.install_snapshot_for_test(id, binding, None);
+        assert!(
+            record_gone_holders_for_abandoned_page(&mut store, &[id], &mut failed_snapshot, None,)
+                .unwrap()
+                .recorded_session_ids
+                .is_empty(),
+            "a failed complete process-table snapshot cannot establish absence"
+        );
+        assert!(
+            store
+                .latest_session_holder_gone_event(id)
+                .unwrap()
+                .is_none()
+        );
+
+        let live = crate::session_holder::ProcessTable::parse(&format!(
+            "{} 1 {} {}\n",
+            holder.pid, holder.started, holder.command
+        ));
+        assert_eq!(
+            record_gone_holder_for_binding(&mut store, id, binding, &holder, Some(&live), None,)
+                .unwrap(),
+            GoneHolderWrite::Skipped
+        );
+        assert!(
+            store
+                .latest_session_holder_gone_event(id)
+                .unwrap()
+                .is_none(),
+            "a live exact holder must not be recorded gone"
+        );
+
+        let rebound = crate::session_holder::AgentProcess {
+            pid: i64::MAX - 1,
+            started: "Tue Oct 27 08:42:41 2026".into(),
+            command: holder.command.clone(),
+        };
+        bind_holder(&mut store, id, &rebound);
+        let absent = crate::session_holder::ProcessTable::default();
+        assert_eq!(
+            record_gone_holder_for_binding(&mut store, id, binding, &holder, Some(&absent), None,)
+                .unwrap(),
+            GoneHolderWrite::Skipped,
+            "the conditional event write rejects a binding that changed after observation"
+        );
+        assert!(
+            store
+                .latest_session_holder_gone_event(id)
+                .unwrap()
+                .is_none()
+        );
+
+        store
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(id),
+                Some("not-json"),
+            )
+            .unwrap();
+        let mut unknown_table = crate::session_holder::RecordedHolderProcessTable::default();
+        unknown_table.prime(&store, &[id], None);
+        assert!(
+            record_gone_holders_for_abandoned_page(&mut store, &[id], &mut unknown_table, None,)
+                .unwrap()
+                .recorded_session_ids
+                .is_empty(),
+            "an unreadable holder binding remains unknown"
+        );
+        assert!(
+            store
+                .latest_session_holder_gone_event(id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

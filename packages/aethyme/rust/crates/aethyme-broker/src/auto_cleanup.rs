@@ -2383,8 +2383,29 @@ impl Broker {
             })
             .map(|session| session.id)
             .collect::<Vec<_>>();
+        let explicit_lease_sessions = self
+            .store_ref()
+            .explicit_lease_sessions_for_sessions_at(&retirement_candidates, retirement_now)?;
+        let gone_holder_candidates = retirement_candidates
+            .iter()
+            .copied()
+            .filter(|session_id| explicit_lease_sessions.contains(session_id))
+            .collect::<Vec<_>>();
         let mut holder_process_table = crate::session_holder::RecordedHolderProcessTable::default();
         holder_process_table.prime(self.store_ref(), &retirement_candidates, deadline);
+        let gone_holder_report = crate::lease_liveness::record_gone_holders_for_abandoned_page(
+            self.store(),
+            &gone_holder_candidates,
+            &mut holder_process_table,
+            deadline,
+        )?;
+        if let Some(session_id) = gone_holder_report.database_busy_session_id {
+            summary.deferred += 1;
+            summary
+                .reasons
+                .push(SessionRetirementDeferredReason::DatabaseBusy { session_id });
+            return Ok(summary);
+        }
         for session in sessions {
             if deadline_expired(deadline) {
                 summary.deferred += 1;
@@ -4109,6 +4130,139 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn automatic_retirement_records_gone_lease_holder_without_status_and_starts_grace_once() {
+        let (_owner, _storage, mut broker, session) = retirement_fixture();
+        age_open_session(&mut broker, &session);
+        let holder = crate::session_holder::AgentProcess {
+            pid: i64::MAX,
+            started: "Mon Oct 26 08:42:41 2026".into(),
+            command: "/opt/codex app-server --listen local".into(),
+        };
+        broker
+            .store()
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session.id),
+                Some(&crate::events::session_holder_bound_payload(
+                    &holder,
+                    "registered",
+                    None,
+                )),
+            )
+            .unwrap();
+        broker
+            .store()
+            .claim_lease(session.id, "source.rs", None)
+            .unwrap();
+        assert!(
+            broker
+                .store()
+                .latest_session_holder_gone_event(session.id)
+                .unwrap()
+                .is_none(),
+            "the test intentionally does not prime gone evidence through status"
+        );
+
+        let first = broker.retire_abandoned_sessions(None).unwrap();
+        assert_eq!(first.retired, 0);
+        assert_eq!(first.deferred, 1);
+        let first_gone = broker
+            .store()
+            .latest_session_holder_gone_event(session.id)
+            .unwrap()
+            .expect("maintenance records the absent exact holder");
+        assert!(
+            first_gone.id
+                > broker
+                    .store()
+                    .latest_session_holder_event(session.id)
+                    .unwrap()
+                    .unwrap()
+                    .id
+        );
+
+        let leases = broker
+            .store()
+            .unreleased_unexpired_leases_for_sessions_at(&[session.id], now_ms())
+            .unwrap();
+        let absent = crate::session_holder::ProcessTable::default();
+        let liveness = crate::lease_liveness::assess_for_abandonment(
+            broker.store(),
+            &leases,
+            Some(&absent),
+            now_ms(),
+            crate::lease_liveness::LeaseLivenessPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(liveness.len(), 1);
+        assert_eq!(
+            liveness[0].liveness_evidence.stale_since,
+            Some(first_gone.ts)
+        );
+        assert!(liveness[0].liveness_evidence.holds);
+
+        let second = broker.retire_abandoned_sessions(None).unwrap();
+        assert_eq!(second.retired, 0);
+        let second_gone = broker
+            .store()
+            .latest_session_holder_gone_event(session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (second_gone.id, second_gone.ts),
+            (first_gone.id, first_gone.ts)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_retirement_does_not_record_gone_without_an_active_explicit_lease() {
+        let (_owner, _storage, mut broker, no_lease) = retirement_fixture();
+        let implicit_only = broker
+            .start_worktree("retirement implicit-only lease", None)
+            .unwrap();
+        let holder = crate::session_holder::AgentProcess {
+            pid: i64::MAX,
+            started: "Mon Oct 26 08:42:41 2026".into(),
+            command: "/opt/codex agent --session fixture".into(),
+        };
+        for session in [&no_lease, &implicit_only] {
+            age_open_session(&mut broker, session);
+            broker
+                .store()
+                .append_event(
+                    crate::events::SESSION_HOLDER_BOUND,
+                    Some(session.id),
+                    Some(&crate::events::session_holder_bound_payload(
+                        &holder,
+                        "registered",
+                        None,
+                    )),
+                )
+                .unwrap();
+        }
+        broker
+            .store()
+            .set_implicit_leases(implicit_only.id, &["src/lib.rs".into()])
+            .unwrap();
+
+        let summary = broker.retire_abandoned_sessions(None).unwrap();
+
+        assert_eq!(summary.retired, 2);
+        for session in [&no_lease, &implicit_only] {
+            assert!(
+                broker
+                    .store()
+                    .latest_session_holder_gone_event(session.id)
+                    .unwrap()
+                    .is_none(),
+                "maintenance records durable gone evidence only for explicit lease holders"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn automatic_retirement_defers_a_busy_database_writer_without_waiting() {
         let (_owner, _storage, mut broker, session) = retirement_fixture();
         age_open_session(&mut broker, &session);
@@ -4145,6 +4299,27 @@ mod tests {
     fn busy_retirement_skips_checkout_planning_and_keeps_its_cursor() {
         let (_owner, _storage, mut broker, session) = retirement_fixture();
         age_open_session(&mut broker, &session);
+        let holder = crate::session_holder::AgentProcess {
+            pid: i64::MAX,
+            started: "Mon Oct 26 08:42:41 2026".into(),
+            command: "/opt/codex agent --session busy-retirement".into(),
+        };
+        broker
+            .store()
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session.id),
+                Some(&crate::events::session_holder_bound_payload(
+                    &holder,
+                    "registered",
+                    None,
+                )),
+            )
+            .unwrap();
+        broker
+            .store()
+            .claim_lease(session.id, "busy-retirement.rs", None)
+            .unwrap();
         let cursor = SessionRetirementCursor {
             version: SESSION_RETIREMENT_CURSOR_VERSION,
             after_session_id: 0,
@@ -4162,8 +4337,9 @@ mod tests {
         let report = broker.auto_remove_disposable_checkouts(None).unwrap();
 
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "a busy retirement pass must stop before cursor or checkout writes"
+            started.elapsed()
+                < crate::session_holder::PROCESS_TABLE_TIMEOUT + Duration::from_millis(250),
+            "a busy retirement pass may take one process snapshot but does not wait on the writer"
         );
         assert_eq!(report.deferred, 1);
         assert!(matches!(
