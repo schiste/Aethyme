@@ -12,6 +12,7 @@ artifacts and their exact source revision are recorded in each signed
 
 ### Fixed
 
+- Fresh worktree-root recovery completes on APFS after interrupted Cargo-config publication while preserving exact file and inventory checks.
 - Session retirement has a separate durable request and retry lane, so cache pressure and future closed-checkout grace periods cannot postpone abandoned-session checks indefinitely. Existing holder and lease proofs remain required.
 - Checkout cleanup distinguishes a proven removed historical checkout from a new checkout at the same path using complete repository, generation and filesystem identity evidence.
 - Final recovery-archive revalidation receives a bounded proof budget, and cleanup reports specific retained-cohort blockers.

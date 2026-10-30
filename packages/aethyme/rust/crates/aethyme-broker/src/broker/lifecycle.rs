@@ -2307,11 +2307,12 @@ fn same_recovery_directory_object(
     left: &crate::worktree_registry::RecoveryArtifactIdentity,
     right: &crate::worktree_registry::RecoveryArtifactIdentity,
 ) -> bool {
+    // APFS directory link counts, like byte sizes, change with membership.
+    // Exact inventories still check them within each publication phase.
     left.device == right.device
         && left.inode == right.inode
         && left.owner == right.owner
         && left.mode == right.mode
-        && left.links == right.links
 }
 
 #[cfg(unix)]
@@ -3077,6 +3078,46 @@ mod fresh_root_recovery_inventory_tests {
         std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(mode)).unwrap();
         let (_, path) = temporary.keep().unwrap();
         path
+    }
+
+    #[test]
+    fn recovery_directory_object_identity_survives_only_membership_changes() {
+        use crate::worktree_registry::RecoveryArtifactIdentity;
+
+        let before = RecoveryArtifactIdentity {
+            device: 1,
+            inode: 2,
+            owner: 3,
+            mode: 0o700,
+            links: 3,
+            bytes: 96,
+        };
+        let after = RecoveryArtifactIdentity {
+            links: 4,
+            bytes: 128,
+            ..before.clone()
+        };
+        assert!(same_recovery_directory_object(&before, &after));
+        for replaced in [
+            RecoveryArtifactIdentity {
+                device: 4,
+                ..after.clone()
+            },
+            RecoveryArtifactIdentity {
+                inode: 4,
+                ..after.clone()
+            },
+            RecoveryArtifactIdentity {
+                owner: 4,
+                ..after.clone()
+            },
+            RecoveryArtifactIdentity {
+                mode: 0o777,
+                ..after.clone()
+            },
+        ] {
+            assert!(!same_recovery_directory_object(&before, &replaced));
+        }
     }
 
     #[test]
