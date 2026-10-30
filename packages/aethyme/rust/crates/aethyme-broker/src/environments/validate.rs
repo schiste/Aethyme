@@ -928,6 +928,33 @@ fn validate_component(
             );
         }
     }
+    for (field, value) in [
+        ("build_output", component.build_output.as_deref()),
+        ("serve_dir", component.serve_dir.as_deref()),
+    ] {
+        if let Some(value) = value
+            && !super::cache::is_worktree_subdirectory(value)
+        {
+            c.push(
+                "invalid_path",
+                p,
+                n,
+                Some(field),
+                &format!("{field} {value:?} must be a subdirectory of the worktree"),
+                "use a relative path without `.` or `..`, e.g. \"dist\"",
+            );
+        }
+    }
+    if component.template.is_some() && component.template_inputs.is_empty() {
+        c.push(
+            "missing_template_inputs",
+            p,
+            n,
+            Some("template_inputs"),
+            "a template without template_inputs would never be refreshed",
+            "list the paths the template depends on, e.g. [\"db/migrations/**\"]",
+        );
+    }
     if component.build_output.is_some() && component.build.is_none() {
         c.push(
             "field_not_supported",

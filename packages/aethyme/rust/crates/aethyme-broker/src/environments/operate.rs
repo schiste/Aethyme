@@ -965,6 +965,9 @@ pub(super) fn run_cache(options: &Options) -> Result<Output, Failure> {
         Some("prune") => {
             let report = lifecycle.prune_cache(options.all);
             let mut text = format!("evicted {} entr(ies)\n", report.evicted.len());
+            if let Some(reason) = &report.refused {
+                text.push_str(&format!("nothing evicted: {reason}\n"));
+            }
             for (path, reason) in &report.kept {
                 text.push_str(&format!("  kept {}: {reason}\n", path.display()));
             }

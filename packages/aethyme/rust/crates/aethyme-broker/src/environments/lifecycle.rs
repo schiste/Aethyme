@@ -173,11 +173,16 @@ impl Lifecycle {
         wait: Duration,
         body: impl FnOnce(&mut Self) -> T,
     ) -> Option<T> {
+        // Request ids are unique forever, and a repeated id is a replay of
+        // the same request: two threads asking in one millisecond must not
+        // share one, or both would be granted the key.
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let digest = format!("{:x}", Sha256::digest(name.as_bytes()));
         let request = HostResourceRequest {
             schema_version: HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
             request_id: format!(
-                "env-key:{}:{}:{}",
+                "env-key:{}:{}:{}:{sequence}",
                 &digest[..24],
                 std::process::id(),
                 now_ms()
@@ -422,7 +427,8 @@ impl Lifecycle {
         // receipt is replayed with an incremented attempt; hooks must be
         // idempotent and can see the replay.
         let mut provisioned: Vec<String> = Vec::new();
-        let mut cache_uses: Vec<PathBuf> = Vec::new();
+        // Present (even empty) means prune can tell what this one uses.
+        self.record_cache_uses(&env_id, Vec::new());
         let mut receipts = bindings.receipts.clone();
         for component in &snapshot.components {
             let previous = self
@@ -474,17 +480,13 @@ impl Lifecycle {
             let outcome = match template {
                 Err(error) => Err(error),
                 Ok(template) => {
-                    if let Some((id, marker)) = template {
+                    if let Some(id) = template {
                         current.template_ids.insert(component.name.clone(), id);
-                        cache_uses.push(marker);
                     }
                     let ctx = self.context(&snapshot, component, &current, attempt);
                     match self.cached_build(&ctx) {
                         Err(error) => Err(error),
-                        Ok(entry) => {
-                            cache_uses.extend(entry);
-                            driver.provision(&ctx)
-                        }
+                        Ok(()) => driver.provision(&ctx),
                     }
                 }
             };
@@ -514,8 +516,6 @@ impl Lifecycle {
                 }
             }
         }
-
-        self.record_cache_uses(&env_id, cache_uses);
         let record = self
             .store
             .get(&env_id)?

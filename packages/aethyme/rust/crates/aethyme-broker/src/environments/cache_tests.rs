@@ -263,7 +263,7 @@ destroy = "true"
     assert!(report.evicted.is_empty());
     assert_eq!(report.kept.len(), 1);
     assert!(
-        report.kept[0].1.contains("template_destroy exited"),
+        report.kept[0].1.contains("template_destroy failed"),
         "{report:?}"
     );
     assert_eq!(
@@ -271,4 +271,152 @@ destroy = "true"
         1,
         "never dropped without its destroy"
     );
+}
+
+fn validation(text: &str) -> Vec<&'static str> {
+    let loaded: Loaded<EnvironmentsFile> = parse_loaded(PathBuf::from("t"), "t", text);
+    let file = loaded.value.unwrap_or_else(|d| panic!("{}", d.render()));
+    super::validate(&file, &HostEnvironmentsFile::default(), "t", "h")
+        .iter()
+        .map(|d| d.code)
+        .collect()
+}
+
+/// A cache hit replaces the output directory: `.`, `..` or an absolute path
+/// would replace the worktree itself or something outside it.
+#[test]
+fn an_output_outside_a_worktree_subdirectory_is_refused() {
+    for output in [".", "..", "/tmp/x", "dist/../..", ""] {
+        let text = format!(
+            r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "site"
+runtime = "static"
+serve_dir = "{output}"
+build = "true"
+cache_inputs = ["web/**"]
+"#
+        );
+        assert!(
+            validation(&text).contains(&"invalid_path"),
+            "{output:?} accepted"
+        );
+    }
+    assert!(super::cache::is_worktree_subdirectory("dist/site"));
+}
+
+/// A cached build sees only its declared inputs, never the environment's
+/// bindings, which differ per worktree and would leak into every hit.
+#[test]
+fn a_cached_build_never_sees_per_environment_bindings() {
+    let host = tempfile::tempdir().unwrap();
+    let text = r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "site"
+runtime = "static"
+serve_dir = "dist"
+build = 'mkdir -p dist && printf "%s|%s" "$AETHYME_ENV_NAMESPACE" "$GREETING" > dist/index.html'
+cache_inputs = ["web/**"]
+env = { GREETING = "hi" }
+"#;
+    let mut lifecycle = lifecycle(host.path());
+    let tree = worktree(&[("web/app.txt", "v1")]);
+    let id = up(&mut lifecycle, text, tree.path());
+    assert_eq!(
+        std::fs::read_to_string(tree.path().join("dist/index.html")).unwrap(),
+        "|hi"
+    );
+    lifecycle.down(&id, None).unwrap();
+}
+
+/// Deleting a tracked input without staging it is an input change, not an
+/// error that blocks every `env up`.
+#[test]
+fn a_deleted_tracked_input_rebuilds() {
+    let host = tempfile::tempdir().unwrap();
+    let counter = host.path().join("builds.log");
+    let text = site(&counter);
+    let mut lifecycle = lifecycle(host.path());
+    let tree = worktree(&[("web/app.txt", "v1"), ("web/old.txt", "gone soon")]);
+    let status = Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(tree.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let first = up(&mut lifecycle, &text, tree.path());
+    lifecycle.down(&first, None).unwrap();
+    std::fs::remove_file(tree.path().join("web/old.txt")).unwrap();
+    let second = up(&mut lifecycle, &text, tree.path());
+    assert_eq!(lines(&counter), 2, "the deletion is a new input");
+    lifecycle.down(&second, None).unwrap();
+}
+
+/// Eviction works after the creating worktree is gone, with the component's
+/// own variables.
+#[test]
+fn a_template_is_destroyed_after_its_worktree_is_gone() {
+    let host = tempfile::tempdir().unwrap();
+    let destroys = host.path().join("destroys.log");
+    let text = format!(
+        r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "db"
+runtime = "hooks"
+template = "true"
+template_destroy = 'echo "$DB_SERVER $AETHYME_ENV_TEMPLATE_ID" >> "{destroys}"'
+template_inputs = ["db/**"]
+provision = "true"
+destroy = "true"
+env = {{ DB_SERVER = "pg-test" }}
+"#,
+        destroys = destroys.display()
+    );
+    let mut lifecycle = lifecycle(host.path());
+    let tree = worktree(&[("db/schema.sql", "x")]);
+    let id = up(&mut lifecycle, &text, tree.path());
+    lifecycle.down(&id, None).unwrap();
+    drop(tree);
+    let report = lifecycle.prune_cache(true);
+    assert_eq!(report.evicted.len(), 1, "{report:?}");
+    assert!(
+        std::fs::read_to_string(&destroys)
+            .unwrap()
+            .starts_with("pg-test "),
+        "destroy got the component env"
+    );
+}
+
+/// When prune cannot tell what a live environment uses, it evicts nothing.
+#[test]
+fn prune_evicts_nothing_when_live_use_is_unknown() {
+    let host = tempfile::tempdir().unwrap();
+    let counter = host.path().join("builds.log");
+    let text = site(&counter);
+    let mut lifecycle = lifecycle(host.path());
+    let a = worktree(&[("web/app.txt", "v1")]);
+    let b = worktree(&[("web/app.txt", "v2")]);
+    let old = up(&mut lifecycle, &text, a.path());
+    lifecycle.down(&old, None).unwrap();
+    let live = up(&mut lifecycle, &text, b.path());
+    std::fs::remove_file(
+        host.path()
+            .join("environments")
+            .join(&live)
+            .join(super::cache::USES_FILE),
+    )
+    .unwrap();
+    let report = lifecycle.prune_cache(true);
+    assert!(report.refused.is_some(), "{report:?}");
+    assert!(report.evicted.is_empty());
+    lifecycle.down(&live, None).unwrap();
 }
