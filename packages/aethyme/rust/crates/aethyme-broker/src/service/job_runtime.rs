@@ -190,7 +190,7 @@ impl JobRuntime {
             }
         }
         let database = identity(&private_file(&database_path)?.metadata()?);
-        let mut store = JobStore::open(&database_path).map_err(other)?;
+        let mut store = JobStore::open_private(&database_path).map_err(other)?;
         directory.validate()?;
         if identity(&private_file(&database_path)?.metadata()?) != database {
             return Err(io::Error::other("service job database changed during open"));

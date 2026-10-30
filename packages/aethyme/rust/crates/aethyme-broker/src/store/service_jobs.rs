@@ -56,10 +56,18 @@ pub struct JobStore {
 
 impl JobStore {
     pub fn open(path: &Path) -> Result<Self, JobError> {
-        let mut conn = Connection::open_with_flags(
-            path,
-            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
+        Self::open_with_flags(path, OpenFlags::default())
+    }
+
+    /// The service supplies a validated canonical private directory. Keep
+    /// its stricter no-follow policy out of the existing general store API.
+    #[cfg(unix)]
+    pub(crate) fn open_private(path: &Path) -> Result<Self, JobError> {
+        Self::open_with_flags(path, OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+    }
+
+    fn open_with_flags(path: &Path, flags: OpenFlags) -> Result<Self, JobError> {
+        let mut conn = Connection::open_with_flags(path, flags)?;
         conn.busy_timeout(Duration::from_secs(2))?;
         // Do not change journal mode or schema before checking identity. In
         // particular, accidentally selecting broker.db must leave it intact.
@@ -90,12 +98,14 @@ impl JobStore {
         Ok(Self { conn })
     }
 
+    #[cfg(unix)]
     pub(crate) fn new_worker_generation(&self) -> Result<String, JobError> {
         Ok(self
             .conn
             .query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?)
     }
 
+    #[cfg(unix)]
     pub(crate) fn outstanding_count(&self, repository: &str) -> Result<usize, JobError> {
         Ok(self.conn.query_row(
             "SELECT COUNT(*) FROM service_jobs WHERE repository=?1 AND state IN ('queued','running','interrupted')",
