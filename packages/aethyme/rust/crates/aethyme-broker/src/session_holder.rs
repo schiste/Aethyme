@@ -1069,8 +1069,10 @@ mod tests {
 
     #[test]
     fn abandonment_refresh_declined_does_not_reuse_cached_process_evidence() {
-        let mut table = RecordedHolderProcessTable::default();
-        table.snapshot = Some(Some(ProcessTable::default()));
+        let mut table = RecordedHolderProcessTable {
+            snapshot: Some(Some(ProcessTable::default())),
+            ..Default::default()
+        };
         table.observed_event_ids.insert(7, 11);
         assert!(table.table_for(7, 11).is_some());
         assert!(table.refresh_for_binding(7, 11, false).is_none());
