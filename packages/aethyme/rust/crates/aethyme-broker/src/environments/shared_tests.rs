@@ -944,3 +944,64 @@ fn a_blue_green_redeploy_holds_nothing() {
         EnvironmentPhase::Destroyed
     );
 }
+
+/// #1274: a stateful shared environment (a database) is never redeployed
+/// blue/green, even with room for a second slot: the new slot would start
+/// without its data. It swaps in place and keeps its environment.
+#[test]
+fn a_stateful_shared_environment_never_runs_blue_green() {
+    if !python_available() {
+        eprintln!("SKIP stateful: python3 not available");
+        return;
+    }
+    let host = Host::new();
+    let repo = repository(43850);
+    commit(
+        repo.path(),
+        ".aethyme/environments.toml",
+        &environments(43850, SERVE).replacen(
+            "min_redeploy_interval_seconds = 3600\n",
+            "min_redeploy_interval_seconds = 3600\nstateful = true\n",
+            1,
+        ),
+        "stateful baseline",
+    );
+    let none = HostEnvironmentsFile::default();
+    let mut lifecycle = host.lifecycle();
+    let before = lifecycle
+        .shared_up(
+            repo.path(),
+            REPOSITORY,
+            "baseline",
+            &none,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    let v2 = commit(repo.path(), "version.txt", "v2", "v2");
+    let outcome = lifecycle
+        .shared_redeploy(
+            repo.path(),
+            REPOSITORY,
+            "baseline",
+            &none,
+            Duration::from_secs(20),
+            true,
+        )
+        .unwrap();
+    assert!(
+        matches!(&outcome, Redeploy::Redeployed { to, .. } if *to == v2),
+        "{outcome:?}"
+    );
+    let after = lifecycle.store.get(&before.env_id).unwrap().unwrap();
+    assert_eq!(after.phase, EnvironmentPhase::Active, "swapped in place");
+    assert_eq!(after.snapshot.source.commit.as_deref(), Some(v2.as_str()));
+    let live = lifecycle.store.list(None).unwrap();
+    assert!(
+        live.iter()
+            .all(|r| !matches!(&r.owner, EnvironmentOwner::Ref { name } if name.ends_with("#b"))),
+        "no second slot: {live:?}"
+    );
+    lifecycle
+        .shared_destroy(repo.path(), REPOSITORY, "baseline")
+        .unwrap();
+}

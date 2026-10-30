@@ -31,7 +31,9 @@
 //! serving one keeps answering, then moves the pointer and the alias and
 //! destroys the old slot: no request is held. When the pool has no room for
 //! a second slot, the redeploy falls back to hold-and-swap above. A new slot
-//! that fails is destroyed and the serving one is never touched.
+//! that fails is destroyed and the serving one is never touched. A
+//! `stateful = true` entry (a database) is never redeployed blue/green: the
+//! new slot would start without its data, so it always holds and swaps.
 //!
 //! The declaration is read from the default branch. When it cannot be read
 //! (Git fails, the file does not parse), nothing is destroyed; only a file
@@ -470,6 +472,7 @@ impl Lifecycle {
         let file = default_branch_file(main_root)
             .ok_or_else(|| io("the default branch has no environments file"))?;
         let spec = Self::shared_spec(&file, name)?;
+        let stateful = spec.stateful;
         let sha = resolve_ref(main_root, &spec.reference).map_err(io)?;
         let env_id = self.serving_env_id(repository, &spec);
         let Some(current) = self.store.get(&env_id)? else {
@@ -509,7 +512,9 @@ impl Lifecycle {
         }
         let key = format!("aethyme-env-shared-redeploy:{env_id}");
         let outcome = self.exclusive(repository, &key, Duration::from_secs(5), |this| {
-            this.swap_revision(main_root, repository, name, host, wait, &env_id, &sha)
+            this.swap_revision(
+                main_root, repository, name, host, wait, &env_id, &sha, stateful,
+            )
         });
         match outcome {
             Some(result) => result,
@@ -527,6 +532,7 @@ impl Lifecycle {
         wait: Duration,
         env_id: &str,
         sha: &str,
+        stateful: bool,
     ) -> Result<Redeploy, LifecycleError> {
         // Re-read under the lease: another redeployer may have finished.
         let current = self
@@ -566,8 +572,10 @@ impl Lifecycle {
                 error: message,
             });
         }
-        // Blue/green when the environment serves: nothing is held.
+        // Blue/green when the environment serves: nothing is held. Never for
+        // a stateful service: the new slot would start without its data.
         if current.phase == EnvironmentPhase::Active
+            && !stateful
             && let Some(outcome) =
                 self.blue_green(main_root, repository, name, host, &current, sha)?
         {
