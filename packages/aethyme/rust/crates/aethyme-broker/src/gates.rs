@@ -719,14 +719,13 @@ impl GateRunOutcome {
     /// explicit deadline flag or the conventional exit code 124. Arbitrary
     /// test output such as "request timed out" is not enough. Deferring on the
     /// class would let a change be deferred forever, with the agent told to
-    /// resubmit unchanged code. So the flag is set only where the broker
-    /// observed the fault itself: host
-    /// resources were refused, the command never started (disk headroom, spawn
-    /// failure, an invalidated broker database), the broker detected a host
-    /// resource error or incomplete output capture, the command ran out of
-    /// disk, or the broker's own deadline killed it for the first time on this
-    /// tree. A second timeout on the same tree is a verdict, so a change that
-    /// hangs is still rejected.
+    /// resubmit unchanged code. The flag is set only where the broker observed
+    /// the fault itself: host resources were refused, the command never
+    /// started (disk headroom, spawn failure, an invalidated broker database),
+    /// the broker detected a host resource error or incomplete output capture,
+    /// the command ran out of disk, or the broker's own deadline killed it for
+    /// the first time on this tree. A second timeout on the same tree is a
+    /// verdict, so a change that hangs is still rejected.
     pub fn is_host_fault(&self) -> bool {
         self.host_fault && self.status != GateStatus::Pass
     }
@@ -3556,7 +3555,14 @@ where
                 .map(|load| format!(" at load 1m {load:.1}{}", cpu_suffix(&environment)))
                 .unwrap_or_default()
         ));
-        let run_id = store.record_gate_result_with_execution_profile(
+        let cache_bypass_reason = should_bypass_timeout_text_test_failure_cache(
+            gate.cache,
+            gate_status,
+            failure_class,
+            &log_path,
+        )
+        .then_some(TIMEOUT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON);
+        let run_id = store.record_gate_result_with_execution_profile_and_cache_bypass(
             &NewGateResult {
                 gate_name: gate.name.clone(),
                 tree_hash: tree.clone(),
@@ -3573,6 +3579,7 @@ where
             },
             &environment,
             cache_provenance.as_ref(),
+            cache_bypass_reason,
         )?;
         let failed = gate_status != GateStatus::Pass;
         outcomes.push(GateRunOutcome {
@@ -3915,6 +3922,25 @@ fn cached_failure_class(status: GateStatus) -> Option<GateFailureClass> {
         GateStatus::Fail => Some(GateFailureClass::CachedPriorFail),
         _ => None,
     }
+}
+
+const TIMEOUT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON: &str =
+    "test output contained timeout text; rerun instead of reusing this failure";
+
+fn should_bypass_timeout_text_test_failure_cache(
+    cache_enabled: bool,
+    status: GateStatus,
+    failure_class: Option<GateFailureClass>,
+    log_path: &Path,
+) -> bool {
+    if !cache_enabled
+        || status != GateStatus::Fail
+        || failure_class != Some(GateFailureClass::TestFailure)
+        || !bounded_log::has_test_timeout_text(log_path)
+    {
+        return false;
+    }
+    true
 }
 
 fn is_resource_contention_error(command: &str, log_path: &Path) -> bool {
@@ -7848,6 +7874,110 @@ mod tests {
         assert_eq!(status, GateStatus::Fail);
         assert_eq!(class, Some(GateFailureClass::TestFailure));
         assert_eq!(exit, Some(101));
+    }
+
+    #[test]
+    fn timeout_text_test_failures_keep_their_class_but_bypass_the_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("gate.log");
+        std::fs::write(&log_path, "test result: FAILED. 1 failed\n").unwrap();
+        let (status, failure_class, exit_code) = classify_gate_result(
+            "cargo test",
+            &log_path,
+            Ok(command_outcome(Some(101), false)),
+        );
+        assert_eq!(status, GateStatus::Fail);
+        assert_eq!(failure_class, Some(GateFailureClass::TestFailure));
+
+        let gate = synthetic_gate("timeout-text", true, "cargo test");
+        let tree_hash = "timeout-text-tree";
+        let mut store = BrokerStore::open(&tmp.path().join("broker.db")).unwrap();
+        let profile = crate::gate_profile::ExecutionProfile::fixture_complete();
+        let cache_provenance = profile.provenance();
+        store
+            .record_gate_result_with_execution_profile(
+                &NewGateResult {
+                    gate_name: gate.name.clone(),
+                    tree_hash: tree_hash.to_string(),
+                    definition_hash: gate.definition_hash.clone(),
+                    status,
+                    failure_class,
+                    exit_code,
+                    duration_ms: Some(1),
+                    wait_duration_ms: Some(0),
+                    first_output_ms: Some(1),
+                    output_bytes: Some(30),
+                    log_path: Some(log_path.to_string_lossy().into_owned()),
+                    session_id: None,
+                },
+                &crate::GateEnvironment::default(),
+                Some(&cache_provenance),
+            )
+            .unwrap();
+        let profile_digest = profile.digest().unwrap();
+        assert!(
+            store
+                .cached_gate_result_for_execution_profile(
+                    &gate.name,
+                    tree_hash,
+                    &gate.definition_hash,
+                    profile_digest,
+                )
+                .unwrap()
+                .is_some()
+        );
+
+        std::fs::write(&log_path, "Test timed out in 5000ms\n").unwrap();
+        let (timeout_status, timeout_failure_class, timeout_exit_code) = classify_gate_result(
+            "cargo test",
+            &log_path,
+            Ok(command_outcome(Some(101), false)),
+        );
+        assert_eq!(timeout_status, GateStatus::Fail);
+        assert_eq!(timeout_failure_class, Some(GateFailureClass::TestFailure));
+        let cache_bypass_reason = should_bypass_timeout_text_test_failure_cache(
+            gate.cache,
+            timeout_status,
+            timeout_failure_class,
+            &log_path,
+        )
+        .then_some(TIMEOUT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON);
+        assert_eq!(
+            cache_bypass_reason,
+            Some(TIMEOUT_TEXT_TEST_FAILURE_CACHE_BYPASS_REASON)
+        );
+        store
+            .record_gate_result_with_execution_profile_and_cache_bypass(
+                &NewGateResult {
+                    gate_name: gate.name.clone(),
+                    tree_hash: tree_hash.to_string(),
+                    definition_hash: gate.definition_hash.clone(),
+                    status: timeout_status,
+                    failure_class: timeout_failure_class,
+                    exit_code: timeout_exit_code,
+                    duration_ms: Some(1),
+                    wait_duration_ms: Some(0),
+                    first_output_ms: Some(1),
+                    output_bytes: Some(28),
+                    log_path: Some(log_path.to_string_lossy().into_owned()),
+                    session_id: None,
+                },
+                &crate::GateEnvironment::default(),
+                Some(&cache_provenance),
+                cache_bypass_reason,
+            )
+            .unwrap();
+        assert!(
+            store
+                .cached_gate_result_for_execution_profile(
+                    &gate.name,
+                    tree_hash,
+                    &gate.definition_hash,
+                    profile_digest,
+                )
+                .unwrap()
+                .is_none()
+        );
     }
 
     const FAILED_TAP: &str = "TAP version 13\n# Subtest: computes a value\nnot ok 1 - computes a value\n  ---\n  error: assertion failed\n  ...\n1..1\n# tests 1\n# pass 0\n# fail 1\n# cancelled 0\n# skipped 0\n# todo 0\n";
