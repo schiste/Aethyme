@@ -533,7 +533,8 @@ impl Drop for OwnedEnsuredService {
         use aethyme_broker::environments::identity::Observation;
         if self.0.observe() == Observation::Alive {
             // SAFETY: signal only the exact process identity created by this test.
-            assert_eq!(unsafe { libc::kill(self.0.pid, libc::SIGTERM) }, 0);
+            let signalled = unsafe { libc::kill(self.0.pid, libc::SIGTERM) };
+            assert_eq!(signalled, 0);
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         while self.0.observe() == Observation::Alive && Instant::now() < deadline {

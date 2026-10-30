@@ -265,10 +265,8 @@ mod tests {
         let mut status = 0;
         // SAFETY: wait only for this test's exact child, without blocking. An
         // unreaped live child yields 0; an unreaped exited child yields its pid.
-        assert_eq!(
-            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
-            -1
-        );
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        assert_eq!(waited, -1);
         assert_eq!(
             io::Error::last_os_error().raw_os_error(),
             Some(libc::ECHILD)
