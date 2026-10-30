@@ -638,6 +638,8 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
         "gc apply",
         &["--confirm", "--include-active-gate-cache", "--full-scan"],
     ),
+    ("gc artifact-use reconcile plan", &["--confirm"]),
+    ("gc artifact-use reconcile apply", &["--confirm"]),
     ("gc sweep", &[]),
     ("gc service plan", &[]),
     ("gc service install", &["--confirm"]),

@@ -573,6 +573,43 @@ fn parse_accepts_gc_plan_and_confirmed_apply() {
 }
 
 #[test]
+fn parse_accepts_exact_session_artifact_use_reconciliation() {
+    let plan = super::parse(&args(&[
+        "artifact-use",
+        "reconcile",
+        "plan",
+        "2469",
+        "--json",
+    ]))
+    .unwrap_or_else(|_| panic!("artifact-use reconciliation plan should parse"));
+    assert_eq!(
+        plan.positional,
+        vec!["artifact-use", "reconcile", "plan", "2469"]
+    );
+    assert!(plan.json);
+    super::validate_flags("gc", &plan).unwrap();
+
+    let apply = super::parse(&args(&[
+        "artifact-use",
+        "reconcile",
+        "apply",
+        "2470",
+        "--confirm",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ]))
+    .unwrap_or_else(|_| panic!("artifact-use reconciliation apply should parse"));
+    assert_eq!(
+        apply.positional,
+        vec!["artifact-use", "reconcile", "apply", "2470"]
+    );
+    super::validate_flags("gc", &apply).unwrap();
+    assert_eq!(
+        apply.confirm.as_deref(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
+}
+
+#[test]
 fn parse_accepts_checkpoint_recovery_confirmation() {
     let parsed = super::parse(&args(&[
         "checkpoint",

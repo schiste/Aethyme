@@ -356,6 +356,15 @@ blocked.
    branch into a published one, and changes nothing if that would conflict.
    Sync is local only: it never pushes, so run `aethyme broker push --session
    <id>` afterwards to publish the caught-up branch.
+   When `sync` hands off an incoming default-branch merge, follow its exact
+   handoff with session-confined Git; use `aethyme broker advanced git` when
+   the operation requires coordination. Do not route the merge through
+   `advanced exec`: its rewrite audit can reject upstream paths outside your
+   leases. Resolve only conflicts in paths leased to this session, and leave
+   all other incoming default-branch changes intact. If the result or a broker
+   operation fence is unknown, inspect the durable operation record, recovery
+   notice and current branch state before retrying; follow the printed recovery
+   step rather than retrying blindly.
    `broker start` and `start --reuse` refresh the default branch first, so a
    new worktree starts from the latest fetched tip. In a repository
    with `[promote] mode = "verify-only"`, `broker submit` is a pre-flight
@@ -366,6 +375,15 @@ blocked.
    on the default branch -- rather than waiting or building on the other
    session's unmerged branch.
    Without the policy, pushing stays a separately authorized action (step 9).
+
+   Before exact-target maintenance, account for automatic cleanup that may
+   run during native startup; prefer a scoped native open when supported. If
+   temporary holds are needed, preserve the existing strict/disposable policy
+   and suppress only automatic lanes; never force strict/disposable policy
+   flags false or true to make an exact target eligible. Restore the exact
+   original bytes or absence with compare-and-swap only after command exit and
+   detached-worker settlement are confirmed. Preserve refusal journals: changed
+   preconditions call for a fresh plan, not deletion of the earlier refusal.
 
 5. **Gate resources are per worker**. Broker gate runs take path-scoped owner
    locks and export `AETHYME_GATE_WORKER_ID` plus `AETHYME_TEST_DB_SUFFIX`.
