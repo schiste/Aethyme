@@ -79,6 +79,17 @@ CREATE TABLE IF NOT EXISTS environment_transitions (
   detail_json TEXT
 );
 CREATE INDEX IF NOT EXISTS environment_transitions_env ON environment_transitions(env_id, seq);
+CREATE TABLE IF NOT EXISTS environment_samples (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  env_id TEXT NOT NULL,
+  repository TEXT NOT NULL,
+  profile TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  bytes INTEGER,
+  cpu_pct REAL,
+  method TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS environment_samples_profile ON environment_samples(repository, profile, seq);
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -782,6 +793,162 @@ impl EnvironmentStore {
             return Err(StoreError::NotFound(format!("{env_id}/{component}")));
         }
         Ok(())
+    }
+
+    /// Swap the recorded snapshot and source of a stopped environment, keeping
+    /// its id, reservation, namespace and ports (#1217 hold-and-swap). Only a
+    /// `parked` or `planned` environment can be swapped: nothing may be
+    /// running from the old commands.
+    pub fn replace_snapshot(
+        &mut self,
+        env_id: &str,
+        snapshot: &CompiledEnvironment,
+        worktree_root: &Path,
+    ) -> Result<EnvironmentRecord, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record =
+            load_record(&tx, env_id)?.ok_or_else(|| StoreError::NotFound(env_id.into()))?;
+        if !matches!(
+            record.phase,
+            EnvironmentPhase::Parked | EnvironmentPhase::Planned
+        ) {
+            return Err(StoreError::IllegalTransition {
+                env_id: env_id.into(),
+                from: record.phase.as_str(),
+                to: "snapshot swap",
+            });
+        }
+        let snapshot_json = serde_json::to_string(snapshot)
+            .map_err(|error| StoreError::Corrupt(error.to_string()))?;
+        tx.execute(
+            "UPDATE environments SET profile_digest = ?2, spec_snapshot_json = ?3,
+               worktree_root = ?4, updated_at = ?5 WHERE env_id = ?1",
+            params![
+                env_id,
+                snapshot.digest,
+                snapshot_json,
+                worktree_root.to_string_lossy(),
+                now_ms()
+            ],
+        )?;
+        for component in &snapshot.components {
+            tx.execute(
+                "INSERT INTO environment_components (env_id, component, runtime, phase, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(env_id, component) DO NOTHING",
+                params![
+                    env_id,
+                    component.name,
+                    component.runtime.as_str(),
+                    ManagedServicePhase::Intent.as_str(),
+                    now_ms()
+                ],
+            )?;
+        }
+        let updated =
+            load_record(&tx, env_id)?.ok_or_else(|| StoreError::NotFound(env_id.into()))?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Record one resource sample (#1218) and keep at most
+    /// `keep` samples per (repository, profile).
+    pub fn record_sample(
+        &mut self,
+        record: &EnvironmentRecord,
+        sample: &super::metrics::Sample,
+        keep: usize,
+    ) -> Result<(), StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO environment_samples (env_id, repository, profile, at, bytes, cpu_pct, method)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                record.env_id,
+                record.repository,
+                record.profile,
+                sample.sampled_at,
+                sample.bytes.map(|b| b as i64),
+                sample.cpu_pct,
+                sample.method
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM environment_samples WHERE repository = ?1 AND profile = ?2 AND seq NOT IN (
+               SELECT seq FROM environment_samples WHERE repository = ?1 AND profile = ?2
+               ORDER BY seq DESC LIMIT ?3)",
+            params![record.repository, record.profile, keep as i64],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The newest sample of an environment.
+    pub fn latest_sample(
+        &self,
+        env_id: &str,
+    ) -> Result<Option<super::metrics::Sample>, StoreError> {
+        if !self.has_samples_table()? {
+            return Ok(None);
+        }
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT bytes, cpu_pct, method, at FROM environment_samples
+                 WHERE env_id = ?1 ORDER BY seq DESC LIMIT 1",
+                params![env_id],
+                |row| {
+                    Ok(super::metrics::Sample {
+                        bytes: row.get::<_, Option<i64>>(0)?.map(|b| b as u64),
+                        cpu_pct: row.get(1)?,
+                        method: row.get(2)?,
+                        sampled_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// A store last opened for writing by a binary older than #1218 has no
+    /// samples table, and a read-only open never creates it: no samples yet.
+    fn has_samples_table(&self) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'environment_samples'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Measured byte samples per profile of one repository (unknown
+    /// measurements excluded).
+    pub fn footprints(
+        &self,
+        repository: &str,
+    ) -> Result<std::collections::BTreeMap<String, Vec<u64>>, StoreError> {
+        if !self.has_samples_table()? {
+            return Ok(Default::default());
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT profile, bytes FROM environment_samples
+             WHERE repository = ?1 AND bytes IS NOT NULL",
+        )?;
+        let rows = statement.query_map(params![repository], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut history: std::collections::BTreeMap<String, Vec<u64>> = Default::default();
+        for row in rows {
+            let (profile, bytes) = row?;
+            history.entry(profile).or_default().push(bytes as u64);
+        }
+        Ok(history)
     }
 
     pub fn set_pin(

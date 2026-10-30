@@ -4,6 +4,16 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.49] - 2026-10-30
+
+### Fixed
+
+- Detached recovery workers pass consistent storage bindings through launch and admission while preserving exact database selection and test isolation.
+- Abandoned-session cleanup can release leases only after a fresh process snapshot and matching durable evidence prove the recorded service holder has exited. Ordinary lease checks remain conservative.
+- Background compaction visits multiple due candidates per worker while reserving time for each verified archive; a foreground GC sweep also wakes compact-only recovery work through the existing admission checks.
+- Recovery verification reuses exact bundled-root evidence and removes a redundant initial bundle check while retaining the final archive and content verification before checkout removal.
+- Preserved-branch retirement skips an unused preliminary inspection while retaining final content, checkout, prerequisite and archive checks.
+
 ## [0.8.48] - 2026-10-29
 
 **Breaking:** see [UPGRADING.md](UPGRADING.md#v0848).
