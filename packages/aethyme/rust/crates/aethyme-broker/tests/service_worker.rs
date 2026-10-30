@@ -250,6 +250,7 @@ fn job_client_refuses_mismatched_reply_identity() {
                     Err(error) => panic!("fake service accept: {error}"),
                 }
             };
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -800,9 +801,10 @@ fn public_cli_plans_gc_and_recovers_a_disconnected_submission_after_restart() {
             offset: 0,
         },
     ] {
+        let context = format!("wrong-owner {operation:?}");
         refusals.push(
             transport::scoped_job_request(&path, &wrong_key, operation)
-                .unwrap()
+                .unwrap_or_else(|error| panic!("{context}: {error:?}"))
                 .result,
         );
     }
