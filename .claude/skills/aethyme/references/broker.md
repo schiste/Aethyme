@@ -376,6 +376,15 @@ blocked.
    session's unmerged branch.
    Without the policy, pushing stays a separately authorized action (step 9).
 
+   Before exact-target maintenance, account for automatic cleanup that may
+   run during native startup; prefer a scoped native open when supported. If
+   temporary holds are needed, preserve the existing strict/disposable policy
+   and suppress only automatic lanes; never force strict/disposable policy
+   flags false or true to make an exact target eligible. Restore the exact
+   original bytes or absence with compare-and-swap only after command exit and
+   detached-worker settlement are confirmed. Preserve refusal journals: changed
+   preconditions call for a fresh plan, not deletion of the earlier refusal.
+
 5. **Gate resources are per worker**. Broker gate runs take path-scoped owner
    locks and export `AETHYME_GATE_WORKER_ID` plus `AETHYME_TEST_DB_SUFFIX`.
    Gate commands that need a test database, cache namespace, or similar
