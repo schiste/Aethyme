@@ -29,6 +29,7 @@ pub mod infer;
 mod inspect;
 pub mod lifecycle;
 pub mod logs;
+pub mod metrics;
 mod operate;
 mod park;
 mod preempt;
@@ -48,6 +49,8 @@ mod drivers_tests;
 mod infer_tests;
 #[cfg(test)]
 mod lifecycle_tests;
+#[cfg(test)]
+mod metrics_tests;
 #[cfg(test)]
 mod park_tests;
 #[cfg(test)]

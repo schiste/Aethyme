@@ -844,6 +844,99 @@ pub(super) fn run_shared(options: &Options) -> Result<Output, Failure> {
     Ok((value, text, exit_status::SUCCESS))
 }
 
+pub(super) fn run_calibrate(options: &Options) -> Result<Output, Failure> {
+    let workspace = workspace(options)?;
+    let checked = check(&workspace)?;
+    let Some(file) = checked
+        .file
+        .as_ref()
+        .filter(|_| checked.diagnostics.is_empty())
+    else {
+        return Err(Failure {
+            code: "invalid_environments_file",
+            message: format!("{ENVIRONMENTS_FILE} has validation problems"),
+            next_action: "run `aethyme env validate` and fix every problem".into(),
+            exit: exit_status::VERIFICATION_FAILED,
+        });
+    };
+    let repository = crate::gates::git_origin_fingerprint(&workspace.repo);
+    let history = match EnvironmentStore::open_default_read_only()
+        .map_err(|error| environment_failure(error.to_string()))?
+    {
+        Some(store) => store
+            .footprints(&repository)
+            .map_err(|error| environment_failure(error.to_string()))?,
+        None => Default::default(),
+    };
+    let host_memory = super::metrics::host_memory_bytes()
+        .ok_or_else(|| environment_failure("cannot read this host's physical memory".into()))?;
+    let calibration = super::metrics::calibrate(
+        file,
+        &history,
+        host_memory,
+        super::metrics::engine_vm_bytes(),
+        options.ram_fraction,
+    )
+    .map_err(|message| Failure {
+        code: "insufficient_history",
+        message,
+        next_action:
+            "keep environments running under the supervisor (it samples every 60 s), then retry"
+                .into(),
+        exit: exit_status::REFUSED,
+    })?;
+    let original = std::fs::read_to_string(workspace.worktree_root.join(ENVIRONMENTS_FILE))
+        .map_err(|error| environment_failure(error.to_string()))?;
+    let diff = super::metrics::proposal_diff(&original, &calibration);
+    let mut text = format!(
+        "host memory {} MiB, budget {} MiB ({:.0}%{}), unit {} MiB\n",
+        calibration.host_memory_bytes >> 20,
+        calibration.budget_bytes >> 20,
+        calibration.ram_fraction * 100.0,
+        calibration
+            .engine_vm
+            .as_ref()
+            .map(|(engine, bytes)| format!(" minus {engine} VM {} MiB", bytes >> 20))
+            .unwrap_or_default(),
+        calibration.unit_bytes >> 20,
+    );
+    for profile in &calibration.profiles {
+        text.push_str(&format!(
+            "  {:<16} {:>4} samples  p95 {:>8}  units {}\n",
+            profile.profile,
+            profile.samples,
+            profile
+                .p95_bytes
+                .map(|b| format!("{} MiB", b >> 20))
+                .unwrap_or_else(|| "-".into()),
+            profile
+                .proposed_units
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| "-".into()),
+        ));
+    }
+    if !calibration.insufficient.is_empty() {
+        text.push_str(&format!(
+            "insufficient history (< {} samples): {}\n",
+            super::metrics::MIN_SAMPLES,
+            calibration.insufficient.join(", ")
+        ));
+    }
+    if let Some(withheld) = &calibration.withheld {
+        text.push_str(&format!("no units or limits proposed: {withheld}\n"));
+    }
+    text.push_str(&diff);
+    Ok((
+        json!({
+            "schema": super::cli::CALIBRATE_SCHEMA,
+            "calibration": calibration,
+            "diff": diff,
+        }),
+        text,
+        exit_status::SUCCESS,
+    ))
+}
+
 pub(super) fn run_sweep(_: &Options) -> Result<Output, Failure> {
     let (mut lifecycle, _) = open("env sweep", false)?;
     lifecycle.renew_leases().map_err(lifecycle_failure)?;
@@ -900,6 +993,8 @@ pub struct LifecycleWork {
     /// The proxy starts on the first tick, i.e. only in the supervisor that
     /// won the singleton lock.
     pub proxy_started: bool,
+    /// When the last resource sample was taken (#1218).
+    pub last_sample: Option<std::time::Instant>,
 }
 
 /// Start the wake-on-request proxy on loopback in this (supervisor)
@@ -959,6 +1054,16 @@ impl super::supervisor::SupervisorWork for LifecycleWork {
                 lifecycle.park_idle(super::activity::now_ms()),
             );
             sync_shared_environments(&mut lifecycle);
+            if self
+                .last_sample
+                .is_none_or(|at| at.elapsed() >= super::metrics::SAMPLE_INTERVAL)
+            {
+                self.last_sample = Some(std::time::Instant::now());
+                crate::warn_unrecorded(
+                    "sample environment resources",
+                    lifecycle.sample_active(super::activity::now_ms()),
+                );
+            }
             // Live environments need renewal even when nothing is moving.
             let live = lifecycle
                 .store
