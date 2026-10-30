@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-10-29
+Last Updated: 2026-10-30
 
 When code outside the `packages/aethyme/` Rust source tree invokes an
 Aethyme command, it crosses a process boundary. Static
@@ -48,6 +48,15 @@ versions and request IDs are checked, and unavailable endpoints fail visibly.
 The exact wire schema, permission rules and staged migration are documented in
 [broker-service.md](broker-service.md). Initial external consumers are manual
 operators; no installed hook, scheduled task or application is migrated yet.
+
+The inactive `service::jobs::JobStore` library adds a separate explicitly opened
+SQLite job file (application ID `0x41534a31`, schema 1), durable idempotency keys,
+atomic deduplication and fenced job state transitions. It has no CLI or socket
+consumer yet; serve/ping still support health only and never open job storage.
+Its typed operation describes GC planning only. See the durable-store section
+in [broker-service.md](broker-service.md) for identities, state transitions,
+deadlines, cancellation, result bounds and restart limitations. The legacy
+broker database and its schema version are unchanged.
 
 ## Automatic checkout maintenance (v0.8.44)
 
