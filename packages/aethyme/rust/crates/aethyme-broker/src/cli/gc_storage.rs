@@ -961,6 +961,48 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
             "gc accepts exactly one action: `plan`, `apply --confirm <sha256>`, `abandon --confirm <sha256>`, `forget-abandoned --confirm <sha256>` or `sweep`".into(),
         ));
     }
+    if parsed.service_directory.is_some()
+        || parsed.request_key.is_some()
+        || parsed.deadline_ms.is_some()
+    {
+        if action != "plan" || parsed.confirm.is_some() {
+            return Err(UsageError::Message(
+                "shared service options require gc plan without --confirm".into(),
+            ));
+        }
+        let (Some(directory), Some(key), Some(deadline_ms)) = (
+            parsed.service_directory.as_deref(),
+            parsed.request_key.as_deref(),
+            parsed.deadline_ms,
+        ) else {
+            return Err(UsageError::Message("shared planning requires --service-directory, --request-key and --deadline-ms together".into()));
+        };
+        #[cfg(unix)]
+        {
+            crate::service::client::deadline_remaining(deadline_ms)?;
+            let client =
+                crate::service::client::Client::connect(directory, &std::env::current_dir()?)?;
+            let (plan, json_plan) = client.gc_plan(
+                key,
+                deadline_ms,
+                parsed.include_active_gate_cache,
+                parsed.full_scan,
+            )?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&json_plan)?);
+            } else {
+                render_gc_plan(&plan, parsed.detail, parsed.full_scan);
+            }
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (directory, key, deadline_ms);
+            return Err(UsageError::Message(
+                "shared planning requires Unix sockets".into(),
+            ));
+        }
+    }
     if matches!(action, "abandon" | "forget-abandoned") && parsed.include_active_gate_cache {
         return Err(UsageError::Message(format!(
             "gc {action} does not accept --include-active-gate-cache"

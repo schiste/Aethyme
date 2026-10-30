@@ -142,44 +142,18 @@ fn execute(directory: &Path, command: Command) -> std::io::Result<()> {
             Ok(())
         }
         Command::Result { job_id } => {
-            let mut encoded = String::new();
-            loop {
-                let response = transport::job_request(
-                    directory,
-                    wire::Method::ResultChunk {
-                        job_id,
-                        offset: encoded.len(),
-                    },
-                )?;
-                let reply = response.result.map_err(|error| {
-                    std::io::Error::other(format!("{:?}: {}", error.code, error.message))
-                })?;
-                let wire::Reply::ResultChunk {
-                    job_id: returned_id,
-                    offset,
-                    next_offset,
-                    complete,
-                    data,
-                } = reply
-                else {
-                    return Err(std::io::Error::other("unexpected result reply"));
-                };
-                if returned_id != job_id
-                    || offset != encoded.len()
-                    || next_offset != offset.saturating_add(data.len())
-                    || data.len() > wire::RESULT_CHUNK_BYTES
-                    || next_offset > 1024 * 1024
-                    || (!complete && data.is_empty())
-                {
-                    return Err(std::io::Error::other("invalid result chunk"));
-                }
-                encoded.push_str(&data);
-                if complete {
-                    let value: serde_json::Value = serde_json::from_str(&encoded)?;
-                    out!("{}", serde_json::to_string(&value)?);
-                    return Ok(());
-                }
-            }
+            let value = crate::service::client::read_result(
+                |method| {
+                    transport::job_request(directory, method)?
+                        .result
+                        .map_err(|error| {
+                            std::io::Error::other(format!("{:?}: {}", error.code, error.message))
+                        })
+                },
+                job_id,
+            )?;
+            out!("{}", serde_json::to_string(&value)?);
+            Ok(())
         }
     }
 }

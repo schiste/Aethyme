@@ -1229,6 +1229,45 @@ fn full_scan_is_only_valid_for_gc_plan_and_apply() {
     assert!(refusal("gc", &["sweep"], &["--full-scan"]).is_some());
 }
 
+#[test]
+fn shared_service_options_are_only_valid_for_gc_plan_and_never_repeat() {
+    let flags = ["--service-directory", "--request-key", "--deadline-ms"];
+    assert_eq!(refusal("gc", &["plan"], &flags), None);
+    for action in ["apply", "abandon", "sweep", "storage"] {
+        for flag in flags {
+            assert!(refusal("gc", &[action], &[flag]).is_some());
+        }
+    }
+    assert!(refusal("status", &[], &flags).is_some());
+    let args = [
+        "plan",
+        "--service-directory",
+        "/private/tmp/service",
+        "--request-key",
+        "key",
+        "--deadline-ms",
+        "12345",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let parsed = super::parse(&args).unwrap();
+    assert_eq!(
+        parsed.service_directory.as_deref(),
+        Some(std::path::Path::new("/private/tmp/service"))
+    );
+    assert_eq!(parsed.request_key.as_deref(), Some("key"));
+    assert_eq!(parsed.deadline_ms, Some(12345));
+    for (flag, value) in [
+        ("--service-directory", "/private/tmp/other"),
+        ("--request-key", "other"),
+        ("--deadline-ms", "45678"),
+    ] {
+        let mut repeated = args.clone();
+        repeated.extend([flag.to_owned(), value.to_owned()]);
+        assert!(super::parse(&repeated).is_err());
+    }
+}
+
 /// `adopt --base` keeps the explanation of why no base can apply.
 #[test]
 fn adopt_base_refusal_keeps_its_explanation() {
