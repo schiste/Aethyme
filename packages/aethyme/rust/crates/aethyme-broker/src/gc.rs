@@ -5961,18 +5961,25 @@ impl Broker {
             return self.write_artifact_sweep_worker_status("compact_checkout_candidate_changed");
         }
         let worktree = PathBuf::from(&session.worktree_path);
-        let Some(cohort) = self.closed_artifact_checkout_cohort_for_session(
+        let cohort = match self.closed_artifact_checkout_cohort_for_session_detailed(
             session_id,
             &worktree,
             Some(deadline),
-        )?
-        else {
-            self.store().defer_checkout_cleanup_compactions(
-                &[session_id],
-                now_ms().saturating_add(AUTO_COMPACT_CHECKOUT_RETRY_MS),
-                now_ms(),
-            )?;
-            return self.write_artifact_sweep_worker_status("compact_checkout_cohort_unavailable");
+        )? {
+            crate::auto_cleanup::ClosedArtifactCheckoutCohortResolution::Available(cohort) => {
+                cohort
+            }
+            crate::auto_cleanup::ClosedArtifactCheckoutCohortResolution::Unavailable(reason) => {
+                self.store().defer_checkout_cleanup_compactions(
+                    &[session_id],
+                    now_ms().saturating_add(AUTO_COMPACT_CHECKOUT_RETRY_MS),
+                    now_ms(),
+                )?;
+                return self.write_artifact_sweep_worker_status(&format!(
+                    "compact_checkout_cohort_unavailable session={session_id} reason={}",
+                    reason.code()
+                ));
+            }
         };
         if cohort.owner_session_id() != session_id || cohort.owner_witness().is_none() {
             self.store().defer_checkout_cleanup_compactions(
@@ -9736,6 +9743,42 @@ mod tests {
             Some(101),
             100
         ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn compact_missing_checkout_reports_reason_and_keeps_request_pending() {
+        let (_temporary, _storage, mut broker, _root) = closed_artifact_sweep_fixture();
+        let (session_id, worktree, _) =
+            closed_artifact_cache(&mut broker, "missing compact checkout");
+        broker
+            .store()
+            .request_closed_spawned_checkout_compactions(&[session_id], 0, now_ms())
+            .unwrap();
+        std::fs::remove_dir_all(&worktree).unwrap();
+
+        broker
+            .auto_compact_checkout_candidate(session_id, Instant::now() + Duration::from_secs(30))
+            .unwrap();
+
+        let expected_status = format!(
+            "compact_checkout_cohort_unavailable session={session_id} reason=checkout_missing"
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(expected_status.as_str())
+        );
+        assert!(
+            broker
+                .store()
+                .next_pending_checkout_compaction_at()
+                .unwrap()
+                .is_some(),
+            "a missing closed checkout must remain pending until safe terminal reconciliation"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
