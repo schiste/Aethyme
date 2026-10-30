@@ -5280,12 +5280,12 @@ impl Broker {
         let policy = load_retention_policy(self.main_root())?;
         let (budget_ms, urgency) = self.artifact_sweep_budget(&policy, ArtifactSweepScope::Drain);
         let outcome = self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::Drain)?;
-        if self.auto_checkout_cleanup_recovery_requested()? {
-            crate::warn_unrecorded(
-                "start deferred automatic checkout cleanup worker",
-                self.maybe_start_artifact_sweep_worker(false),
-            );
-        }
+        // The launcher admits artifact, checkout-cleanup and compaction work.
+        // A compact-only backlog must not depend on a checkout-cleanup request.
+        crate::warn_unrecorded(
+            "start deferred artifact or checkout recovery worker",
+            self.maybe_start_artifact_sweep_worker(false),
+        );
         Ok(ArtifactSweepReport {
             directories_reclaimed: outcome.directories_reclaimed,
             complete: outcome.complete,
@@ -6030,6 +6030,9 @@ impl Broker {
         &mut self,
         pressure_request: bool,
     ) -> Result<(), BrokerOpError> {
+        #[cfg(test)]
+        tests::ARTIFACT_WORKER_ADMISSION_ATTEMPTS
+            .with(|attempts| attempts.borrow_mut().push(pressure_request));
         self.reconcile_checkout_cleanup_outbox()?;
         let root = self.main_root().to_path_buf();
         if crate::host_state::path_is_ephemeral(&root) || artifact_worker_process_is_suppressed() {
@@ -9293,6 +9296,10 @@ mod tests {
     }
 
     std::thread_local! {
+        // Observe the real launch boundary without bypassing test suppression
+        // or spawning detached processes in the test runner.
+        pub(super) static ARTIFACT_WORKER_ADMISSION_ATTEMPTS: RefCell<Vec<bool>> =
+            const { RefCell::new(Vec::new()) };
         static ARTIFACT_SWEEP_TEST_MUTATION_INTERRUPT: RefCell<Option<ArtifactSweepTestMutation>> =
             const { RefCell::new(None) };
     }
@@ -9718,6 +9725,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn foreground_sweep_reaches_worker_admission_for_compact_only_backlog() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        let config = root.join(crate::retention::BROKER_CONFIG_RELPATH);
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "[retention]\ncompact_closed_worktrees = true\n").unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        assert!(broker.reconcile_compact_checkout_backfill().unwrap());
+        assert!(broker.compact_checkout_work_pending().unwrap());
+        assert!(!broker.auto_checkout_cleanup_recovery_requested().unwrap());
+
+        assert!(broker.compact_checkout_work_due(now_ms()).unwrap());
+        assert!(!broker.artifact_sweep_backlog_pending().unwrap());
+        ARTIFACT_WORKER_ADMISSION_ATTEMPTS.with(|attempts| attempts.borrow_mut().clear());
+        let report = broker.gc_sweep_artifacts().unwrap();
+
+        assert!(report.complete, "{report:?}");
+        assert!(!broker.artifact_sweep_backlog_pending().unwrap());
+        assert!(!broker.auto_checkout_cleanup_recovery_requested().unwrap());
+        assert!(broker.compact_checkout_work_pending().unwrap());
+        assert_eq!(
+            ARTIFACT_WORKER_ADMISSION_ATTEMPTS.with(|attempts| attempts.borrow().clone()),
+            vec![false],
+            "a compact-only backlog must reach the real worker admission boundary"
+        );
     }
 
     #[test]
