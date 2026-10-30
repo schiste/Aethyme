@@ -514,6 +514,47 @@ fn invalid_or_unavailable_shared_gc_never_initializes_a_local_broker() {
         .as_millis()
         + 120_000)
         .to_string();
+    for action in [
+        "apply",
+        "abandon",
+        "forget-abandoned",
+        "sweep",
+        "__continue-artifacts",
+    ] {
+        for (flag, value) in [
+            ("--service-directory", missing.to_str().unwrap()),
+            ("--request-key", "key"),
+            ("--deadline-ms", deadline.as_str()),
+        ] {
+            let mut command = common::broker_cli_for_fixture(
+                env!("CARGO_BIN_EXE_broker-cli-shim"),
+                &["gc", action],
+                fixture.path(),
+            );
+            isolated(&mut command, &fixture);
+            let output = command.args([flag, value]).output().unwrap();
+            assert!(!output.status.success(), "gc {action} accepted {flag}");
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                error.contains("is not valid"),
+                "gc {action} {flag}: {error}"
+            );
+            assert!(!fixture.path().join(".aethyme/broker.db").exists());
+            assert!(!missing.exists());
+        }
+    }
+    // Unknown GC actions reach the handler rather than an action-specific flag rule.
+    let mut unknown = common::broker_cli_for_fixture(
+        env!("CARGO_BIN_EXE_broker-cli-shim"),
+        &["gc", "storage"],
+        fixture.path(),
+    );
+    isolated(&mut unknown, &fixture);
+    let output = unknown.args(["--request-key", "key"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("require gc plan"));
+    assert!(!fixture.path().join(".aethyme/broker.db").exists());
+    assert!(!missing.exists());
     for args in [
         vec!["--service-directory", missing.to_str().unwrap(), "--json"],
         vec!["--request-key", "key", "--deadline-ms", &deadline, "--json"],

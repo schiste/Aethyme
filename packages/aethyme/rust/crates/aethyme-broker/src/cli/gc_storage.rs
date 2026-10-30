@@ -942,6 +942,41 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
     Ok(())
 }
 
+#[cfg(unix)]
+fn run_shared_gc_plan(
+    parsed: &Parsed,
+    directory: &Path,
+    key: &str,
+    deadline_ms: i64,
+) -> Result<(), UsageError> {
+    crate::service::client::deadline_remaining(deadline_ms)?;
+    let client = crate::service::client::Client::connect(directory, &std::env::current_dir()?)?;
+    let (plan, json_plan) = client.gc_plan(
+        key,
+        deadline_ms,
+        parsed.include_active_gate_cache,
+        parsed.full_scan,
+    )?;
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&json_plan)?);
+    } else {
+        render_gc_plan(&plan, parsed.detail, parsed.full_scan);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn run_shared_gc_plan(
+    _parsed: &Parsed,
+    _directory: &Path,
+    _key: &str,
+    _deadline_ms: i64,
+) -> Result<(), UsageError> {
+    Err(UsageError::Message(
+        "shared planning requires Unix sockets".into(),
+    ))
+}
+
 /// `broker gc`.
 pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     let action = parsed
@@ -977,31 +1012,7 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
         ) else {
             return Err(UsageError::Message("shared planning requires --service-directory, --request-key and --deadline-ms together".into()));
         };
-        #[cfg(unix)]
-        {
-            crate::service::client::deadline_remaining(deadline_ms)?;
-            let client =
-                crate::service::client::Client::connect(directory, &std::env::current_dir()?)?;
-            let (plan, json_plan) = client.gc_plan(
-                key,
-                deadline_ms,
-                parsed.include_active_gate_cache,
-                parsed.full_scan,
-            )?;
-            if parsed.json {
-                out!("{}", serde_json::to_string_pretty(&json_plan)?);
-            } else {
-                render_gc_plan(&plan, parsed.detail, parsed.full_scan);
-            }
-            return Ok(());
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (directory, key, deadline_ms);
-            return Err(UsageError::Message(
-                "shared planning requires Unix sockets".into(),
-            ));
-        }
+        return run_shared_gc_plan(&parsed, directory, key, deadline_ms);
     }
     if matches!(action, "abandon" | "forget-abandoned") && parsed.include_active_gate_cache {
         return Err(UsageError::Message(format!(

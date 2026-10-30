@@ -1233,9 +1233,18 @@ fn full_scan_is_only_valid_for_gc_plan_and_apply() {
 fn shared_service_options_are_only_valid_for_gc_plan_and_never_repeat() {
     let flags = ["--service-directory", "--request-key", "--deadline-ms"];
     assert_eq!(refusal("gc", &["plan"], &flags), None);
-    for action in ["apply", "abandon", "sweep", "storage"] {
+    for action in [
+        "apply",
+        "abandon",
+        "forget-abandoned",
+        "sweep",
+        "__continue-artifacts",
+    ] {
         for flag in flags {
-            assert!(refusal("gc", &[action], &[flag]).is_some());
+            assert!(
+                refusal("gc", &[action], &[flag]).is_some(),
+                "gc {action} must refuse {flag}"
+            );
         }
     }
     assert!(refusal("status", &[], &flags).is_some());
