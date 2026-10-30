@@ -745,7 +745,7 @@ pub(crate) enum ClosedArtifactCheckoutCohortUnavailableReason {
     CohortMembershipChanged,
     NonClosedAlias,
     AliasResolutionFailed,
-    LiveAliasOverlap,
+    AliasOverlapOutsideCohort,
     LiveAliasUnknown,
     CheckoutMissing,
     GitCheckoutUnavailable,
@@ -768,7 +768,7 @@ impl ClosedArtifactCheckoutCohortUnavailableReason {
             Self::CohortMembershipChanged => "cohort_membership_changed",
             Self::NonClosedAlias => "non_closed_alias",
             Self::AliasResolutionFailed => "alias_resolution_failed",
-            Self::LiveAliasOverlap => "live_alias_overlap",
+            Self::AliasOverlapOutsideCohort => "alias_overlap_outside_cohort",
             Self::LiveAliasUnknown => "live_alias_unknown",
             Self::CheckoutMissing => "checkout_missing",
             Self::GitCheckoutUnavailable => "git_checkout_unavailable",
@@ -1724,7 +1724,7 @@ impl Broker {
                 LiveOverlapEvidence::Overlap
                     if row.cleanup_state == "closed" && group_ids.contains(&row.session_id) => {}
                 LiveOverlapEvidence::Overlap => {
-                    return Ok(unavailable(Reason::LiveAliasOverlap));
+                    return Ok(unavailable(Reason::AliasOverlapOutsideCohort));
                 }
                 LiveOverlapEvidence::Unknown => {
                     return Ok(unavailable(Reason::LiveAliasUnknown));
