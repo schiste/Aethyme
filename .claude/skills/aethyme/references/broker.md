@@ -63,6 +63,17 @@ archive succeeded while checkout removal failed. Check `worktree_removed` and
 reporting reclaimed storage. A partial removal needs inspection, not a blind
 retry or forced deletion.
 
+At the checkout cap, an already-closed, retained checkout owned by your task
+can be reused without allocating or deleting a worktree. Verify that no live
+session owns its exact path, its previous HEAD is fully pushed, and tracked,
+untracked and ignored paths contain no pending work or unpreserved evidence.
+Preserve the previous local and remote branches; create a fresh task branch
+at the intended base, then run `broker start --adopt` from that checkout with
+explicit planned paths. Do not use this to take over another task's checkout
+or to bypass the requirement to keep an unmerged PR session live unless the
+user has authorized that exception. Re-adoption invalidates old cleanup plans;
+never apply a retirement plan made for the previous owner of that path.
+
 When investigating retained worktrees, distinguish task identity from shared
 service uptime. A shared agent daemon can outlive many tasks; its PID alone
 proves neither that each task is active nor that its checkout is disposable.
