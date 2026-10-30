@@ -49,14 +49,26 @@ The exact wire schema, permission rules and staged migration are documented in
 [broker-service.md](broker-service.md). Initial external consumers are manual
 operators; no installed hook, scheduled task or application is migrated yet.
 
-The inactive `service::jobs::JobStore` library adds a separate explicitly opened
+The `service::jobs::JobStore` library adds a separate explicitly opened
 SQLite job file (application ID `0x41534a31`, schema 1), durable idempotency keys,
 atomic deduplication and fenced job state transitions. It has no CLI or socket
-consumer yet; serve/ping still support health only and never open job storage.
+consumer in its foundation phase; plain serve/ping never open job storage.
 Its typed operation describes GC planning only. See the durable-store section
 in [broker-service.md](broker-service.md) for identities, state transitions,
 deadlines, cancellation, result bounds and restart limitations. The legacy
 broker database and its schema version are unchanged.
+
+The dependent opt-in worker adds `service serve <directory> --jobs-for <repository>`
+and `service submit`, `lookup`, `status`, `cancel` and `result`. Submit requires
+an explicit request key and absolute job deadline; optional flags select full
+scan and active gate-cache inspection. A private v2 JSON-line protocol accepts
+only typed GC planning, scoped to the server-verified repository UUID and
+filesystem identities. It provides durable lookup, shared outcomes and chunked
+results while retaining v1 health. Submit/lookup/status/cancel print the v2
+Response envelope; result prints the assembled plan JSON. Exact shapes, null
+semantics, bounds, restart fencing and ambiguous-response handling are specified
+in [broker-service.md](broker-service.md). These are
+manual operator surfaces; existing scripts and automatic jobs are not migrated.
 
 ## Automatic checkout maintenance (v0.8.44)
 

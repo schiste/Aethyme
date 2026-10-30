@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 use crate::service::jobs::{
     JobClaim, JobCompletion, JobError, JobOperation, JobProgress, JobRecord, JobRequest, JobState,
@@ -56,7 +56,18 @@ pub struct JobStore {
 
 impl JobStore {
     pub fn open(path: &Path) -> Result<Self, JobError> {
-        let mut conn = Connection::open(path)?;
+        Self::open_with_flags(path, OpenFlags::default())
+    }
+
+    /// The service supplies a validated canonical private directory. Keep
+    /// its stricter no-follow policy out of the existing general store API.
+    #[cfg(unix)]
+    pub(crate) fn open_private(path: &Path) -> Result<Self, JobError> {
+        Self::open_with_flags(path, OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+    }
+
+    fn open_with_flags(path: &Path, flags: OpenFlags) -> Result<Self, JobError> {
+        let mut conn = Connection::open_with_flags(path, flags)?;
         conn.busy_timeout(Duration::from_secs(2))?;
         // Do not change journal mode or schema before checking identity. In
         // particular, accidentally selecting broker.db must leave it intact.
@@ -85,6 +96,28 @@ impl JobStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         Ok(Self { conn })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn new_worker_generation(&self) -> Result<String, JobError> {
+        Ok(self
+            .conn
+            .query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn begin_read_snapshot_for_test(&self) -> Result<(), JobError> {
+        self.conn
+            .execute_batch("BEGIN; SELECT id FROM service_jobs;")?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn outstanding_count(&self, repository: &str) -> Result<usize, JobError> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM service_jobs WHERE repository=?1 AND state IN ('queued','running','interrupted')",
+            [repository], |r| r.get(0),
+        )?)
     }
 
     /// Retrying a key always returns its original job, including after a

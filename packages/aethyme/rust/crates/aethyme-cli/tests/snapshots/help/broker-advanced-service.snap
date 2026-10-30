@@ -1,8 +1,15 @@
 exit: 0
 --- stdout
-  aethyme broker advanced service serve <private-runtime-directory>
+  aethyme broker advanced service serve <private-runtime-directory> [--jobs-for <repository>]
   aethyme broker advanced service ping <private-runtime-directory> [--json]
-      Opt-in foreground health service; existing broker operations stay local.
+  aethyme broker advanced service submit <private-runtime-directory> --request-key <key> --deadline-ms <utc-ms> [--full-scan] [--include-active-gate-cache] [--json]
+  aethyme broker advanced service lookup <private-runtime-directory> <request-key> [--json]
+  aethyme broker advanced service status <private-runtime-directory> <job-id> [--json]
+  aethyme broker advanced service cancel <private-runtime-directory> <job-id> [--json]
+  aethyme broker advanced service result <private-runtime-directory> <job-id> [--json]
+      Explicit foreground service; existing broker operations stay local.
       Create an absolute canonical directory owned by this user, mode 0700.
+      Jobs require an initialized repository and only plan GC; they never apply it.
+      Keep the request key and exact deadline for durable retry or lookup.
       Stop with Ctrl-C or your process supervisor; no implicit activation.
 --- stderr
