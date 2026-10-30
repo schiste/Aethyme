@@ -4723,7 +4723,9 @@ impl Broker {
         // not the byte count, and a walk here only widens the window between
         // the live-checkout check below and the removal.
         let mut records = crate::measurement::SizeRecords::default();
-        let item = if let Some(archive_guard) = archive_guard {
+        let item = if archive_guard.is_some_and(|guard| guard.preserves_branch(session)) {
+            None
+        } else if let Some(archive_guard) = archive_guard {
             self.cleanup_item_for_recovery_archive_with_limits(
                 session,
                 crate::SizeScan::Recorded,
