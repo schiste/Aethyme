@@ -2383,29 +2383,8 @@ impl Broker {
             })
             .map(|session| session.id)
             .collect::<Vec<_>>();
-        let explicit_lease_sessions = self
-            .store_ref()
-            .explicit_lease_sessions_for_sessions_at(&retirement_candidates, retirement_now)?;
-        let gone_holder_candidates = retirement_candidates
-            .iter()
-            .copied()
-            .filter(|session_id| explicit_lease_sessions.contains(session_id))
-            .collect::<Vec<_>>();
         let mut holder_process_table = crate::session_holder::RecordedHolderProcessTable::default();
         holder_process_table.prime(self.store_ref(), &retirement_candidates, deadline);
-        let gone_holder_report = crate::lease_liveness::record_gone_holders_for_abandoned_page(
-            self.store(),
-            &gone_holder_candidates,
-            &mut holder_process_table,
-            deadline,
-        )?;
-        if let Some(session_id) = gone_holder_report.database_busy_session_id {
-            summary.deferred += 1;
-            summary
-                .reasons
-                .push(SessionRetirementDeferredReason::DatabaseBusy { session_id });
-            return Ok(summary);
-        }
         for session in sessions {
             if deadline_expired(deadline) {
                 summary.deferred += 1;
@@ -2430,6 +2409,7 @@ impl Broker {
                 window_ms,
                 &mut holder_process_table,
                 allow_snapshot,
+                deadline,
             )? {
                 crate::broker::AbandonedSessionCloseOutcome::Closed => summary.retired += 1,
                 crate::broker::AbandonedSessionCloseOutcome::HolderUnavailable => {
@@ -4278,6 +4258,7 @@ mod tests {
                 72 * 3_600_000,
                 &mut process_table,
                 true,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -4302,7 +4283,7 @@ mod tests {
         let holder = crate::session_holder::AgentProcess {
             pid: i64::MAX,
             started: "Mon Oct 26 08:42:41 2026".into(),
-            command: "/opt/codex agent --session busy-retirement".into(),
+            command: "/opt/codex app-server --listen local".into(),
         };
         broker
             .store()

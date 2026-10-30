@@ -449,6 +449,7 @@ impl Broker {
                         abandon_after_ms,
                         &mut holder_process_table,
                         true,
+                        None,
                     )?,
                     AbandonedSessionCloseOutcome::Closed
                 );
@@ -604,6 +605,7 @@ impl Broker {
         abandon_after_ms: i64,
         process_table: &mut crate::session_holder::RecordedHolderProcessTable,
         allow_process_snapshot: bool,
+        deadline: Option<std::time::Instant>,
     ) -> Result<AbandonedSessionCloseOutcome, BrokerOpError> {
         if abandon_after_ms <= 0 {
             return Ok(AbandonedSessionCloseOutcome::NotDue);
@@ -728,10 +730,11 @@ impl Broker {
             .cloned()
             .collect::<Vec<_>>();
         if !explicit_leases.is_empty() {
-            let shared_holder =
-                crate::session_holder::recorded_holder(self.store_ref(), session_id)?.is_some_and(
-                    |holder| crate::session_holder::is_shared_agent_service(&holder.command),
-                );
+            let bound_holder =
+                crate::session_holder::recorded_holder(self.store_ref(), session_id)?;
+            let shared_holder = bound_holder.as_ref().is_some_and(|holder| {
+                crate::session_holder::is_shared_agent_service(&holder.command)
+            });
             let lease_table = holder.binding_event_id.and_then(|event_id| {
                 if shared_holder {
                     process_table.refresh_for_binding(session_id, event_id, allow_process_snapshot)
@@ -739,6 +742,26 @@ impl Broker {
                     process_table.table_for(session_id, event_id)
                 }
             });
+            if shared_holder {
+                if let (Some(binding_event_id), Some(holder_process)) =
+                    (holder.binding_event_id, bound_holder.as_ref())
+                {
+                    match crate::lease_liveness::record_gone_holder_for_abandoned_session(
+                        self.store(),
+                        session_id,
+                        binding_event_id,
+                        holder_process,
+                        lease_table,
+                        deadline,
+                    )? {
+                        crate::lease_liveness::GoneHolderWrite::Skipped
+                        | crate::lease_liveness::GoneHolderWrite::Recorded => {}
+                        crate::lease_liveness::GoneHolderWrite::DatabaseBusy => {
+                            return Ok(AbandonedSessionCloseOutcome::DatabaseBusy);
+                        }
+                    }
+                }
+            }
             let liveness = match crate::lease_liveness::assess_for_abandonment(
                 self.store_ref(),
                 &explicit_leases,
@@ -3609,7 +3632,7 @@ mod generic_guarded_exec_tests {
             ).unwrap();
             let mut table = crate::session_holder::RecordedHolderProcessTable::default();
             let outcome = broker
-                .try_close_abandoned_session(session.id, decision, 60_000, &mut table, true)
+                .try_close_abandoned_session(session.id, decision, 60_000, &mut table, true, None)
                 .unwrap();
             assert_eq!(
                 outcome,
