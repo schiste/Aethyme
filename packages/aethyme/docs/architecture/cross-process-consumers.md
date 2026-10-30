@@ -61,6 +61,38 @@ contract while protocol-dependent unattended removal stays blocked. See
 [automatic checkout maintenance](../guides/automatic-checkout-maintenance.md)
 for rollout holds, policy restoration and the report field contract.
 
+## Scheduled GC service
+
+The macOS operator commands `broker gc service plan|install|status|activate|deactivate|uninstall`
+introduce a separate `aethyme.gc-sweep-service-plan/v1` plan namespace. Installation
+is inert; each state change requires the exact installed plan digest. The plan
+binds repository UUID, canonical repository/home paths, user identity, immutable
+managed router and engine paths, both binary hashes, build identity, fixed
+900-second interval, generation and LaunchAgent bytes. Changed runtimes require
+explicit deactivation, uninstall and review of a replacement plan.
+
+The LaunchAgent invokes only `broker gc sweep --json`, with
+`AETHYME_GC_SWEEP_SERVICE_UUID` and `AETHYME_GC_SWEEP_SERVICE_GENERATION` markers.
+Before opening a mutating broker it checks the repository snapshot, installed
+generation and both binaries. Native GC policy, singleton admission, bounded
+worker passes and retry backoff remain authoritative. `RunAtLoad` is false;
+intervals missed while asleep are not proof that a tick ran. No agent/model
+calls, retention overrides or automatic recovery-archive purging are added.
+
+`aethyme.gc-sweep-service-control/v1` records acknowledged or unknown scheduler
+operations. Read-only status reports that observation and runtime health.
+Uninstall requires an acknowledged deactivation, checked under the same
+installation lock used by activation and managed ticks; it removes only the
+exact owned generation files. Missing receipts are distinct from unreadable or
+unsafe receipts.
+
+`aethyme.gc-sweep-service-last-pass/v1` is atomically replaced and limited to
+4 KiB. It binds repository UUID/generation and timestamps, with `sweep_complete`,
+`sweep_paused`, `error` or `unknown` outcomes and optional sweep counters. A
+completed sweep is not proof that all checkout cleanup or archive retention
+work has finished. Detached continuation workers keep their own native receipts.
+Existing PR-watch plans, units and health records retain their contract.
+
 ## PR-watch service plan (#887)
 
 `aethyme broker advanced watch pr service plan --broker-bin <absolute-router>`

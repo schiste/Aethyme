@@ -1,10 +1,14 @@
 //! Explicit operator plans for a macOS PR-watch service. No implicit activation.
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 
-const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(test)]
+use crate::scheduled_service::{MAX_BINARY_BYTES, binary_digest_with_hook};
+use crate::scheduled_service::{
+    absolute_directory, binary_digest, digest, executable, invalid, text, xml,
+};
+
 const MONITOR: &str = include_str!("../../../../scripts/adapters/aethyme-pr-monitor.py");
 const ADAPTER: &str = include_str!("../../../../scripts/adapters/chau7-delivery-adapter.py");
 
@@ -36,120 +40,6 @@ pub(crate) struct Plan {
     pub generation: String,
     pub unit: String,
     pub digest: String,
-}
-
-fn invalid(message: impl Into<String>) -> io::Error {
-    io::Error::other(message.into())
-}
-
-fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
-fn text(path: &Path) -> io::Result<&str> {
-    path.to_str()
-        .ok_or_else(|| invalid("service paths must be UTF-8"))
-}
-
-fn xml(value: &str) -> io::Result<String> {
-    if value
-        .chars()
-        .any(|c| c < ' ' && !matches!(c, '\n' | '\r' | '\t'))
-    {
-        return Err(invalid("service values contain XML control characters"));
-    }
-    Ok(value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;"))
-}
-
-fn absolute_directory(path: &Path) -> io::Result<PathBuf> {
-    if !path.is_absolute() || !path.is_dir() {
-        return Err(invalid(
-            "service directory inputs must be existing absolute directories",
-        ));
-    }
-    path.canonicalize()
-}
-
-fn executable(path: &Path) -> io::Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt as _;
-    if !path.is_absolute() {
-        return Err(invalid("service executables must use absolute paths"));
-    }
-    let path = path.canonicalize()?;
-    let metadata = path.metadata()?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-        return Err(invalid(
-            "service executable is not an executable regular file",
-        ));
-    }
-    Ok(path)
-}
-
-fn binary_digest(path: &Path) -> io::Result<String> {
-    binary_digest_with_hook(path, || Ok(()))
-}
-
-fn same_identity(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    a.dev() == b.dev()
-        && a.ino() == b.ino()
-        && a.len() == b.len()
-        && a.mode() == b.mode()
-        && a.mtime() == b.mtime()
-        && a.mtime_nsec() == b.mtime_nsec()
-        && a.ctime() == b.ctime()
-        && a.ctime_nsec() == b.ctime_nsec()
-}
-
-fn binary_digest_with_hook(
-    path: &Path,
-    after_open: impl FnOnce() -> io::Result<()>,
-) -> io::Result<String> {
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
-    let before = file.metadata()?;
-    if !before.is_file() || before.mode() & 0o111 == 0 {
-        return Err(invalid(
-            "service identity requires an executable regular file",
-        ));
-    }
-    if before.len() > MAX_BINARY_BYTES {
-        return Err(invalid("service executable exceeds the identity budget"));
-    }
-    after_open()?;
-    let mut hash = Sha256::new();
-    let mut read = (&file).take(MAX_BINARY_BYTES + 1);
-    let mut bytes = [0; 64 * 1024];
-    let mut total = 0;
-    loop {
-        let size = read.read(&mut bytes)?;
-        if size == 0 {
-            break;
-        }
-        total += size as u64;
-        if total > MAX_BINARY_BYTES {
-            return Err(invalid(
-                "service executable grew beyond the identity budget",
-            ));
-        }
-        hash.update(&bytes[..size]);
-    }
-    let after = file.metadata()?;
-    let named = std::fs::symlink_metadata(path)?;
-    if total != before.len() || !same_identity(&before, &after) || !same_identity(&after, &named) {
-        return Err(invalid(
-            "service executable changed during identity verification",
-        ));
-    }
-    Ok(format!("{:x}", hash.finalize()))
 }
 
 pub(crate) fn script_contents() -> [(&'static str, &'static str); 2] {
@@ -310,6 +200,61 @@ mod tests {
         assert!(!first.directory.exists());
         assert!(!first.unit_path.exists());
         assert_eq!(first.scripts.len(), 2);
+    }
+
+    #[test]
+    fn shared_service_helpers_preserve_pr_watch_v1_plan_and_unit_fixture() {
+        let (_owner, repo, home, broker) = fixture();
+        let plan = Plan::new(&repo, UUID, &home, &broker, &broker, 300, 501).unwrap();
+        assert_eq!(plan.schema, "aethyme.pr-watch-service-plan/v1");
+        let serialized = serde_json::to_string(&plan).unwrap();
+        assert!(serialized.starts_with(
+            r#"{"schema":"aethyme.pr-watch-service-plan/v1","repository_uuid":"12345678-1234-4123-8123-123456789abc","repository":""#
+        ));
+
+        let mut unit = plan.unit.clone();
+        for (actual, fixture) in [
+            (xml(text(&plan.python).unwrap()).unwrap(), "<PYTHON>"),
+            (
+                xml(text(&plan.directory.join("aethyme-pr-monitor.py")).unwrap()).unwrap(),
+                "<MONITOR>",
+            ),
+            (
+                xml(text(&plan.repository).unwrap()).unwrap(),
+                "<REPOSITORY>",
+            ),
+            (xml(text(&plan.home).unwrap()).unwrap(), "<HOME>"),
+            (xml(text(&plan.broker).unwrap()).unwrap(), "<BROKER>"),
+            (plan.label.clone(), "<LABEL>"),
+            (plan.generation.clone(), "<GENERATION>"),
+            (plan.broker_sha256.clone(), "<BROKER_SHA256>"),
+        ] {
+            unit = unit.replace(&actual, fixture);
+        }
+        assert_eq!(
+            unit,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string><LABEL></string>
+<key>ProgramArguments</key><array><string><PYTHON></string><string>-I</string><string>-B</string><string><MONITOR></string></array>
+<key>EnvironmentVariables</key><dict>
+<key>HOME</key><string><HOME></string>
+<key>AETHYME_PR_MONITOR_REPO</key><string><REPOSITORY></string>
+<key>AETHYME_BROKER_BIN</key><string><BROKER></string>
+<key>AETHYME_PR_MONITOR_BROKER_SHA256</key><string><BROKER_SHA256></string>
+<key>AETHYME_PR_MONITOR_GENERATION</key><string><GENERATION></string>
+<key>AETHYME_PR_MONITOR_RECORD_HEALTH</key><string>1</string>
+<key>AETHYME_PR_MONITOR_WORKER</key><string><LABEL></string>
+<key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+</dict>
+<key>StartInterval</key><integer>300</integer>
+<key>RunAtLoad</key><false/>
+<key>StandardOutPath</key><string>/dev/null</string>
+<key>StandardErrorPath</key><string>/dev/null</string>
+</dict></plist>
+"#
+        );
     }
 
     #[test]

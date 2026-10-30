@@ -176,6 +176,10 @@ pub use pr_monitoring::{
 };
 mod pr_projection;
 mod pr_watch;
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod gc_sweep_service;
+#[cfg(unix)]
+mod scheduled_service;
 #[cfg(unix)]
 mod pr_watch_service;
 #[cfg(any(target_os = "macos", all(test, unix)))]
