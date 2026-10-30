@@ -310,7 +310,8 @@ pub fn validate_runtime_bundle_pair(
         runtime_executable_identity(&router_path).map_err(|error| error.to_string())?;
     let engine_before =
         runtime_executable_identity(&engine_path).map_err(|error| error.to_string())?;
-    if router_before.len > MAX_RUNTIME_BINARY_BYTES || engine_before.len > MAX_RUNTIME_BINARY_BYTES
+    if router_before.length > MAX_RUNTIME_BINARY_BYTES
+        || engine_before.length > MAX_RUNTIME_BINARY_BYTES
     {
         return Err("managed runtime binary exceeds the identity budget".into());
     }
@@ -685,7 +686,9 @@ fn bounded_version_output(path: &Path, timeout: Duration) -> Result<VersionOutpu
             status = child.child.try_wait().map_err(|error| error.to_string())?;
             child.reaped = status.is_some();
         }
-        if let (Some(status), Some(output)) = (status, output.take()) {
+        if status.is_some() && output.is_some() {
+            let status = status.take().expect("child status was checked above");
+            let output = output.take().expect("probe output was checked above");
             if output.len() > VERSION_PROBE_BYTES {
                 return Err("managed runtime version probe exceeded its output budget".into());
             }
