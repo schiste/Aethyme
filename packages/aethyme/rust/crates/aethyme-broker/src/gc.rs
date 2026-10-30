@@ -18,8 +18,8 @@ use crate::{
     GcCheckpointPinRelease, GcDeclinedArtifact, GcFileAction, GcFileCandidate,
     GcGateCacheCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcPublicationExposureExpiry,
     GcRecoveryArchiveCandidate, GcRowCandidate, GcWorktreeBlockerSummary, GcWorktreeCandidate,
-    GitRepo, OperationStatus, RecoveryArchiveInventory, RetentionPolicy, load_retention_policy,
-    load_retention_policy_report,
+    GitRepo, OperationStatus, RecoveryArchiveInventory, RetentionPolicy,
+    SessionRetirementDeferredReason, load_retention_policy, load_retention_policy_report,
 };
 
 mod tree_removal;
@@ -11643,7 +11643,7 @@ mod tests {
         let lock = GcLock::acquire(root).unwrap();
 
         let (outcome, entries) = broker
-            .sweep_artifacts_autonomously(&policy, ArtifactSweepScope::Inline)
+            .sweep_artifacts_autonomously_with_progress(&policy, ArtifactSweepScope::Inline)
             .unwrap();
         assert!(outcome.complete);
         assert!(outcome.auto_cleanup.is_none());
