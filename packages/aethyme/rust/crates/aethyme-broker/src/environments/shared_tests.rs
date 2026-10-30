@@ -180,10 +180,32 @@ fn a_shared_environment_is_ref_owned_and_survives_worktree_cleanup() {
     let after = lifecycle.store.get(&record.env_id).unwrap().unwrap();
     assert_eq!(after.phase, EnvironmentPhase::Active);
 
-    let vars = consumer_variables(&host.root(), "baseline", &after);
+    let vars = consumer_variables(&host.root(), "baseline", &after, None);
     assert!(
         vars.iter()
             .any(|(k, v)| k == "AETHYME_SHARED_BASELINE_URL" && v.starts_with("http://127.0.0.1:"))
+    );
+    // #1274: with the proxy, consumers go through the route host (held
+    // during a swap, woken on request); the direct URL stays available.
+    let proxied = consumer_variables(&host.root(), "baseline", &after, Some(4180));
+    let url = proxied
+        .iter()
+        .find(|(k, _)| k == "AETHYME_SHARED_BASELINE_URL")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    assert_eq!(
+        url,
+        format!(
+            "http://{}:4180",
+            super::shared::alias_host(REPOSITORY, "baseline", "localhost")
+        ),
+        "the alias survives blue/green flips"
+    );
+    assert!(
+        proxied
+            .iter()
+            .any(|(k, v)| k == "AETHYME_SHARED_BASELINE_DIRECT_URL"
+                && v.starts_with("http://127.0.0.1:"))
     );
     assert!(
         vars.iter()
@@ -209,7 +231,17 @@ fn get(port: u16, host: &str, path: &str) -> Option<String> {
     Some(response)
 }
 
-/// #1217 acceptance: advancing the default branch redeploys the baseline
+/// The shared environment in a one-unit pool: no room for a second slot.
+fn in_a_full_pool(text: &str) -> String {
+    text.replacen(
+        "[[profiles]]\nname = \"backend\"\n",
+        "[pools.envs]\nlimit = 1\n[[profiles]]\nname = \"backend\"\nunits = 1\n",
+        1,
+    )
+}
+
+/// #1217 acceptance, and #1274's fallback: with no room for a second slot,
+/// advancing the default branch redeploys the baseline by hold-and-swap
 /// without a single failed request through its route.
 #[test]
 fn a_redeploy_swaps_revisions_without_a_failed_request() {
@@ -219,6 +251,12 @@ fn a_redeploy_swaps_revisions_without_a_failed_request() {
     }
     let host = Host::new();
     let repo = repository(43450);
+    commit(
+        repo.path(),
+        ".aethyme/environments.toml",
+        &in_a_full_pool(&environments(43450, SERVE)),
+        "one-unit pool",
+    );
     let none = HostEnvironmentsFile::default();
     let mut lifecycle = host.lifecycle();
     let before = lifecycle
@@ -657,6 +695,312 @@ fn a_profile_change_replaces_the_shared_environment() {
         .unwrap();
     assert_eq!(new.profile, "backend2");
     assert_eq!(new.phase, EnvironmentPhase::Active);
+    lifecycle
+        .shared_destroy(repo.path(), REPOSITORY, "baseline")
+        .unwrap();
+}
+
+/// #1274: waking a consumer brings its shared environments up first, so the
+/// URLs it was given answer.
+#[test]
+fn waking_a_consumer_wakes_its_shared_environment() {
+    if !python_available() {
+        eprintln!("SKIP consumer wake: python3 not available");
+        return;
+    }
+    let host = Host::new();
+    let repo = repository(43750);
+    let mut lifecycle = host.lifecycle();
+    let shared = up_baseline(&mut lifecycle, repo.path());
+
+    let text = std::fs::read_to_string(repo.path().join(".aethyme/environments.toml")).unwrap();
+    let loaded: super::Loaded<super::spec::EnvironmentsFile> =
+        super::parse_loaded(PathBuf::from("t"), "t", &text);
+    let file = loaded.value.unwrap();
+    let fingerprint = crate::console::worktree_fingerprint(repo.path());
+    let snapshot = super::compile::compile(
+        &file,
+        &HostEnvironmentsFile::default(),
+        "frontend",
+        "t",
+        &super::compile::CompileContext {
+            repository: REPOSITORY.into(),
+            owner: EnvironmentOwner::Worktree {
+                fingerprint: fingerprint.clone(),
+            },
+            worktree_fingerprint: fingerprint,
+            source_commit: None,
+            source_dirty: false,
+            source_digest: String::new(),
+        },
+    )
+    .unwrap();
+    let consumer = lifecycle
+        .up(
+            &snapshot,
+            repo.path(),
+            Some(repo.path()),
+            None,
+            &super::lifecycle::UpOptions {
+                wait: Duration::from_secs(5),
+                reconfigure: false,
+            },
+        )
+        .unwrap()
+        .env_id;
+    lifecycle.park(&consumer, "test").unwrap();
+    lifecycle.park(&shared.env_id, "idle").unwrap();
+
+    lifecycle.wake(&consumer, Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        lifecycle.store.get(&shared.env_id).unwrap().unwrap().phase,
+        EnvironmentPhase::Active,
+        "the shared environment woke with its consumer"
+    );
+    lifecycle.down(&consumer, None).unwrap();
+    lifecycle
+        .shared_destroy(repo.path(), REPOSITORY, "baseline")
+        .unwrap();
+}
+
+/// #1274: shared sync runs off the supervisor tick, one at a time, so a slow
+/// redeploy never delays lease renewal.
+#[test]
+fn shared_sync_never_blocks_the_tick() {
+    let mut work = super::operate::LifecycleWork {
+        watch: super::supervisor::StoreWatch {
+            store_path: PathBuf::from("/nonexistent/environments.db"),
+        },
+        proxy_started: true,
+        last_sample: None,
+        shared_sync: None,
+    };
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let started = std::time::Instant::now();
+    assert!(work.start_shared_sync(move || {
+        wait.recv().ok();
+    }));
+    // A second start runs on its own thread so a blocking one fails the test
+    // instead of hanging it.
+    let (done, second) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let started_again = work.start_shared_sync(|| {});
+        done.send((work, started_again)).ok();
+    });
+    let Ok((mut work, started_again)) = second.recv_timeout(Duration::from_secs(2)) else {
+        release.send(()).ok();
+        panic!("starting a sync blocked while the previous one ran");
+    };
+    assert!(!started_again, "a second sync waits for the first");
+    assert!(started.elapsed() < Duration::from_millis(500));
+    release.send(()).unwrap();
+    for _ in 0..100 {
+        if work.start_shared_sync(|| {}) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the next sync starts once the first finished");
+}
+
+/// #1274: with room for a second slot, a redeploy is blue/green: the new
+/// revision comes up beside the serving one, the alias moves, and no request
+/// through it is held or fails; the old slot is destroyed, never parked.
+#[test]
+fn a_blue_green_redeploy_holds_nothing() {
+    if !python_available() {
+        eprintln!("SKIP blue/green: python3 not available");
+        return;
+    }
+    let host = Host::new();
+    let repo = repository(43800);
+    let none = HostEnvironmentsFile::default();
+    let mut lifecycle = host.lifecycle();
+    let blue = up_baseline(&mut lifecycle, repo.path());
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let config = Arc::new(ProxyConfig {
+        root: host.root(),
+        store_path: host.store(),
+        host_db: host.db(),
+        token: "t".repeat(64),
+        holder_pid: None,
+    });
+    let proxy_stop = stop.clone();
+    std::thread::spawn(move || serve(listener, config, proxy_stop));
+
+    let alias = super::shared::alias_host(REPOSITORY, "baseline", "localhost");
+    let results: Arc<std::sync::Mutex<Vec<(std::time::Duration, String)>>> = Arc::default();
+    let client_stop = Arc::new(AtomicBool::new(false));
+    let client = {
+        let (alias, client_stop, results) = (alias.clone(), client_stop.clone(), results.clone());
+        std::thread::spawn(move || {
+            while !client_stop.load(Ordering::SeqCst) {
+                let started = std::time::Instant::now();
+                let response = get(proxy_port, &alias, "/version.txt").unwrap_or_default();
+                results.lock().unwrap().push((started.elapsed(), response));
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        })
+    };
+    let wait_for = |count: usize| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while results.lock().unwrap().len() < count {
+            assert!(std::time::Instant::now() < deadline, "the client stalled");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_for(5);
+    let v2 = commit(repo.path(), "version.txt", "v2", "v2");
+    let outcome = lifecycle
+        .shared_redeploy(
+            repo.path(),
+            REPOSITORY,
+            "baseline",
+            &none,
+            Duration::from_secs(10),
+            true,
+        )
+        .unwrap();
+    assert!(
+        matches!(&outcome, Redeploy::Redeployed { to, .. } if *to == v2),
+        "{outcome:?}"
+    );
+    let seen = results.lock().unwrap().len();
+    wait_for(seen + 5);
+    client_stop.store(true, Ordering::SeqCst);
+    client.join().unwrap();
+    stop.store(true, Ordering::SeqCst);
+    let results = results.lock().unwrap().clone();
+
+    let failed: Vec<&String> = results
+        .iter()
+        .map(|(_, r)| r)
+        .filter(|r| !(r.starts_with("HTTP/1.0 200") || r.starts_with("HTTP/1.1 200")))
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "{} of {} failed: {:?}",
+        failed.len(),
+        results.len(),
+        failed.first()
+    );
+    assert!(results.first().unwrap().1.ends_with("v1"));
+    assert!(
+        results.last().unwrap().1.ends_with("v2"),
+        "the new slot serves"
+    );
+    let slowest = results.iter().map(|(d, _)| *d).max().unwrap();
+    assert!(
+        slowest < Duration::from_secs(1),
+        "nothing was held: {slowest:?}"
+    );
+
+    let transitions = lifecycle.store.transitions(&blue.env_id, 100).unwrap();
+    assert!(
+        !transitions.iter().any(|t| t.to == EnvironmentPhase::Parked),
+        "the serving slot was never parked: {transitions:?}"
+    );
+    assert_eq!(
+        lifecycle.store.get(&blue.env_id).unwrap().unwrap().phase,
+        EnvironmentPhase::Destroyed,
+        "the previous slot is destroyed"
+    );
+    let green = lifecycle
+        .shared_record(repo.path(), REPOSITORY, "baseline")
+        .unwrap()
+        .unwrap();
+    assert_ne!(green.env_id, blue.env_id);
+    assert_eq!(green.phase, EnvironmentPhase::Active);
+
+    // The next redeploy flips back to the first slot.
+    let v3 = commit(repo.path(), "version.txt", "v3", "v3");
+    let outcome = lifecycle
+        .shared_redeploy(
+            repo.path(),
+            REPOSITORY,
+            "baseline",
+            &none,
+            Duration::from_secs(10),
+            true,
+        )
+        .unwrap();
+    assert!(
+        matches!(&outcome, Redeploy::Redeployed { to, .. } if *to == v3),
+        "{outcome:?}"
+    );
+    let serving = lifecycle
+        .shared_record(repo.path(), REPOSITORY, "baseline")
+        .unwrap()
+        .unwrap();
+    assert_eq!(serving.env_id, blue.env_id, "back on the first slot");
+    lifecycle
+        .shared_destroy(repo.path(), REPOSITORY, "baseline")
+        .unwrap();
+    assert_eq!(
+        lifecycle.store.get(&green.env_id).unwrap().unwrap().phase,
+        EnvironmentPhase::Destroyed
+    );
+}
+
+/// #1274: a stateful shared environment (a database) is never redeployed
+/// blue/green, even with room for a second slot: the new slot would start
+/// without its data. It swaps in place and keeps its environment.
+#[test]
+fn a_stateful_shared_environment_never_runs_blue_green() {
+    if !python_available() {
+        eprintln!("SKIP stateful: python3 not available");
+        return;
+    }
+    let host = Host::new();
+    let repo = repository(43850);
+    commit(
+        repo.path(),
+        ".aethyme/environments.toml",
+        &environments(43850, SERVE).replacen(
+            "min_redeploy_interval_seconds = 3600\n",
+            "min_redeploy_interval_seconds = 3600\nstateful = true\n",
+            1,
+        ),
+        "stateful baseline",
+    );
+    let none = HostEnvironmentsFile::default();
+    let mut lifecycle = host.lifecycle();
+    let before = lifecycle
+        .shared_up(
+            repo.path(),
+            REPOSITORY,
+            "baseline",
+            &none,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    let v2 = commit(repo.path(), "version.txt", "v2", "v2");
+    let outcome = lifecycle
+        .shared_redeploy(
+            repo.path(),
+            REPOSITORY,
+            "baseline",
+            &none,
+            Duration::from_secs(20),
+            true,
+        )
+        .unwrap();
+    assert!(
+        matches!(&outcome, Redeploy::Redeployed { to, .. } if *to == v2),
+        "{outcome:?}"
+    );
+    let after = lifecycle.store.get(&before.env_id).unwrap().unwrap();
+    assert_eq!(after.phase, EnvironmentPhase::Active, "swapped in place");
+    assert_eq!(after.snapshot.source.commit.as_deref(), Some(v2.as_str()));
+    let live = lifecycle.store.list(None).unwrap();
+    assert!(
+        live.iter()
+            .all(|r| !matches!(&r.owner, EnvironmentOwner::Ref { name } if name.ends_with("#b"))),
+        "no second slot: {live:?}"
+    );
     lifecycle
         .shared_destroy(repo.path(), REPOSITORY, "baseline")
         .unwrap();
