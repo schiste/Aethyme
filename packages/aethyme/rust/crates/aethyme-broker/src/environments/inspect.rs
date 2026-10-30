@@ -208,10 +208,28 @@ pub(super) fn run_list(options: &Options) -> Result<Output, Failure> {
     for record in &records {
         text.push_str(&summary_line(record));
     }
+    let memory: Vec<Value> = records
+        .iter()
+        .map(|record| {
+            store
+                .as_ref()
+                .and_then(|store| store.latest_sample(&record.env_id).ok().flatten())
+                .map_or(Value::Null, |sample| json!(sample))
+        })
+        .collect();
+    let environments: Vec<Value> = records
+        .iter()
+        .zip(memory)
+        .map(|(record, memory)| {
+            let mut value = summary(record);
+            value["memory"] = memory;
+            value
+        })
+        .collect();
     let value = json!({
         "schema": LIST_SCHEMA,
         "scope": if options.all { "host" } else { "repository" },
-        "environments": records.iter().map(summary).collect::<Vec<_>>(),
+        "environments": environments,
     });
     Ok((value, text, exit_status::SUCCESS))
 }
@@ -331,6 +349,7 @@ pub(super) fn run_supervise(options: &Options) -> Result<Output, Failure> {
     let mut work = super::operate::LifecycleWork {
         watch: StoreWatch { store_path },
         proxy_started: false,
+        last_sample: None,
     };
     let reason = supervisor::run(&config, &mut work, &|| false)
         .map_err(|error| environment_failure(format!("supervisor: {error}")))?;

@@ -79,6 +79,17 @@ CREATE TABLE IF NOT EXISTS environment_transitions (
   detail_json TEXT
 );
 CREATE INDEX IF NOT EXISTS environment_transitions_env ON environment_transitions(env_id, seq);
+CREATE TABLE IF NOT EXISTS environment_samples (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  env_id TEXT NOT NULL,
+  repository TEXT NOT NULL,
+  profile TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  bytes INTEGER,
+  cpu_pct REAL,
+  method TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS environment_samples_profile ON environment_samples(repository, profile, seq);
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -824,6 +835,84 @@ impl EnvironmentStore {
             load_record(&tx, env_id)?.ok_or_else(|| StoreError::NotFound(env_id.into()))?;
         tx.commit()?;
         Ok(updated)
+    }
+
+    /// Record one resource sample (#1218) and keep at most
+    /// `keep` samples per (repository, profile).
+    pub fn record_sample(
+        &mut self,
+        record: &EnvironmentRecord,
+        sample: &super::metrics::Sample,
+        keep: usize,
+    ) -> Result<(), StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO environment_samples (env_id, repository, profile, at, bytes, cpu_pct, method)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                record.env_id,
+                record.repository,
+                record.profile,
+                sample.sampled_at,
+                sample.bytes.map(|b| b as i64),
+                sample.cpu_pct,
+                sample.method
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM environment_samples WHERE repository = ?1 AND profile = ?2 AND seq NOT IN (
+               SELECT seq FROM environment_samples WHERE repository = ?1 AND profile = ?2
+               ORDER BY seq DESC LIMIT ?3)",
+            params![record.repository, record.profile, keep as i64],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The newest sample of an environment.
+    pub fn latest_sample(
+        &self,
+        env_id: &str,
+    ) -> Result<Option<super::metrics::Sample>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT bytes, cpu_pct, method, at FROM environment_samples
+                 WHERE env_id = ?1 ORDER BY seq DESC LIMIT 1",
+                params![env_id],
+                |row| {
+                    Ok(super::metrics::Sample {
+                        bytes: row.get::<_, Option<i64>>(0)?.map(|b| b as u64),
+                        cpu_pct: row.get(1)?,
+                        method: row.get(2)?,
+                        sampled_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Measured byte samples per profile of one repository (unknown
+    /// measurements excluded).
+    pub fn footprints(
+        &self,
+        repository: &str,
+    ) -> Result<std::collections::BTreeMap<String, Vec<u64>>, StoreError> {
+        let mut statement = self.conn.prepare(
+            "SELECT profile, bytes FROM environment_samples
+             WHERE repository = ?1 AND bytes IS NOT NULL",
+        )?;
+        let rows = statement.query_map(params![repository], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut history: std::collections::BTreeMap<String, Vec<u64>> = Default::default();
+        for row in rows {
+            let (profile, bytes) = row?;
+            history.entry(profile).or_default().push(bytes as u64);
+        }
+        Ok(history)
     }
 
     pub fn set_pin(

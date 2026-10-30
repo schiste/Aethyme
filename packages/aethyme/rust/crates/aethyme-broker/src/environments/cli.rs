@@ -39,6 +39,7 @@ pub const PIN_SCHEMA: &str = "aethyme.env-pin/v1";
 pub const ROUTES_SCHEMA: &str = "aethyme.env-routes/v1";
 pub const INFER_SCHEMA: &str = "aethyme.env-infer/v1";
 pub const SHARED_SCHEMA: &str = "aethyme.env-shared/v1";
+pub const CALIBRATE_SCHEMA: &str = "aethyme.env-calibrate/v1";
 
 pub const USAGE: &str = "\
 aethyme env — declared runnable environments per worktree
@@ -124,6 +125,13 @@ Usage:
       the new revision fails; the supervisor does this when the ref moves,
       at most every min_redeploy_interval_seconds (--force ignores it).
       Profiles with uses_shared get AETHYME_SHARED_<NAME>_URL/_PORT_<C>.
+  aethyme env calibrate [--ram-fraction <0..1>] [--json]
+      Propose `units` per profile and `limit` per pool from measured
+      footprints (the supervisor samples active environments every 60 s:
+      process-group RSS or container stats), so a full pool's p95 stays
+      within --ram-fraction (default 0.5) of RAM minus any container-engine
+      VM reservation. Prints a diff of environments.toml; never writes it.
+      Profiles with fewer than 10 samples are reported as insufficient.
   aethyme env routes [--json]
       The route table the built-in proxy serves on 127.0.0.1:4180
       (AETHYME_ENV_PROXY_PORT): <component>.<namespace>.<route_domain> and
@@ -167,6 +175,7 @@ pub(super) struct Options {
     pub(super) pin_seconds: Option<u64>,
     pub(super) range: Option<String>,
     pub(super) force: bool,
+    pub(super) ram_fraction: f64,
 }
 
 pub fn run(args: &[String]) -> u8 {
@@ -213,6 +222,7 @@ pub fn run(args: &[String]) -> u8 {
         "routes" => super::operate::run_routes(&options),
         "infer" => super::operate::run_infer(&options),
         "shared" => super::operate::run_shared(&options),
+        "calibrate" => super::operate::run_calibrate(&options),
         other => Err(Failure {
             code: "unknown_subcommand",
             message: format!("unknown env subcommand {other:?}"),
@@ -260,6 +270,7 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
         pin_seconds: None,
         range: None,
         force: false,
+        ram_fraction: super::metrics::DEFAULT_RAM_FRACTION,
     };
     let number = |value: Option<&String>, flag: &str| -> Result<usize, Failure> {
         value
@@ -292,6 +303,13 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
                 )
             }
             "--force" if command == "shared" => options.force = true,
+            "--ram-fraction" if command == "calibrate" => {
+                options.ram_fraction = args
+                    .next()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .filter(|f| *f > 0.0 && *f <= 1.0)
+                    .ok_or_else(|| usage("--ram-fraction needs a number in (0, 1]".into()))?
+            }
             "--range" if command == "infer" => {
                 options.range = Some(
                     args.next()
