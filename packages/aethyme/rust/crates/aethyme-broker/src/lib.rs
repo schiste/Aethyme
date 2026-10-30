@@ -174,12 +174,10 @@ pub use pr_monitoring::{
     activate as activate_pr_monitoring, active_sessions as pr_monitoring_sessions,
     deactivate as deactivate_pr_monitoring, is_active as pr_monitoring_is_active,
 };
-mod pr_projection;
-mod pr_watch;
 #[cfg(any(target_os = "macos", all(test, unix)))]
 mod gc_sweep_service;
-#[cfg(unix)]
-mod scheduled_service;
+mod pr_projection;
+mod pr_watch;
 #[cfg(unix)]
 mod pr_watch_service;
 #[cfg(any(target_os = "macos", all(test, unix)))]
@@ -199,6 +197,8 @@ pub mod renamed_targets;
 mod repo_watch;
 mod report;
 mod report_filing;
+#[cfg(unix)]
+mod scheduled_service;
 mod watch_tick_budget;
 pub use chau7_tabs::{
     Chau7DispatchAction, Chau7Resolution, Chau7ResolutionRefusal, Chau7Tab, Chau7TabReadiness,
