@@ -251,6 +251,7 @@ fn runtime_pair(current_executable: &Path) -> io::Result<RuntimePair> {
             "managed runtime is not in an immutable version directory",
         ));
     }
+    // SAFETY: geteuid has no preconditions and reads this process's effective user ID.
     let uid = unsafe { libc::geteuid() };
     for path in [&managed_root, &versions_directory, &version_directory] {
         let metadata = fs::symlink_metadata(path)?;
@@ -355,6 +356,7 @@ pub(crate) fn service_plan() -> io::Result<Plan> {
         &repository,
         &uuid,
         &home,
+        // SAFETY: geteuid has no preconditions and reads this process's effective user ID.
         unsafe { libc::geteuid() },
         &runtime,
     )
@@ -430,6 +432,7 @@ fn validate_plan(plan: &Plan, bytes: &[u8], home: &Path, uuid: &str, uid: u32) -
 
 fn load(home: &Path, uuid: &str) -> io::Result<(Plan, Vec<u8>)> {
     let home = absolute_directory(home)?;
+    // SAFETY: geteuid has no preconditions and reads this process's effective user ID.
     let uid = unsafe { libc::geteuid() };
     if uid == 0 {
         return Err(invalid("GC sweep service requires a non-root user"));
@@ -458,6 +461,7 @@ fn load(home: &Path, uuid: &str) -> io::Result<(Plan, Vec<u8>)> {
 fn verify_runtime(plan: &Plan) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
 
+    // SAFETY: geteuid has no preconditions and reads this process's effective user ID.
     let uid = unsafe { libc::geteuid() };
     let runtime = RuntimePair {
         managed_root: plan.managed_root.clone(),
@@ -952,6 +956,7 @@ mod tests {
             &repo,
             "123e4567-e89b-42d3-a456-426614174000",
             &home,
+            // SAFETY: geteuid has no preconditions and reads this process's effective user ID.
             unsafe { libc::geteuid() },
             &runtime,
         )

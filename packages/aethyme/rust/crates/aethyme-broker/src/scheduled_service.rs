@@ -137,6 +137,7 @@ pub(crate) mod launchd {
     #[cfg(target_os = "macos")]
     use std::io;
 
+    #[cfg(any(target_os = "macos", test))]
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) enum Observation {
         Success,
