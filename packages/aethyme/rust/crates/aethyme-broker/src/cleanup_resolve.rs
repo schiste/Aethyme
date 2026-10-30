@@ -6897,6 +6897,88 @@ mod tests {
     }
 
     #[test]
+    fn preserved_branch_retirement_rechecks_content_after_archive_verification() {
+        let (_owner, repository, _storage, mut broker, session, worktree, _base, head, branch_ref) =
+            closed_unique_commit_fixture("preserved retirement rechecks archived content");
+        git(&worktree, &["checkout", "--detach"]);
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        assert!(plan.checkout_branch_ref.is_none());
+        assert_eq!(plan.checkout_branch_tip.as_deref(), Some(head.as_str()));
+
+        let late_change = worktree.join("preserve.txt");
+        let outcome = broker
+            .cleanup_resolve_apply_with_bundle_writer_mode(
+                session.id,
+                &plan.digest,
+                move || {
+                    std::fs::write(&late_change, "changed after archive\n").unwrap();
+                },
+                sync_archive_directory,
+                |_, _| {
+                    Some(crate::disk_headroom::DiskHeadroom {
+                        bytes: u64::MAX,
+                        inodes: None,
+                    })
+                },
+                true,
+                false,
+                None,
+                None,
+                None,
+                RecoveryBundleWriter {
+                    max_bytes: MAX_RECOVERY_BUNDLE_BYTES,
+                    write_to: write_recovery_bundle_to_file,
+                },
+            )
+            .unwrap();
+
+        assert!(!outcome.worktree_removed, "{outcome:?}");
+        assert!(
+            outcome
+                .cleanup_error
+                .as_deref()
+                .is_some_and(|error| { error.contains("changed after archive verification") })
+        );
+        assert!(worktree.is_dir());
+        assert!(outcome.archive.join(MANIFEST_FILE).is_file());
+        assert_eq!(
+            std::fs::read(worktree.join("preserve.txt")).unwrap(),
+            b"changed after archive\n"
+        );
+        assert_eq!(
+            git_output(&repository, &["rev-parse", "--verify", branch_ref.as_str()]),
+            head
+        );
+    }
+
+    #[test]
+    fn unmodified_preserved_branch_retirement_removes_checkout_and_keeps_branch() {
+        let (_owner, repository, _storage, mut broker, session, worktree, _base, head, branch_ref) =
+            closed_unique_commit_fixture("preserved retirement keeps detached branch");
+        git(&worktree, &["checkout", "--detach"]);
+        let plan = broker
+            .cleanup_resolve_retirement_plan(session.id, false)
+            .unwrap();
+        assert!(plan.checkout_branch_ref.is_none());
+        assert_eq!(plan.checkout_branch_tip.as_deref(), Some(head.as_str()));
+
+        let outcome = broker
+            .cleanup_resolve_retirement_apply(session.id, &plan.digest, false)
+            .unwrap();
+
+        assert!(outcome.worktree_removed, "{outcome:?}");
+        assert!(outcome.cleanup_error.is_none(), "{outcome:?}");
+        assert!(!worktree.exists());
+        assert!(outcome.archive.join(MANIFEST_FILE).is_file());
+        assert_eq!(
+            git_output(&repository, &["rev-parse", "--verify", branch_ref.as_str()]),
+            head
+        );
+    }
+
+    #[test]
     fn retirement_archive_refuses_backward_delivery_move_and_keeps_prerequisite_pins() {
         let (_owner, repository, _storage, mut broker, session, worktree, base, head, branch_ref) =
             closed_unique_commit_fixture("retirement archive backward delivery move");
