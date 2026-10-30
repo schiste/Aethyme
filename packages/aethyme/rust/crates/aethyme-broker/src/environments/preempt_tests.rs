@@ -385,3 +385,76 @@ fn an_exclusive_key_admits_one_holder_at_a_time() {
     });
     assert_eq!(most.load(Ordering::SeqCst), 1);
 }
+
+/// #1272: a preemption appears in the broker events of the repositories
+/// involved, naming the beneficiary and every victim, once per repository.
+#[test]
+fn a_preemption_is_mirrored_into_repository_events() {
+    let host = Host::new();
+    let text = file("park_lru", 0);
+    let mut lifecycle = host.lifecycle();
+    let repo = tempfile::tempdir().unwrap();
+    let git = |dir: &Path, args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(repo.path(), &["init", "-q"]);
+    git(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "base"],
+    );
+    let main_root = repo.path().canonicalize().unwrap();
+    drop(crate::BrokerStore::open_in_repo(&main_root).unwrap());
+
+    // Real worktrees of the repository: destroy verifies the source.
+    let mut up_in_repo = |profile: &str| {
+        let worktree = tempfile::tempdir().unwrap();
+        let path = worktree.path().join("wt");
+        git(
+            &main_root,
+            &["worktree", "add", "-q", "--detach", path.to_str().unwrap()],
+        );
+        let snapshot = snapshot(&text, profile, &path);
+        let id = lifecycle
+            .up(
+                &snapshot,
+                &path,
+                Some(&main_root),
+                None,
+                &UpOptions {
+                    wait: Duration::from_millis(300),
+                    reconfigure: false,
+                },
+            )
+            .unwrap()
+            .env_id;
+        (id, worktree)
+    };
+    let fleet: Vec<_> = (0..4).map(|_| up_in_repo("small")).collect();
+    let (big, _big_worktree) = up_in_repo("big");
+
+    let store = crate::BrokerStore::open_in_repo(&main_root).unwrap();
+    let events: Vec<serde_json::Value> = store
+        .events_after_filtered(0, 100, Some(super::preempt::PREEMPTED_EVENT))
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| event.payload_json)
+        .map(|payload| serde_json::from_str(&payload).unwrap())
+        .filter(|payload: &serde_json::Value| payload["beneficiary"] == big.as_str())
+        .collect();
+    assert_eq!(events.len(), 1, "once per repository: {events:?}");
+    let victims = events[0]["victims"].as_array().unwrap();
+    assert_eq!(victims.len(), 3, "{events:?}");
+    assert_eq!(events[0]["shortfall_units"], 3);
+    for id in fleet.iter().map(|(id, _)| id).chain([&big]) {
+        lifecycle.down(id, None).unwrap();
+    }
+}
