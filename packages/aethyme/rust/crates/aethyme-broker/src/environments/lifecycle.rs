@@ -33,12 +33,19 @@ use super::exec::{Bindings, DriverError, append_log};
 use super::logs::remove_environment_directory;
 use super::store::{EnvironmentPhase, EnvironmentRecord, EnvironmentStore, StoreError};
 use crate::managed_services::ManagedServicePhase;
-use crate::resources::{HostResourceCoordinator, HostResourceError, HostResourceGrant};
+use sha2::{Digest, Sha256};
+
+use crate::resources::{
+    HOST_RESOURCE_REQUEST_SCHEMA_VERSION, HostResourceCoordinator, HostResourceError,
+    HostResourceGrant, HostResourceKind, HostResourceRequest, HostResourceRequirement,
+};
 
 pub const RESERVATION_GRANT: &str = "reservation.grant.json";
 pub const CAPACITY_GRANT: &str = "capacity.grant.json";
 /// Destroy retries the supervisor makes before waiting for an operator.
 pub const MAX_DESTROY_RETRIES: usize = 5;
+/// Longest an [`Lifecycle::exclusive`] key is held before it lapses.
+pub const EXCLUSIVE_KEY_TTL_SECONDS: u64 = 1800;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LifecycleError {
@@ -156,6 +163,53 @@ pub(super) fn bindings_from(
 }
 
 impl Lifecycle {
+    /// Run `body` holding the exclusive host key `name`, released afterwards
+    /// whatever `body` returns. `None` when another holder kept the key past
+    /// `wait` (or the key could not be acquired), and `body` did not run.
+    pub(super) fn exclusive<T>(
+        &mut self,
+        repository: &str,
+        name: &str,
+        wait: Duration,
+        body: impl FnOnce(&mut Self) -> T,
+    ) -> Option<T> {
+        let digest = format!("{:x}", Sha256::digest(name.as_bytes()));
+        let request = HostResourceRequest {
+            schema_version: HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+            request_id: format!(
+                "env-key:{}:{}:{}",
+                &digest[..24],
+                std::process::id(),
+                now_ms()
+            ),
+            repository: repository.to_string(),
+            worktree_fingerprint: "environment-key".into(),
+            run_id: format!("env-key-{}", &digest[..12]),
+            ttl_seconds: EXCLUSIVE_KEY_TTL_SECONDS,
+            holder_pid: Some(std::process::id()),
+            resources: vec![HostResourceRequirement {
+                key: "key".into(),
+                resource: HostResourceKind::ExclusiveKey {
+                    name: name.to_string(),
+                },
+            }],
+        };
+        let grant = self
+            .coordinator
+            .acquire_with_wait(&request, wait, |_| {})
+            .ok()?;
+        let result = body(self);
+        crate::warn_unrecorded(
+            "release an environment key",
+            self.coordinator.release(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token,
+            ),
+        );
+        Some(result)
+    }
+
     pub(super) fn operation_lock(
         &self,
         env_id: &str,
