@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::jobs::{JobCompletion, JobOperation, JobProgress, JobRecord, JobState};
+use super::jobs::{JobCompletion, JobOperation, JobRecord, JobState};
 
 pub const VERSION: u32 = 2;
 pub const RESULT_CHUNK_BYTES: usize = 8192;
@@ -58,6 +58,7 @@ pub enum Reply {
         job: Status,
     },
     Lookup {
+        #[serde(deserialize_with = "required_nullable")]
         job: Option<Status>,
     },
     CancelRequested {
@@ -82,8 +83,29 @@ pub struct Status {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub cancellation_requested: bool,
-    pub progress: Option<JobProgress>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub progress: Option<Progress>,
+    #[serde(deserialize_with = "required_nullable")]
     pub completion: Option<Completion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Progress {
+    pub completed: u64,
+    #[serde(deserialize_with = "required_nullable")]
+    pub total: Option<u64>,
+    pub message: String,
+}
+
+// A nullable field is still required on the wire. Without a custom decoder,
+// Serde gives Option fields an implicit default when their key is absent.
+fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,7 +126,11 @@ impl From<&JobRecord> for Status {
             created_at_ms: job.created_at_ms,
             updated_at_ms: job.updated_at_ms,
             cancellation_requested: job.cancellation_requested,
-            progress: job.progress.clone(),
+            progress: job.progress.as_ref().map(|progress| Progress {
+                completed: progress.completed,
+                total: progress.total,
+                message: progress.message.clone(),
+            }),
             completion: job.completion.as_ref().map(|completion| match completion {
                 JobCompletion::Succeeded { .. } => Completion::Succeeded,
                 JobCompletion::Failed { message } => Completion::Failed {

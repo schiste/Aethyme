@@ -30,6 +30,47 @@ fn runtime_directory() -> tempfile::TempDir {
 }
 
 #[test]
+fn v2_nullable_fields_require_keys_and_accept_explicit_nulls() {
+    let status = serde_json::json!({
+        "id": 1,
+        "operation": {"kind": "gc_plan", "include_active_gate_cache": false, "full_scan": false},
+        "state": "queued", "deadline_ms": 100, "created_at_ms": 1, "updated_at_ms": 1,
+        "cancellation_requested": false, "progress": null, "completion": null
+    });
+    for field in ["progress", "completion"] {
+        let mut missing = status.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(
+            serde_json::from_value::<wire::Status>(missing).is_err(),
+            "accepted missing {field}"
+        );
+    }
+    assert!(serde_json::from_value::<wire::Status>(status.clone()).is_ok());
+    for total in [serde_json::Value::Null, serde_json::json!(10)] {
+        let mut populated = status.clone();
+        populated["progress"] =
+            serde_json::json!({"completed": 0, "total": total, "message": "planning"});
+        populated["completion"] = serde_json::json!({"kind": "succeeded"});
+        let decoded: wire::Status = serde_json::from_value(populated.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), populated);
+        populated["progress"]
+            .as_object_mut()
+            .unwrap()
+            .remove("total");
+        assert!(serde_json::from_value::<wire::Status>(populated).is_err());
+    }
+    assert!(serde_json::from_str::<wire::Reply>(r#"{"kind":"lookup"}"#).is_err());
+    assert_eq!(
+        serde_json::from_str::<wire::Reply>(r#"{"kind":"lookup","job":null}"#).unwrap(),
+        wire::Reply::Lookup { job: None }
+    );
+    assert!(
+        serde_json::from_value::<wire::Reply>(serde_json::json!({"kind":"lookup", "job":status}))
+            .is_ok()
+    );
+}
+
+#[test]
 fn result_chunks_preserve_utf8_and_bound_even_maximally_escaped_frames() {
     for encoded in ["é🎉".repeat(10000), "\u{0000}".repeat(10000)] {
         let mut reconstructed = String::new();
