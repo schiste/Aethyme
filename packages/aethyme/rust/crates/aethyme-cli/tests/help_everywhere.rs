@@ -119,6 +119,7 @@ const COMMANDS: &[&str] = &[
     "env routes",
     "env infer",
     "env shared",
+    "env calibrate",
     "certify",
     "init",
     "deploy",
