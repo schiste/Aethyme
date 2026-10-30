@@ -1706,6 +1706,78 @@ fn enable_sweep(repo: &Path) {
     .unwrap();
 }
 
+#[test]
+fn cleanup_resolve_plan_and_apply_skip_sweeping_unrelated_closed_checkouts() {
+    let (repo, container) =
+        fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
+    let (cleanup_id, cleanup_worktree) =
+        blocked_session_with_build_cache(repo.path(), container.path());
+    let (_unrelated_id, unrelated_worktree) =
+        blocked_session_with_build_cache(repo.path(), container.path());
+    let unrelated_cache = unrelated_worktree.join("rust/target");
+    let cache_payload = unrelated_cache.join("debug/artifact.bin");
+    assert!(cache_payload.is_file());
+
+    enable_sweep(repo.path());
+    let plan_output = run(
+        repo.path(),
+        container.path(),
+        &[
+            "finish",
+            "cleanup",
+            "resolve",
+            &cleanup_id,
+            "--archive",
+            "--json",
+        ],
+    );
+    assert!(
+        plan_output.status.success(),
+        "cleanup plan: {}",
+        String::from_utf8_lossy(&plan_output.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&plan_output.stdout).unwrap();
+    let digest = plan["digest"].as_str().unwrap();
+    assert!(
+        cache_payload.is_file(),
+        "planning cleanup for one session must not sweep an unrelated closed checkout"
+    );
+    // Setup kept the sweep disabled, so an eligible startup pass would leave
+    // either a completed cadence stamp or a partial-progress stamp.
+    assert!(meta(repo.path(), SWEEP_STAMP).is_none());
+    assert!(meta(repo.path(), SWEEP_PARTIAL).is_none());
+
+    let apply_output = run(
+        repo.path(),
+        container.path(),
+        &[
+            "finish",
+            "cleanup",
+            "resolve",
+            &cleanup_id,
+            "--archive",
+            "--confirm",
+            digest,
+            "--json",
+        ],
+    );
+    assert!(
+        apply_output.status.success(),
+        "cleanup apply: {}",
+        String::from_utf8_lossy(&apply_output.stderr)
+    );
+    assert!(
+        !cleanup_worktree.exists(),
+        "apply should remove only the reviewed cleanup target"
+    );
+    assert!(
+        cache_payload.is_file(),
+        "applying cleanup for one session must not sweep an unrelated closed checkout"
+    );
+    assert!(meta(repo.path(), SWEEP_STAMP).is_none());
+    assert!(meta(repo.path(), SWEEP_PARTIAL).is_none());
+}
+
 /// Run the sweep explicitly, with its full budget. Eligibility tests use this
 /// rather than a broker open: an open spends at most a quarter of a second, so
 /// on a loaded machine it can pause before reaching the case under test and a
