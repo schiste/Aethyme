@@ -173,11 +173,16 @@ impl Lifecycle {
         wait: Duration,
         body: impl FnOnce(&mut Self) -> T,
     ) -> Option<T> {
+        // Request ids are unique forever, and a repeated id is a replay of
+        // the same request: two threads asking in one millisecond must not
+        // share one, or both would be granted the key.
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let digest = format!("{:x}", Sha256::digest(name.as_bytes()));
         let request = HostResourceRequest {
             schema_version: HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
             request_id: format!(
-                "env-key:{}:{}:{}",
+                "env-key:{}:{}:{}:{sequence}",
                 &digest[..24],
                 std::process::id(),
                 now_ms()
