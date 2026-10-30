@@ -1424,6 +1424,141 @@ fn run_storage_identity(parsed: Parsed) -> Result<(), UsageError> {
 mod artifact_worker_tests {
     use super::*;
 
+    fn worker_environment_fixture() -> (tempfile::TempDir, crate::test_storage::TestStorage, Broker)
+    {
+        let owner = tempfile::tempdir().unwrap();
+        let root = owner.path().canonicalize().unwrap();
+        std::fs::write(root.join("README.md"), "worker environment fixture\n").unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["add", "README.md"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let storage = crate::test_storage::TestStorage::new();
+        let broker = storage.open(&root).unwrap();
+        (owner, storage, broker)
+    }
+
+    #[test]
+    fn produced_worker_environment_passes_consumer_without_test_database_override() {
+        let (_owner, _storage, mut broker) = worker_environment_fixture();
+        let root = broker.main_root().to_path_buf();
+        let database = broker.store().db_path().to_path_buf();
+        let gate_scope = crate::gate_database::for_child(&root, &database, None).unwrap();
+        for scope in [None, Some(std::ffi::OsStr::new(&gate_scope))] {
+            let command = broker
+                .artifact_sweep_worker_command(std::path::Path::new("unused-router"), &root, scope)
+                .unwrap();
+            let environment: std::collections::BTreeMap<_, _> = command
+                .get_envs()
+                .map(|(key, value)| (key.to_os_string(), value.map(std::ffi::OsStr::to_os_string)))
+                .collect();
+            assert_eq!(
+                environment.get(std::ffi::OsStr::new(crate::BROKER_DB_ENV)),
+                Some(&None)
+            );
+            assert!(
+                environment
+                    .get(std::ffi::OsStr::new("AETHYME_BROKER_STORAGE_CONTEXT_V1"))
+                    .is_some_and(Option::is_some)
+            );
+            assert_eq!(
+                environment
+                    .get(std::ffi::OsStr::new(crate::gc::ARTIFACT_SWEEP_WORKER_ENV))
+                    .and_then(Option::as_deref),
+                Some(std::ffi::OsStr::new("1"))
+            );
+            assert_eq!(
+                environment.get(std::ffi::OsStr::new(crate::gate_database::SCOPE_ENV)),
+                Some(&scope.map(std::ffi::OsStr::to_os_string)),
+                "the emitted scope must be the exact snapshot used for the database proof"
+            );
+            let forbidden = artifact_worker_environment_has(|key| {
+                environment
+                    .get(std::ffi::OsStr::new(key))
+                    .is_some_and(Option::is_some)
+            });
+            assert!(
+                validate_artifact_sweep_worker_invocation(Some("1"), false, 2, forbidden).is_ok()
+            );
+            assert_eq!(
+                crate::gate_database::resolve(&root, None, scope).unwrap(),
+                database,
+                "removing the pin must preserve the exact database the child opens"
+            );
+            // Test the produced environment through the real consumer predicate
+            // without inheriting the Cargo runner's own ambient test markers.
+            for marker in ARTIFACT_WORKER_TEST_ENVIRONMENT_KEYS {
+                assert!(
+                    validate_artifact_sweep_worker_invocation(
+                        Some("1"),
+                        false,
+                        2,
+                        artifact_worker_environment_has(|key| key == *marker
+                            || environment
+                                .get(std::ffi::OsStr::new(key))
+                                .is_some_and(Option::is_some)),
+                    )
+                    .is_err(),
+                    "test marker {marker} must still refuse"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn worker_command_refuses_database_resolution_mismatch_or_invalid_gate_scope() {
+        let (_owner, storage, mut broker) = worker_environment_fixture();
+        let root = broker.main_root().to_path_buf();
+        let other_database = storage.root().join("different-worker.db");
+        let different_scope =
+            crate::gate_database::for_child(&root, &other_database, None).unwrap();
+        for scope in [
+            std::ffi::OsStr::new(&different_scope),
+            std::ffi::OsStr::new("malformed-scope"),
+        ] {
+            assert!(
+                broker
+                    .artifact_sweep_worker_command(
+                        std::path::Path::new("unused-router"),
+                        &root,
+                        Some(scope)
+                    )
+                    .is_err()
+            );
+        }
+        let other_root = tempfile::tempdir().unwrap();
+        assert!(
+            broker
+                .artifact_sweep_worker_command(
+                    std::path::Path::new("unused-router"),
+                    other_root.path(),
+                    None
+                )
+                .is_err()
+        );
+        assert!(broker.store().db_path().is_file());
+    }
+
     #[test]
     fn hidden_worker_cli_rejects_untrusted_invocations_before_repository_open() {
         assert!(validate_artifact_sweep_worker_invocation(None, false, 2, false).is_err());

@@ -19,7 +19,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aethyme-broker"
-version = "0.8.48"
+version = "0.8.49"
 dependencies = [
  "aethyme-config",
  "aethyme-contracts",
@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-cli"
-version = "0.8.48"
+version = "0.8.49"
 dependencies = [
  "aethyme-broker",
  "aethyme-engine",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-config"
-version = "0.8.48"
+version = "0.8.49"
 dependencies = [
  "noyalib",
  "serde",
@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-contracts"
-version = "0.8.48"
+version = "0.8.49"
 dependencies = [
  "data-encoding",
  "serde",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-engine"
-version = "0.8.48"
+version = "0.8.49"
 dependencies = [
  "aethyme-graph-indexer",
  "aethyme-graph-schema",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-enhance"
-version = "0.8.48"
+version = "0.8.49"
 dependencies = [
  "aethyme-config",
  "libc",
@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-graph-indexer"
-version = "0.8.48"
+version = "0.8.49"
 dependencies = [
  "aethyme-graph-schema",
  "aethyme-graph-storage",
@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-graph-schema"
-version = "0.8.48"
+version = "0.8.49"
 dependencies = [
  "bincode",
  "blake3",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-graph-storage"
-version = "0.8.48"
+version = "0.8.49"
 dependencies = [
  "aethyme-config",
  "aethyme-graph-schema",
@@ -178,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-producers"
-version = "0.8.48"
+version = "0.8.49"
 dependencies = [
  "aethyme-graph-schema",
  "aethyme-graph-storage",
@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "aethyme-quality"
-version = "0.8.48"
+version = "0.8.49"
 dependencies = [
  "libc",
  "regex",
