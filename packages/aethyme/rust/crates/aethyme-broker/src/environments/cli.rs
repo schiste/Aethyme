@@ -37,6 +37,9 @@ pub const WAKE_SCHEMA: &str = "aethyme.env-wake/v1";
 pub const TOUCH_SCHEMA: &str = "aethyme.env-touch/v1";
 pub const PIN_SCHEMA: &str = "aethyme.env-pin/v1";
 pub const ROUTES_SCHEMA: &str = "aethyme.env-routes/v1";
+pub const INFER_SCHEMA: &str = "aethyme.env-infer/v1";
+pub const SHARED_SCHEMA: &str = "aethyme.env-shared/v1";
+pub const CALIBRATE_SCHEMA: &str = "aethyme.env-calibrate/v1";
 
 pub const USAGE: &str = "\
 aethyme env — declared runnable environments per worktree
@@ -67,11 +70,21 @@ Usage:
       The environment's recorded phase transitions, oldest first.
   aethyme env logs <id> [<component>] [--tail N] [--json]
       The last N (default 50) lines of each component log, or of one.
-  aethyme env up [--profile <name>] [--wait <seconds>] [--reconfigure] [--json]
+  aethyme env infer [--range <rev-range>] [--json]
+      The minimum profile this worktree's changes need: [[rules]] globs over
+      the diff against its base (committed, uncommitted and untracked, both
+      sides of renames), the rules that fired with their paths, and the
+      paths no rule matched. --range evaluates every commit in a range and
+      prints how many would need each profile, for tuning rules.
+  aethyme env up [--profile <name> [--reason <text>]] [--wait <seconds>] [--reconfigure] [--json]
       Make sure this worktree's environment is up: create it, or return it
       if already active. Reserves its namespace and ports, waits up to
       --wait (default 300) for pool capacity, provisions, starts and
       health-checks every component in dependency order, and prints its
+      ports, URLs and variables. Without --profile it uses the inferred
+      minimum (`env infer`); a lower profile is refused, a higher one needs
+      --reason and is recorded. An environment of this worktree below the
+      minimum is destroyed and replaced. It prints its
       ports, URLs and the AETHYME_ENV_* variables. A failure rolls back and
       leaves the environment `failed` with its error. A changed profile
       needs --reconfigure (destroy, then recreate).
@@ -102,6 +115,23 @@ Usage:
   aethyme env pin <id> --for <seconds> --reason <text> [--json]
       Keep the environment awake (up to 24 h). `env unpin <id>` ends it.
       Pins are recorded in the environment's history.
+  aethyme env shared up|redeploy|destroy <name> [--force] [--json]
+  aethyme env shared list [--json]
+      Host-scoped [[shared]] environments, owned by a ref instead of a
+      session: never removed by session or worktree cleanup. `up` creates or
+      wakes one at its ref's commit (an export, not a worktree); `redeploy`
+      moves it to the ref's current commit by hold-and-swap (park, swap,
+      wake: same ports and URLs, requests held meanwhile), rolling back if
+      the new revision fails; the supervisor does this when the ref moves,
+      at most every min_redeploy_interval_seconds (--force ignores it).
+      Profiles with uses_shared get AETHYME_SHARED_<NAME>_URL/_PORT_<C>.
+  aethyme env calibrate [--ram-fraction <0..1>] [--json]
+      Propose `units` per profile and `limit` per pool from measured
+      footprints (the supervisor samples active environments every 60 s:
+      process-group RSS or container stats), so a full pool's p95 stays
+      within --ram-fraction (default 0.5) of RAM minus any container-engine
+      VM reservation. Prints a diff of environments.toml; never writes it.
+      Profiles with fewer than 10 samples are reported as insufficient.
   aethyme env routes [--json]
       The route table the built-in proxy serves on 127.0.0.1:4180
       (AETHYME_ENV_PROXY_PORT): <component>.<namespace>.<route_domain> and
@@ -143,6 +173,9 @@ pub(super) struct Options {
     pub(super) abandon: bool,
     pub(super) reason: Option<String>,
     pub(super) pin_seconds: Option<u64>,
+    pub(super) range: Option<String>,
+    pub(super) force: bool,
+    pub(super) ram_fraction: f64,
 }
 
 pub fn run(args: &[String]) -> u8 {
@@ -187,6 +220,9 @@ pub fn run(args: &[String]) -> u8 {
         "pin" => super::operate::run_pin(&options),
         "unpin" => super::operate::run_unpin(&options),
         "routes" => super::operate::run_routes(&options),
+        "infer" => super::operate::run_infer(&options),
+        "shared" => super::operate::run_shared(&options),
+        "calibrate" => super::operate::run_calibrate(&options),
         other => Err(Failure {
             code: "unknown_subcommand",
             message: format!("unknown env subcommand {other:?}"),
@@ -232,6 +268,9 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
         abandon: false,
         reason: None,
         pin_seconds: None,
+        range: None,
+        force: false,
+        ram_fraction: super::metrics::DEFAULT_RAM_FRACTION,
     };
     let number = |value: Option<&String>, flag: &str| -> Result<usize, Failure> {
         value
@@ -263,7 +302,22 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
                         .ok_or_else(|| usage("--for needs seconds from 60 to 86400".into()))?,
                 )
             }
-            "--reason" if matches!(command, "destroy" | "pin") => {
+            "--force" if command == "shared" => options.force = true,
+            "--ram-fraction" if command == "calibrate" => {
+                options.ram_fraction = args
+                    .next()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .filter(|f| *f > 0.0 && *f <= 1.0)
+                    .ok_or_else(|| usage("--ram-fraction needs a number in (0, 1]".into()))?
+            }
+            "--range" if command == "infer" => {
+                options.range = Some(
+                    args.next()
+                        .ok_or_else(|| usage("--range needs a revision range".into()))?
+                        .clone(),
+                )
+            }
+            "--reason" if matches!(command, "destroy" | "pin" | "up") => {
                 options.reason = Some(
                     args.next()
                         .ok_or_else(|| usage("--reason needs text".into()))?
@@ -295,8 +349,14 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
                             | "touch"
                             | "pin"
                             | "unpin"
+                            | "shared"
                     )
-                    && options.positional.len() < if command == "logs" { 2 } else { 1 } =>
+                    && options.positional.len()
+                        < if matches!(command, "logs" | "shared") {
+                            2
+                        } else {
+                            1
+                        } =>
             {
                 options.positional.push(positional.to_string())
             }

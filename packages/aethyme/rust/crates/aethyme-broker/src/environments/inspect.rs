@@ -151,10 +151,38 @@ pub(super) fn run_status(options: &Options) -> Result<Output, Failure> {
     for record in &records {
         text.push_str(&summary_line(record));
     }
+    // Advisory (#1216): an environment below what this worktree's changes
+    // now need. Best effort: no valid file or no git means no advisory.
+    let inference = super::load_repository_file(&workspace.worktree_root)
+        .ok()
+        .flatten()
+        .and_then(|loaded| loaded.value.ok())
+        .and_then(|file| {
+            let (_, changed) = super::infer::changed_paths(&workspace.worktree_root).ok()?;
+            let inference = super::infer::infer(&file, &changed).ok()?;
+            Some((file, inference))
+        });
+    let mut below = Vec::new();
+    if let Some((file, inference)) = &inference {
+        for record in &records {
+            if record.phase.retains_worktree()
+                && super::infer::profile_rank(file, &record.profile)
+                    .is_some_and(|rank| rank < inference.rank)
+            {
+                below.push(record.env_id.clone());
+                text.push_str(&format!(
+                    "advisory: {} ({}) is below the inferred minimum {}; `aethyme env up` replaces it\n",
+                    record.env_id, record.profile, inference.minimum
+                ));
+            }
+        }
+    }
     text.push_str(&supervisor_line(&supervisor));
     let value = json!({
         "schema": STATUS_SCHEMA,
         "environments": records.iter().map(summary).collect::<Vec<_>>(),
+        "inferred_minimum": inference.as_ref().map(|(_, i)| i.minimum.clone()),
+        "below_inferred_minimum": below,
         "supervisor": supervisor,
     });
     Ok((value, text, exit_status::SUCCESS))
@@ -180,10 +208,35 @@ pub(super) fn run_list(options: &Options) -> Result<Output, Failure> {
     for record in &records {
         text.push_str(&summary_line(record));
     }
+    let memory: Vec<Value> = records
+        .iter()
+        .map(|record| {
+            // Current footprint only: an active environment's recent
+            // measurement. Parked or stopped ones use no memory, and an old
+            // or unmeasurable sample is not a footprint.
+            let now = super::activity::now_ms();
+            let stale = 3 * super::metrics::SAMPLE_INTERVAL.as_millis() as i64;
+            store
+                .as_ref()
+                .filter(|_| record.phase == super::store::EnvironmentPhase::Active)
+                .and_then(|store| store.latest_sample(&record.env_id).ok().flatten())
+                .filter(|sample| sample.method != "none" && now - sample.sampled_at <= stale)
+                .map_or(Value::Null, |sample| json!(sample))
+        })
+        .collect();
+    let environments: Vec<Value> = records
+        .iter()
+        .zip(memory)
+        .map(|(record, memory)| {
+            let mut value = summary(record);
+            value["memory"] = memory;
+            value
+        })
+        .collect();
     let value = json!({
         "schema": LIST_SCHEMA,
         "scope": if options.all { "host" } else { "repository" },
-        "environments": records.iter().map(summary).collect::<Vec<_>>(),
+        "environments": environments,
     });
     Ok((value, text, exit_status::SUCCESS))
 }
@@ -303,6 +356,7 @@ pub(super) fn run_supervise(options: &Options) -> Result<Output, Failure> {
     let mut work = super::operate::LifecycleWork {
         watch: StoreWatch { store_path },
         proxy_started: false,
+        last_sample: None,
     };
     let reason = supervisor::run(&config, &mut work, &|| false)
         .map_err(|error| environment_failure(format!("supervisor: {error}")))?;
