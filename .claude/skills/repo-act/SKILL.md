@@ -393,6 +393,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   temporary root before deriving its database and cache paths. Platform aliases
   such as macOS `/var` must not turn a valid fixture into a symlink traversal;
   keep the production no-follow check intact.
+  Scope stricter private-runtime opens explicitly to that runtime; preserve
+  existing shared-store path semantics unless changing that contract is intended.
+  Run predecessor path tests as well as the new runtime's refusal cases.
 - Give background-writer tests an independent, fixture-owned stop condition
   and a finite write limit. Deliberately breaking production cleanup must not
   leave the test itself writing indefinitely after an assertion fails.
