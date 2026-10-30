@@ -151,10 +151,38 @@ pub(super) fn run_status(options: &Options) -> Result<Output, Failure> {
     for record in &records {
         text.push_str(&summary_line(record));
     }
+    // Advisory (#1216): an environment below what this worktree's changes
+    // now need. Best effort: no valid file or no git means no advisory.
+    let inference = super::load_repository_file(&workspace.worktree_root)
+        .ok()
+        .flatten()
+        .and_then(|loaded| loaded.value.ok())
+        .and_then(|file| {
+            let (_, changed) = super::infer::changed_paths(&workspace.worktree_root).ok()?;
+            let inference = super::infer::infer(&file, &changed).ok()?;
+            Some((file, inference))
+        });
+    let mut below = Vec::new();
+    if let Some((file, inference)) = &inference {
+        for record in &records {
+            if record.phase.retains_worktree()
+                && super::infer::profile_rank(file, &record.profile)
+                    .is_some_and(|rank| rank < inference.rank)
+            {
+                below.push(record.env_id.clone());
+                text.push_str(&format!(
+                    "advisory: {} ({}) is below the inferred minimum {}; `aethyme env up` replaces it\n",
+                    record.env_id, record.profile, inference.minimum
+                ));
+            }
+        }
+    }
     text.push_str(&supervisor_line(&supervisor));
     let value = json!({
         "schema": STATUS_SCHEMA,
         "environments": records.iter().map(summary).collect::<Vec<_>>(),
+        "inferred_minimum": inference.as_ref().map(|(_, i)| i.minimum.clone()),
+        "below_inferred_minimum": below,
         "supervisor": supervisor,
     });
     Ok((value, text, exit_status::SUCCESS))
