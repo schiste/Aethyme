@@ -301,6 +301,8 @@ pub(crate) struct RecordedHolderProcessTable {
     prefetched_event_ids: HashMap<i64, i64>,
     observed_event_ids: HashMap<i64, i64>,
     snapshot: Option<Option<ProcessTable>>,
+    #[cfg(test)]
+    snapshots_taken: usize,
 }
 
 impl RecordedHolderProcessTable {
@@ -334,17 +336,28 @@ impl RecordedHolderProcessTable {
                 return None;
             }
             self.snapshot = Some(ProcessTable::snapshot());
+            #[cfg(test)]
+            {
+                self.snapshots_taken += 1;
+            }
             self.observed_event_ids.extend(
                 self.prefetched_event_ids
                     .iter()
                     .map(|(id, event)| (*id, *event)),
             );
-        }
-        if self.observed_event_ids.get(&session_id) != Some(&event_id) {
+            // The requested binding was read before this first snapshot. Use
+            // the snapshot just taken for it instead of immediately taking a
+            // second one when `prime` saw an older binding.
+            self.observed_event_ids.insert(session_id, event_id);
+        } else if self.observed_event_ids.get(&session_id) != Some(&event_id) {
             if !allow_snapshot {
                 return None;
             }
             self.snapshot = Some(ProcessTable::snapshot());
+            #[cfg(test)]
+            {
+                self.snapshots_taken += 1;
+            }
             self.observed_event_ids.insert(session_id, event_id);
         }
         self.snapshot.as_ref().and_then(Option::as_ref)
@@ -1067,6 +1080,18 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn first_process_snapshot_is_not_repeated_for_a_rebound_candidate() {
+        let mut table = RecordedHolderProcessTable::default();
+        table.prefetched_event_ids.insert(7, 11);
+
+        let _ = table.get_or_snapshot(7, 12, true);
+
+        assert_eq!(table.snapshots_taken, 1);
+        assert_eq!(table.observed_event_ids.get(&7), Some(&12));
+    }
+
     #[test]
     fn abandonment_refresh_declined_does_not_reuse_cached_process_evidence() {
         let mut table = RecordedHolderProcessTable {
@@ -1276,6 +1301,7 @@ mod tests {
             prefetched_event_ids: HashMap::from([(session.id, holder_event_id)]),
             observed_event_ids: HashMap::from([(session.id, holder_event_id)]),
             snapshot: Some(Some(table)),
+            snapshots_taken: 0,
         };
         assert_eq!(
             recorded_holder_liveness(broker.store(), session.id, &mut matching, true).liveness,
@@ -1285,6 +1311,7 @@ mod tests {
             prefetched_event_ids: HashMap::from([(session.id, holder_event_id)]),
             observed_event_ids: HashMap::from([(session.id, holder_event_id)]),
             snapshot: Some(Some(ProcessTable::parse(""))),
+            snapshots_taken: 0,
         };
         assert_eq!(
             recorded_holder_liveness(broker.store(), session.id, &mut missing, true).liveness,
