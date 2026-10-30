@@ -159,6 +159,8 @@ pub struct CompiledComponent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serve_dir: Option<String>,
     pub cache_inputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_output: Option<String>,
     pub cache_env: Vec<String>,
     pub template_inputs: Vec<String>,
 }
@@ -322,6 +324,7 @@ fn compile_component(file: &EnvironmentsFile, component: &ComponentSpec) -> Comp
         container_port: component.container_port,
         serve_dir: component.serve_dir.clone(),
         cache_inputs: component.cache_inputs.clone(),
+        build_output: component.build_output.clone(),
         cache_env: component.cache_env.clone(),
         template_inputs: component.template_inputs.clone(),
     }
