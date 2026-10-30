@@ -6024,6 +6024,42 @@ impl Broker {
         Ok(())
     }
 
+    /// Build the continuation command without changing which database it opens.
+    /// The private worker rejects test database overrides, so omit the pin only
+    /// after the child's real no-override resolver proves the same database.
+    pub(crate) fn artifact_sweep_worker_command(
+        &mut self,
+        router: &Path,
+        canonical_root: &Path,
+        gate_scope: Option<&std::ffi::OsStr>,
+    ) -> Result<Command, BrokerOpError> {
+        let child_database = crate::gate_database::resolve(canonical_root, None, gate_scope)
+            .map_err(|reason| BrokerOpError::InvalidStorageContext { reason })?;
+        if self.store().db_path() != child_database {
+            return Err(BrokerOpError::InvalidStorageContext {
+                reason: "automatic recovery cannot omit a non-default broker database binding"
+                    .into(),
+            });
+        }
+        let mut command = Command::new(router);
+        command
+            .args(["broker", "gc", "__continue-artifacts"])
+            .arg(canonical_root)
+            .current_dir(canonical_root)
+            .env(ARTIFACT_SWEEP_WORKER_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        self.configure_storage_context_for_child(&mut command)?;
+        command.env_remove(crate::BROKER_DB_ENV);
+        // Pass the same scope snapshot used by the equality proof.
+        match gate_scope {
+            Some(scope) => command.env(crate::gate_database::SCOPE_ENV, scope),
+            None => command.env_remove(crate::gate_database::SCOPE_ENV),
+        };
+        Ok(command)
+    }
+
     /// Launch the installed router as a detached, request-scoped continuation.
     /// The OS advisory lock is the singleton; its file stays content-free.
     fn maybe_start_artifact_sweep_worker(
@@ -6096,33 +6132,29 @@ impl Broker {
                 path: root.clone(),
                 source,
             })?;
-        let mut command = Command::new(&router);
-        command
-            .args(["broker", "gc", "__continue-artifacts"])
-            .arg(&canonical_root)
-            .current_dir(&canonical_root)
-            .env(ARTIFACT_SWEEP_WORKER_ENV, "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if self
-            .configure_storage_context_for_child(&mut command)
-            .is_err()
-        {
-            if artifact_due {
-                self.defer_artifact_sweep_worker("storage_context_unavailable")?;
+        let gate_scope = std::env::var_os(crate::gate_database::SCOPE_ENV);
+        let mut command = match self.artifact_sweep_worker_command(
+            &router,
+            &canonical_root,
+            gate_scope.as_deref(),
+        ) {
+            Ok(command) => command,
+            Err(_) => {
+                if artifact_due {
+                    self.defer_artifact_sweep_worker("storage_context_unavailable")?;
+                }
+                if checkout_cleanup_due {
+                    self.defer_auto_checkout_cleanup_worker("storage_context_unavailable")?;
+                }
+                if compact_due {
+                    self.defer_auto_compact_checkout_worker(
+                        "compact_checkout_storage_context_unavailable",
+                        AUTO_COMPACT_BACKFILL_RETRY_MS,
+                    )?;
+                }
+                return Ok(());
             }
-            if checkout_cleanup_due {
-                self.defer_auto_checkout_cleanup_worker("storage_context_unavailable")?;
-            }
-            if compact_due {
-                self.defer_auto_compact_checkout_worker(
-                    "compact_checkout_storage_context_unavailable",
-                    AUTO_COMPACT_BACKFILL_RETRY_MS,
-                )?;
-            }
-            return Ok(());
-        }
+        };
         configure_artifact_worker_process_group(&mut command);
         let _child = match command.spawn() {
             Ok(child) => child,
