@@ -221,7 +221,7 @@ fn write_message<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> io:
 fn read_message<T: serde::de::DeserializeOwned>(stream: &mut UnixStream) -> io::Result<T> {
     protocol::read_frame(&mut BufReader::new(super::socket_io::DeadlineIo::new(
         stream, IO_TIMEOUT,
-    )))
+    )?))
 }
 
 #[cfg(test)]
