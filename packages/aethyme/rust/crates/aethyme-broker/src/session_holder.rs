@@ -350,6 +350,23 @@ impl RecordedHolderProcessTable {
         self.snapshot.as_ref().and_then(Option::as_ref)
     }
 
+    /// A final abandonment decision must not reuse an earlier pass's process
+    /// observation for a legacy shared-service binding.
+    pub(crate) fn refresh_for_binding(
+        &mut self,
+        session_id: i64,
+        event_id: i64,
+        allow_snapshot: bool,
+    ) -> Option<&ProcessTable> {
+        if !allow_snapshot {
+            return None;
+        }
+        self.snapshot = Some(ProcessTable::snapshot());
+        self.observed_event_ids.clear();
+        self.observed_event_ids.insert(session_id, event_id);
+        self.snapshot.as_ref().and_then(Option::as_ref)
+    }
+
     pub(crate) fn table_for(&self, session_id: i64, event_id: i64) -> Option<&ProcessTable> {
         (self.observed_event_ids.get(&session_id) == Some(&event_id))
             .then(|| self.snapshot.as_ref().and_then(Option::as_ref))
@@ -1006,6 +1023,15 @@ mod tests {
                 )),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn abandonment_refresh_declined_does_not_reuse_cached_process_evidence() {
+        let mut table = RecordedHolderProcessTable::default();
+        table.snapshot = Some(Some(ProcessTable::default()));
+        table.observed_event_ids.insert(7, 11);
+        assert!(table.table_for(7, 11).is_some());
+        assert!(table.refresh_for_binding(7, 11, false).is_none());
     }
 
     #[test]

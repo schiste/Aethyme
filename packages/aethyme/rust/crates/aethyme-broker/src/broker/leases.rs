@@ -728,10 +728,18 @@ impl Broker {
             .cloned()
             .collect::<Vec<_>>();
         if !explicit_leases.is_empty() {
-            let lease_table = holder
-                .binding_event_id
-                .and_then(|event_id| process_table.table_for(session_id, event_id));
-            let liveness = match crate::lease_liveness::assess(
+            let shared_holder =
+                crate::session_holder::recorded_holder(self.store_ref(), session_id)?.is_some_and(
+                    |holder| crate::session_holder::is_shared_agent_service(&holder.command),
+                );
+            let lease_table = holder.binding_event_id.and_then(|event_id| {
+                if shared_holder {
+                    process_table.refresh_for_binding(session_id, event_id, allow_process_snapshot)
+                } else {
+                    process_table.table_for(session_id, event_id)
+                }
+            });
+            let liveness = match crate::lease_liveness::assess_for_abandonment(
                 self.store_ref(),
                 &explicit_leases,
                 lease_table,
@@ -3548,6 +3556,84 @@ mod generic_guarded_exec_tests {
         let storage = crate::test_storage::TestStorage::new();
         let broker = storage.open(repository.path()).unwrap();
         (repository, storage, broker)
+    }
+
+    #[test]
+    fn abandoned_shared_holder_explicit_lease_closes_only_after_recorded_grace() {
+        for grace_elapsed in [false, true] {
+            let (_repository, _storage, mut broker) = fixture();
+            let session = broker
+                .start_worktree("abandoned shared lease", None)
+                .unwrap();
+            let holder = crate::session_holder::AgentProcess {
+                pid: i32::MAX as i64,
+                started: "Fri Oct 23 08:42:41 2026".into(),
+                command: "/opt/codex app-server --listen local".into(),
+            };
+            broker
+                .store
+                .append_event(
+                    crate::events::SESSION_HOLDER_BOUND,
+                    Some(session.id),
+                    Some(&crate::events::session_holder_bound_payload(
+                        &holder,
+                        "registered",
+                        None,
+                    )),
+                )
+                .unwrap();
+            broker
+                .store
+                .claim_lease(session.id, "tracked.txt", None)
+                .unwrap();
+            broker
+                .store
+                .append_event(
+                    crate::events::SESSION_HOLDER_GONE,
+                    Some(session.id),
+                    Some(&crate::events::session_holder_gone_payload(&holder)),
+                )
+                .unwrap();
+            let decision = crate::clock::epoch_ms() + 3 * 24 * 60 * 60 * 1000;
+            let policy = crate::lease_liveness::LeaseLivenessPolicy::load(broker.main_root());
+            let since = if grace_elapsed {
+                decision - policy.stale_grace_ms - 1
+            } else {
+                decision
+            };
+            broker.store.connection().execute(
+                "UPDATE events SET ts = ?1 WHERE id = (SELECT MAX(id) FROM events WHERE session_id = ?2 AND kind = ?3)",
+                rusqlite::params![since, session.id, crate::events::SESSION_HOLDER_GONE],
+            ).unwrap();
+            let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+            let outcome = broker
+                .try_close_abandoned_session(session.id, decision, 60_000, &mut table, true)
+                .unwrap();
+            assert_eq!(
+                outcome,
+                if grace_elapsed {
+                    AbandonedSessionCloseOutcome::Closed
+                } else {
+                    AbandonedSessionCloseOutcome::LeaseHeld
+                }
+            );
+            assert_eq!(
+                broker.store.session(session.id).unwrap().status.is_closed(),
+                grace_elapsed
+            );
+            assert!(
+                Path::new(&session.worktree_path).exists(),
+                "closure preserves checkout content"
+            );
+            assert!(
+                broker
+                    .store
+                    .session_leases(session.id)
+                    .unwrap()
+                    .iter()
+                    .all(|lease| lease.released_at.is_some() == grace_elapsed)
+            );
+        }
     }
 
     struct ReleaseHookOnDrop(PathBuf);
