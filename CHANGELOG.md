@@ -4,6 +4,13 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.50] - 2026-10-30
+
+### Fixed
+
+- Automatic retirement persists first verified holder-absence evidence for its bounded candidate page, so lease grace can advance without a status refresh. Live, unknown and rebound holders remain protected.
+- Compact cleanup admits its archive lane after cache handoff overhead while preserving the full archive minimum, any due whole-checkout cleanup reserve and the existing worker time limit.
+
 ## [0.8.49] - 2026-10-30
 
 ### Fixed
