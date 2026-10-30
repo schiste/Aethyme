@@ -998,6 +998,31 @@ impl BrokerStore {
         Ok(changed == 1)
     }
 
+    /// Read maintenance state without waiting behind a competing SQLite
+    /// writer. A busy result lets the caller keep its bounded request pending
+    /// for the next normal wake instead of extending a foreground sweep.
+    pub(crate) fn meta_get_for_session_retirement(
+        &mut self,
+        key: &str,
+    ) -> Result<Option<String>, BrokerError> {
+        self.conn.busy_timeout(std::time::Duration::ZERO)?;
+        let result = self.meta_get(key);
+        let result = match result {
+            Err(BrokerError::Sqlite(error))
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                ) =>
+            {
+                Err(BrokerError::SessionRetirementDatabaseBusy)
+            }
+            result => result,
+        };
+        self.conn
+            .busy_timeout(std::time::Duration::from_millis(super::BUSY_TIMEOUT_MS))?;
+        result
+    }
+
     /// Compare and update the bounded retirement cursor without waiting for a
     /// competing SQLite writer. A busy result is a deferral; restore the
     /// connection's normal timeout on both success and error.

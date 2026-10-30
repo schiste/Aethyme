@@ -2613,6 +2613,29 @@ impl Broker {
         Ok(summary)
     }
 
+    /// Run one bounded session-retirement page without planning or applying
+    /// whole-checkout cleanup. The detached retirement lane uses this while a
+    /// closed checkout is still inside its independent cleanup grace period.
+    pub(crate) fn retire_abandoned_sessions_for_recovery(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> Result<AutoCleanupReport, BrokerOpError> {
+        let retirement = self.retire_abandoned_sessions(deadline)?;
+        let (enabled, config_error) = match AutoCleanupPolicy::load(self.main_root()) {
+            Ok(policy) => (policy.auto_remove, None),
+            Err(error) => (false, Some(error)),
+        };
+        Ok(AutoCleanupReport {
+            enabled,
+            config_error,
+            evaluated_at_ms: now_ms(),
+            deferred: retirement.deferred,
+            sessions_retired: retirement.retired,
+            retirement_deferred_reasons: retirement.reasons,
+            ..AutoCleanupReport::default()
+        })
+    }
+
     /// Run one auto-cleanup pass within `deadline`: select, then revalidate
     /// and remove. The caller holds the GC lock for the whole pass.
     pub(crate) fn auto_remove_disposable_checkouts(
@@ -3102,7 +3125,7 @@ impl Broker {
         Ok(())
     }
 
-    fn record_auto_cleanup_report(
+    pub(crate) fn record_auto_cleanup_report(
         &mut self,
         report: &AutoCleanupReport,
     ) -> Result<(), BrokerOpError> {
