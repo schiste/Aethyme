@@ -115,6 +115,16 @@ pub struct PoolSpec {
     pub scope: PoolScope,
     #[serde(default)]
     pub preempt: Preempt,
+    /// `park_lru` never parks an environment active for less than this,
+    /// so two agents cannot keep parking each other (#1215).
+    #[serde(default = "default_min_active_seconds")]
+    pub min_active_seconds: u64,
+}
+
+pub const DEFAULT_MIN_ACTIVE_SECONDS: u64 = 120;
+
+fn default_min_active_seconds() -> u64 {
+    DEFAULT_MIN_ACTIVE_SECONDS
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
