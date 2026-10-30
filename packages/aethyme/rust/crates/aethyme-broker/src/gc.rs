@@ -6034,7 +6034,9 @@ impl Broker {
         gate_scope: Option<&std::ffi::OsStr>,
     ) -> Result<Command, BrokerOpError> {
         let child_database = crate::gate_database::resolve(canonical_root, None, gate_scope)
-            .map_err(|reason| BrokerOpError::InvalidStorageContext { reason })?;
+            .map_err(|reason| BrokerOpError::InvalidStorageContext {
+                reason: reason.into(),
+            })?;
         if self.store().db_path() != child_database {
             return Err(BrokerOpError::InvalidStorageContext {
                 reason: "automatic recovery cannot omit a non-default broker database binding"
