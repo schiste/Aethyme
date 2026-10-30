@@ -100,8 +100,11 @@ fn independent_connections_submit_and_claim_once() {
             let path = path.clone();
             let barrier = barrier.clone();
             std::thread::spawn(move || {
-                let mut store = JobStore::open(&path).unwrap();
+                let opened = JobStore::open(&path);
                 barrier.wait();
+                // An open failure must fail the test after releasing every
+                // peer, rather than strand the other threads at the barrier.
+                let mut store = opened.unwrap();
                 let submission = store.submit(&request(&format!("request-{n}")), 10).unwrap();
                 let claim = store.claim_next(&format!("worker-{n}"), 11).unwrap();
                 (submission, claim)
