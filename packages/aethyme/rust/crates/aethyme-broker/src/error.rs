@@ -72,6 +72,9 @@ pub enum BrokerError {
     #[error("broker database is busy; session-retirement work was deferred")]
     SessionRetirementDatabaseBusy,
 
+    #[error("session-retirement request state is invalid: {0}")]
+    InvalidSessionRetirementState(String),
+
     #[error(
         "GC retention candidate {kind} row {id} changed or is now protected; the pending batch stopped"
     )]
