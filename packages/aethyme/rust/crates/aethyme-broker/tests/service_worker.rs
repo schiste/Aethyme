@@ -520,6 +520,7 @@ fn invalid_or_unavailable_shared_gc_never_initializes_a_local_broker() {
         "forget-abandoned",
         "sweep",
         "__continue-artifacts",
+        "storage",
     ] {
         for (flag, value) in [
             ("--service-directory", missing.to_str().unwrap()),
@@ -546,13 +547,14 @@ fn invalid_or_unavailable_shared_gc_never_initializes_a_local_broker() {
     // Unknown GC actions reach the handler rather than an action-specific flag rule.
     let mut unknown = common::broker_cli_for_fixture(
         env!("CARGO_BIN_EXE_broker-cli-shim"),
-        &["gc", "storage"],
+        &["gc", "not-an-action"],
         fixture.path(),
     );
     isolated(&mut unknown, &fixture);
     let output = unknown.args(["--request-key", "key"]).output().unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("require gc plan"));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("require gc plan"), "{error}");
     assert!(!fixture.path().join(".aethyme/broker.db").exists());
     assert!(!missing.exists());
     for args in [
