@@ -193,6 +193,10 @@ const AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE: Duration = Duration::from_secs(60);
 /// The detached worker gives an opt-in compact archive its own admission
 /// window. Foreground sweeps never archive checkout content.
 const AUTO_COMPACT_CHECKOUT_WORKER_RESERVE: Duration = Duration::from_secs(90);
+/// An archive may start with less than its nominal lane reservation, but it
+/// still needs the full cleanup helper minimum after fresh index work.
+const AUTO_COMPACT_CHECKOUT_WORKER_ADMISSION_MINIMUM: Duration =
+    crate::auto_cleanup::AUTO_COMPACTION_MIN_BUDGET;
 const AUTO_COMPACT_CHECKOUT_RETRY_MS: i64 = 10 * 60_000;
 const AUTO_COMPACT_BACKFILL_RETRY_MS: i64 = 60_000;
 const AUTO_COMPACT_CHECKOUT_BATCH_SIZE: usize = 8;
@@ -228,8 +232,20 @@ fn run_compact_checkout_candidates<T, E>(
     Ok(true)
 }
 
-fn compact_checkout_worker_has_admission_budget(remaining: Duration) -> bool {
-    remaining >= AUTO_COMPACT_CHECKOUT_WORKER_RESERVE
+fn compact_checkout_worker_pass_budget(
+    remaining: Duration,
+    checkout_cleanup_due: bool,
+) -> Option<Duration> {
+    // The 90-second reserve caps scheduling; admission needs only enough
+    // budget to preserve the full archive minimum after fresh index work.
+    let cleanup_reserve = if checkout_cleanup_due {
+        AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE
+    } else {
+        Duration::ZERO
+    };
+    let compact_lane_remaining = remaining.saturating_sub(cleanup_reserve);
+    (compact_lane_remaining >= AUTO_COMPACT_CHECKOUT_WORKER_ADMISSION_MINIMUM)
+        .then_some(compact_lane_remaining.min(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE))
 }
 
 fn compact_checkout_pending_is_due(
@@ -6289,16 +6305,19 @@ impl Broker {
             // the backfill marker and per-session due times here.
             let compact_pending = broker.compact_checkout_work_pending()?;
             let compact_due = compact_pending && broker.compact_checkout_work_due(now_ms())?;
+            let cleanup_pending_before_compact = if compact_due {
+                broker.auto_checkout_cleanup_recovery_requested()?
+            } else {
+                false
+            };
+            let cleanup_due_before_compact = cleanup_pending_before_compact
+                && !broker.auto_checkout_cleanup_retry_pending(now_ms())?;
             if compact_due {
                 let remaining =
                     ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(worker_started.elapsed());
-                if !compact_checkout_worker_has_admission_budget(remaining) {
-                    broker.defer_auto_compact_checkout_worker(
-                        "compact_checkout_worker_reserve_unavailable",
-                        AUTO_COMPACT_BACKFILL_RETRY_MS,
-                    )?;
-                } else {
-                    let pass_budget = remaining.min(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE);
+                if let Some(pass_budget) =
+                    compact_checkout_worker_pass_budget(remaining, cleanup_due_before_compact)
+                {
                     let deadline = Instant::now() + pass_budget;
                     if let Err(error) = broker.auto_compact_checkout_recovery_pass(deadline) {
                         if matches!(error, BrokerOpError::Store(_)) {
@@ -6309,6 +6328,11 @@ impl Broker {
                             AUTO_COMPACT_CHECKOUT_RETRY_MS,
                         )?;
                     }
+                } else {
+                    broker.defer_auto_compact_checkout_worker(
+                        "compact_checkout_worker_reserve_unavailable",
+                        AUTO_COMPACT_BACKFILL_RETRY_MS,
+                    )?;
                 }
             }
 
@@ -9644,12 +9668,50 @@ mod tests {
                     .saturating_add(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE)
             )
         );
-        assert!(!compact_checkout_worker_has_admission_budget(
-            AUTO_COMPACT_CHECKOUT_WORKER_RESERVE - Duration::from_millis(1)
-        ));
-        assert!(compact_checkout_worker_has_admission_budget(
-            AUTO_COMPACT_CHECKOUT_WORKER_RESERVE
-        ));
+        // Consume the full cache grant plus ordinary handoff time, then feed
+        // that remaining budget into the compact-lane admission decision.
+        let normal_handoff_overhead = Duration::from_secs(5);
+        let compact_only_cache_budget = artifact_worker_cache_lane_duration(false, true);
+        let compact_only_remaining = ARTIFACT_SWEEP_WORKER_MAX_DURATION
+            .saturating_sub(compact_only_cache_budget.saturating_add(normal_handoff_overhead));
+        assert_eq!(compact_only_cache_budget, Duration::from_secs(210));
+        assert_eq!(compact_only_remaining, Duration::from_secs(85));
+        assert_eq!(
+            compact_checkout_worker_pass_budget(compact_only_remaining, false),
+            Some(compact_only_remaining)
+        );
+        assert_eq!(
+            compact_checkout_worker_pass_budget(
+                AUTO_COMPACT_CHECKOUT_WORKER_ADMISSION_MINIMUM - Duration::from_nanos(1),
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            compact_checkout_worker_pass_budget(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE, false),
+            Some(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE)
+        );
+
+        let both_due_cache_budget = artifact_worker_cache_lane_duration(true, true);
+        let both_due_remaining = ARTIFACT_SWEEP_WORKER_MAX_DURATION
+            .saturating_sub(both_due_cache_budget.saturating_add(normal_handoff_overhead));
+        let both_due_compact_budget =
+            compact_checkout_worker_pass_budget(both_due_remaining, true).unwrap();
+        assert_eq!(both_due_cache_budget, Duration::from_secs(150));
+        assert_eq!(both_due_compact_budget, Duration::from_secs(85));
+        assert_eq!(
+            both_due_remaining.saturating_sub(both_due_compact_budget),
+            AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE
+        );
+        assert_eq!(
+            compact_checkout_worker_pass_budget(
+                AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE
+                    .saturating_add(AUTO_COMPACT_CHECKOUT_WORKER_ADMISSION_MINIMUM)
+                    .saturating_sub(Duration::from_nanos(1)),
+                true,
+            ),
+            None
+        );
         assert!(!compact_checkout_pending_is_due(
             true,
             Some(101),
