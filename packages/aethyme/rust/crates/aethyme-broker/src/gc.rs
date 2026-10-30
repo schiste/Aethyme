@@ -1336,9 +1336,9 @@ fn recovery_archive_minimum_age_elapsed(
     archive: &crate::cleanup_resolve::OwnedRecoveryArchive,
     now: i64,
 ) -> bool {
-    let Some(minimum_age_ms) = archive.minimum_archive_retention_ms else {
-        return true;
-    };
+    let minimum_age_ms = archive
+        .minimum_archive_retention_ms
+        .unwrap_or(crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS);
     now.checked_sub(archive.created_at_ms)
         .and_then(|age| u64::try_from(age).ok())
         .is_some_and(|age| age >= minimum_age_ms)
@@ -1348,9 +1348,10 @@ fn recovery_archive_minimum_age_elapsed(
 mod recovery_archive_minimum_age_tests {
     use super::recovery_archive_minimum_age_elapsed;
     use crate::cleanup_resolve::OwnedRecoveryArchive;
+    use crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS;
 
     #[test]
-    fn immutable_age_uses_exact_boundary_and_fails_closed_on_clock_overflow() {
+    fn immutable_and_legacy_age_use_exact_boundary_and_fail_closed_on_clock_overflow() {
         let mut archive = OwnedRecoveryArchive {
             path: "/fixture/archive".into(),
             session_id: 1,
@@ -1361,28 +1362,40 @@ mod recovery_archive_minimum_age_tests {
                 available_from_delivery: false,
             }],
             created_at_ms: 100,
-            minimum_archive_retention_ms: Some(1_296_000_000),
+            minimum_archive_retention_ms: Some(MIN_RECOVERY_ARCHIVE_RETENTION_MS),
             prerequisite_refs: Vec::new(),
             retirement_digest: None,
             prerequisite_targets: Vec::new(),
             holds_uncommitted: false,
         };
+        let minimum_age_ms = i64::try_from(MIN_RECOVERY_ARCHIVE_RETENTION_MS).unwrap();
         assert!(!recovery_archive_minimum_age_elapsed(&archive, 99));
         assert!(!recovery_archive_minimum_age_elapsed(
             &archive,
-            1_296_000_099
+            100 + minimum_age_ms - 1
         ));
         assert!(recovery_archive_minimum_age_elapsed(
             &archive,
-            1_296_000_100
+            100 + minimum_age_ms
         ));
         archive.created_at_ms = i64::MIN;
         assert!(!recovery_archive_minimum_age_elapsed(&archive, i64::MAX));
         archive.created_at_ms = 0;
         archive.minimum_archive_retention_ms = Some(u64::MAX);
         assert!(!recovery_archive_minimum_age_elapsed(&archive, i64::MAX));
+        archive.created_at_ms = 100;
         archive.minimum_archive_retention_ms = None;
-        assert!(recovery_archive_minimum_age_elapsed(&archive, 0));
+        assert!(!recovery_archive_minimum_age_elapsed(&archive, 99));
+        assert!(!recovery_archive_minimum_age_elapsed(
+            &archive,
+            100 + minimum_age_ms - 1
+        ));
+        assert!(recovery_archive_minimum_age_elapsed(
+            &archive,
+            100 + minimum_age_ms
+        ));
+        archive.created_at_ms = i64::MIN;
+        assert!(!recovery_archive_minimum_age_elapsed(&archive, i64::MAX));
     }
 }
 
