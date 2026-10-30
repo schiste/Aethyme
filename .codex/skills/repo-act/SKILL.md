@@ -597,6 +597,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   then query structured broker status by task or short name. An empty filtered
   result or truncated response is not proof that no session was created; retry
   only after a complete status confirms there is no registered session.
+- Synchronize an authorized PR stack from its lowest prerequisite upward.
+  Bringing main into a child while its declared base remains stale can expose
+  unrelated main commits in that child's PR. After updating each prerequisite,
+  align its dependents and inspect every PR's changed-file list and diff against
+  its declared base. Verify the exact resulting trees and current-head checks;
+  a clean worktree or successful push does not prove the review scope is clean.
 - When resolving stacked merges, preserve the stronger assertions from both
   parents. Adapt tests to the merged API; do not replace explicit failure or
   completeness checks with weaker count-only assertions.
