@@ -211,9 +211,16 @@ pub(super) fn run_list(options: &Options) -> Result<Output, Failure> {
     let memory: Vec<Value> = records
         .iter()
         .map(|record| {
+            // Current footprint only: an active environment's recent
+            // measurement. Parked or stopped ones use no memory, and an old
+            // or unmeasurable sample is not a footprint.
+            let now = super::activity::now_ms();
+            let stale = 3 * super::metrics::SAMPLE_INTERVAL.as_millis() as i64;
             store
                 .as_ref()
+                .filter(|_| record.phase == super::store::EnvironmentPhase::Active)
                 .and_then(|store| store.latest_sample(&record.env_id).ok().flatten())
+                .filter(|sample| sample.method != "none" && now - sample.sampled_at <= stale)
                 .map_or(Value::Null, |sample| json!(sample))
         })
         .collect();

@@ -29,7 +29,7 @@ use serde::Serialize;
 
 use super::drivers::ComponentIdentity;
 use super::engine::resolve;
-use super::spec::{Engine, EnvironmentsFile};
+use super::spec::{Engine, EnvironmentsFile, PoolScope};
 
 /// Samples kept per (repository, profile).
 pub const HISTORY_PER_PROFILE: usize = 200;
@@ -62,7 +62,11 @@ pub struct ProcessRow {
 /// a tick, so the cost is one process per tick, not one per environment.
 pub fn process_table() -> Result<Vec<ProcessRow>, String> {
     let mut command = Command::new("ps");
-    command.args(["-A", "-o", "pid=,pgid=,rss=,%cpu="]);
+    // `ps` formats numbers per locale: `0,0` under a decimal-comma locale
+    // would make every row unparseable.
+    command
+        .args(["-A", "-o", "pid=,pgid=,rss=,%cpu="])
+        .env("LC_ALL", "C");
     let output = match crate::bounded_output::output_limited(
         &mut command,
         Duration::from_secs(10),
@@ -95,6 +99,8 @@ pub fn parse_process_table(text: &str) -> Vec<ProcessRow> {
 }
 
 /// `docker stats` memory such as `123.4MiB / 7.6GiB` -> bytes of the left side.
+/// IEC units (`KiB`, Docker) are powers of 1024; SI units (`kB`, `MB`,
+/// Podman) are powers of 1000.
 pub fn parse_mem_usage(text: &str) -> Option<u64> {
     let used = text.split('/').next()?.trim();
     let split = used.find(|c: char| c.is_ascii_alphabetic())?;
@@ -102,46 +108,83 @@ pub fn parse_mem_usage(text: &str) -> Option<u64> {
     let number: f64 = number.trim().parse().ok()?;
     let factor: f64 = match unit.trim() {
         "B" => 1.0,
-        "KiB" | "kB" | "KB" => 1024.0,
-        "MiB" | "MB" => 1024.0 * 1024.0,
-        "GiB" | "GB" => 1024.0 * 1024.0 * 1024.0,
-        "TiB" | "TB" => 1024.0_f64.powi(4),
+        "KiB" => 1024.0,
+        "MiB" => 1024.0_f64.powi(2),
+        "GiB" => 1024.0_f64.powi(3),
+        "TiB" => 1024.0_f64.powi(4),
+        "kB" | "KB" => 1000.0,
+        "MB" => 1000.0_f64.powi(2),
+        "GB" => 1000.0_f64.powi(3),
+        "TB" => 1000.0_f64.powi(4),
         _ => return None,
     };
     Some((number * factor) as u64)
 }
 
-fn engine_memory(engine: Engine, ids: &[String]) -> Option<(u64, f64)> {
+/// Memory and CPU per container, from one `stats` call per engine for every
+/// container sampled this tick, bounded by [`STATS_BUDGET`] so a hung engine
+/// cannot stall the supervisor (and its lease renewals).
+pub type ContainerStats = BTreeMap<String, (u64, f64)>;
+
+const STATS_BUDGET: Duration = Duration::from_secs(10);
+
+pub fn container_stats(engine: Engine, ids: &[String]) -> ContainerStats {
+    let mut stats = ContainerStats::new();
     if ids.is_empty() {
-        return None;
+        return stats;
     }
-    let cli = resolve(Some(engine)).ok()?;
+    let Ok(cli) = resolve(Some(engine)) else {
+        return stats;
+    };
     let mut args: Vec<&str> = vec![
         "stats",
         "--no-stream",
         "--format",
-        "{{.MemUsage}}\t{{.CPUPerc}}",
+        "{{.ID}}\t{{.MemUsage}}\t{{.CPUPerc}}",
     ];
     args.extend(ids.iter().map(String::as_str));
-    let out = cli
-        .run(&args, std::path::Path::new("/"), &BTreeMap::new())
-        .ok()?;
+    let Ok(out) = cli.run_within(&args, std::path::Path::new("/"), STATS_BUDGET) else {
+        return stats;
+    };
+    for line in out.lines() {
+        let mut fields = line.split('\t');
+        let (Some(id), Some(memory), Some(percent)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (Some(bytes), Ok(cpu)) = (
+            parse_mem_usage(memory),
+            percent.trim().trim_end_matches('%').parse::<f64>(),
+        ) else {
+            continue;
+        };
+        stats.insert(id.trim().to_string(), (bytes, cpu));
+    }
+    stats
+}
+
+fn engine_memory(stats: &ContainerStats, ids: &[String]) -> Option<(u64, f64)> {
     let mut bytes = 0u64;
     let mut cpu = 0f64;
-    for line in out.lines().filter(|l| !l.trim().is_empty()) {
-        let (memory, percent) = line.split_once('\t')?;
-        bytes = bytes.checked_add(parse_mem_usage(memory)?)?;
-        cpu += percent
-            .trim()
-            .trim_end_matches('%')
-            .parse::<f64>()
-            .unwrap_or(0.0);
+    for id in ids {
+        // `stats` prints short ids; identities may record full ones.
+        let (b, c) = stats
+            .iter()
+            .find(|(short, _)| id.starts_with(short.as_str()) || short.starts_with(id.as_str()))
+            .map(|(_, v)| *v)?;
+        bytes = bytes.checked_add(b)?;
+        cpu += c;
     }
-    Some((bytes, cpu))
+    (!ids.is_empty()).then_some((bytes, cpu))
 }
 
 /// Measure one environment from its recorded component identities.
-pub fn sample(identities: &[ComponentIdentity], table: &[ProcessRow], at: i64) -> Sample {
+pub fn sample(
+    identities: &[ComponentIdentity],
+    table: &[ProcessRow],
+    containers: &ContainerStats,
+    at: i64,
+) -> Sample {
     let mut bytes: Option<u64> = None;
     let mut cpu: Option<f64> = None;
     let mut methods: Vec<&str> = Vec::new();
@@ -149,9 +192,14 @@ pub fn sample(identities: &[ComponentIdentity], table: &[ProcessRow], at: i64) -
     for identity in identities {
         let measured = match identity {
             ComponentIdentity::Process(process) => {
+                // The group leader must still be the process we started: a
+                // reused pgid would measure an unrelated group.
+                let leader_alive = table.iter().any(|r| r.pid == process.pid)
+                    && crate::gates::process_start_time(process.pid)
+                        .is_none_or(|start| start == process.start_time);
                 let rows: Vec<&ProcessRow> =
                     table.iter().filter(|r| r.pgid == process.pgid).collect();
-                if rows.is_empty() {
+                if rows.is_empty() || !leader_alive {
                     None
                 } else {
                     methods.push("ps_rss");
@@ -161,8 +209,8 @@ pub fn sample(identities: &[ComponentIdentity], table: &[ProcessRow], at: i64) -
                     ))
                 }
             }
-            ComponentIdentity::Containers { engine, ids, .. } => {
-                let measured = engine_memory(*engine, ids);
+            ComponentIdentity::Containers { ids, .. } => {
+                let measured = engine_memory(containers, ids);
                 if measured.is_some() {
                     methods.push("engine_stats");
                 }
@@ -254,10 +302,16 @@ pub struct Calibration {
     pub budget_bytes: u64,
     pub unit_bytes: u64,
     pub profiles: Vec<ProfileFootprint>,
-    /// Proposed limit per pool.
+    /// Proposed limit per repository pool. Host pools are sized in host
+    /// state, never by one repository.
     pub pools: BTreeMap<String, u32>,
     /// Profiles with too little history to calibrate.
     pub insufficient: Vec<String>,
+    /// Why no units or limits are proposed, when they are not: a proposal
+    /// that rescaled some profiles but kept another's old `units` would mix
+    /// two unit sizes in one pool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<String>,
 }
 
 fn percentile(sorted: &[u64], p: f64) -> u64 {
@@ -317,25 +371,45 @@ pub fn calibrate(
                 insufficient.join(", ")
             )
         })?;
-    for footprint in &mut profiles {
-        // Zero-unit profiles (static, hooks-only) take no pool capacity.
-        let consumes = file
-            .profiles
-            .iter()
-            .any(|p| p.name == footprint.profile && p.units > 0);
-        footprint.proposed_units = footprint
-            .p95_bytes
-            .filter(|_| consumes)
-            .map(|p95| p95.div_ceil(unit_bytes).max(1) as u32);
-    }
     let vm = engine_vm.as_ref().map_or(0, |(_, bytes)| *bytes);
     let budget_bytes = ((host_memory_bytes as f64 * ram_fraction) as u64).saturating_sub(vm);
-    let limit = (budget_bytes / unit_bytes).max(1) as u32;
-    let pools = file
-        .pools
-        .keys()
-        .map(|name| (name.clone(), limit))
+    let thin: Vec<&str> = insufficient
+        .iter()
+        .map(String::as_str)
+        .filter(|name| consumes(name))
         .collect();
+    let withheld = if !thin.is_empty() {
+        Some(format!(
+            "capacity-consuming profile(s) {} have fewer than {MIN_SAMPLES} samples",
+            thin.join(", ")
+        ))
+    } else if budget_bytes < unit_bytes {
+        Some(format!(
+            "the budget ({budget_bytes} bytes after the engine VM) is smaller than one unit ({unit_bytes} bytes)"
+        ))
+    } else {
+        None
+    };
+    let mut pools = BTreeMap::new();
+    if withheld.is_none() {
+        for footprint in &mut profiles {
+            footprint.proposed_units = footprint
+                .p95_bytes
+                .filter(|_| consumes(&footprint.profile))
+                .map(|p95| p95.div_ceil(unit_bytes).max(1) as u32);
+        }
+        // Every repository pool may be full at once: they share the budget.
+        let repository_pools: Vec<&String> = file
+            .pools
+            .iter()
+            .filter(|(_, pool)| pool.scope == PoolScope::Repository)
+            .map(|(name, _)| name)
+            .collect();
+        let share = budget_bytes / repository_pools.len().max(1) as u64;
+        for name in repository_pools {
+            pools.insert(name.clone(), (share / unit_bytes).max(1) as u32);
+        }
+    }
     Ok(Calibration {
         host_memory_bytes,
         engine_vm,
@@ -345,6 +419,7 @@ pub fn calibrate(
         profiles,
         pools,
         insufficient,
+        withheld,
     })
 }
 
@@ -406,20 +481,51 @@ impl super::lifecycle::Lifecycle {
     /// Sample every active environment once, from one shared process-table
     /// snapshot. Returns how many were sampled.
     pub fn sample_active(&mut self, now: i64) -> Result<usize, super::lifecycle::LifecycleError> {
-        let table = process_table().unwrap_or_default();
-        let mut sampled = 0;
+        let table = match process_table() {
+            Ok(table) => table,
+            Err(error) => {
+                crate::warn_unrecorded("sample process memory", Err::<(), _>(error));
+                Vec::new()
+            }
+        };
+        let mut active = Vec::new();
+        let mut containers: BTreeMap<Engine, Vec<String>> = BTreeMap::new();
         for record in self.store.list(None)? {
             if record.phase != super::store::EnvironmentPhase::Active {
                 continue;
             }
-            let identities: Vec<ComponentIdentity> = self
+            let mut identities = Vec::new();
+            let mut unreadable = false;
+            for value in self
                 .store
                 .components(&record.env_id)?
                 .into_iter()
                 .filter_map(|c| c.identity)
-                .filter_map(|v| serde_json::from_value(v).ok())
-                .collect();
-            let measured = sample(&identities, &table, now);
+            {
+                match serde_json::from_value::<ComponentIdentity>(value) {
+                    Ok(identity) => {
+                        if let ComponentIdentity::Containers { engine, ids, .. } = &identity {
+                            containers.entry(*engine).or_default().extend(ids.clone());
+                        }
+                        identities.push(identity);
+                    }
+                    Err(_) => unreadable = true,
+                }
+            }
+            active.push((record, identities, unreadable));
+        }
+        let mut stats = ContainerStats::new();
+        for (engine, ids) in &containers {
+            stats.extend(container_stats(*engine, ids));
+        }
+        let mut sampled = 0;
+        for (record, identities, unreadable) in active {
+            let mut measured = sample(&identities, &table, &stats, now);
+            if unreadable {
+                // A component we cannot identify makes the total unknown.
+                measured.bytes = None;
+                measured.cpu_pct = None;
+            }
             self.store
                 .record_sample(&record, &measured, HISTORY_PER_PROFILE)?;
             sampled += 1;

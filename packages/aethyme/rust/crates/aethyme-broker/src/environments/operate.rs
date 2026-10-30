@@ -922,6 +922,9 @@ pub(super) fn run_calibrate(options: &Options) -> Result<Output, Failure> {
             calibration.insufficient.join(", ")
         ));
     }
+    if let Some(withheld) = &calibration.withheld {
+        text.push_str(&format!("no units or limits proposed: {withheld}\n"));
+    }
     text.push_str(&diff);
     Ok((
         json!({

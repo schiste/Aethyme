@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::compile::{CompileContext, CompiledEnvironment, EnvironmentOwner, compile};
+use super::drivers::ComponentIdentity;
 use super::lifecycle::{Lifecycle, UpOptions};
 use super::metrics::{
-    MIN_SAMPLES, ProcessRow, Sample, calibrate, parse_mem_usage, parse_process_table, proposal_diff,
+    MIN_SAMPLES, ProcessRow, Sample, calibrate, parse_mem_usage, parse_process_table,
+    proposal_diff, sample,
 };
 use super::spec::{EnvironmentsFile, HostEnvironmentsFile};
 use super::store::EnvironmentStore;
@@ -94,7 +96,9 @@ fn process_tables_and_engine_memory_parse() {
     );
     assert_eq!(parse_mem_usage("512MiB / 7.6GiB"), Some(512 * MIB));
     assert_eq!(parse_mem_usage("1.5GiB / 8GiB"), Some(3 * 512 * MIB));
-    assert_eq!(parse_mem_usage("12kB / 1GB"), Some(12 * 1024));
+    // Podman prints SI units: powers of 1000, not 1024.
+    assert_eq!(parse_mem_usage("12kB / 1GB"), Some(12_000));
+    assert_eq!(parse_mem_usage("1.5GB / 8GB"), Some(1_500_000_000));
     assert_eq!(parse_mem_usage("garbage"), None);
 }
 
@@ -228,7 +232,7 @@ fn history() -> BTreeMap<String, Vec<u64>> {
         ("site".to_string(), spread(10)),
         ("small".to_string(), spread(100)),
         ("big".to_string(), spread(300)),
-        ("new".to_string(), vec![50 * MIB; MIN_SAMPLES - 1]),
+        ("new".to_string(), spread(120)),
     ])
 }
 
@@ -255,8 +259,7 @@ fn calibrate_fits_a_full_pool_in_the_budget() {
         "the smallest pool consumer is one unit"
     );
     assert_eq!(units("big"), Some(3));
-    assert_eq!(units("new"), None);
-    assert_eq!(calibration.insufficient, ["new"]);
+    assert_eq!(calibration.withheld, None);
     assert_eq!(
         calibration.budget_bytes,
         ram / 2 - vm,
@@ -276,6 +279,92 @@ fn calibrate_fits_a_full_pool_in_the_budget() {
         !diff.contains("+name"),
         "only units and limit lines change: {diff}"
     );
+}
+
+/// A capacity-consuming profile without history keeps its old `units`; a
+/// proposal rescaling the others would mix two unit sizes in one pool, so
+/// nothing is proposed.
+#[test]
+fn a_thin_consuming_profile_withholds_every_proposal() {
+    let file = parse(CALIBRATED);
+    let mut history = history();
+    history.insert("new".into(), vec![50 * MIB; MIN_SAMPLES - 1]);
+    let calibration = calibrate(&file, &history, 16 * 1024 * MIB, None, 0.5).unwrap();
+    assert!(
+        calibration
+            .withheld
+            .as_deref()
+            .is_some_and(|w| w.contains("new")),
+        "{calibration:?}"
+    );
+    assert!(calibration.pools.is_empty());
+    assert!(
+        calibration
+            .profiles
+            .iter()
+            .all(|p| p.proposed_units.is_none())
+    );
+    assert_eq!(proposal_diff(CALIBRATED, &calibration), "");
+}
+
+/// Every repository pool may be full at once: they share the budget. Host
+/// pools are sized in host state, never by one repository.
+#[test]
+fn repository_pools_share_the_budget_and_host_pools_are_left_alone() {
+    let text = CALIBRATED.replace(
+        "[pools.envs]\nlimit = 2\n",
+        "[pools.envs]\nlimit = 2\n[pools.more]\nlimit = 2\n[pools.shared]\nscope = \"host\"\n",
+    );
+    let file = parse(&text);
+    let calibration = calibrate(&file, &history(), 16 * 1024 * MIB, None, 0.5).unwrap();
+    assert_eq!(
+        calibration.pools.keys().collect::<Vec<_>>(),
+        ["envs", "more"]
+    );
+    let total: u64 = calibration.pools.values().map(|l| *l as u64).sum();
+    assert!(total * calibration.unit_bytes <= calibration.budget_bytes);
+}
+
+#[test]
+fn a_budget_below_one_unit_proposes_nothing() {
+    let file = parse(CALIBRATED);
+    let ram = 1024 * MIB;
+    let calibration = calibrate(&file, &history(), ram, Some(("docker".into(), ram)), 0.5).unwrap();
+    assert!(calibration.withheld.is_some(), "{calibration:?}");
+    assert!(calibration.pools.is_empty());
+}
+
+/// A recycled process group (the leader is gone or is another process) is
+/// unknown, never an unrelated group's memory.
+#[test]
+fn a_reused_process_group_is_unknown() {
+    let me = std::process::id() as i32;
+    let table = parse_process_table(&format!("{me} 4242 2048 0.0\n"));
+    let identity = ComponentIdentity::Process(super::identity::ProcessIdentity {
+        pid: me,
+        pgid: 4242,
+        start_time: crate::gates::process_start_time(me).unwrap_or(0) + 1,
+    });
+    let measured = sample(&[identity], &table, &Default::default(), 0);
+    assert_eq!(measured.bytes, None, "{measured:?}");
+}
+
+/// A store a pre-#1218 binary created has no samples table yet: reads find
+/// no history instead of failing.
+#[test]
+fn a_store_without_the_samples_table_reads_as_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("environments.db");
+    drop(super::store::EnvironmentStore::open(&path).unwrap());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("DROP TABLE environment_samples")
+        .unwrap();
+    drop(conn);
+    let store = super::store::EnvironmentStore::open_read_only(&path)
+        .unwrap()
+        .unwrap();
+    assert!(store.footprints("r").unwrap().is_empty());
+    assert_eq!(store.latest_sample("env-x").unwrap(), None);
 }
 
 #[test]

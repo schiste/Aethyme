@@ -892,6 +892,9 @@ impl EnvironmentStore {
         &self,
         env_id: &str,
     ) -> Result<Option<super::metrics::Sample>, StoreError> {
+        if !self.has_samples_table()? {
+            return Ok(None);
+        }
         Ok(self
             .conn
             .query_row(
@@ -910,12 +913,29 @@ impl EnvironmentStore {
             .optional()?)
     }
 
+    /// A store last opened for writing by a binary older than #1218 has no
+    /// samples table, and a read-only open never creates it: no samples yet.
+    fn has_samples_table(&self) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'environment_samples'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
     /// Measured byte samples per profile of one repository (unknown
     /// measurements excluded).
     pub fn footprints(
         &self,
         repository: &str,
     ) -> Result<std::collections::BTreeMap<String, Vec<u64>>, StoreError> {
+        if !self.has_samples_table()? {
+            return Ok(Default::default());
+        }
         let mut statement = self.conn.prepare(
             "SELECT profile, bytes FROM environment_samples
              WHERE repository = ?1 AND bytes IS NOT NULL",
