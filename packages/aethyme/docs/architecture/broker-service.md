@@ -1,6 +1,6 @@
 # Progressive broker service
 
-Last Updated: 2026-10-29
+Last Updated: 2026-10-30
 
 The broker currently coordinates CLI processes through SQLite transactions and
 file locks. A shared service will own recurring work and request scheduling,
@@ -15,10 +15,11 @@ preserve existing CLI contracts and remain usable after its predecessors merge.
 2. **Opt-in service.** Add explicit serve/status lifecycle commands and a private
    local socket with singleton ownership. Initially support health requests
    only. Existing operations continue to run directly.
-3. **Shared cleanup jobs.** Add durable job IDs, deduplication by repository and
-   operation inputs, shared progress, deadlines and cancellation. Make explicit
-   cleanup requests available through the service. Reuse existing cleanup safety
-   checks and journals; a service does not authorize deletion by itself.
+3. **Shared cleanup jobs.** First add an inactive durable job store with IDs,
+   deduplication, shared progress, deadlines and cancellation. Then connect
+   explicitly requested GC planning to the service in a dependent PR. Applying
+   cleanup needs a subsequent authorization contract and must reuse existing
+   safety checks and journals; a service does not authorize deletion by itself.
 4. **Recurring work.** Move automatic cleanup and monitoring behind service
    scheduling. Preserve existing coordinators while old clients coexist. One
    slow job must not prevent health or status requests.
@@ -111,6 +112,59 @@ abrupt process exit leaves a socket for the next startup to recover.
 The runtime directory is explicitly selected in this opt-in phase. Automatic
 per-user discovery, startup, shutdown requests and migration of repository jobs
 are later steps; this phase does not yet reduce existing broker process counts.
+
+## Inactive durable job store
+
+`service::jobs::JobStore` is a library foundation, with no service methods,
+automatic workers, discovery or routing changes. Even `serve` and `ping` do
+not open it. Its only typed operation describes GC **planning**, never apply,
+arbitrary commands or CLI argument vectors.
+
+The caller explicitly selects a trusted private SQLite file, separate from
+`broker.db`, and must resolve the stable repository identity shared by linked
+worktrees before submission. Opening storage grants no repository or cleanup
+authority. Application ID `0x41534a31` and user version 1 distinguish this file
+from broker or unrelated databases; incompatible identities and versions are
+refused before schema or journal-mode changes. Transactions use a two-second
+busy timeout, WAL and FULL synchronization. This PR introduces no broker schema
+migration and never points a development job store at installed broker state.
+
+Each accepted request receives a persistent positive integer job ID. A
+repository-scoped idempotency key maps permanently to that job; after a lost
+reply, `find_request` can recover the ID and outcome. Reusing a key with changed
+options or a changed job deadline is refused. Different keys join identical
+outstanding repository, typed operation options and absolute job deadline.
+Different repositories, options or job deadlines remain separate. A client's
+wait timeout is a separate future transport concern. After a terminal outcome,
+a fresh key can request a fresh plan; old keys keep returning the old result.
+Rows are retained without automatic pruning in this foundation.
+
+Immediate SQLite transactions serialize submission and claim across independent
+connections. A queued job may be claimed only once. The claim carries a random
+128-bit token in addition to its job ID and worker generation; stale or
+cross-database claims cannot update progress or completion. Progress is shared,
+bounded and cannot move backwards. Completion persists either a JSON result
+(at most one MiB), failure message or worker-acknowledged cancellation. Messages
+are at most 4096 bytes. These internal records are not the socket v1 response
+schema; large result transport and retention remain follow-up work.
+
+The states are `queued`, `running`, `interrupted`, `succeeded`, `failed`,
+`cancelled` and `expired`. Queued jobs whose deadline elapsed become expired
+before claim. A running worker must enforce its deadline itself and report
+what happened; the store never declares that a deadline stopped a live worker.
+Cancelling queued work prevents dispatch. Cancelling running work only records
+`cancellation_requested`; its state stays running until the worker reports an
+actual outcome. Cancellation affects the shared job and all joiners. Repeating
+cancellation on a terminal job leaves its recorded outcome unchanged.
+
+After independently proving that a worker generation has lost ownership, a
+controller may mark that generation's running jobs interrupted. Opening a
+database or observing an elapsed deadline never supplies that proof. Interrupted
+jobs retain their ID and progress, continue deduplicating identical requests,
+and cannot be claimed again or completed through their old token. There is
+deliberately no generic retry or reconciliation override yet. Connecting this
+store to the singleton service must supply fencing, repository identity,
+execution deadline enforcement and a bounded scheduling policy first.
 
 ## Acceptance before default activation
 
