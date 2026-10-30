@@ -317,6 +317,39 @@ pub fn record_gone_holders(
     Ok(recorded)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GoneHolderWrite {
+    Skipped,
+    Recorded,
+    DatabaseBusy,
+}
+
+/// Persist exact absence observed by the final lease check. The caller
+/// supplies the process table captured for this binding.
+pub(crate) fn record_gone_holder_for_abandoned_session(
+    store: &mut crate::BrokerStore,
+    session_id: i64,
+    binding_event_id: i64,
+    holder: &crate::session_holder::AgentProcess,
+    table: Option<&crate::session_holder::ProcessTable>,
+    deadline: Option<std::time::Instant>,
+) -> Result<GoneHolderWrite, crate::BrokerOpError> {
+    let Some(table) = table else {
+        return Ok(GoneHolderWrite::Skipped);
+    };
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        || table.is_alive(holder)
+    {
+        return Ok(GoneHolderWrite::Skipped);
+    }
+    match store.record_session_holder_gone_for_binding(session_id, binding_event_id, holder) {
+        Ok(true) => Ok(GoneHolderWrite::Recorded),
+        Ok(false) => Ok(GoneHolderWrite::Skipped),
+        Err(crate::BrokerError::SessionRetirementDatabaseBusy) => Ok(GoneHolderWrite::DatabaseBusy),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Liveness of every given lease, one holder lookup per session.
 pub fn assess(
     store: &crate::BrokerStore,
@@ -448,6 +481,225 @@ mod tests {
             )
             .unwrap();
         (dir, store, session.id, holder)
+    }
+
+    fn bind_holder(
+        store: &mut crate::BrokerStore,
+        session_id: i64,
+        holder: &crate::session_holder::AgentProcess,
+    ) -> i64 {
+        store
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session_id),
+                Some(&crate::events::session_holder_bound_payload(
+                    holder,
+                    "registered",
+                    None,
+                )),
+            )
+            .unwrap();
+        store
+            .latest_session_holder_event(session_id)
+            .unwrap()
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn abandoned_lease_check_records_gone_once_and_rebind_starts_a_new_grace() {
+        let (_dir, mut store, id, mut holder) = shared_holder_fixture();
+        holder.pid = i64::MAX;
+        holder.started = "Mon Oct 26 08:42:41 2026".into();
+        let binding = bind_holder(&mut store, id, &holder);
+        let absent = crate::session_holder::ProcessTable::default();
+
+        assert_eq!(
+            record_gone_holder_for_abandoned_session(
+                &mut store,
+                id,
+                binding,
+                &holder,
+                Some(&absent),
+                None,
+            )
+            .unwrap(),
+            GoneHolderWrite::Recorded
+        );
+        let first_gone = store.latest_session_holder_gone_event(id).unwrap().unwrap();
+        assert!(first_gone.id > binding);
+        let alternate_serialization = serde_json::to_string_pretty(&holder).unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE events SET payload_json = ?1 WHERE id = ?2",
+                rusqlite::params![alternate_serialization, first_gone.id],
+            )
+            .unwrap();
+        assert_eq!(
+            record_gone_holder_for_abandoned_session(
+                &mut store,
+                id,
+                binding,
+                &holder,
+                Some(&absent),
+                None,
+            )
+            .unwrap(),
+            GoneHolderWrite::Skipped
+        );
+        let repeated_gone = store.latest_session_holder_gone_event(id).unwrap().unwrap();
+        assert_eq!(
+            (repeated_gone.id, repeated_gone.ts),
+            (first_gone.id, first_gone.ts)
+        );
+
+        let rebound = crate::session_holder::AgentProcess {
+            pid: i64::MAX - 1,
+            started: "Tue Oct 27 08:42:41 2026".into(),
+            command: holder.command.clone(),
+        };
+        let rebound_binding = bind_holder(&mut store, id, &rebound);
+        assert_eq!(
+            record_gone_holder_for_abandoned_session(
+                &mut store,
+                id,
+                rebound_binding,
+                &rebound,
+                Some(&absent),
+                None,
+            )
+            .unwrap(),
+            GoneHolderWrite::Recorded
+        );
+        let rebound_gone = store.latest_session_holder_gone_event(id).unwrap().unwrap();
+        assert!(rebound_gone.id > rebound_binding);
+        assert_eq!(
+            recorded_gone_since(&store, id, &rebound).unwrap(),
+            Some(rebound_gone.ts)
+        );
+        assert_eq!(
+            recorded_gone_since(&store, id, &holder).unwrap(),
+            None,
+            "the previous binding's gone evidence does not survive a rebind"
+        );
+    }
+
+    #[test]
+    fn gone_holder_recorder_preserves_unknown_live_and_unavailable_observations() {
+        let (_dir, mut store, id, mut holder) = shared_holder_fixture();
+        holder.pid = i64::MAX;
+        holder.started = "Mon Oct 26 08:42:41 2026".into();
+        let binding = bind_holder(&mut store, id, &holder);
+
+        assert_eq!(
+            record_gone_holder_for_abandoned_session(
+                &mut store,
+                id,
+                binding,
+                &holder,
+                Some(&crate::session_holder::ProcessTable::default()),
+                Some(std::time::Instant::now() - std::time::Duration::from_millis(1)),
+            )
+            .unwrap(),
+            GoneHolderWrite::Skipped,
+            "an expired retirement deadline cannot start lease grace"
+        );
+        assert!(
+            store
+                .latest_session_holder_gone_event(id)
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(
+            record_gone_holder_for_abandoned_session(&mut store, id, binding, &holder, None, None,)
+                .unwrap(),
+            GoneHolderWrite::Skipped,
+            "an unavailable or failed process snapshot cannot start lease grace"
+        );
+        assert!(
+            store
+                .latest_session_holder_gone_event(id)
+                .unwrap()
+                .is_none()
+        );
+
+        let live = crate::session_holder::ProcessTable::parse(&format!(
+            "{} 1 {} {}\n",
+            holder.pid, holder.started, holder.command
+        ));
+        assert_eq!(
+            record_gone_holder_for_abandoned_session(
+                &mut store,
+                id,
+                binding,
+                &holder,
+                Some(&live),
+                None,
+            )
+            .unwrap(),
+            GoneHolderWrite::Skipped,
+            "a live exact holder must not be recorded gone"
+        );
+        assert!(
+            store
+                .latest_session_holder_gone_event(id)
+                .unwrap()
+                .is_none()
+        );
+
+        let rebound = crate::session_holder::AgentProcess {
+            pid: i64::MAX - 1,
+            started: "Tue Oct 27 08:42:41 2026".into(),
+            command: holder.command.clone(),
+        };
+        bind_holder(&mut store, id, &rebound);
+        let absent = crate::session_holder::ProcessTable::default();
+        assert_eq!(
+            record_gone_holder_for_abandoned_session(
+                &mut store,
+                id,
+                binding,
+                &holder,
+                Some(&absent),
+                None,
+            )
+            .unwrap(),
+            GoneHolderWrite::Skipped,
+            "the conditional write rejects a binding that changed after observation"
+        );
+        assert!(
+            store
+                .latest_session_holder_gone_event(id)
+                .unwrap()
+                .is_none()
+        );
+
+        store
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(id),
+                Some("not-json"),
+            )
+            .unwrap();
+        assert_eq!(
+            crate::session_holder::recorded_holder_liveness(
+                &store,
+                id,
+                &mut crate::session_holder::RecordedHolderProcessTable::default(),
+                false,
+            )
+            .liveness,
+            crate::session_holder::RecordedHolderLiveness::Unknown,
+            "an unreadable binding remains unknown and cannot reach the recorder"
+        );
+        assert!(
+            store
+                .latest_session_holder_gone_event(id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
