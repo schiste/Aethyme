@@ -67,7 +67,7 @@ filesystem identities. It provides durable lookup, shared outcomes and chunked
 results while retaining v1 health. Submit/lookup/status/cancel print the v2
 Response envelope; result prints the assembled plan JSON. Exact shapes, null
 semantics, bounds, restart fencing and ambiguous-response handling are specified
-in [broker-service.md](broker-service.md#opt-in-gc-planning-worker). These are
+in [broker-service.md](broker-service.md). These are
 manual operator surfaces; existing scripts and automatic jobs are not migrated.
 
 ## Automatic checkout maintenance (v0.8.44)
