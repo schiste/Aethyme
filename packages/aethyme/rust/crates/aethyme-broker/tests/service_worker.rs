@@ -515,6 +515,261 @@ fn discovery_validates_existing_leaf_and_socket_path_without_repairing_them() {
     assert_eq!(fs::read_dir(&too_long).unwrap().count(), 0);
 }
 
+fn ensure_command(fixture: &common::FixtureRepository, root: &Path) -> Command {
+    let mut command = shim(fixture);
+    command
+        .arg("ensure")
+        .arg(root)
+        .arg("--jobs-for")
+        .arg(fixture.path())
+        .arg("--json");
+    command
+}
+
+struct OwnedEnsuredService(aethyme_broker::environments::identity::ProcessIdentity);
+
+impl Drop for OwnedEnsuredService {
+    fn drop(&mut self) {
+        use aethyme_broker::environments::identity::Observation;
+        if self.0.observe() == Observation::Alive {
+            // SAFETY: signal only the exact process identity created by this test.
+            let signalled = unsafe { libc::kill(self.0.pid, libc::SIGTERM) };
+            assert_eq!(signalled, 0);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.0.observe() == Observation::Alive && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            self.0.observe(),
+            Observation::Gone,
+            "owned service exit could not be proved"
+        );
+    }
+}
+
+#[test]
+fn concurrent_ensure_starts_one_service_and_reuses_its_repository_identity() {
+    let fixture = planning_fixture();
+    let root = runtime_directory();
+    let root = root.path().canonicalize().unwrap();
+    let children: Vec<_> = (0..4)
+        .map(|_| {
+            ensure_command(&fixture, &root)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let outputs: Vec<_> = children
+        .into_iter()
+        .map(|child| child.wait_with_output().unwrap())
+        .collect();
+    let successful: Vec<serde_json::Value> = outputs
+        .iter()
+        .filter(|o| o.status.success())
+        .map(|o| serde_json::from_slice(&o.stdout).unwrap())
+        .collect();
+    let owned = successful.first().map(|value| {
+        OwnedEnsuredService(
+            aethyme_broker::environments::identity::ProcessIdentity::capture(
+                value["pid"].as_i64().unwrap() as i32,
+            )
+            .expect("capture our newly started service identity"),
+        )
+    });
+    for output in &outputs {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        successful.iter().filter(|v| v["started"] == true).count(),
+        1
+    );
+    let first = &successful[0];
+    for value in &successful {
+        assert_eq!(value["pid"], first["pid"]);
+        assert_eq!(value["repository"], first["repository"]);
+        assert_eq!(value["directory"], first["directory"]);
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value.as_object().unwrap().len(), 6);
+    }
+    let repeated = ensure_command(&fixture, &root).output().unwrap();
+    assert!(
+        repeated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    let repeated: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(repeated["pid"], first["pid"]);
+    assert_eq!(repeated["started"], false);
+    let directory = Path::new(first["directory"].as_str().unwrap());
+    assert!(directory.join("broker-service.lock").exists());
+    assert!(directory.join("broker-service-startup.lock").exists());
+    let deadline_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        + 120000;
+    let plan = gc_plan_command(&fixture)
+        .arg("--service-directory")
+        .arg(directory)
+        .args([
+            "--request-key",
+            "ensured-plan",
+            "--deadline-ms",
+            &deadline_ms.to_string(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        plan.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&plan.stdout)
+            .unwrap()
+            .is_object()
+    );
+    let before = cli_json(
+        &fixture,
+        &["lookup", directory.to_str().unwrap(), "ensured-plan"],
+    );
+    drop(owned);
+    let restarted = ensure_command(&fixture, &root).output().unwrap();
+    assert!(
+        restarted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    let restarted: serde_json::Value = serde_json::from_slice(&restarted.stdout).unwrap();
+    let _restarted = OwnedEnsuredService(
+        aethyme_broker::environments::identity::ProcessIdentity::capture(
+            restarted["pid"].as_i64().unwrap() as i32,
+        )
+        .expect("capture our restarted service identity"),
+    );
+    assert_eq!(restarted["started"], true);
+    assert_eq!(
+        cli_json(
+            &fixture,
+            &["lookup", directory.to_str().unwrap(), "ensured-plan"]
+        ),
+        before
+    );
+}
+
+#[test]
+fn ensure_preserves_a_live_service_for_another_repository() {
+    let fixture = planning_fixture();
+    let other = planning_fixture();
+    let root = runtime_directory();
+    let root = root.path().canonicalize().unwrap();
+    let discovered = discover(&fixture, &root, fixture.path());
+    assert!(discovered.status.success());
+    let discovered: serde_json::Value = serde_json::from_slice(&discovered.stdout).unwrap();
+    let directory = Path::new(discovered["directory"].as_str().unwrap());
+    fs::create_dir(directory).unwrap();
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let _other_service = start(&other, directory);
+    let before = transport::ping(directory).unwrap().result.unwrap();
+    let output = ensure_command(&fixture, &root).output().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(transport::ping(directory).unwrap().result.unwrap(), before);
+    assert!(!directory.join("broker-service-startup.log").exists());
+}
+
+#[test]
+fn ensure_refuses_unsafe_coordination_files_without_spawning_or_repair() {
+    let fixture = planning_fixture();
+    let root = runtime_directory();
+    let root = root.path().canonicalize().unwrap();
+    let discovered = discover(&fixture, &root, fixture.path());
+    assert!(discovered.status.success());
+    let discovered: serde_json::Value = serde_json::from_slice(&discovered.stdout).unwrap();
+    let directory = Path::new(discovered["directory"].as_str().unwrap());
+    fs::create_dir(directory).unwrap();
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let sentinel = root.join("sentinel");
+    fs::write(&sentinel, "preserve").unwrap();
+    let startup_lock = directory.join("broker-service-startup.lock");
+    std::os::unix::fs::symlink(&sentinel, &startup_lock).unwrap();
+    assert!(
+        !ensure_command(&fixture, &root)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_eq!(fs::read(&sentinel).unwrap(), b"preserve");
+    assert!(startup_lock.is_symlink());
+    fs::remove_file(&startup_lock).unwrap();
+    fs::write(&startup_lock, "private lock").unwrap();
+    fs::set_permissions(&startup_lock, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        !ensure_command(&fixture, &root)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_eq!(
+        fs::metadata(&startup_lock).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    fs::set_permissions(&startup_lock, fs::Permissions::from_mode(0o600)).unwrap();
+    let startup_log = directory.join("broker-service-startup.log");
+    std::os::unix::fs::symlink(&sentinel, &startup_log).unwrap();
+    assert!(
+        !ensure_command(&fixture, &root)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(startup_log.is_symlink());
+    assert_eq!(fs::read(&sentinel).unwrap(), b"preserve");
+    assert!(!directory.join("broker-service.sock").exists());
+    assert!(!directory.join("broker-service-jobs.sqlite").exists());
+}
+
+#[test]
+fn ensure_invalid_arguments_and_uninitialized_owner_create_no_service_state() {
+    let fixture = common::FixtureRepository::new();
+    let root = runtime_directory();
+    let root = root.path().canonicalize().unwrap();
+    let mut git = Command::new("git");
+    isolated(&mut git, &fixture);
+    assert!(git.args(["init", "-q"]).status().unwrap().success());
+    for extra in [
+        vec![],
+        vec!["--jobs-for"],
+        vec!["--jobs-for", ".", "--json", "--json"],
+        vec!["--jobs-for", ".", "--unknown"],
+    ] {
+        let output = shim(&fixture)
+            .arg("ensure")
+            .arg(&root)
+            .args(extra)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(!fixture.path().join(".aethyme").exists());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+    }
+    let output = ensure_command(&fixture, &root).output().unwrap();
+    assert!(!output.status.success());
+    assert!(!fixture.path().join(".aethyme").exists());
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+}
+
 fn gc_plan_command(fixture: &common::FixtureRepository) -> Command {
     let mut command = common::broker_cli_for_fixture(
         env!("CARGO_BIN_EXE_broker-cli-shim"),

@@ -146,6 +146,54 @@ collision or a service bound to a different repository. Starting and managing
 the discovered service is a subsequent opt-in change; existing commands retain
 their explicit runtime-directory and direct execution behavior.
 
+## Explicit singleton startup
+
+The dependent startup PR adds:
+
+```sh
+aethyme broker advanced service ensure <private-service-root> --jobs-for <repository> --json
+```
+
+This is an explicit request to start a background service if none is available.
+The root must already exist and satisfy discovery's private-path requirements.
+Only the discovered leaf is created, with mode 0700; neither the repository nor
+the root is initialized. The CLI launches its own current executable by
+absolute path, with fixed `broker advanced service serve ... --jobs-for ...`
+arguments, null stdin/stdout and a private startup stderr log. The child has its
+own process group. There is no PATH search, shell command, launch agent or
+implicit call from other broker commands.
+
+Concurrent ensure callers serialize on the permanent
+`broker-service-startup.lock`, separate from the service's lifetime
+`broker-service.lock`. Both must be private owned regular files with one link;
+symlinks, unsafe modes and inode replacements are refused. Never unlink either
+lock while it might be in use. A running endpoint must return the same package
+version, support the repository protocol, and match the complete locally
+verified identity. A live incompatible, wrong-owner or unresponsive endpoint is
+preserved and refused. Only a missing or connection-refused endpoint permits
+startup; the existing server still controls stale-socket recovery and the
+durable job-store restart rules.
+
+Both output modes return the discovery object plus `pid` (positive integer),
+`version` (string), and `started` (boolean). `started` is true only when this
+invocation started the observed ready process. Reuse returns false. Readiness
+is an observation, not a guarantee of future availability. Neither success nor
+failure submits a GC job. Normal GC commands still require the explicit
+`--service-directory` triple to use this worker.
+
+The startup-lock wait and child-readiness wait each have a ten-second budget.
+Socket calls retain two-second timeouts, checked between operations, so these
+are not hard end-to-end wall-clock limits. A failed or timed-out owned startup
+child is stopped and reaped; an already-running service is never killed by
+ensure. Successful children are reaped when they exit while the caller remains
+alive, or by the operating system after the CLI exits. Private startup logs are
+appended through a verified descriptor; an existing log over eight MiB refuses
+another launch until explicitly rotated. This is a startup check, not a runtime
+log-size cap. Failures leave durable files in place for inspection and explicit
+retry. Stop a background service through a process supervisor or after verifying
+its reported process identity. Idle shutdown and automatic lifecycle management
+remain later steps; this opt-in stage installs no recurring activity.
+
 ## Inactive durable job store
 
 `service::jobs::JobStore` is a library foundation, with no service methods,

@@ -12,6 +12,9 @@ pub(crate) mod client;
 pub mod discovery;
 
 #[cfg(unix)]
+pub mod startup;
+
+#[cfg(unix)]
 pub(crate) mod job_runtime;
 
 #[cfg(unix)]
