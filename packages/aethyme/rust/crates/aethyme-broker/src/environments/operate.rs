@@ -10,7 +10,7 @@ use super::cli::{
     DOWN_SCHEMA, Failure, Options, Output, PARK_SCHEMA, PIN_SCHEMA, SWEEP_SCHEMA, TOUCH_SCHEMA,
     UP_SCHEMA, WAKE_SCHEMA, check, compile_context, environment_failure, workspace,
 };
-use super::compile::{compile, default_profile_name};
+use super::compile::compile;
 use super::lifecycle::{Lifecycle, LifecycleError, RESERVATION_GRANT, UpOptions, read_grant};
 use super::logs::environments_directory;
 use super::store::{EnvironmentRecord, EnvironmentStore};
@@ -147,12 +147,19 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
             });
         }
     };
-    let profile = options
-        .profile
-        .as_deref()
-        .or_else(|| default_profile_name(file))
-        .unwrap_or_default()
-        .to_string();
+    let (base, changed) =
+        super::infer::changed_paths(&workspace.worktree_root).map_err(environment_failure)?;
+    let inference = super::infer::infer(file, &changed).map_err(environment_failure)?;
+    let (mut lifecycle, warning) = open("env up", true)?;
+    let mut profile = choose_profile(file, &inference, options)?;
+    if options.profile.is_none()
+        && let Some(higher) =
+            existing_at_or_above(&lifecycle, &workspace.worktree_root, file, &inference)?
+    {
+        // Reuse a deliberately higher environment rather than start a second,
+        // cheaper one beside it.
+        profile = higher;
+    }
     let context = compile_context(&workspace, &checked.digest);
     let snapshot =
         compile(file, &checked.host, &profile, ENVIRONMENTS_FILE, &context).map_err(|error| {
@@ -163,8 +170,15 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
                 exit: exit_status::USAGE,
             }
         })?;
-    let (mut lifecycle, warning) = open("env up", true)?;
     let main_root = workspace.repo.main_root().ok();
+    let mut snapshot = snapshot;
+    attach_shared(
+        &mut lifecycle,
+        &mut snapshot,
+        main_root.as_deref(),
+        &checked.host,
+        options,
+    )?;
     let record = lifecycle
         .up(
             &snapshot,
@@ -177,10 +191,55 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
             },
         )
         .map_err(lifecycle_failure)?;
+    // Only now that the new environment is up are cheaper ones retired.
+    let (replaced, kept) =
+        replace_below_minimum(&mut lifecycle, &workspace.worktree_root, file, &inference);
     let (mut value, mut text) = describe(&lifecycle, &record);
     if let Some(warning) = &warning {
         value["warning"] = json!(warning);
         text.push_str(&format!("warning: {warning}\n"));
+    }
+    if base.is_none() {
+        let warning = "no diff base (aethyme/integration or the remote default branch): only uncommitted changes were inferred";
+        value["inference_warning"] = json!(warning);
+        text.push_str(&format!("warning: {warning}\n"));
+    }
+    if !kept.is_empty() {
+        value["kept_below_minimum"] = json!(kept);
+        for (env_id, why) in &kept {
+            text.push_str(&format!(
+                "kept below-minimum environment {env_id}: {why}; `env down {env_id}` when done\n"
+            ));
+        }
+    }
+    if let Some(reason) = options.reason.as_deref()
+        && super::infer::profile_rank(file, &record.profile).is_some_and(|r| r > inference.rank)
+    {
+        lifecycle
+            .store
+            .note(
+                &record.env_id,
+                "profile above inferred minimum",
+                "env up",
+                Some(&json!({
+                    "profile": record.profile,
+                    "inferred_minimum": inference.minimum,
+                    "reason": reason,
+                })),
+            )
+            .map_err(|error| environment_failure(error.to_string()))?;
+    }
+    value["inference"] = json!({
+        "base": base,
+        "minimum": inference.minimum,
+        "fired": inference.fired,
+    });
+    if !replaced.is_empty() {
+        value["replaced"] = json!(replaced);
+        text.push_str(&format!(
+            "replaced below-minimum environment(s): {}\n",
+            replaced.join(", ")
+        ));
     }
     value["schema"] = json!(UP_SCHEMA);
     Ok((value, text, exit_status::SUCCESS))
@@ -460,6 +519,473 @@ pub(super) fn run_routes(_: &Options) -> Result<Output, Failure> {
     ))
 }
 
+/// The profile `env up` brings up: the inferred minimum unless `--profile`
+/// asks for one. Lower than the minimum is refused with the firing rules;
+/// higher needs `--reason`.
+fn choose_profile(
+    file: &super::spec::EnvironmentsFile,
+    inference: &super::infer::Inference,
+    options: &Options,
+) -> Result<String, Failure> {
+    let Some(requested) = options.profile.as_deref() else {
+        return Ok(inference.minimum.clone());
+    };
+    let rank = super::infer::profile_rank(file, requested).ok_or_else(|| Failure {
+        code: "unknown_profile",
+        message: format!("profile {requested:?} is not declared"),
+        next_action: "pass --profile with a declared profile".into(),
+        exit: exit_status::USAGE,
+    })?;
+    if rank < inference.rank {
+        let rules: Vec<String> = inference
+            .fired
+            .iter()
+            .map(|f| format!("{} -> {} ({})", f.rule, f.min_profile, f.paths.join(", ")))
+            .collect();
+        return Err(Failure {
+            code: "below_inferred_minimum",
+            message: format!(
+                "profile {requested} is below the inferred minimum {}; rules fired: {}",
+                inference.minimum,
+                rules.join("; ")
+            ),
+            next_action: format!(
+                "use --profile {} (or higher); if a rule is wrong, change [[rules]] in environments.toml",
+                inference.minimum
+            ),
+            exit: exit_status::REFUSED,
+        });
+    }
+    if rank > inference.rank
+        && options
+            .reason
+            .as_deref()
+            .is_none_or(|r| r.trim().is_empty())
+    {
+        return Err(Failure {
+            code: "reason_required",
+            message: format!(
+                "profile {requested} is above the inferred minimum {}; say why",
+                inference.minimum
+            ),
+            next_action: format!(
+                "rerun with --reason \"...\", or use --profile {}",
+                inference.minimum
+            ),
+            exit: exit_status::USAGE,
+        });
+    }
+    Ok(requested.to_string())
+}
+
+/// This worktree's environments that keep their worktree, with their rank.
+fn worktree_environments(
+    lifecycle: &Lifecycle,
+    worktree: &std::path::Path,
+    file: &super::spec::EnvironmentsFile,
+) -> Result<Vec<(super::store::EnvironmentRecord, u32)>, Failure> {
+    let fingerprint = crate::console::worktree_fingerprint(worktree);
+    Ok(lifecycle
+        .store
+        .list(None)
+        .map_err(|error| environment_failure(error.to_string()))?
+        .into_iter()
+        .filter(|r| r.worktree_fingerprint == fingerprint && r.phase.retains_worktree())
+        .filter_map(|r| super::infer::profile_rank(file, &r.profile).map(|rank| (r, rank)))
+        .collect())
+}
+
+/// The highest profile among this worktree's environments, when it already
+/// meets the inferred minimum.
+fn existing_at_or_above(
+    lifecycle: &Lifecycle,
+    worktree: &std::path::Path,
+    file: &super::spec::EnvironmentsFile,
+    inference: &super::infer::Inference,
+) -> Result<Option<String>, Failure> {
+    Ok(worktree_environments(lifecycle, worktree, file)?
+        .into_iter()
+        .filter(|(_, rank)| *rank >= inference.rank)
+        .max_by_key(|(_, rank)| *rank)
+        .map(|(record, _)| record.profile))
+}
+
+/// Retire this worktree's environments ranked below the inferred minimum,
+/// once the new one is up. A pinned or busy environment, or one mid
+/// transition, is kept and reported, never torn down under its user.
+pub(super) fn replace_below_minimum(
+    lifecycle: &mut Lifecycle,
+    worktree: &std::path::Path,
+    file: &super::spec::EnvironmentsFile,
+    inference: &super::infer::Inference,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let below = match worktree_environments(lifecycle, worktree, file) {
+        Ok(found) => found,
+        Err(failure) => {
+            return (Vec::new(), vec![("*".into(), failure.message)]);
+        }
+    };
+    let now = super::activity::now_ms();
+    let mut replaced = Vec::new();
+    let mut kept = Vec::new();
+    for (record, rank) in below {
+        if rank >= inference.rank {
+            continue;
+        }
+        let why = if record.pinned_until.is_some_and(|until| until > now) {
+            Some("pinned".to_string())
+        } else if super::activity::has_live_busy_marker(&lifecycle.root, &record.env_id) {
+            Some("busy (`env exec` running)".to_string())
+        } else if !matches!(
+            record.phase,
+            super::store::EnvironmentPhase::Active | super::store::EnvironmentPhase::Parked
+        ) {
+            Some(format!("{} (mid transition)", record.phase.as_str()))
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            kept.push((record.env_id, why));
+            continue;
+        }
+        match lifecycle.down(&record.env_id, None) {
+            Ok(_) => replaced.push(record.env_id),
+            Err(error) => kept.push((record.env_id, error.to_string())),
+        }
+    }
+    (replaced, kept)
+}
+
+pub(super) fn run_infer(options: &Options) -> Result<Output, Failure> {
+    let workspace = workspace(options)?;
+    let checked = check(&workspace)?;
+    let file = match (&checked.file, checked.diagnostics.is_empty()) {
+        (Some(file), true) => file,
+        _ => {
+            return Err(Failure {
+                code: "invalid_environments_file",
+                message: format!("{ENVIRONMENTS_FILE} has validation problems"),
+                next_action: "run `aethyme env validate` and fix every problem".into(),
+                exit: exit_status::VERIFICATION_FAILED,
+            });
+        }
+    };
+    if let Some(range) = &options.range {
+        let report = super::infer::infer_range(&workspace.worktree_root, file, range)
+            .map_err(environment_failure)?;
+        let mut text = format!("{} commit(s) in {range}\n", report.commits);
+        for (profile, count) in &report.profiles {
+            text.push_str(&format!(
+                "  {profile:<16} {count:>6}{}\n",
+                report
+                    .top_rule
+                    .get(profile)
+                    .map(|rule| format!("  (most often: {rule})"))
+                    .unwrap_or_default()
+            ));
+        }
+        return Ok((
+            json!({ "schema": super::cli::INFER_SCHEMA, "range": range, "report": report }),
+            text,
+            exit_status::SUCCESS,
+        ));
+    }
+    let (base, changed) =
+        super::infer::changed_paths(&workspace.worktree_root).map_err(environment_failure)?;
+    let inference = super::infer::infer(file, &changed).map_err(environment_failure)?;
+    let mut text = format!(
+        "minimum profile: {} ({} changed path(s))\n",
+        inference.minimum, inference.changed
+    );
+    for fired in &inference.fired {
+        text.push_str(&format!(
+            "  rule {} -> {}: {}\n",
+            fired.rule,
+            fired.min_profile,
+            fired.paths.join(", ")
+        ));
+    }
+    if !inference.unmatched.is_empty() {
+        text.push_str(&format!(
+            "  unmatched: {}\n",
+            inference.unmatched.join(", ")
+        ));
+    }
+    Ok((
+        json!({ "schema": super::cli::INFER_SCHEMA, "base": base, "inference": inference }),
+        text,
+        exit_status::SUCCESS,
+    ))
+}
+
+/// Bring up every shared environment `snapshot` uses and give each of its
+/// components that environment's `AETHYME_SHARED_*` variables.
+fn attach_shared(
+    lifecycle: &mut Lifecycle,
+    snapshot: &mut super::compile::CompiledEnvironment,
+    main_root: Option<&std::path::Path>,
+    host: &super::spec::HostEnvironmentsFile,
+    options: &Options,
+) -> Result<(), Failure> {
+    if snapshot.uses_shared.is_empty() {
+        return Ok(());
+    }
+    let main_root = main_root.ok_or_else(|| {
+        environment_failure("shared environments need the repository's main checkout".into())
+    })?;
+    let mut variables = Vec::new();
+    for name in snapshot.uses_shared.clone() {
+        let record = lifecycle
+            .shared_up(
+                main_root,
+                &snapshot.repository,
+                &name,
+                host,
+                Duration::from_secs(options.wait_seconds),
+            )
+            .map_err(lifecycle_failure)?;
+        variables.extend(super::shared::consumer_variables(
+            &lifecycle.root,
+            &name,
+            &record,
+        ));
+    }
+    for component in &mut snapshot.components {
+        for (key, value) in &variables {
+            component.env.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn run_shared(options: &Options) -> Result<Output, Failure> {
+    let usage = || Failure {
+        code: "usage",
+        message: "env shared needs up|redeploy|destroy <name>, or list".into(),
+        next_action: "run `aethyme env --help`".into(),
+        exit: exit_status::USAGE,
+    };
+    let action = options
+        .positional
+        .first()
+        .map(String::as_str)
+        .ok_or_else(usage)?;
+    let workspace = workspace(options)?;
+    let main_root = workspace
+        .repo
+        .main_root()
+        .map_err(|error| environment_failure(error.to_string()))?;
+    let repository = crate::gates::git_origin_fingerprint(&workspace.repo);
+    let (_, host) =
+        super::load_host_file().map_err(|error| environment_failure(error.to_string()))?;
+    let host = host.value.map_err(|d| environment_failure(d.render()))?;
+    let (mut lifecycle, warning) = open("env shared", action == "up" || action == "redeploy")?;
+    let wait = Duration::from_secs(options.wait_seconds);
+    let (value, text) = match (action, options.positional.get(1)) {
+        ("list", None) => {
+            let records: Vec<EnvironmentRecord> = lifecycle
+                .store
+                .list(Some(&repository))
+                .map_err(|error| environment_failure(error.to_string()))?
+                .into_iter()
+                .filter(|r| matches!(r.owner, super::compile::EnvironmentOwner::Ref { .. }))
+                .collect();
+            let mut text = String::new();
+            for record in &records {
+                text.push_str(&format!(
+                    "  {} {:?} {} at {}\n",
+                    record.env_id,
+                    record.owner,
+                    record.phase.as_str(),
+                    record.snapshot.source.commit.as_deref().unwrap_or("?")
+                ));
+            }
+            let shared: Vec<Value> = records
+                .iter()
+                .map(|r| {
+                    json!({
+                        "env_id": r.env_id,
+                        "owner": r.owner,
+                        "phase": r.phase,
+                        "deployed_commit": r.snapshot.source.commit,
+                    })
+                })
+                .collect();
+            (json!({ "shared": shared }), text)
+        }
+        ("up", Some(name)) => {
+            let record = lifecycle
+                .shared_up(&main_root, &repository, name, &host, wait)
+                .map_err(lifecycle_failure)?;
+            let (mut value, text) = describe(&lifecycle, &record);
+            value["deployed_commit"] = json!(record.snapshot.source.commit);
+            (value, text)
+        }
+        ("redeploy", Some(name)) => {
+            let outcome = lifecycle
+                .shared_redeploy(&main_root, &repository, name, &host, wait, options.force)
+                .map_err(lifecycle_failure)?;
+            let text = format!("{outcome:?}\n");
+            (json!({ "result": outcome }), text)
+        }
+        ("destroy", Some(name)) => {
+            let record = lifecycle
+                .shared_destroy(&main_root, &repository, name)
+                .map_err(lifecycle_failure)?;
+            describe(&lifecycle, &record)
+        }
+        _ => return Err(usage()),
+    };
+    let mut value = value;
+    value["schema"] = json!(super::cli::SHARED_SCHEMA);
+    if let Some(warning) = warning {
+        value["warning"] = json!(warning);
+    }
+    Ok((value, text, exit_status::SUCCESS))
+}
+
+pub(super) fn run_calibrate(options: &Options) -> Result<Output, Failure> {
+    let workspace = workspace(options)?;
+    let checked = check(&workspace)?;
+    let Some(file) = checked
+        .file
+        .as_ref()
+        .filter(|_| checked.diagnostics.is_empty())
+    else {
+        return Err(Failure {
+            code: "invalid_environments_file",
+            message: format!("{ENVIRONMENTS_FILE} has validation problems"),
+            next_action: "run `aethyme env validate` and fix every problem".into(),
+            exit: exit_status::VERIFICATION_FAILED,
+        });
+    };
+    let repository = crate::gates::git_origin_fingerprint(&workspace.repo);
+    let history = match EnvironmentStore::open_default_read_only()
+        .map_err(|error| environment_failure(error.to_string()))?
+    {
+        Some(store) => store
+            .footprints(&repository)
+            .map_err(|error| environment_failure(error.to_string()))?,
+        None => Default::default(),
+    };
+    let host_memory = super::metrics::host_memory_bytes()
+        .ok_or_else(|| environment_failure("cannot read this host's physical memory".into()))?;
+    let calibration = super::metrics::calibrate(
+        file,
+        &history,
+        host_memory,
+        super::metrics::engine_vm_bytes(),
+        options.ram_fraction,
+    )
+    .map_err(|message| Failure {
+        code: "insufficient_history",
+        message,
+        next_action:
+            "keep environments running under the supervisor (it samples every 60 s), then retry"
+                .into(),
+        exit: exit_status::REFUSED,
+    })?;
+    let original = std::fs::read_to_string(workspace.worktree_root.join(ENVIRONMENTS_FILE))
+        .map_err(|error| environment_failure(error.to_string()))?;
+    let diff = super::metrics::proposal_diff(&original, &calibration);
+    let mut text = format!(
+        "host memory {} MiB, budget {} MiB ({:.0}%{}), unit {} MiB\n",
+        calibration.host_memory_bytes >> 20,
+        calibration.budget_bytes >> 20,
+        calibration.ram_fraction * 100.0,
+        calibration
+            .engine_vm
+            .as_ref()
+            .map(|(engine, bytes)| format!(" minus {engine} VM {} MiB", bytes >> 20))
+            .unwrap_or_default(),
+        calibration.unit_bytes >> 20,
+    );
+    for profile in &calibration.profiles {
+        text.push_str(&format!(
+            "  {:<16} {:>4} samples  p95 {:>8}  units {}\n",
+            profile.profile,
+            profile.samples,
+            profile
+                .p95_bytes
+                .map(|b| format!("{} MiB", b >> 20))
+                .unwrap_or_else(|| "-".into()),
+            profile
+                .proposed_units
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| "-".into()),
+        ));
+    }
+    if !calibration.insufficient.is_empty() {
+        text.push_str(&format!(
+            "insufficient history (< {} samples): {}\n",
+            super::metrics::MIN_SAMPLES,
+            calibration.insufficient.join(", ")
+        ));
+    }
+    if let Some(withheld) = &calibration.withheld {
+        text.push_str(&format!("no units or limits proposed: {withheld}\n"));
+    }
+    text.push_str(&diff);
+    Ok((
+        json!({
+            "schema": super::cli::CALIBRATE_SCHEMA,
+            "calibration": calibration,
+            "diff": diff,
+        }),
+        text,
+        exit_status::SUCCESS,
+    ))
+}
+
+pub(super) fn run_cache(options: &Options) -> Result<Output, Failure> {
+    let (mut lifecycle, _) = open("env cache", false)?;
+    match options.positional.first().map(String::as_str) {
+        Some("list") | None => {
+            let entries = lifecycle.cache_entries();
+            let mut text = String::new();
+            for entry in &entries {
+                text.push_str(&format!(
+                    "  {:<8} {:<16} {} {:>10} bytes{}\n",
+                    entry.kind,
+                    entry.component,
+                    entry.digest,
+                    entry.bytes,
+                    if entry.in_use { "  (in use)" } else { "" }
+                ));
+            }
+            if entries.is_empty() {
+                text.push_str("cache is empty\n");
+            }
+            Ok((
+                json!({ "schema": super::cli::CACHE_SCHEMA, "entries": entries }),
+                text,
+                exit_status::SUCCESS,
+            ))
+        }
+        Some("prune") => {
+            let report = lifecycle.prune_cache(options.all);
+            let mut text = format!("evicted {} entr(ies)\n", report.evicted.len());
+            if let Some(reason) = &report.refused {
+                text.push_str(&format!("nothing evicted: {reason}\n"));
+            }
+            for (path, reason) in &report.kept {
+                text.push_str(&format!("  kept {}: {reason}\n", path.display()));
+            }
+            Ok((
+                json!({ "schema": super::cli::CACHE_SCHEMA, "prune": report }),
+                text,
+                exit_status::SUCCESS,
+            ))
+        }
+        Some(other) => Err(Failure {
+            code: "usage",
+            message: format!("unknown env cache action {other:?}"),
+            next_action: "use `env cache list` or `env cache prune [--all]`".into(),
+            exit: exit_status::USAGE,
+        }),
+    }
+}
+
 pub(super) fn run_sweep(_: &Options) -> Result<Output, Failure> {
     let (mut lifecycle, _) = open("env sweep", false)?;
     lifecycle.renew_leases().map_err(lifecycle_failure)?;
@@ -476,6 +1002,39 @@ pub(super) fn run_sweep(_: &Options) -> Result<Output, Failure> {
     ))
 }
 
+/// Redeploy shared environments whose ref moved, once per repository that
+/// has any.
+fn sync_shared_environments(lifecycle: &mut Lifecycle) {
+    let Ok(records) = lifecycle.store.list(None) else {
+        return;
+    };
+    let mut repositories: Vec<(String, std::path::PathBuf)> = records
+        .iter()
+        .filter(|r| matches!(r.owner, super::compile::EnvironmentOwner::Ref { .. }))
+        .filter_map(|r| {
+            r.main_root
+                .clone()
+                .map(|root| (r.repository.clone(), root.into()))
+        })
+        .collect();
+    repositories.sort();
+    repositories.dedup();
+    let host = super::load_host_file()
+        .ok()
+        .and_then(|(_, loaded)| loaded.value.ok())
+        .unwrap_or_default();
+    for (repository, main_root) in repositories {
+        match lifecycle.sync_shared(&main_root, &repository, &host) {
+            Ok(actions) => {
+                for action in actions {
+                    eprintln!("aethyme env supervisor: {action}");
+                }
+            }
+            Err(error) => crate::warn_unrecorded("sync shared environments", Err::<(), _>(error)),
+        }
+    }
+}
+
 /// Supervisor work for the lifecycle: renew leases, sweep orphans, and stay
 /// up while anything needs supervision.
 pub struct LifecycleWork {
@@ -483,6 +1042,8 @@ pub struct LifecycleWork {
     /// The proxy starts on the first tick, i.e. only in the supervisor that
     /// won the singleton lock.
     pub proxy_started: bool,
+    /// When the last resource sample was taken (#1218).
+    pub last_sample: Option<std::time::Instant>,
 }
 
 /// Start the wake-on-request proxy on loopback in this (supervisor)
@@ -541,6 +1102,17 @@ impl super::supervisor::SupervisorWork for LifecycleWork {
                 "park idle environments",
                 lifecycle.park_idle(super::activity::now_ms()),
             );
+            sync_shared_environments(&mut lifecycle);
+            if self
+                .last_sample
+                .is_none_or(|at| at.elapsed() >= super::metrics::SAMPLE_INTERVAL)
+            {
+                self.last_sample = Some(std::time::Instant::now());
+                crate::warn_unrecorded(
+                    "sample environment resources",
+                    lifecycle.sample_active(super::activity::now_ms()),
+                );
+            }
             // Live environments need renewal even when nothing is moving.
             let live = lifecycle
                 .store

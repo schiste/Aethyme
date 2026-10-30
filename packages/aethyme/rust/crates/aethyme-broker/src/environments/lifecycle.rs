@@ -33,12 +33,19 @@ use super::exec::{Bindings, DriverError, append_log};
 use super::logs::remove_environment_directory;
 use super::store::{EnvironmentPhase, EnvironmentRecord, EnvironmentStore, StoreError};
 use crate::managed_services::ManagedServicePhase;
-use crate::resources::{HostResourceCoordinator, HostResourceError, HostResourceGrant};
+use sha2::{Digest, Sha256};
+
+use crate::resources::{
+    HOST_RESOURCE_REQUEST_SCHEMA_VERSION, HostResourceCoordinator, HostResourceError,
+    HostResourceGrant, HostResourceKind, HostResourceRequest, HostResourceRequirement,
+};
 
 pub const RESERVATION_GRANT: &str = "reservation.grant.json";
 pub const CAPACITY_GRANT: &str = "capacity.grant.json";
 /// Destroy retries the supervisor makes before waiting for an operator.
 pub const MAX_DESTROY_RETRIES: usize = 5;
+/// Longest an [`Lifecycle::exclusive`] key is held before it lapses.
+pub const EXCLUSIVE_KEY_TTL_SECONDS: u64 = 1800;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LifecycleError {
@@ -156,6 +163,58 @@ pub(super) fn bindings_from(
 }
 
 impl Lifecycle {
+    /// Run `body` holding the exclusive host key `name`, released afterwards
+    /// whatever `body` returns. `None` when another holder kept the key past
+    /// `wait` (or the key could not be acquired), and `body` did not run.
+    pub(super) fn exclusive<T>(
+        &mut self,
+        repository: &str,
+        name: &str,
+        wait: Duration,
+        body: impl FnOnce(&mut Self) -> T,
+    ) -> Option<T> {
+        // Request ids are unique forever, and a repeated id is a replay of
+        // the same request: two threads asking in one millisecond must not
+        // share one, or both would be granted the key.
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let digest = format!("{:x}", Sha256::digest(name.as_bytes()));
+        let request = HostResourceRequest {
+            schema_version: HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+            request_id: format!(
+                "env-key:{}:{}:{}:{sequence}",
+                &digest[..24],
+                std::process::id(),
+                now_ms()
+            ),
+            repository: repository.to_string(),
+            worktree_fingerprint: "environment-key".into(),
+            run_id: format!("env-key-{}", &digest[..12]),
+            ttl_seconds: EXCLUSIVE_KEY_TTL_SECONDS,
+            holder_pid: Some(std::process::id()),
+            resources: vec![HostResourceRequirement {
+                key: "key".into(),
+                resource: HostResourceKind::ExclusiveKey {
+                    name: name.to_string(),
+                },
+            }],
+        };
+        let grant = self
+            .coordinator
+            .acquire_with_wait(&request, wait, |_| {})
+            .ok()?;
+        let result = body(self);
+        crate::warn_unrecorded(
+            "release an environment key",
+            self.coordinator.release(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token,
+            ),
+        );
+        Some(result)
+    }
+
     pub(super) fn operation_lock(
         &self,
         env_id: &str,
@@ -339,6 +398,8 @@ impl Lifecycle {
         };
         let capacity = match snapshot.capacity_request(self.holder_pid, instance) {
             Some(request) => {
+                // A full `park_lru` pool parks idle victims first (#1215).
+                self.make_room(&snapshot, now_ms())?;
                 let grant = self
                     .coordinator
                     .acquire_with_wait(&request, options.wait, |_| {})?;
@@ -366,6 +427,8 @@ impl Lifecycle {
         // receipt is replayed with an incremented attempt; hooks must be
         // idempotent and can see the replay.
         let mut provisioned: Vec<String> = Vec::new();
+        // Present (even empty) means prune can tell what this one uses.
+        self.record_cache_uses(&env_id, Vec::new());
         let mut receipts = bindings.receipts.clone();
         for component in &snapshot.components {
             let previous = self
@@ -403,18 +466,30 @@ impl Lifecycle {
                 None,
             )?;
             let attempt = if replay { 2 } else { 1 };
-            let current = Bindings {
+            let mut current = Bindings {
                 receipts: receipts.clone(),
                 ..bindings.clone()
             };
-            let ctx = self.context(&snapshot, component, &current, attempt);
             let driver = driver_for(component.runtime);
-            let outcome = (|| -> Result<Option<Value>, DriverError> {
-                if let Some(build) = &component.commands.build {
-                    ctx.hook("build", build)?;
+            // Template first (its id reaches provision), then the build from
+            // the cache when its inputs are unchanged (#1219).
+            let template = {
+                let ctx = self.context(&snapshot, component, &current, attempt);
+                self.ensure_template(&ctx)
+            };
+            let outcome = match template {
+                Err(error) => Err(error),
+                Ok(template) => {
+                    if let Some(id) = template {
+                        current.template_ids.insert(component.name.clone(), id);
+                    }
+                    let ctx = self.context(&snapshot, component, &current, attempt);
+                    match self.cached_build(&ctx) {
+                        Err(error) => Err(error),
+                        Ok(()) => driver.provision(&ctx),
+                    }
                 }
-                driver.provision(&ctx)
-            })();
+            };
             match outcome {
                 Ok(receipt) => {
                     if let Some(receipt) = &receipt {
@@ -441,7 +516,6 @@ impl Lifecycle {
                 }
             }
         }
-
         let record = self
             .store
             .get(&env_id)?
@@ -868,8 +942,18 @@ impl Lifecycle {
         &self,
         record: &EnvironmentRecord,
     ) -> Result<(PathBuf, Option<tempfile::TempDir>), String> {
+        // A shared environment runs from an Aethyme-made export, which has no
+        // Git metadata; its marker proves it is the export of the recorded
+        // commit (#1217).
+        if let (Some(root), Some(commit)) = (&record.worktree_root, &record.snapshot.source.commit)
+            && matches!(record.owner, super::compile::EnvironmentOwner::Ref { .. })
+            && super::shared::is_shared_export_of(&self.root, Path::new(root), commit)
+        {
+            return Ok((PathBuf::from(root), None));
+        }
         if let Some(root) = &record.worktree_root
             && Path::new(root).is_dir()
+            && !matches!(record.owner, super::compile::EnvironmentOwner::Ref { .. })
         {
             // A path can be reused after manual checkout removal. Never run
             // recorded hooks in a replacement repository at the same name.
@@ -979,7 +1063,7 @@ impl Lifecycle {
 
 /// Export `commit` from the repository at `main_root` into `into` without
 /// registering a worktree.
-fn export_commit(main_root: &Path, commit: &str, into: &Path) -> Result<(), String> {
+pub(super) fn export_commit(main_root: &Path, commit: &str, into: &Path) -> Result<(), String> {
     use std::process::{Command, Stdio};
     let mut archive = Command::new("git")
         .args(["archive", "--format=tar", commit])

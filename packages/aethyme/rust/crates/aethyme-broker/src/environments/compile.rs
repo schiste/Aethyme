@@ -123,6 +123,12 @@ pub struct CompiledPool {
     pub scope: PoolScope,
     pub limit: u32,
     pub preempt: Preempt,
+    #[serde(default = "default_min_active_seconds")]
+    pub min_active_seconds: u64,
+}
+
+fn default_min_active_seconds() -> u64 {
+    super::spec::DEFAULT_MIN_ACTIVE_SECONDS
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +159,8 @@ pub struct CompiledComponent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serve_dir: Option<String>,
     pub cache_inputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_output: Option<String>,
     pub cache_env: Vec<String>,
     pub template_inputs: Vec<String>,
 }
@@ -243,6 +251,7 @@ pub fn compile(
             scope: spec.scope,
             limit,
             preempt: spec.preempt,
+            min_active_seconds: spec.min_active_seconds,
         })
     } else {
         None
@@ -315,6 +324,7 @@ fn compile_component(file: &EnvironmentsFile, component: &ComponentSpec) -> Comp
         container_port: component.container_port,
         serve_dir: component.serve_dir.clone(),
         cache_inputs: component.cache_inputs.clone(),
+        build_output: component.build_output.clone(),
         cache_env: component.cache_env.clone(),
         template_inputs: component.template_inputs.clone(),
     }

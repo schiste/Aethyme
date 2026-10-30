@@ -1212,6 +1212,84 @@ impl BrokerStore {
         Ok(leases)
     }
 
+    /// Record exact-holder absence only if the binding is still current and
+    /// no gone event has already been recorded for it. The immediate
+    /// transaction makes the binding check and event append one conditional
+    /// write; zero busy timeout lets maintenance defer instead of waiting on
+    /// another writer.
+    pub(crate) fn record_session_holder_gone_for_binding(
+        &mut self,
+        session_id: i64,
+        binding_event_id: i64,
+        holder: &crate::session_holder::AgentProcess,
+    ) -> Result<bool, BrokerError> {
+        self.conn.busy_timeout(std::time::Duration::ZERO)?;
+        let result = (|| {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current_binding: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM events
+                     WHERE session_id = ?1 AND kind = 'session.holder_bound'
+                     ORDER BY id DESC LIMIT 1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if current_binding != Some(binding_event_id) {
+                tx.commit()?;
+                return Ok(false);
+            }
+            let latest_gone: Option<(i64, Option<String>)> = tx
+                .query_row(
+                    "SELECT id, payload_json FROM events
+                     WHERE session_id = ?1 AND kind = 'session.holder_gone'
+                     ORDER BY id DESC LIMIT 1",
+                    [session_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if latest_gone.is_some_and(|(id, payload)| {
+                id > binding_event_id
+                    && payload
+                        .as_deref()
+                        .and_then(|payload| {
+                            serde_json::from_str::<crate::session_holder::AgentProcess>(payload)
+                                .ok()
+                        })
+                        .is_some_and(|recorded| &recorded == holder)
+            }) {
+                tx.commit()?;
+                return Ok(false);
+            }
+            let payload_json = crate::events::session_holder_gone_payload(holder);
+            insert_event(
+                &tx,
+                now_ms(),
+                "session.holder_gone",
+                Some(session_id),
+                Some(&payload_json),
+            )?;
+            tx.commit()?;
+            Ok(true)
+        })();
+        let result = match result {
+            Err(BrokerError::Sqlite(error))
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                ) =>
+            {
+                Err(BrokerError::SessionRetirementDatabaseBusy)
+            }
+            result => result,
+        };
+        self.conn
+            .busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        result
+    }
+
     /// Resolve publication advisories only after their affected session no
     /// longer has a live lease overlapping the advisory paths. Acknowledged
     /// advisories still complete their lifecycle once the condition clears.

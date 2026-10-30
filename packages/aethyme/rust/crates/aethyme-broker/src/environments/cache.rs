@@ -1,0 +1,732 @@
+//! Content-addressed builds and provision templates (#1219).
+//!
+//! **Builds.** A component's `build` whose output is cacheable (`build_output`,
+//! or `serve_dir` for `static`) and that declares `cache_inputs` is keyed by
+//! an input digest: the component, its command, its `env`, the values of
+//! `pass_env` and `cache_env`, the content of every tracked or
+//! untracked-but-not-ignored file matching `cache_inputs` (globset, like
+//! rules; a deleted file, a symlink or a submodule counts by what it is), and
+//! the OS and architecture. A cached build runs with exactly those inputs:
+//! none of the environment's own bindings (`AETHYME_ENV_*` ports, namespace,
+//! receipts), which differ per worktree and would otherwise be baked into an
+//! output served to every other worktree. The output is stored once per
+//! (repository, component, digest) and shared by every worktree and clone; a
+//! hit is materialised with a copy-on-write clone where the filesystem
+//! supports it (`cp -c` on APFS, `--reflink=auto` on Linux). The output path
+//! must be a subdirectory of the worktree (validated): it is replaced on a
+//! hit.
+//!
+//! **Templates.** A component with `template`, `template_destroy` and
+//! `template_inputs` gets a template per digest of those inputs. Aethyme
+//! never clones databases; it guarantees the template for the digest exists
+//! before `provision` runs and passes `AETHYME_ENV_TEMPLATE_ID`. Templates
+//! live outside Aethyme (in a database server), so eviction runs the
+//! component's `template_destroy`, with the component's `env` and `pass_env`
+//! and the hook timeout, in the cache's own directory: it must not depend on
+//! a worktree, which may be long gone by then.
+//!
+//! **Coalescing and use.** Building, ensuring and evicting one digest all run
+//! under one exclusive host key (`aethyme-env-build|template:<repository>:
+//! <component>:<digest>`), so concurrent builders run it once and prune
+//! never evicts an entry while it is being made. An environment records each
+//! entry it uses under that key, before relying on it; prune keeps every
+//! entry a live environment uses, and when it cannot tell what a live
+//! environment uses, it evicts nothing.
+//!
+//! The cache lives in `<host state>/environments/cache/`, bounded by
+//! [`DEFAULT_CACHE_MAX_BYTES`] (`AETHYME_ENV_CACHE_MAX_BYTES`); `env cache
+//! prune` evicts least recently used entries no live environment uses. It is
+//! not yet charged to the host managed-storage ledger (`broker gc plan`).
+
+use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+
+use globset::{GlobBuilder, GlobSetBuilder};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use super::compile::CompiledComponent;
+use super::drivers::DriverContext;
+use super::exec::{DriverError, append_log, run_hook};
+use super::lifecycle::Lifecycle;
+use super::spec::Runtime;
+
+pub const CACHE_DIRECTORY: &str = "cache";
+pub const BUILDS: &str = "builds";
+pub const TEMPLATES: &str = "templates";
+pub const COMPLETE: &str = ".complete";
+/// The entry's exclusive key, so prune can take it before evicting.
+pub const KEY_FILE: &str = ".key";
+pub const OUTPUT: &str = "output";
+pub const USES_FILE: &str = "cache-uses.json";
+pub const MAX_BYTES_ENV: &str = "AETHYME_ENV_CACHE_MAX_BYTES";
+pub const DEFAULT_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub const TEMPLATE_ID_VARIABLE: &str = "AETHYME_ENV_TEMPLATE_ID";
+const COALESCE_WAIT: Duration = Duration::from_secs(1800);
+/// Prune never waits long for an entry someone is using right now.
+const PRUNE_WAIT: Duration = Duration::from_secs(2);
+
+fn io(what: &str) -> impl FnOnce(std::io::Error) -> DriverError + '_ {
+    move |source| DriverError::Io {
+        what: what.to_string(),
+        source,
+    }
+}
+
+fn short(digest: &str) -> &str {
+    &digest[..16.min(digest.len())]
+}
+
+fn repository_dir(repository: &str) -> String {
+    repository
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(48)
+        .collect()
+}
+
+/// Whether `path` names a subdirectory of the worktree: relative, non-empty,
+/// only normal components. `.`, `..` or an absolute path would make a cache
+/// hit replace the worktree itself, or something outside it.
+pub fn is_worktree_subdirectory(path: &str) -> bool {
+    let path = Path::new(path);
+    path.components().next().is_some()
+        && path.components().all(|c| matches!(c, Component::Normal(_)))
+}
+
+/// The directory a cacheable build writes, relative to the worktree.
+pub fn output_of(component: &CompiledComponent) -> Option<&str> {
+    component
+        .build_output
+        .as_deref()
+        .or(match component.runtime {
+            Runtime::Static => component.serve_dir.as_deref(),
+            _ => None,
+        })
+}
+
+/// Files under `worktree` matching `patterns`: tracked plus untracked files
+/// Git does not ignore, sorted.
+fn matching_files(worktree: &Path, patterns: &[String]) -> Result<Vec<String>, String> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(
+            GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
+                .map_err(|e| format!("{pattern:?}: {e}"))?,
+        );
+    }
+    let set = builder.build().map_err(|e| e.to_string())?;
+    let output = crate::git::git_command()
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .current_dir(worktree)
+        .output()
+        .map_err(|e| format!("git ls-files: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git ls-files: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut files: Vec<String> = output
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .filter(|p| set.is_match(p.as_str()))
+        .collect();
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+/// What one input path contributes: a file's content, a symlink's target, or
+/// what kind of thing it is. A tracked file deleted from the working tree is
+/// an input change, not an error.
+fn path_fingerprint(path: &Path) -> Result<Vec<u8>, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(b"deleted".to_vec());
+        }
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        return Ok(format!("link:{}", target.display()).into_bytes());
+    }
+    if metadata.is_dir() {
+        // A submodule gitlink or a directory matched by name.
+        return Ok(b"directory".to_vec());
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Sha256::digest(&bytes).to_vec())
+}
+
+/// The content digest of one cacheable step.
+pub fn input_digest(
+    worktree: &Path,
+    kind: &str,
+    component: &CompiledComponent,
+    command: &str,
+    patterns: &[String],
+) -> Result<String, String> {
+    let mut digest = Sha256::new();
+    let mut part = |bytes: &[u8]| {
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    };
+    for text in [
+        "aethyme-env-cache/v2",
+        kind,
+        &component.name,
+        command,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    ] {
+        part(text.as_bytes());
+    }
+    for path in matching_files(worktree, patterns)? {
+        part(path.as_bytes());
+        part(&path_fingerprint(&worktree.join(&path))?);
+    }
+    for (name, value) in &component.env {
+        part(format!("env:{name}={value}").as_bytes());
+    }
+    let mut passed: Vec<&String> = component
+        .pass_env
+        .iter()
+        .chain(&component.cache_env)
+        .collect();
+    passed.sort();
+    passed.dedup();
+    for name in passed {
+        let value = std::env::var(name).unwrap_or_default();
+        part(format!("host:{name}={value}").as_bytes());
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+/// Copy a directory tree, cloning copy-on-write where the filesystem can.
+pub fn materialize(source: &Path, destination: &Path) -> std::io::Result<()> {
+    if destination.exists() {
+        std::fs::remove_dir_all(destination)?;
+    }
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let clone = if cfg!(target_os = "macos") {
+        Command::new("cp")
+            .arg("-cR")
+            .arg(source)
+            .arg(destination)
+            .status()
+    } else {
+        Command::new("cp")
+            .arg("-R")
+            .arg("--reflink=auto")
+            .arg(source)
+            .arg(destination)
+            .status()
+    };
+    if clone.is_ok_and(|status| status.success()) {
+        return Ok(());
+    }
+    if destination.exists() {
+        std::fs::remove_dir_all(destination)?;
+    }
+    copy_tree(source, destination)
+}
+
+/// The portable fallback: symlinks are recreated, never followed.
+fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, &target)?;
+            #[cfg(not(unix))]
+            std::fs::copy(entry.path(), &target)?;
+        } else if kind.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+fn directory_bytes(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => directory_bytes(&entry.path()),
+            _ => entry.metadata().map(|m| m.len()).unwrap_or(0),
+        })
+        .sum()
+}
+
+/// What one template entry needs to be evicted later, without the worktree
+/// that created it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemplateMarker {
+    pub template_id: String,
+    pub template_destroy: String,
+    /// The component's `env`, given to `template_destroy` as to `template`.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Host variables passed through, by name (values are read at eviction).
+    #[serde(default)]
+    pub pass_env: Vec<String>,
+    /// The exclusive key the template was made under.
+    pub key: String,
+    pub created_at: i64,
+}
+
+/// Cache entries a live environment depends on, recorded under each entry's
+/// key as it is ensured.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheUses {
+    pub entries: Vec<PathBuf>,
+}
+
+impl Lifecycle {
+    pub fn cache_root(&self) -> PathBuf {
+        self.root.join(CACHE_DIRECTORY)
+    }
+
+    /// Run `body` holding the cache key, failing if another holder keeps it
+    /// past `COALESCE_WAIT`.
+    fn coalesce<T>(
+        &mut self,
+        repository: &str,
+        key: &str,
+        body: impl FnOnce(&mut Self) -> Result<T, DriverError>,
+    ) -> Result<T, DriverError> {
+        self.exclusive(repository, key, COALESCE_WAIT, body)
+            .unwrap_or_else(|| {
+                Err(DriverError::Engine(format!(
+                    "cache key {key} is held by another process"
+                )))
+            })
+    }
+
+    /// Build a component, reusing the cached output for its input digest.
+    pub(super) fn cached_build(&mut self, ctx: &DriverContext<'_>) -> Result<(), DriverError> {
+        let component = ctx.component;
+        let Some(command) = component.commands.build.clone() else {
+            return Ok(());
+        };
+        let Some(output) = output_of(component).filter(|_| !component.cache_inputs.is_empty())
+        else {
+            ctx.hook("build", &command)?;
+            return Ok(());
+        };
+        if !is_worktree_subdirectory(output) {
+            return Err(DriverError::Unsupported(format!(
+                "{}: build output {output:?} must be a subdirectory of the worktree",
+                component.name
+            )));
+        }
+        let worktree = ctx.bindings.worktree.clone();
+        let digest = input_digest(
+            &worktree,
+            "build",
+            component,
+            &command,
+            &component.cache_inputs,
+        )
+        .map_err(DriverError::Unsupported)?;
+        let repository = ctx.environment.repository.clone();
+        let env_id = ctx.environment.env_id.clone();
+        let entry = self
+            .cache_root()
+            .join(BUILDS)
+            .join(repository_dir(&repository))
+            .join(&component.name)
+            .join(short(&digest));
+        let key = format!("aethyme-env-build:{repository}:{}:{digest}", component.name);
+        let log = ctx.log();
+        let target = worktree.join(output);
+        self.coalesce(&repository, &key, |this| {
+            this.add_cache_use(&env_id, &entry)?;
+            if entry.join(COMPLETE).exists() {
+                materialize(&entry.join(OUTPUT), &target)
+                    .map_err(io("materialize a cached build"))?;
+                crate::warn_unrecorded(
+                    "record cache use",
+                    std::fs::write(entry.join(COMPLETE), b""),
+                );
+                append_log(
+                    &log,
+                    &format!(
+                        "[aethyme] {}: build cache hit {}\n",
+                        component.name,
+                        short(&digest)
+                    ),
+                );
+                return Ok(());
+            }
+            // Only the declared inputs: no per-environment bindings.
+            run_hook(
+                &format!("{}: build", component.name),
+                &command,
+                &worktree,
+                &component.pass_env,
+                &component.env,
+                &log,
+                ctx.hook_timeout,
+            )?;
+            if !target.is_dir() {
+                return Err(DriverError::Unsupported(format!(
+                    "{}: build did not produce {output}",
+                    component.name
+                )));
+            }
+            let staging = entry.with_extension("staging");
+            if staging.exists() {
+                std::fs::remove_dir_all(&staging).map_err(io("clear build staging"))?;
+            }
+            materialize(&target, &staging.join(OUTPUT)).map_err(io("store a build"))?;
+            std::fs::write(staging.join(KEY_FILE), &key).map_err(io("record a build key"))?;
+            std::fs::write(staging.join(COMPLETE), b"").map_err(io("mark a build complete"))?;
+            if entry.exists() {
+                std::fs::remove_dir_all(&entry).map_err(io("replace an incomplete build"))?;
+            }
+            std::fs::rename(&staging, &entry).map_err(io("publish a build"))?;
+            append_log(
+                &log,
+                &format!(
+                    "[aethyme] {}: build cached {}\n",
+                    component.name,
+                    short(&digest)
+                ),
+            );
+            Ok(())
+        })
+    }
+
+    /// Make sure the component's template for its current input digest
+    /// exists. Returns the template id for `AETHYME_ENV_TEMPLATE_ID`.
+    pub(super) fn ensure_template(
+        &mut self,
+        ctx: &DriverContext<'_>,
+    ) -> Result<Option<String>, DriverError> {
+        let component = ctx.component;
+        let (Some(command), Some(destroy)) = (
+            component.commands.template.clone(),
+            component.commands.template_destroy.clone(),
+        ) else {
+            return Ok(None);
+        };
+        let worktree = ctx.bindings.worktree.clone();
+        let digest = input_digest(
+            &worktree,
+            "template",
+            component,
+            &command,
+            &component.template_inputs,
+        )
+        .map_err(DriverError::Unsupported)?;
+        let id = short(&digest).to_string();
+        let repository = ctx.environment.repository.clone();
+        let env_id = ctx.environment.env_id.clone();
+        let marker = self
+            .cache_root()
+            .join(TEMPLATES)
+            .join(repository_dir(&repository))
+            .join(&component.name)
+            .join(format!("{id}.json"));
+        let key = format!(
+            "aethyme-env-template:{repository}:{}:{digest}",
+            component.name
+        );
+        self.coalesce(&repository, &key, |this| {
+            this.add_cache_use(&env_id, &marker)?;
+            if marker.exists() {
+                return Ok(());
+            }
+            let mut vars = ctx.vars();
+            vars.insert(TEMPLATE_ID_VARIABLE.into(), id.clone());
+            run_hook(
+                &format!("{}: template", component.name),
+                &command,
+                &worktree,
+                &component.pass_env,
+                &vars,
+                &ctx.log(),
+                ctx.hook_timeout,
+            )?;
+            if let Some(parent) = marker.parent() {
+                std::fs::create_dir_all(parent).map_err(io("create the template index"))?;
+            }
+            let record = TemplateMarker {
+                template_id: id.clone(),
+                template_destroy: destroy.clone(),
+                env: component.env.clone(),
+                pass_env: component.pass_env.clone(),
+                key: key.clone(),
+                created_at: super::activity::now_ms(),
+            };
+            let bytes = serde_json::to_vec(&record)
+                .map_err(std::io::Error::other)
+                .map_err(io("encode a template marker"))?;
+            std::fs::write(&marker, bytes).map_err(io("record a template"))?;
+            Ok(())
+        })?;
+        Ok(Some(id))
+    }
+
+    /// Start an environment's use record empty: present means "known".
+    pub(super) fn record_cache_uses(&self, env_id: &str, entries: Vec<PathBuf>) {
+        crate::warn_unrecorded(
+            "record cache uses",
+            self.write_cache_uses(env_id, &CacheUses { entries }),
+        );
+    }
+
+    fn write_cache_uses(&self, env_id: &str, uses: &CacheUses) -> std::io::Result<()> {
+        let directory = super::logs::environment_directory(&self.root, env_id)
+            .ok_or_else(|| std::io::Error::other("not an environment id"))?;
+        std::fs::create_dir_all(&directory)?;
+        let bytes = serde_json::to_vec(uses).map_err(std::io::Error::other)?;
+        std::fs::write(directory.join(USES_FILE), bytes)
+    }
+
+    /// Record a use before relying on the entry. A failure fails the step:
+    /// an unrecorded use is one prune could evict.
+    fn add_cache_use(&self, env_id: &str, entry: &Path) -> Result<(), DriverError> {
+        let mut uses = super::logs::environment_directory(&self.root, env_id)
+            .and_then(|d| std::fs::read(d.join(USES_FILE)).ok())
+            .and_then(|bytes| serde_json::from_slice::<CacheUses>(&bytes).ok())
+            .unwrap_or_default();
+        if !uses.entries.iter().any(|e| e == entry) {
+            uses.entries.push(entry.to_path_buf());
+        }
+        self.write_cache_uses(env_id, &uses)
+            .map_err(io("record a cache use"))
+    }
+
+    /// Every entry a live environment uses. Fails closed: when the store
+    /// cannot be read, or a live environment with cacheable components has
+    /// no readable use record, nobody can say what is safe to evict.
+    fn entries_in_use(&self) -> Result<Vec<PathBuf>, String> {
+        let records = self.store.list(None).map_err(|e| e.to_string())?;
+        let mut entries = Vec::new();
+        for record in records.iter().filter(|r| r.phase.retains_worktree()) {
+            let caches = record.snapshot.components.iter().any(|c| {
+                c.commands.template.is_some()
+                    || (c.commands.build.is_some() && !c.cache_inputs.is_empty())
+            });
+            let uses = super::logs::environment_directory(&self.root, &record.env_id)
+                .and_then(|d| std::fs::read(d.join(USES_FILE)).ok())
+                .and_then(|bytes| serde_json::from_slice::<CacheUses>(&bytes).ok());
+            match uses {
+                Some(uses) => entries.extend(uses.entries),
+                None if caches => {
+                    return Err(format!(
+                        "cannot tell which cache entries {} uses",
+                        record.env_id
+                    ));
+                }
+                None => {}
+            }
+        }
+        Ok(entries)
+    }
+
+    pub fn cache_entries(&self) -> Vec<CacheEntry> {
+        let in_use = self.entries_in_use().unwrap_or_default();
+        let mut entries = Vec::new();
+        let builds = self.cache_root().join(BUILDS);
+        for repository in read_dirs(&builds) {
+            for component in read_dirs(&repository) {
+                for entry in read_dirs(&component) {
+                    let last_used = std::fs::metadata(entry.join(COMPLETE))
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as i64);
+                    entries.push(CacheEntry {
+                        kind: "build",
+                        component: file_name(&component),
+                        digest: file_name(&entry),
+                        bytes: directory_bytes(&entry),
+                        last_used,
+                        in_use: in_use.contains(&entry),
+                        key: std::fs::read_to_string(entry.join(KEY_FILE)).ok(),
+                        path: entry,
+                    });
+                }
+            }
+        }
+        let templates = self.cache_root().join(TEMPLATES);
+        for repository in read_dirs(&templates) {
+            for component in read_dirs(&repository) {
+                for marker in std::fs::read_dir(&component)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    let path = marker.path();
+                    let key = std::fs::read(&path)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<TemplateMarker>(&bytes).ok())
+                        .map(|m| m.key);
+                    entries.push(CacheEntry {
+                        kind: "template",
+                        component: file_name(&component),
+                        digest: path
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        bytes: 0,
+                        last_used: None,
+                        in_use: in_use.contains(&path),
+                        key,
+                        path,
+                    });
+                }
+            }
+        }
+        entries
+    }
+
+    /// Evict unused entries: every unused one with `all`, else least recently
+    /// used builds until the cache is within its byte budget. Each eviction
+    /// takes the entry's key and re-checks use under it. Templates are
+    /// evicted only through their `template_destroy`; one whose destroy fails
+    /// is kept and reported.
+    pub fn prune_cache(&mut self, all: bool) -> PruneReport {
+        let mut report = PruneReport::default();
+        if let Err(reason) = self.entries_in_use() {
+            report.refused = Some(reason);
+            return report;
+        }
+        let budget = std::env::var(MAX_BYTES_ENV)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_CACHE_MAX_BYTES);
+        let everything = self.cache_entries();
+        let mut total: u64 = everything.iter().map(|e| e.bytes).sum();
+        let mut candidates: Vec<CacheEntry> =
+            everything.into_iter().filter(|e| !e.in_use).collect();
+        candidates.sort_by_key(|e| e.last_used.unwrap_or(0));
+        let repository = "environment-cache".to_string();
+        for entry in candidates {
+            if !all && (entry.kind == "template" || total <= budget) {
+                continue;
+            }
+            let key = entry.key.clone().unwrap_or_else(|| {
+                let path = entry.path.to_string_lossy();
+                format!(
+                    "aethyme-env-cache-path:{:x}",
+                    Sha256::digest(path.as_bytes())
+                )
+            });
+            let outcome = self.exclusive(&repository, &key, PRUNE_WAIT, |this| {
+                match this.entries_in_use() {
+                    Ok(in_use) if in_use.contains(&entry.path) => {
+                        return Err("in use".to_string());
+                    }
+                    Ok(_) => {}
+                    Err(reason) => return Err(reason),
+                }
+                match entry.kind {
+                    "template" => this.evict_template(&entry.path),
+                    _ => std::fs::remove_dir_all(&entry.path).map_err(|e| e.to_string()),
+                }
+            });
+            match outcome {
+                Some(Ok(())) => {
+                    total = total.saturating_sub(entry.bytes);
+                    report.evicted.push(entry.path);
+                }
+                Some(Err(reason)) => report.kept.push((entry.path, reason)),
+                None => report
+                    .kept
+                    .push((entry.path, "being built or used right now".into())),
+            }
+        }
+        report
+    }
+
+    fn evict_template(&self, marker: &Path) -> Result<(), String> {
+        let record: TemplateMarker = std::fs::read(marker)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .ok_or("unreadable template marker")?;
+        let directory = marker
+            .parent()
+            .ok_or("template marker without a directory")?;
+        let mut vars = record.env.clone();
+        vars.insert(TEMPLATE_ID_VARIABLE.into(), record.template_id.clone());
+        run_hook(
+            "template_destroy",
+            &record.template_destroy,
+            directory,
+            &record.pass_env,
+            &vars,
+            &self.cache_root().join("prune.log"),
+            self.hook_timeout,
+        )
+        .map_err(|error| format!("template_destroy failed: {error}"))?;
+        std::fs::remove_file(marker).map_err(|e| e.to_string())
+    }
+}
+
+fn read_dirs(path: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p.extension().is_none_or(|e| e != "staging"))
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CacheEntry {
+    pub kind: &'static str,
+    pub component: String,
+    pub digest: String,
+    pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used: Option<i64>,
+    pub in_use: bool,
+    #[serde(skip)]
+    pub key: Option<String>,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PruneReport {
+    pub evicted: Vec<PathBuf>,
+    pub kept: Vec<(PathBuf, String)>,
+    /// Set when nothing was evicted because live use could not be known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+}

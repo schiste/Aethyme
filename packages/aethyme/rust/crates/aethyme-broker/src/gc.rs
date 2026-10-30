@@ -193,6 +193,10 @@ const AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE: Duration = Duration::from_secs(60);
 /// The detached worker gives an opt-in compact archive its own admission
 /// window. Foreground sweeps never archive checkout content.
 const AUTO_COMPACT_CHECKOUT_WORKER_RESERVE: Duration = Duration::from_secs(90);
+/// An archive may start with less than its nominal lane reservation, but it
+/// still needs the full cleanup helper minimum after fresh index work.
+const AUTO_COMPACT_CHECKOUT_WORKER_ADMISSION_MINIMUM: Duration =
+    crate::auto_cleanup::AUTO_COMPACTION_MIN_BUDGET;
 const AUTO_COMPACT_CHECKOUT_RETRY_MS: i64 = 10 * 60_000;
 const AUTO_COMPACT_BACKFILL_RETRY_MS: i64 = 60_000;
 const AUTO_COMPACT_CHECKOUT_BATCH_SIZE: usize = 8;
@@ -228,8 +232,20 @@ fn run_compact_checkout_candidates<T, E>(
     Ok(true)
 }
 
-fn compact_checkout_worker_has_admission_budget(remaining: Duration) -> bool {
-    remaining >= AUTO_COMPACT_CHECKOUT_WORKER_RESERVE
+fn compact_checkout_worker_pass_budget(
+    remaining: Duration,
+    checkout_cleanup_due: bool,
+) -> Option<Duration> {
+    // The 90-second reserve caps scheduling; admission needs only enough
+    // budget to preserve the full archive minimum after fresh index work.
+    let cleanup_reserve = if checkout_cleanup_due {
+        AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE
+    } else {
+        Duration::ZERO
+    };
+    let compact_lane_remaining = remaining.saturating_sub(cleanup_reserve);
+    (compact_lane_remaining >= AUTO_COMPACT_CHECKOUT_WORKER_ADMISSION_MINIMUM)
+        .then_some(compact_lane_remaining.min(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE))
 }
 
 fn compact_checkout_pending_is_due(
@@ -5280,12 +5296,12 @@ impl Broker {
         let policy = load_retention_policy(self.main_root())?;
         let (budget_ms, urgency) = self.artifact_sweep_budget(&policy, ArtifactSweepScope::Drain);
         let outcome = self.sweep_artifacts_autonomously(&policy, ArtifactSweepScope::Drain)?;
-        if self.auto_checkout_cleanup_recovery_requested()? {
-            crate::warn_unrecorded(
-                "start deferred automatic checkout cleanup worker",
-                self.maybe_start_artifact_sweep_worker(false),
-            );
-        }
+        // The launcher admits artifact, checkout-cleanup and compaction work.
+        // A compact-only backlog must not depend on a checkout-cleanup request.
+        crate::warn_unrecorded(
+            "start deferred artifact or checkout recovery worker",
+            self.maybe_start_artifact_sweep_worker(false),
+        );
         Ok(ArtifactSweepReport {
             directories_reclaimed: outcome.directories_reclaimed,
             complete: outcome.complete,
@@ -6024,12 +6040,53 @@ impl Broker {
         Ok(())
     }
 
+    /// Build the continuation command without changing which database it opens.
+    /// The private worker rejects test database overrides, so omit the pin only
+    /// after the child's real no-override resolver proves the same database.
+    pub(crate) fn artifact_sweep_worker_command(
+        &mut self,
+        router: &Path,
+        canonical_root: &Path,
+        gate_scope: Option<&std::ffi::OsStr>,
+    ) -> Result<Command, BrokerOpError> {
+        let child_database = crate::gate_database::resolve(canonical_root, None, gate_scope)
+            .map_err(|reason| BrokerOpError::InvalidStorageContext {
+                reason: reason.into(),
+            })?;
+        if self.store().db_path() != child_database {
+            return Err(BrokerOpError::InvalidStorageContext {
+                reason: "automatic recovery cannot omit a non-default broker database binding"
+                    .into(),
+            });
+        }
+        let mut command = Command::new(router);
+        command
+            .args(["broker", "gc", "__continue-artifacts"])
+            .arg(canonical_root)
+            .current_dir(canonical_root)
+            .env(ARTIFACT_SWEEP_WORKER_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        self.configure_storage_context_for_child(&mut command)?;
+        command.env_remove(crate::BROKER_DB_ENV);
+        // Pass the same scope snapshot used by the equality proof.
+        match gate_scope {
+            Some(scope) => command.env(crate::gate_database::SCOPE_ENV, scope),
+            None => command.env_remove(crate::gate_database::SCOPE_ENV),
+        };
+        Ok(command)
+    }
+
     /// Launch the installed router as a detached, request-scoped continuation.
     /// The OS advisory lock is the singleton; its file stays content-free.
     fn maybe_start_artifact_sweep_worker(
         &mut self,
         pressure_request: bool,
     ) -> Result<(), BrokerOpError> {
+        #[cfg(test)]
+        tests::ARTIFACT_WORKER_ADMISSION_ATTEMPTS
+            .with(|attempts| attempts.borrow_mut().push(pressure_request));
         self.reconcile_checkout_cleanup_outbox()?;
         let root = self.main_root().to_path_buf();
         if crate::host_state::path_is_ephemeral(&root) || artifact_worker_process_is_suppressed() {
@@ -6093,33 +6150,29 @@ impl Broker {
                 path: root.clone(),
                 source,
             })?;
-        let mut command = Command::new(&router);
-        command
-            .args(["broker", "gc", "__continue-artifacts"])
-            .arg(&canonical_root)
-            .current_dir(&canonical_root)
-            .env(ARTIFACT_SWEEP_WORKER_ENV, "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if self
-            .configure_storage_context_for_child(&mut command)
-            .is_err()
-        {
-            if artifact_due {
-                self.defer_artifact_sweep_worker("storage_context_unavailable")?;
+        let gate_scope = std::env::var_os(crate::gate_database::SCOPE_ENV);
+        let mut command = match self.artifact_sweep_worker_command(
+            &router,
+            &canonical_root,
+            gate_scope.as_deref(),
+        ) {
+            Ok(command) => command,
+            Err(_) => {
+                if artifact_due {
+                    self.defer_artifact_sweep_worker("storage_context_unavailable")?;
+                }
+                if checkout_cleanup_due {
+                    self.defer_auto_checkout_cleanup_worker("storage_context_unavailable")?;
+                }
+                if compact_due {
+                    self.defer_auto_compact_checkout_worker(
+                        "compact_checkout_storage_context_unavailable",
+                        AUTO_COMPACT_BACKFILL_RETRY_MS,
+                    )?;
+                }
+                return Ok(());
             }
-            if checkout_cleanup_due {
-                self.defer_auto_checkout_cleanup_worker("storage_context_unavailable")?;
-            }
-            if compact_due {
-                self.defer_auto_compact_checkout_worker(
-                    "compact_checkout_storage_context_unavailable",
-                    AUTO_COMPACT_BACKFILL_RETRY_MS,
-                )?;
-            }
-            return Ok(());
-        }
+        };
         configure_artifact_worker_process_group(&mut command);
         let _child = match command.spawn() {
             Ok(child) => child,
@@ -6252,16 +6305,19 @@ impl Broker {
             // the backfill marker and per-session due times here.
             let compact_pending = broker.compact_checkout_work_pending()?;
             let compact_due = compact_pending && broker.compact_checkout_work_due(now_ms())?;
+            let cleanup_pending_before_compact = if compact_due {
+                broker.auto_checkout_cleanup_recovery_requested()?
+            } else {
+                false
+            };
+            let cleanup_due_before_compact = cleanup_pending_before_compact
+                && !broker.auto_checkout_cleanup_retry_pending(now_ms())?;
             if compact_due {
                 let remaining =
                     ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(worker_started.elapsed());
-                if !compact_checkout_worker_has_admission_budget(remaining) {
-                    broker.defer_auto_compact_checkout_worker(
-                        "compact_checkout_worker_reserve_unavailable",
-                        AUTO_COMPACT_BACKFILL_RETRY_MS,
-                    )?;
-                } else {
-                    let pass_budget = remaining.min(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE);
+                if let Some(pass_budget) =
+                    compact_checkout_worker_pass_budget(remaining, cleanup_due_before_compact)
+                {
                     let deadline = Instant::now() + pass_budget;
                     if let Err(error) = broker.auto_compact_checkout_recovery_pass(deadline) {
                         if matches!(error, BrokerOpError::Store(_)) {
@@ -6272,6 +6328,11 @@ impl Broker {
                             AUTO_COMPACT_CHECKOUT_RETRY_MS,
                         )?;
                     }
+                } else {
+                    broker.defer_auto_compact_checkout_worker(
+                        "compact_checkout_worker_reserve_unavailable",
+                        AUTO_COMPACT_BACKFILL_RETRY_MS,
+                    )?;
                 }
             }
 
@@ -7294,8 +7355,13 @@ impl Broker {
             return Ok((
                 ArtifactSweepOutcome {
                     directories_reclaimed: 0,
+                    // An explicit sweep did not inspect the namespace and
+                    // must remain retryable while another GC owns its lock.
                     complete: closed_session_id.is_none()
-                        && scope != ArtifactSweepScope::AutomaticContinuation,
+                        && !matches!(
+                            scope,
+                            ArtifactSweepScope::AutomaticContinuation | ArtifactSweepScope::Drain
+                        ),
                     auto_cleanup: None,
                 },
                 0,
@@ -9293,6 +9359,10 @@ mod tests {
     }
 
     std::thread_local! {
+        // Observe the real launch boundary without bypassing test suppression
+        // or spawning detached processes in the test runner.
+        pub(super) static ARTIFACT_WORKER_ADMISSION_ATTEMPTS: RefCell<Vec<bool>> =
+            const { RefCell::new(Vec::new()) };
         static ARTIFACT_SWEEP_TEST_MUTATION_INTERRUPT: RefCell<Option<ArtifactSweepTestMutation>> =
             const { RefCell::new(None) };
     }
@@ -9603,12 +9673,50 @@ mod tests {
                     .saturating_add(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE)
             )
         );
-        assert!(!compact_checkout_worker_has_admission_budget(
-            AUTO_COMPACT_CHECKOUT_WORKER_RESERVE - Duration::from_millis(1)
-        ));
-        assert!(compact_checkout_worker_has_admission_budget(
-            AUTO_COMPACT_CHECKOUT_WORKER_RESERVE
-        ));
+        // Consume the full cache grant plus ordinary handoff time, then feed
+        // that remaining budget into the compact-lane admission decision.
+        let normal_handoff_overhead = Duration::from_secs(5);
+        let compact_only_cache_budget = artifact_worker_cache_lane_duration(false, true);
+        let compact_only_remaining = ARTIFACT_SWEEP_WORKER_MAX_DURATION
+            .saturating_sub(compact_only_cache_budget.saturating_add(normal_handoff_overhead));
+        assert_eq!(compact_only_cache_budget, Duration::from_secs(210));
+        assert_eq!(compact_only_remaining, Duration::from_secs(85));
+        assert_eq!(
+            compact_checkout_worker_pass_budget(compact_only_remaining, false),
+            Some(compact_only_remaining)
+        );
+        assert_eq!(
+            compact_checkout_worker_pass_budget(
+                AUTO_COMPACT_CHECKOUT_WORKER_ADMISSION_MINIMUM - Duration::from_nanos(1),
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            compact_checkout_worker_pass_budget(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE, false),
+            Some(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE)
+        );
+
+        let both_due_cache_budget = artifact_worker_cache_lane_duration(true, true);
+        let both_due_remaining = ARTIFACT_SWEEP_WORKER_MAX_DURATION
+            .saturating_sub(both_due_cache_budget.saturating_add(normal_handoff_overhead));
+        let both_due_compact_budget =
+            compact_checkout_worker_pass_budget(both_due_remaining, true).unwrap();
+        assert_eq!(both_due_cache_budget, Duration::from_secs(150));
+        assert_eq!(both_due_compact_budget, Duration::from_secs(85));
+        assert_eq!(
+            both_due_remaining.saturating_sub(both_due_compact_budget),
+            AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE
+        );
+        assert_eq!(
+            compact_checkout_worker_pass_budget(
+                AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE
+                    .saturating_add(AUTO_COMPACT_CHECKOUT_WORKER_ADMISSION_MINIMUM)
+                    .saturating_sub(Duration::from_nanos(1)),
+                true,
+            ),
+            None
+        );
         assert!(!compact_checkout_pending_is_due(
             true,
             Some(101),
@@ -9718,6 +9826,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn foreground_sweep_reaches_worker_admission_for_compact_only_backlog() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        let config = root.join(crate::retention::BROKER_CONFIG_RELPATH);
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "[retention]\ncompact_closed_worktrees = true\n").unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        assert!(broker.reconcile_compact_checkout_backfill().unwrap());
+        assert!(broker.compact_checkout_work_pending().unwrap());
+        assert!(!broker.auto_checkout_cleanup_recovery_requested().unwrap());
+
+        assert!(broker.compact_checkout_work_due(now_ms()).unwrap());
+        assert!(!broker.artifact_sweep_backlog_pending().unwrap());
+        ARTIFACT_WORKER_ADMISSION_ATTEMPTS.with(|attempts| attempts.borrow_mut().clear());
+        let report = broker.gc_sweep_artifacts().unwrap();
+
+        assert!(report.complete, "{report:?}");
+        assert!(!broker.artifact_sweep_backlog_pending().unwrap());
+        assert!(!broker.auto_checkout_cleanup_recovery_requested().unwrap());
+        assert!(broker.compact_checkout_work_pending().unwrap());
+        assert_eq!(
+            ARTIFACT_WORKER_ADMISSION_ATTEMPTS.with(|attempts| attempts.borrow().clone()),
+            vec![false],
+            "a compact-only backlog must reach the real worker admission boundary"
+        );
+    }
+
+    #[test]
+    fn explicit_sweep_reports_incomplete_until_gc_lock_is_released() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
+            .unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
+            .unwrap();
+
+        let held = GcLock::acquire(root).unwrap();
+        let report = broker.gc_sweep_artifacts().unwrap();
+        assert!(
+            !report.complete,
+            "lock contention skipped inspection: {report:?}"
+        );
+        assert_eq!(report.directories_reclaimed, 0);
+        assert!(report.auto_cleanup.is_none());
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("3"),
+            "a skipped pass must not acknowledge pending recovery"
+        );
+        drop(held);
+
+        let retry = broker.gc_sweep_artifacts().unwrap();
+        assert!(
+            retry.complete,
+            "the unlocked namespace can be inspected: {retry:?}"
+        );
     }
 
     #[test]
