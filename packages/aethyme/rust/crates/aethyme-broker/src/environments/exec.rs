@@ -14,6 +14,8 @@
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -175,6 +177,128 @@ pub fn command(
 #[derive(Debug, Clone, PartialEq)]
 pub struct HookOutcome {
     pub receipt: Option<Value>,
+}
+
+pub(crate) trait HookLog {
+    fn append(&mut self, text: &str) -> std::io::Result<()>;
+    fn tail(&mut self, lines: usize) -> std::io::Result<Vec<String>>;
+}
+
+impl HookLog for crate::resources::cache_gc_fs::CachePruneLog {
+    fn append(&mut self, text: &str) -> std::io::Result<()> {
+        crate::resources::cache_gc_fs::CachePruneLog::append(self, text)
+    }
+
+    fn tail(&mut self, lines: usize) -> std::io::Result<Vec<String>> {
+        crate::resources::cache_gc_fs::CachePruneLog::tail(self, lines)
+    }
+}
+
+/// Run a destructive cache hook from an already-pinned component directory,
+/// writing its diagnostics through the validated cache-log handle.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn run_hook_in_directory_fd(
+    label: &str,
+    text: &str,
+    directory_fd: libc::c_int,
+    pass_env: &[String],
+    vars: &BTreeMap<String, String>,
+    log: &mut dyn HookLog,
+    timeout: Duration,
+) -> Result<HookOutcome, DriverError> {
+    let mut command = Command::new("/bin/sh");
+    command.arg("-c").arg(text).env_clear();
+    for name in INHERITED_VARIABLES
+        .iter()
+        .copied()
+        .chain(pass_env.iter().map(String::as_str))
+    {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command.envs(vars);
+    // SAFETY: the child inherits `directory_fd` through pre-exec, and this
+    // closure performs only the async-signal-safe fchdir syscall before exec.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fchdir(directory_fd) < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+
+    let outcome = crate::bounded_output::output_limited_in_owned_group(
+        &mut command,
+        timeout,
+        HOOK_OUTPUT_LIMIT,
+    )
+    .map_err(io(format!("run {label}")))?;
+    let output = match outcome {
+        crate::bounded_output::LimitedOutput::Completed(output) => output,
+        crate::bounded_output::LimitedOutput::Deadline => {
+            crate::warn_unrecorded(
+                "append cache hook timeout to prune log",
+                log.append(&format!(
+                    "[aethyme] {label}: timed out after {}s\n",
+                    timeout.as_secs()
+                )),
+            );
+            return Err(DriverError::Timeout {
+                label: label.into(),
+                seconds: timeout.as_secs(),
+            });
+        }
+        crate::bounded_output::LimitedOutput::OutputLimit => {
+            crate::warn_unrecorded(
+                "append cache hook output-limit diagnostic to prune log",
+                log.append(&format!(
+                    "[aethyme] {label}: output exceeded {HOOK_OUTPUT_LIMIT} bytes\n"
+                )),
+            );
+            return Err(DriverError::HookFailed {
+                label: label.into(),
+                exit: "output limit".into(),
+                tail: String::new(),
+            });
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    log.append(&format!(
+        "[aethyme] {label}: {}\n{stdout}{stderr}",
+        output.status
+    ))
+    .map_err(io("append environment cache prune log"))?;
+    if !output.status.success() {
+        return Err(DriverError::HookFailed {
+            label: label.into(),
+            exit: output.status.to_string(),
+            tail: log.tail(20).unwrap_or_default().join("\n"),
+        });
+    }
+    let receipt = parse_receipt(&stdout).map_err(|reason| DriverError::InvalidReceipt {
+        label: label.into(),
+        reason,
+    })?;
+    Ok(HookOutcome { receipt })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn run_hook_in_directory_fd(
+    _label: &str,
+    _text: &str,
+    _directory_fd: libc::c_int,
+    _pass_env: &[String],
+    _vars: &BTreeMap<String, String>,
+    _log: &mut dyn HookLog,
+    _timeout: Duration,
+) -> Result<HookOutcome, DriverError> {
+    Err(DriverError::Unsupported(
+        "safe cache hooks are supported only on macOS and Linux".into(),
+    ))
 }
 
 /// Run one hook to completion. Output is appended to `log`; a non-zero exit,
