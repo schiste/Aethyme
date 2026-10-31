@@ -519,7 +519,7 @@ fn a_pin_longer_than_the_host_cap_is_refused() {
     std::fs::create_dir(&host_settings).unwrap();
     let (code, unreadable) =
         fixture.json(&["env", "pin", "e-none", "--for", "60", "--reason", "demo"]);
-    assert_eq!(code, 1, "{unreadable}");
+    assert_eq!(code, 6, "{unreadable}");
     assert_eq!(
         unreadable["code"], "host_settings_unreadable",
         "{unreadable}"
