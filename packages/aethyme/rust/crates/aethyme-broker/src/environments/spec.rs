@@ -317,13 +317,21 @@ pub struct SharedSpec {
     pub stateful: bool,
 }
 
-/// Host-scoped settings: `<host state>/environments.toml`. Only host pool
-/// limits live here today.
+/// Host-scoped settings: `<host state>/environments.toml`: host pool limits
+/// and the keep-awake caps (#1293).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostEnvironmentsFile {
     #[serde(default)]
     pub pools: BTreeMap<String, HostPoolSpec>,
+    /// The longest `env pin --for` accepted (default and ceiling: 24 h).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_pin_seconds: Option<u64>,
+    /// How long a running `env exec` keeps an environment busy; past it the
+    /// command keeps running but no longer prevents idle parking. Unset:
+    /// for as long as the command runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_exec_busy_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
