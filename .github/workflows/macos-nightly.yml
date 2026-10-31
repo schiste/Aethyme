@@ -98,6 +98,11 @@ jobs:
           tool: cargo-nextest@0.9.146
 
       - name: Generate workspace coverage reports
+        # Bound llvm-profdata report-merge concurrency as a resource diagnostic.
+        # Keep every generated profile and the default merge failure policy; the
+        # cause of the prior SIGILL remains unconfirmed.
+        env:
+          LLVM_PROFDATA_FLAGS: "--num-threads=1"
         run: |
           mkdir -p coverage
           # Build the product binaries once under the same instrumentation
