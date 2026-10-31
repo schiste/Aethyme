@@ -928,6 +928,33 @@ fn validate_component(
             );
         }
     }
+    if component.entry_path.is_some()
+        && (!component.listen || matches!(component.runtime, Runtime::Static | Runtime::Hooks))
+    {
+        c.push(
+            "field_not_supported",
+            p,
+            n,
+            Some("entry_path"),
+            "entry_path requires a listening process, compose or container component",
+            "set entry_path on a component with listen = true, or remove it",
+        );
+    }
+    if let Some(entry_path) = component.entry_path.as_deref()
+        && (!entry_path.starts_with('/')
+            || entry_path
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || c == '#'))
+    {
+        c.push(
+            "invalid_path",
+            p,
+            n,
+            Some("entry_path"),
+            format!("entry_path {entry_path:?} must be a URL path starting with `/`"),
+            "use a path such as \"/o/\"",
+        );
+    }
     for (field, value) in [
         ("build_output", component.build_output.as_deref()),
         ("serve_dir", component.serve_dir.as_deref()),
