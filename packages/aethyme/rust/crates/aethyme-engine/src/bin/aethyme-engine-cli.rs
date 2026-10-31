@@ -915,6 +915,14 @@ fn daemon_serve_action(
     _fragment_mode: FragmentBuildMode,
     args: &[String],
 ) -> Result<(), String> {
+    let inherited_pin =
+        aethyme_engine::daemon::RuntimeBundlePin::take_inherited_from_environment()?;
+    let _runtime_pin = match inherited_pin {
+        Some(pin) => Some(pin),
+        None => aethyme_engine::daemon::RuntimeBundlePin::for_current_executable(
+            &aethyme_engine::daemon::runtime_build_identity(),
+        )?,
+    };
     let idle_timeout = parse_daemon_idle_timeout(args)?;
     let config = aethyme_engine::daemon::DaemonConfig::new(repo.to_path_buf())
         .with_idle_timeout(idle_timeout);
@@ -929,10 +937,22 @@ fn daemon_start_action(
     args: &[String],
 ) -> Result<(), String> {
     let self_path = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let runtime_pin = aethyme_engine::daemon::RuntimeBundlePin::for_current_executable(
+        &aethyme_engine::daemon::runtime_build_identity(),
+    )?;
+    let serve_exe = runtime_pin
+        .as_ref()
+        .map(aethyme_engine::daemon::RuntimeBundlePin::engine_path)
+        .unwrap_or(self_path);
     let opts = aethyme_engine::daemon::StartOptions {
         idle_timeout: read_option(args, "--idle-timeout").ok(),
     };
-    match aethyme_engine::daemon::start_detached(repo, &self_path, &opts)? {
+    match aethyme_engine::daemon::start_detached_with_runtime_pin(
+        repo,
+        &serve_exe,
+        &opts,
+        runtime_pin.as_ref(),
+    )? {
         aethyme_engine::daemon::StartOutcome::AlreadyRunning(pid) => {
             eprintln!("engine daemon already running (pid {pid})");
         }

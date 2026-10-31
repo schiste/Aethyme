@@ -4,6 +4,17 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.52] - 2026-10-31
+
+### Added
+
+- Explicit, digest-confirmed recovery of stale artifact-use markers for closed sessions, retaining ambiguous process or checkout identity evidence instead of forcing cleanup.
+
+### Fixed
+
+- Targeted archive-resolution cleanup resumes already-confirmed GC recovery without starting unrelated automatic cleanup during the command.
+- Cooperating managed routers, engine daemons and updaters pin the exact runtime bundle through daemon startup and pruning, and validate daemon protocol and full build identity. Older launchers and updaters do not participate in this protection; mixed-generation rollout still requires a reviewed transition.
+
 ## [0.8.51] - 2026-10-30
 
 ### Added

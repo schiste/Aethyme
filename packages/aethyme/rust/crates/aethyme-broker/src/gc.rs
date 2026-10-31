@@ -5270,7 +5270,7 @@ impl Broker {
         let journal_path = self.main_root().join(".aethyme/gc-journal.json");
         let resumed = match load_journal(&journal_path)? {
             Some(journal) => {
-                Some(self.gc_apply_bounded(&journal.digest, Some(policy.startup_budget_ms))?)
+                Some(self.apply_confirmed_gc_journal(journal, policy.startup_budget_ms)?)
             }
             None => None,
         };
@@ -5288,6 +5288,35 @@ impl Broker {
             self.maybe_start_artifact_sweep_worker(false),
         );
         Ok(resumed)
+    }
+
+    /// Resume a confirmed GC journal without probing preparation-cache debt,
+    /// sweeping artifacts, or admitting the detached maintenance worker.
+    /// Explicit cleanup resolve uses this open-time path because it must keep
+    /// normal writable-open recovery while avoiding unrelated cleanup work.
+    pub(crate) fn resume_confirmed_gc_journal_only(
+        &mut self,
+    ) -> Result<Option<GcApplyReport>, BrokerOpError> {
+        if std::env::var_os(ARTIFACT_SWEEP_WORKER_ENV).is_some() {
+            // Worker processes have their own scoped continuation lane and
+            // must not resume operator-authorized whole-repository journals.
+            return Ok(None);
+        }
+        let journal_path = self.main_root().join(".aethyme/gc-journal.json");
+        let Some(journal) = load_journal(&journal_path)? else {
+            return Ok(None);
+        };
+        let policy = load_retention_policy(self.main_root())?;
+        self.apply_confirmed_gc_journal(journal, policy.startup_budget_ms)
+            .map(Some)
+    }
+
+    fn apply_confirmed_gc_journal(
+        &mut self,
+        journal: GcJournal,
+        startup_budget_ms: u64,
+    ) -> Result<GcApplyReport, BrokerOpError> {
+        self.gc_apply_bounded(&journal.digest, Some(startup_budget_ms))
     }
 
     fn request_recovery_for_rotation_debt(&mut self) -> Result<(), BrokerOpError> {
@@ -13565,6 +13594,87 @@ mod tests {
             &policy,
             Path::new("/worktrees/agent-disposable")
         ));
+    }
+
+    fn repository_with_pending_gc_journal() -> (
+        tempfile::TempDir,
+        PathBuf,
+        crate::test_storage::TestStorage,
+        PathBuf,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nartifact_sweep_budget_ms = 0\nstartup_budget_ms = 5000\n",
+        )
+        .unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        // Fresh storage has no managed-worktree registry yet. Establish its
+        // root registration through the real lifecycle so the orphan inventory
+        // can finish before publishing a confirmed recovery journal.
+        let _binding_session = broker
+            .start_worktree("confirmed GC journal fixture", None)
+            .unwrap();
+        let plan = broker.gc_plan().unwrap();
+        assert_eq!(
+            plan.digest.len(),
+            64,
+            "fixture GC plan must be complete: {:?}",
+            plan.deferred_checks
+        );
+        let journal_path = root.join(".aethyme/gc-journal.json");
+        // Model a crash after a complete operator-reviewed plan was durably
+        // published, before its first apply step.
+        write_journal(&journal_path, &GcJournal::from(plan)).unwrap();
+        drop(broker);
+        (temporary, root, storage, journal_path)
+    }
+
+    #[test]
+    fn cleanup_resolve_open_resumes_a_confirmed_gc_journal_without_starting_maintenance() {
+        let (_temporary, root, storage, journal_path) = repository_with_pending_gc_journal();
+        ARTIFACT_WORKER_ADMISSION_ATTEMPTS.with(|attempts| attempts.borrow_mut().clear());
+
+        let _broker = Broker::open_for_cleanup_resolve_with_options(&root, storage.options())
+            .expect("cleanup resolve keeps the ordinary writable broker open");
+
+        assert!(
+            !journal_path.exists(),
+            "a confirmed GC journal must still resume during cleanup-resolve open"
+        );
+        assert_eq!(
+            ARTIFACT_WORKER_ADMISSION_ATTEMPTS.with(|attempts| attempts.borrow().clone()),
+            Vec::<bool>::new(),
+            "cleanup-resolve open must not admit the unrelated artifact-sweep worker"
+        );
+    }
+
+    #[test]
+    fn normal_open_still_resumes_confirmed_gc_journals_and_runs_startup_maintenance() {
+        let (_temporary, root, storage, journal_path) = repository_with_pending_gc_journal();
+        ARTIFACT_WORKER_ADMISSION_ATTEMPTS.with(|attempts| attempts.borrow_mut().clear());
+
+        let _broker = storage
+            .open(&root)
+            .expect("normal writable open retains its startup maintenance");
+
+        assert!(
+            !journal_path.exists(),
+            "normal open must continue resuming confirmed GC journals"
+        );
+        assert_eq!(
+            ARTIFACT_WORKER_ADMISSION_ATTEMPTS.with(|attempts| attempts.borrow().clone()),
+            vec![false],
+            "normal open must retain its artifact-sweep worker admission"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

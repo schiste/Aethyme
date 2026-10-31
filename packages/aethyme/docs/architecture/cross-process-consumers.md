@@ -1,6 +1,6 @@
 # Cross-process consumers of Aethyme entry points
 
-Last Updated: 2026-10-30
+Last Updated: 2026-10-31
 
 When code outside the `packages/aethyme/` Rust source tree invokes an
 Aethyme command, it crosses a process boundary. Static
@@ -60,6 +60,46 @@ support this protocol; unsupported targets retain the existing explicit cleanup
 contract while protocol-dependent unattended removal stays blocked. See
 [automatic checkout maintenance](../guides/automatic-checkout-maintenance.md)
 for rollout holds, policy restoration and the report field contract.
+
+## Managed daemon runtime identity and bundle pins (#1313)
+
+Managed daemon startup is a private matched-router/engine protocol. The router
+selects a versioned pair under `<managed_root>/versions/<bundle>` by exact full
+embedded version/revision/commit identity while holding the shared
+`<managed_root>/.update.lock`, then acquires a shared pin at
+`<managed_root>/runtime-pins/<bundle>.lock`. It passes that pinned descriptor
+to the daemon child on stdin with `AETHYME_ENGINE_RUNTIME_PIN_STDIN=1` and
+`AETHYME_ENGINE_RUNTIME_PIN_PATH=<exact pin path>`. Those private markers are
+claims only: the child validates the descriptor, exact path, executable pair
+and full build identity before serving, and keeps the pin open for the daemon's
+lifetime. Version probes clear both markers.
+
+The private line-delimited JSON identity request is `{"command":"identity"}`;
+its response must contain `ok: true`, `protocol_version: ENGINE_PROTOCOL_VERSION`
+(currently 1), and the exact `build_identity`. The socket key includes the
+canonical repository path, protocol version and full identity. The daemon
+pidfile name is derived from the full identity.
+Updaters retain current and previous bundles and skip a noncurrent bundle with
+a busy pin. Once all daemon descriptors close, a later updater removes the
+released pin and bundle.
+
+Installer cleanup uses `RuntimeBundlePin::try_acquire_exclusive_for_cleanup`
+for safe old directory components, including orphan and staging names. Its
+`None` outcome preserves an unrecognized directory without treating
+it as missing; malformed pin metadata remains an error. Non-UTF-8 names are
+also preserved. This cleanup-only path retains the existing private-path and
+file-lock checks. Candidate resolution, shared consumer pins and inherited
+daemon descriptors keep the strict versioned-bundle name validation.
+
+This protocol is cooperative: older updaters ignore pins, and pre-protocol
+daemons use legacy pid/socket names, so the new lifecycle cannot account for
+them. It does not establish safe mixed-generation rollout on a shared mutable
+runtime. For scheduled idle GC rollouts, provision a dedicated immutable managed
+installation prefix per repository. The service plan binds one generation, exact
+versioned router/engine paths, hashes and full build identity; changing that
+runtime requires deactivating and uninstalling the old generation, then
+reviewing, installing and activating a replacement plan. Do not point the
+service at a shared mutable global selector.
 
 ## Scheduled GC service
 
