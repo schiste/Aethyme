@@ -256,6 +256,20 @@ pub struct ComponentSpec {
     pub cache_env: Vec<String>,
     #[serde(default)]
     pub template_inputs: Vec<String>,
+    /// E21: requests to this routed component's host whose path starts with
+    /// `prefix` go to `to` instead (#1296).
+    #[serde(default)]
+    pub paths: Vec<PathRouteSpec>,
+}
+
+/// One per-path route (#1296): `to` is another routed component of the
+/// profile, `shared:<name>` for a shared environment the profile uses, or an
+/// `http://host[:port]` URL. The prefix is kept on the forwarded request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathRouteSpec {
+    pub prefix: String,
+    pub to: String,
 }
 
 impl ComponentSpec {
