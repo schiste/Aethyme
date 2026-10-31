@@ -13617,8 +13617,19 @@ mod tests {
 
         let storage = crate::test_storage::TestStorage::new();
         let mut broker = storage.open(&root).unwrap();
+        // Fresh storage has no managed-worktree registry yet. Establish its
+        // root registration through the real lifecycle so the orphan inventory
+        // can finish before publishing a confirmed recovery journal.
+        let _binding_session = broker
+            .start_worktree("confirmed GC journal fixture", None)
+            .unwrap();
         let plan = broker.gc_plan().unwrap();
-        assert_eq!(plan.digest.len(), 64, "fixture GC plan must be complete");
+        assert_eq!(
+            plan.digest.len(),
+            64,
+            "fixture GC plan must be complete: {:?}",
+            plan.deferred_checks
+        );
         let journal_path = root.join(".aethyme/gc-journal.json");
         // Model a crash after a complete operator-reviewed plan was durably
         // published, before its first apply step.
