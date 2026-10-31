@@ -53,7 +53,7 @@ use sha2::{Digest, Sha256};
 
 use super::compile::{CompileContext, CompiledEnvironment, EnvironmentOwner, compile};
 use super::lifecycle::{Lifecycle, LifecycleError, UpOptions, export_commit, now_ms};
-use super::spec::{EnvironmentsFile, HostEnvironmentsFile, SharedSpec};
+use super::spec::{EnvironmentsFile, HostEnvironmentsFile, RedeployOn, SharedSpec};
 use super::store::{EnvironmentPhase, EnvironmentRecord, StoreError};
 use super::{ENVIRONMENTS_FILE, parse_loaded};
 
@@ -158,6 +158,41 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Under an environment's directory: the latest revision a
+/// `redeploy_on = "inputs"` entry recorded without redeploying.
+pub const INPUTS_REVISION_FILE: &str = "inputs-revision";
+
+/// The digest a `redeploy_on = "inputs"` entry redeploys on (#1297): every
+/// file at `commit` matching `inputs`, plus the environments file itself (so
+/// a change to the profile or the entry always redeploys), by path, mode and
+/// blob id. Read from the commit's tree, so nothing is exported to decide.
+pub fn inputs_digest(main_root: &Path, commit: &str, inputs: &[String]) -> Result<String, String> {
+    let mut builder = globset::GlobSetBuilder::new();
+    for pattern in inputs {
+        builder.add(
+            globset::GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
+                .map_err(|e| format!("{pattern:?}: {e}"))?,
+        );
+    }
+    let set = builder.build().map_err(|e| e.to_string())?;
+    let listing = git(main_root, &["ls-tree", "-r", "--full-tree", commit])?;
+    let mut digest = Sha256::new();
+    for line in listing.lines() {
+        let Some((meta, path)) = line.split_once('\t') else {
+            continue;
+        };
+        if path == ENVIRONMENTS_FILE || set.is_match(path) {
+            digest.update(meta.as_bytes());
+            digest.update(b"\t");
+            digest.update(path.as_bytes());
+            digest.update(b"\n");
+        }
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 /// The commit a shared environment's `ref` names right now. Local refs only:
@@ -685,6 +720,35 @@ impl Lifecycle {
         // Both checks before exporting, so skipped revisions leave nothing
         // on disk.
         if current.snapshot.source.commit.as_deref() == Some(sha.as_str()) {
+            return Ok(Redeploy::Unchanged { commit: sha });
+        }
+        // Inputs unchanged: record the revision, restart nothing (#1297).
+        if spec.redeploy_on == RedeployOn::Inputs
+            && let Some(serving) = current.snapshot.source.commit.as_deref()
+            && inputs_digest(main_root, serving, &spec.inputs).map_err(io)?
+                == inputs_digest(main_root, &sha, &spec.inputs).map_err(io)?
+        {
+            let recorded = super::logs::environment_directory(&self.root, &env_id)
+                .map(|d| d.join(INPUTS_REVISION_FILE));
+            if recorded
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .as_deref()
+                != Some(sha.as_str())
+            {
+                if let Some(path) = &recorded {
+                    crate::warn_unrecorded(
+                        "record the shared revision",
+                        std::fs::write(path, &sha),
+                    );
+                }
+                self.store.note(
+                    &env_id,
+                    "revision recorded",
+                    &self.actor,
+                    Some(&json!({ "serving": serving, "revision": sha, "reason": "inputs unchanged" })),
+                )?;
+            }
             return Ok(Redeploy::Unchanged { commit: sha });
         }
         let interval = spec
@@ -1258,6 +1322,7 @@ fn proxied_url(root: &Path, record: &EnvironmentRecord, proxy_port: u16) -> Opti
 #[cfg(test)]
 mod operation_key_tests {
     use super::{SharedSpec, declared_spec_for_owner, shared_operation_key};
+    use crate::environments::spec::RedeployOn;
 
     #[test]
     fn shared_operation_key_is_stable_and_scoped_by_repository_and_name() {
@@ -1277,6 +1342,8 @@ mod operation_key_tests {
             idle_seconds: None,
             min_redeploy_interval_seconds: None,
             stateful: false,
+            redeploy_on: RedeployOn::Ref,
+            inputs: Vec::new(),
         }];
         assert!(declared_spec_for_owner(&declared, "baseline@refs/heads/feature#b").is_some());
         assert!(declared_spec_for_owner(&declared, "baseline@refs/heads/feature").is_some());
