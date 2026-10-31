@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 pub mod activity;
+pub mod budgets;
 pub mod cache;
 pub mod cli;
 pub mod compile;
@@ -44,6 +45,8 @@ pub mod validate;
 
 #[cfg(test)]
 mod activity_tests;
+#[cfg(test)]
+mod budgets_tests;
 #[cfg(test)]
 mod cache_tests;
 #[cfg(test)]

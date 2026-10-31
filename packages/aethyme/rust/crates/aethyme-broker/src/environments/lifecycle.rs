@@ -23,14 +23,15 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::compile::CompiledEnvironment;
+use super::compile::{CompiledComponent, CompiledEnvironment};
 use super::drivers::{ComponentIdentity, DriverContext, driver_for, wait_healthy};
 use super::exec::{Bindings, DriverError, append_log};
 use super::logs::remove_environment_directory;
+use super::spec::Runtime;
 use super::store::{EnvironmentPhase, EnvironmentRecord, EnvironmentStore, StoreError};
 use crate::managed_services::ManagedServicePhase;
 use sha2::{Digest, Sha256};
@@ -65,6 +66,16 @@ pub enum LifecycleError {
         "environment {env_id} was brought up from a different profile snapshot; pass --reconfigure to destroy and recreate it"
     )]
     ReconfigureRequired { env_id: String },
+    #[error(
+        "reconfiguring environment {env_id} would destroy the data of {}; pass --recreate <component> for each to confirm",
+        components.join(", ")
+    )]
+    RecreateRequired {
+        env_id: String,
+        components: Vec<String>,
+    },
+    #[error("environment {env_id} is {phase}; only an active environment restarts")]
+    NotActive { env_id: String, phase: &'static str },
     #[error("{0}")]
     Io(String),
 }
@@ -79,6 +90,8 @@ impl LifecycleError {
             Self::Driver(error) => error.code(),
             Self::WrongPhase { .. } => "wrong_phase",
             Self::ReconfigureRequired { .. } => "reconfigure_required",
+            Self::RecreateRequired { .. } => "recreate_required",
+            Self::NotActive { .. } => "not_active",
             Self::Io(_) => "io_error",
         }
     }
@@ -100,6 +113,87 @@ pub struct Lifecycle {
 pub struct UpOptions {
     pub wait: Duration,
     pub reconfigure: bool,
+    /// Components whose data a reconfigure may destroy (E20).
+    pub recreate: Vec<String>,
+}
+
+/// How a recompiled snapshot differs from the one an environment runs
+/// (E20), component by component.
+#[derive(Debug)]
+struct Reconfigure {
+    kept: Vec<String>,
+    changed: Vec<String>,
+    removed: Vec<String>,
+    added: Vec<String>,
+    /// Same namespace and port keys: the reservation lease still fits, so
+    /// the environment can be reconfigured in place.
+    same_reservation: bool,
+    /// Nothing but the component list differs.
+    same_environment: bool,
+}
+
+impl Reconfigure {
+    fn new(old: &CompiledEnvironment, new: &CompiledEnvironment) -> Self {
+        let in_new = |name: &str| new.components.iter().find(|c| c.name == name);
+        let (mut kept, mut changed, mut removed) = (Vec::new(), Vec::new(), Vec::new());
+        for component in &old.components {
+            match in_new(&component.name) {
+                Some(same) if same == component => kept.push(component.name.clone()),
+                Some(_) => changed.push(component.name.clone()),
+                None => removed.push(component.name.clone()),
+            }
+        }
+        let added = new
+            .components
+            .iter()
+            .filter(|c| !old.components.iter().any(|o| o.name == c.name))
+            .map(|c| c.name.clone())
+            .collect();
+        let reservation = |s: &CompiledEnvironment| {
+            let mut keys: Vec<String> = s
+                .reservation_request(None, 0)
+                .resources
+                .into_iter()
+                .map(|r| format!("{}={:?}", r.key, r.resource))
+                .collect();
+            keys.sort();
+            keys
+        };
+        let environment = |s: &CompiledEnvironment| CompiledEnvironment {
+            components: Vec::new(),
+            reserved_port_keys: Vec::new(),
+            digest: String::new(),
+            source: new.source.clone(),
+            ..s.clone()
+        };
+        Self {
+            kept,
+            changed,
+            removed,
+            added,
+            same_reservation: reservation(old) == reservation(new),
+            same_environment: environment(old) == environment(new),
+        }
+    }
+
+    /// Only components were added: nothing running is changed or lost, so
+    /// it needs no `--reconfigure`.
+    fn only_adds(&self) -> bool {
+        self.changed.is_empty()
+            && self.removed.is_empty()
+            && !self.added.is_empty()
+            && self.same_environment
+            && self.same_reservation
+    }
+}
+
+/// Whether recreating `component` loses data: it provisions something (a
+/// database, a template) or runs in a container engine, whose volumes go
+/// with it.
+fn holds_data(component: &CompiledComponent) -> bool {
+    component.commands.provision.is_some()
+        || component.commands.template.is_some()
+        || matches!(component.runtime, Runtime::Compose | Runtime::Container)
 }
 
 fn grant_path(root: &Path, env_id: &str, name: &str) -> PathBuf {
@@ -308,7 +402,55 @@ impl Lifecycle {
         options: &UpOptions,
     ) -> Result<EnvironmentRecord, LifecycleError> {
         let _operation = self.operation_lock(&snapshot.env_id)?;
-        self.up_locked(snapshot, worktree, main_root, session_id, options)
+        // A warm up starts what exists; a cold one provisions (#1239). An
+        // environment already up with this snapshot does nothing to time.
+        let metric = match self.store.get(&snapshot.env_id)? {
+            Some(r)
+                if r.phase == EnvironmentPhase::Active && r.profile_digest == snapshot.digest =>
+            {
+                None
+            }
+            Some(r)
+                if r.phase == EnvironmentPhase::Parked && r.profile_digest == snapshot.digest =>
+            {
+                Some(format!("up.{}", snapshot.profile))
+            }
+            _ => Some("up.cold".to_string()),
+        };
+        let started = Instant::now();
+        let result = self.up_locked(snapshot, worktree, main_root, session_id, options);
+        if let Some(metric) = metric {
+            self.record_timing(
+                &snapshot.repository,
+                &metric,
+                &snapshot.env_id,
+                started,
+                result.is_ok(),
+            );
+        }
+        result
+    }
+
+    /// Record how long a lifecycle step took (#1239). Never fails the step:
+    /// an unrecorded timing is a gap in a trend, not a broken environment.
+    pub(super) fn record_timing(
+        &mut self,
+        repository: &str,
+        metric: &str,
+        env_id: &str,
+        started: Instant,
+        ok: bool,
+    ) {
+        crate::warn_unrecorded(
+            "record an environment timing",
+            self.store.record_timing(
+                repository,
+                metric,
+                env_id,
+                started.elapsed().as_secs_f64(),
+                ok,
+            ),
+        );
     }
 
     fn up_locked(
@@ -319,18 +461,20 @@ impl Lifecycle {
         session_id: Option<i64>,
         options: &UpOptions,
     ) -> Result<EnvironmentRecord, LifecycleError> {
-        let mut record = self.store.register(snapshot, Some(worktree), session_id)?;
+        let record = self.store.register(snapshot, Some(worktree), session_id)?;
         if let Some(main_root) = main_root {
             self.store.set_main_root(&record.env_id, main_root)?;
         }
         if record.profile_digest != snapshot.digest {
-            if !options.reconfigure {
+            let plan = Reconfigure::new(&record.snapshot, snapshot);
+            if !options.reconfigure && !plan.only_adds() {
                 return Err(LifecycleError::ReconfigureRequired {
                     env_id: record.env_id,
                 });
             }
-            self.down_locked(&record.env_id, None)?;
-            record = self.store.register(snapshot, Some(worktree), session_id)?;
+            return self.reconfigure_locked(
+                record, snapshot, worktree, main_root, session_id, options, &plan,
+            );
         }
         if record.phase == EnvironmentPhase::Failed
             && (record.capacity_lease_id.is_some()
@@ -369,6 +513,124 @@ impl Lifecycle {
             }
         }
         self.bring_up(record, worktree, options)
+    }
+
+    /// Move a running or parked environment to `snapshot` (E20). With the
+    /// same reservation it is reconfigured in place: parked, its changed and
+    /// removed components destroyed, the snapshot swapped, added and changed
+    /// components provisioned, then woken; unchanged components keep their
+    /// provisioned data and receipts. Otherwise it is destroyed and
+    /// recreated. Either way, destroying a component that holds data needs
+    /// it named in `--recreate`.
+    #[allow(clippy::too_many_arguments)]
+    fn reconfigure_locked(
+        &mut self,
+        record: EnvironmentRecord,
+        snapshot: &CompiledEnvironment,
+        worktree: &Path,
+        main_root: Option<&Path>,
+        session_id: Option<i64>,
+        options: &UpOptions,
+        plan: &Reconfigure,
+    ) -> Result<EnvironmentRecord, LifecycleError> {
+        let env_id = record.env_id.clone();
+        let old = record.snapshot.clone();
+        let in_place = plan.same_reservation
+            && matches!(
+                record.phase,
+                EnvironmentPhase::Active | EnvironmentPhase::Parked
+            );
+        let destroyed: Vec<&CompiledComponent> = old
+            .components
+            .iter()
+            .filter(|c| {
+                !in_place || plan.changed.contains(&c.name) || plan.removed.contains(&c.name)
+            })
+            .collect();
+        // A planned environment never provisioned anything.
+        let unconfirmed: Vec<String> = destroyed
+            .iter()
+            .filter(|c| record.phase != EnvironmentPhase::Planned && holds_data(c))
+            .filter(|c| !options.recreate.contains(&c.name))
+            .map(|c| c.name.clone())
+            .collect();
+        if !unconfirmed.is_empty() {
+            return Err(LifecycleError::RecreateRequired {
+                env_id,
+                components: unconfirmed,
+            });
+        }
+        if !in_place {
+            self.down_locked(&env_id, None)?;
+            self.store.register(snapshot, Some(worktree), session_id)?;
+            let record = self.up_locked(snapshot, worktree, main_root, session_id, options)?;
+            self.store.note(
+                &env_id,
+                "reconfigured",
+                &self.actor,
+                Some(&json!({"strategy": "recreate"})),
+            )?;
+            return Ok(record);
+        }
+        if record.phase == EnvironmentPhase::Active {
+            self.park_locked(&env_id, "reconfigure")?;
+        }
+        let parked = self
+            .store
+            .get(&env_id)?
+            .ok_or_else(|| StoreError::NotFound(env_id.clone()))?;
+        let bindings = self.bindings_for(&parked)?;
+        let components = self.store.components(&env_id)?;
+        for component in destroyed.iter().rev() {
+            let identity: Option<ComponentIdentity> = components
+                .iter()
+                .find(|c| c.component == component.name)
+                .and_then(|c| c.identity.clone())
+                .and_then(|v| serde_json::from_value(v).ok());
+            let ctx = self.context(&old, component, &bindings, 1);
+            if let Err(error) = driver_for(component.runtime).destroy(&ctx, identity.as_ref()) {
+                let detail = json!({
+                    "code": error.code(),
+                    "component": component.name,
+                    "message": error.to_string(),
+                });
+                self.store.set_error(&env_id, Some(&detail))?;
+                return Err(error.into());
+            }
+            self.store.reset_component(&env_id, &component.name)?;
+        }
+        let swapped = self.store.replace_snapshot(&env_id, snapshot, worktree)?;
+        let bindings = self.bindings_for(&swapped)?;
+        let mut provisioned = Vec::new();
+        let mut receipts = bindings.receipts.clone();
+        if let Err(error) = self.provision_missing(
+            &env_id,
+            snapshot,
+            &bindings,
+            &mut provisioned,
+            &mut receipts,
+        )? {
+            let detail = json!({
+                "code": error.code(),
+                "message": error.to_string(),
+                "provisioned": provisioned,
+            });
+            self.store.set_error(&env_id, Some(&detail))?;
+            return Err(error.into());
+        }
+        self.store.note(
+            &env_id,
+            "reconfigured",
+            &self.actor,
+            Some(&json!({
+                "strategy": "in_place",
+                "kept": plan.kept,
+                "recreated": plan.changed,
+                "removed": plan.removed,
+                "added": plan.added,
+            })),
+        )?;
+        self.wake_locked(&env_id, options.wait)
     }
 
     fn bring_up(
@@ -430,91 +692,21 @@ impl Lifecycle {
         // Present (even empty) means prune can tell what this one uses.
         self.record_cache_uses(&env_id, Vec::new());
         let mut receipts = bindings.receipts.clone();
-        for component in &snapshot.components {
-            let previous = self
-                .store
-                .components(&env_id)?
-                .into_iter()
-                .find(|c| c.component == component.name);
-            // Provisioned already: created, or started at some point since.
-            if previous.as_ref().is_some_and(|c| {
-                matches!(
-                    c.phase,
-                    ManagedServicePhase::Created
-                        | ManagedServicePhase::StartPending
-                        | ManagedServicePhase::Running
-                        | ManagedServicePhase::RemovalPending
-                        | ManagedServicePhase::Removed
-                        | ManagedServicePhase::Settled
-                )
-            }) {
-                provisioned.push(component.name.clone());
-                continue;
-            }
-            let replay = previous
-                .as_ref()
-                .is_some_and(|c| c.phase == ManagedServicePhase::CreatePending);
-            self.component_to(
+        if let Err(error) = self.provision_missing(
+            &env_id,
+            &snapshot,
+            &bindings,
+            &mut provisioned,
+            &mut receipts,
+        )? {
+            return self.fail_provision(
                 &env_id,
-                &component.name,
-                &[
-                    ManagedServicePhase::AdmissionPending,
-                    ManagedServicePhase::Admitted,
-                    ManagedServicePhase::CreatePending,
-                ],
-                None,
-                None,
-            )?;
-            let attempt = if replay { 2 } else { 1 };
-            let mut current = Bindings {
-                receipts: receipts.clone(),
-                ..bindings.clone()
-            };
-            let driver = driver_for(component.runtime);
-            // Template first (its id reaches provision), then the build from
-            // the cache when its inputs are unchanged (#1219).
-            let template = {
-                let ctx = self.context(&snapshot, component, &current, attempt);
-                self.ensure_template(&ctx)
-            };
-            let outcome = match template {
-                Err(error) => Err(error),
-                Ok(template) => {
-                    if let Some(id) = template {
-                        current.template_ids.insert(component.name.clone(), id);
-                    }
-                    let ctx = self.context(&snapshot, component, &current, attempt);
-                    match self.cached_build(&ctx) {
-                        Err(error) => Err(error),
-                        Ok(()) => driver.provision(&ctx),
-                    }
-                }
-            };
-            match outcome {
-                Ok(receipt) => {
-                    if let Some(receipt) = &receipt {
-                        receipts.insert(component.name.clone(), receipt.clone());
-                    }
-                    self.component_to(
-                        &env_id,
-                        &component.name,
-                        &[ManagedServicePhase::Created],
-                        None,
-                        receipt.as_ref(),
-                    )?;
-                    provisioned.push(component.name.clone());
-                }
-                Err(error) => {
-                    return self.fail_provision(
-                        &env_id,
-                        &snapshot,
-                        worktree,
-                        &provisioned,
-                        &receipts,
-                        error,
-                    );
-                }
-            }
+                &snapshot,
+                worktree,
+                &provisioned,
+                &receipts,
+                error,
+            );
         }
         let record = self
             .store
@@ -530,7 +722,16 @@ impl Lifecycle {
             self.prepare_start(&env_id, &snapshot, &bindings, component)?;
             let ctx = self.context(&snapshot, component, &bindings, 1);
             let driver = driver_for(component.runtime);
-            let identity = match driver.start(&ctx) {
+            let start_started = Instant::now();
+            let start = driver.start(&ctx);
+            self.record_timing(
+                &snapshot.repository,
+                &format!("start.{}", component.name),
+                &env_id,
+                start_started,
+                start.is_ok(),
+            );
+            let identity = match start {
                 Ok(identity) => identity,
                 Err(error) => {
                     return self.fail_start(
@@ -553,7 +754,16 @@ impl Lifecycle {
                 None,
             )?;
             started.push((component.name.clone(), identity.clone()));
-            if let Err(error) = wait_healthy(driver.as_ref(), &ctx, &identity) {
+            let health_started = Instant::now();
+            let health = wait_healthy(driver.as_ref(), &ctx, &identity);
+            self.record_timing(
+                &snapshot.repository,
+                &format!("health.{}", component.name),
+                &env_id,
+                health_started,
+                health.is_ok(),
+            );
+            if let Err(error) = health {
                 return self.fail_start(
                     &record,
                     &snapshot,
@@ -568,6 +778,118 @@ impl Lifecycle {
         self.store.set_error(&env_id, None)?;
         self.store.record_activity(&env_id, now_ms())?;
         Ok(self.store.get(&env_id)?.unwrap_or(record))
+    }
+
+    /// Provision, in dependency order, every component of `snapshot` not
+    /// provisioned yet. A driver failure is returned for the caller to roll
+    /// back; `provisioned` and `receipts` say how far it got.
+    fn provision_missing(
+        &mut self,
+        env_id: &str,
+        snapshot: &CompiledEnvironment,
+        bindings: &Bindings,
+        provisioned: &mut Vec<String>,
+        receipts: &mut BTreeMap<String, Value>,
+    ) -> Result<Result<(), DriverError>, LifecycleError> {
+        for component in &snapshot.components {
+            let previous = self
+                .store
+                .components(env_id)?
+                .into_iter()
+                .find(|c| c.component == component.name);
+            // Provisioned already: created, or started at some point since.
+            if previous.as_ref().is_some_and(|c| {
+                matches!(
+                    c.phase,
+                    ManagedServicePhase::Created
+                        | ManagedServicePhase::StartPending
+                        | ManagedServicePhase::Running
+                        | ManagedServicePhase::RemovalPending
+                        | ManagedServicePhase::Removed
+                        | ManagedServicePhase::Settled
+                )
+            }) {
+                provisioned.push(component.name.clone());
+                continue;
+            }
+            let replay = previous
+                .as_ref()
+                .is_some_and(|c| c.phase == ManagedServicePhase::CreatePending);
+            self.component_to(
+                env_id,
+                &component.name,
+                &[
+                    ManagedServicePhase::AdmissionPending,
+                    ManagedServicePhase::Admitted,
+                    ManagedServicePhase::CreatePending,
+                ],
+                None,
+                None,
+            )?;
+            let attempt = if replay { 2 } else { 1 };
+            let mut current = Bindings {
+                receipts: receipts.clone(),
+                ..bindings.clone()
+            };
+            let driver = driver_for(component.runtime);
+            let provision_started = Instant::now();
+            // Template first (its id reaches provision), then the build from
+            // the cache when its inputs are unchanged (#1219).
+            let template = {
+                let ctx = self.context(snapshot, component, &current, attempt);
+                self.ensure_template(&ctx)
+            };
+            let outcome = match template {
+                Err(error) => Err(error),
+                Ok(template) => {
+                    if let Some(id) = template {
+                        current.template_ids.insert(component.name.clone(), id);
+                    }
+                    let ctx = self.context(snapshot, component, &current, attempt);
+                    match self.cached_build(&ctx) {
+                        Err(error) => Err(error),
+                        Ok(()) => driver.provision(&ctx),
+                    }
+                }
+            };
+            self.record_timing(
+                &snapshot.repository,
+                &format!("provision.{}", component.name),
+                env_id,
+                provision_started,
+                outcome.is_ok(),
+            );
+            match outcome {
+                Ok(receipt) => {
+                    if let Some(receipt) = &receipt {
+                        // Durations the hook measured itself (#1239).
+                        for (metric, seconds) in super::budgets::hook_metrics(receipt) {
+                            crate::warn_unrecorded(
+                                "record a hook-reported timing",
+                                self.store.record_timing(
+                                    &snapshot.repository,
+                                    &metric,
+                                    env_id,
+                                    seconds,
+                                    true,
+                                ),
+                            );
+                        }
+                        receipts.insert(component.name.clone(), receipt.clone());
+                    }
+                    self.component_to(
+                        env_id,
+                        &component.name,
+                        &[ManagedServicePhase::Created],
+                        None,
+                        receipt.as_ref(),
+                    )?;
+                    provisioned.push(component.name.clone());
+                }
+                Err(error) => return Ok(Err(error)),
+            }
+        }
+        Ok(Ok(()))
     }
 
     /// Bring a component's record to `start_pending` from wherever an earlier
@@ -800,7 +1122,19 @@ impl Lifecycle {
     ) -> Result<EnvironmentRecord, LifecycleError> {
         let record = self.store.resolve(env_id)?;
         let _operation = self.operation_lock(&record.env_id)?;
-        self.down_locked(&record.env_id, abandon)
+        let started = Instant::now();
+        let result = self.down_locked(&record.env_id, abandon);
+        // Only a real destroy is timed: an abandon skips the drivers.
+        if record.phase != EnvironmentPhase::Destroyed && abandon.is_none() {
+            self.record_timing(
+                &record.repository,
+                "down",
+                &record.env_id,
+                started,
+                result.is_ok(),
+            );
+        }
+        result
     }
 
     fn down_locked(

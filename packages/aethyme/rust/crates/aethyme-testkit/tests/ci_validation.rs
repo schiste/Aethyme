@@ -402,9 +402,22 @@ fn linux_nightly_publishes_workspace_coverage_without_a_threshold() {
     let job = block(&nightly, "  rust-coverage-linux:");
     let job_text = job.join("\n");
     assert!(job_text.contains("runs-on: ubuntu-latest"));
-    assert!(
-        job_text.contains("cargo llvm-cov --locked --workspace --html --output-dir coverage/html")
-    );
+    assert!(job_text.contains("tool: cargo-nextest@0.9.146"));
+    // The shared harness builds and shares instrumented product binaries.
+    // Clear old coverage before the harness; keep retries disabled here.
+    let mut remaining = job_text.as_str();
+    for command in [
+        "cargo llvm-cov show-env --sh",
+        "eval \"$coverage_environment\"",
+        "cargo llvm-cov clean --workspace",
+        "../scripts/test-like-ci.sh --full -- --retries 0",
+        "cargo llvm-cov report --html --output-dir coverage/html",
+    ] {
+        let offset = remaining
+            .find(command)
+            .unwrap_or_else(|| panic!("missing or out-of-order coverage command: {command}"));
+        remaining = &remaining[offset + command.len()..];
+    }
     assert!(job_text.contains("cargo llvm-cov report --lcov --output-path coverage/lcov.info"));
     assert!(job_text.contains("GITHUB_STEP_SUMMARY"));
     assert!(job_text.contains("workspace-total"));
@@ -563,6 +576,12 @@ fn contract_check_reads_the_same_sources_on_prs_and_on_main() {
     assert!(
         contract_cache.contains(&"          save-if: false"),
         "PR checks may restore the main cache but must not write shared compiler artifacts"
+    );
+    assert!(
+        pr_check.contains(
+            "if: github.event.action != 'edited' || github.event.changes.body || github.event.changes.base"
+        ),
+        "a retargeted PR is judged on a new diff, so a base change must rerun the check"
     );
     assert!(pr_check.contains("fetch-depth: 0"));
     assert!(pr_check.contains("ref: ${{ github.event.pull_request.head.sha }}"));

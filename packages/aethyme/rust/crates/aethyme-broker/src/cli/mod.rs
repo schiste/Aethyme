@@ -912,6 +912,14 @@ Usage:
       Forget the matching archive or its private interrupted staging files;
       retained project data is not removed. Archives are bounded to 32 files
       and 64 MiB total.
+  aethyme broker gc artifact-use reconcile plan <exact-session-id> [--json]
+      Review exact marker bytes, closed checkout aliases, registry identity
+      history and PID/start/group absence for one retained checkout.
+  aethyme broker gc artifact-use reconcile apply <exact-session-id> --confirm <sha256> [--json]
+      Remove only markers re-proven quiescent against the exact plan digest.
+      Uncertain processes and unmatched historical identities remain blocked;
+      stopped applies report removed, retained and unknown markers; this never
+      removes the checkout or its broker records.
   aethyme broker gc sweep [--json]
       Run the unattended build-artifact sweep now with its full budget
       (scaled up when disk is below the gate headroom), ignoring its daily
@@ -919,6 +927,19 @@ Usage:
       broker open spends at most 250 ms on the same sweep. Open-session caches
       require the reviewed gc reclaim path. Run again to continue a pass that
       paused at its budget.
+  aethyme broker gc service plan [--json]
+      Read-only macOS per-repository service plan for fixed `gc sweep --json`
+      ticks every 900 seconds. Binds the immutable managed router/engine pair.
+  aethyme broker gc service install --confirm <plan-sha256> [--json]
+      Install exact service files without loading launchd.
+  aethyme broker gc service status [--json]
+      Observe service scheduler state and the bounded last-pass receipt.
+  aethyme broker gc service activate --confirm <installed-plan-sha256> [--json]
+  aethyme broker gc service deactivate --confirm <installed-plan-sha256> [--json]
+      Load or unload the exact per-repository service. A changed runtime
+      requires a reviewed plan and service generation refresh.
+  aethyme broker gc service uninstall --confirm <installed-plan-sha256> [--json]
+      Remove exact installed service files only after successful deactivation.
   aethyme broker storage [--json]
   aethyme broker storage plan [--json]
   aethyme broker storage apply --confirm <sha256> [--json]

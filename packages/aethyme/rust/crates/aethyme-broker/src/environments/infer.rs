@@ -16,13 +16,13 @@
 //! stays within one path segment and `**` crosses directories, so
 //! `src/**/*.rs` matches `src/a/b.rs`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 
-use super::compile::default_profile_name;
+use super::compile::{CompiledEnvironment, default_profile_name};
 use super::spec::EnvironmentsFile;
 use super::validate::effective_rank;
 
@@ -72,6 +72,26 @@ fn rule_set(patterns: &[String]) -> Result<GlobSet, String> {
 }
 
 /// The minimum profile for `paths` under `file`'s rules.
+/// Optional components of `snapshot` that `paths` enable through their
+/// `enabled_by` globs (E20).
+pub fn enabled_components(
+    snapshot: &CompiledEnvironment,
+    paths: &[String],
+) -> Result<BTreeSet<String>, String> {
+    let mut enabled = BTreeSet::new();
+    for component in snapshot
+        .components
+        .iter()
+        .filter(|c| c.optional && !c.enabled_by.is_empty())
+    {
+        let set = rule_set(&component.enabled_by)?;
+        if paths.iter().any(|path| set.is_match(path.as_str())) {
+            enabled.insert(component.name.clone());
+        }
+    }
+    Ok(enabled)
+}
+
 pub fn infer(file: &EnvironmentsFile, paths: &[String]) -> Result<Inference, String> {
     let fallback = default_profile_name(file).ok_or("no profiles are declared")?;
     let mut minimum = (
@@ -275,4 +295,81 @@ pub fn infer_range(
         profiles,
         top_rule,
     })
+}
+
+/// A session's live environment ranked below the profile its changes now
+/// require (#1273), for `broker status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BelowMinimum {
+    pub session_id: i64,
+    pub env_id: String,
+    pub profile: String,
+    pub minimum: String,
+    /// `rule -> min_profile (paths)` for each rule that fired.
+    pub rules: Vec<String>,
+}
+
+/// Every live environment of `sessions` (id, worktree) ranked below the
+/// minimum its worktree's changes infer. Only sessions with a live
+/// environment are inferred, so the cost is one diff per such session.
+/// Best effort: a worktree whose environments file is missing or invalid, or
+/// whose diff cannot be read, is skipped (`env status` reports those).
+pub fn below_minimum(
+    store: &super::store::EnvironmentStore,
+    sessions: &[(i64, std::path::PathBuf)],
+) -> Vec<BelowMinimum> {
+    let Ok(records) = store.list(None) else {
+        return Vec::new();
+    };
+    let live: Vec<_> = records
+        .into_iter()
+        .filter(|r| r.phase.retains_worktree())
+        .filter(|r| matches!(r.owner, super::compile::EnvironmentOwner::Worktree { .. }))
+        .collect();
+    let mut found = Vec::new();
+    for (session_id, worktree) in sessions {
+        let fingerprint = crate::console::worktree_fingerprint(worktree);
+        let mine: Vec<_> = live
+            .iter()
+            .filter(|r| r.worktree_fingerprint == fingerprint)
+            .collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let Ok(Some(loaded)) = super::load_repository_file(worktree) else {
+            continue;
+        };
+        let Ok(file) = loaded.value else {
+            continue;
+        };
+        let Ok((_, changed)) = changed_paths(worktree) else {
+            continue;
+        };
+        let Ok(inference) = infer(&file, &changed) else {
+            continue;
+        };
+        // Each worktree is judged by its best environment: a cheaper one kept
+        // beside one that meets the minimum is not a problem to report.
+        let best = mine
+            .iter()
+            .filter_map(|r| profile_rank(&file, &r.profile).map(|rank| (rank, *r)))
+            .max_by_key(|(rank, _)| *rank);
+        let Some((rank, record)) = best else {
+            continue;
+        };
+        if rank < inference.rank {
+            found.push(BelowMinimum {
+                session_id: *session_id,
+                env_id: record.env_id.clone(),
+                profile: record.profile.clone(),
+                minimum: inference.minimum.clone(),
+                rules: inference
+                    .fired
+                    .iter()
+                    .map(|f| format!("{} -> {} ({})", f.rule, f.min_profile, f.paths.join(", ")))
+                    .collect(),
+            });
+        }
+    }
+    found
 }

@@ -141,6 +141,42 @@ impl CleanupStatusLimits {
             path_fields,
         }
     }
+
+    fn for_removal(
+        overall_deadline: Option<std::time::Instant>,
+        output_bytes: usize,
+        path_fields: usize,
+        has_archive: bool,
+    ) -> Self {
+        if !has_archive {
+            return Self::new(overall_deadline, output_bytes, path_fields);
+        }
+        Self {
+            deadline: archive_cleanup_deadline(
+                std::time::Instant::now(),
+                overall_deadline,
+                crate::git::active_git_deadline(),
+            ),
+            output_bytes,
+            path_fields,
+        }
+    }
+}
+
+fn archive_cleanup_deadline(
+    now: std::time::Instant,
+    overall_deadline: Option<std::time::Instant>,
+    active_git_deadline: Option<std::time::Instant>,
+) -> std::time::Instant {
+    // Archive removal rechecks content, delivery prerequisites and the complete
+    // bundle under the lifecycle claim. A status report's 15-second allowance
+    // starves the last proof on large histories. Bound the entire proof phase
+    // to one minute, preserving every earlier caller/worker deadline.
+    let requested = now + std::time::Duration::from_secs(60);
+    overall_deadline
+        .into_iter()
+        .chain(active_git_deadline)
+        .fold(requested, std::cmp::min)
 }
 
 struct CleanupInspectionContext<'a> {
@@ -4543,10 +4579,11 @@ impl Broker {
         force: bool,
         archive_guard: Option<CleanupArchiveGuard<'_>>,
     ) -> Result<(), BrokerOpError> {
-        let status_limits = CleanupStatusLimits::new(
+        let status_limits = CleanupStatusLimits::for_removal(
             self.landing_deadline.get(),
             crate::git::MAX_CLEANUP_STATUS_OUTPUT_BYTES,
             crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
+            archive_guard.is_some(),
         );
         // No cleanup path consumes archive intents yet. Even an otherwise
         // verified archive guard must retain the checkout until a matching,
@@ -4840,7 +4877,7 @@ impl Broker {
                 .map_err(|reason| BrokerOpError::CleanupResolveRefused {
                     id: session_id,
                     reason: format!(
-                        "the verified archive changed before worktree removal; the worktree remains in place: {reason}"
+                        "the archive could not be reverified before worktree removal; the archive and worktree remain in place: {reason}"
                     ),
                 })?;
             }
@@ -5469,6 +5506,51 @@ mod registered_removal_failure_tests {
     use std::path::Path;
     use std::process::Command;
     use std::time::Duration;
+
+    #[test]
+    fn archive_removal_has_one_bounded_proof_budget() {
+        let now = std::time::Instant::now();
+        assert_eq!(
+            super::archive_cleanup_deadline(now, None, None),
+            now + Duration::from_secs(60),
+        );
+        let outer = now + Duration::from_secs(8);
+        let worker = now + Duration::from_secs(4);
+        assert_eq!(
+            super::archive_cleanup_deadline(now, Some(outer), Some(worker)),
+            worker,
+        );
+        assert_eq!(
+            super::archive_cleanup_deadline(now, Some(worker), Some(outer)),
+            worker,
+        );
+        let expired = now - Duration::from_secs(1);
+        assert_eq!(
+            super::archive_cleanup_deadline(now, Some(expired), None),
+            expired,
+        );
+        assert_eq!(
+            super::archive_cleanup_deadline(now, None, Some(expired)),
+            expired,
+        );
+    }
+
+    #[test]
+    fn removal_budget_wiring_preserves_status_and_worker_limits() {
+        let before = std::time::Instant::now();
+        let ordinary = CleanupStatusLimits::for_removal(None, 123, 456, false);
+        let archive = CleanupStatusLimits::for_removal(None, 123, 456, true);
+        let after = std::time::Instant::now();
+        assert!(ordinary.deadline >= before + Duration::from_secs(15));
+        assert!(ordinary.deadline <= after + Duration::from_secs(15));
+        assert!(archive.deadline >= before + Duration::from_secs(60));
+        assert!(archive.deadline <= after + Duration::from_secs(60));
+        assert_eq!((archive.output_bytes, archive.path_fields), (123, 456));
+        let outer = before + Duration::from_secs(2);
+        let _guard = crate::git::limit_git_until(outer);
+        let bounded = CleanupStatusLimits::for_removal(None, 123, 456, true);
+        assert_eq!(bounded.deadline, outer);
+    }
 
     fn initialized_repository(root: &Path) -> std::path::PathBuf {
         let repository = root.join("repository");

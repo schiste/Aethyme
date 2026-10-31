@@ -930,16 +930,34 @@ fn run_explore_summary(args: &[String]) -> ExitCode {
 
 fn start_engine_daemon_and_wait(repo: &Path) -> Result<(), String> {
     use aethyme_engine::daemon::{self, ReadyOutcome, StartOutcome};
-    let serve_exe = engine_cli_binary_path();
+    let expected_identity = daemon::runtime_build_identity();
+    let router_exe = env::current_exe().map_err(|error| format!("current_exe: {error}"))?;
+    let managed_launch =
+        aethyme_broker::pin_runtime_pair_for_build(&router_exe, &expected_identity)?;
+    let serve_exe = managed_launch
+        .as_ref()
+        .map(|launch| launch.paths().engine_path().to_path_buf())
+        .unwrap_or_else(engine_cli_binary_path);
+    let runtime_pin = managed_launch.as_ref().map(|launch| launch.pin());
     let opts = daemon::StartOptions::default();
-    let mut spawned = match daemon::start_detached(repo, &serve_exe, &opts)? {
-        StartOutcome::Spawned(child) => Some(child),
-        // Already running but the socket refused just now — likely mid
-        // map-build. Don't watch a process we didn't spawn.
-        StartOutcome::AlreadyRunning(_) => None,
-    };
-    match daemon::wait_until_ready(repo, spawned.as_mut(), DAEMON_READY_TIMEOUT) {
+    let mut spawned =
+        match daemon::start_detached_with_runtime_pin(repo, &serve_exe, &opts, runtime_pin)? {
+            StartOutcome::Spawned(child) => Some(child),
+            // Already running but the socket refused just now — likely mid
+            // map-build. Don't watch a process we didn't spawn.
+            StartOutcome::AlreadyRunning(_) => None,
+        };
+    match daemon::wait_until_ready_for_identity(
+        repo,
+        spawned.as_mut(),
+        DAEMON_READY_TIMEOUT,
+        &expected_identity,
+    ) {
         ReadyOutcome::Ready => Ok(()),
+        ReadyOutcome::IdentityMismatch => Err(format!(
+            "engine daemon answered with a different protocol or build identity; log: {}",
+            daemon::logfile_path_for(repo).display()
+        )),
         ReadyOutcome::ProcessExited => Err(format!(
             "engine daemon exited during startup (is the repo indexed? \
              run `aethyme graph status --repo .`, then review and execute \
@@ -954,10 +972,8 @@ fn start_engine_daemon_and_wait(repo: &Path) -> Result<(), String> {
     }
 }
 
-/// Locate the `aethyme-engine-cli` binary, used only as the detached
-/// daemon-serve process. It's built into the same directory as this
-/// binary (both by `cargo build` and by `cargo install --path`), so a
-/// sibling lookup covers both layouts; PATH is the fallback.
+/// Locate the engine for unmanaged development/archive layouts. Installer
+/// managed launches resolve an immutable full-identity pair instead.
 fn engine_cli_binary_path() -> PathBuf {
     if let Ok(mut exe) = env::current_exe() {
         exe.pop();

@@ -28,7 +28,7 @@ fn private_file(metadata: &Metadata, uid: u32, links: u64) -> io::Result<()> {
     Ok(())
 }
 
-fn existing(path: &Path, uid: u32) -> io::Result<Option<(Vec<u8>, Metadata)>> {
+pub(crate) fn existing(path: &Path, uid: u32) -> io::Result<Option<(Vec<u8>, Metadata)>> {
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -152,7 +152,10 @@ fn publish_with_hook(
     Ok(true)
 }
 
-fn claim_installer(root: &Path, uid: u32) -> io::Result<crate::file_lock::ExclusiveFileLock> {
+pub(crate) fn claim_installer(
+    root: &Path,
+    uid: u32,
+) -> io::Result<crate::file_lock::ExclusiveFileLock> {
     let lock_path = root.join(".install.lock");
     let file = OpenOptions::new()
         .read(true)
@@ -180,6 +183,53 @@ fn claim_installer(root: &Path, uid: u32) -> io::Result<crate::file_lock::Exclus
     Ok(claim)
 }
 
+/// Publish an exact list of bounded service files, then the unit last. The
+/// caller owns the purpose-specific plan validation; this shared path performs
+/// only secure, no-replace installation and never activates the service.
+pub(crate) fn install_exact_files(
+    home: &Path,
+    directory: &Path,
+    unit_path: &Path,
+    uid: u32,
+    files: &[(&str, &[u8])],
+    unit_bytes: &[u8],
+) -> io::Result<Vec<PathBuf>> {
+    let relative = directory
+        .strip_prefix(home)
+        .map_err(|_| invalid("service helpers are outside the reviewed home"))?;
+    for (name, _) in files {
+        let mut components = Path::new(name).components();
+        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+            return Err(invalid("service file names must be single path components"));
+        }
+    }
+    let root = ensure_directories(home, relative, uid, true)?;
+    let _claim = claim_installer(&root, uid)?;
+    let unit_parent = unit_path
+        .parent()
+        .ok_or_else(|| invalid("service unit has no parent"))?;
+    ensure_directories(
+        home,
+        unit_parent
+            .strip_prefix(home)
+            .map_err(|_| invalid("service unit is outside the reviewed home"))?,
+        uid,
+        false,
+    )?;
+    let mut created = Vec::new();
+    for (name, content) in files {
+        let path = root.join(name);
+        if publish(&path, content, &root, uid)? {
+            created.push(path);
+        }
+    }
+    // Unit publication is last. Installation never invokes launchctl.
+    if publish(unit_path, unit_bytes, &root, uid)? {
+        created.push(unit_path.to_path_buf());
+    }
+    Ok(created)
+}
+
 pub(crate) fn install(plan: &Plan, confirmation: &str) -> io::Result<Vec<PathBuf>> {
     if confirmation != plan.digest {
         return Err(invalid(
@@ -205,40 +255,19 @@ pub(crate) fn install(plan: &Plan, confirmation: &str) -> io::Result<Vec<PathBuf
             "service plan changed; recompute and review it before installing",
         ));
     }
-    let relative = plan
-        .directory
-        .strip_prefix(&plan.home)
-        .map_err(|_| invalid("service helpers are outside the reviewed home"))?;
-    let root = ensure_directories(&plan.home, relative, plan.uid, true)?;
-    let _claim = claim_installer(&root, plan.uid)?;
-    let unit_parent = plan
-        .unit_path
-        .parent()
-        .ok_or_else(|| invalid("service unit has no parent"))?;
-    ensure_directories(
+    let mut files = script_contents()
+        .into_iter()
+        .map(|(name, content)| (name, content.as_bytes()))
+        .collect::<Vec<_>>();
+    files.push(("plan.json", encoded.as_slice()));
+    install_exact_files(
         &plan.home,
-        unit_parent
-            .strip_prefix(&plan.home)
-            .map_err(|_| invalid("service unit is outside the reviewed home"))?,
+        &plan.directory,
+        &plan.unit_path,
         plan.uid,
-        false,
-    )?;
-    let mut created = Vec::new();
-    for (name, content) in script_contents() {
-        let path = root.join(name);
-        if publish(&path, content.as_bytes(), &root, plan.uid)? {
-            created.push(path);
-        }
-    }
-    let manifest = root.join("plan.json");
-    if publish(&manifest, &encoded, &root, plan.uid)? {
-        created.push(manifest);
-    }
-    // Unit publication is last. This function never invokes launchctl or a poller.
-    if publish(&plan.unit_path, plan.unit.as_bytes(), &root, plan.uid)? {
-        created.push(plan.unit_path.clone());
-    }
-    Ok(created)
+        &files,
+        plan.unit.as_bytes(),
+    )
 }
 
 #[cfg(test)]

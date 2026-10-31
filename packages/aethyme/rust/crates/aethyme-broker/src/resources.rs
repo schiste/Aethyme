@@ -4865,10 +4865,18 @@ fn plan_allocations(
                 None,
             )),
             HostResourceKind::TcpPort { start, end } => {
+                // Nothing holds a port between iterations, so a port this
+                // bundle already chose still binds: exclude it explicitly, or
+                // every request over an overlapping range gets the same one
+                // (#1235).
                 let port = (*start..=*end).find(|p| {
+                    let value = p.to_string();
                     !occupied
                         .iter()
-                        .any(|o| o.kind == "tcp_port" && o.value == p.to_string())
+                        .any(|o| o.kind == "tcp_port" && o.value == value)
+                        && !proposed.iter().any(|a: &HostResourceAllocation| {
+                            a.kind == "tcp_port" && a.value == value
+                        })
                         && TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, *p)).is_ok()
                 });
                 if let Some(port) = port {
@@ -8724,6 +8732,56 @@ mod tests {
             }
         }
         panic!("could not find a free adjacent TCP port pair for the test");
+    }
+
+    /// #1235: several ports over one range in one bundle are distinct, in
+    /// the plan and the grant; a range too narrow for all of them is refused
+    /// whole, never granted with a duplicate.
+    #[test]
+    fn ports_in_one_bundle_are_distinct_or_refused_together() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let (first, second) = adjacent_bindable_ports();
+        let ports = |id: &str, keys: &[&str]| {
+            req(
+                id,
+                keys.iter()
+                    .map(|key| HostResourceRequirement {
+                        key: (*key).into(),
+                        resource: HostResourceKind::TcpPort {
+                            start: first,
+                            end: second,
+                        },
+                    })
+                    .collect(),
+            )
+        };
+        let values = |allocations: &[HostResourceAllocation]| {
+            let mut values: Vec<String> = allocations.iter().map(|a| a.value.clone()).collect();
+            values.sort();
+            values
+        };
+        let expected = vec![first.to_string(), second.to_string()];
+
+        let pair = ports("pair", &["port_api", "port_db"]);
+        let plan = c.plan(&pair).unwrap();
+        assert!(plan.available, "{plan:?}");
+        assert_eq!(values(&plan.proposed), expected);
+        let grant = c.acquire(&pair).unwrap();
+        assert_eq!(values(&grant.lease.allocations), expected);
+        c.release(
+            &grant.lease.lease_id,
+            grant.lease.generation,
+            &grant.ownership_token,
+        )
+        .unwrap();
+
+        let three = ports("three", &["port_api", "port_db", "port_web"]);
+        let plan = c.plan(&three).unwrap();
+        assert!(!plan.available, "{plan:?}");
+        let error = c.acquire(&three).unwrap_err();
+        assert_eq!(conflict_code(error), "resource_contention");
+        assert!(c.list(false).unwrap().is_empty(), "nothing was granted");
     }
 
     #[test]
