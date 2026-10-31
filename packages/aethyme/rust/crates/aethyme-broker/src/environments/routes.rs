@@ -174,8 +174,8 @@ fn route_table_snapshot(
         // after capturing the pointer generation; the initial route-table
         // list may have observed that slot while it was still starting.
         match current_serving_record(store, &records, group, &owner, snapshot.exists()) {
-            Ok(Some(record)) => match route_alias(root, &record.env_id) {
-                Some(alias) => {
+            Ok(Some(record)) => {
+                if let Some(alias) = route_alias(root, &record.env_id) {
                     let alias = alias.to_ascii_lowercase();
                     if let Some(route) = record_routes(&record, root, Some(&alias))
                         .into_iter()
@@ -189,8 +189,7 @@ fn route_table_snapshot(
                         )));
                     }
                 }
-                None => {}
-            },
+            }
             Ok(None) => {}
             Err(error) => deferred_errors.push(error),
         }

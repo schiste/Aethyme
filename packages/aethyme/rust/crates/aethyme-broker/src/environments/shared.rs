@@ -1055,17 +1055,16 @@ impl Lifecycle {
                 let key = shared_operation_key(repository, &shared);
                 let env_id = record.env_id.clone();
                 let owner = name.clone();
-                match self.exclusive(repository, &key, Duration::ZERO, |this| -> bool {
-                    if this.serving_owner(repository, spec) == owner {
-                        return false;
-                    }
-                    this.retire_slot(&env_id);
-                    true
-                }) {
-                    Some(true) => {
-                        actions.push(format!("retired an idle {shared} slot ({env_id})"));
-                    }
-                    Some(false) | None => {}
+                if let Some(true) =
+                    self.exclusive(repository, &key, Duration::ZERO, |this| -> bool {
+                        if this.serving_owner(repository, spec) == owner {
+                            return false;
+                        }
+                        this.retire_slot(&env_id);
+                        true
+                    })
+                {
+                    actions.push(format!("retired an idle {shared} slot ({env_id})"));
                 }
                 continue;
             }
@@ -1181,35 +1180,6 @@ fn remove_previous_export(previous: Option<PathBuf>, current: &Path) {
     }
 }
 
-#[cfg(test)]
-mod operation_key_tests {
-    use super::{SharedSpec, declared_spec_for_owner, shared_operation_key};
-
-    #[test]
-    fn shared_operation_key_is_stable_and_scoped_by_repository_and_name() {
-        let baseline = shared_operation_key("repo-a", "baseline");
-        assert_eq!(baseline, shared_operation_key("repo-a", "baseline"));
-        assert_ne!(baseline, shared_operation_key("repo-b", "baseline"));
-        assert_ne!(baseline, shared_operation_key("repo-a", "frontend"));
-        assert!(baseline.len() <= 256);
-    }
-
-    #[test]
-    fn declared_slot_matching_preserves_refs_ending_in_slot_suffix() {
-        let declared = [SharedSpec {
-            name: "baseline".into(),
-            profile: "backend".into(),
-            reference: "refs/heads/feature#b".into(),
-            idle_seconds: None,
-            min_redeploy_interval_seconds: None,
-            stateful: false,
-        }];
-        assert!(declared_spec_for_owner(&declared, "baseline@refs/heads/feature#b").is_some());
-        assert!(declared_spec_for_owner(&declared, "baseline@refs/heads/feature").is_some());
-        assert!(declared_spec_for_owner(&declared, "baseline@refs/heads/feature#b#b").is_none());
-    }
-}
-
 /// `AETHYME_SHARED_<NAME>_URL` / `_DIRECT_URL` / `_PORT_<COMPONENT>` for a
 /// consumer, from the shared environment's reservation.
 ///
@@ -1283,4 +1253,33 @@ fn proxied_url(root: &Path, record: &EnvironmentRecord, proxy_port: u16) -> Opti
         .ok()?
         .any(|address| address.ip().is_loopback());
     loopback.then(|| format!("http://{host}:{proxy_port}"))
+}
+
+#[cfg(test)]
+mod operation_key_tests {
+    use super::{SharedSpec, declared_spec_for_owner, shared_operation_key};
+
+    #[test]
+    fn shared_operation_key_is_stable_and_scoped_by_repository_and_name() {
+        let baseline = shared_operation_key("repo-a", "baseline");
+        assert_eq!(baseline, shared_operation_key("repo-a", "baseline"));
+        assert_ne!(baseline, shared_operation_key("repo-b", "baseline"));
+        assert_ne!(baseline, shared_operation_key("repo-a", "frontend"));
+        assert!(baseline.len() <= 256);
+    }
+
+    #[test]
+    fn declared_slot_matching_preserves_refs_ending_in_slot_suffix() {
+        let declared = [SharedSpec {
+            name: "baseline".into(),
+            profile: "backend".into(),
+            reference: "refs/heads/feature#b".into(),
+            idle_seconds: None,
+            min_redeploy_interval_seconds: None,
+            stateful: false,
+        }];
+        assert!(declared_spec_for_owner(&declared, "baseline@refs/heads/feature#b").is_some());
+        assert!(declared_spec_for_owner(&declared, "baseline@refs/heads/feature").is_some());
+        assert!(declared_spec_for_owner(&declared, "baseline@refs/heads/feature#b#b").is_none());
+    }
 }
