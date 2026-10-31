@@ -114,7 +114,8 @@ Usage:
   aethyme env touch <id> [--json]
       Record activity now (an mtime update; no database lock).
   aethyme env pin <id> --for <seconds> --reason <text> [--json]
-      Keep the environment awake (up to 24 h). `env unpin <id>` ends it.
+      Keep the environment awake (up to the host cap, at most 24 h). A host
+      cap of 0 disables new pins. `env unpin <id>` ends an existing pin.
       Pins are recorded in the environment's history.
   aethyme env shared up|redeploy|destroy <name> [--force] [--json]
   aethyme env shared list [--json]

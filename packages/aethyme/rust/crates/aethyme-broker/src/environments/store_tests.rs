@@ -292,6 +292,23 @@ fn identity_proves_only_the_process_it_captured() {
     if let Some(captured) = captured {
         assert_eq!(captured.observe(), Observation::Gone);
     }
+
+    // `env exec` deliberately shares its caller's process group. Its own
+    // process is enough to prove the marker stale after it exits.
+    let mut shared_group_child = std::process::Command::new("/bin/sleep")
+        .arg("0.2")
+        .spawn()
+        .unwrap();
+    let captured = ProcessIdentity::capture(shared_group_child.id() as i32);
+    shared_group_child.wait().unwrap();
+    if let Some(captured) = captured {
+        assert_eq!(captured.observe_process(), Observation::Gone);
+        assert_eq!(
+            captured.observe(),
+            Observation::Unproven,
+            "the lifecycle group check still notices the living test runner"
+        );
+    }
 }
 
 #[test]

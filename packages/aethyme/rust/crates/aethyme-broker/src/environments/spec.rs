@@ -324,12 +324,13 @@ pub struct SharedSpec {
 pub struct HostEnvironmentsFile {
     #[serde(default)]
     pub pools: BTreeMap<String, HostPoolSpec>,
-    /// The longest `env pin --for` accepted (default and ceiling: 24 h).
+    /// The longest new `env pin --for` accepted (default and ceiling: 24 h).
+    /// Zero disables new pins; lowering the cap does not shorten a stored pin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_pin_seconds: Option<u64>,
-    /// How long a running `env exec` keeps an environment busy; past it the
-    /// command keeps running but no longer prevents idle parking. Unset:
-    /// for as long as the command runs.
+    /// How long a proven-live `env exec` marker keeps an environment busy;
+    /// at the cap the command and marker remain, but idle parking may proceed.
+    /// Unknown marker/process state remains busy. Unset: for the command's life.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_exec_busy_seconds: Option<u64>,
 }
