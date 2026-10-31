@@ -499,6 +499,8 @@ impl Lifecycle {
             },
         )
         .map_err(io)?;
+        // A shared environment runs without its optional components (E20).
+        super::compile::select_components(&mut snapshot, &Default::default());
         if let Some(idle) = spec.idle_seconds {
             snapshot.idle_seconds = idle;
         }
@@ -619,6 +621,7 @@ impl Lifecycle {
                 &UpOptions {
                     wait,
                     reconfigure: false,
+                    recreate: Vec::new(),
                 },
             )?,
         };
@@ -786,6 +789,7 @@ impl Lifecycle {
                 &UpOptions {
                     wait,
                     reconfigure: false,
+                    recreate: Vec::new(),
                 },
             )?;
             self.store.note(
@@ -923,6 +927,7 @@ impl Lifecycle {
             &UpOptions {
                 wait: BLUE_GREEN_CAPACITY_WAIT,
                 reconfigure: false,
+                recreate: Vec::new(),
             },
         );
         let next = match started {

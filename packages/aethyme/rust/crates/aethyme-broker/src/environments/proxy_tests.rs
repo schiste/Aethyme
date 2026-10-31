@@ -163,6 +163,7 @@ fn up(host: &Host, text: &str, worktree: &Path) -> (Lifecycle, String) {
             &UpOptions {
                 wait: Duration::from_secs(1),
                 reconfigure: false,
+                recreate: Vec::new(),
             },
         )
         .unwrap();
