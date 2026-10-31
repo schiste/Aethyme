@@ -13,7 +13,11 @@
 //! - a **static** component's files are served directly, with no process.
 //!
 //! Routing is per connection: the first request's `Host` decides where the
-//! whole connection goes.
+//! whole connection goes. A route with `paths` (#1296) sends a request whose
+//! path is under one of them (longest prefix wins, the prefix is kept) to
+//! that path's target instead: another route of the table, held and woken
+//! like a host route, or an external `http://` URL, whose `Host` header the
+//! proxy rewrites. Upgrades are spliced the same way, so `/ws` works.
 //!
 //! Control endpoints (for external proxies and scripts):
 //!
@@ -37,7 +41,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use super::lifecycle::Lifecycle;
-use super::routes::{Route, etag, lookup, route_table};
+use super::routes::{Route, etag, lookup, route_table, select_path};
 use super::store::EnvironmentStore;
 use crate::resources::HostResourceCoordinator;
 
@@ -320,6 +324,91 @@ fn ensure_awake(config: &ProxyConfig, route: &Route) -> Result<(), String> {
         .map_err(|error| format!("{} ({})", error, error.code()))
 }
 
+/// Where one request goes once its host's route is known.
+enum Target {
+    Route(Route),
+    Url(String),
+}
+
+/// The target for `path` on `route`: the longest matching `paths` entry, or
+/// the route itself. `Err` names a path target missing from the table.
+fn target(routes: &[Route], route: &Route, path: &str) -> Result<Target, String> {
+    let Some(entry) = select_path(route, path) else {
+        return Ok(Target::Route(route.clone()));
+    };
+    if let Some(url) = &entry.url {
+        return Ok(Target::Url(url.clone()));
+    }
+    let host = entry.host.as_deref().unwrap_or_default();
+    lookup(routes, host)
+        .cloned()
+        .map(Target::Route)
+        .ok_or_else(|| {
+            format!(
+                "path {} of {} routes to {host}, which has no route; is it up?",
+                entry.prefix, route.host
+            )
+        })
+}
+
+fn path_target_unavailable(client: &mut TcpStream, route: &Route, reason: &str) -> io::Result<()> {
+    respond_json(
+        client,
+        "503 Service Unavailable",
+        json!({
+            "env_id": route.env_id,
+            "component": route.component,
+            "error": reason,
+            "next_action": "aethyme env routes",
+        }),
+        &[("Retry-After", "5".into())],
+    )
+}
+
+/// The request head with its `Host` header replaced by `host`.
+fn with_host(raw: &[u8], host: &str) -> Vec<u8> {
+    let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return raw.to_vec();
+    };
+    let head = String::from_utf8_lossy(&raw[..end]);
+    let mut out = String::new();
+    for (index, line) in head.split("\r\n").enumerate() {
+        let is_host = index > 0
+            && line
+                .split_once(':')
+                .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("host"));
+        if is_host {
+            out.push_str(&format!("Host: {host}"));
+        } else {
+            out.push_str(line);
+        }
+        out.push_str("\r\n");
+    }
+    let mut bytes = out.into_bytes();
+    bytes.extend_from_slice(&raw[end + 2..]);
+    bytes
+}
+
+/// Forward the request to an external `http://host[:port]` (#1296).
+fn forward_url(client: TcpStream, head: &Head, url: &str) -> io::Result<()> {
+    let authority = url
+        .strip_prefix("http://")
+        .unwrap_or(url)
+        .trim_end_matches('/');
+    let address = if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{authority}:80")
+    };
+    let addr = std::net::ToSocketAddrs::to_socket_addrs(&address)?
+        .next()
+        .ok_or_else(|| io::Error::other(format!("{address} does not resolve")))?;
+    let mut upstream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+    client.set_read_timeout(None)?;
+    upstream.write_all(&with_host(&head.raw, authority))?;
+    splice(client, upstream)
+}
+
 fn handle(mut client: TcpStream, config: &ProxyConfig) -> io::Result<()> {
     client.set_read_timeout(Some(Duration::from_secs(30)))?;
     let Some(head) = read_head(&mut client)? else {
@@ -333,7 +422,7 @@ fn handle(mut client: TcpStream, config: &ProxyConfig) -> io::Result<()> {
         Ok(routes) => routes,
         Err(reason) => return route_snapshot_unavailable(&mut client, &reason),
     };
-    let Some(route) = lookup(&routes, &host).cloned() else {
+    let Some(host_route) = lookup(&routes, &host).cloned() else {
         return respond(
             &mut client,
             "404 Not Found",
@@ -341,6 +430,14 @@ fn handle(mut client: TcpStream, config: &ProxyConfig) -> io::Result<()> {
             &[],
             format!("no environment route for {host:?}; see `aethyme env routes`\n").as_bytes(),
         );
+    };
+    let route = match target(&routes, &host_route, &head.path) {
+        Ok(Target::Route(route)) => route,
+        Ok(Target::Url(url)) => {
+            touch_debounced(&config.root, &host_route.env_id);
+            return forward_url(client, &head, &url);
+        }
+        Err(reason) => return path_target_unavailable(&mut client, &host_route, &reason),
     };
     if let Err(reason) = ensure_awake(config, &route) {
         return respond_json(
@@ -361,7 +458,7 @@ fn handle(mut client: TcpStream, config: &ProxyConfig) -> io::Result<()> {
         Ok(routes) => routes,
         Err(reason) => return route_snapshot_unavailable(&mut client, &reason),
     };
-    let Some(route) = lookup(&routes, &host).cloned() else {
+    let Some(host_route) = lookup(&routes, &host).cloned() else {
         return respond(
             &mut client,
             "503 Service Unavailable",
@@ -370,7 +467,15 @@ fn handle(mut client: TcpStream, config: &ProxyConfig) -> io::Result<()> {
             b"route vanished\n",
         );
     };
+    let route = match target(&routes, &host_route, &head.path) {
+        Ok(Target::Route(route)) => route,
+        Ok(Target::Url(url)) => return forward_url(client, &head, &url),
+        Err(reason) => return path_target_unavailable(&mut client, &host_route, &reason),
+    };
     touch_debounced(&config.root, &route.env_id);
+    if host_route.env_id != route.env_id {
+        touch_debounced(&config.root, &host_route.env_id);
+    }
     if let Some(directory) = &route.static_dir {
         return serve_static(&mut client, &head, directory);
     }

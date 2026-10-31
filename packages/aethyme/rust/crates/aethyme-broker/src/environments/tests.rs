@@ -345,6 +345,76 @@ fn every_rule_has_a_located_diagnostic() {
             field: "name",
         },
         Case {
+            name: "paths on an unrouted component",
+            toml: profile(
+                "{ name = \"a\", runtime = \"hooks\", provision = \"x\", destroy = \"y\", paths = [{ prefix = \"/api\", to = \"http://127.0.0.1:9\" }] }",
+            ),
+            code: "paths_without_route",
+            profile: Some("p"),
+            component: Some("a"),
+            field: "paths",
+        },
+        Case {
+            name: "relative path prefix",
+            toml: profile(
+                "{ name = \"site\", runtime = \"static\", serve_dir = \"dist\", paths = [{ prefix = \"api\", to = \"http://127.0.0.1:9\" }] }",
+            ),
+            code: "invalid_path_prefix",
+            profile: Some("p"),
+            component: Some("site"),
+            field: "paths[0].prefix",
+        },
+        Case {
+            name: "duplicate path prefix",
+            toml: profile(
+                "{ name = \"site\", runtime = \"static\", serve_dir = \"dist\", paths = [{ prefix = \"/api\", to = \"http://127.0.0.1:9\" }, { prefix = \"/api/\", to = \"http://127.0.0.1:9\" }] }",
+            ),
+            code: "duplicate_path_prefix",
+            profile: Some("p"),
+            component: Some("site"),
+            field: "paths[1].prefix",
+        },
+        Case {
+            name: "path to an unknown component",
+            toml: profile(
+                "{ name = \"site\", runtime = \"static\", serve_dir = \"dist\", paths = [{ prefix = \"/api\", to = \"api\" }] }",
+            ),
+            code: "invalid_path_target",
+            profile: Some("p"),
+            component: Some("site"),
+            field: "paths[0].to",
+        },
+        Case {
+            name: "path to a TLS upstream",
+            toml: profile(
+                "{ name = \"site\", runtime = \"static\", serve_dir = \"dist\", paths = [{ prefix = \"/api\", to = \"https://example.com\" }] }",
+            ),
+            code: "invalid_path_target",
+            profile: Some("p"),
+            component: Some("site"),
+            field: "paths[0].to",
+        },
+        Case {
+            name: "path to a shared environment the profile does not use",
+            toml: profile(
+                "{ name = \"site\", runtime = \"static\", serve_dir = \"dist\", paths = [{ prefix = \"/ws\", to = \"shared:realtime\" }] }",
+            ),
+            code: "invalid_path_target",
+            profile: Some("p"),
+            component: Some("site"),
+            field: "paths[0].to",
+        },
+        Case {
+            name: "path to an unrouted component",
+            toml: profile(
+                "{ name = \"site\", runtime = \"static\", serve_dir = \"dist\", paths = [{ prefix = \"/api\", to = \"db\" }] }, { name = \"db\", runtime = \"hooks\", provision = \"x\", destroy = \"y\" }",
+            ),
+            code: "invalid_path_target",
+            profile: Some("p"),
+            component: Some("site"),
+            field: "paths[0].to",
+        },
+        Case {
             name: "idle too short",
             toml: "schema = 1\ndefault_idle_seconds = 5\n[[profiles]]\nname = \"a\"\ncomponents = [{ name = \"x\", runtime = \"process\", start = \"x\" }]\n".into(),
             code: "idle_too_short",
