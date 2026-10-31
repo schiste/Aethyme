@@ -256,6 +256,7 @@ fn find_managed_install_receipt(
                         ));
                     }
                 };
+                // SAFETY: `geteuid` has no preconditions and only reads this process's effective UID.
                 let uid = unsafe { libc::geteuid() };
                 if !named.is_file()
                     || named.uid() != uid
@@ -273,7 +274,7 @@ fn find_managed_install_receipt(
                 options
                     .read(true)
                     .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
-                let mut file = options.open(&path).map_err(|error| {
+                let file = options.open(&path).map_err(|error| {
                     format!("open installation receipt {}: {error}", path.display())
                 })?;
                 let opened = file.metadata().map_err(|error| {
@@ -462,6 +463,7 @@ fn validate_managed_versions_directory(path: &Path) -> Result<(), String> {
             path.display()
         )
     })?;
+    // SAFETY: `geteuid` has no preconditions and only reads this process's effective UID.
     let uid = unsafe { libc::geteuid() };
     if !metadata.is_dir()
         || metadata.uid() != uid
