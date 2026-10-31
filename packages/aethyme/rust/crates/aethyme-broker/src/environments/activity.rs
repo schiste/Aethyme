@@ -18,6 +18,12 @@
 //!
 //! The supervisor parks an `active`, unpinned environment with no live busy
 //! marker whose last activity is older than its `idle_seconds`.
+//!
+//! **Caps (#1293).** The host file can cap both keep-awake signals:
+//! `max_pin_seconds` bounds `env pin --for`, and `max_exec_busy_seconds`
+//! bounds how long a running `env exec` keeps an environment busy. Past that
+//! cap the command keeps running, but the environment can park, and the
+//! park records `exec busy cap reached`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -100,13 +106,29 @@ impl Drop for BusyMarker {
 /// forever. Stale markers are removed. An unreadable marker counts as busy
 /// (fail toward staying up) for at most [`MAX_PIN`], then is removed.
 pub fn has_live_busy_marker(root: &Path, env_id: &str) -> bool {
+    busy_state(root, env_id, now_ms(), None) == BusyState::Busy
+}
+
+/// What the busy markers say at `now`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusyState {
+    Idle,
+    Busy,
+    /// Only commands running longer than `max_exec_busy_seconds` (#1293).
+    Capped,
+}
+
+/// [`has_live_busy_marker`], with a live marker older than `cap` at `now`
+/// reported as [`BusyState::Capped`] (kept: its command still runs).
+pub fn busy_state(root: &Path, env_id: &str, now: i64, cap: Option<Duration>) -> BusyState {
     let Some(directory) = env_dir(root, env_id).map(|d| d.join(BUSY_DIRECTORY)) else {
-        return false;
+        return BusyState::Idle;
     };
     let Ok(entries) = fs::read_dir(&directory) else {
-        return false;
+        return BusyState::Idle;
     };
     let mut busy = false;
+    let mut capped = false;
     for entry in entries.flatten() {
         let identity = fs::read(entry.path())
             .ok()
@@ -122,13 +144,31 @@ pub fn has_live_busy_marker(root: &Path, env_id: &str) -> bool {
                 .and_then(|modified| modified.elapsed().ok())
                 .is_none_or(|age| age < MAX_PIN),
         };
-        if live {
-            busy = true;
-        } else {
+        if !live {
             crate::warn_unrecorded("remove a stale busy marker", fs::remove_file(entry.path()));
+            continue;
+        }
+        // The marker is written when the command starts.
+        let started = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64);
+        match (cap, started) {
+            (Some(cap), Some(started)) if now - started > cap.as_millis() as i64 => {
+                capped = true;
+            }
+            _ => busy = true,
         }
     }
-    busy
+    if busy {
+        BusyState::Busy
+    } else if capped {
+        BusyState::Capped
+    } else {
+        BusyState::Idle
+    }
 }
 
 /// Why an environment is (not) idle, for status output and tests.
@@ -147,6 +187,9 @@ pub enum Idleness {
     Idle {
         last_activity_at: i64,
         idle_for_ms: i64,
+        /// A command is still running, past `max_exec_busy_seconds`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        busy_capped: bool,
     },
 }
 
@@ -172,7 +215,11 @@ impl super::lifecycle::Lifecycle {
         {
             return Idleness::Pinned { until };
         }
-        if has_live_busy_marker(&self.root, &record.env_id) {
+        let cap = super::host_file_beside(&self.root)
+            .max_exec_busy_seconds
+            .map(Duration::from_secs);
+        let busy = busy_state(&self.root, &record.env_id, now, cap);
+        if busy == BusyState::Busy {
             return Idleness::Busy;
         }
         // A shared environment is in use while any environment that uses it
@@ -210,6 +257,7 @@ impl super::lifecycle::Lifecycle {
         Idleness::Idle {
             last_activity_at: last,
             idle_for_ms: now - last,
+            busy_capped: busy == BusyState::Capped,
         }
     }
 
@@ -248,7 +296,26 @@ impl super::lifecycle::Lifecycle {
             if record.phase != super::store::EnvironmentPhase::Active {
                 continue;
             }
-            if let Idleness::Idle { idle_for_ms, .. } = self.idleness(&record, now, true) {
+            if let Idleness::Idle {
+                idle_for_ms,
+                busy_capped,
+                ..
+            } = self.idleness(&record, now, true)
+            {
+                if busy_capped {
+                    crate::warn_unrecorded(
+                        "record a capped exec",
+                        self.store.note(
+                            &record.env_id,
+                            "exec busy cap reached",
+                            "supervisor",
+                            Some(&serde_json::json!({
+                                "max_exec_busy_seconds":
+                                    super::host_file_beside(&self.root).max_exec_busy_seconds,
+                            })),
+                        ),
+                    );
+                }
                 match self.park(&record.env_id, "idle") {
                     Ok(_) => {
                         parked.push(record.env_id.clone());
