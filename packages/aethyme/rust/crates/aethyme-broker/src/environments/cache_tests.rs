@@ -74,6 +74,7 @@ fn up(lifecycle: &mut Lifecycle, text: &str, worktree: &Path) -> String {
             &UpOptions {
                 wait: Duration::from_secs(5),
                 reconfigure: false,
+                recreate: Vec::new(),
             },
         )
         .unwrap()

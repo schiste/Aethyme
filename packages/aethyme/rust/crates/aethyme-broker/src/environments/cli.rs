@@ -78,7 +78,7 @@ Usage:
       sides of renames), the rules that fired with their paths, and the
       paths no rule matched. --range evaluates every commit in a range and
       prints how many would need each profile, for tuning rules.
-  aethyme env up [--profile <name> [--reason <text>]] [--wait <seconds>] [--reconfigure] [--json]
+  aethyme env up [--profile <name> [--reason <text>]] [--component <name>]... [--wait <seconds>] [--reconfigure [--recreate <component>]...] [--json]
       Make sure this worktree's environment is up: create it, or return it
       if already active. Reserves its namespace and ports, waits up to
       --wait (default 300) for pool capacity, provisions, starts and
@@ -89,7 +89,14 @@ Usage:
       minimum is destroyed and replaced. It prints its
       ports, URLs and the AETHYME_ENV_* variables. A failure rolls back and
       leaves the environment `failed` with its error. A changed profile
-      needs --reconfigure (destroy, then recreate).
+      needs --reconfigure, which keeps the environment and changes only
+      what changed: unchanged components keep their data, changed and
+      removed ones are destroyed, added ones provisioned. Destroying a
+      component that holds data (it provisions, or runs in a container
+      engine) needs --recreate <component>. Optional components start only
+      when named with --component or enabled by a changed path matching
+      their enabled_by, and stay selected; selecting one needs no
+      --reconfigure.
   aethyme env down <id> [--json]
       Destroy the environment (reverse dependency order) and release its
       leases only after every destroy hook succeeded. A failing destroy
@@ -183,6 +190,10 @@ pub(super) struct Options {
     pub(super) limit: usize,
     pub(super) wait_seconds: u64,
     pub(super) reconfigure: bool,
+    /// `env up --recreate <component>` (E20), repeatable.
+    pub(super) recreate: Vec<String>,
+    /// `env up --component <name>` (E20), repeatable.
+    pub(super) components: Vec<String>,
     pub(super) retry: bool,
     pub(super) abandon: bool,
     pub(super) reason: Option<String>,
@@ -280,6 +291,8 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
         limit: 200,
         wait_seconds: 300,
         reconfigure: false,
+        recreate: Vec::new(),
+        components: Vec::new(),
         retry: false,
         abandon: false,
         reason: None,
@@ -308,6 +321,16 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
                 options.wait_seconds = number(args.next(), "--wait")? as u64
             }
             "--reconfigure" if command == "up" => options.reconfigure = true,
+            "--recreate" if command == "up" => options.recreate.push(
+                args.next()
+                    .ok_or_else(|| usage("--recreate needs a component name".into()))?
+                    .clone(),
+            ),
+            "--component" if command == "up" => options.components.push(
+                args.next()
+                    .ok_or_else(|| usage("--component needs a component name".into()))?
+                    .clone(),
+            ),
             "--retry" if command == "destroy" => options.retry = true,
             "--abandon" if command == "destroy" => options.abandon = true,
             "--for" if command == "pin" => {
@@ -584,6 +607,9 @@ fn run_plan(options: &Options) -> Result<Output, Failure> {
                 exit: exit_status::USAGE,
             }
         })?;
+    // Optional components are off unless `env up` selects them (E20).
+    let mut compiled = compiled;
+    super::compile::select_components(&mut compiled, &Default::default());
     let plans = advisory_plans(&compiled)?;
     Ok(render_plan(&compiled, plans))
 }

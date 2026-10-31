@@ -256,6 +256,13 @@ pub struct ComponentSpec {
     pub cache_env: Vec<String>,
     #[serde(default)]
     pub template_inputs: Vec<String>,
+    /// E20: off unless selected with `env up --component` or enabled by a
+    /// changed path matching `enabled_by`.
+    #[serde(default)]
+    pub optional: bool,
+    /// E20: globs over the diff that enable this optional component.
+    #[serde(default)]
+    pub enabled_by: Vec<String>,
     /// E21: requests to this routed component's host whose path starts with
     /// `prefix` go to `to` instead (#1296).
     #[serde(default)]

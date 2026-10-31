@@ -15,13 +15,13 @@
 //! stays within one path segment and `**` crosses directories, so
 //! `src/**/*.rs` matches `src/a/b.rs`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 
-use super::compile::default_profile_name;
+use super::compile::{CompiledEnvironment, default_profile_name};
 use super::spec::EnvironmentsFile;
 use super::validate::effective_rank;
 
@@ -71,6 +71,26 @@ fn rule_set(patterns: &[String]) -> Result<GlobSet, String> {
 }
 
 /// The minimum profile for `paths` under `file`'s rules.
+/// Optional components of `snapshot` that `paths` enable through their
+/// `enabled_by` globs (E20).
+pub fn enabled_components(
+    snapshot: &CompiledEnvironment,
+    paths: &[String],
+) -> Result<BTreeSet<String>, String> {
+    let mut enabled = BTreeSet::new();
+    for component in snapshot
+        .components
+        .iter()
+        .filter(|c| c.optional && !c.enabled_by.is_empty())
+    {
+        let set = rule_set(&component.enabled_by)?;
+        if paths.iter().any(|path| set.is_match(path.as_str())) {
+            enabled.insert(component.name.clone());
+        }
+    }
+    Ok(enabled)
+}
+
 pub fn infer(file: &EnvironmentsFile, paths: &[String]) -> Result<Inference, String> {
     let fallback = default_profile_name(file).ok_or("no profiles are declared")?;
     let mut minimum = (

@@ -640,6 +640,21 @@ fn validate_profile(
                     "name a component of the same profile",
                 );
             }
+            if !component.optional
+                && profile
+                    .components
+                    .iter()
+                    .any(|other| &other.name == dependency && other.optional)
+            {
+                c.push(
+                    "depends_on_optional",
+                    p,
+                    Some(&component.name),
+                    Some("depends_on"),
+                    format!("{dependency:?} is optional, so this component could start without it"),
+                    "make this component optional too, or the dependency required",
+                );
+            }
         }
     }
     if let Some(cycle) = find_cycle(&profile.components) {
@@ -1019,6 +1034,28 @@ fn validate_component(
                 Some("pass_env"),
                 format!("{name:?} is not a valid environment variable name"),
                 "use [A-Za-z_][A-Za-z0-9_]*",
+            );
+        }
+    }
+    if !component.enabled_by.is_empty() && !component.optional {
+        c.push(
+            "enabled_by_without_optional",
+            p,
+            n,
+            Some("enabled_by"),
+            "enabled_by only selects optional components",
+            "add optional = true, or remove enabled_by",
+        );
+    }
+    for pattern in &component.enabled_by {
+        if let Err(error) = Glob::new(pattern) {
+            c.push(
+                "invalid_glob",
+                p,
+                n,
+                Some("enabled_by"),
+                format!("{pattern:?}: {error}"),
+                "fix the glob syntax",
             );
         }
     }

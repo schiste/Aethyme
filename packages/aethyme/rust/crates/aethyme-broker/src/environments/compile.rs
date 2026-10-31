@@ -16,7 +16,7 @@
 //! Parking releases the second and keeps the first, so no lease ever holds a
 //! partial allocation and lease states stay `active | quarantined | released`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -98,6 +98,11 @@ pub struct CompiledEnvironment {
     pub uses_shared: Vec<String>,
     /// Topological order: every component follows its dependencies.
     pub components: Vec<CompiledComponent>,
+    /// Port keys of optional components left out by the selection (E20):
+    /// still reserved, so selecting one later never changes the
+    /// reservation and the environment can be reconfigured in place.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reserved_port_keys: Vec<String>,
     pub source: SnapshotSource,
     /// Digest of everything above except `source`, so committing an unchanged
     /// file does not look like a reconfiguration.
@@ -163,6 +168,12 @@ pub struct CompiledComponent {
     pub build_output: Option<String>,
     pub cache_env: Vec<String>,
     pub template_inputs: Vec<String>,
+    /// Omitted when false or empty, so a snapshot without optional
+    /// components keeps the digest it had before E20.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enabled_by: Vec<String>,
     /// Per-path routes (#1296). Omitted when empty, so existing snapshot
     /// digests are unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -281,6 +292,7 @@ pub fn compile(
         port_range: (file.ports.start, file.ports.end),
         uses_shared: profile.uses_shared.clone(),
         components,
+        reserved_port_keys: Vec::new(),
         source: SnapshotSource {
             file: file_label.to_string(),
             file_digest: context.source_digest.clone(),
@@ -331,6 +343,8 @@ fn compile_component(file: &EnvironmentsFile, component: &ComponentSpec) -> Comp
         build_output: component.build_output.clone(),
         cache_env: component.cache_env.clone(),
         template_inputs: component.template_inputs.clone(),
+        optional: component.optional,
+        enabled_by: component.enabled_by.clone(),
         paths: component.paths.clone(),
     }
 }
@@ -354,6 +368,31 @@ pub fn topological_order(components: &[ComponentSpec]) -> Option<Vec<&ComponentS
         placed.push(remaining.remove(ready));
     }
     Some(placed)
+}
+
+/// Keep the optional components in `selected`, and the optional
+/// components they depend on; leave the rest out, keeping their ports
+/// reserved (E20). Recomputes the digest.
+pub fn select_components(compiled: &mut CompiledEnvironment, selected: &BTreeSet<String>) {
+    let mut keep: BTreeSet<String> = compiled
+        .components
+        .iter()
+        .filter(|c| !c.optional || selected.contains(&c.name))
+        .map(|c| c.name.clone())
+        .collect();
+    // Components follow their dependencies, so one reverse pass pulls in
+    // every dependency of a kept component.
+    for component in compiled.components.iter().rev() {
+        if keep.contains(&component.name) {
+            keep.extend(component.depends_on.iter().cloned());
+        }
+    }
+    let (kept, dropped): (Vec<_>, Vec<_>) = std::mem::take(&mut compiled.components)
+        .into_iter()
+        .partition(|c| keep.contains(&c.name));
+    compiled.components = kept;
+    compiled.reserved_port_keys = dropped.into_iter().filter_map(|c| c.port_key).collect();
+    compiled.digest = snapshot_digest(compiled);
 }
 
 fn snapshot_digest(compiled: &CompiledEnvironment) -> String {
@@ -387,16 +426,19 @@ impl CompiledEnvironment {
                 prefix: self.env_id.clone(),
             },
         }];
-        for component in &self.components {
-            if let Some(key) = &component.port_key {
-                resources.push(HostResourceRequirement {
-                    key: key.clone(),
-                    resource: HostResourceKind::TcpPort {
-                        start: self.port_range.0,
-                        end: self.port_range.1,
-                    },
-                });
-            }
+        let keys = self
+            .components
+            .iter()
+            .filter_map(|c| c.port_key.as_ref())
+            .chain(&self.reserved_port_keys);
+        for key in keys {
+            resources.push(HostResourceRequirement {
+                key: key.clone(),
+                resource: HostResourceKind::TcpPort {
+                    start: self.port_range.0,
+                    end: self.port_range.1,
+                },
+            });
         }
         HostResourceRequest {
             schema_version: HOST_RESOURCE_REQUEST_SCHEMA_VERSION,

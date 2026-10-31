@@ -422,6 +422,27 @@ fn every_rule_has_a_located_diagnostic() {
             component: None,
             field: "default_idle_seconds",
         },
+        Case {
+            name: "required depends on optional",
+            toml: profile(
+                "{ name = \"a\", runtime = \"process\", start = \"x\", optional = true },\
+                 { name = \"b\", runtime = \"process\", start = \"x\", depends_on = [\"a\"] }",
+            ),
+            code: "depends_on_optional",
+            profile: Some("p"),
+            component: Some("b"),
+            field: "depends_on",
+        },
+        Case {
+            name: "enabled_by without optional",
+            toml: profile(
+                "{ name = \"a\", runtime = \"process\", start = \"x\", enabled_by = [\"web/**\"] }",
+            ),
+            code: "enabled_by_without_optional",
+            profile: Some("p"),
+            component: Some("a"),
+            field: "enabled_by",
+        },
     ];
     for case in cases {
         let found = diagnostics(&case.toml);
