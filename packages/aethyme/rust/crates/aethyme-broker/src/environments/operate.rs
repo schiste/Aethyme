@@ -845,6 +845,79 @@ pub(super) fn run_shared(options: &Options) -> Result<Output, Failure> {
     Ok((value, text, exit_status::SUCCESS))
 }
 
+/// `env budgets` (#1239): declared budgets against recorded timings and
+/// measured footprints. Read-only; a host with no store reports no data.
+pub(super) fn run_budgets(options: &Options) -> Result<Output, Failure> {
+    let workspace = workspace(options)?;
+    let checked = check(&workspace)?;
+    let Some(file) = checked
+        .file
+        .as_ref()
+        .filter(|_| checked.diagnostics.is_empty())
+    else {
+        return Err(Failure {
+            code: "invalid_environments_file",
+            message: format!("{ENVIRONMENTS_FILE} has validation problems"),
+            next_action: "run `aethyme env validate` and fix every problem".into(),
+            exit: exit_status::VERIFICATION_FAILED,
+        });
+    };
+    let repository = crate::gates::git_origin_fingerprint(&workspace.repo);
+    let (timings, footprints) = match EnvironmentStore::open_default_read_only()
+        .map_err(|error| environment_failure(error.to_string()))?
+    {
+        Some(store) => (
+            store
+                .timings(&repository)
+                .map_err(|error| environment_failure(error.to_string()))?,
+            store
+                .footprints(&repository)
+                .map_err(|error| environment_failure(error.to_string()))?,
+        ),
+        None => Default::default(),
+    };
+    let metrics = super::budgets::report(&file.budgets, &timings, &footprints);
+    let mut text = String::new();
+    if metrics.is_empty() {
+        text.push_str("no budgets declared and nothing recorded yet\n");
+    }
+    let number = |value: Option<f64>| value.map_or_else(|| "-".to_string(), |v| format!("{v:.1}"));
+    for metric in &metrics {
+        text.push_str(&format!(
+            "  {:<28} {:<9} n={:<4} p50 {:>8} p95 {:>8} budget {:>6} {}{}\n",
+            metric.metric,
+            metric.status,
+            metric.count,
+            number(metric.p50),
+            number(metric.p95),
+            metric
+                .budget
+                .map_or_else(|| "-".to_string(), |b| b.to_string()),
+            if metric.unit == "seconds" { "s" } else { "MiB" },
+            metric
+                .trend
+                .as_ref()
+                .map(|t| format!("  trend {:+.1}%", t.change_pct))
+                .unwrap_or_default(),
+        ));
+        if metric.failures > 0 {
+            text.push_str(&format!(
+                "      {} failed run(s) kept apart\n",
+                metric.failures
+            ));
+        }
+    }
+    Ok((
+        json!({
+            "schema": super::cli::BUDGETS_SCHEMA,
+            "repository": repository,
+            "metrics": metrics,
+        }),
+        text,
+        exit_status::SUCCESS,
+    ))
+}
+
 pub(super) fn run_calibrate(options: &Options) -> Result<Output, Failure> {
     let workspace = workspace(options)?;
     let checked = check(&workspace)?;

@@ -45,6 +45,23 @@ pub struct EnvironmentsFile {
     /// E9: host-scoped environments owned by a ref. Validated here.
     #[serde(default)]
     pub shared: Vec<SharedSpec>,
+    /// E13 (#1239): declared budgets that `env budgets` compares the
+    /// recorded timings and measured footprints against.
+    #[serde(default)]
+    pub budgets: BudgetsSpec,
+}
+
+/// `[budgets.seconds]` per metric (`up.<profile>` for a warm up, `up.cold`
+/// for one that provisioned, `park`, `down`, `provision|start|health.<c>`,
+/// or any name a hook reports) and `[budgets.memory_mib]` per profile.
+/// Unknown metric names are allowed: a hook may report one later.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetsSpec {
+    #[serde(default)]
+    pub seconds: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub memory_mib: BTreeMap<String, u64>,
 }
 
 fn default_idle_seconds() -> u64 {
