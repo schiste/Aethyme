@@ -246,7 +246,8 @@ pub struct ComponentSpec {
     /// `static`: the directory served, relative to the worktree root.
     #[serde(default)]
     pub serve_dir: Option<String>,
-    /// The page to open, appended to the component's URL (`/o/`, #1292).
+    /// The page to open for a listening process, compose or container component.
+    /// Appended to that component's URL (`/o/`, #1292).
     #[serde(default)]
     pub entry_path: Option<String>,
     /// E11: build cache inputs.
