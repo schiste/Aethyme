@@ -1197,17 +1197,19 @@ fn run_gc_artifact_use_reconcile(parsed: Parsed) -> Result<(), UsageError> {
         };
     let session = broker.store().session(session_id)?;
     let checkout_root = PathBuf::from(&session.worktree_path);
-    let cohort = broker
-        .closed_artifact_checkout_cohort_for_session_readonly(
-            session_id,
-            &checkout_root,
-            None,
-        )?
-        .ok_or_else(|| {
-            UsageError::Message(
-                "the selected session does not have a complete, closed checkout cohort; no markers were changed".into(),
-            )
-        })?;
+    let cohort = match broker.closed_artifact_checkout_cohort_for_session_readonly(
+        session_id,
+        &checkout_root,
+        None,
+    )? {
+        crate::auto_cleanup::ClosedArtifactCheckoutCohortResolution::Available(cohort) => cohort,
+        crate::auto_cleanup::ClosedArtifactCheckoutCohortResolution::Unavailable(reason) => {
+            return Err(UsageError::Message(format!(
+                "artifact-use reconciliation refused: {}; no markers were changed. Inspect the selected session and `aethyme broker gc plan --json` for the missing checkout proof; do not remove markers manually",
+                reason.code()
+            )));
+        }
+    };
 
     let cwd = std::env::current_dir()
         .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;
