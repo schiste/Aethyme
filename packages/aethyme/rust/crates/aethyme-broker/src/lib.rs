@@ -580,13 +580,13 @@ pub use resources::{
 };
 pub use retention::{
     BROKER_CONFIG_RELPATH, GcApplyReport, GcArtifactCandidate, GcBlocker, GcBlockerSummary,
-    GcCheckpointPinRelease, GcDeclinedArtifact, GcFileAction, GcFileCandidate,
-    GcGateCacheCandidate, GcGateCacheDisposition, GcGateCacheEntry, GcGateCacheInventory, GcHealth,
-    GcOrphanCandidate, GcPlan, GcPublicationExposureExpiry, GcRecoveryArchiveCandidate,
-    GcRowCandidate, GcRowKind, GcWorktreeBlockerSummary, GcWorktreeCandidate,
-    RETENTION_POLICY_SCHEMA_VERSION, RecoveryArchiveInventory, RetentionConfigError,
-    RetentionConfigWarning, RetentionPolicy, RetentionPolicyLoadReport, load_retention_policy,
-    load_retention_policy_report,
+    GcCheckpointPinRelease, GcDeclinedArtifact, GcEnvironmentCacheCandidate,
+    GcEnvironmentCacheInventory, GcFileAction, GcFileCandidate, GcGateCacheCandidate,
+    GcGateCacheDisposition, GcGateCacheEntry, GcGateCacheInventory, GcHealth, GcOrphanCandidate,
+    GcPlan, GcPublicationExposureExpiry, GcRecoveryArchiveCandidate, GcRowCandidate, GcRowKind,
+    GcWorktreeBlockerSummary, GcWorktreeCandidate, RETENTION_POLICY_SCHEMA_VERSION,
+    RecoveryArchiveInventory, RetentionConfigError, RetentionConfigWarning, RetentionPolicy,
+    RetentionPolicyLoadReport, load_retention_policy, load_retention_policy_report,
 };
 pub use review::{
     REVIEW_POLICY_SCHEMA_VERSION, ReviewEvidenceAdapter, ReviewLifecycle,

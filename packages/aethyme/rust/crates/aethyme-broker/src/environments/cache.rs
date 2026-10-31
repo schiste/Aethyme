@@ -35,13 +35,15 @@
 //!
 //! The cache lives in `<host state>/environments/cache/`, bounded by
 //! [`DEFAULT_CACHE_MAX_BYTES`] (`AETHYME_ENV_CACHE_MAX_BYTES`); `env cache
-//! prune` evicts least recently used entries no live environment uses. It is
-//! not yet charged to the host managed-storage ledger (`broker gc plan`).
+//! prune` evicts least recently used entries no live environment uses.
+//! `broker gc plan` reports a repository's part of it and proposes the builds
+//! prune would evict, and `gc apply` evicts each through the same key and use
+//! check, and only if nobody used it since the plan (#1275).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use globset::{GlobBuilder, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
@@ -52,6 +54,7 @@ use super::drivers::DriverContext;
 use super::exec::{DriverError, append_log, run_hook};
 use super::lifecycle::Lifecycle;
 use super::spec::Runtime;
+use super::store::EnvironmentStore;
 
 pub const CACHE_DIRECTORY: &str = "cache";
 pub const BUILDS: &str = "builds";
@@ -67,6 +70,14 @@ pub const TEMPLATE_ID_VARIABLE: &str = "AETHYME_ENV_TEMPLATE_ID";
 const COALESCE_WAIT: Duration = Duration::from_secs(1800);
 /// Prune never waits long for an entry someone is using right now.
 const PRUNE_WAIT: Duration = Duration::from_secs(2);
+const CACHE_GC_MAX_DURATION: Duration = Duration::from_secs(3);
+const CACHE_GC_MAX_USE_BYTES: usize = 16 * 1024 * 1024;
+const CACHE_GC_MAX_USE_PATHS: usize = 100_000;
+
+fn cache_gc_deadline(deadline: Option<Instant>) -> Option<Instant> {
+    let ceiling = Instant::now() + CACHE_GC_MAX_DURATION;
+    Some(deadline.map_or(ceiling, |deadline| deadline.min(ceiling)))
+}
 
 fn io(what: &str) -> impl FnOnce(std::io::Error) -> DriverError + '_ {
     move |source| DriverError::Io {
@@ -85,6 +96,22 @@ fn repository_dir(repository: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
         .take(48)
         .collect()
+}
+
+fn planned_build_cache_lock(
+    candidate: &crate::GcEnvironmentCacheCandidate,
+) -> Result<(&str, &str), String> {
+    candidate.coordinated_build_lock().ok_or_else(|| {
+        let code = if candidate.cache_key.is_none() {
+            "environment_cache_lock_key_missing"
+        } else {
+            "environment_cache_lock_key_invalid"
+        };
+        format!(
+            "{}: {code}: the exact historical build-reader lock cannot be proven; retain the entry, archive an old plan with aethyme broker gc abandon --confirm <digest>, and review a fresh aethyme broker gc plan",
+            candidate.path
+        )
+    })
 }
 
 /// Whether `path` names a subdirectory of the worktree: relative, non-empty,
@@ -522,89 +549,148 @@ impl Lifecycle {
             .map_err(io("record a cache use"))
     }
 
-    /// Every entry a live environment uses. Fails closed: when the store
-    /// cannot be read, or a live environment with cacheable components has
-    /// no readable use record, nobody can say what is safe to evict.
     fn entries_in_use(&self) -> Result<Vec<PathBuf>, String> {
-        let records = self.store.list(None).map_err(|e| e.to_string())?;
-        let mut entries = Vec::new();
-        for record in records.iter().filter(|r| r.phase.retains_worktree()) {
-            let caches = record.snapshot.components.iter().any(|c| {
-                c.commands.template.is_some()
-                    || (c.commands.build.is_some() && !c.cache_inputs.is_empty())
-            });
-            let uses = super::logs::environment_directory(&self.root, &record.env_id)
-                .and_then(|d| std::fs::read(d.join(USES_FILE)).ok())
-                .and_then(|bytes| serde_json::from_slice::<CacheUses>(&bytes).ok());
-            match uses {
-                Some(uses) => entries.extend(uses.entries),
-                None if caches => {
-                    return Err(format!(
-                        "cannot tell which cache entries {} uses",
-                        record.env_id
-                    ));
-                }
-                None => {}
-            }
-        }
-        Ok(entries)
+        entries_in_use(&self.store, &self.root)
     }
 
     pub fn cache_entries(&self) -> Vec<CacheEntry> {
         let in_use = self.entries_in_use().unwrap_or_default();
-        let mut entries = Vec::new();
-        let builds = self.cache_root().join(BUILDS);
-        for repository in read_dirs(&builds) {
-            for component in read_dirs(&repository) {
-                for entry in read_dirs(&component) {
-                    let last_used = std::fs::metadata(entry.join(COMPLETE))
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_millis() as i64);
-                    entries.push(CacheEntry {
-                        kind: "build",
-                        component: file_name(&component),
-                        digest: file_name(&entry),
-                        bytes: directory_bytes(&entry),
-                        last_used,
-                        in_use: in_use.contains(&entry),
-                        key: std::fs::read_to_string(entry.join(KEY_FILE)).ok(),
-                        path: entry,
-                    });
-                }
-            }
+        cache_entries(&self.cache_root(), &in_use)
+    }
+
+    /// Evict one build a reviewed `broker gc apply` proposed (#1275), as
+    /// prune would: under its key, never while in use, and only if nobody
+    /// used it since the plan. `Ok(false)` when it is already gone.
+    pub fn evict_planned_build(
+        &mut self,
+        candidate: &crate::GcEnvironmentCacheCandidate,
+    ) -> Result<bool, String> {
+        self.evict_planned_build_with(candidate, None, || Ok(()))
+    }
+
+    fn evict_planned_build_with(
+        &mut self,
+        candidate: &crate::GcEnvironmentCacheCandidate,
+        deadline: Option<Instant>,
+        before_delete: impl FnOnce() -> Result<(), String>,
+    ) -> Result<bool, String> {
+        let deadline = cache_gc_deadline(deadline);
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err("environment cache eviction exceeded its bounded deadline".into());
         }
-        let templates = self.cache_root().join(TEMPLATES);
-        for repository in read_dirs(&templates) {
-            for component in read_dirs(&repository) {
-                for marker in std::fs::read_dir(&component)
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                {
-                    let path = marker.path();
-                    let key = std::fs::read(&path)
-                        .ok()
-                        .and_then(|bytes| serde_json::from_slice::<TemplateMarker>(&bytes).ok())
-                        .map(|m| m.key);
-                    entries.push(CacheEntry {
-                        kind: "template",
-                        component: file_name(&component),
-                        digest: path
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                        bytes: 0,
-                        last_used: None,
-                        in_use: in_use.contains(&path),
-                        key,
-                        path,
-                    });
-                }
-            }
+        if !candidate.has_identity_bound_location() {
+            return Err(format!(
+                "{}: {}: saved environment-cache candidate lacks its planned filesystem identity",
+                candidate.path,
+                crate::retention::GC_ENVIRONMENT_CACHE_IDENTITY_MISSING
+            ));
         }
-        entries
+        let environment_root =
+            std::fs::canonicalize(&self.root).map_err(|error| error.to_string())?;
+        let cache_root = environment_root.join(CACHE_DIRECTORY);
+        let path = cache_root
+            .join(BUILDS)
+            .join(&candidate.repository)
+            .join(&candidate.component)
+            .join(&candidate.digest);
+        if candidate.repository.is_empty()
+            || candidate.component.is_empty()
+            || candidate.digest.is_empty()
+            || candidate.path != path.to_string_lossy().as_ref()
+            || candidate.cache_root != cache_root.to_string_lossy().as_ref()
+        {
+            return Err(format!(
+                "{}: the cache candidate has no valid identity-bound location",
+                candidate.path
+            ));
+        }
+        if !single_path_component(&candidate.repository)
+            || !single_path_component(&candidate.component)
+            || !single_path_component(&candidate.digest)
+        {
+            return Err(format!(
+                "{}: not an environment build cache entry",
+                candidate.path
+            ));
+        }
+        let (lock_repository, expected_key) = planned_build_cache_lock(candidate)?;
+        let wait = deadline.map_or(PRUNE_WAIT, |deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(PRUNE_WAIT)
+        });
+        if wait.is_zero() {
+            return Err("environment cache eviction exceeded its bounded deadline".into());
+        }
+        let outcome = self.exclusive(lock_repository, expected_key, wait, |this| {
+            let in_use = entries_in_use_until(&this.store, &this.root, deadline)?;
+            if in_use.contains(&path) {
+                return Err("in use".to_string());
+            }
+            let result = crate::resources::cache_gc_fs::remove_build(
+                &environment_root,
+                &cache_root,
+                crate::resources::cache_gc_fs::CacheFsIdentity {
+                    device: candidate.cache_root_device,
+                    inode: candidate.cache_root_inode,
+                },
+                &candidate.repository,
+                &candidate.component,
+                &candidate.digest,
+                crate::resources::cache_gc_fs::CacheFsIdentity {
+                    device: candidate.entry_device,
+                    inode: candidate.entry_inode,
+                },
+                Some(expected_key),
+                candidate.last_used_at_ms,
+                candidate.deletion_started,
+                before_delete,
+                deadline,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(matches!(
+                result,
+                crate::resources::cache_gc_fs::DeleteOutcome::Removed
+            ))
+        });
+        outcome.unwrap_or_else(|| {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                Err("environment cache eviction exceeded its bounded deadline".into())
+            } else {
+                Err("being built or used right now".into())
+            }
+        })
+    }
+
+    /// Evict one entry under its key, re-checking under it that no live
+    /// environment uses it and that nobody used it since it was listed.
+    fn evict_entry(&mut self, entry: &CacheEntry) -> Result<(), String> {
+        let key = entry.key.clone().unwrap_or_else(|| {
+            let path = entry.path.to_string_lossy();
+            format!(
+                "aethyme-env-cache-path:{:x}",
+                Sha256::digest(path.as_bytes())
+            )
+        });
+        let outcome = self.exclusive("environment-cache", &key, PRUNE_WAIT, |this| {
+            let canonical_entry =
+                std::fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
+            match this.entries_in_use() {
+                Ok(in_use) if in_use.contains(&canonical_entry) => {
+                    return Err("in use".to_string());
+                }
+                Ok(_) => {}
+                Err(reason) => return Err(reason),
+            }
+            if entry.kind == "build" && last_used(&entry.path) != entry.last_used {
+                return Err("used since it was listed".to_string());
+            }
+            match entry.kind {
+                "template" => this.evict_template(&entry.path),
+                _ => std::fs::remove_dir_all(&entry.path).map_err(|e| e.to_string()),
+            }
+        });
+        outcome.unwrap_or_else(|| Err("being built or used right now".into()))
     }
 
     /// Evict unused entries: every unused one with `all`, else least recently
@@ -618,49 +704,22 @@ impl Lifecycle {
             report.refused = Some(reason);
             return report;
         }
-        let budget = std::env::var(MAX_BYTES_ENV)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_CACHE_MAX_BYTES);
+        let budget = budget_bytes();
         let everything = self.cache_entries();
         let mut total: u64 = everything.iter().map(|e| e.bytes).sum();
         let mut candidates: Vec<CacheEntry> =
             everything.into_iter().filter(|e| !e.in_use).collect();
         candidates.sort_by_key(|e| e.last_used.unwrap_or(0));
-        let repository = "environment-cache".to_string();
         for entry in candidates {
             if !all && (entry.kind == "template" || total <= budget) {
                 continue;
             }
-            let key = entry.key.clone().unwrap_or_else(|| {
-                let path = entry.path.to_string_lossy();
-                format!(
-                    "aethyme-env-cache-path:{:x}",
-                    Sha256::digest(path.as_bytes())
-                )
-            });
-            let outcome = self.exclusive(&repository, &key, PRUNE_WAIT, |this| {
-                match this.entries_in_use() {
-                    Ok(in_use) if in_use.contains(&entry.path) => {
-                        return Err("in use".to_string());
-                    }
-                    Ok(_) => {}
-                    Err(reason) => return Err(reason),
-                }
-                match entry.kind {
-                    "template" => this.evict_template(&entry.path),
-                    _ => std::fs::remove_dir_all(&entry.path).map_err(|e| e.to_string()),
-                }
-            });
-            match outcome {
-                Some(Ok(())) => {
+            match self.evict_entry(&entry) {
+                Ok(()) => {
                     total = total.saturating_sub(entry.bytes);
                     report.evicted.push(entry.path);
                 }
-                Some(Err(reason)) => report.kept.push((entry.path, reason)),
-                None => report
-                    .kept
-                    .push((entry.path, "being built or used right now".into())),
+                Err(reason) => report.kept.push((entry.path, reason)),
             }
         }
         report
@@ -688,6 +747,557 @@ impl Lifecycle {
         .map_err(|error| format!("template_destroy failed: {error}"))?;
         std::fs::remove_file(marker).map_err(|e| e.to_string())
     }
+}
+
+fn single_path_component(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains('/')
+        && !value.contains('\0')
+        && Path::new(value)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn budget_bytes() -> u64 {
+    std::env::var(MAX_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_CACHE_MAX_BYTES)
+}
+
+/// When a build was last used: its `.complete` marker is rewritten on every hit.
+fn last_used(entry: &Path) -> Option<i64> {
+    std::fs::metadata(entry.join(COMPLETE))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+}
+
+/// Every entry a live environment uses. Fails closed: when the store
+/// cannot be read, or a live environment with cacheable components has
+/// no readable use record, nobody can say what is safe to evict.
+fn entries_in_use(store: &EnvironmentStore, root: &Path) -> Result<Vec<PathBuf>, String> {
+    let records = store.list(None).map_err(|error| error.to_string())?;
+    let root = std::fs::canonicalize(root).map_err(|error| error.to_string())?;
+    let mut entries = Vec::new();
+    for record in records
+        .iter()
+        .filter(|record| record.phase.retains_worktree())
+    {
+        if !snapshot_uses_cache(&record.snapshot) {
+            continue;
+        }
+        let directory = root.join(&record.env_id);
+        let Some(bytes) = std::fs::read(directory.join(USES_FILE)).ok() else {
+            return Err(format!(
+                "cannot tell which cache entries {} uses",
+                record.env_id
+            ));
+        };
+        let uses: CacheUses = serde_json::from_slice(&bytes).map_err(|error| {
+            format!("cache use record for {} is invalid: {error}", record.env_id)
+        })?;
+        for entry in uses.entries {
+            if !entry.is_absolute() {
+                return Err(format!(
+                    "cache use record for {} contains a non-absolute path",
+                    record.env_id
+                ));
+            }
+            match std::fs::canonicalize(&entry) {
+                Ok(path) => {
+                    entries.insert(path);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "cannot resolve cache use {} for {}: {error}",
+                        entry.display(),
+                        record.env_id
+                    ));
+                }
+            }
+        }
+    }
+    Ok(entries)
+}
+
+fn snapshot_uses_cache(snapshot: &CompiledEnvironment) -> bool {
+    snapshot.components.iter().any(|component| {
+        component.commands.template.is_some()
+            || (component.commands.build.is_some() && !component.cache_inputs.is_empty())
+    })
+}
+
+fn entries_in_use_until(
+    store: &EnvironmentStore,
+    root: &Path,
+    deadline: Option<Instant>,
+) -> Result<HashSet<PathBuf>, String> {
+    let records = store
+        .cache_gc_records(deadline)
+        .map_err(|error| error.to_string())?;
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err("cache-use inspection exceeded its bounded deadline".into());
+    }
+    let root = std::fs::canonicalize(root).map_err(|error| error.to_string())?;
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err("cache-use inspection exceeded its bounded deadline".into());
+    }
+    let mut entries = HashSet::new();
+    let mut use_record_bytes = 0_usize;
+    let mut use_paths = 0_usize;
+    for record in records.iter().filter(|r| r.phase.retains_worktree()) {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err("cache-use inspection exceeded its bounded deadline".into());
+        }
+        if !snapshot_uses_cache(&record.snapshot) {
+            continue;
+        }
+        let directory = root.join(&record.env_id);
+        let bytes = crate::resources::cache_gc_fs::read_regular_file(
+            &directory,
+            USES_FILE,
+            1024 * 1024,
+            deadline,
+        )
+        .map_err(|error| error.to_string())?;
+        match bytes {
+            Some(bytes) => {
+                use_record_bytes = use_record_bytes
+                    .checked_add(bytes.len())
+                    .filter(|total| *total <= CACHE_GC_MAX_USE_BYTES)
+                    .ok_or_else(|| "cache-use metadata byte limit exceeded".to_string())?;
+                let uses: CacheUses = serde_json::from_slice(&bytes).map_err(|error| {
+                    format!("cache use record for {} is invalid: {error}", record.env_id)
+                })?;
+                for entry in uses.entries {
+                    use_paths = use_paths
+                        .checked_add(1)
+                        .filter(|count| *count <= CACHE_GC_MAX_USE_PATHS)
+                        .ok_or_else(|| "cache-use path count limit exceeded".to_string())?;
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        return Err("cache-use inspection exceeded its bounded deadline".into());
+                    }
+                    if !entry.is_absolute() {
+                        return Err(format!(
+                            "cache use record for {} contains a non-absolute path",
+                            record.env_id
+                        ));
+                    }
+                    let resolved = std::fs::canonicalize(&entry);
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        return Err("cache-use inspection exceeded its bounded deadline".into());
+                    }
+                    match resolved {
+                        Ok(path) => {
+                            entries.insert(path);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(format!(
+                                "cannot resolve cache use {} for {}: {error}",
+                                entry.display(),
+                                record.env_id
+                            ));
+                        }
+                    }
+                }
+            }
+            None => {
+                return Err(format!(
+                    "cannot tell which cache entries {} uses",
+                    record.env_id
+                ));
+            }
+        }
+    }
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err("cache-use inspection exceeded its bounded deadline".into());
+    }
+    Ok(entries)
+}
+
+fn cache_entries(cache_root: &Path, in_use: &[PathBuf]) -> Vec<CacheEntry> {
+    let mut entries = Vec::new();
+    let builds = cache_root.join(BUILDS);
+    for repository in read_dirs(&builds) {
+        for component in read_dirs(&repository) {
+            for entry in read_dirs(&component) {
+                let last_used = last_used(&entry);
+                let canonical_entry =
+                    std::fs::canonicalize(&entry).unwrap_or_else(|_| entry.clone());
+                entries.push(CacheEntry {
+                    kind: "build",
+                    component: file_name(&component),
+                    digest: file_name(&entry),
+                    bytes: directory_bytes(&entry),
+                    last_used,
+                    in_use: in_use.contains(&canonical_entry),
+                    key: std::fs::read_to_string(entry.join(KEY_FILE)).ok(),
+                    path: entry,
+                });
+            }
+        }
+    }
+    let templates = cache_root.join(TEMPLATES);
+    for repository in read_dirs(&templates) {
+        for component in read_dirs(&repository) {
+            for marker in std::fs::read_dir(&component)
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let path = marker.path();
+                let canonical_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                let key = std::fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<TemplateMarker>(&bytes).ok())
+                    .map(|m| m.key);
+                entries.push(CacheEntry {
+                    kind: "template",
+                    component: file_name(&component),
+                    digest: path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    bytes: 0,
+                    last_used: None,
+                    in_use: in_use.contains(&canonical_path),
+                    key,
+                    path,
+                });
+            }
+        }
+    }
+    entries
+}
+
+/// This repository's part of the cache, and the builds `env cache prune`
+/// would evict from it now: unused, least recently used first, while the
+/// whole cache is over `budget`. Nothing is proposed when live use cannot
+/// be known. `None` when the repository has no entries.
+pub fn gc_inventory(
+    store: Option<&EnvironmentStore>,
+    root: &Path,
+    repository: &str,
+    budget: u64,
+    deadline: Option<Instant>,
+) -> (
+    Option<crate::GcEnvironmentCacheInventory>,
+    Vec<crate::GcEnvironmentCacheCandidate>,
+) {
+    let deadline = cache_gc_deadline(deadline);
+    let fallback_cache_root = root.join(CACHE_DIRECTORY);
+    let fallback_repo_root = fallback_cache_root
+        .join(BUILDS)
+        .join(repository_dir(repository));
+    let scanned = match crate::resources::cache_gc_fs::inventory(root, deadline) {
+        Ok(Some(scanned)) => scanned,
+        Ok(None) => return (None, Vec::new()),
+        Err(error) => {
+            return (
+                Some(incomplete_cache_inventory(
+                    &fallback_repo_root,
+                    budget,
+                    error.code,
+                    error.to_string(),
+                )),
+                Vec::new(),
+            );
+        }
+    };
+    let repository_directory = repository_dir(repository);
+    let mine: Vec<&crate::resources::cache_gc_fs::BuildEntry> = scanned
+        .builds
+        .iter()
+        .filter(|entry| entry.repository == repository_directory)
+        .collect();
+    let template_entries = scanned
+        .templates_by_repository
+        .get(&repository_directory)
+        .copied()
+        .unwrap_or(0);
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return (
+            Some(incomplete_cache_inventory(
+                &scanned.cache_root.join(BUILDS).join(&repository_directory),
+                budget,
+                "deadline_exceeded",
+                "environment cache inventory exceeded its bounded deadline".into(),
+            )),
+            Vec::new(),
+        );
+    }
+    if mine.is_empty() && template_entries == 0 {
+        return (None, Vec::new());
+    }
+    let in_use = match store.map(|store| entries_in_use_until(store, root, deadline)) {
+        Some(Ok(in_use)) => in_use,
+        Some(Err(reason)) => {
+            let code = if reason.contains("bounded deadline") {
+                "deadline_exceeded"
+            } else {
+                "store_unreadable"
+            };
+            return (
+                Some(incomplete_cache_inventory(
+                    &scanned.cache_root.join(BUILDS).join(&repository_directory),
+                    budget,
+                    code,
+                    reason,
+                )),
+                Vec::new(),
+            );
+        }
+        // No store: no environment has ever run, so none uses anything.
+        None => HashSet::new(),
+    };
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return (
+            Some(incomplete_cache_inventory(
+                &scanned.cache_root.join(BUILDS).join(&repository_directory),
+                budget,
+                "deadline_exceeded",
+                "environment cache inventory exceeded its bounded deadline".into(),
+            )),
+            Vec::new(),
+        );
+    }
+    let mut everything: Vec<(&crate::resources::cache_gc_fs::BuildEntry, bool)> = scanned
+        .builds
+        .iter()
+        .map(|entry| (entry, in_use.contains(&entry.path)))
+        .collect();
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return (
+            Some(incomplete_cache_inventory(
+                &scanned.cache_root.join(BUILDS).join(&repository_directory),
+                budget,
+                "deadline_exceeded",
+                "environment cache inventory exceeded its bounded deadline".into(),
+            )),
+            Vec::new(),
+        );
+    }
+    let mut total = scanned.host_total_bytes;
+    let host_total_bytes = total;
+    let mut unused: Vec<_> = everything
+        .iter()
+        .filter_map(|(entry, in_use)| (!*in_use).then_some(*entry))
+        .collect();
+    unused.sort_by_key(|entry| entry.last_used_at_ms.unwrap_or(0));
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return (
+            Some(incomplete_cache_inventory(
+                &scanned.cache_root.join(BUILDS).join(&repository_directory),
+                budget,
+                "deadline_exceeded",
+                "environment cache inventory exceeded its bounded deadline".into(),
+            )),
+            Vec::new(),
+        );
+    }
+    let mut candidates = Vec::new();
+    let mut lock_key_refusal = None;
+    for entry in unused {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return (
+                Some(incomplete_cache_inventory(
+                    &scanned.cache_root.join(BUILDS).join(&repository_directory),
+                    budget,
+                    "deadline_exceeded",
+                    "environment cache inventory exceeded its bounded deadline".into(),
+                )),
+                Vec::new(),
+            );
+        }
+        if total <= budget {
+            break;
+        }
+        let candidate = crate::GcEnvironmentCacheCandidate {
+            path: entry.path.to_string_lossy().into_owned(),
+            repository: entry.repository.clone(),
+            component: entry.component.clone(),
+            digest: entry.digest.clone(),
+            cache_root: scanned.cache_root.to_string_lossy().into_owned(),
+            cache_root_device: scanned.cache_identity.device,
+            cache_root_inode: scanned.cache_identity.inode,
+            entry_device: entry.identity.device,
+            entry_inode: entry.identity.inode,
+            cache_key: entry.key.clone(),
+            deletion_started: false,
+            estimated_bytes: entry.bytes,
+            estimated_inodes: Some(entry.inodes),
+            last_used_at_ms: entry.last_used_at_ms,
+            reason:
+                "unused build, least recently used, while the environment cache is over its budget"
+                    .into(),
+        };
+        match planned_build_cache_lock(&candidate) {
+            Ok(_) => {
+                total = total.saturating_sub(entry.bytes);
+                if entry.repository == repository_directory {
+                    candidates.push(candidate);
+                }
+            }
+            Err(reason) if lock_key_refusal.is_none() => lock_key_refusal = Some(reason),
+            Err(_) => {}
+        }
+    }
+    let builds: Vec<_> = everything
+        .drain(..)
+        .filter(|(entry, _)| entry.repository == repository_directory)
+        .collect();
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return (
+            Some(incomplete_cache_inventory(
+                &scanned.cache_root.join(BUILDS).join(&repository_directory),
+                budget,
+                "deadline_exceeded",
+                "environment cache inventory exceeded its bounded deadline".into(),
+            )),
+            Vec::new(),
+        );
+    }
+    let build_bytes = builds.iter().map(|(entry, _)| entry.bytes).sum();
+    let in_use_entries = builds.iter().filter(|(_, in_use)| *in_use).count();
+    let in_use_bytes = builds
+        .iter()
+        .filter(|(_, in_use)| *in_use)
+        .map(|(entry, _)| entry.bytes)
+        .sum();
+    let reclaimable_bytes = candidates
+        .iter()
+        .map(|candidate| candidate.estimated_bytes)
+        .sum();
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return (
+            Some(incomplete_cache_inventory(
+                &scanned.cache_root.join(BUILDS).join(&repository_directory),
+                budget,
+                "deadline_exceeded",
+                "environment cache inventory exceeded its bounded deadline".into(),
+            )),
+            Vec::new(),
+        );
+    }
+    let inventory = crate::GcEnvironmentCacheInventory {
+        root: scanned
+            .cache_root
+            .join(BUILDS)
+            .join(&repository_directory)
+            .to_string_lossy()
+            .into_owned(),
+        complete: true,
+        refusal_code: None,
+        budget_bytes: budget,
+        host_total_bytes: Some(host_total_bytes),
+        build_entries: Some(builds.len()),
+        build_bytes: Some(build_bytes),
+        in_use_entries: Some(in_use_entries),
+        in_use_bytes: Some(in_use_bytes),
+        reclaimable_bytes: Some(reclaimable_bytes),
+        template_entries: Some(template_entries),
+        refused: lock_key_refusal,
+    };
+    (Some(inventory), candidates)
+}
+
+fn incomplete_cache_inventory(
+    root: &Path,
+    budget: u64,
+    code: &str,
+    reason: String,
+) -> crate::GcEnvironmentCacheInventory {
+    crate::GcEnvironmentCacheInventory {
+        root: root.to_string_lossy().into_owned(),
+        complete: false,
+        refusal_code: Some(code.to_string()),
+        budget_bytes: budget,
+        host_total_bytes: None,
+        build_entries: None,
+        build_bytes: None,
+        in_use_entries: None,
+        in_use_bytes: None,
+        reclaimable_bytes: None,
+        template_entries: None,
+        refused: Some(reason),
+    }
+}
+
+/// [`gc_inventory`] for the host's own cache, reading the environment store
+/// without creating or migrating it.
+pub fn host_gc_inventory(
+    repository: &str,
+    deadline: Option<Instant>,
+) -> (
+    Option<crate::GcEnvironmentCacheInventory>,
+    Vec<crate::GcEnvironmentCacheCandidate>,
+) {
+    let deadline = cache_gc_deadline(deadline);
+    let Some(root) = super::logs::environments_directory() else {
+        return (None, Vec::new());
+    };
+    match EnvironmentStore::open_default_cache_gc_read_only(deadline) {
+        Ok(store) => gc_inventory(Some(&store), &root, repository, budget_bytes(), deadline),
+        Err(error) => {
+            let (inventory, _) = gc_inventory(None, &root, repository, budget_bytes(), deadline);
+            let refusal_code = if matches!(&error, super::store::StoreError::CacheGcDeadline) {
+                "deadline_exceeded"
+            } else {
+                "store_unreadable"
+            };
+            let inventory = inventory.map(|inventory| crate::GcEnvironmentCacheInventory {
+                complete: false,
+                refusal_code: Some(refusal_code.into()),
+                host_total_bytes: None,
+                build_entries: None,
+                build_bytes: None,
+                in_use_entries: None,
+                in_use_bytes: None,
+                reclaimable_bytes: None,
+                template_entries: None,
+                refused: Some(format!("cannot read the environment store: {error}")),
+                ..inventory
+            });
+            (inventory, Vec::new())
+        }
+    }
+}
+
+/// [`Lifecycle::evict_planned_build`] against the host's own cache.
+pub fn host_gc_evict(
+    candidate: &crate::GcEnvironmentCacheCandidate,
+    deadline: Option<Instant>,
+    before_delete: impl FnOnce() -> Result<(), String>,
+) -> Result<bool, String> {
+    let deadline = cache_gc_deadline(deadline);
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err("environment cache eviction exceeded its bounded deadline".into());
+    }
+    let root =
+        super::logs::environments_directory().ok_or("the host state directory is unavailable")?;
+    let store =
+        EnvironmentStore::open_default_cache_gc_read_only(deadline).map_err(|e| e.to_string())?;
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err("environment cache eviction exceeded its bounded deadline".into());
+    }
+    let coordinator =
+        crate::resources::HostResourceCoordinator::open_default().map_err(|e| e.to_string())?;
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err("environment cache eviction exceeded its bounded deadline".into());
+    }
+    let mut lifecycle = Lifecycle {
+        store,
+        coordinator,
+        root,
+        holder_pid: None,
+        hook_timeout: super::exec::DEFAULT_HOOK_TIMEOUT,
+        actor: "broker gc apply".into(),
+    };
+    lifecycle.evict_planned_build_with(candidate, deadline, before_delete)
 }
 
 fn read_dirs(path: &Path) -> Vec<PathBuf> {
@@ -729,4 +1339,81 @@ pub struct PruneReport {
     /// Set when nothing was evicted because live use could not be known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refused: Option<String>,
+}
+
+#[cfg(test)]
+mod cache_gc_lock_tests {
+    use super::*;
+
+    fn candidate(cache_key: Option<String>) -> crate::GcEnvironmentCacheCandidate {
+        crate::GcEnvironmentCacheCandidate {
+            path: "/host/environments/cache/builds/tmprepo/component/0123456789abcdef".into(),
+            repository: "tmprepo".into(),
+            component: "component".into(),
+            digest: "0123456789abcdef".into(),
+            cache_root: "/host/environments/cache".into(),
+            cache_root_device: 1,
+            cache_root_inode: 2,
+            entry_device: 1,
+            entry_inode: 3,
+            cache_key,
+            deletion_started: false,
+            estimated_bytes: 1,
+            estimated_inodes: Some(1),
+            last_used_at_ms: Some(1),
+            reason: "test".into(),
+        }
+    }
+
+    #[test]
+    fn gc_recovers_the_exact_historical_build_lock_from_the_key() {
+        let repository = "/tmp/repo";
+        let digest = format!("0123456789abcdef{}", "a".repeat(48));
+        let key = format!("aethyme-env-build:{repository}:component:{digest}");
+
+        let lock = planned_build_cache_lock(&candidate(Some(key.clone()))).unwrap();
+
+        assert_eq!(lock, (repository, key.as_str()));
+    }
+
+    #[test]
+    fn gc_refuses_cache_candidates_without_a_matching_historical_build_lock() {
+        let missing = planned_build_cache_lock(&candidate(None)).unwrap_err();
+        assert!(missing.contains("environment_cache_lock_key_missing"));
+
+        let mismatched = planned_build_cache_lock(&candidate(Some(
+            "aethyme-env-build:/tmp/other:component:0123456789abcdefaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        )))
+        .unwrap_err();
+        assert!(mismatched.contains("environment_cache_lock_key_invalid"));
+    }
+
+    #[test]
+    fn gc_inventory_retains_an_entry_without_a_shared_build_lock() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("environments");
+        let entry = root
+            .join(BUILDS)
+            .join(repository_dir("/tmp/repo"))
+            .join("component")
+            .join("0123456789abcdef");
+        std::fs::create_dir_all(entry.join(OUTPUT)).unwrap();
+        std::fs::write(entry.join(COMPLETE), b"").unwrap();
+        std::fs::write(entry.join(OUTPUT).join("app.bin"), b"payload").unwrap();
+
+        let (inventory, candidates) = gc_inventory(None, &root, "/tmp/repo", 0, None);
+
+        let inventory = inventory.unwrap();
+        assert!(inventory.complete);
+        assert_eq!(inventory.reclaimable_bytes, Some(0));
+        assert!(candidates.is_empty());
+        assert!(
+            inventory
+                .refused
+                .as_deref()
+                .is_some_and(|reason| reason.contains("environment_cache_lock_key_missing"))
+        );
+        assert!(entry.join(COMPLETE).exists());
+        assert!(entry.join(OUTPUT).join("app.bin").exists());
+    }
 }
