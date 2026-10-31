@@ -2568,7 +2568,10 @@ mod tests {
         let error =
             pin_runtime_pair_for_build(&install_dir.join("aethyme"), &identity).unwrap_err();
 
-        assert!(error.contains("multiple immutable runtime pairs"));
+        assert!(
+            error.contains("multiple immutable runtime pairs"),
+            "unexpected runtime-pair resolver error: {error}"
+        );
     }
 
     #[cfg(unix)]

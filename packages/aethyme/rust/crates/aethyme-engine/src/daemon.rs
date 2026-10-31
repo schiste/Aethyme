@@ -701,20 +701,30 @@ fn bounded_version_output(path: &Path, timeout: Duration) -> Result<VersionOutpu
             });
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        match receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
-            Ok(result) => {
-                output = Some(result.map_err(|error| error.to_string())?);
-                if output
-                    .as_ref()
-                    .is_some_and(|bytes| bytes.len() > VERSION_PROBE_BYTES)
-                {
-                    return Err("managed runtime version probe exceeded its output budget".into());
+        if output.is_none() {
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                Ok(result) => {
+                    output = Some(result.map_err(|error| error.to_string())?);
+                    if output
+                        .as_ref()
+                        .is_some_and(|bytes| bytes.len() > VERSION_PROBE_BYTES)
+                    {
+                        return Err(
+                            "managed runtime version probe exceeded its output budget".into()
+                        );
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("managed runtime version output reader disconnected".into());
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("managed runtime version output reader disconnected".into());
-            }
+        } else {
+            // The reader sends as soon as stdout reaches EOF, which can happen
+            // before a child that closed stdout exits. Once output is collected,
+            // keep polling the child under the same deadline without treating
+            // the reader thread's normal sender drop as a disconnection error.
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
         }
     }
 }
@@ -2222,6 +2232,26 @@ mod tests {
 
         assert_eq!(pin.bundle_name(), bundle_name);
         assert_eq!(pin.engine_path(), engine_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_version_output_accepts_stdout_eof_before_child_exit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("slow-after-close");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' 'aethyme fixture'\nexec 1>&-\nsleep 0.1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = bounded_version_output(&executable, Duration::from_secs(1)).unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"aethyme fixture\n");
     }
 
     #[cfg(unix)]
