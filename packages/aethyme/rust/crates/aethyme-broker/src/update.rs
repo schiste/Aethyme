@@ -16,9 +16,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::file_lock::ExclusiveFileLock;
 use crate::update_cache::{self, ManifestFetch};
 use crate::{ReleaseArtifact, ReleaseCompatibility, ReleaseManifest};
+use aethyme_engine::daemon::{
+    RuntimeBundlePaths, RuntimeBundlePin, RuntimeBundlePinAttempt, RuntimeUpdateLock,
+    RuntimeValidationBudget, validate_runtime_bundle_pair,
+};
 
 pub const UPDATE_PLAN_SCHEMA_VERSION: u32 = 1;
 pub const INSTALL_RECEIPT_SCHEMA_VERSION: u32 = 1;
@@ -30,6 +33,11 @@ const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 const UPDATE_LOCK_FILENAME: &str = ".update.lock";
 const UPDATE_LOCK_WAIT: Duration = Duration::from_secs(10);
 const UPDATE_LOCK_POLL: Duration = Duration::from_millis(50);
+const MAX_RUNTIME_VERSION_ENTRIES: usize = 128;
+const MAX_RUNTIME_VERSION_CANDIDATES: usize = 16;
+const MAX_INSTALL_RECEIPT_BYTES: u64 = 64 * 1024;
+const MAX_RUNTIME_PAIR_VALIDATION: Duration = Duration::from_secs(12);
+const MAX_RUNTIME_PAIR_HASH_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -124,16 +132,10 @@ impl InstallReceipt {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ManagedRootIdentity {
-    device: u64,
-    inode: u64,
-}
-
 /// Serialize updater instances that use this version of the installer-managed
 /// update path. Keep this lock file in the persistent managed root (not under
 /// `versions`, whose contents are pruned after activation) and never unlink it.
-fn acquire_installation_update_lock(receipt: &InstallReceipt) -> Result<ExclusiveFileLock, String> {
+fn acquire_installation_update_lock(receipt: &InstallReceipt) -> Result<RuntimeUpdateLock, String> {
     let deadline = Instant::now() + UPDATE_LOCK_WAIT;
     loop {
         if let Some(lock) = try_acquire_installation_update_lock(receipt)? {
@@ -151,108 +153,195 @@ fn acquire_installation_update_lock(receipt: &InstallReceipt) -> Result<Exclusiv
 
 fn try_acquire_installation_update_lock(
     receipt: &InstallReceipt,
-) -> Result<Option<ExclusiveFileLock>, String> {
+) -> Result<Option<RuntimeUpdateLock>, String> {
     receipt.validate().map_err(|error| error.to_string())?;
-    let expected_root = managed_root_identity(&receipt.managed_root)?;
-    let lock_path = receipt.managed_root.join(UPDATE_LOCK_FILENAME);
-    let file =
-        open_installation_update_lock_file(&receipt.managed_root, &lock_path, expected_root)?;
-    let identity_file = file.try_clone().map_err(|error| {
+    RuntimeUpdateLock::try_exclusive(&receipt.managed_root).map_err(|error| {
         format!(
-            "duplicate update lock handle {}: {error}",
-            lock_path.display()
+            "acquire update lock {}: {error}",
+            receipt.managed_root.join(UPDATE_LOCK_FILENAME).display()
         )
-    })?;
-    match ExclusiveFileLock::try_acquire(file)
-        .map_err(|error| format!("acquire update lock {}: {error}", lock_path.display()))?
-    {
-        Some(lock) => {
-            if managed_root_identity(&receipt.managed_root)? != expected_root {
-                return Err(format!(
-                    "managed installation root changed while acquiring {}",
-                    lock_path.display()
-                ));
-            }
-            verify_installation_update_lock_file(&lock_path, &identity_file)?;
-            Ok(Some(lock))
-        }
-        None => Ok(None),
-    }
-}
-
-fn managed_root_identity(path: &Path) -> Result<ManagedRootIdentity, String> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        format!(
-            "inspect managed installation root {}: {error}",
-            path.display()
-        )
-    })?;
-    if !metadata.file_type().is_dir() || fs::canonicalize(path).ok().as_deref() != Some(path) {
-        return Err(format!(
-            "managed installation root {} is not a canonical real directory",
-            path.display()
-        ));
-    }
-    Ok(ManagedRootIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
     })
 }
 
-fn open_installation_update_lock_file(
-    managed_root: &Path,
-    lock_path: &Path,
-    expected_root: ManagedRootIdentity,
-) -> Result<fs::File, String> {
-    if managed_root_identity(managed_root)? != expected_root {
-        return Err(format!(
-            "managed installation root changed before opening {}",
-            lock_path.display()
-        ));
+fn acquire_shared_runtime_update_lock(managed_root: &Path) -> Result<RuntimeUpdateLock, String> {
+    let deadline = Instant::now() + UPDATE_LOCK_WAIT;
+    loop {
+        if let Some(lock) = RuntimeUpdateLock::try_shared(managed_root)
+            .map_err(|error| format!("acquire shared runtime update lock: {error}"))?
+        {
+            return Ok(lock);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "an installer update still holds {}; retry after it finishes",
+                managed_root.join(UPDATE_LOCK_FILENAME).display()
+            ));
+        }
+        thread::sleep(UPDATE_LOCK_POLL.min(deadline.saturating_duration_since(Instant::now())));
     }
-    let mut options = OpenOptions::new();
-    options
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .mode(0o600);
-    let file = options
-        .open(lock_path)
-        .map_err(|error| format!("open update lock {}: {error}", lock_path.display()))?;
-    verify_installation_update_lock_file(lock_path, &file)?;
-    if managed_root_identity(managed_root)? != expected_root {
-        return Err(format!(
-            "managed installation root changed while opening {}",
-            lock_path.display()
-        ));
-    }
-    Ok(file)
 }
 
-fn verify_installation_update_lock_file(lock_path: &Path, opened: &fs::File) -> Result<(), String> {
-    let named = fs::symlink_metadata(lock_path)
-        .map_err(|error| format!("recheck update lock {}: {error}", lock_path.display()))?;
-    let opened_metadata = opened.metadata().map_err(|error| {
-        format!(
-            "inspect opened update lock {}: {error}",
-            lock_path.display()
-        )
-    })?;
-    if !named.file_type().is_file()
-        || !opened_metadata.file_type().is_file()
-        || named.dev() != opened_metadata.dev()
-        || named.ino() != opened_metadata.ino()
-        || named.nlink() != 1
-        || opened_metadata.nlink() != 1
+fn validate_runtime_identity(identity: &str) -> Result<(), String> {
+    if identity.is_empty()
+        || identity.len() > 512
+        || identity.bytes().any(|byte| byte.is_ascii_control())
+        || identity.lines().count() != 1
     {
-        return Err(format!(
-            "update lock {} is not the expected unique regular file",
-            lock_path.display()
-        ));
+        return Err("router build identity is invalid or unbounded".into());
     }
     Ok(())
+}
+
+fn find_managed_install_receipt(
+    original_executable: &Path,
+    resolved_executable: &Path,
+) -> Result<Option<InstallReceipt>, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut searched = Vec::new();
+    for base in [original_executable, resolved_executable] {
+        let Some(base_directory) = base.parent() else {
+            continue;
+        };
+        for ancestor in base_directory.ancestors().take(8) {
+            if searched
+                .iter()
+                .any(|path: &PathBuf| path.as_path() == ancestor)
+            {
+                continue;
+            }
+            searched.push(ancestor.to_path_buf());
+            let canonical_ancestor = match fs::canonicalize(ancestor) {
+                Ok(path) => path,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "resolve executable parent directory {}: {error}",
+                        ancestor.display()
+                    ));
+                }
+            };
+            if !fs::metadata(&canonical_ancestor)
+                .map_err(|error| {
+                    format!(
+                        "inspect executable parent directory {}: {error}",
+                        canonical_ancestor.display()
+                    )
+                })?
+                .is_dir()
+            {
+                continue;
+            }
+            let receipt_paths = [
+                canonical_ancestor.join(INSTALL_RECEIPT_FILENAME),
+                canonical_ancestor
+                    .join(".aethyme-managed")
+                    .join(INSTALL_RECEIPT_FILENAME),
+            ];
+            for path in receipt_paths {
+                let named = match fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(format!(
+                            "inspect installation receipt {}: {error}",
+                            path.display()
+                        ));
+                    }
+                };
+                let uid = unsafe { libc::geteuid() };
+                if !named.is_file()
+                    || named.uid() != uid
+                    || named.nlink() != 1
+                    || named.mode() & 0o022 != 0
+                    || named.len() > MAX_INSTALL_RECEIPT_BYTES
+                    || fs::canonicalize(&path).ok().as_deref() != Some(path.as_path())
+                {
+                    return Err(format!(
+                        "installation receipt {} is not a protected bounded file",
+                        path.display()
+                    ));
+                }
+                let mut options = OpenOptions::new();
+                options
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+                let mut file = options.open(&path).map_err(|error| {
+                    format!("open installation receipt {}: {error}", path.display())
+                })?;
+                let opened = file.metadata().map_err(|error| {
+                    format!("inspect installation receipt {}: {error}", path.display())
+                })?;
+                if named.dev() != opened.dev() || named.ino() != opened.ino() || opened.nlink() != 1
+                {
+                    return Err("installation receipt changed while it was opened".into());
+                }
+                let mut bytes = Vec::new();
+                file.take(MAX_INSTALL_RECEIPT_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| {
+                        format!("read installation receipt {}: {error}", path.display())
+                    })?;
+                if bytes.len() as u64 > MAX_INSTALL_RECEIPT_BYTES {
+                    return Err("installation receipt exceeds its byte limit".into());
+                }
+                let after = fs::symlink_metadata(&path).map_err(|error| {
+                    format!("recheck installation receipt {}: {error}", path.display())
+                })?;
+                if after.dev() != named.dev()
+                    || after.ino() != named.ino()
+                    || after.len() != named.len()
+                    || after.mtime() != named.mtime()
+                    || after.mtime_nsec() != named.mtime_nsec()
+                    || after.ctime() != named.ctime()
+                    || after.ctime_nsec() != named.ctime_nsec()
+                {
+                    return Err("installation receipt changed while it was read".into());
+                }
+                let receipt: InstallReceipt = serde_json::from_slice(&bytes).map_err(|error| {
+                    format!("parse installation receipt {}: {error}", path.display())
+                })?;
+                receipt.validate().map_err(|error| error.to_string())?;
+                if path != receipt.managed_root.join(INSTALL_RECEIPT_FILENAME)
+                    || fs::canonicalize(&receipt.install_dir).ok().as_deref()
+                        != Some(receipt.install_dir.as_path())
+                    || fs::canonicalize(&receipt.managed_root).ok().as_deref()
+                        != Some(receipt.managed_root.as_path())
+                {
+                    return Err(
+                        "installation receipt is not rooted at its declared install directory"
+                            .into(),
+                    );
+                }
+                return Ok(Some(receipt));
+            }
+        }
+    }
+
+    let managed_marker = std::ffi::OsStr::new(".aethyme-managed");
+    let mentions_managed_root =
+        [original_executable, resolved_executable]
+            .into_iter()
+            .any(|path| {
+                path.components()
+                    .any(|component| component.as_os_str() == managed_marker)
+                    || path.parent().is_some_and(|parent| {
+                        fs::symlink_metadata(parent.join(".aethyme-managed")).is_ok()
+                    })
+            });
+    if mentions_managed_root {
+        return Err(
+            "executable is inside a managed runtime but its installation receipt is missing".into(),
+        );
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +353,127 @@ pub struct InstallationProvenance {
     pub receipt_path: Option<PathBuf>,
     pub manager_command: Option<String>,
     pub explanation: String,
+}
+
+/// Exact immutable engine pair selected for one running router, with a shared
+/// pin held until the daemon child takes ownership of a cloned descriptor.
+#[derive(Debug)]
+pub struct ManagedRuntimeLaunch {
+    paths: RuntimeBundlePaths,
+    pin: RuntimeBundlePin,
+}
+
+impl ManagedRuntimeLaunch {
+    pub fn paths(&self) -> &RuntimeBundlePaths {
+        &self.paths
+    }
+
+    pub fn pin(&self) -> &RuntimeBundlePin {
+        &self.pin
+    }
+}
+
+/// Resolve a full-identity router/engine pair under the installation's shared
+/// updater lock, then pin that exact bundle before releasing the lock. `None`
+/// means the executable is not installer-managed and may use its usual
+/// unmanaged sibling lookup.
+pub fn pin_runtime_pair_for_build(
+    executable: &Path,
+    expected_identity: &str,
+) -> Result<Option<ManagedRuntimeLaunch>, String> {
+    validate_runtime_identity(expected_identity)?;
+    let resolved = fs::canonicalize(executable).unwrap_or_else(|_| executable.to_path_buf());
+    let Some(receipt) = find_managed_install_receipt(executable, &resolved)? else {
+        return Ok(None);
+    };
+    receipt.validate().map_err(|error| error.to_string())?;
+    let _update_lock = acquire_shared_runtime_update_lock(&receipt.managed_root)?;
+    validate_managed_versions_directory(&receipt.versions_dir)?;
+    let expected_version = expected_identity
+        .split_whitespace()
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "router build identity has no version".to_string())?;
+    Version::parse(expected_version)
+        .map_err(|error| format!("invalid router build version {expected_version:?}: {error}"))?;
+    let expected_prefix = format!("v{expected_version}-");
+    let mut budget =
+        RuntimeValidationBudget::new(MAX_RUNTIME_PAIR_VALIDATION, MAX_RUNTIME_PAIR_HASH_BYTES);
+    let mut entries = 0usize;
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(&receipt.versions_dir)
+        .map_err(|error| format!("read managed versions directory: {error}"))?
+    {
+        entries += 1;
+        if entries > MAX_RUNTIME_VERSION_ENTRIES {
+            return Err("managed versions directory exceeds the candidate inventory limit".into());
+        }
+        let entry = entry.map_err(|error| format!("read managed runtime candidate: {error}"))?;
+        let name = entry.file_name();
+        let name_text = name
+            .to_str()
+            .ok_or_else(|| "managed runtime candidate name is not UTF-8".to_string())?;
+        if !name_text.starts_with(&expected_prefix) {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("inspect managed runtime candidate: {error}"))?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            return Err(format!(
+                "managed runtime candidate {name_text:?} is not a real version directory"
+            ));
+        }
+        candidates.push(name_text.to_string());
+        if candidates.len() > MAX_RUNTIME_VERSION_CANDIDATES {
+            return Err("managed runtime candidates exceed the bounded identity scan limit".into());
+        }
+    }
+
+    let mut matched: Option<RuntimeBundlePaths> = None;
+    for candidate in candidates {
+        if let Some(pair) = validate_runtime_bundle_pair(
+            &receipt.managed_root,
+            &candidate,
+            expected_identity,
+            &mut budget,
+        )? {
+            if matched.is_some() {
+                return Err(
+                    "multiple immutable runtime pairs match this router build identity; refusing ambiguous engine selection"
+                        .into(),
+                );
+            }
+            matched = Some(pair);
+        }
+    }
+    let pair = matched.ok_or_else(|| {
+        "no validated installer-managed router/engine pair matches this build identity; retry after updates finish, or run `aethyme update apply` to restore a paired release and rerun the command".to_string()
+    })?;
+    let pin = RuntimeBundlePin::acquire_shared(pair.managed_root(), pair.bundle_name())
+        .map_err(|error| format!("pin selected managed runtime pair: {error}"))?;
+    Ok(Some(ManagedRuntimeLaunch { paths: pair, pin }))
+}
+
+fn validate_managed_versions_directory(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "inspect managed versions directory {}: {error}",
+            path.display()
+        )
+    })?;
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o022 != 0
+        || fs::canonicalize(path).ok().as_deref() != Some(path)
+    {
+        return Err(format!(
+            "managed versions directory is not a private real directory: {}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1521,7 +1731,7 @@ fn activate_payload_with_completion(
     receipt: &InstallReceipt,
     version: &str,
     manifest_sha256: &str,
-    update_lock: &ExclusiveFileLock,
+    update_lock: &RuntimeUpdateLock,
     completion: impl FnOnce() -> Result<(), String>,
 ) -> Result<(PathBuf, Option<PathBuf>), String> {
     receipt.validate().map_err(|error| error.to_string())?;
@@ -1663,7 +1873,7 @@ fn read_selector_link(path: &Path) -> Result<Option<SelectorLink>, String> {
 
 fn publish_current_selector(
     receipt: &InstallReceipt,
-    update_lock: &ExclusiveFileLock,
+    update_lock: &RuntimeUpdateLock,
     target: &Path,
     old_selector: Option<&SelectorLink>,
     publish: impl FnOnce() -> Result<SelectorLink, AtomicSymlinkError>,
@@ -1695,7 +1905,7 @@ fn publish_current_selector(
 
 fn restore_selector_if_still_owned(
     receipt: &InstallReceipt,
-    _update_lock: &ExclusiveFileLock,
+    _update_lock: &RuntimeUpdateLock,
     published: &SelectorLink,
     old_selector: Option<&SelectorLink>,
 ) -> String {
@@ -1859,6 +2069,32 @@ fn cleanup_old_bundles(receipt: &InstallReceipt) -> Result<(), String> {
             .file_type()
             .map_err(|error| format!("inspect {}: {error}", entry.path().display()))?;
         if file_type.is_dir() && !file_type.is_symlink() && !keep.contains(&entry.file_name()) {
+            let bundle_name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| "managed runtime bundle name is not UTF-8".to_string())?;
+            match RuntimeBundlePin::try_acquire_exclusive(&receipt.managed_root, &bundle_name)
+                .map_err(|error| format!("check runtime pin for {bundle_name}: {error}"))?
+            {
+                RuntimeBundlePinAttempt::Busy => continue,
+                RuntimeBundlePinAttempt::Missing => {}
+                RuntimeBundlePinAttempt::Acquired(pin) => {
+                    // The updater holds the exclusive installation lock here,
+                    // so no resolver can create a new shared pin after this
+                    // exclusive bundle claim is acquired.
+                    pin.remove_pin_file().map_err(|error| {
+                        format!(
+                            "remove released runtime pin {}: {error}",
+                            pin.pin_path().display()
+                        )
+                    })?;
+                    fs::remove_dir_all(entry.path()).map_err(|error| {
+                        format!("remove old bundle {}: {error}", entry.path().display())
+                    })?;
+                    drop(pin);
+                    continue;
+                }
+            }
             fs::remove_dir_all(entry.path()).map_err(|error| {
                 format!("remove old bundle {}: {error}", entry.path().display())
             })?;
@@ -2194,9 +2430,162 @@ mod tests {
         }
     }
 
-    fn acquire_test_update_lock(receipt: &InstallReceipt) -> ExclusiveFileLock {
+    fn write_test_runtime_binary(path: &Path, program: &str, identity: &str) {
+        let banner = format!("{program} {identity} build_date=test");
+        let quoted = format!("'{}'", banner.replace('\'', "'\\''"));
+        fs::write(path, format!("#!/bin/sh\nprintf '%s\\n' {quoted}\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn create_test_runtime_bundle(
+        receipt: &InstallReceipt,
+        bundle_name: &str,
+        identity: &str,
+    ) -> PathBuf {
+        let bundle = receipt.versions_dir.join(bundle_name);
+        fs::create_dir(&bundle).unwrap();
+        write_test_runtime_binary(&bundle.join("aethyme"), "aethyme", identity);
+        write_test_runtime_binary(
+            &bundle.join("aethyme-engine-cli"),
+            "aethyme-engine-cli",
+            identity,
+        );
+        bundle
+    }
+
+    fn create_test_install_receipt(install_dir: &Path) -> InstallReceipt {
+        fs::create_dir_all(install_dir).unwrap();
+        let receipt = install_receipt(install_dir);
+        fs::create_dir_all(&receipt.versions_dir).unwrap();
+        fs::write(
+            receipt.managed_root.join(INSTALL_RECEIPT_FILENAME),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        receipt
+    }
+
+    #[cfg(unix)]
+    fn link_test_public_runtime_pair(receipt: &InstallReceipt, bundle_name: &str) {
+        use std::os::unix::fs::symlink;
+
+        symlink(
+            Path::new("versions").join(bundle_name),
+            &receipt.current_link,
+        )
+        .unwrap();
+        symlink(
+            Path::new(".aethyme-managed/current/aethyme"),
+            &receipt.router_path,
+        )
+        .unwrap();
+        symlink(
+            Path::new(".aethyme-managed/current/aethyme-engine-cli"),
+            &receipt.engine_path,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn managed_receipt_lookup_starts_from_an_executable_parent_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = temp.path().join("bin");
+        let receipt = create_test_install_receipt(&install_dir);
+        let bundle = receipt.versions_dir.join("v0.8.51-0123456789ab");
+        fs::create_dir(&bundle).unwrap();
+        let executable = bundle.join("aethyme");
+        fs::write(&executable, b"runtime executable fixture").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let resolved = fs::canonicalize(&executable).unwrap();
+
+        let found = find_managed_install_receipt(&executable, &resolved)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found, receipt);
+    }
+
+    fn acquire_test_update_lock(receipt: &InstallReceipt) -> RuntimeUpdateLock {
         fs::create_dir_all(&receipt.managed_root).unwrap();
         acquire_installation_update_lock(receipt).unwrap()
+    }
+
+    #[test]
+    fn runtime_pair_resolver_pins_the_unique_full_identity_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = temp.path().join("bin");
+        let receipt = create_test_install_receipt(&install_dir);
+        let identity = aethyme_engine::daemon::runtime_build_identity();
+        let bundle_name = format!("v{}-0123456789ab", env!("CARGO_PKG_VERSION"));
+        create_test_runtime_bundle(&receipt, &bundle_name, &identity);
+        link_test_public_runtime_pair(&receipt, &bundle_name);
+        let executable = install_dir.join("aethyme");
+
+        let launch = pin_runtime_pair_for_build(&executable, &identity)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(launch.paths().bundle_name(), bundle_name);
+        assert_eq!(
+            launch.paths().engine_path(),
+            receipt
+                .versions_dir
+                .join(&bundle_name)
+                .join("aethyme-engine-cli")
+        );
+        assert_eq!(launch.pin().bundle_name(), bundle_name);
+        assert!(launch.paths().router_sha256().len() == 64);
+    }
+
+    #[test]
+    fn runtime_pair_resolver_refuses_multiple_full_identity_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = temp.path().join("bin");
+        let receipt = create_test_install_receipt(&install_dir);
+        let identity = aethyme_engine::daemon::runtime_build_identity();
+        create_test_runtime_bundle(
+            &receipt,
+            &format!("v{}-111111111111", env!("CARGO_PKG_VERSION")),
+            &identity,
+        );
+        create_test_runtime_bundle(
+            &receipt,
+            &format!("v{}-222222222222", env!("CARGO_PKG_VERSION")),
+            &identity,
+        );
+        link_test_public_runtime_pair(
+            &receipt,
+            &format!("v{}-111111111111", env!("CARGO_PKG_VERSION")),
+        );
+
+        let error =
+            pin_runtime_pair_for_build(&install_dir.join("aethyme"), &identity).unwrap_err();
+
+        assert!(error.contains("multiple immutable runtime pairs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_pair_resolver_refuses_unmatched_public_managed_selector() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = temp.path().join("bin");
+        let receipt = create_test_install_receipt(&install_dir);
+        symlink(Path::new("versions/v0.0.0-pruned"), &receipt.current_link).unwrap();
+        symlink(
+            Path::new(".aethyme-managed/current/aethyme"),
+            &receipt.router_path,
+        )
+        .unwrap();
+
+        let error = pin_runtime_pair_for_build(
+            &receipt.router_path,
+            &aethyme_engine::daemon::runtime_build_identity(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("no validated installer-managed"));
     }
 
     #[test]
@@ -2646,6 +3035,51 @@ mod tests {
             )
         );
         assert!(third.rollback_bundle.is_some());
+    }
+
+    #[test]
+    fn cleanup_keeps_active_pinned_bundle_then_prunes_it_after_release() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = temp.path().join("bin");
+        let receipt = create_test_install_receipt(&install_dir);
+        let current = "v0.8.51-current";
+        let previous = "v0.8.50-previous";
+        let active = "v0.8.49-daemon-active";
+        let orphan = "v0.8.48-orphan";
+        for bundle in [current, previous, active, orphan] {
+            fs::create_dir(receipt.versions_dir.join(bundle)).unwrap();
+        }
+        symlink(Path::new("versions").join(current), &receipt.current_link).unwrap();
+        symlink(Path::new("versions").join(previous), &receipt.previous_link).unwrap();
+
+        let update_shared = RuntimeUpdateLock::try_shared(&receipt.managed_root)
+            .unwrap()
+            .unwrap();
+        let pin = RuntimeBundlePin::acquire_shared(&receipt.managed_root, active).unwrap();
+        drop(update_shared);
+
+        let updater = acquire_test_update_lock(&receipt);
+        cleanup_old_bundles(&receipt).unwrap();
+        assert!(receipt.versions_dir.join(current).is_dir());
+        assert!(receipt.versions_dir.join(previous).is_dir());
+        assert!(receipt.versions_dir.join(active).is_dir());
+        assert!(!receipt.versions_dir.join(orphan).exists());
+        drop(updater);
+
+        drop(pin);
+        let updater = acquire_test_update_lock(&receipt);
+        cleanup_old_bundles(&receipt).unwrap();
+        assert!(!receipt.versions_dir.join(active).exists());
+        assert!(
+            !receipt
+                .managed_root
+                .join("runtime-pins")
+                .join(format!("{active}.lock"))
+                .exists()
+        );
+        drop(updater);
     }
 
     #[test]
