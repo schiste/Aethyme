@@ -567,7 +567,7 @@ fn runtime_binary_digest(
     expected: RuntimeFileIdentity,
     budget: &RuntimeValidationBudget,
 ) -> Result<(String, u64), String> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
 
     let mut options = OpenOptions::new();
     options
@@ -664,7 +664,7 @@ fn bounded_version_output(path: &Path, timeout: Duration) -> Result<VersionOutpu
         .stdout
         .take()
         .ok_or_else(|| "managed runtime version probe has no stdout".to_string())?;
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::channel::<std::io::Result<Vec<u8>>>();
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let result = stdout
@@ -677,7 +677,7 @@ fn bounded_version_output(path: &Path, timeout: Duration) -> Result<VersionOutpu
         .checked_add(timeout)
         .ok_or_else(|| "managed runtime version deadline overflow".to_string())?;
     let mut status = None;
-    let mut output = None;
+    let mut output: Option<Vec<u8>> = None;
     loop {
         if Instant::now() >= deadline {
             return Err("managed runtime version probe exceeded its time budget".into());
@@ -904,7 +904,8 @@ fn take_inherited_pin_file_from_stdin() -> Result<Option<RuntimeBundlePin>, Stri
     // pin guard becomes its sole Rust owner in this child.
     let file = unsafe { File::from_raw_fd(0) };
     set_close_on_exec(file.as_raw_fd(), true).map_err(|error| error.to_string())?;
-    let pin = validate_open_runtime_pin_file(file, &path)?;
+    let pin = validate_open_runtime_pin_file(file, &path)
+        .map_err(|error| format!("validate inherited runtime pin: {error}"))?;
     Ok(Some(pin))
 }
 
