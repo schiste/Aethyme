@@ -329,6 +329,21 @@ pub struct SharedSpec {
     /// redeployed blue/green, only by the in-place hold-and-swap.
     #[serde(default)]
     pub stateful: bool,
+    /// What makes a ref move redeploy (#1297): any move (`ref`, the
+    /// default), or only a change to the files matching `inputs`
+    /// (`inputs`), so shared infrastructure does not restart on every commit.
+    #[serde(default)]
+    pub redeploy_on: RedeployOn,
+    #[serde(default)]
+    pub inputs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedeployOn {
+    #[default]
+    Ref,
+    Inputs,
 }
 
 /// Host-scoped settings: `<host state>/environments.toml`. Only host pool

@@ -338,6 +338,28 @@ pub fn validate(
                 "use \"default_branch\", \"integration\" or refs/heads/<name>",
             );
         }
+        if shared.redeploy_on == super::spec::RedeployOn::Inputs && shared.inputs.is_empty() {
+            c.push(
+                "missing_inputs",
+                None,
+                None,
+                Some(&format!("{field}.inputs")),
+                "redeploy_on = \"inputs\" needs the globs whose changes redeploy",
+                "add inputs, or use redeploy_on = \"ref\"",
+            );
+        }
+        for pattern in &shared.inputs {
+            if let Err(error) = Glob::new(pattern) {
+                c.push(
+                    "invalid_glob",
+                    None,
+                    None,
+                    Some(&format!("{field}.inputs")),
+                    format!("{pattern:?}: {error}"),
+                    "fix the glob syntax",
+                );
+            }
+        }
     }
     for profile in &file.profiles {
         for used in &profile.uses_shared {
