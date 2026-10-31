@@ -150,15 +150,27 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
     let (base, changed) =
         super::infer::changed_paths(&workspace.worktree_root).map_err(environment_failure)?;
     let inference = super::infer::infer(file, &changed).map_err(environment_failure)?;
-    let (mut lifecycle, warning) = open("env up", true)?;
     let mut profile = choose_profile(file, &inference, options)?;
+    let empty = |name: &str| {
+        file.profiles
+            .iter()
+            .any(|p| p.name == name && p.components.is_empty())
+    };
+    // An empty profile needs no supervisor: nothing will be registered.
+    let (mut lifecycle, mut warning) = open("env up", !empty(&profile))?;
     if options.profile.is_none()
         && let Some(higher) =
             existing_at_or_above(&lifecycle, &workspace.worktree_root, file, &inference)?
     {
         // Reuse a deliberately higher environment rather than start a second,
         // cheaper one beside it.
+        if empty(&profile) && !empty(&higher) {
+            (lifecycle, warning) = open("env up", true)?;
+        }
         profile = higher;
+    }
+    if empty(&profile) {
+        return Ok(nothing_needed(&profile, base.as_deref(), &inference));
     }
     let context = compile_context(&workspace, &checked.digest);
     let snapshot =
@@ -243,6 +255,27 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
     }
     value["schema"] = json!(UP_SCHEMA);
     Ok((value, text, exit_status::SUCCESS))
+}
+
+/// `env up` on a profile with no components (#1289): nothing is registered,
+/// reserved or started.
+fn nothing_needed(
+    profile: &str,
+    base: Option<&str>,
+    inference: &super::infer::Inference,
+) -> Output {
+    let value = json!({
+        "schema": UP_SCHEMA,
+        "nothing_needed": true,
+        "profile": profile,
+        "inference": {
+            "base": base,
+            "minimum": inference.minimum,
+            "fired": inference.fired,
+        },
+    });
+    let text = format!("no environment needed (profile {profile} has no components)\n");
+    (value, text, exit_status::SUCCESS)
 }
 
 fn required_id(options: &Options) -> Result<String, Failure> {
