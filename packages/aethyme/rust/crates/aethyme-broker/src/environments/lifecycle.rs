@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -308,7 +308,55 @@ impl Lifecycle {
         options: &UpOptions,
     ) -> Result<EnvironmentRecord, LifecycleError> {
         let _operation = self.operation_lock(&snapshot.env_id)?;
-        self.up_locked(snapshot, worktree, main_root, session_id, options)
+        // A warm up starts what exists; a cold one provisions (#1239). An
+        // environment already up with this snapshot does nothing to time.
+        let metric = match self.store.get(&snapshot.env_id)? {
+            Some(r)
+                if r.phase == EnvironmentPhase::Active && r.profile_digest == snapshot.digest =>
+            {
+                None
+            }
+            Some(r)
+                if r.phase == EnvironmentPhase::Parked && r.profile_digest == snapshot.digest =>
+            {
+                Some(format!("up.{}", snapshot.profile))
+            }
+            _ => Some("up.cold".to_string()),
+        };
+        let started = Instant::now();
+        let result = self.up_locked(snapshot, worktree, main_root, session_id, options);
+        if let Some(metric) = metric {
+            self.record_timing(
+                &snapshot.repository,
+                &metric,
+                &snapshot.env_id,
+                started,
+                result.is_ok(),
+            );
+        }
+        result
+    }
+
+    /// Record how long a lifecycle step took (#1239). Never fails the step:
+    /// an unrecorded timing is a gap in a trend, not a broken environment.
+    pub(super) fn record_timing(
+        &mut self,
+        repository: &str,
+        metric: &str,
+        env_id: &str,
+        started: Instant,
+        ok: bool,
+    ) {
+        crate::warn_unrecorded(
+            "record an environment timing",
+            self.store.record_timing(
+                repository,
+                metric,
+                env_id,
+                started.elapsed().as_secs_f64(),
+                ok,
+            ),
+        );
     }
 
     fn up_locked(
@@ -471,6 +519,7 @@ impl Lifecycle {
                 ..bindings.clone()
             };
             let driver = driver_for(component.runtime);
+            let provision_started = Instant::now();
             // Template first (its id reaches provision), then the build from
             // the cache when its inputs are unchanged (#1219).
             let template = {
@@ -490,9 +539,29 @@ impl Lifecycle {
                     }
                 }
             };
+            self.record_timing(
+                &snapshot.repository,
+                &format!("provision.{}", component.name),
+                &env_id,
+                provision_started,
+                outcome.is_ok(),
+            );
             match outcome {
                 Ok(receipt) => {
                     if let Some(receipt) = &receipt {
+                        // Durations the hook measured itself (#1239).
+                        for (metric, seconds) in super::budgets::hook_metrics(receipt) {
+                            crate::warn_unrecorded(
+                                "record a hook-reported timing",
+                                self.store.record_timing(
+                                    &snapshot.repository,
+                                    &metric,
+                                    &env_id,
+                                    seconds,
+                                    true,
+                                ),
+                            );
+                        }
                         receipts.insert(component.name.clone(), receipt.clone());
                     }
                     self.component_to(
@@ -530,7 +599,16 @@ impl Lifecycle {
             self.prepare_start(&env_id, &snapshot, &bindings, component)?;
             let ctx = self.context(&snapshot, component, &bindings, 1);
             let driver = driver_for(component.runtime);
-            let identity = match driver.start(&ctx) {
+            let start_started = Instant::now();
+            let start = driver.start(&ctx);
+            self.record_timing(
+                &snapshot.repository,
+                &format!("start.{}", component.name),
+                &env_id,
+                start_started,
+                start.is_ok(),
+            );
+            let identity = match start {
                 Ok(identity) => identity,
                 Err(error) => {
                     return self.fail_start(
@@ -553,7 +631,16 @@ impl Lifecycle {
                 None,
             )?;
             started.push((component.name.clone(), identity.clone()));
-            if let Err(error) = wait_healthy(driver.as_ref(), &ctx, &identity) {
+            let health_started = Instant::now();
+            let health = wait_healthy(driver.as_ref(), &ctx, &identity);
+            self.record_timing(
+                &snapshot.repository,
+                &format!("health.{}", component.name),
+                &env_id,
+                health_started,
+                health.is_ok(),
+            );
+            if let Err(error) = health {
                 return self.fail_start(
                     &record,
                     &snapshot,
@@ -800,7 +887,19 @@ impl Lifecycle {
     ) -> Result<EnvironmentRecord, LifecycleError> {
         let record = self.store.resolve(env_id)?;
         let _operation = self.operation_lock(&record.env_id)?;
-        self.down_locked(&record.env_id, abandon)
+        let started = Instant::now();
+        let result = self.down_locked(&record.env_id, abandon);
+        // Only a real destroy is timed: an abandon skips the drivers.
+        if record.phase != EnvironmentPhase::Destroyed && abandon.is_none() {
+            self.record_timing(
+                &record.repository,
+                "down",
+                &record.env_id,
+                started,
+                result.is_ok(),
+            );
+        }
+        result
     }
 
     fn down_locked(

@@ -40,6 +40,7 @@ pub const ROUTES_SCHEMA: &str = "aethyme.env-routes/v1";
 pub const INFER_SCHEMA: &str = "aethyme.env-infer/v1";
 pub const SHARED_SCHEMA: &str = "aethyme.env-shared/v1";
 pub const CALIBRATE_SCHEMA: &str = "aethyme.env-calibrate/v1";
+pub const BUDGETS_SCHEMA: &str = "aethyme.env-budgets/v1";
 pub const CACHE_SCHEMA: &str = "aethyme.env-cache/v1";
 
 pub const USAGE: &str = "\
@@ -133,6 +134,16 @@ Usage:
       within --ram-fraction (default 0.5) of RAM minus any container-engine
       VM reservation. Prints a diff of environments.toml; never writes it.
       Profiles with fewer than 10 samples are reported as insufficient.
+  aethyme env budgets [--json]
+      Compare recorded timings and measured footprints with the
+      [budgets.seconds] / [budgets.memory_mib] declared in environments.toml:
+      per metric (up.<profile> for a warm up, up.cold for one that
+      provisioned, park, down, provision|start|health.<component>, any
+      duration a hook reports in its receipt's metrics object,
+      memory.<profile>)
+      the count, p50, p95, latest, the trend between the older and newer
+      halves of the window, and ok (p95 within budget), watch (only p50
+      within), over, no-data or no-budget. Read-only.
   aethyme env cache list|prune [--all] [--json]
       Content-addressed build outputs (build + cache_inputs, output in
       build_output or serve_dir) shared across worktrees, and database
@@ -231,6 +242,7 @@ pub fn run(args: &[String]) -> u8 {
         "infer" => super::operate::run_infer(&options),
         "shared" => super::operate::run_shared(&options),
         "calibrate" => super::operate::run_calibrate(&options),
+        "budgets" => super::operate::run_budgets(&options),
         "cache" => super::operate::run_cache(&options),
         other => Err(Failure {
             code: "unknown_subcommand",
