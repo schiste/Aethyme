@@ -90,7 +90,28 @@ CREATE TABLE IF NOT EXISTS environment_samples (
   method TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS environment_samples_profile ON environment_samples(repository, profile, seq);
+CREATE TABLE IF NOT EXISTS environment_timings (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  repository TEXT NOT NULL,
+  metric TEXT NOT NULL,
+  env_id TEXT NOT NULL,
+  at INTEGER NOT NULL,
+  seconds REAL NOT NULL,
+  ok INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS environment_timings_metric ON environment_timings(repository, metric, ok, seq);
 ";
+
+/// Timings kept per (repository, metric, outcome) (#1239).
+pub const TIMINGS_KEPT: usize = 200;
+
+/// One recorded duration of a lifecycle step (#1239).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Timing {
+    pub seconds: f64,
+    pub at: i64,
+    pub ok: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -913,6 +934,75 @@ impl EnvironmentStore {
             .optional()?)
     }
 
+    /// Record how long a lifecycle step took (#1239), keeping the newest
+    /// [`TIMINGS_KEPT`] per (repository, metric, outcome): failures are kept
+    /// apart, so a crash loop never reads as fast.
+    pub fn record_timing(
+        &mut self,
+        repository: &str,
+        metric: &str,
+        env_id: &str,
+        seconds: f64,
+        ok: bool,
+    ) -> Result<(), StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO environment_timings (repository, metric, env_id, at, seconds, ok)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![repository, metric, env_id, now_ms(), seconds, ok],
+        )?;
+        tx.execute(
+            "DELETE FROM environment_timings WHERE repository = ?1 AND metric = ?2 AND ok = ?3
+             AND seq NOT IN (
+               SELECT seq FROM environment_timings WHERE repository = ?1 AND metric = ?2 AND ok = ?3
+               ORDER BY seq DESC LIMIT ?4)",
+            params![repository, metric, ok, TIMINGS_KEPT as i64],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every recorded timing of one repository, per metric, oldest first.
+    pub fn timings(
+        &self,
+        repository: &str,
+    ) -> Result<std::collections::BTreeMap<String, Vec<Timing>>, StoreError> {
+        let exists = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'environment_timings'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(Default::default());
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT metric, seconds, at, ok FROM environment_timings
+             WHERE repository = ?1 ORDER BY seq",
+        )?;
+        let rows = statement.query_map(params![repository], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                Timing {
+                    seconds: row.get(1)?,
+                    at: row.get(2)?,
+                    ok: row.get(3)?,
+                },
+            ))
+        })?;
+        let mut timings: std::collections::BTreeMap<String, Vec<Timing>> = Default::default();
+        for row in rows {
+            let (metric, timing) = row?;
+            timings.entry(metric).or_default().push(timing);
+        }
+        Ok(timings)
+    }
+
     /// A store last opened for writing by a binary older than #1218 has no
     /// samples table, and a read-only open never creates it: no samples yet.
     fn has_samples_table(&self) -> Result<bool, StoreError> {
@@ -938,7 +1028,7 @@ impl EnvironmentStore {
         }
         let mut statement = self.conn.prepare(
             "SELECT profile, bytes FROM environment_samples
-             WHERE repository = ?1 AND bytes IS NOT NULL",
+             WHERE repository = ?1 AND bytes IS NOT NULL ORDER BY seq",
         )?;
         let rows = statement.query_map(params![repository], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))

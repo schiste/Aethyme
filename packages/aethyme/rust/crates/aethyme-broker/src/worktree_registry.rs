@@ -2405,6 +2405,167 @@ pub(crate) fn registered_source(
     Ok(record.source)
 }
 
+/// Opaque registry evidence retained while an artifact-use marker is
+/// reconciled. The held registry lock prevents retained rows from changing
+/// between plan revalidation and marker removal.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct ArtifactUsePrimaryRootWitness {
+    primary_root: PathBuf,
+    repository_key: String,
+    current_identity: DirectoryIdentity,
+    rows: Vec<ArtifactUseRootRowWitness>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ArtifactUseRootRowWitness {
+    root: PathBuf,
+    payload_sha256: String,
+    owner_marker_sha256: String,
+    origin_identity: DirectoryIdentity,
+}
+
+pub(crate) struct ArtifactUsePrimaryRootWitnessGuard {
+    host_database: PathBuf,
+    _registry_lock: crate::file_lock::ExclusiveFileLock,
+    witness: ArtifactUsePrimaryRootWitness,
+}
+
+impl ArtifactUsePrimaryRootWitnessGuard {
+    pub(crate) fn witness(&self) -> &ArtifactUsePrimaryRootWitness {
+        &self.witness
+    }
+
+    /// Re-read the exact registry rows and owner-marker bytes while retaining
+    /// the same exclusive registry lock.
+    pub(crate) fn revalidate(&self) -> io::Result<()> {
+        let current = build_artifact_use_primary_root_witness(
+            &self.host_database,
+            &self.witness.primary_root,
+            &self.witness.repository_key,
+        )?;
+        if current != self.witness {
+            return Err(invalid(
+                "primary-root registry witness changed during artifact-use reconciliation",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Accept the live primary identity or an exact mount-scoped primary
+    /// identity saved by a validated registration for this same repository.
+    /// The inode must match in both cases; an old device is accepted only
+    /// through the stable identity rules of the retained origin record.
+    pub(crate) fn matches_marker_identity(
+        &self,
+        primary_root: &Path,
+        device: u64,
+        inode: u64,
+    ) -> bool {
+        self.witness
+            .matches_marker_identity(primary_root, device, inode)
+    }
+}
+
+impl ArtifactUsePrimaryRootWitness {
+    fn matches_marker_identity(&self, primary_root: &Path, device: u64, inode: u64) -> bool {
+        if primary_root != self.primary_root || inode != self.current_identity.inode {
+            return false;
+        }
+        if device == self.current_identity.device {
+            return true;
+        }
+        self.rows.iter().any(|row| {
+            row.origin_identity.device == device
+                && row.origin_identity.inode == inode
+                && row
+                    .origin_identity
+                    .same_registered_object(&self.current_identity)
+        })
+    }
+}
+
+/// Build a held, read-only witness for one exact repository primary root.
+/// Every matching retained root row and owner marker is revalidated while the
+/// host registry lock is held. A partial registry inventory is a refusal.
+pub(crate) fn artifact_use_primary_root_witness_guard(
+    host_database: &Path,
+    primary_root: &Path,
+    repository_key: &str,
+) -> io::Result<ArtifactUsePrimaryRootWitnessGuard> {
+    if repository_key.is_empty() {
+        return Err(invalid("repository key is empty"));
+    }
+    let primary_root = primary_root.canonicalize()?;
+    let lock = registry_lock(host_database, false)?;
+    let witness =
+        build_artifact_use_primary_root_witness(host_database, &primary_root, repository_key)?;
+    Ok(ArtifactUsePrimaryRootWitnessGuard {
+        host_database: host_database.to_path_buf(),
+        _registry_lock: lock,
+        witness,
+    })
+}
+
+fn build_artifact_use_primary_root_witness(
+    host_database: &Path,
+    primary_root: &Path,
+    repository_key: &str,
+) -> io::Result<ArtifactUsePrimaryRootWitness> {
+    let primary_root = primary_root.canonicalize()?;
+    let metadata = real_directory(&primary_root)?;
+    let current_identity = directory_identity(&primary_root, &metadata)?
+        .ok_or_else(|| invalid("primary root filesystem identity is unavailable"))?;
+    let inventory = inventory(host_database, None);
+    if !inventory.complete {
+        return Err(invalid(format!(
+            "worktree registry inventory is incomplete: {}",
+            inventory.issues.join("; ")
+        )));
+    }
+    let connection = open_registry(host_database, false)?;
+
+    let mut rows = Vec::new();
+    for candidate in inventory.roots.iter().filter(|record| {
+        record.repository_key == repository_key && record.repository_root == primary_root
+    }) {
+        let payload = retained_registration(&connection, &candidate.root)?
+            .ok_or_else(|| invalid("matching retained root row disappeared under registry lock"))?;
+        let record = validate_retained_registration(&candidate.root, &payload)?;
+        if &record != candidate
+            || record.repository_key != repository_key
+            || record.repository_root != primary_root
+        {
+            return Err(invalid(
+                "retained root registration changed repository binding",
+            ));
+        }
+        let origin_identity = record
+            .origin_identity
+            .clone()
+            .ok_or_else(|| invalid("retained root has no origin identity"))?;
+        if !origin_identity.same_registered_object(&current_identity) {
+            return Err(invalid(
+                "retained root origin does not match the current primary identity",
+            ));
+        }
+        let (marker, marker_bytes) = read_marker_with_payload(&record.root)?;
+        marker_owner_matches(&record, &marker)?;
+        rows.push(ArtifactUseRootRowWitness {
+            root: record.root,
+            payload_sha256: format!("{:x}", Sha256::digest(payload.as_bytes())),
+            owner_marker_sha256: format!("{:x}", Sha256::digest(&marker_bytes)),
+            origin_identity,
+        });
+    }
+    rows.sort_by(|left, right| left.root.cmp(&right.root));
+    Ok(ArtifactUsePrimaryRootWitness {
+        primary_root,
+        repository_key: repository_key.to_owned(),
+        current_identity,
+        rows,
+    })
+}
+
 pub(crate) fn ownership_fingerprint(record: &RootRecord) -> io::Result<String> {
     if !root_still_present(record)? || !origin_is_missing(record)? {
         return Err(invalid("root is no longer an orphan"));
@@ -2578,6 +2739,120 @@ pub(crate) fn claim_for_removal(
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_use_witness_accepts_only_exact_validated_mount_history() {
+        let current_identity = DirectoryIdentity {
+            device: 16_777_233,
+            inode: 20_093_191,
+            filesystem: vec![1, 2, 3],
+            volume_uuid: Some([7; 16]),
+        };
+        let saved_origin = DirectoryIdentity {
+            device: 16_777_230,
+            inode: 20_093_191,
+            filesystem: vec![9, 8, 7],
+            volume_uuid: Some([7; 16]),
+        };
+        let witness = ArtifactUsePrimaryRootWitness {
+            primary_root: PathBuf::from("/fixture/primary"),
+            repository_key: "fixture-repository".into(),
+            current_identity: current_identity.clone(),
+            rows: vec![ArtifactUseRootRowWitness {
+                root: PathBuf::from("/fixture/worktree"),
+                payload_sha256: "payload".into(),
+                owner_marker_sha256: "owner".into(),
+                origin_identity: saved_origin,
+            }],
+        };
+        assert!(witness.matches_marker_identity(
+            Path::new("/fixture/primary"),
+            16_777_233,
+            20_093_191,
+        ));
+        assert!(witness.matches_marker_identity(
+            Path::new("/fixture/primary"),
+            16_777_230,
+            20_093_191,
+        ));
+        assert!(!witness.matches_marker_identity(
+            Path::new("/fixture/primary"),
+            16_777_234,
+            20_093_191,
+        ));
+        assert!(!witness.matches_marker_identity(
+            Path::new("/fixture/primary"),
+            16_777_230,
+            20_093_192,
+        ));
+        let mut changed_volume = witness;
+        changed_volume.current_identity.volume_uuid = Some([8; 16]);
+        assert!(!changed_volume.matches_marker_identity(
+            Path::new("/fixture/primary"),
+            16_777_230,
+            20_093_191,
+        ));
+    }
+
+    #[test]
+    fn artifact_use_witness_requires_exact_linux_identity_without_uuid() {
+        let current_identity = DirectoryIdentity {
+            device: 31,
+            inode: 47,
+            filesystem: vec![1, 2, 3],
+            volume_uuid: None,
+        };
+        let witness = ArtifactUsePrimaryRootWitness {
+            primary_root: PathBuf::from("/fixture/primary"),
+            repository_key: "fixture-repository".into(),
+            current_identity: current_identity.clone(),
+            rows: vec![ArtifactUseRootRowWitness {
+                root: PathBuf::from("/fixture/worktree"),
+                payload_sha256: "payload".into(),
+                owner_marker_sha256: "owner".into(),
+                origin_identity: current_identity,
+            }],
+        };
+        assert!(witness.matches_marker_identity(Path::new("/fixture/primary"), 31, 47,));
+        assert!(!witness.matches_marker_identity(Path::new("/fixture/primary"), 30, 47,));
+        assert!(!witness.matches_marker_identity(Path::new("/fixture/primary"), 31, 48,));
+    }
+
+    #[test]
+    fn artifact_use_registry_guard_revalidates_retained_owner_marker_bytes() {
+        let fixture = Fixture::new();
+        let (root, mut marker) = fixture.root("registered-root");
+        marker.repository_root = fixture.origin.canonicalize().unwrap();
+        fs::write(
+            root.join(WORKTREE_ROOT_MARKER),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        fixture.register(&root, &marker);
+        let guard = artifact_use_primary_root_witness_guard(
+            &fixture.database,
+            &marker.repository_root,
+            &marker.repository_key,
+        )
+        .unwrap();
+        let metadata = real_directory(&marker.repository_root).unwrap();
+        let identity = directory_identity(&marker.repository_root, &metadata)
+            .unwrap()
+            .unwrap();
+        assert!(guard.matches_marker_identity(
+            &marker.repository_root,
+            identity.device,
+            identity.inode,
+        ));
+
+        marker.repository_key = "changed-owner".into();
+        fs::write(
+            root.join(WORKTREE_ROOT_MARKER),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        assert!(guard.revalidate().is_err());
+    }
 
     thread_local! {
         static REGISTRATION_CONTENTION: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =

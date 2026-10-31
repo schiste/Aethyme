@@ -4,6 +4,31 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.52] - 2026-10-31
+
+### Added
+
+- Explicit, digest-confirmed recovery of stale artifact-use markers for closed sessions, retaining ambiguous process or checkout identity evidence instead of forcing cleanup.
+
+### Fixed
+
+- Targeted archive-resolution cleanup resumes already-confirmed GC recovery without starting unrelated automatic cleanup during the command.
+- Cooperating managed routers, engine daemons and updaters pin the exact runtime bundle through daemon startup and pruning, and validate daemon protocol and full build identity. Older launchers and updaters do not participate in this protection; mixed-generation rollout still requires a reviewed transition.
+
+## [0.8.51] - 2026-10-30
+
+### Added
+
+- An opt-in macOS cleanup service pins the installed router and engine and schedules bounded public GC sweeps every 15 minutes, subject to broker eligibility and retention. Installation is inert; activation and control changes require exact reviewed plans.
+
+### Fixed
+
+- Fresh worktree-root recovery completes on APFS after interrupted Cargo-config publication while preserving exact file and inventory checks.
+- Session retirement has a separate durable request and retry lane, so cache pressure and future closed-checkout grace periods cannot postpone abandoned-session checks indefinitely. Existing holder and lease proofs remain required.
+- Checkout cleanup distinguishes a proven removed historical checkout from a new checkout at the same path using complete repository, generation and filesystem identity evidence.
+- Final recovery-archive revalidation receives a bounded proof budget, and cleanup reports specific retained-cohort blockers.
+- Recovery archives without a recorded minimum age retain the 15-day minimum. Clean preparation journals can recover a changed root identity only when root-wide durable debt is absent.
+
 ## [0.8.50] - 2026-10-30
 
 ### Fixed
