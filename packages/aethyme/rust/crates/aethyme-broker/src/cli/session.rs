@@ -2126,6 +2126,15 @@ pub(super) fn render_cleanup_audit(audit: &crate::CleanupAudit, detail: bool) {
 }
 
 /// `broker cleanup resolve <session-id> --archive [--confirm <sha256>]`.
+fn open_cleanup_resolve_broker(read_only_snapshot: bool) -> Result<Broker, UsageError> {
+    if read_only_snapshot {
+        return open_broker(true);
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|err| UsageError::Message(format!("cannot resolve cwd: {err}")))?;
+    Ok(Broker::open_for_cleanup_resolve(&cwd)?)
+}
+
 fn run_cleanup_resolve(parsed: Parsed) -> Result<(), UsageError> {
     let usage = "usage: aethyme broker finish cleanup resolve <session-id>... --archive [--batch] [--retire] [--allow-adopted] [--confirm <sha256>] [--json]";
     let Some((command, ids)) = parsed.positional.split_first() else {
@@ -2153,7 +2162,7 @@ fn run_cleanup_resolve(parsed: Parsed) -> Result<(), UsageError> {
             "recovery apply requires the current writable repository database".into(),
         ));
     }
-    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let mut broker = open_cleanup_resolve_broker(parsed.read_only_snapshot)?;
     if parsed.cleanup_batch || ids.len() > 1 {
         return run_cleanup_resolve_batch(&mut broker, &ids, &parsed);
     }

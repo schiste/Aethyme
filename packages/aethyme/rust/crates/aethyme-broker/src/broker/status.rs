@@ -271,6 +271,7 @@ impl Broker {
         push_integration_refresh_advice(&mut view, integration_refresh);
         let auto_cleanup = self.last_auto_cleanup_report();
         push_auto_cleanup_advice(&mut view, auto_cleanup);
+        push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,
             crate::AdvisoryDeliverySurface::Status,
@@ -606,6 +607,7 @@ impl Broker {
         push_integration_refresh_advice(&mut view, integration_refresh);
         let auto_cleanup = self.last_auto_cleanup_report();
         push_auto_cleanup_advice(&mut view, auto_cleanup);
+        push_environment_minimum_advice(&mut view, deadline);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,
             crate::AdvisoryDeliverySurface::Status,

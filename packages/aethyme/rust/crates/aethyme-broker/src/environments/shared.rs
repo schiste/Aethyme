@@ -21,20 +21,39 @@
 //! component set differs from the serving one cannot be swapped in place
 //! (new components would never be provisioned) and is recreated instead.
 //!
+//! **Blue/green (#1274).** A shared environment alternates between two
+//! slots, `<name>@<ref>` and `<name>@<ref>#b`, each with its own ports and
+//! namespace; `<host state>/environments/shared/<repo>/<name>/serving` names
+//! the serving one. Consumers reach it through a stable alias route
+//! (`<name>.<repo>.shared.<route_domain>` on the proxy), which only the
+//! serving slot answers. A redeploy of an active environment brings the idle
+//! slot up at the new revision (build, provision, start, health) while the
+//! serving one keeps answering, then moves the pointer and the alias and
+//! destroys the old slot: no request is held. When the pool has no room for
+//! a second slot, the redeploy falls back to hold-and-swap above. A new slot
+//! that fails is destroyed and the serving one is never touched. A
+//! `stateful = true` entry (a database) is never redeployed blue/green: the
+//! new slot would start without its data, so it always holds and swaps.
+//!
 //! The declaration is read from the default branch. When it cannot be read
 //! (Git fails, the file does not parse), nothing is destroyed; only a file
 //! absent from the default branch, or a `[[shared]]` entry removed from it,
 //! destroys.
 
+use std::fs::File;
+#[cfg(unix)]
+use std::fs::OpenOptions;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use super::compile::{CompileContext, CompiledEnvironment, EnvironmentOwner, compile};
 use super::lifecycle::{Lifecycle, LifecycleError, UpOptions, export_commit, now_ms};
-use super::spec::{EnvironmentsFile, HostEnvironmentsFile, SharedSpec};
+use super::spec::{EnvironmentsFile, HostEnvironmentsFile, RedeployOn, SharedSpec};
 use super::store::{EnvironmentPhase, EnvironmentRecord, StoreError};
 use super::{ENVIRONMENTS_FILE, parse_loaded};
 
@@ -141,6 +160,41 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Under an environment's directory: the latest revision a
+/// `redeploy_on = "inputs"` entry recorded without redeploying.
+pub const INPUTS_REVISION_FILE: &str = "inputs-revision";
+
+/// The digest a `redeploy_on = "inputs"` entry redeploys on (#1297): every
+/// file at `commit` matching `inputs`, plus the environments file itself (so
+/// a change to the profile or the entry always redeploys), by path, mode and
+/// blob id. Read from the commit's tree, so nothing is exported to decide.
+pub fn inputs_digest(main_root: &Path, commit: &str, inputs: &[String]) -> Result<String, String> {
+    let mut builder = globset::GlobSetBuilder::new();
+    for pattern in inputs {
+        builder.add(
+            globset::GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
+                .map_err(|e| format!("{pattern:?}: {e}"))?,
+        );
+    }
+    let set = builder.build().map_err(|e| e.to_string())?;
+    let listing = git(main_root, &["ls-tree", "-r", "--full-tree", commit])?;
+    let mut digest = Sha256::new();
+    for line in listing.lines() {
+        let Some((meta, path)) = line.split_once('\t') else {
+            continue;
+        };
+        if path == ENVIRONMENTS_FILE || set.is_match(path) {
+            digest.update(meta.as_bytes());
+            digest.update(b"\t");
+            digest.update(path.as_bytes());
+            digest.update(b"\n");
+        }
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 /// The commit a shared environment's `ref` names right now. Local refs only:
 /// fetching stays with the commands that already fetch.
 pub fn resolve_ref(main_root: &Path, reference: &str) -> Result<String, String> {
@@ -192,6 +246,191 @@ pub fn declared_file(main_root: &Path) -> Result<Option<EnvironmentsFile>, Strin
 
 fn owner_name(spec: &SharedSpec) -> String {
     format!("{}@{}", spec.name, spec.reference)
+}
+
+/// The second blue/green slot's owner suffix.
+const SECOND_SLOT: &str = "#b";
+/// In a shared environment's home: the serving slot's owner name.
+const SERVING_FILE: &str = "serving";
+/// Serving-owner markers are small names, not arbitrary state payloads.
+const SERVING_OWNER_MAX_BYTES: u64 = 4096;
+/// Serializes pointer, alias, and lifecycle changes for one declared shared
+/// environment across both ref and blue/green slot transitions. Exclusive
+/// resource names are global, so hash both repository and shared name.
+fn shared_operation_key(repository: &str, name: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"aethyme-shared-operation/v1\0");
+    digest.update((repository.len() as u64).to_be_bytes());
+    digest.update(repository.as_bytes());
+    digest.update((name.len() as u64).to_be_bytes());
+    digest.update(name.as_bytes());
+    format!("aethyme-env-shared-redeploy:{:x}", digest.finalize())
+}
+/// How long a blue/green redeploy waits for pool capacity for the second
+/// slot before falling back to hold-and-swap.
+const BLUE_GREEN_CAPACITY_WAIT: Duration = Duration::from_secs(2);
+
+/// An open snapshot of the plain-text owner selected by `SERVING_FILE`.
+/// Keeping the file open prevents its inode from being reused while route
+/// construction compares the current path with this generation.
+pub(super) struct ServingPointerSnapshot {
+    owner: Option<String>,
+    default_owner: Option<String>,
+    identity: Option<ServingFileIdentity>,
+    _file: Option<File>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServingFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+// Stable file IDs are not exposed by stable `std` APIs on non-Unix targets.
+// There, bounded owner bytes still detect a switch to the other slot, but a
+// same-owner atomic replacement can escape detection (the ABA case is not
+// qualified on those targets).
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServingFileIdentity;
+
+impl ServingPointerSnapshot {
+    pub(super) fn owner(&self) -> Option<&str> {
+        self.owner.as_deref()
+    }
+
+    pub(super) fn exists(&self) -> bool {
+        self.identity.is_some()
+    }
+
+    pub(super) fn is_current(
+        &self,
+        root: &Path,
+        repository: &str,
+        shared_name: &str,
+    ) -> io::Result<bool> {
+        let current =
+            serving_pointer_snapshot(root, repository, shared_name, self.default_owner.as_deref())?;
+        Ok(self.identity == current.identity && self.owner == current.owner)
+    }
+}
+
+/// Read the serving owner without changing the on-disk owner format. An
+/// absent pointer retains the original first-slot fallback for older and
+/// first-start installations.
+pub(super) fn serving_pointer_snapshot(
+    root: &Path,
+    repository: &str,
+    shared_name: &str,
+    default_owner: Option<&str>,
+) -> io::Result<ServingPointerSnapshot> {
+    let path = home(root, repository, shared_name).join(SERVING_FILE);
+    let file = match open_serving_pointer(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ServingPointerSnapshot {
+                owner: default_owner.map(str::to_string),
+                default_owner: default_owner.map(str::to_string),
+                identity: None,
+                _file: None,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "serving pointer is not a regular file",
+        ));
+    }
+    if metadata.len() > SERVING_OWNER_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "serving pointer exceeds the 4096-byte limit",
+        ));
+    }
+    let identity = serving_file_identity(&metadata)?;
+    let mut contents = Vec::new();
+    file.try_clone()?
+        .take(SERVING_OWNER_MAX_BYTES + 1)
+        .read_to_end(&mut contents)?;
+    if contents.len() as u64 > SERVING_OWNER_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "serving pointer exceeds the 4096-byte limit",
+        ));
+    }
+    let contents = String::from_utf8(contents)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(ServingPointerSnapshot {
+        owner: Some(contents.trim().to_string()),
+        default_owner: default_owner.map(str::to_string),
+        identity: Some(identity),
+        _file: Some(file),
+    })
+}
+
+#[cfg(unix)]
+fn open_serving_pointer(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_serving_pointer(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+#[cfg(unix)]
+fn serving_file_identity(metadata: &std::fs::Metadata) -> io::Result<ServingFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(ServingFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn serving_file_identity(_metadata: &std::fs::Metadata) -> io::Result<ServingFileIdentity> {
+    Ok(ServingFileIdentity)
+}
+
+/// Find the declaration that owns either exact slot name. Comparing against
+/// both generated names avoids mistaking a legal ref ending in `#b` for a slot.
+fn declared_spec_for_owner<'a>(declared: &'a [SharedSpec], owner: &str) -> Option<&'a SharedSpec> {
+    declared.iter().find(|spec| {
+        let first = owner_name(spec);
+        first == owner || other_slot(&first) == owner
+    })
+}
+
+/// The other slot's owner name.
+fn other_slot(owner: &str) -> String {
+    match owner.strip_suffix(SECOND_SLOT) {
+        Some(first) => first.to_string(),
+        None => format!("{owner}{SECOND_SLOT}"),
+    }
+}
+
+/// The stable alias host consumers use: the serving slot answers on it.
+pub fn alias_host(repository: &str, name: &str, route_domain: &str) -> String {
+    let repository: String = repository
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(12)
+        .collect();
+    format!(
+        "{}.{repository}.shared.{route_domain}",
+        name.replace('_', "-")
+    )
+    .to_ascii_lowercase()
 }
 
 /// Stable per (repository, name): the shared environment's identity and its
@@ -251,6 +490,7 @@ impl Lifecycle {
         name: &str,
         sha: &str,
         host: &HostEnvironmentsFile,
+        owner: &str,
     ) -> Result<(CompiledEnvironment, PathBuf), LifecycleError> {
         let export = export_for(&self.root, repository, name, sha);
         // Complete only once the marker is in place: export into a staging
@@ -285,7 +525,7 @@ impl Lifecycle {
             &CompileContext {
                 repository: repository.to_string(),
                 owner: EnvironmentOwner::Ref {
-                    name: owner_name(&spec),
+                    name: owner.to_string(),
                 },
                 worktree_fingerprint: fingerprint,
                 source_commit: Some(sha.to_string()),
@@ -294,10 +534,68 @@ impl Lifecycle {
             },
         )
         .map_err(io)?;
+        // A shared environment runs without its optional components (E20).
+        super::compile::select_components(&mut snapshot, &Default::default());
         if let Some(idle) = spec.idle_seconds {
             snapshot.idle_seconds = idle;
         }
         Ok((snapshot, export))
+    }
+
+    /// The serving slot's owner name.
+    fn serving_owner(&self, repository: &str, spec: &SharedSpec) -> String {
+        let first = owner_name(spec);
+        let pointer =
+            std::fs::read_to_string(home(&self.root, repository, &spec.name).join(SERVING_FILE))
+                .unwrap_or_default();
+        if pointer.trim() == other_slot(&first) {
+            other_slot(&first)
+        } else {
+            first
+        }
+    }
+
+    fn set_serving(&self, repository: &str, name: &str, owner: &str) -> Result<(), LifecycleError> {
+        let directory = home(&self.root, repository, name);
+        std::fs::create_dir_all(&directory).map_err(io)?;
+        let staging = directory.join(format!("{SERVING_FILE}.next"));
+        std::fs::write(&staging, owner).map_err(io)?;
+        std::fs::rename(&staging, directory.join(SERVING_FILE)).map_err(io)
+    }
+
+    /// Record (or with `None` remove) the alias host `env_id` answers on.
+    fn set_alias(&self, env_id: &str, alias: Option<&str>) -> Result<(), LifecycleError> {
+        let path = self.root.join(env_id).join(super::routes::ROUTE_ALIAS_FILE);
+        match alias {
+            Some(alias) => {
+                std::fs::create_dir_all(self.root.join(env_id)).map_err(io)?;
+                std::fs::write(&path, alias).map_err(io)
+            }
+            None => match std::fs::remove_file(&path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(io(error)),
+                _ => Ok(()),
+            },
+        }
+    }
+
+    /// The serving slot's environment id for `spec`.
+    fn serving_env_id(&self, repository: &str, spec: &SharedSpec) -> String {
+        super::compile::environment_id(
+            repository,
+            &EnvironmentOwner::Ref {
+                name: self.serving_owner(repository, spec),
+            },
+            &spec.profile,
+        )
+    }
+
+    /// Destroy a slot that is not serving, if it holds anything.
+    fn retire_slot(&mut self, env_id: &str) {
+        if let Ok(Some(record)) = self.store.get(env_id)
+            && record.phase != EnvironmentPhase::Destroyed
+        {
+            crate::warn_unrecorded("retire a shared environment slot", self.down(env_id, None));
+        }
     }
 
     /// The shared environment's record, if it has been created.
@@ -310,11 +608,7 @@ impl Lifecycle {
         let file = default_branch_file(main_root)
             .ok_or_else(|| io("the default branch has no environments file"))?;
         let spec = Self::shared_spec(&file, name)?;
-        let owner = EnvironmentOwner::Ref {
-            name: owner_name(&spec),
-        };
-        let env_id = super::compile::environment_id(repository, &owner, &spec.profile);
-        Ok(self.store.get(&env_id)?)
+        Ok(self.store.get(&self.serving_env_id(repository, &spec))?)
     }
 
     /// Make sure the shared environment exists and is up: create it at its
@@ -327,29 +621,60 @@ impl Lifecycle {
         host: &HostEnvironmentsFile,
         wait: Duration,
     ) -> Result<EnvironmentRecord, LifecycleError> {
+        let key = shared_operation_key(repository, name);
+        self.exclusive(repository, &key, Duration::from_secs(5), |this| {
+            this.shared_up_locked(main_root, repository, name, host, wait)
+        })
+        .unwrap_or_else(|| Err(io(format!("shared environment {name:?} is busy; retry"))))
+    }
+
+    fn shared_up_locked(
+        &mut self,
+        main_root: &Path,
+        repository: &str,
+        name: &str,
+        host: &HostEnvironmentsFile,
+        wait: Duration,
+    ) -> Result<EnvironmentRecord, LifecycleError> {
         let file = default_branch_file(main_root)
             .ok_or_else(|| io("the default branch has no environments file"))?;
         let spec = Self::shared_spec(&file, name)?;
         let sha = resolve_ref(main_root, &spec.reference).map_err(io)?;
-        let (snapshot, export) = self.shared_snapshot(main_root, repository, name, &sha, host)?;
-        if let Some(record) = self.store.get(&snapshot.env_id)?
-            && record.phase.retains_worktree()
-        {
-            return match record.phase {
-                EnvironmentPhase::Parked => self.wake(&record.env_id, wait),
-                _ => Ok(record),
-            };
-        }
-        self.up(
-            &snapshot,
-            &export,
-            Some(main_root),
-            None,
-            &UpOptions {
-                wait,
-                reconfigure: false,
+        let owner = self.serving_owner(repository, &spec);
+        let (snapshot, export) =
+            self.shared_snapshot(main_root, repository, name, &sha, host, &owner)?;
+        let record = match self.store.get(&snapshot.env_id)? {
+            Some(record) if record.phase.retains_worktree() => match record.phase {
+                EnvironmentPhase::Parked => self.wake(&record.env_id, wait)?,
+                _ => record,
             },
-        )
+            _ => self.up(
+                &snapshot,
+                &export,
+                Some(main_root),
+                None,
+                &UpOptions {
+                    wait,
+                    reconfigure: false,
+                    recreate: Vec::new(),
+                },
+            )?,
+        };
+        let alias = alias_host(repository, name, &record.snapshot.route_domain);
+        self.set_alias(&record.env_id, Some(&alias))?;
+        if record.phase == EnvironmentPhase::Active {
+            let EnvironmentOwner::Ref { name: owner } = &record.owner else {
+                return Err(io("not a shared environment"));
+            };
+            let pointer =
+                serving_pointer_snapshot(&self.root, repository, name, Some(owner)).map_err(io)?;
+            let already_selected = pointer.exists() && pointer.owner() == Some(owner.as_str());
+            drop(pointer);
+            if !already_selected {
+                self.set_serving(repository, name, owner)?;
+            }
+        }
+        Ok(record)
     }
 
     /// Bring the shared environment to its ref's current commit by
@@ -364,19 +689,32 @@ impl Lifecycle {
         wait: Duration,
         force: bool,
     ) -> Result<Redeploy, LifecycleError> {
+        let key = shared_operation_key(repository, name);
+        match self.exclusive(repository, &key, Duration::from_secs(5), |this| {
+            this.shared_redeploy_locked(main_root, repository, name, host, wait, force)
+        }) {
+            Some(result) => result,
+            None => Ok(Redeploy::InProgress),
+        }
+    }
+
+    fn shared_redeploy_locked(
+        &mut self,
+        main_root: &Path,
+        repository: &str,
+        name: &str,
+        host: &HostEnvironmentsFile,
+        wait: Duration,
+        force: bool,
+    ) -> Result<Redeploy, LifecycleError> {
         let file = default_branch_file(main_root)
             .ok_or_else(|| io("the default branch has no environments file"))?;
         let spec = Self::shared_spec(&file, name)?;
+        let stateful = spec.stateful;
         let sha = resolve_ref(main_root, &spec.reference).map_err(io)?;
-        let env_id = super::compile::environment_id(
-            repository,
-            &EnvironmentOwner::Ref {
-                name: owner_name(&spec),
-            },
-            &spec.profile,
-        );
+        let env_id = self.serving_env_id(repository, &spec);
         let Some(current) = self.store.get(&env_id)? else {
-            self.shared_up(main_root, repository, name, host, wait)?;
+            self.shared_up_locked(main_root, repository, name, host, wait)?;
             return Ok(Redeploy::Redeployed {
                 from: None,
                 to: sha,
@@ -385,6 +723,35 @@ impl Lifecycle {
         // Both checks before exporting, so skipped revisions leave nothing
         // on disk.
         if current.snapshot.source.commit.as_deref() == Some(sha.as_str()) {
+            return Ok(Redeploy::Unchanged { commit: sha });
+        }
+        // Inputs unchanged: record the revision, restart nothing (#1297).
+        if spec.redeploy_on == RedeployOn::Inputs
+            && let Some(serving) = current.snapshot.source.commit.as_deref()
+            && inputs_digest(main_root, serving, &spec.inputs).map_err(io)?
+                == inputs_digest(main_root, &sha, &spec.inputs).map_err(io)?
+        {
+            let recorded = super::logs::environment_directory(&self.root, &env_id)
+                .map(|d| d.join(INPUTS_REVISION_FILE));
+            if recorded
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .as_deref()
+                != Some(sha.as_str())
+            {
+                if let Some(path) = &recorded {
+                    crate::warn_unrecorded(
+                        "record the shared revision",
+                        std::fs::write(path, &sha),
+                    );
+                }
+                self.store.note(
+                    &env_id,
+                    "revision recorded",
+                    &self.actor,
+                    Some(&json!({ "serving": serving, "revision": sha, "reason": "inputs unchanged" })),
+                )?;
+            }
             return Ok(Redeploy::Unchanged { commit: sha });
         }
         let interval = spec
@@ -410,14 +777,9 @@ impl Lifecycle {
                 until_ms: last + interval,
             });
         }
-        let key = format!("aethyme-env-shared-redeploy:{env_id}");
-        let outcome = self.exclusive(repository, &key, Duration::from_secs(5), |this| {
-            this.swap_revision(main_root, repository, name, host, wait, &env_id, &sha)
-        });
-        match outcome {
-            Some(result) => result,
-            None => Ok(Redeploy::InProgress),
-        }
+        self.swap_revision(
+            main_root, repository, name, host, wait, &env_id, &sha, stateful,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -430,6 +792,7 @@ impl Lifecycle {
         wait: Duration,
         env_id: &str,
         sha: &str,
+        stateful: bool,
     ) -> Result<Redeploy, LifecycleError> {
         // Re-read under the lease: another redeployer may have finished.
         let current = self
@@ -441,7 +804,12 @@ impl Lifecycle {
                 commit: sha.to_string(),
             });
         }
-        let (snapshot, export) = self.shared_snapshot(main_root, repository, name, sha, host)?;
+        let current_owner = match &current.owner {
+            EnvironmentOwner::Ref { name } => name.clone(),
+            EnvironmentOwner::Worktree { .. } => return Err(io("not a shared environment")),
+        };
+        let (snapshot, export) =
+            self.shared_snapshot(main_root, repository, name, sha, host, &current_owner)?;
         let previous_snapshot = current.snapshot.clone();
         let previous_export = current.worktree_root.clone().map(PathBuf::from);
         let from = previous_snapshot.source.commit.clone();
@@ -451,6 +819,28 @@ impl Lifecycle {
                 .map(|c| (c.name.clone(), format!("{:?}", c.runtime)))
                 .collect()
         };
+        // Build the new revision in its own export while the old one serves.
+        if let Err(error) = self.build_export(&current, &snapshot, &export) {
+            let message = error.to_string();
+            let detail = json!({ "code": "redeploy_failed", "failed_commit": sha, "serving": from, "message": message });
+            self.store.set_error(env_id, Some(&detail))?;
+            self.store
+                .note(env_id, "redeploy build failed", &self.actor, Some(&detail))?;
+            return Ok(Redeploy::RolledBack {
+                failed: sha.to_string(),
+                serving: from,
+                error: message,
+            });
+        }
+        // Blue/green when the environment serves: nothing is held. Never for
+        // a stateful service: the new slot would start without its data.
+        if current.phase == EnvironmentPhase::Active
+            && !stateful
+            && let Some(outcome) =
+                self.blue_green(main_root, repository, name, host, &current, sha)?
+        {
+            return Ok(outcome);
+        }
         if names(&snapshot) != names(&previous_snapshot) {
             // Components added, removed or changed runtime: an in-place swap
             // would never provision them. Recreate at the new revision.
@@ -463,6 +853,7 @@ impl Lifecycle {
                 &UpOptions {
                     wait,
                     reconfigure: false,
+                    recreate: Vec::new(),
                 },
             )?;
             self.store.note(
@@ -475,19 +866,6 @@ impl Lifecycle {
             return Ok(Redeploy::Redeployed {
                 from,
                 to: sha.to_string(),
-            });
-        }
-        // Build the new revision in its own export while the old one serves.
-        if let Err(error) = self.build_export(&current, &snapshot, &export) {
-            let message = error.to_string();
-            let detail = json!({ "code": "redeploy_failed", "failed_commit": sha, "serving": from, "message": message });
-            self.store.set_error(env_id, Some(&detail))?;
-            self.store
-                .note(env_id, "redeploy build failed", &self.actor, Some(&detail))?;
-            return Ok(Redeploy::RolledBack {
-                failed: sha.to_string(),
-                serving: from,
-                error: message,
             });
         }
         let was_active = current.phase == EnvironmentPhase::Active;
@@ -565,6 +943,104 @@ impl Lifecycle {
         }
     }
 
+    /// Bring the idle slot up at `sha` while `current` serves, then move the
+    /// serving pointer and the alias to it and destroy `current`. `None` when
+    /// the pool has no room for a second slot (the caller holds and swaps
+    /// instead). A slot that fails to come up is destroyed; `current` is
+    /// never touched.
+    fn blue_green(
+        &mut self,
+        main_root: &Path,
+        repository: &str,
+        name: &str,
+        host: &HostEnvironmentsFile,
+        current: &EnvironmentRecord,
+        sha: &str,
+    ) -> Result<Option<Redeploy>, LifecycleError> {
+        let EnvironmentOwner::Ref {
+            name: current_owner,
+        } = &current.owner
+        else {
+            return Ok(None);
+        };
+        let next_owner = other_slot(current_owner);
+        // A first blue/green redeploy must make the current serving owner
+        // explicit before the second owner's record can appear. Once both
+        // slots exist, a missing pointer cannot distinguish a blue/green pair
+        // from two valid refs whose names differ by `#b`.
+        let pointer = serving_pointer_snapshot(&self.root, repository, name, Some(current_owner))
+            .map_err(io)?;
+        if pointer.exists() && pointer.owner() != Some(current_owner.as_str()) {
+            return Err(io(format!(
+                "serving pointer for shared environment {name:?} does not name current owner {current_owner:?}"
+            )));
+        }
+        drop(pointer);
+        self.set_serving(repository, name, current_owner)?;
+
+        let (snapshot, export) =
+            self.shared_snapshot(main_root, repository, name, sha, host, &next_owner)?;
+        // A slot left by an interrupted redeploy.
+        self.retire_slot(&snapshot.env_id);
+        let from = current.snapshot.source.commit.clone();
+        let started = self.up(
+            &snapshot,
+            &export,
+            Some(main_root),
+            None,
+            &UpOptions {
+                wait: BLUE_GREEN_CAPACITY_WAIT,
+                reconfigure: false,
+                recreate: Vec::new(),
+            },
+        );
+        let next = match started {
+            Ok(next) => next,
+            Err(error) if error.code() == "capacity_timeout" => {
+                self.retire_slot(&snapshot.env_id);
+                return Ok(None);
+            }
+            Err(error) => {
+                self.retire_slot(&snapshot.env_id);
+                let message = error.to_string();
+                let detail = json!({ "code": "redeploy_failed", "failed_commit": sha, "serving": from, "message": message, "strategy": "blue_green" });
+                self.store.set_error(&current.env_id, Some(&detail))?;
+                self.store.note(
+                    &current.env_id,
+                    "redeploy rolled back",
+                    &self.actor,
+                    Some(&detail),
+                )?;
+                return Ok(Some(Redeploy::RolledBack {
+                    failed: sha.to_string(),
+                    serving: from,
+                    error: message,
+                }));
+            }
+        };
+        // Flip: the alias moves before the pointer, so the new slot answers
+        // first; the old slot keeps answering its own hosts until destroyed.
+        let alias = alias_host(repository, name, &next.snapshot.route_domain);
+        self.set_alias(&next.env_id, Some(&alias))?;
+        self.set_serving(repository, name, &next_owner)?;
+        self.set_alias(&current.env_id, None)?;
+        crate::warn_unrecorded(
+            "destroy the previous shared slot",
+            self.down(&current.env_id, None),
+        );
+        self.store.note(
+            &next.env_id,
+            "redeployed",
+            &self.actor,
+            Some(&json!({ "from": from, "to": sha, "strategy": "blue_green", "previous": current.env_id })),
+        )?;
+        remove_previous_export(current.worktree_root.clone().map(PathBuf::from), &export);
+        Ok(Some(Redeploy::Redeployed {
+            from,
+            to: sha.to_string(),
+        }))
+    }
+
     /// Run every component's `build` hook in the new export.
     fn build_export(
         &self,
@@ -610,24 +1086,83 @@ impl Lifecycle {
                 continue;
             }
             let shared = name.split('@').next().unwrap_or_default().to_string();
-            let Some(spec) = declared.iter().find(|s| owner_name(s) == *name) else {
-                match self.down(&record.env_id, None) {
-                    Ok(_) => actions.push(format!(
+            let Some(spec) = declared_spec_for_owner(&declared, name) else {
+                let env_id = record.env_id.clone();
+                let key = shared_operation_key(repository, &shared);
+                match self.exclusive(
+                    repository,
+                    &key,
+                    Duration::ZERO,
+                    |this| -> Result<bool, LifecycleError> {
+                        let Some(current) = this.store.get(&env_id)? else {
+                            return Ok(false);
+                        };
+                        if !current.phase.retains_worktree() {
+                            return Ok(false);
+                        }
+                        this.down(&env_id, None)?;
+                        Ok(true)
+                    },
+                ) {
+                    Some(Ok(true)) => actions.push(format!(
                         "destroyed {shared}: no longer declared on the default branch"
                     )),
-                    Err(error) => actions.push(format!("destroying {shared} failed: {error}")),
+                    Some(Ok(false)) => {}
+                    Some(Err(error)) => {
+                        actions.push(format!("destroying {shared} failed: {error}"));
+                    }
+                    None => actions.push(format!(
+                        "skipped destroying {shared}: a shared operation is in progress"
+                    )),
                 }
                 continue;
             };
+            if *name != self.serving_owner(repository, spec) {
+                // An idle slot left by an interrupted blue/green redeploy.
+                // Recheck the selected slot under the same key as redeploys;
+                // the earlier list may now describe the serving slot.
+                let key = shared_operation_key(repository, &shared);
+                let env_id = record.env_id.clone();
+                let owner = name.clone();
+                if let Some(true) =
+                    self.exclusive(repository, &key, Duration::ZERO, |this| -> bool {
+                        if this.serving_owner(repository, spec) == owner {
+                            return false;
+                        }
+                        this.retire_slot(&env_id);
+                        true
+                    })
+                {
+                    actions.push(format!("retired an idle {shared} slot ({env_id})"));
+                }
+                continue;
+            }
             if spec.profile != record.profile {
                 // Its id is per profile: without this the old one would be
                 // kept forever beside the new one.
-                match self.down(&record.env_id, None) {
-                    Ok(_) => actions.push(format!(
+                let env_id = record.env_id.clone();
+                let key = shared_operation_key(repository, &shared);
+                match self.exclusive(
+                    repository,
+                    &key,
+                    Duration::ZERO,
+                    |this| -> Result<bool, LifecycleError> {
+                        let Some(current) = this.store.get(&env_id)? else {
+                            return Ok(false);
+                        };
+                        if !current.phase.retains_worktree() {
+                            return Ok(false);
+                        }
+                        this.down(&env_id, None)?;
+                        Ok(true)
+                    },
+                ) {
+                    Some(Ok(true)) => actions.push(format!(
                         "destroyed {shared} ({}): its profile changed to {}",
                         record.profile, spec.profile
                     )),
-                    Err(error) => {
+                    Some(Ok(false)) | None => continue,
+                    Some(Err(error)) => {
                         actions.push(format!("replacing {shared} failed: {error}"));
                         continue;
                     }
@@ -669,9 +1204,36 @@ impl Lifecycle {
         repository: &str,
         name: &str,
     ) -> Result<EnvironmentRecord, LifecycleError> {
+        let key = shared_operation_key(repository, name);
+        self.exclusive(repository, &key, Duration::from_secs(5), |this| {
+            this.shared_destroy_locked(main_root, repository, name)
+        })
+        .unwrap_or_else(|| Err(io(format!("shared environment {name:?} is busy; retry"))))
+    }
+
+    fn shared_destroy_locked(
+        &mut self,
+        main_root: &Path,
+        repository: &str,
+        name: &str,
+    ) -> Result<EnvironmentRecord, LifecycleError> {
+        let file = default_branch_file(main_root)
+            .ok_or_else(|| io("the default branch has no environments file"))?;
+        let spec = Self::shared_spec(&file, name)?;
         let record = self
             .shared_record(main_root, repository, name)?
             .ok_or_else(|| StoreError::NotFound(format!("shared environment {name}")))?;
+        let EnvironmentOwner::Ref { name: owner } = &record.owner else {
+            return Err(io("not a shared environment"));
+        };
+        let idle = super::compile::environment_id(
+            repository,
+            &EnvironmentOwner::Ref {
+                name: other_slot(owner),
+            },
+            &spec.profile,
+        );
+        self.retire_slot(&idle);
         self.down(&record.env_id, None)
     }
 }
@@ -687,12 +1249,21 @@ fn remove_previous_export(previous: Option<PathBuf>, current: &Path) {
     }
 }
 
-/// `AETHYME_SHARED_<NAME>_URL` / `_PORT_<COMPONENT>` for a consumer, from the
-/// shared environment's reservation.
+/// `AETHYME_SHARED_<NAME>_URL` / `_DIRECT_URL` / `_PORT_<COMPONENT>` for a
+/// consumer, from the shared environment's reservation.
+///
+/// With a proxy port, `_URL` goes through the wake-on-request proxy
+/// (`http://<namespace>.<route_domain>:<proxy port>`), so a consumer's request
+/// during a redeploy is held rather than refused, and a parked shared
+/// environment is woken by the request itself (#1274). That needs the route
+/// host to resolve to loopback here (`*.localhost` does on macOS and most
+/// Linux resolvers); otherwise `_URL` is the direct port, as before.
+/// `_DIRECT_URL` and the ports always address the component directly.
 pub fn consumer_variables(
     root: &Path,
     shared_name: &str,
     record: &EnvironmentRecord,
+    proxy_port: Option<u16>,
 ) -> Vec<(String, String)> {
     let suffix = super::validate::env_suffix(shared_name);
     let mut vars = Vec::new();
@@ -722,7 +1293,65 @@ pub fn consumer_variables(
         }
     }
     if let Some(url) = url {
-        vars.push((format!("AETHYME_SHARED_{suffix}_URL"), url));
+        let proxied = proxy_port.and_then(|port| proxied_url(root, record, port));
+        vars.push((format!("AETHYME_SHARED_{suffix}_DIRECT_URL"), url.clone()));
+        vars.push((
+            format!("AETHYME_SHARED_{suffix}_URL"),
+            proxied.unwrap_or(url),
+        ));
     }
     vars
+}
+
+/// The proxy URL of the shared environment's first routed component, when its
+/// route host resolves to loopback on this host.
+fn proxied_url(root: &Path, record: &EnvironmentRecord, proxy_port: u16) -> Option<String> {
+    use std::net::ToSocketAddrs;
+    record.snapshot.components.iter().find(|c| c.routed)?;
+    // The alias survives blue/green flips; the namespace host is the slot's.
+    let host = match super::routes::route_alias(root, &record.env_id) {
+        Some(alias) => alias,
+        None => format!(
+            "{}.{}",
+            record.namespace.as_deref()?,
+            record.snapshot.route_domain
+        ),
+    };
+    let loopback = (host.as_str(), proxy_port)
+        .to_socket_addrs()
+        .ok()?
+        .any(|address| address.ip().is_loopback());
+    loopback.then(|| format!("http://{host}:{proxy_port}"))
+}
+
+#[cfg(test)]
+mod operation_key_tests {
+    use super::{SharedSpec, declared_spec_for_owner, shared_operation_key};
+    use crate::environments::spec::RedeployOn;
+
+    #[test]
+    fn shared_operation_key_is_stable_and_scoped_by_repository_and_name() {
+        let baseline = shared_operation_key("repo-a", "baseline");
+        assert_eq!(baseline, shared_operation_key("repo-a", "baseline"));
+        assert_ne!(baseline, shared_operation_key("repo-b", "baseline"));
+        assert_ne!(baseline, shared_operation_key("repo-a", "frontend"));
+        assert!(baseline.len() <= 256);
+    }
+
+    #[test]
+    fn declared_slot_matching_preserves_refs_ending_in_slot_suffix() {
+        let declared = [SharedSpec {
+            name: "baseline".into(),
+            profile: "backend".into(),
+            reference: "refs/heads/feature#b".into(),
+            idle_seconds: None,
+            min_redeploy_interval_seconds: None,
+            stateful: false,
+            redeploy_on: RedeployOn::Ref,
+            inputs: Vec::new(),
+        }];
+        assert!(declared_spec_for_owner(&declared, "baseline@refs/heads/feature#b").is_some());
+        assert!(declared_spec_for_owner(&declared, "baseline@refs/heads/feature").is_some());
+        assert!(declared_spec_for_owner(&declared, "baseline@refs/heads/feature#b#b").is_none());
+    }
 }

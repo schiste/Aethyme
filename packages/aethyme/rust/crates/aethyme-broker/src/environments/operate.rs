@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 
 use super::ENVIRONMENTS_FILE;
 use super::cli::{
-    DOWN_SCHEMA, Failure, Options, Output, PARK_SCHEMA, PIN_SCHEMA, SWEEP_SCHEMA, TOUCH_SCHEMA,
-    UP_SCHEMA, WAKE_SCHEMA, check, compile_context, environment_failure, workspace,
+    DOWN_SCHEMA, Failure, Options, Output, PARK_SCHEMA, PIN_SCHEMA, RESTART_SCHEMA, SWEEP_SCHEMA,
+    TOUCH_SCHEMA, UP_SCHEMA, WAKE_SCHEMA, check, compile_context, environment_failure, workspace,
 };
 use super::compile::compile;
 use super::lifecycle::{Lifecycle, LifecycleError, RESERVATION_GRANT, UpOptions, read_grant};
@@ -21,7 +21,18 @@ fn lifecycle_failure(error: LifecycleError) -> Failure {
     let code = error.code();
     let next_action = match &error {
         LifecycleError::ReconfigureRequired { .. } => "rerun with --reconfigure".to_string(),
+        LifecycleError::RecreateRequired { components, .. } => format!(
+            "rerun with {} to confirm the data loss, or keep those components unchanged",
+            components
+                .iter()
+                .map(|c| format!("--recreate {c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
         LifecycleError::WrongPhase { next, .. } => next.clone(),
+        LifecycleError::NotActive { env_id, .. } => {
+            format!("run `aethyme env wake {env_id}` (or `aethyme env up`) first")
+        }
         LifecycleError::Resources(_) if code == "capacity_timeout" => {
             "raise --wait, park or destroy another environment in the pool, or raise the pool limit"
                 .into()
@@ -34,9 +45,12 @@ fn lifecycle_failure(error: LifecycleError) -> Failure {
         message: error.to_string(),
         next_action,
         exit: match code {
-            "not_found" | "wrong_phase" | "reconfigure_required" | "capacity_timeout" => {
-                exit_status::REFUSED
-            }
+            "not_found"
+            | "wrong_phase"
+            | "not_active"
+            | "reconfigure_required"
+            | "recreate_required"
+            | "capacity_timeout" => exit_status::REFUSED,
             _ => exit_status::FAILED,
         },
     }
@@ -84,7 +98,16 @@ fn describe(lifecycle: &Lifecycle, record: &EnvironmentRecord) -> (Value, String
     let mut ports = serde_json::Map::new();
     let mut variables = serde_json::Map::new();
     if let Some(grant) = &grant {
-        for allocation in &grant.lease.allocations {
+        // Only components the environment runs: an optional component left
+        // out keeps its port reserved but is not reported (E20).
+        let runs = |key: &str| {
+            record
+                .snapshot
+                .components
+                .iter()
+                .any(|c| c.port_key.as_deref() == Some(key))
+        };
+        for allocation in grant.lease.allocations.iter().filter(|a| runs(&a.key)) {
             if let Some(component) = allocation.key.strip_prefix("port_") {
                 ports.insert(component.into(), json!(allocation.value));
                 let suffix = super::validate::env_suffix(component);
@@ -150,15 +173,27 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
     let (base, changed) =
         super::infer::changed_paths(&workspace.worktree_root).map_err(environment_failure)?;
     let inference = super::infer::infer(file, &changed).map_err(environment_failure)?;
-    let (mut lifecycle, warning) = open("env up", true)?;
     let mut profile = choose_profile(file, &inference, options)?;
+    let empty = |name: &str| {
+        file.profiles
+            .iter()
+            .any(|p| p.name == name && p.components.is_empty())
+    };
+    // An empty profile needs no supervisor: nothing will be registered.
+    let (mut lifecycle, mut warning) = open("env up", !empty(&profile))?;
     if options.profile.is_none()
         && let Some(higher) =
             existing_at_or_above(&lifecycle, &workspace.worktree_root, file, &inference)?
     {
         // Reuse a deliberately higher environment rather than start a second,
         // cheaper one beside it.
+        if empty(&profile) && !empty(&higher) {
+            (lifecycle, warning) = open("env up", true)?;
+        }
         profile = higher;
+    }
+    if empty(&profile) {
+        return Ok(nothing_needed(&profile, base.as_deref(), &inference));
     }
     let context = compile_context(&workspace, &checked.digest);
     let snapshot =
@@ -172,6 +207,28 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
         })?;
     let main_root = workspace.repo.main_root().ok();
     let mut snapshot = snapshot;
+    // Optional components (E20): the ones the diff enables, the ones named
+    // with --component, and the ones the running environment already has,
+    // so a later plain `env up` never drops what was selected.
+    let mut selected =
+        super::infer::enabled_components(&snapshot, &changed).map_err(environment_failure)?;
+    for name in &options.components {
+        if !snapshot.components.iter().any(|c| &c.name == name) {
+            return Err(Failure {
+                code: "unknown_component",
+                message: format!("profile {profile} has no component {name:?}"),
+                next_action: "pass --component with a component of the profile".into(),
+                exit: exit_status::USAGE,
+            });
+        }
+        selected.insert(name.clone());
+    }
+    if let Ok(Some(existing)) = lifecycle.store.get(&snapshot.env_id)
+        && existing.phase.retains_worktree()
+    {
+        selected.extend(existing.snapshot.components.into_iter().map(|c| c.name));
+    }
+    super::compile::select_components(&mut snapshot, &selected);
     attach_shared(
         &mut lifecycle,
         &mut snapshot,
@@ -188,6 +245,7 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
             &UpOptions {
                 wait: Duration::from_secs(options.wait_seconds),
                 reconfigure: options.reconfigure,
+                recreate: options.recreate.clone(),
             },
         )
         .map_err(lifecycle_failure)?;
@@ -243,6 +301,27 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
     }
     value["schema"] = json!(UP_SCHEMA);
     Ok((value, text, exit_status::SUCCESS))
+}
+
+/// `env up` on a profile with no components (#1289): nothing is registered,
+/// reserved or started.
+fn nothing_needed(
+    profile: &str,
+    base: Option<&str>,
+    inference: &super::infer::Inference,
+) -> Output {
+    let value = json!({
+        "schema": UP_SCHEMA,
+        "nothing_needed": true,
+        "profile": profile,
+        "inference": {
+            "base": base,
+            "minimum": inference.minimum,
+            "fired": inference.fired,
+        },
+    });
+    let text = format!("no environment needed (profile {profile} has no components)\n");
+    (value, text, exit_status::SUCCESS)
 }
 
 fn required_id(options: &Options) -> Result<String, Failure> {
@@ -308,6 +387,19 @@ pub(super) fn run_wake(options: &Options) -> Result<Output, Failure> {
         text.push_str(&format!("warning: {warning}\n"));
     }
     value["schema"] = json!(WAKE_SCHEMA);
+    Ok((value, text, exit_status::SUCCESS))
+}
+
+pub(super) fn run_restart(options: &Options) -> Result<Output, Failure> {
+    let id = required_id(options)?;
+    let (mut lifecycle, _) = open("env restart", false)?;
+    let (record, restarted) = lifecycle
+        .restart(&id, options.positional.get(1).map(String::as_str))
+        .map_err(lifecycle_failure)?;
+    let (mut value, mut text) = describe(&lifecycle, &record);
+    value["schema"] = json!(RESTART_SCHEMA);
+    value["restarted"] = json!(restarted);
+    text.push_str(&format!("restarted: {}\n", restarted.join(", ")));
     Ok((value, text, exit_status::SUCCESS))
 }
 
@@ -748,6 +840,7 @@ fn attach_shared(
             &lifecycle.root,
             &name,
             &record,
+            Some(super::proxy::proxy_port()),
         ));
     }
     for component in &mut snapshot.components {
@@ -842,6 +935,79 @@ pub(super) fn run_shared(options: &Options) -> Result<Output, Failure> {
         value["warning"] = json!(warning);
     }
     Ok((value, text, exit_status::SUCCESS))
+}
+
+/// `env budgets` (#1239): declared budgets against recorded timings and
+/// measured footprints. Read-only; a host with no store reports no data.
+pub(super) fn run_budgets(options: &Options) -> Result<Output, Failure> {
+    let workspace = workspace(options)?;
+    let checked = check(&workspace)?;
+    let Some(file) = checked
+        .file
+        .as_ref()
+        .filter(|_| checked.diagnostics.is_empty())
+    else {
+        return Err(Failure {
+            code: "invalid_environments_file",
+            message: format!("{ENVIRONMENTS_FILE} has validation problems"),
+            next_action: "run `aethyme env validate` and fix every problem".into(),
+            exit: exit_status::VERIFICATION_FAILED,
+        });
+    };
+    let repository = crate::gates::git_origin_fingerprint(&workspace.repo);
+    let (timings, footprints) = match EnvironmentStore::open_default_read_only()
+        .map_err(|error| environment_failure(error.to_string()))?
+    {
+        Some(store) => (
+            store
+                .timings(&repository)
+                .map_err(|error| environment_failure(error.to_string()))?,
+            store
+                .footprints(&repository)
+                .map_err(|error| environment_failure(error.to_string()))?,
+        ),
+        None => Default::default(),
+    };
+    let metrics = super::budgets::report(&file.budgets, &timings, &footprints);
+    let mut text = String::new();
+    if metrics.is_empty() {
+        text.push_str("no budgets declared and nothing recorded yet\n");
+    }
+    let number = |value: Option<f64>| value.map_or_else(|| "-".to_string(), |v| format!("{v:.1}"));
+    for metric in &metrics {
+        text.push_str(&format!(
+            "  {:<28} {:<9} n={:<4} p50 {:>8} p95 {:>8} budget {:>6} {}{}\n",
+            metric.metric,
+            metric.status,
+            metric.count,
+            number(metric.p50),
+            number(metric.p95),
+            metric
+                .budget
+                .map_or_else(|| "-".to_string(), |b| b.to_string()),
+            if metric.unit == "seconds" { "s" } else { "MiB" },
+            metric
+                .trend
+                .as_ref()
+                .map(|t| format!("  trend {:+.1}%", t.change_pct))
+                .unwrap_or_default(),
+        ));
+        if metric.failures > 0 {
+            text.push_str(&format!(
+                "      {} failed run(s) kept apart\n",
+                metric.failures
+            ));
+        }
+    }
+    Ok((
+        json!({
+            "schema": super::cli::BUDGETS_SCHEMA,
+            "repository": repository,
+            "metrics": metrics,
+        }),
+        text,
+        exit_status::SUCCESS,
+    ))
 }
 
 pub(super) fn run_calibrate(options: &Options) -> Result<Output, Failure> {
@@ -1044,6 +1210,27 @@ pub struct LifecycleWork {
     pub proxy_started: bool,
     /// When the last resource sample was taken (#1218).
     pub last_sample: Option<std::time::Instant>,
+    /// Shared-environment sync runs off the tick (#1274): a redeploy waits
+    /// for health for up to its wake timeout, which must never delay lease
+    /// renewal. At most one runs at a time.
+    pub shared_sync: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LifecycleWork {
+    /// Start `job` on its own thread unless the previous one is still
+    /// running. Returns whether it started.
+    pub fn start_shared_sync(&mut self, job: impl FnOnce() + Send + 'static) -> bool {
+        if self.shared_sync.as_ref().is_some_and(|h| !h.is_finished()) {
+            return false;
+        }
+        if let Some(finished) = self.shared_sync.take()
+            && finished.join().is_err()
+        {
+            eprintln!("warning: aethyme env supervisor: shared environment sync panicked");
+        }
+        self.shared_sync = Some(std::thread::spawn(job));
+        true
+    }
 }
 
 /// Start the wake-on-request proxy on loopback in this (supervisor)
@@ -1102,7 +1289,11 @@ impl super::supervisor::SupervisorWork for LifecycleWork {
                 "park idle environments",
                 lifecycle.park_idle(super::activity::now_ms()),
             );
-            sync_shared_environments(&mut lifecycle);
+            self.start_shared_sync(|| {
+                if let Ok((mut lifecycle, _)) = open("supervisor shared sync", false) {
+                    sync_shared_environments(&mut lifecycle);
+                }
+            });
             if self
                 .last_sample
                 .is_none_or(|at| at.elapsed() >= super::metrics::SAMPLE_INTERVAL)

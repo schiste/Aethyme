@@ -34,12 +34,14 @@ pub const DOWN_SCHEMA: &str = "aethyme.env-down/v1";
 pub const SWEEP_SCHEMA: &str = "aethyme.env-sweep/v1";
 pub const PARK_SCHEMA: &str = "aethyme.env-park/v1";
 pub const WAKE_SCHEMA: &str = "aethyme.env-wake/v1";
+pub const RESTART_SCHEMA: &str = "aethyme.env-restart/v1";
 pub const TOUCH_SCHEMA: &str = "aethyme.env-touch/v1";
 pub const PIN_SCHEMA: &str = "aethyme.env-pin/v1";
 pub const ROUTES_SCHEMA: &str = "aethyme.env-routes/v1";
 pub const INFER_SCHEMA: &str = "aethyme.env-infer/v1";
 pub const SHARED_SCHEMA: &str = "aethyme.env-shared/v1";
 pub const CALIBRATE_SCHEMA: &str = "aethyme.env-calibrate/v1";
+pub const BUDGETS_SCHEMA: &str = "aethyme.env-budgets/v1";
 pub const CACHE_SCHEMA: &str = "aethyme.env-cache/v1";
 
 pub const USAGE: &str = "\
@@ -77,7 +79,7 @@ Usage:
       sides of renames), the rules that fired with their paths, and the
       paths no rule matched. --range evaluates every commit in a range and
       prints how many would need each profile, for tuning rules.
-  aethyme env up [--profile <name> [--reason <text>]] [--wait <seconds>] [--reconfigure] [--json]
+  aethyme env up [--profile <name> [--reason <text>]] [--component <name>]... [--wait <seconds>] [--reconfigure [--recreate <component>]...] [--json]
       Make sure this worktree's environment is up: create it, or return it
       if already active. Reserves its namespace and ports, waits up to
       --wait (default 300) for pool capacity, provisions, starts and
@@ -88,7 +90,14 @@ Usage:
       minimum is destroyed and replaced. It prints its
       ports, URLs and the AETHYME_ENV_* variables. A failure rolls back and
       leaves the environment `failed` with its error. A changed profile
-      needs --reconfigure (destroy, then recreate).
+      needs --reconfigure, which keeps the environment and changes only
+      what changed: unchanged components keep their data, changed and
+      removed ones are destroyed, added ones provisioned. Destroying a
+      component that holds data (it provisions, or runs in a container
+      engine) needs --recreate <component>. Optional components start only
+      when named with --component or enabled by a changed path matching
+      their enabled_by, and stay selected; selecting one needs no
+      --reconfigure.
   aethyme env down <id> [--json]
       Destroy the environment (reverse dependency order) and release its
       leases only after every destroy hook succeeded. A failing destroy
@@ -106,6 +115,11 @@ Usage:
       component and wait for health. Without capacity it stays parked with
       capacity_timeout; a failed start rolls back to parked. `env up` on a
       parked environment wakes it.
+  aethyme env restart <id> [<component>] [--json]
+      Stop and start one component (or every running one, in dependency
+      order) in place, then re-check its health. Ports, namespace, data and
+      every other component are kept. Only an active environment restarts
+      (not_active); a failed start leaves it active with last_error set.
   aethyme env exec <id> -- <command> [args...]
       Run a command against the environment: it wakes a parked environment,
       sets the AETHYME_ENV_* variables (namespace, ports, URLs, receipts),
@@ -133,6 +147,16 @@ Usage:
       within --ram-fraction (default 0.5) of RAM minus any container-engine
       VM reservation. Prints a diff of environments.toml; never writes it.
       Profiles with fewer than 10 samples are reported as insufficient.
+  aethyme env budgets [--json]
+      Compare recorded timings and measured footprints with the
+      [budgets.seconds] / [budgets.memory_mib] declared in environments.toml:
+      per metric (up.<profile> for a warm up, up.cold for one that
+      provisioned, park, down, provision|start|health.<component>, any
+      duration a hook reports in its receipt's metrics object,
+      memory.<profile>)
+      the count, p50, p95, latest, the trend between the older and newer
+      halves of the window, and ok (p95 within budget), watch (only p50
+      within), over, no-data or no-budget. Read-only.
   aethyme env cache list|prune [--all] [--json]
       Content-addressed build outputs (build + cache_inputs, output in
       build_output or serve_dir) shared across worktrees, and database
@@ -177,6 +201,10 @@ pub(super) struct Options {
     pub(super) limit: usize,
     pub(super) wait_seconds: u64,
     pub(super) reconfigure: bool,
+    /// `env up --recreate <component>` (E20), repeatable.
+    pub(super) recreate: Vec<String>,
+    /// `env up --component <name>` (E20), repeatable.
+    pub(super) components: Vec<String>,
     pub(super) retry: bool,
     pub(super) abandon: bool,
     pub(super) reason: Option<String>,
@@ -224,6 +252,7 @@ pub fn run(args: &[String]) -> u8 {
         "sweep" => super::operate::run_sweep(&options),
         "park" => super::operate::run_park(&options),
         "wake" => super::operate::run_wake(&options),
+        "restart" => super::operate::run_restart(&options),
         "touch" => super::operate::run_touch(&options),
         "pin" => super::operate::run_pin(&options),
         "unpin" => super::operate::run_unpin(&options),
@@ -231,6 +260,7 @@ pub fn run(args: &[String]) -> u8 {
         "infer" => super::operate::run_infer(&options),
         "shared" => super::operate::run_shared(&options),
         "calibrate" => super::operate::run_calibrate(&options),
+        "budgets" => super::operate::run_budgets(&options),
         "cache" => super::operate::run_cache(&options),
         other => Err(Failure {
             code: "unknown_subcommand",
@@ -273,6 +303,8 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
         limit: 200,
         wait_seconds: 300,
         reconfigure: false,
+        recreate: Vec::new(),
+        components: Vec::new(),
         retry: false,
         abandon: false,
         reason: None,
@@ -301,6 +333,16 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
                 options.wait_seconds = number(args.next(), "--wait")? as u64
             }
             "--reconfigure" if command == "up" => options.reconfigure = true,
+            "--recreate" if command == "up" => options.recreate.push(
+                args.next()
+                    .ok_or_else(|| usage("--recreate needs a component name".into()))?
+                    .clone(),
+            ),
+            "--component" if command == "up" => options.components.push(
+                args.next()
+                    .ok_or_else(|| usage("--component needs a component name".into()))?
+                    .clone(),
+            ),
             "--retry" if command == "destroy" => options.retry = true,
             "--abandon" if command == "destroy" => options.abandon = true,
             "--for" if command == "pin" => {
@@ -356,6 +398,7 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
                             | "destroy"
                             | "park"
                             | "wake"
+                            | "restart"
                             | "touch"
                             | "pin"
                             | "unpin"
@@ -363,7 +406,7 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
                             | "cache"
                     )
                     && options.positional.len()
-                        < if matches!(command, "logs" | "shared") {
+                        < if matches!(command, "logs" | "shared" | "restart") {
                             2
                         } else {
                             1
@@ -576,6 +619,9 @@ fn run_plan(options: &Options) -> Result<Output, Failure> {
                 exit: exit_status::USAGE,
             }
         })?;
+    // Optional components are off unless `env up` selects them (E20).
+    let mut compiled = compiled;
+    super::compile::select_components(&mut compiled, &Default::default());
     let plans = advisory_plans(&compiled)?;
     Ok(render_plan(&compiled, plans))
 }

@@ -1,6 +1,6 @@
 # Reaching environments: the built-in proxy and external proxies
 
-Last Updated: 2026-10-29
+Last Updated: 2026-10-31
 
 Every running `aethyme env supervise` process serves a small HTTP/1.1
 reverse proxy on loopback, `127.0.0.1:4180` by default
@@ -29,6 +29,30 @@ an environment's namespace.
   browsing is not parked as idle.
 
 Routing is decided per connection, from its first request's `Host`.
+
+## Several services on one address
+
+A routed component can send some paths elsewhere, so one address serves a
+built app and forwards its API and WebSocket traffic (#1296):
+
+```toml
+[[profiles.components]]
+name = "site"
+runtime = "static"
+serve_dir = "dist"
+paths = [
+  { prefix = "/api", to = "api" },             # another routed component
+  { prefix = "/ws", to = "shared:realtime" },  # a shared environment in uses_shared
+  { prefix = "/legacy", to = "http://127.0.0.1:9000" },
+]
+```
+
+The longest matching prefix wins, and the prefix is kept on the forwarded
+request (`/api/users` reaches the api component as `/api/users`). `/api`
+matches `/api`, `/api/...` and `/api?...`, never `/apix`. A component or
+shared target is held and woken like a host route. An `http://` target
+receives its own `Host` header; TLS upstreams (`https://`) are not supported.
+Paths not under any prefix go to the component itself.
 
 ## Hostnames and `.localhost`
 

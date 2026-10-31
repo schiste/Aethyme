@@ -26,9 +26,11 @@ env:
 jobs:
   contract-check:
     name: Cross-process contract check
-    # A rerun keeps the original event payload. Revalidate changed PR bodies,
-    # but avoid rebuilding the checker for title-only or base-only edits.
-    if: github.event.action != 'edited' || github.event.changes.body
+    # A rerun keeps the original event payload. Revalidate changed PR bodies
+    # and changed bases (retargeting a stacked PR to main changes the diff the
+    # contract is judged on), but avoid rebuilding the checker for title-only
+    # edits.
+    if: github.event.action != 'edited' || github.event.changes.body || github.event.changes.base
     runs-on: ubuntu-latest
     steps:
       - name: Checkout PR (full history for diff)

@@ -316,6 +316,7 @@ fn replacing_below_minimum_keeps_pinned_environments() {
                 &UpOptions {
                     wait: Duration::from_secs(5),
                     reconfigure: false,
+                    recreate: Vec::new(),
                 },
             )
             .unwrap()
@@ -341,4 +342,170 @@ fn replacing_below_minimum_keeps_pinned_environments() {
             .is_none_or(|r| !r.phase.retains_worktree())
     );
     lifecycle.down(&pinned, None).unwrap();
+}
+
+/// #1290: a rule's `exclude` carves exceptions out of a broad rule; the
+/// highest-rank rule still wins for everything it does match.
+#[test]
+fn an_excluded_path_never_fires_its_rule() {
+    let text = RULES.replace(
+        "paths = [\"server/**\", \"src/**/*.rs\"]\n",
+        "paths = [\"server/**\", \"src/**/*.rs\"]\nexclude = [\"server/docs/**\"]\n",
+    );
+    let loaded: Loaded<EnvironmentsFile> = parse_loaded(PathBuf::from("t"), "t", &text);
+    let file = loaded.value.unwrap_or_else(|d| panic!("{}", d.render()));
+
+    let docs = infer(&file, &paths(&["server/docs/api.md"])).unwrap();
+    assert_eq!(docs.minimum, "static", "{docs:?}");
+    assert!(docs.fired.is_empty(), "{docs:?}");
+    assert_eq!(docs.unmatched, paths(&["server/docs/api.md"]));
+
+    let code = infer(&file, &paths(&["server/docs/api.md", "server/main.rs"])).unwrap();
+    assert_eq!(code.minimum, "backend", "{code:?}");
+    assert_eq!(code.fired[0].paths, paths(&["server/main.rs"]));
+}
+
+/// #1273: a session whose committed changes raise the minimum above its
+/// running environment is reported for `broker status`, and stops being
+/// reported once an environment meeting the minimum runs.
+#[test]
+fn a_live_environment_below_the_minimum_is_reported() {
+    use super::compile::{CompileContext, EnvironmentOwner, compile};
+    use super::lifecycle::{Lifecycle, UpOptions};
+    use super::spec::HostEnvironmentsFile;
+    use super::store::EnvironmentStore;
+    use std::time::Duration;
+
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path();
+    git(dir, &["init", "-q", "-b", "main"]);
+    write(dir, ".aethyme/environments.toml", RULES);
+    write(dir, "README", "x\n");
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-qm", "base"]);
+    git(dir, &["branch", "aethyme/integration"]);
+
+    let host = tempfile::tempdir().unwrap();
+    let mut lifecycle = Lifecycle {
+        store: EnvironmentStore::open(&host.path().join("environments.db")).unwrap(),
+        coordinator: crate::resources::HostResourceCoordinator::open(&host.path().join("host.db"))
+            .unwrap(),
+        root: host.path().join("environments"),
+        holder_pid: None,
+        hook_timeout: Duration::from_secs(20),
+        actor: "test".into(),
+    };
+    let file = file();
+    let fingerprint = crate::console::worktree_fingerprint(dir);
+    let up = |lifecycle: &mut Lifecycle, profile: &str| {
+        let snapshot = compile(
+            &file,
+            &HostEnvironmentsFile::default(),
+            profile,
+            "t",
+            &CompileContext {
+                repository: "repo-below".into(),
+                owner: EnvironmentOwner::Worktree {
+                    fingerprint: fingerprint.clone(),
+                },
+                worktree_fingerprint: fingerprint.clone(),
+                source_commit: None,
+                source_dirty: false,
+                source_digest: String::new(),
+            },
+        )
+        .unwrap();
+        lifecycle
+            .up(
+                &snapshot,
+                dir,
+                None,
+                None,
+                &UpOptions {
+                    wait: Duration::from_secs(5),
+                    reconfigure: false,
+                    recreate: Vec::new(),
+                },
+            )
+            .unwrap()
+            .env_id
+    };
+    let cheap = up(&mut lifecycle, "static");
+    let sessions = vec![(7, dir.to_path_buf())];
+    assert!(
+        super::infer::below_minimum(&lifecycle.store, &sessions).is_empty(),
+        "no changes yet"
+    );
+
+    write(dir, "db/migrations/0002.sql", "alter table t add c int;\n");
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-qm", "migration"]);
+    let found = super::infer::below_minimum(&lifecycle.store, &sessions);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].session_id, 7);
+    assert_eq!(found[0].env_id, cheap);
+    assert_eq!(found[0].minimum, "isolated");
+    assert!(
+        found[0].rules[0].contains("db/migrations/0002.sql"),
+        "{found:?}"
+    );
+
+    let enough = up(&mut lifecycle, "isolated");
+    assert!(
+        super::infer::below_minimum(&lifecycle.store, &sessions).is_empty(),
+        "an environment meeting the minimum now runs"
+    );
+    for id in [cheap, enough] {
+        lifecycle.down(&id, None).unwrap();
+    }
+}
+
+/// #1295: an optional component is enabled by a changed path matching its
+/// `enabled_by`, and never by anything else.
+#[test]
+fn enabled_by_selects_optional_components_from_the_diff() {
+    let text = r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "api"
+runtime = "process"
+start = "x"
+[[profiles.components]]
+name = "orgs"
+runtime = "process"
+start = "x"
+optional = true
+enabled_by = ["apps/orgs/**"]
+"#;
+    let loaded: super::Loaded<EnvironmentsFile> =
+        super::parse_loaded(std::path::PathBuf::from("t"), "t", text);
+    let file = loaded.value.unwrap_or_else(|d| panic!("{}", d.render()));
+    let snapshot = super::compile::compile(
+        &file,
+        &super::spec::HostEnvironmentsFile::default(),
+        "p",
+        "t",
+        &super::compile::CompileContext {
+            repository: "r".into(),
+            owner: super::compile::EnvironmentOwner::Worktree {
+                fingerprint: "f".into(),
+            },
+            worktree_fingerprint: "f".into(),
+            source_commit: None,
+            source_dirty: false,
+            source_digest: String::new(),
+        },
+    )
+    .unwrap();
+    let enabled =
+        |list: &[&str]| super::infer::enabled_components(&snapshot, &paths(list)).unwrap();
+    assert_eq!(
+        enabled(&["apps/orgs/src/main.ts"])
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec!["orgs".to_string()]
+    );
+    assert!(enabled(&["apps/customer/x.ts", "README.md"]).is_empty());
 }

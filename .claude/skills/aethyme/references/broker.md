@@ -45,23 +45,47 @@ floor, so verify which executable resumed agents will use; the repo-local
 selector does not change their PATH. Preserve concurrent work and never
 automatically restore a pre-upgrade database over newer activity.
 
+For scheduled cleanup on macOS, a loaded LaunchAgent proves only scheduler
+registration. Check `broker gc service status --json` and its matching
+`last_pass` before claiming delivery; inspect the pass outcome separately
+before claiming reclamation. A runtime stored on a removable volume can wait
+at a macOS file-access prompt before product code starts. If there is no pass
+receipt, inspect launchd state and a short process sample, then confirm any
+OS permission request through the human operator. Do not bypass macOS privacy
+controls or start duplicate sweep jobs while delivery is unresolved.
+
 Checkout capacity is configured with `[worktrees] max_checkouts = <count>` in
 `.aethyme/config.toml` on the fetched default branch. A working-copy edit alone
 may not change the effective cap: land the configuration and refresh upstream
 before claiming it is active. Keep a finite limit while reclaiming a backlog;
 raising capacity does not reclaim storage. For closed checkouts, targeted
-`broker finish cleanup <session-id> --json` avoids the bulk plan's recursive
-size inventory while retaining fresh delivery and live-owner checks. From v0.8.33, default cleanup treats every Git-ignored directory as disposable
+`broker finish cleanup <session-id> --json` immediately applies cleanup; it is
+not a preview, and `--json` changes only the output format. It avoids the bulk
+plan's recursive size inventory while retaining fresh delivery and live-owner
+checks. Use the bulk plan below when only inspecting eligibility. From v0.8.33, default cleanup treats every Git-ignored directory as disposable
 without inspecting its contents, including saved records and datasets. Preserve
 irreplaceable evidence outside disposable checkouts before closing them, or set
 `[cleanup] strict = true` in the primary checkout to retain ignored leftovers and
 pause automatic artifact sweeps. `auto_remove = false` only disables whole-checkout
 removal. Never use `--force` merely to clear a capacity refusal.
-For `finish cleanup resolve --archive --json`, exit status zero can mean the
-archive succeeded while checkout removal failed. Check `worktree_removed` and
+`finish cleanup resolve <session-id> --archive --json` previews the archive
+resolution without creating an archive or removing a checkout; apply only with
+the reviewed plan's full `--confirm <sha256>`. On an applied archive resolution,
+exit status zero can mean the archive succeeded while checkout removal failed. Check `worktree_removed` and
 `cleanup_error`, verify the checkout is absent, and retain the archive before
 reporting reclaimed storage. A partial removal needs inspection, not a blind
 retry or forced deletion.
+
+At the checkout cap, an already-closed, retained checkout owned by your task
+can be reused without allocating or deleting a worktree. Verify that no live
+session owns its exact path, its previous HEAD is fully pushed, and tracked,
+untracked and ignored paths contain no pending work or unpreserved evidence.
+Preserve the previous local and remote branches; create a fresh task branch
+at the intended base, then run `broker start --adopt` from that checkout with
+explicit planned paths. Do not use this to take over another task's checkout
+or to bypass the requirement to keep an unmerged PR session live unless the
+user has authorized that exception. Re-adoption invalidates old cleanup plans;
+never apply a retirement plan made for the previous owner of that path.
 
 When investigating retained worktrees, distinguish task identity from shared
 service uptime. A shared agent daemon can outlive many tasks; its PID alone
@@ -341,6 +365,15 @@ blocked.
    branch into a published one, and changes nothing if that would conflict.
    Sync is local only: it never pushes, so run `aethyme broker push --session
    <id>` afterwards to publish the caught-up branch.
+   When `sync` hands off an incoming default-branch merge, follow its exact
+   handoff with session-confined Git; use `aethyme broker advanced git` when
+   the operation requires coordination. Do not route the merge through
+   `advanced exec`: its rewrite audit can reject upstream paths outside your
+   leases. Resolve only conflicts in paths leased to this session, and leave
+   all other incoming default-branch changes intact. If the result or a broker
+   operation fence is unknown, inspect the durable operation record, recovery
+   notice and current branch state before retrying; follow the printed recovery
+   step rather than retrying blindly.
    `broker start` and `start --reuse` refresh the default branch first, so a
    new worktree starts from the latest fetched tip. In a repository
    with `[promote] mode = "verify-only"`, `broker submit` is a pre-flight
@@ -351,6 +384,15 @@ blocked.
    on the default branch -- rather than waiting or building on the other
    session's unmerged branch.
    Without the policy, pushing stays a separately authorized action (step 9).
+
+   Before exact-target maintenance, account for automatic cleanup that may
+   run during native startup; prefer a scoped native open when supported. If
+   temporary holds are needed, preserve the existing strict/disposable policy
+   and suppress only automatic lanes; never force strict/disposable policy
+   flags false or true to make an exact target eligible. Restore the exact
+   original bytes or absence with compare-and-swap only after command exit and
+   detached-worker settlement are confirmed. Preserve refusal journals: changed
+   preconditions call for a fresh plan, not deletion of the earlier refusal.
 
 5. **Gate resources are per worker**. Broker gate runs take path-scoped owner
    locks and export `AETHYME_GATE_WORKER_ID` plus `AETHYME_TEST_DB_SUFFIX`.
@@ -451,7 +493,9 @@ blocked.
    `aethyme broker finish cleanup <id>`. Operators can periodically review all
    retained broker-owned worktrees with
    `aethyme broker finish cleanup --all-cleaned` and apply the unchanged plan
-   explicitly with `aethyme broker finish cleanup --all-cleaned --apply`.
+   explicitly with `aethyme broker finish cleanup --all-cleaned --apply --confirm
+   <sha256>` using the reviewed plan's full digest. Omitting `--apply` is the
+   bulk preview; single-session cleanup applies immediately.
 
    For a storage audit, reconcile broker session paths, `git worktree list
    --porcelain`, and directories under current and historical roots on every
