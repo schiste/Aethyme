@@ -83,6 +83,14 @@ Updaters retain current and previous bundles and skip a noncurrent bundle with
 a busy pin. Once all daemon descriptors close, a later updater removes the
 released pin and bundle.
 
+Installer cleanup uses `RuntimeBundlePin::try_acquire_exclusive_for_cleanup`
+for safe old directory components, including orphan and staging names. Its
+`None` outcome preserves an unrecognized directory without treating
+it as missing; malformed pin metadata remains an error. Non-UTF-8 names are
+also preserved. This cleanup-only path retains the existing private-path and
+file-lock checks. Candidate resolution, shared consumer pins and inherited
+daemon descriptors keep the strict versioned-bundle name validation.
+
 This protocol is cooperative: older updaters ignore pins, and pre-protocol
 daemons use legacy pid/socket names, so the new lifecycle cannot account for
 them. It does not establish safe mixed-generation rollout on a shared mutable

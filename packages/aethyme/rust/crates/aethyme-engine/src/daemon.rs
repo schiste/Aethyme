@@ -749,15 +749,20 @@ impl RuntimeBundlePin {
         managed_root: &Path,
         bundle_name: &str,
     ) -> std::io::Result<RuntimeBundlePinAttempt> {
-        validate_bundle_name(bundle_name)?;
-        let Some(pin) = open_runtime_pin_file_if_present(managed_root, bundle_name)? else {
-            return Ok(RuntimeBundlePinAttempt::Missing);
-        };
-        match pin.file.try_lock() {
-            Ok(()) => Ok(RuntimeBundlePinAttempt::Acquired(pin)),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(RuntimeBundlePinAttempt::Busy),
-            Err(std::fs::TryLockError::Error(error)) => Err(error),
+        try_exclusive_runtime_pin(managed_root, bundle_name, validate_bundle_name)
+    }
+
+    /// Check a stale installer directory without accepting its name as a live
+    /// runtime identity. The caller must hold the exclusive installation lock.
+    /// `None` preserves an unsupported name; malformed pin files remain errors.
+    pub fn try_acquire_exclusive_for_cleanup(
+        managed_root: &Path,
+        bundle_name: &str,
+    ) -> std::io::Result<Option<RuntimeBundlePinAttempt>> {
+        if validate_cleanup_component(bundle_name).is_err() {
+            return Ok(None);
         }
+        try_exclusive_runtime_pin(managed_root, bundle_name, validate_cleanup_component).map(Some)
     }
 
     pub fn bundle_name(&self) -> &str {
@@ -927,12 +932,56 @@ fn validate_bundle_name(bundle_name: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn validate_cleanup_component(name: &str) -> std::io::Result<()> {
+    if name.is_empty()
+        || name.len() > 160
+        || matches!(name, "." | "..")
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cleanup pin name is not a bounded safe component",
+        ));
+    }
+    Ok(())
+}
+
+fn try_exclusive_runtime_pin(
+    managed_root: &Path,
+    bundle_name: &str,
+    validate_name: fn(&str) -> std::io::Result<()>,
+) -> std::io::Result<RuntimeBundlePinAttempt> {
+    validate_name(bundle_name)?;
+    let Some(pin) = open_runtime_pin_file_if_present(managed_root, bundle_name, validate_name)?
+    else {
+        return Ok(RuntimeBundlePinAttempt::Missing);
+    };
+    match pin.file.try_lock() {
+        Ok(()) => Ok(RuntimeBundlePinAttempt::Acquired(pin)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(RuntimeBundlePinAttempt::Busy),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
 fn open_runtime_pin_file(
     managed_root: &Path,
     bundle_name: &str,
     create: bool,
 ) -> std::io::Result<RuntimeBundlePin> {
+    open_runtime_pin_file_checked(managed_root, bundle_name, create, validate_bundle_name)
+}
+
+fn open_runtime_pin_file_checked(
+    managed_root: &Path,
+    bundle_name: &str,
+    create: bool,
+    validate_name: fn(&str) -> std::io::Result<()>,
+) -> std::io::Result<RuntimeBundlePin> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+
+    validate_name(bundle_name)?;
 
     validate_managed_root(managed_root)?;
     let pin_directory = managed_root.join(RUNTIME_PIN_DIRECTORY);
@@ -977,12 +1026,13 @@ fn open_runtime_pin_file(
         options.create(true);
     }
     let file = options.open(&path)?;
-    validate_open_runtime_pin_file(file, &path)
+    validate_open_runtime_pin_file_checked(file, &path, validate_name)
 }
 
 fn open_runtime_pin_file_if_present(
     managed_root: &Path,
     bundle_name: &str,
+    validate_name: fn(&str) -> std::io::Result<()>,
 ) -> std::io::Result<Option<RuntimeBundlePin>> {
     let pin_directory = managed_root.join(RUNTIME_PIN_DIRECTORY);
     match fs::symlink_metadata(&pin_directory) {
@@ -990,7 +1040,7 @@ fn open_runtime_pin_file_if_present(
         Err(error) => return Err(error),
         Ok(_) => {}
     }
-    match open_runtime_pin_file(managed_root, bundle_name, false) {
+    match open_runtime_pin_file_checked(managed_root, bundle_name, false, validate_name) {
         Ok(pin) => Ok(Some(pin)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
@@ -998,6 +1048,14 @@ fn open_runtime_pin_file_if_present(
 }
 
 fn validate_open_runtime_pin_file(file: File, path: &Path) -> std::io::Result<RuntimeBundlePin> {
+    validate_open_runtime_pin_file_checked(file, path, validate_bundle_name)
+}
+
+fn validate_open_runtime_pin_file_checked(
+    file: File,
+    path: &Path,
+    validate_name: fn(&str) -> std::io::Result<()>,
+) -> std::io::Result<RuntimeBundlePin> {
     use std::os::unix::fs::MetadataExt;
     let named = fs::symlink_metadata(path)?;
     let opened = file.metadata()?;
@@ -1037,7 +1095,7 @@ fn validate_open_runtime_pin_file(file: File, path: &Path) -> std::io::Result<Ru
         .ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid pin filename")
         })?;
-    validate_bundle_name(bundle_name)?;
+    validate_name(bundle_name)?;
     Ok(RuntimeBundlePin {
         file,
         path: path.to_path_buf(),
@@ -1972,6 +2030,56 @@ mod tests {
             RuntimeBundlePin::try_acquire_exclusive(&managed_root, "v0.8.51-0123456789ab").unwrap(),
             RuntimeBundlePinAttempt::Acquired(_)
         ));
+    }
+
+    #[test]
+    fn cleanup_pin_does_not_relax_live_or_inherited_runtime_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = canonical_fixture_root(&temp).join(".aethyme-managed");
+        fs::create_dir(&root).unwrap();
+        for name in ["orphan", ".staging-old"] {
+            assert!(RuntimeBundlePin::acquire_shared(&root, name).is_err());
+            assert!(RuntimeBundlePin::try_acquire_exclusive(&root, name).is_err());
+            let pin = open_runtime_pin_file_checked(&root, name, true, validate_cleanup_component)
+                .unwrap();
+            pin.file.lock_shared().unwrap();
+            assert!(
+                validate_open_runtime_pin_file(pin.file.try_clone().unwrap(), pin.pin_path())
+                    .is_err()
+            );
+            assert!(matches!(
+                RuntimeBundlePin::try_acquire_exclusive_for_cleanup(&root, name).unwrap(),
+                Some(RuntimeBundlePinAttempt::Busy)
+            ));
+            drop(pin);
+            assert!(matches!(
+                RuntimeBundlePin::try_acquire_exclusive_for_cleanup(&root, name).unwrap(),
+                Some(RuntimeBundlePinAttempt::Acquired(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn cleanup_pin_distinguishes_unknown_names_from_malformed_pins() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = canonical_fixture_root(&temp).join(".aethyme-managed");
+        fs::create_dir(&root).unwrap();
+        for name in ["", ".", "..", "../escape", "a/b", "unknown name"] {
+            assert!(
+                RuntimeBundlePin::try_acquire_exclusive_for_cleanup(&root, name)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(!root.join(RUNTIME_PIN_DIRECTORY).exists());
+        let pin = open_runtime_pin_file_checked(&root, "orphan", true, validate_cleanup_component)
+            .unwrap();
+        let path = pin.pin_path().to_path_buf();
+        drop(pin);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(RuntimeBundlePin::try_acquire_exclusive_for_cleanup(&root, "orphan").is_err());
     }
 
     #[cfg(unix)]
