@@ -74,6 +74,7 @@ fn up(lifecycle: &mut Lifecycle, text: &str, worktree: &Path) -> String {
             &UpOptions {
                 wait: Duration::from_secs(5),
                 reconfigure: false,
+                recreate: Vec::new(),
             },
         )
         .unwrap()
@@ -419,4 +420,34 @@ fn prune_evicts_nothing_when_live_use_is_unknown() {
     assert!(report.refused.is_some(), "{report:?}");
     assert!(report.evicted.is_empty());
     lifecycle.down(&live, None).unwrap();
+}
+
+/// #1297: `redeploy_on = "inputs"` needs inputs, and they must be globs.
+#[test]
+fn redeploy_on_inputs_needs_valid_inputs() {
+    let text = |extra: &str| {
+        format!(
+            r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "db"
+runtime = "hooks"
+provision = "true"
+destroy = "true"
+[[shared]]
+name = "db"
+profile = "p"
+ref = "default_branch"
+{extra}
+"#
+        )
+    };
+    assert!(validation(&text("redeploy_on = \"inputs\"")).contains(&"missing_inputs"));
+    assert!(
+        validation(&text("redeploy_on = \"inputs\"\ninputs = [\"db/[\"]"))
+            .contains(&"invalid_glob")
+    );
+    assert!(validation(&text("redeploy_on = \"inputs\"\ninputs = [\"db/**\"]")).is_empty());
 }

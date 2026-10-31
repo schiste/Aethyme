@@ -380,6 +380,28 @@ pub fn validate(
                 "use \"default_branch\", \"integration\" or refs/heads/<name>",
             );
         }
+        if shared.redeploy_on == super::spec::RedeployOn::Inputs && shared.inputs.is_empty() {
+            c.push(
+                "missing_inputs",
+                None,
+                None,
+                Some(&format!("{field}.inputs")),
+                "redeploy_on = \"inputs\" needs the globs whose changes redeploy",
+                "add inputs, or use redeploy_on = \"ref\"",
+            );
+        }
+        for pattern in &shared.inputs {
+            if let Err(error) = Glob::new(pattern) {
+                c.push(
+                    "invalid_glob",
+                    None,
+                    None,
+                    Some(&format!("{field}.inputs")),
+                    format!("{pattern:?}: {error}"),
+                    "fix the glob syntax",
+                );
+            }
+        }
     }
     for profile in &file.profiles {
         for used in &profile.uses_shared {
@@ -660,6 +682,21 @@ fn validate_profile(
                     "name a component of the same profile",
                 );
             }
+            if !component.optional
+                && profile
+                    .components
+                    .iter()
+                    .any(|other| &other.name == dependency && other.optional)
+            {
+                c.push(
+                    "depends_on_optional",
+                    p,
+                    Some(&component.name),
+                    Some("depends_on"),
+                    format!("{dependency:?} is optional, so this component could start without it"),
+                    "make this component optional too, or the dependency required",
+                );
+            }
         }
     }
     if let Some(cycle) = find_cycle(&profile.components) {
@@ -671,6 +708,93 @@ fn validate_profile(
             format!("dependency cycle: {}", cycle.join(" -> ")),
             "break the cycle",
         );
+    }
+}
+
+/// Per-path routes (#1296): only on a routed component; each prefix an
+/// absolute path, unique, outside the proxy's control namespace; each target
+/// another routed component of the profile, a shared environment the profile
+/// uses, or an `http://host[:port]` URL (TLS upstreams are not supported).
+fn validate_paths(c: &mut Collector<'_>, profile: &ProfileSpec, component: &ComponentSpec) {
+    if component.paths.is_empty() {
+        return;
+    }
+    let p = Some(profile.name.as_str());
+    let n = Some(component.name.as_str());
+    if !component.routed() {
+        c.push(
+            "paths_without_route",
+            p,
+            n,
+            Some("paths"),
+            "per-path routes need a routed component: they answer on its host",
+            "set route = true or remove paths",
+        );
+    }
+    let mut prefixes = BTreeSet::new();
+    for (index, path) in component.paths.iter().enumerate() {
+        let field = format!("paths[{index}]");
+        let prefix = path.prefix.as_str();
+        if !prefix.starts_with('/')
+            || prefix
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch == '?' || ch == '#')
+            || prefix.starts_with("/__aethyme")
+        {
+            c.push(
+                "invalid_path_prefix",
+                p,
+                n,
+                Some(&format!("{field}.prefix")),
+                format!("{prefix:?} is not a usable path prefix"),
+                "use an absolute path such as \"/api\", outside /__aethyme",
+            );
+        } else if !prefixes.insert(prefix.trim_end_matches('/')) {
+            c.push(
+                "duplicate_path_prefix",
+                p,
+                n,
+                Some(&format!("{field}.prefix")),
+                format!("{prefix:?} is routed more than once"),
+                "keep one route per prefix",
+            );
+        }
+        let to = path.to.as_str();
+        let target_error = if let Some(authority) = to.strip_prefix("http://") {
+            let authority = authority.trim_end_matches('/');
+            let (host, port) = authority.rsplit_once(':').unwrap_or((authority, "80"));
+            (host.is_empty()
+                || authority.contains('/')
+                || host.contains(['@', ' '])
+                || port.parse::<u16>().map_or(true, |port| port == 0))
+            .then(|| format!("{to:?} is not an http://host[:port] URL"))
+        } else if to.contains("://") {
+            Some(format!("{to:?}: only http:// URLs are supported"))
+        } else if let Some(shared) = to.strip_prefix("shared:") {
+            (!profile.uses_shared.iter().any(|used| used == shared)).then(|| {
+                format!("shared environment {shared:?} is not in this profile's uses_shared")
+            })
+        } else if to == component.name {
+            Some("a path cannot route to its own component".to_string())
+        } else {
+            match profile.components.iter().find(|other| other.name == to) {
+                None => Some(format!("{to:?} is not a component of this profile")),
+                Some(other) if !other.routed() => Some(format!(
+                    "{to:?} is not routed, so it has no host to forward to"
+                )),
+                Some(_) => None,
+            }
+        };
+        if let Some(message) = target_error {
+            c.push(
+                "invalid_path_target",
+                p,
+                n,
+                Some(&format!("{field}.to")),
+                message,
+                "name a routed component, shared:<name> from uses_shared, or http://host[:port]",
+            );
+        }
     }
 }
 
@@ -918,6 +1042,7 @@ fn validate_component(
             );
         }
     }
+    validate_paths(c, profile, component);
     if let Some(health) = &component.health {
         validate_health(c, p, n, component, health);
     }
@@ -951,6 +1076,28 @@ fn validate_component(
                 Some("pass_env"),
                 format!("{name:?} is not a valid environment variable name"),
                 "use [A-Za-z_][A-Za-z0-9_]*",
+            );
+        }
+    }
+    if !component.enabled_by.is_empty() && !component.optional {
+        c.push(
+            "enabled_by_without_optional",
+            p,
+            n,
+            Some("enabled_by"),
+            "enabled_by only selects optional components",
+            "add optional = true, or remove enabled_by",
+        );
+    }
+    for pattern in &component.enabled_by {
+        if let Err(error) = Glob::new(pattern) {
+            c.push(
+                "invalid_glob",
+                p,
+                n,
+                Some("enabled_by"),
+                format!("{pattern:?}: {error}"),
+                "fix the glob syntax",
             );
         }
     }

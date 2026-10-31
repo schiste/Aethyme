@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 
 use super::ENVIRONMENTS_FILE;
 use super::cli::{
-    DOWN_SCHEMA, Failure, Options, Output, PARK_SCHEMA, PIN_SCHEMA, SWEEP_SCHEMA, TOUCH_SCHEMA,
-    UP_SCHEMA, WAKE_SCHEMA, check, compile_context, environment_failure, workspace,
+    DOWN_SCHEMA, Failure, Options, Output, PARK_SCHEMA, PIN_SCHEMA, RESTART_SCHEMA, SWEEP_SCHEMA,
+    TOUCH_SCHEMA, UP_SCHEMA, WAKE_SCHEMA, check, compile_context, environment_failure, workspace,
 };
 use super::compile::compile;
 use super::lifecycle::{Lifecycle, LifecycleError, RESERVATION_GRANT, UpOptions, read_grant};
@@ -21,7 +21,18 @@ fn lifecycle_failure(error: LifecycleError) -> Failure {
     let code = error.code();
     let next_action = match &error {
         LifecycleError::ReconfigureRequired { .. } => "rerun with --reconfigure".to_string(),
+        LifecycleError::RecreateRequired { components, .. } => format!(
+            "rerun with {} to confirm the data loss, or keep those components unchanged",
+            components
+                .iter()
+                .map(|c| format!("--recreate {c}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
         LifecycleError::WrongPhase { next, .. } => next.clone(),
+        LifecycleError::NotActive { env_id, .. } => {
+            format!("run `aethyme env wake {env_id}` (or `aethyme env up`) first")
+        }
         LifecycleError::Resources(_) if code == "capacity_timeout" => {
             "raise --wait, park or destroy another environment in the pool, or raise the pool limit"
                 .into()
@@ -34,9 +45,12 @@ fn lifecycle_failure(error: LifecycleError) -> Failure {
         message: error.to_string(),
         next_action,
         exit: match code {
-            "not_found" | "wrong_phase" | "reconfigure_required" | "capacity_timeout" => {
-                exit_status::REFUSED
-            }
+            "not_found"
+            | "wrong_phase"
+            | "not_active"
+            | "reconfigure_required"
+            | "recreate_required"
+            | "capacity_timeout" => exit_status::REFUSED,
             _ => exit_status::FAILED,
         },
     }
@@ -84,7 +98,16 @@ fn describe(lifecycle: &Lifecycle, record: &EnvironmentRecord) -> (Value, String
     let mut ports = serde_json::Map::new();
     let mut variables = serde_json::Map::new();
     if let Some(grant) = &grant {
-        for allocation in &grant.lease.allocations {
+        // Only components the environment runs: an optional component left
+        // out keeps its port reserved but is not reported (E20).
+        let runs = |key: &str| {
+            record
+                .snapshot
+                .components
+                .iter()
+                .any(|c| c.port_key.as_deref() == Some(key))
+        };
+        for allocation in grant.lease.allocations.iter().filter(|a| runs(&a.key)) {
             if let Some(component) = allocation.key.strip_prefix("port_") {
                 ports.insert(component.into(), json!(allocation.value));
                 let suffix = super::validate::env_suffix(component);
@@ -172,6 +195,28 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
         })?;
     let main_root = workspace.repo.main_root().ok();
     let mut snapshot = snapshot;
+    // Optional components (E20): the ones the diff enables, the ones named
+    // with --component, and the ones the running environment already has,
+    // so a later plain `env up` never drops what was selected.
+    let mut selected =
+        super::infer::enabled_components(&snapshot, &changed).map_err(environment_failure)?;
+    for name in &options.components {
+        if !snapshot.components.iter().any(|c| &c.name == name) {
+            return Err(Failure {
+                code: "unknown_component",
+                message: format!("profile {profile} has no component {name:?}"),
+                next_action: "pass --component with a component of the profile".into(),
+                exit: exit_status::USAGE,
+            });
+        }
+        selected.insert(name.clone());
+    }
+    if let Ok(Some(existing)) = lifecycle.store.get(&snapshot.env_id)
+        && existing.phase.retains_worktree()
+    {
+        selected.extend(existing.snapshot.components.into_iter().map(|c| c.name));
+    }
+    super::compile::select_components(&mut snapshot, &selected);
     attach_shared(
         &mut lifecycle,
         &mut snapshot,
@@ -188,6 +233,7 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
             &UpOptions {
                 wait: Duration::from_secs(options.wait_seconds),
                 reconfigure: options.reconfigure,
+                recreate: options.recreate.clone(),
             },
         )
         .map_err(lifecycle_failure)?;
@@ -308,6 +354,19 @@ pub(super) fn run_wake(options: &Options) -> Result<Output, Failure> {
         text.push_str(&format!("warning: {warning}\n"));
     }
     value["schema"] = json!(WAKE_SCHEMA);
+    Ok((value, text, exit_status::SUCCESS))
+}
+
+pub(super) fn run_restart(options: &Options) -> Result<Output, Failure> {
+    let id = required_id(options)?;
+    let (mut lifecycle, _) = open("env restart", false)?;
+    let (record, restarted) = lifecycle
+        .restart(&id, options.positional.get(1).map(String::as_str))
+        .map_err(lifecycle_failure)?;
+    let (mut value, mut text) = describe(&lifecycle, &record);
+    value["schema"] = json!(RESTART_SCHEMA);
+    value["restarted"] = json!(restarted);
+    text.push_str(&format!("restarted: {}\n", restarted.join(", ")));
     Ok((value, text, exit_status::SUCCESS))
 }
 
