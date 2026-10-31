@@ -407,6 +407,21 @@ fn a_single_page_app_falls_back_to_index_html() {
     let worktree = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(worktree.path().join("dist/assets")).unwrap();
     std::fs::write(worktree.path().join("dist/index.html"), "<h1>app</h1>").unwrap();
+    std::fs::write(worktree.path().join("dist/health"), "healthy").unwrap();
+    std::fs::File::create(worktree.path().join("dist/oversized"))
+        .unwrap()
+        .set_len(128 * 1024 * 1024)
+        .unwrap();
+    std::fs::create_dir(worktree.path().join("outside")).unwrap();
+    std::fs::write(worktree.path().join("outside/private"), "outside").unwrap();
+    for (target, link) in [
+        ("outside/private", "dist/refused"),
+        ("outside", "dist/refused-parent"),
+        ("dist/absent-target", "dist/dangling"),
+    ] {
+        std::os::unix::fs::symlink(worktree.path().join(target), worktree.path().join(link))
+            .unwrap();
+    }
     std::fs::write(worktree.path().join("dist/assets/app.js"), "console.log(1)").unwrap();
     let text = r#"
 schema = 1
@@ -438,7 +453,17 @@ spa_fallback = true
     }
     let script = proxy.get(&site, "/assets/app.js");
     assert!(script.ends_with("console.log(1)"), "{script}");
-    for missing in ["/missing.js", "/assets/gone.css", "/../escape"] {
+    let health = proxy.get(&site, "/health");
+    assert!(health.ends_with("healthy"), "{health}");
+    for missing in [
+        "/missing.js",
+        "/assets/gone.css",
+        "/../escape",
+        "/oversized",
+        "/refused",
+        "/refused-parent/missing-route",
+        "/dangling",
+    ] {
         let refused = proxy.get(&site, missing);
         assert!(refused.starts_with("HTTP/1.1 404"), "{missing}: {refused}");
     }
