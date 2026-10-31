@@ -93,6 +93,47 @@ impl Collector<'_> {
     }
 }
 
+/// Budgets must be positive, and a memory budget must name a declared
+/// profile (it is measured per profile). Time metric names are free: hooks
+/// may report their own.
+fn validate_budgets(c: &mut Collector<'_>, file: &EnvironmentsFile) {
+    for (metric, seconds) in &file.budgets.seconds {
+        if metric.is_empty() || *seconds == 0 {
+            c.push(
+                "invalid_budget",
+                None,
+                None,
+                Some("budgets.seconds"),
+                format!(
+                    "budget {metric:?} must be a non-empty name with a positive number of seconds"
+                ),
+                "e.g. [budgets.seconds] \"up.backend\" = 30",
+            );
+        }
+    }
+    for (profile, mib) in &file.budgets.memory_mib {
+        if *mib == 0 {
+            c.push(
+                "invalid_budget",
+                Some(profile),
+                None,
+                Some("budgets.memory_mib"),
+                format!("memory budget for {profile:?} must be a positive number of MiB"),
+                "e.g. [budgets.memory_mib] backend = 350",
+            );
+        } else if !file.profiles.iter().any(|p| &p.name == profile) {
+            c.push(
+                "unknown_profile",
+                Some(profile),
+                None,
+                Some("budgets.memory_mib"),
+                format!("memory budget names {profile:?}, which is not a declared profile"),
+                "use a profile name from [[profiles]]",
+            );
+        }
+    }
+}
+
 /// `[a-z][a-z0-9_-]{0,31}`: names become hostnames, lease keys and
 /// environment-variable suffixes, so they stay in the intersection of all three.
 pub fn valid_name(name: &str) -> bool {
@@ -185,6 +226,7 @@ pub fn validate(
     }
 
     validate_pools(&mut c, file, host, host_label);
+    validate_budgets(&mut c, file);
 
     let mut names = BTreeSet::new();
     let mut ranks: BTreeMap<u32, &str> = BTreeMap::new();
@@ -282,16 +324,18 @@ pub fn validate(
                 "add at least one glob",
             );
         }
-        for pattern in &rule.paths {
-            if let Err(error) = Glob::new(pattern) {
-                c.push(
-                    "invalid_glob",
-                    None,
-                    None,
-                    Some(&format!("{field}.paths")),
-                    format!("{pattern:?}: {error}"),
-                    "fix the glob syntax",
-                );
+        for (list, patterns) in [("paths", &rule.paths), ("exclude", &rule.exclude)] {
+            for pattern in patterns {
+                if let Err(error) = Glob::new(pattern) {
+                    c.push(
+                        "invalid_glob",
+                        None,
+                        None,
+                        Some(&format!("{field}.{list}")),
+                        format!("{pattern:?}: {error}"),
+                        "fix the glob syntax",
+                    );
+                }
             }
         }
     }
@@ -337,6 +381,28 @@ pub fn validate(
                 "ref must not be empty",
                 "use \"default_branch\", \"integration\" or refs/heads/<name>",
             );
+        }
+        if shared.redeploy_on == super::spec::RedeployOn::Inputs && shared.inputs.is_empty() {
+            c.push(
+                "missing_inputs",
+                None,
+                None,
+                Some(&format!("{field}.inputs")),
+                "redeploy_on = \"inputs\" needs the globs whose changes redeploy",
+                "add inputs, or use redeploy_on = \"ref\"",
+            );
+        }
+        for pattern in &shared.inputs {
+            if let Err(error) = Glob::new(pattern) {
+                c.push(
+                    "invalid_glob",
+                    None,
+                    None,
+                    Some(&format!("{field}.inputs")),
+                    format!("{pattern:?}: {error}"),
+                    "fix the glob syntax",
+                );
+            }
         }
     }
     for profile in &file.profiles {
@@ -530,16 +596,8 @@ fn validate_profile(
             "declare it under [pools] or remove pool",
         );
     }
-    if profile.components.is_empty() {
-        c.push(
-            "no_components",
-            p,
-            None,
-            Some("components"),
-            "a profile needs at least one component",
-            "add a component",
-        );
-    }
+    // A profile with no components is "no environment needed" (#1289):
+    // the target of rules for diffs that need nothing.
 
     let mut names = BTreeSet::new();
     let mut suffixes: BTreeMap<String, &str> = BTreeMap::new();
@@ -618,6 +676,21 @@ fn validate_profile(
                     "name a component of the same profile",
                 );
             }
+            if !component.optional
+                && profile
+                    .components
+                    .iter()
+                    .any(|other| &other.name == dependency && other.optional)
+            {
+                c.push(
+                    "depends_on_optional",
+                    p,
+                    Some(&component.name),
+                    Some("depends_on"),
+                    format!("{dependency:?} is optional, so this component could start without it"),
+                    "make this component optional too, or the dependency required",
+                );
+            }
         }
     }
     if let Some(cycle) = find_cycle(&profile.components) {
@@ -629,6 +702,93 @@ fn validate_profile(
             format!("dependency cycle: {}", cycle.join(" -> ")),
             "break the cycle",
         );
+    }
+}
+
+/// Per-path routes (#1296): only on a routed component; each prefix an
+/// absolute path, unique, outside the proxy's control namespace; each target
+/// another routed component of the profile, a shared environment the profile
+/// uses, or an `http://host[:port]` URL (TLS upstreams are not supported).
+fn validate_paths(c: &mut Collector<'_>, profile: &ProfileSpec, component: &ComponentSpec) {
+    if component.paths.is_empty() {
+        return;
+    }
+    let p = Some(profile.name.as_str());
+    let n = Some(component.name.as_str());
+    if !component.routed() {
+        c.push(
+            "paths_without_route",
+            p,
+            n,
+            Some("paths"),
+            "per-path routes need a routed component: they answer on its host",
+            "set route = true or remove paths",
+        );
+    }
+    let mut prefixes = BTreeSet::new();
+    for (index, path) in component.paths.iter().enumerate() {
+        let field = format!("paths[{index}]");
+        let prefix = path.prefix.as_str();
+        if !prefix.starts_with('/')
+            || prefix
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch == '?' || ch == '#')
+            || prefix.starts_with("/__aethyme")
+        {
+            c.push(
+                "invalid_path_prefix",
+                p,
+                n,
+                Some(&format!("{field}.prefix")),
+                format!("{prefix:?} is not a usable path prefix"),
+                "use an absolute path such as \"/api\", outside /__aethyme",
+            );
+        } else if !prefixes.insert(prefix.trim_end_matches('/')) {
+            c.push(
+                "duplicate_path_prefix",
+                p,
+                n,
+                Some(&format!("{field}.prefix")),
+                format!("{prefix:?} is routed more than once"),
+                "keep one route per prefix",
+            );
+        }
+        let to = path.to.as_str();
+        let target_error = if let Some(authority) = to.strip_prefix("http://") {
+            let authority = authority.trim_end_matches('/');
+            let (host, port) = authority.rsplit_once(':').unwrap_or((authority, "80"));
+            (host.is_empty()
+                || authority.contains('/')
+                || host.contains(['@', ' '])
+                || port.parse::<u16>().map_or(true, |port| port == 0))
+            .then(|| format!("{to:?} is not an http://host[:port] URL"))
+        } else if to.contains("://") {
+            Some(format!("{to:?}: only http:// URLs are supported"))
+        } else if let Some(shared) = to.strip_prefix("shared:") {
+            (!profile.uses_shared.iter().any(|used| used == shared)).then(|| {
+                format!("shared environment {shared:?} is not in this profile's uses_shared")
+            })
+        } else if to == component.name {
+            Some("a path cannot route to its own component".to_string())
+        } else {
+            match profile.components.iter().find(|other| other.name == to) {
+                None => Some(format!("{to:?} is not a component of this profile")),
+                Some(other) if !other.routed() => Some(format!(
+                    "{to:?} is not routed, so it has no host to forward to"
+                )),
+                Some(_) => None,
+            }
+        };
+        if let Some(message) = target_error {
+            c.push(
+                "invalid_path_target",
+                p,
+                n,
+                Some(&format!("{field}.to")),
+                message,
+                "name a routed component, shared:<name> from uses_shared, or http://host[:port]",
+            );
+        }
     }
 }
 
@@ -724,6 +884,9 @@ fn validate_component(
             );
         }
     };
+    if component.runtime != Runtime::Static {
+        forbid(c, "spa_fallback", component.spa_fallback);
+    }
     match component.runtime {
         Runtime::Process => {
             require(c, "start", component.start.is_some());
@@ -876,6 +1039,7 @@ fn validate_component(
             );
         }
     }
+    validate_paths(c, profile, component);
     if let Some(health) = &component.health {
         validate_health(c, p, n, component, health);
     }
@@ -912,6 +1076,28 @@ fn validate_component(
             );
         }
     }
+    if !component.enabled_by.is_empty() && !component.optional {
+        c.push(
+            "enabled_by_without_optional",
+            p,
+            n,
+            Some("enabled_by"),
+            "enabled_by only selects optional components",
+            "add optional = true, or remove enabled_by",
+        );
+    }
+    for pattern in &component.enabled_by {
+        if let Err(error) = Glob::new(pattern) {
+            c.push(
+                "invalid_glob",
+                p,
+                n,
+                Some("enabled_by"),
+                format!("{pattern:?}: {error}"),
+                "fix the glob syntax",
+            );
+        }
+    }
     for pattern in component
         .cache_inputs
         .iter()
@@ -927,6 +1113,33 @@ fn validate_component(
                 "fix the glob syntax",
             );
         }
+    }
+    if component.entry_path.is_some()
+        && (!component.listen || matches!(component.runtime, Runtime::Static | Runtime::Hooks))
+    {
+        c.push(
+            "field_not_supported",
+            p,
+            n,
+            Some("entry_path"),
+            "entry_path requires a listening process, compose or container component",
+            "set entry_path on a component with listen = true, or remove it",
+        );
+    }
+    if let Some(entry_path) = component.entry_path.as_deref()
+        && (!entry_path.starts_with('/')
+            || entry_path
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || c == '#'))
+    {
+        c.push(
+            "invalid_path",
+            p,
+            n,
+            Some("entry_path"),
+            format!("entry_path {entry_path:?} must be a URL path starting with `/`"),
+            "use a path such as \"/o/\"",
+        );
     }
     for (field, value) in [
         ("build_output", component.build_output.as_deref()),

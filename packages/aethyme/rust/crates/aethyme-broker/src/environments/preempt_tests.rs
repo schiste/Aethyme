@@ -122,6 +122,7 @@ fn up(
             &UpOptions {
                 wait: Duration::from_millis(300),
                 reconfigure: false,
+                recreate: Vec::new(),
             },
         )
         .map(|record| Env {
@@ -432,6 +433,7 @@ fn a_preemption_is_mirrored_into_repository_events() {
                 &UpOptions {
                     wait: Duration::from_millis(300),
                     reconfigure: false,
+                    recreate: Vec::new(),
                 },
             )
             .unwrap()

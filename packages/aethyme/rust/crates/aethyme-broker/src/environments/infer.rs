@@ -2,7 +2,8 @@
 //!
 //! `[[rules]]` map changed paths to a minimum profile. The session's diff
 //! against its base fires rules; the inferred minimum is the highest-ranked
-//! profile any fired rule names, or `default_profile` when none fires.
+//! profile any fired rule names, or `default_profile` when none fires. A
+//! path matching a rule's `exclude` never fires that rule (#1290).
 //!
 //! Inference is **raise-only**: `env up` refuses a profile ranked below the
 //! minimum and lists the rules and paths that fired. A higher profile is
@@ -15,13 +16,13 @@
 //! stays within one path segment and `**` crosses directories, so
 //! `src/**/*.rs` matches `src/a/b.rs`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 
-use super::compile::default_profile_name;
+use super::compile::{CompiledEnvironment, default_profile_name};
 use super::spec::EnvironmentsFile;
 use super::validate::effective_rank;
 
@@ -71,6 +72,26 @@ fn rule_set(patterns: &[String]) -> Result<GlobSet, String> {
 }
 
 /// The minimum profile for `paths` under `file`'s rules.
+/// Optional components of `snapshot` that `paths` enable through their
+/// `enabled_by` globs (E20).
+pub fn enabled_components(
+    snapshot: &CompiledEnvironment,
+    paths: &[String],
+) -> Result<BTreeSet<String>, String> {
+    let mut enabled = BTreeSet::new();
+    for component in snapshot
+        .components
+        .iter()
+        .filter(|c| c.optional && !c.enabled_by.is_empty())
+    {
+        let set = rule_set(&component.enabled_by)?;
+        if paths.iter().any(|path| set.is_match(path.as_str())) {
+            enabled.insert(component.name.clone());
+        }
+    }
+    Ok(enabled)
+}
+
 pub fn infer(file: &EnvironmentsFile, paths: &[String]) -> Result<Inference, String> {
     let fallback = default_profile_name(file).ok_or("no profiles are declared")?;
     let mut minimum = (
@@ -81,10 +102,11 @@ pub fn infer(file: &EnvironmentsFile, paths: &[String]) -> Result<Inference, Str
     let mut matched = vec![false; paths.len()];
     for rule in &file.rules {
         let set = rule_set(&rule.paths)?;
+        let exclude = rule_set(&rule.exclude)?;
         let hits: Vec<String> = paths
             .iter()
             .enumerate()
-            .filter(|(_, path)| set.is_match(path.as_str()))
+            .filter(|(_, path)| set.is_match(path.as_str()) && !exclude.is_match(path.as_str()))
             .map(|(index, path)| {
                 matched[index] = true;
                 path.clone()

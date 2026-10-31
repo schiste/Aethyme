@@ -233,12 +233,17 @@ fn zero_days_keeps_every_archive() {
 }
 
 #[test]
-fn an_archive_whose_commits_landed_is_proposed_before_it_expires() {
+fn a_landed_archive_is_proposed_after_minimum_retention_before_policy_expiry() {
     let tmp = repo();
-    let (_, head, _) = archived_session(tmp.path(), "landed", false);
+    let (_, head, archive) = archived_session(tmp.path(), "landed", false);
     // The archived commit reaches the primary checkout after archiving.
     git(tmp.path(), &["merge", "-q", "--ff-only", &head]);
 
+    let young = plan(tmp.path());
+    assert!(proposed(&young).is_empty(), "{young}");
+    // Landing does not bypass the 15-day minimum; it permits collection
+    // afterward without waiting for the default 30-day policy expiry.
+    age(&archive, 16);
     let candidates = proposed(&plan(tmp.path()));
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0]["landed"], true);

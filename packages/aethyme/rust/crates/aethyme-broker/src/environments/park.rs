@@ -15,6 +15,17 @@
 //! A park whose stop cannot be proven also goes to `quarantined` and keeps
 //! its capacity.
 //!
+//! **Restart (#1294).** `restart` stops one component, or every running one
+//! in reverse start order, and starts them again in start order, under the
+//! environment's operation lock and without touching capacity or the
+//! reservation: the same ports, namespace and provisioned data, and every
+//! other component keeps running. Each restarted component's health is
+//! re-checked. Only an active environment restarts (`not_active`). A stop
+//! that cannot be proven quarantines the environment as park does; a
+//! component that fails to start or become healthy leaves the environment
+//! active with `last_error` naming it, its process (if any) still recorded
+//! so `down` stops it.
+//!
 //! Ports stay reserved while parked, but only Aethyme respects the
 //! reservation: another process may bind one in the meantime. A wake checks
 //! first and fails with `port_in_use`, naming the port, rather than starting
@@ -22,7 +33,7 @@
 
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -73,7 +84,18 @@ impl Lifecycle {
     ) -> Result<EnvironmentRecord, LifecycleError> {
         let record = self.store.resolve(env_id)?;
         let _operation = self.operation_lock(&record.env_id)?;
-        self.park_locked(&record.env_id, reason)
+        let started = Instant::now();
+        let result = self.park_locked(&record.env_id, reason);
+        if record.phase == EnvironmentPhase::Active {
+            self.record_timing(
+                &record.repository,
+                "park",
+                &record.env_id,
+                started,
+                result.is_ok(),
+            );
+        }
+        result
     }
 
     pub(super) fn park_locked(
@@ -132,6 +154,126 @@ impl Lifecycle {
         self.advance(&current, EnvironmentPhase::Parked, reason, None)
     }
 
+    /// Restart `component`, or every running component, in place (#1294).
+    /// Returns the environment and the components restarted, in start order.
+    pub fn restart(
+        &mut self,
+        env_id: &str,
+        component: Option<&str>,
+    ) -> Result<(EnvironmentRecord, Vec<String>), LifecycleError> {
+        let record = self.store.resolve(env_id)?;
+        let _operation = self.operation_lock(&record.env_id)?;
+        self.restart_locked(&record.env_id, component)
+    }
+
+    fn restart_locked(
+        &mut self,
+        env_id: &str,
+        component: Option<&str>,
+    ) -> Result<(EnvironmentRecord, Vec<String>), LifecycleError> {
+        let record = self.store.resolve(env_id)?;
+        let env_id = record.env_id.clone();
+        if record.phase != EnvironmentPhase::Active {
+            return Err(LifecycleError::NotActive {
+                env_id,
+                phase: record.phase.as_str(),
+            });
+        }
+        let snapshot = record.snapshot.clone();
+        let states = self.store.components(&env_id)?;
+        let identity_of = |name: &str| -> Option<ComponentIdentity> {
+            states
+                .iter()
+                .find(|c| c.component == name)
+                .and_then(|c| c.identity.clone())
+                .and_then(|v| serde_json::from_value(v).ok())
+        };
+        let targets: Vec<_> = match component {
+            Some(name) => {
+                let Some(found) = snapshot.components.iter().find(|c| c.name == name) else {
+                    return Err(StoreError::NotFound(format!("{env_id}/{name}")).into());
+                };
+                vec![found.clone()]
+            }
+            None => snapshot
+                .components
+                .iter()
+                .filter(|c| {
+                    states
+                        .iter()
+                        .any(|s| s.component == c.name && s.phase == ManagedServicePhase::Running)
+                })
+                .cloned()
+                .collect(),
+        };
+        let bindings = self.bindings_for(&record)?;
+        for component in targets.iter().rev() {
+            let ctx = self.context(&snapshot, component, &bindings, 1);
+            if let Some(identity) = identity_of(&component.name)
+                && let Err(error) = driver_for(component.runtime).stop(&ctx, &identity)
+            {
+                // Not proven stopped: as for park, never start a second
+                // instance beside one that may still run.
+                let detail = json!({
+                    "code": error.code(),
+                    "component": component.name,
+                    "message": error.to_string(),
+                });
+                self.store.set_error(&env_id, Some(&detail))?;
+                let current = self.current(&env_id)?;
+                self.advance(
+                    &current,
+                    EnvironmentPhase::Quarantined,
+                    "restart stop unproven",
+                    Some(detail),
+                )?;
+                return Err(error.into());
+            }
+            self.component_to(&env_id, &component.name, &SETTLE, None, None)?;
+        }
+        for component in &targets {
+            self.prepare_start(&env_id, &snapshot, &bindings, component)?;
+            let ctx = self.context(&snapshot, component, &bindings, 1);
+            let driver = driver_for(component.runtime);
+            let outcome = match driver.start(&ctx) {
+                Ok(identity) => {
+                    let identity_json = serde_json::to_value(&identity)
+                        .map_err(|e| LifecycleError::Io(e.to_string()))?;
+                    self.component_to(
+                        &env_id,
+                        &component.name,
+                        &[ManagedServicePhase::Running],
+                        Some(&identity_json),
+                        None,
+                    )?;
+                    wait_healthy(driver.as_ref(), &ctx, &identity)
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = outcome {
+                let detail = json!({
+                    "code": error.code(),
+                    "component": component.name,
+                    "message": error.to_string(),
+                });
+                self.store.set_error(&env_id, Some(&detail))?;
+                self.store
+                    .note(&env_id, "restart failed", &self.actor, Some(&detail))?;
+                return Err(error.into());
+            }
+        }
+        let names: Vec<String> = targets.iter().map(|c| c.name.clone()).collect();
+        self.store.set_error(&env_id, None)?;
+        self.store.record_activity(&env_id, now_ms())?;
+        self.store.note(
+            &env_id,
+            "restarted",
+            &self.actor,
+            Some(&json!({ "components": names })),
+        )?;
+        Ok((self.current(&env_id)?, names))
+    }
+
     /// Re-acquire capacity, start every component and wait for health.
     pub fn wake(
         &mut self,
@@ -141,7 +283,19 @@ impl Lifecycle {
         let record = self.store.resolve(env_id)?;
         self.wake_shared_dependencies(&record, wait)?;
         let _operation = self.operation_lock(&record.env_id)?;
-        self.wake_locked(&record.env_id, wait)
+        let started = Instant::now();
+        let result = self.wake_locked(&record.env_id, wait);
+        // Waking is a warm up: everything provisioned is kept (#1239).
+        if record.phase == EnvironmentPhase::Parked {
+            self.record_timing(
+                &record.repository,
+                &format!("up.{}", record.profile),
+                &record.env_id,
+                started,
+                result.is_ok(),
+            );
+        }
+        result
     }
 
     /// A consumer's shared environments may have parked while it was parked

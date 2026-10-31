@@ -316,6 +316,7 @@ fn replacing_below_minimum_keeps_pinned_environments() {
                 &UpOptions {
                     wait: Duration::from_secs(5),
                     reconfigure: false,
+                    recreate: Vec::new(),
                 },
             )
             .unwrap()
@@ -341,6 +342,27 @@ fn replacing_below_minimum_keeps_pinned_environments() {
             .is_none_or(|r| !r.phase.retains_worktree())
     );
     lifecycle.down(&pinned, None).unwrap();
+}
+
+/// #1290: a rule's `exclude` carves exceptions out of a broad rule; the
+/// highest-rank rule still wins for everything it does match.
+#[test]
+fn an_excluded_path_never_fires_its_rule() {
+    let text = RULES.replace(
+        "paths = [\"server/**\", \"src/**/*.rs\"]\n",
+        "paths = [\"server/**\", \"src/**/*.rs\"]\nexclude = [\"server/docs/**\"]\n",
+    );
+    let loaded: Loaded<EnvironmentsFile> = parse_loaded(PathBuf::from("t"), "t", &text);
+    let file = loaded.value.unwrap_or_else(|d| panic!("{}", d.render()));
+
+    let docs = infer(&file, &paths(&["server/docs/api.md"])).unwrap();
+    assert_eq!(docs.minimum, "static", "{docs:?}");
+    assert!(docs.fired.is_empty(), "{docs:?}");
+    assert_eq!(docs.unmatched, paths(&["server/docs/api.md"]));
+
+    let code = infer(&file, &paths(&["server/docs/api.md", "server/main.rs"])).unwrap();
+    assert_eq!(code.minimum, "backend", "{code:?}");
+    assert_eq!(code.fired[0].paths, paths(&["server/main.rs"]));
 }
 
 /// #1273: a session whose committed changes raise the minimum above its
@@ -402,6 +424,7 @@ fn a_live_environment_below_the_minimum_is_reported() {
                 &UpOptions {
                     wait: Duration::from_secs(5),
                     reconfigure: false,
+                    recreate: Vec::new(),
                 },
             )
             .unwrap()
@@ -435,4 +458,54 @@ fn a_live_environment_below_the_minimum_is_reported() {
     for id in [cheap, enough] {
         lifecycle.down(&id, None).unwrap();
     }
+}
+
+/// #1295: an optional component is enabled by a changed path matching its
+/// `enabled_by`, and never by anything else.
+#[test]
+fn enabled_by_selects_optional_components_from_the_diff() {
+    let text = r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "api"
+runtime = "process"
+start = "x"
+[[profiles.components]]
+name = "orgs"
+runtime = "process"
+start = "x"
+optional = true
+enabled_by = ["apps/orgs/**"]
+"#;
+    let loaded: super::Loaded<EnvironmentsFile> =
+        super::parse_loaded(std::path::PathBuf::from("t"), "t", text);
+    let file = loaded.value.unwrap_or_else(|d| panic!("{}", d.render()));
+    let snapshot = super::compile::compile(
+        &file,
+        &super::spec::HostEnvironmentsFile::default(),
+        "p",
+        "t",
+        &super::compile::CompileContext {
+            repository: "r".into(),
+            owner: super::compile::EnvironmentOwner::Worktree {
+                fingerprint: "f".into(),
+            },
+            worktree_fingerprint: "f".into(),
+            source_commit: None,
+            source_dirty: false,
+            source_digest: String::new(),
+        },
+    )
+    .unwrap();
+    let enabled =
+        |list: &[&str]| super::infer::enabled_components(&snapshot, &paths(list)).unwrap();
+    assert_eq!(
+        enabled(&["apps/orgs/src/main.ts"])
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec!["orgs".to_string()]
+    );
+    assert!(enabled(&["apps/customer/x.ts", "README.md"]).is_empty());
 }

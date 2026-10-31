@@ -98,6 +98,7 @@ fn up(host: &Host, text: &str) -> (Lifecycle, String, tempfile::TempDir) {
             &UpOptions {
                 wait: Duration::from_secs(1),
                 reconfigure: false,
+                recreate: Vec::new(),
             },
         )
         .unwrap();

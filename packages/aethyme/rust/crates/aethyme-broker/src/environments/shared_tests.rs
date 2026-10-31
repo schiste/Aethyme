@@ -5,8 +5,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use super::compile::EnvironmentOwner;
@@ -185,28 +185,48 @@ fn a_shared_environment_is_ref_owned_and_survives_worktree_cleanup() {
         vars.iter()
             .any(|(k, v)| k == "AETHYME_SHARED_BASELINE_URL" && v.starts_with("http://127.0.0.1:"))
     );
-    // #1274: with the proxy, consumers go through the route host (held
-    // during a swap, woken on request); the direct URL stays available.
+    let direct_url = vars
+        .iter()
+        .find(|(k, _)| k == "AETHYME_SHARED_BASELINE_URL")
+        .map(|(_, v)| v.as_str())
+        .unwrap();
+    let alias = super::shared::alias_host(REPOSITORY, "baseline", "localhost");
+    assert_eq!(
+        super::routes::route_alias(&host.root(), &after.env_id),
+        Some(alias.clone()),
+        "the ref-owned environment advertises its stable alias"
+    );
+    let alias_file = host
+        .root()
+        .join(&after.env_id)
+        .join(super::routes::ROUTE_ALIAS_FILE);
+    // #1274: consumers use a loopback route through the proxy while keeping
+    // the direct endpoint. Literal addresses make both branches independent
+    // of the host's wildcard-localhost DNS support.
+    std::fs::write(&alias_file, "127.0.0.1").unwrap();
     let proxied = consumer_variables(&host.root(), "baseline", &after, Some(4180));
     let url = proxied
         .iter()
         .find(|(k, _)| k == "AETHYME_SHARED_BASELINE_URL")
         .map(|(_, v)| v.clone())
         .unwrap();
-    assert_eq!(
-        url,
-        format!(
-            "http://{}:4180",
-            super::shared::alias_host(REPOSITORY, "baseline", "localhost")
-        ),
-        "the alias survives blue/green flips"
-    );
+    assert_eq!(url, "http://127.0.0.1:4180", "use the loopback proxy route");
     assert!(
         proxied
             .iter()
-            .any(|(k, v)| k == "AETHYME_SHARED_BASELINE_DIRECT_URL"
-                && v.starts_with("http://127.0.0.1:"))
+            .any(|(k, v)| k == "AETHYME_SHARED_BASELINE_DIRECT_URL" && v == direct_url)
     );
+    // A non-loopback literal must keep consumers on their direct endpoint;
+    // this address is parsed locally and no connection is attempted.
+    std::fs::write(&alias_file, "192.0.2.1").unwrap();
+    let fallback = consumer_variables(&host.root(), "baseline", &after, Some(4180));
+    assert!(
+        fallback
+            .iter()
+            .any(|(k, v)| k == "AETHYME_SHARED_BASELINE_URL" && v == direct_url),
+        "a non-loopback alias must fall back to the direct endpoint"
+    );
+    std::fs::write(&alias_file, &alias).unwrap();
     assert!(
         vars.iter()
             .any(|(k, _)| k == "AETHYME_SHARED_BASELINE_PORT_API")
@@ -744,6 +764,7 @@ fn waking_a_consumer_wakes_its_shared_environment() {
             &super::lifecycle::UpOptions {
                 wait: Duration::from_secs(5),
                 reconfigure: false,
+                recreate: Vec::new(),
             },
         )
         .unwrap()
@@ -945,6 +966,385 @@ fn a_blue_green_redeploy_holds_nothing() {
     );
 }
 
+/// A serving-pointer flip between pointer capture and record selection must
+/// rebuild the route table from the new active slot, never pair the new alias
+/// with stale slot metadata from the initial list.
+#[test]
+fn route_snapshot_reselects_when_serving_pointer_flips_mid_snapshot() {
+    if !python_available() {
+        eprintln!("SKIP route snapshot flip: python3 not available");
+        return;
+    }
+    let host = Host::new();
+    let repo = repository(43900);
+    let none = HostEnvironmentsFile::default();
+    let mut lifecycle = host.lifecycle();
+    let blue = up_baseline(&mut lifecycle, repo.path());
+    let v2 = commit(repo.path(), "version.txt", "v2", "v2");
+
+    let store_path = host.store();
+    let root = host.root();
+    let (snapshot_started, snapshot_waiting) = mpsc::channel();
+    let (continue_snapshot, snapshot_continues) = mpsc::channel();
+    let route_reader = std::thread::spawn(move || {
+        let store = EnvironmentStore::open_read_only(&store_path)
+            .unwrap()
+            .unwrap();
+        let mut pause_once = true;
+        super::routes::route_table_with_test_hook(&store, &root, || {
+            if pause_once {
+                pause_once = false;
+                snapshot_started.send(()).unwrap();
+                snapshot_continues.recv().unwrap();
+            }
+        })
+    });
+    snapshot_waiting
+        .recv_timeout(Duration::from_secs(5))
+        .expect("route snapshot reached its captured serving pointer");
+
+    let outcome = lifecycle
+        .shared_redeploy(
+            repo.path(),
+            REPOSITORY,
+            "baseline",
+            &none,
+            Duration::from_secs(10),
+            true,
+        )
+        .unwrap();
+    assert!(
+        matches!(&outcome, Redeploy::Redeployed { to, .. } if *to == v2),
+        "the pointer flip completed before the snapshot continued: {outcome:?}"
+    );
+    let green = lifecycle
+        .shared_record(repo.path(), REPOSITORY, "baseline")
+        .unwrap()
+        .unwrap();
+    continue_snapshot.send(()).unwrap();
+
+    let routes = route_reader.join().unwrap().unwrap();
+    let alias = super::shared::alias_host(REPOSITORY, "baseline", "localhost");
+    let alias_route = routes
+        .iter()
+        .find(|route| route.host == alias)
+        .expect("the serving slot retains the stable alias");
+    assert_eq!(alias_route.env_id, green.env_id);
+    assert_eq!(alias_route.state, "active");
+    assert!(alias_route.upstream.is_some());
+    assert!(
+        !routes
+            .iter()
+            .any(|route| route.host == alias && route.env_id == blue.env_id),
+        "the old slot must not receive the new serving alias"
+    );
+    let canonical_host = format!(
+        "api.{}.{}",
+        green.namespace.as_deref().unwrap(),
+        green.snapshot.route_domain
+    );
+    assert!(
+        routes
+            .iter()
+            .any(|route| route.host == canonical_host && route.env_id == green.env_id),
+        "the new slot keeps its canonical component route"
+    );
+}
+
+/// A new serving owner published after the initial database list must trigger
+/// a complete snapshot rebuild, including that slot's canonical routes.
+#[test]
+fn route_snapshot_rebuilds_when_new_serving_owner_appears_after_initial_list() {
+    if !python_available() {
+        eprintln!("SKIP route snapshot owner publication: python3 not available");
+        return;
+    }
+    let host = Host::new();
+    let repo = repository(43901);
+    let none = HostEnvironmentsFile::default();
+    let mut lifecycle = host.lifecycle();
+    let blue = up_baseline(&mut lifecycle, repo.path());
+    let v2 = commit(repo.path(), "version.txt", "v2", "v2");
+
+    let store_path = host.store();
+    let root = host.root();
+    let (snapshot_started, snapshot_waiting) = mpsc::channel();
+    let (continue_snapshot, snapshot_continues) = mpsc::channel();
+    let route_reader = std::thread::spawn(move || {
+        let store = EnvironmentStore::open_read_only(&store_path)
+            .unwrap()
+            .unwrap();
+        let mut pause_once = true;
+        super::routes::route_table_with_list_hook(&store, &root, || {
+            if pause_once {
+                pause_once = false;
+                snapshot_started.send(()).unwrap();
+                snapshot_continues.recv().unwrap();
+            }
+        })
+    });
+    snapshot_waiting
+        .recv_timeout(Duration::from_secs(5))
+        .expect("route snapshot reached its initial record list");
+
+    let outcome = lifecycle
+        .shared_redeploy(
+            repo.path(),
+            REPOSITORY,
+            "baseline",
+            &none,
+            Duration::from_secs(10),
+            true,
+        )
+        .unwrap();
+    assert!(
+        matches!(&outcome, Redeploy::Redeployed { to, .. } if *to == v2),
+        "the new owner was published before pointer capture: {outcome:?}"
+    );
+    let green = lifecycle
+        .shared_record(repo.path(), REPOSITORY, "baseline")
+        .unwrap()
+        .unwrap();
+    continue_snapshot.send(()).unwrap();
+
+    let routes = route_reader.join().unwrap().unwrap();
+    let alias = super::shared::alias_host(REPOSITORY, "baseline", "localhost");
+    let alias_route = routes
+        .iter()
+        .find(|route| route.host == alias)
+        .expect("the serving slot retains the stable alias");
+    assert_eq!(alias_route.env_id, green.env_id);
+    assert_eq!(alias_route.state, "active");
+    assert!(alias_route.upstream.is_some());
+    assert!(
+        !routes
+            .iter()
+            .any(|route| route.host == alias && route.env_id == blue.env_id),
+        "the old slot must not receive the new serving alias"
+    );
+    let canonical_host = format!(
+        "api.{}.{}",
+        green.namespace.as_deref().unwrap(),
+        green.snapshot.route_domain
+    );
+    assert!(
+        routes
+            .iter()
+            .any(|route| route.host == canonical_host && route.env_id == green.env_id),
+        "the new slot keeps its canonical component route"
+    );
+}
+
+/// A legacy singleton with no pointer gets its current owner published before
+/// blue/green starts the second slot.
+#[cfg(unix)]
+#[test]
+fn blue_green_publishes_current_owner_before_starting_second_slot() {
+    if !python_available() {
+        eprintln!("SKIP blue-green serving pointer guard: python3 not available");
+        return;
+    }
+    let host = Host::new();
+    let repo = repository(43902);
+    let none = HostEnvironmentsFile::default();
+    let mut lifecycle = host.lifecycle();
+    let blue = up_baseline(&mut lifecycle, repo.path());
+    let pointer = host
+        .root()
+        .join("shared")
+        .join(REPOSITORY)
+        .join("baseline")
+        .join("serving");
+    std::fs::remove_file(&pointer).unwrap();
+
+    let guarded_start = format!(
+        "test \"$(cat {})\" = baseline@default_branch && exec python3 -m http.server --bind 127.0.0.1 $AETHYME_ENV_PORT_API",
+        pointer.display()
+    );
+    let guarded_config = environments(43902, &guarded_start);
+    let v2 = commit(
+        repo.path(),
+        ".aethyme/environments.toml",
+        &guarded_config,
+        "check serving pointer before starting green",
+    );
+    let outcome = lifecycle
+        .shared_redeploy(
+            repo.path(),
+            REPOSITORY,
+            "baseline",
+            &none,
+            Duration::from_secs(10),
+            true,
+        )
+        .unwrap();
+    assert!(
+        matches!(&outcome, Redeploy::Redeployed { to, .. } if *to == v2),
+        "green only starts after the current owner is explicit: {outcome:?}"
+    );
+    let serving = std::fs::read_to_string(&pointer).unwrap();
+    assert_eq!(serving, "baseline@default_branch#b");
+    assert_eq!(
+        lifecycle.store.get(&blue.env_id).unwrap().unwrap().phase,
+        EnvironmentPhase::Destroyed
+    );
+}
+
+/// Changing a shared declaration's ref publishes the new healthy declared
+/// owner before sync removes the old ref's last retained slot.
+#[test]
+fn shared_ref_change_replaces_stale_serving_owner_before_sync_cleanup() {
+    if !python_available() {
+        eprintln!("SKIP shared ref pointer migration: python3 not available");
+        return;
+    }
+    let host = Host::new();
+    let repo = repository(43903);
+    let none = HostEnvironmentsFile::default();
+    let mut lifecycle = host.lifecycle();
+    let blue = up_baseline(&mut lifecycle, repo.path());
+    let v2 = commit(repo.path(), "version.txt", "v2", "v2");
+    let redeployed = lifecycle
+        .shared_redeploy(
+            repo.path(),
+            REPOSITORY,
+            "baseline",
+            &none,
+            Duration::from_secs(10),
+            true,
+        )
+        .unwrap();
+    assert!(matches!(&redeployed, Redeploy::Redeployed { to, .. } if *to == v2));
+    assert_eq!(
+        lifecycle.store.get(&blue.env_id).unwrap().unwrap().phase,
+        EnvironmentPhase::Destroyed
+    );
+    let previous = lifecycle
+        .shared_record(repo.path(), REPOSITORY, "baseline")
+        .unwrap()
+        .unwrap();
+    let previous_owner = "baseline@default_branch#b";
+    assert!(matches!(
+        &previous.owner,
+        EnvironmentOwner::Ref { name } if name == previous_owner
+    ));
+    let pointer = host
+        .root()
+        .join("shared")
+        .join(REPOSITORY)
+        .join("baseline")
+        .join("serving");
+    assert_eq!(std::fs::read_to_string(&pointer).unwrap(), previous_owner);
+
+    let new_config =
+        environments(43903, SERVE).replace("ref = \"default_branch\"", "ref = \"feature#b\"");
+    let v3 = commit(
+        repo.path(),
+        ".aethyme/environments.toml",
+        &new_config,
+        "move shared declaration to feature ref",
+    );
+    git(repo.path(), &["branch", "feature#b", v3.as_str()]);
+    let new_record = lifecycle
+        .shared_up(
+            repo.path(),
+            REPOSITORY,
+            "baseline",
+            &none,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+    assert!(matches!(
+        &new_record.owner,
+        EnvironmentOwner::Ref { name } if name == "baseline@feature#b"
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&pointer).unwrap(),
+        "baseline@feature#b"
+    );
+
+    lifecycle
+        .sync_shared(repo.path(), REPOSITORY, &none)
+        .unwrap();
+    assert_eq!(
+        lifecycle
+            .store
+            .get(&previous.env_id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        EnvironmentPhase::Destroyed,
+        "sync removes the old ref's now-unselected serving slot"
+    );
+    let routes = super::routes::route_table(&lifecycle.store, &host.root()).unwrap();
+    let alias = super::shared::alias_host(REPOSITORY, "baseline", "localhost");
+    assert!(
+        routes
+            .iter()
+            .any(|route| route.host == alias && route.env_id == new_record.env_id)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn serving_pointer_snapshot_detects_same_owner_atomic_replacement() {
+    let host = Host::new();
+    let owner = "baseline@default_branch";
+    let pointer_dir = host.root().join("shared").join(REPOSITORY).join("baseline");
+    std::fs::create_dir_all(&pointer_dir).unwrap();
+    let pointer = pointer_dir.join("serving");
+    std::fs::write(&pointer, owner).unwrap();
+    let snapshot =
+        super::shared::serving_pointer_snapshot(&host.root(), REPOSITORY, "baseline", Some(owner))
+            .unwrap();
+
+    // Match the production temp-file + rename publication while keeping the
+    // plain owner bytes identical. The retained old descriptor prevents inode
+    // reuse from making this replacement look unchanged.
+    let staging = pointer_dir.join("serving.next");
+    std::fs::write(&staging, owner).unwrap();
+    std::fs::rename(&staging, &pointer).unwrap();
+
+    assert_eq!(snapshot.owner(), Some(owner));
+    assert!(
+        !snapshot
+            .is_current(&host.root(), REPOSITORY, "baseline")
+            .unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn serving_pointer_snapshot_rejects_nonregular_and_oversized_files() {
+    let host = Host::new();
+    let pointer_dir = host.root().join("shared").join(REPOSITORY).join("baseline");
+    std::fs::create_dir_all(&pointer_dir).unwrap();
+    let pointer = pointer_dir.join("serving");
+
+    std::fs::write(&pointer, vec![b'x'; 4097]).unwrap();
+    assert!(
+        super::shared::serving_pointer_snapshot(
+            &host.root(),
+            REPOSITORY,
+            "baseline",
+            Some("baseline@default_branch"),
+        )
+        .is_err()
+    );
+
+    std::fs::remove_file(&pointer).unwrap();
+    std::fs::create_dir(&pointer).unwrap();
+    assert!(
+        super::shared::serving_pointer_snapshot(
+            &host.root(),
+            REPOSITORY,
+            "baseline",
+            Some("baseline@default_branch"),
+        )
+        .is_err()
+    );
+}
+
 /// #1274: a stateful shared environment (a database) is never redeployed
 /// blue/green, even with room for a second slot: the new slot would start
 /// without its data. It swaps in place and keeps its environment.
@@ -1004,4 +1404,88 @@ fn a_stateful_shared_environment_never_runs_blue_green() {
     lifecycle
         .shared_destroy(repo.path(), REPOSITORY, "baseline")
         .unwrap();
+}
+
+/// #1297: with `redeploy_on = "inputs"`, a commit that leaves the inputs
+/// alone records the revision and restarts nothing; a commit that changes
+/// them redeploys.
+#[test]
+fn a_shared_environment_on_inputs_ignores_unrelated_commits() {
+    if !python_available() {
+        eprintln!("SKIP redeploy on inputs: python3 not available");
+        return;
+    }
+    let host = Host::new();
+    let repo = repository(44000);
+    let first = commit(
+        repo.path(),
+        ".aethyme/environments.toml",
+        &environments(44000, SERVE).replacen(
+            "min_redeploy_interval_seconds = 3600\n",
+            "min_redeploy_interval_seconds = 3600\nredeploy_on = \"inputs\"\ninputs = [\"version.txt\"]\n",
+            1,
+        ),
+        "redeploy on inputs",
+    );
+    let none = HostEnvironmentsFile::default();
+    let mut lifecycle = host.lifecycle();
+    let before = lifecycle
+        .shared_up(
+            repo.path(),
+            REPOSITORY,
+            "baseline",
+            &none,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    let redeploy = |lifecycle: &mut Lifecycle| {
+        lifecycle
+            .shared_redeploy(
+                repo.path(),
+                REPOSITORY,
+                "baseline",
+                &none,
+                Duration::from_secs(20),
+                true,
+            )
+            .unwrap()
+    };
+
+    let unrelated = commit(repo.path(), "notes.txt", "n", "unrelated");
+    let outcome = redeploy(&mut lifecycle);
+    assert!(
+        matches!(&outcome, Redeploy::Unchanged { commit } if *commit == unrelated),
+        "{outcome:?}"
+    );
+    let after = lifecycle.store.get(&before.env_id).unwrap().unwrap();
+    assert_eq!(after.phase, EnvironmentPhase::Active);
+    assert_eq!(
+        after.snapshot.source.commit.as_deref(),
+        Some(first.as_str()),
+        "nothing was redeployed"
+    );
+    let history = lifecycle.store.transitions(&before.env_id, 50).unwrap();
+    assert!(
+        history.iter().any(|t| t.reason == "revision recorded"),
+        "{history:?}"
+    );
+    assert!(
+        history.iter().all(|t| t.reason != "redeployed"),
+        "{history:?}"
+    );
+
+    let v2 = commit(repo.path(), "version.txt", "v2", "v2");
+    let outcome = redeploy(&mut lifecycle);
+    assert!(
+        matches!(&outcome, Redeploy::Redeployed { to, .. } if *to == v2),
+        "{outcome:?}"
+    );
+    for record in lifecycle.store.list(None).unwrap() {
+        if record.phase.retains_worktree() {
+            lifecycle
+                .shared_destroy(repo.path(), REPOSITORY, "baseline")
+                .unwrap();
+            break;
+        }
+    }
 }

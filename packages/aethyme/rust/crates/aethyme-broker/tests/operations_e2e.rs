@@ -1922,6 +1922,16 @@ fn opening_the_broker_reaps_a_dead_prepared_operation_without_another_write() {
         broker.cleanup(root_setup.id, false).unwrap();
         let session = broker.adopt(&worktree, None).unwrap();
         let repository = format!("local:{}", broker.main_root().display());
+        // A magic PID can belong to an unrelated process on a busy runner.
+        // Record a child we actually waited for instead of assuming it is absent.
+        let mut abandoned_child = Command::new("git")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let abandoned_pid = i64::from(abandoned_child.id());
+        assert!(abandoned_child.wait().unwrap().success());
         operation_id = broker
             .store()
             .create_coordinated_operation(&NewCoordinatedOperation {
@@ -1932,7 +1942,7 @@ fn opening_the_broker_reaps_a_dead_prepared_operation_without_another_write() {
                 effect: OperationEffect::Write,
                 authorization_reason: Some("simulated abandoned admission".into()),
                 command_json: r#"["git","branch","never-started"]"#.into(),
-                pid: 999_999,
+                pid: abandoned_pid,
                 host_operation_id: None,
                 identity_provenance: OperationIdentityProvenance::LocalRepository,
             })

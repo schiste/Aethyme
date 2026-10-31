@@ -45,6 +45,23 @@ pub struct EnvironmentsFile {
     /// E9: host-scoped environments owned by a ref. Validated here.
     #[serde(default)]
     pub shared: Vec<SharedSpec>,
+    /// E13 (#1239): declared budgets that `env budgets` compares the
+    /// recorded timings and measured footprints against.
+    #[serde(default)]
+    pub budgets: BudgetsSpec,
+}
+
+/// `[budgets.seconds]` per metric (`up.<profile>` for a warm up, `up.cold`
+/// for one that provisioned, `park`, `down`, `provision|start|health.<c>`,
+/// or any name a hook reports) and `[budgets.memory_mib]` per profile.
+/// Unknown metric names are allowed: a hook may report one later.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetsSpec {
+    #[serde(default)]
+    pub seconds: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub memory_mib: BTreeMap<String, u64>,
 }
 
 fn default_idle_seconds() -> u64 {
@@ -246,6 +263,16 @@ pub struct ComponentSpec {
     /// `static`: the directory served, relative to the worktree root.
     #[serde(default)]
     pub serve_dir: Option<String>,
+    /// The page to open for a listening process, compose or container component.
+    /// Appended to that component's URL (`/o/`, #1292).
+    #[serde(default)]
+    pub entry_path: Option<String>,
+
+    /// `static`: serve `index.html` for a GET of a path that is not a file
+    /// and has no extension, so a single-page app's client-side routes load
+    /// (#1291).
+    #[serde(default)]
+    pub spa_fallback: bool,
     /// E11: build cache inputs.
     #[serde(default)]
     pub cache_inputs: Vec<String>,
@@ -256,6 +283,27 @@ pub struct ComponentSpec {
     pub cache_env: Vec<String>,
     #[serde(default)]
     pub template_inputs: Vec<String>,
+    /// E20: off unless selected with `env up --component` or enabled by a
+    /// changed path matching `enabled_by`.
+    #[serde(default)]
+    pub optional: bool,
+    /// E20: globs over the diff that enable this optional component.
+    #[serde(default)]
+    pub enabled_by: Vec<String>,
+    /// E21: requests to this routed component's host whose path starts with
+    /// `prefix` go to `to` instead (#1296).
+    #[serde(default)]
+    pub paths: Vec<PathRouteSpec>,
+}
+
+/// One per-path route (#1296): `to` is another routed component of the
+/// profile, `shared:<name>` for a shared environment the profile uses, or an
+/// `http://host[:port]` URL. The prefix is kept on the forwarded request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathRouteSpec {
+    pub prefix: String,
+    pub to: String,
 }
 
 impl ComponentSpec {
@@ -295,6 +343,10 @@ fn default_health_interval() -> u64 {
 pub struct RuleSpec {
     pub name: String,
     pub paths: Vec<String>,
+    /// Paths matching one of these never fire this rule (#1290), so a broad
+    /// rule can have exceptions without changing highest-rank inference.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
     pub min_profile: String,
     #[serde(default)]
     pub reason: Option<String>,
@@ -315,6 +367,21 @@ pub struct SharedSpec {
     /// redeployed blue/green, only by the in-place hold-and-swap.
     #[serde(default)]
     pub stateful: bool,
+    /// What makes a ref move redeploy (#1297): any move (`ref`, the
+    /// default), or only a change to the files matching `inputs`
+    /// (`inputs`), so shared infrastructure does not restart on every commit.
+    #[serde(default)]
+    pub redeploy_on: RedeployOn,
+    #[serde(default)]
+    pub inputs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedeployOn {
+    #[default]
+    Ref,
+    Inputs,
 }
 
 /// Host-scoped settings: `<host state>/environments.toml`: host pool limits
