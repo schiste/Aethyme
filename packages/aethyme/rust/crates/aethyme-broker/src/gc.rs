@@ -1808,6 +1808,8 @@ struct GcJournal {
     remaining_orphans: Vec<GcOrphanCandidate>,
     #[serde(default)]
     remaining_gate_caches: Vec<GcGateCacheCandidate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    remaining_environment_caches: Vec<crate::GcEnvironmentCacheCandidate>,
     #[serde(default)]
     remaining_checkpoint_pin_releases: Vec<GcCheckpointPinRelease>,
     #[serde(default)]
@@ -1823,6 +1825,8 @@ struct GcJournal {
     orphans_removed: Vec<String>,
     #[serde(default)]
     gate_caches_reclaimed: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    environment_caches_reclaimed: Vec<String>,
     #[serde(default)]
     checkpoint_pins_released: Vec<i64>,
     #[serde(default)]
@@ -1887,6 +1891,7 @@ impl From<GcPlan> for GcJournal {
             remaining_artifacts: plan.artifacts,
             remaining_orphans: plan.orphans,
             remaining_gate_caches: plan.gate_caches,
+            remaining_environment_caches: plan.environment_caches,
             remaining_checkpoint_pin_releases: plan.checkpoint_pin_releases,
             remaining_publication_exposure_expiries: plan.publication_exposure_expiries,
             remaining_recovery_archives: plan.recovery_archives,
@@ -1896,6 +1901,7 @@ impl From<GcPlan> for GcJournal {
             artifacts_reclaimed: Vec::new(),
             orphans_removed: Vec::new(),
             gate_caches_reclaimed: Vec::new(),
+            environment_caches_reclaimed: Vec::new(),
             checkpoint_pins_released: Vec::new(),
             publication_exposures_expired: Vec::new(),
             recovery_archives_removed: Vec::new(),
@@ -4755,6 +4761,20 @@ impl Broker {
                 }
             }
         };
+        // The host environment build cache, this repository's part (#1275).
+        // Walking it is bounded by the cache budget, but a deadline-bound
+        // pass still defers it like the gate cache.
+        let (environment_cache, environment_caches) = if deadline_expired(deadline) {
+            deferred_checks.push("environment_cache_inventory".into());
+            (None, Vec::new())
+        } else {
+            match GitRepo::discover(&main_root) {
+                Ok(repo) => crate::environments::cache::host_gc_inventory(
+                    &crate::gates::git_origin_fingerprint(&repo),
+                ),
+                Err(_) => (None, Vec::new()),
+            }
+        };
         if scan.measures() && size_records_complete {
             crate::warn_unrecorded(
                 "record gate cache sizes",
@@ -4925,11 +4945,13 @@ impl Broker {
             .chain(artifacts.iter().map(|artifact| artifact.estimated_bytes))
             .chain(orphans.iter().map(|orphan| orphan.estimated_bytes))
             .chain(gate_caches.iter().map(|cache| cache.estimated_bytes))
+            .chain(environment_caches.iter().map(|cache| cache.estimated_bytes))
             .fold(0_u64, u64::saturating_add);
         let estimated_build_output_reclaimable_bytes = artifacts
             .iter()
             .map(|artifact| artifact.estimated_bytes)
             .chain(gate_caches.iter().map(|cache| cache.estimated_bytes))
+            .chain(environment_caches.iter().map(|cache| cache.estimated_bytes))
             .fold(0_u64, u64::saturating_add);
         let estimated_declined_artifact_bytes = declined_artifacts
             .iter()
@@ -4941,13 +4963,23 @@ impl Broker {
                 .map(|worktree| worktree.estimated_inodes)
                 .chain(artifacts.iter().map(|artifact| artifact.estimated_inodes))
                 .chain(orphans.iter().map(|orphan| orphan.estimated_inodes))
-                .chain(gate_caches.iter().map(|cache| cache.estimated_inodes)),
+                .chain(gate_caches.iter().map(|cache| cache.estimated_inodes))
+                .chain(
+                    environment_caches
+                        .iter()
+                        .map(|cache| cache.estimated_inodes),
+                ),
         );
         let estimated_build_output_reclaimable_inodes = sum_inode_estimates(
             artifacts
                 .iter()
                 .map(|artifact| artifact.estimated_inodes)
-                .chain(gate_caches.iter().map(|cache| cache.estimated_inodes)),
+                .chain(gate_caches.iter().map(|cache| cache.estimated_inodes))
+                .chain(
+                    environment_caches
+                        .iter()
+                        .map(|cache| cache.estimated_inodes),
+                ),
         );
         let estimated_declined_artifact_inodes = sum_inode_estimates(
             declined_artifacts
@@ -5080,6 +5112,7 @@ impl Broker {
             artifacts,
             orphans,
             gate_caches,
+            environment_caches,
             recovery_archives,
             blockers,
             checkpoint_pin_releases,
@@ -5096,6 +5129,7 @@ impl Broker {
             estimated_declined_artifact_bytes,
             estimated_declined_artifact_inodes,
             gate_cache,
+            environment_cache,
             estimated_build_output_reclaimable_bytes,
             estimated_build_output_reclaimable_inodes,
             reclaim_order,
@@ -9768,6 +9802,31 @@ impl Broker {
             write_journal(&journal_path, &journal)?;
         }
 
+        // Environment build cache entries (#1275): each is evicted as `env
+        // cache prune` would, under its key, never in use, and only if nobody
+        // used it since the plan; one that fails is kept and the run carries
+        // on. Operator-invoked only, like the gate cache: the unattended
+        // resume must not be what decides to discard a cache.
+        while budget_ms.is_none()
+            && !journal.remaining_environment_caches.is_empty()
+            && !check_deadline(deadline)
+        {
+            let candidate = journal.remaining_environment_caches[0].clone();
+            match crate::environments::cache::host_gc_evict(&candidate) {
+                Ok(true) => {
+                    journal.reclaimed_bytes = journal
+                        .reclaimed_bytes
+                        .saturating_add(candidate.estimated_bytes);
+                    journal.environment_caches_reclaimed.push(candidate.path);
+                }
+                // Gone is the outcome asked for; this run did not free it.
+                Ok(false) => {}
+                Err(reason) => failures.push(format!("{}: {reason}", candidate.path)),
+            }
+            journal.remaining_environment_caches.remove(0);
+            write_journal(&journal_path, &journal)?;
+        }
+
         // Visit each candidate at most once per apply. A temporarily unreadable
         // tree stays durable at the tail without starving healthy roots.
         let orphan_visits = journal.remaining_orphans.len();
@@ -9964,6 +10023,7 @@ impl Broker {
                 || !journal.remaining_worktrees.is_empty()
                 || !journal.remaining_artifacts.is_empty()
                 || !journal.remaining_gate_caches.is_empty()
+                || !journal.remaining_environment_caches.is_empty()
                 || !journal.remaining_orphans.is_empty()
                 || !journal.remaining_recovery_archives.is_empty());
         let complete = journal.remaining_rows.is_empty()
@@ -9973,6 +10033,7 @@ impl Broker {
             && journal.remaining_worktrees.is_empty()
             && journal.remaining_artifacts.is_empty()
             && journal.remaining_gate_caches.is_empty()
+            && journal.remaining_environment_caches.is_empty()
             && journal.remaining_orphans.is_empty()
             && journal.remaining_recovery_archives.is_empty();
         let recovery_action =
@@ -9987,6 +10048,7 @@ impl Broker {
             artifacts_reclaimed: journal.artifacts_reclaimed.clone(),
             orphans_removed: journal.orphans_removed.clone(),
             gate_caches_reclaimed: journal.gate_caches_reclaimed.clone(),
+            environment_caches_reclaimed: journal.environment_caches_reclaimed.clone(),
             checkpoint_pins_released: journal.checkpoint_pins_released.clone(),
             publication_exposures_expired: journal.publication_exposures_expired.clone(),
             recovery_archives_removed: journal.recovery_archives_removed.clone(),
@@ -10003,6 +10065,7 @@ impl Broker {
                 "artifacts_reclaimed": report.artifacts_reclaimed.len(),
                 "orphans_removed": report.orphans_removed.len(),
                 "gate_caches_reclaimed": report.gate_caches_reclaimed.len(),
+                "environment_caches_reclaimed": report.environment_caches_reclaimed.len(),
                 "checkpoint_pins_released": report.checkpoint_pins_released.len(),
                 "publication_exposures_expired": report.publication_exposures_expired.len(),
                 "recovery_archives_removed": report.recovery_archives_removed.len(),
