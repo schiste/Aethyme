@@ -87,10 +87,11 @@ pub struct ProxyConfig {
 }
 
 impl ProxyConfig {
-    fn routes(&self) -> Vec<Route> {
+    fn routes(&self) -> Result<Vec<Route>, String> {
         match EnvironmentStore::open_read_only(&self.store_path) {
-            Ok(Some(store)) => route_table(&store, &self.root).unwrap_or_default(),
-            _ => Vec::new(),
+            Ok(Some(store)) => route_table(&store, &self.root).map_err(|error| error.to_string()),
+            Ok(None) => Ok(Vec::new()),
+            Err(error) => Err(error.to_string()),
         }
     }
 
@@ -224,6 +225,18 @@ fn respond_json(
     )
 }
 
+fn route_snapshot_unavailable(client: &mut TcpStream, reason: &str) -> io::Result<()> {
+    respond_json(
+        client,
+        "503 Service Unavailable",
+        json!({
+            "error": reason,
+            "next_action": "inspect `aethyme env routes` and retry after the shared redeploy settles"
+        }),
+        &[("Retry-After", "1".into())],
+    )
+}
+
 /// One environment wakes at a time; concurrent requests for it wait on the
 /// same lock and then find it active.
 fn wake_lock(env_id: &str) -> Arc<Mutex<()>> {
@@ -316,7 +329,10 @@ fn handle(mut client: TcpStream, config: &ProxyConfig) -> io::Result<()> {
         return control_request(&mut client, config, &head, control);
     }
     let host = head.header("Host").unwrap_or_default().to_string();
-    let routes = config.routes();
+    let routes = match config.routes() {
+        Ok(routes) => routes,
+        Err(reason) => return route_snapshot_unavailable(&mut client, &reason),
+    };
     let Some(route) = lookup(&routes, &host).cloned() else {
         return respond(
             &mut client,
@@ -339,9 +355,12 @@ fn handle(mut client: TcpStream, config: &ProxyConfig) -> io::Result<()> {
             &[("Retry-After", "5".into())],
         );
     }
-    touch_debounced(&config.root, &route.env_id);
-    // Re-read: waking may have changed the phase (and so the upstream).
-    let routes = config.routes();
+    // Re-read just before connecting: waking or a blue/green flip may have
+    // changed the selected slot and its upstream.
+    let routes = match config.routes() {
+        Ok(routes) => routes,
+        Err(reason) => return route_snapshot_unavailable(&mut client, &reason),
+    };
     let Some(route) = lookup(&routes, &host).cloned() else {
         return respond(
             &mut client,
@@ -351,6 +370,7 @@ fn handle(mut client: TcpStream, config: &ProxyConfig) -> io::Result<()> {
             b"route vanished\n",
         );
     };
+    touch_debounced(&config.root, &route.env_id);
     if let Some(directory) = &route.static_dir {
         return serve_static(&mut client, &head, directory);
     }
@@ -491,7 +511,10 @@ fn control_request(
         control.split_once('/').unwrap_or((control, "")),
     ) {
         ("GET", ("routes", "")) => {
-            let routes = config.routes();
+            let routes = match config.routes() {
+                Ok(routes) => routes,
+                Err(reason) => return route_snapshot_unavailable(client, &reason),
+            };
             let tag = etag(&routes);
             if head.header("If-None-Match") == Some(tag.as_str()) {
                 return respond(
@@ -518,7 +541,10 @@ fn control_request(
                     &[],
                 );
             }
-            let routes = config.routes();
+            let routes = match config.routes() {
+                Ok(routes) => routes,
+                Err(reason) => return route_snapshot_unavailable(client, &reason),
+            };
             let Some(route) = routes.iter().find(|r| r.namespace == namespace) else {
                 return respond_json(
                     client,
