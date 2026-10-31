@@ -530,16 +530,8 @@ fn validate_profile(
             "declare it under [pools] or remove pool",
         );
     }
-    if profile.components.is_empty() {
-        c.push(
-            "no_components",
-            p,
-            None,
-            Some("components"),
-            "a profile needs at least one component",
-            "add a component",
-        );
-    }
+    // A profile with no components is "no environment needed" (#1289):
+    // the target of rules for diffs that need nothing.
 
     let mut names = BTreeSet::new();
     let mut suffixes: BTreeMap<String, &str> = BTreeMap::new();
