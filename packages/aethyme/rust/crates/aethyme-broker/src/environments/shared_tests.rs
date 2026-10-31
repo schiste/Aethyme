@@ -1405,3 +1405,87 @@ fn a_stateful_shared_environment_never_runs_blue_green() {
         .shared_destroy(repo.path(), REPOSITORY, "baseline")
         .unwrap();
 }
+
+/// #1297: with `redeploy_on = "inputs"`, a commit that leaves the inputs
+/// alone records the revision and restarts nothing; a commit that changes
+/// them redeploys.
+#[test]
+fn a_shared_environment_on_inputs_ignores_unrelated_commits() {
+    if !python_available() {
+        eprintln!("SKIP redeploy on inputs: python3 not available");
+        return;
+    }
+    let host = Host::new();
+    let repo = repository(44000);
+    let first = commit(
+        repo.path(),
+        ".aethyme/environments.toml",
+        &environments(44000, SERVE).replacen(
+            "min_redeploy_interval_seconds = 3600\n",
+            "min_redeploy_interval_seconds = 3600\nredeploy_on = \"inputs\"\ninputs = [\"version.txt\"]\n",
+            1,
+        ),
+        "redeploy on inputs",
+    );
+    let none = HostEnvironmentsFile::default();
+    let mut lifecycle = host.lifecycle();
+    let before = lifecycle
+        .shared_up(
+            repo.path(),
+            REPOSITORY,
+            "baseline",
+            &none,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    let redeploy = |lifecycle: &mut Lifecycle| {
+        lifecycle
+            .shared_redeploy(
+                repo.path(),
+                REPOSITORY,
+                "baseline",
+                &none,
+                Duration::from_secs(20),
+                true,
+            )
+            .unwrap()
+    };
+
+    let unrelated = commit(repo.path(), "notes.txt", "n", "unrelated");
+    let outcome = redeploy(&mut lifecycle);
+    assert!(
+        matches!(&outcome, Redeploy::Unchanged { commit } if *commit == unrelated),
+        "{outcome:?}"
+    );
+    let after = lifecycle.store.get(&before.env_id).unwrap().unwrap();
+    assert_eq!(after.phase, EnvironmentPhase::Active);
+    assert_eq!(
+        after.snapshot.source.commit.as_deref(),
+        Some(first.as_str()),
+        "nothing was redeployed"
+    );
+    let history = lifecycle.store.transitions(&before.env_id, 50).unwrap();
+    assert!(
+        history.iter().any(|t| t.reason == "revision recorded"),
+        "{history:?}"
+    );
+    assert!(
+        history.iter().all(|t| t.reason != "redeployed"),
+        "{history:?}"
+    );
+
+    let v2 = commit(repo.path(), "version.txt", "v2", "v2");
+    let outcome = redeploy(&mut lifecycle);
+    assert!(
+        matches!(&outcome, Redeploy::Redeployed { to, .. } if *to == v2),
+        "{outcome:?}"
+    );
+    for record in lifecycle.store.list(None).unwrap() {
+        if record.phase.retains_worktree() {
+            lifecycle
+                .shared_destroy(repo.path(), REPOSITORY, "baseline")
+                .unwrap();
+            break;
+        }
+    }
+}

@@ -74,6 +74,8 @@ pub enum LifecycleError {
         env_id: String,
         components: Vec<String>,
     },
+    #[error("environment {env_id} is {phase}; only an active environment restarts")]
+    NotActive { env_id: String, phase: &'static str },
     #[error("{0}")]
     Io(String),
 }
@@ -89,6 +91,7 @@ impl LifecycleError {
             Self::WrongPhase { .. } => "wrong_phase",
             Self::ReconfigureRequired { .. } => "reconfigure_required",
             Self::RecreateRequired { .. } => "recreate_required",
+            Self::NotActive { .. } => "not_active",
             Self::Io(_) => "io_error",
         }
     }

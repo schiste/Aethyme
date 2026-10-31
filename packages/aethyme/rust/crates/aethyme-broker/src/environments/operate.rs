@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 
 use super::ENVIRONMENTS_FILE;
 use super::cli::{
-    DOWN_SCHEMA, Failure, Options, Output, PARK_SCHEMA, PIN_SCHEMA, SWEEP_SCHEMA, TOUCH_SCHEMA,
-    UP_SCHEMA, WAKE_SCHEMA, check, compile_context, environment_failure, workspace,
+    DOWN_SCHEMA, Failure, Options, Output, PARK_SCHEMA, PIN_SCHEMA, RESTART_SCHEMA, SWEEP_SCHEMA,
+    TOUCH_SCHEMA, UP_SCHEMA, WAKE_SCHEMA, check, compile_context, environment_failure, workspace,
 };
 use super::compile::compile;
 use super::lifecycle::{Lifecycle, LifecycleError, RESERVATION_GRANT, UpOptions, read_grant};
@@ -30,6 +30,9 @@ fn lifecycle_failure(error: LifecycleError) -> Failure {
                 .join(" ")
         ),
         LifecycleError::WrongPhase { next, .. } => next.clone(),
+        LifecycleError::NotActive { env_id, .. } => {
+            format!("run `aethyme env wake {env_id}` (or `aethyme env up`) first")
+        }
         LifecycleError::Resources(_) if code == "capacity_timeout" => {
             "raise --wait, park or destroy another environment in the pool, or raise the pool limit"
                 .into()
@@ -44,6 +47,7 @@ fn lifecycle_failure(error: LifecycleError) -> Failure {
         exit: match code {
             "not_found"
             | "wrong_phase"
+            | "not_active"
             | "reconfigure_required"
             | "recreate_required"
             | "capacity_timeout" => exit_status::REFUSED,
@@ -350,6 +354,19 @@ pub(super) fn run_wake(options: &Options) -> Result<Output, Failure> {
         text.push_str(&format!("warning: {warning}\n"));
     }
     value["schema"] = json!(WAKE_SCHEMA);
+    Ok((value, text, exit_status::SUCCESS))
+}
+
+pub(super) fn run_restart(options: &Options) -> Result<Output, Failure> {
+    let id = required_id(options)?;
+    let (mut lifecycle, _) = open("env restart", false)?;
+    let (record, restarted) = lifecycle
+        .restart(&id, options.positional.get(1).map(String::as_str))
+        .map_err(lifecycle_failure)?;
+    let (mut value, mut text) = describe(&lifecycle, &record);
+    value["schema"] = json!(RESTART_SCHEMA);
+    value["restarted"] = json!(restarted);
+    text.push_str(&format!("restarted: {}\n", restarted.join(", ")));
     Ok((value, text, exit_status::SUCCESS))
 }
 

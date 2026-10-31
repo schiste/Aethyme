@@ -263,6 +263,20 @@ pub struct ComponentSpec {
     /// E20: globs over the diff that enable this optional component.
     #[serde(default)]
     pub enabled_by: Vec<String>,
+    /// E21: requests to this routed component's host whose path starts with
+    /// `prefix` go to `to` instead (#1296).
+    #[serde(default)]
+    pub paths: Vec<PathRouteSpec>,
+}
+
+/// One per-path route (#1296): `to` is another routed component of the
+/// profile, `shared:<name>` for a shared environment the profile uses, or an
+/// `http://host[:port]` URL. The prefix is kept on the forwarded request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathRouteSpec {
+    pub prefix: String,
+    pub to: String,
 }
 
 impl ComponentSpec {
@@ -322,6 +336,21 @@ pub struct SharedSpec {
     /// redeployed blue/green, only by the in-place hold-and-swap.
     #[serde(default)]
     pub stateful: bool,
+    /// What makes a ref move redeploy (#1297): any move (`ref`, the
+    /// default), or only a change to the files matching `inputs`
+    /// (`inputs`), so shared infrastructure does not restart on every commit.
+    #[serde(default)]
+    pub redeploy_on: RedeployOn,
+    #[serde(default)]
+    pub inputs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedeployOn {
+    #[default]
+    Ref,
+    Inputs,
 }
 
 /// Host-scoped settings: `<host state>/environments.toml`. Only host pool

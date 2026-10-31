@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::spec::{
-    ComponentSpec, Engine, EnvironmentsFile, HealthSpec, HostEnvironmentsFile, PoolScope, Preempt,
-    Runtime,
+    ComponentSpec, Engine, EnvironmentsFile, HealthSpec, HostEnvironmentsFile, PathRouteSpec,
+    PoolScope, Preempt, Runtime,
 };
 use super::validate::{declared_engine, effective_rank, env_suffix, pool_limit, profile_pool};
 use crate::resources::{
@@ -174,6 +174,10 @@ pub struct CompiledComponent {
     pub optional: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enabled_by: Vec<String>,
+    /// Per-path routes (#1296). Omitted when empty, so existing snapshot
+    /// digests are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<PathRouteSpec>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,6 +345,7 @@ fn compile_component(file: &EnvironmentsFile, component: &ComponentSpec) -> Comp
         template_inputs: component.template_inputs.clone(),
         optional: component.optional,
         enabled_by: component.enabled_by.clone(),
+        paths: component.paths.clone(),
     }
 }
 

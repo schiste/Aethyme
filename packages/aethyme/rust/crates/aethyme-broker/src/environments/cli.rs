@@ -34,6 +34,7 @@ pub const DOWN_SCHEMA: &str = "aethyme.env-down/v1";
 pub const SWEEP_SCHEMA: &str = "aethyme.env-sweep/v1";
 pub const PARK_SCHEMA: &str = "aethyme.env-park/v1";
 pub const WAKE_SCHEMA: &str = "aethyme.env-wake/v1";
+pub const RESTART_SCHEMA: &str = "aethyme.env-restart/v1";
 pub const TOUCH_SCHEMA: &str = "aethyme.env-touch/v1";
 pub const PIN_SCHEMA: &str = "aethyme.env-pin/v1";
 pub const ROUTES_SCHEMA: &str = "aethyme.env-routes/v1";
@@ -113,6 +114,11 @@ Usage:
       component and wait for health. Without capacity it stays parked with
       capacity_timeout; a failed start rolls back to parked. `env up` on a
       parked environment wakes it.
+  aethyme env restart <id> [<component>] [--json]
+      Stop and start one component (or every running one, in dependency
+      order) in place, then re-check its health. Ports, namespace, data and
+      every other component are kept. Only an active environment restarts
+      (not_active); a failed start leaves it active with last_error set.
   aethyme env exec <id> -- <command> [args...]
       Run a command against the environment: it wakes a parked environment,
       sets the AETHYME_ENV_* variables (namespace, ports, URLs, receipts),
@@ -235,6 +241,7 @@ pub fn run(args: &[String]) -> u8 {
         "sweep" => super::operate::run_sweep(&options),
         "park" => super::operate::run_park(&options),
         "wake" => super::operate::run_wake(&options),
+        "restart" => super::operate::run_restart(&options),
         "touch" => super::operate::run_touch(&options),
         "pin" => super::operate::run_pin(&options),
         "unpin" => super::operate::run_unpin(&options),
@@ -379,6 +386,7 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
                             | "destroy"
                             | "park"
                             | "wake"
+                            | "restart"
                             | "touch"
                             | "pin"
                             | "unpin"
@@ -386,7 +394,7 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
                             | "cache"
                     )
                     && options.positional.len()
-                        < if matches!(command, "logs" | "shared") {
+                        < if matches!(command, "logs" | "shared" | "restart") {
                             2
                         } else {
                             1

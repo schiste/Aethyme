@@ -454,3 +454,38 @@ health = { command = "true", timeout_seconds = 10, interval_ms = 50 }
     let (code, down) = fixture.json(&["env", "down", &env_id]);
     assert_eq!(code, 0, "{down}");
 }
+
+/// #1294 through the router: `env restart` replaces one component and
+/// reports it; a parked environment is refused with `not_active`.
+#[test]
+fn restart_through_the_cli_reports_the_component_and_refuses_parked() {
+    let environments = r#"
+schema = 1
+[[profiles]]
+name = "backend"
+[[profiles.components]]
+name = "api"
+runtime = "process"
+listen = true
+start = "exec sleep 300"
+health = { command = "true", timeout_seconds = 10, interval_ms = 50 }
+"#;
+    let fixture = Fixture::new(Some(environments));
+    let (code, up) = fixture.json(&["env", "up", "--wait", "5"]);
+    assert_eq!(code, 0, "{up}");
+    let env_id = up["env_id"].as_str().unwrap().to_string();
+    let (code, restarted) = fixture.json(&["env", "restart", &env_id, "api"]);
+    assert_eq!(code, 0, "{restarted}");
+    assert_eq!(restarted["schema"], "aethyme.env-restart/v1");
+    assert_eq!(restarted["restarted"], serde_json::json!(["api"]));
+    assert_eq!(restarted["phase"], "active");
+
+    let (code, parked) = fixture.json(&["env", "park", &env_id]);
+    assert_eq!(code, 0, "{parked}");
+    let (code, refused) = fixture.json(&["env", "restart", &env_id]);
+    assert_eq!(code, 3, "{refused}");
+    assert_eq!(refused["code"], "not_active");
+
+    let (code, down) = fixture.json(&["env", "down", &env_id]);
+    assert_eq!(code, 0, "{down}");
+}
