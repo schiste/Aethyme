@@ -3094,8 +3094,6 @@ mod tests {
 
     #[test]
     fn bootstrap_reclaims_staging_but_preserves_unknown_directory_names() {
-        use std::os::unix::ffi::OsStringExt;
-
         let temp = tempfile::tempdir().unwrap();
         let fixture = fs::canonicalize(temp.path()).unwrap();
         let install_dir = fixture.join("bin");
@@ -3110,11 +3108,19 @@ mod tests {
         let versions = install_dir.join(".aethyme-managed/versions");
         let staging = versions.join(".staging-old");
         let unknown = versions.join("unknown directory");
-        let non_utf8 = versions.join(std::ffi::OsString::from_vec(vec![0xff]));
-        for path in [&staging, &unknown, &non_utf8] {
+        for path in [&staging, &unknown] {
             fs::create_dir(path).unwrap();
             fs::write(path.join("retained-content"), b"content").unwrap();
         }
+        #[cfg(target_os = "linux")]
+        let non_utf8 = {
+            use std::os::unix::ffi::OsStringExt;
+
+            let path = versions.join(std::ffi::OsString::from_vec(vec![0xff]));
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("retained-content"), b"content").unwrap();
+            path
+        };
         let update = bootstrap_install(
             &fake_payload(&fixture, "0.3.0", true),
             &install_dir,
@@ -3124,9 +3130,15 @@ mod tests {
         .unwrap();
         assert!(update.active_bundle.is_dir());
         assert!(!staging.exists());
-        for path in [&unknown, &non_utf8] {
-            assert_eq!(fs::read(path.join("retained-content")).unwrap(), b"content");
-        }
+        assert_eq!(
+            fs::read(unknown.join("retained-content")).unwrap(),
+            b"content"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            fs::read(non_utf8.join("retained-content")).unwrap(),
+            b"content"
+        );
     }
 
     #[test]
