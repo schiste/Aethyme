@@ -460,6 +460,7 @@ fn validate_update_lock_file(path: &Path, opened: &File) -> std::io::Result<()> 
 
     let named = fs::symlink_metadata(path)?;
     let metadata = opened.metadata()?;
+    // SAFETY: `geteuid` has no preconditions and only reads this process's effective UID.
     let uid = unsafe { libc::geteuid() };
     if !named.is_file()
         || !metadata.is_file()
@@ -492,6 +493,7 @@ fn validate_expected_identity(expected: &str) -> Result<(), String> {
 
 fn is_private_directory_metadata(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
+    // SAFETY: `geteuid` has no preconditions and only reads this process's effective UID.
     let uid = unsafe { libc::geteuid() };
     metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o022 == 0
 }
@@ -533,6 +535,7 @@ fn runtime_executable_identity(path: &Path) -> std::io::Result<RuntimeFileIdenti
     use std::os::unix::fs::MetadataExt;
 
     let metadata = fs::symlink_metadata(path)?;
+    // SAFETY: `geteuid` has no preconditions and only reads this process's effective UID.
     let uid = unsafe { libc::geteuid() };
     if !metadata.is_file()
         || metadata.uid() != uid
@@ -950,6 +953,7 @@ fn open_runtime_pin_file(
         }
         Err(error) => return Err(error),
     };
+    // SAFETY: `geteuid` has no preconditions and only reads this process's effective UID.
     let uid = unsafe { libc::geteuid() };
     if !pin_dir_metadata.is_dir()
         || pin_dir_metadata.uid() != uid
@@ -997,6 +1001,7 @@ fn validate_open_runtime_pin_file(file: File, path: &Path) -> std::io::Result<Ru
     use std::os::unix::fs::MetadataExt;
     let named = fs::symlink_metadata(path)?;
     let opened = file.metadata()?;
+    // SAFETY: `geteuid` has no preconditions and only reads this process's effective UID.
     let uid = unsafe { libc::geteuid() };
     if !named.is_file()
         || !opened.is_file()
@@ -1044,6 +1049,7 @@ fn validate_open_runtime_pin_file(file: File, path: &Path) -> std::io::Result<Ru
 fn validate_managed_root(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let metadata = fs::symlink_metadata(path)?;
+    // SAFETY: `geteuid` has no preconditions and only reads this process's effective UID.
     let uid = unsafe { libc::geteuid() };
     if path.file_name().and_then(|name| name.to_str()) != Some(".aethyme-managed")
         || !metadata.is_dir()
@@ -1060,6 +1066,7 @@ fn validate_managed_root(path: &Path) -> std::io::Result<()> {
 }
 
 fn set_close_on_exec(fd: RawFd, enabled: bool) -> std::io::Result<()> {
+    // SAFETY: `F_GETFD` takes the descriptor by value, dereferences no pointers, and reports invalid descriptors through errno.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags < 0 {
         return Err(std::io::Error::last_os_error());
@@ -1069,6 +1076,7 @@ fn set_close_on_exec(fd: RawFd, enabled: bool) -> std::io::Result<()> {
     } else {
         flags & !libc::FD_CLOEXEC
     };
+    // SAFETY: the caller holds this open descriptor; `F_SETFD` takes scalar arguments and dereferences no pointers.
     if unsafe { libc::fcntl(fd, libc::F_SETFD, updated) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -1824,6 +1832,10 @@ pub fn send_request(socket: &Path, request: &serde_json::Value) -> Result<String
 mod tests {
     use super::*;
 
+    fn canonical_fixture_root(temp: &tempfile::TempDir) -> PathBuf {
+        fs::canonicalize(temp.path()).expect("temporary fixture root should resolve")
+    }
+
     #[test]
     fn socket_path_is_in_aethyme_namespace() {
         let path = socket_path_for(Path::new("/some/repo/path"));
@@ -1945,7 +1957,8 @@ mod tests {
     #[test]
     fn daemon_pin_lifetime_is_close_only() {
         let repository = tempfile::tempdir().unwrap();
-        let managed_root = repository.path().join(".aethyme-managed");
+        let fixture_root = canonical_fixture_root(&repository);
+        let managed_root = fixture_root.join(".aethyme-managed");
         std::fs::create_dir(&managed_root).unwrap();
         let pin = RuntimeBundlePin::acquire_shared(&managed_root, "v0.8.51-0123456789ab").unwrap();
         let child_copy = pin.file().try_clone().unwrap();
@@ -1961,10 +1974,37 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn runtime_pin_rejects_a_symlinked_parent_alias() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fixture_root = canonical_fixture_root(&temp);
+        let managed_root = fixture_root.join(".aethyme-managed");
+        fs::create_dir(&managed_root).unwrap();
+        let alias_parent = fixture_root.join("alias-parent");
+        symlink(&fixture_root, &alias_parent).unwrap();
+
+        let error = RuntimeBundlePin::acquire_shared(
+            &alias_parent.join(".aethyme-managed"),
+            "v0.8.51-0123456789ab",
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("managed runtime root is not a private real directory")
+        );
+        assert!(!managed_root.join(RUNTIME_PIN_DIRECTORY).exists());
+    }
+
     #[test]
     fn shared_update_lock_excludes_exclusive_updater_and_releases_on_drop() {
         let repository = tempfile::tempdir().unwrap();
-        let managed_root = repository.path().join(".aethyme-managed");
+        let fixture_root = canonical_fixture_root(&repository);
+        let managed_root = fixture_root.join(".aethyme-managed");
         std::fs::create_dir(&managed_root).unwrap();
 
         let shared = RuntimeUpdateLock::try_shared(&managed_root)
@@ -2004,7 +2044,8 @@ mod tests {
         }
 
         let temp = tempfile::tempdir().unwrap();
-        let managed_root = temp.path().join(".aethyme-managed");
+        let fixture_root = canonical_fixture_root(&temp);
+        let managed_root = fixture_root.join(".aethyme-managed");
         std::fs::create_dir(&managed_root).unwrap();
         let versions = managed_root.join("versions");
         std::fs::create_dir(&versions).unwrap();
@@ -2020,7 +2061,6 @@ mod tests {
             &bundle.join("aethyme-engine-cli"),
             &format!("aethyme-engine-cli {identity} build_date=test"),
         );
-        let managed_root = fs::canonicalize(managed_root).unwrap();
 
         let mut budget = RuntimeValidationBudget::new(Duration::from_secs(5), 1024 * 1024);
         let pair =
@@ -2058,7 +2098,8 @@ mod tests {
     #[test]
     fn direct_managed_engine_start_pins_the_exact_matching_bundle() {
         let temp = tempfile::tempdir().unwrap();
-        let managed_root = temp.path().join(".aethyme-managed");
+        let fixture_root = canonical_fixture_root(&temp);
+        let managed_root = fixture_root.join(".aethyme-managed");
         let bundle_name = format!("v{}-0123456789ab", env!("CARGO_PKG_VERSION"));
         let bundle = managed_root.join("versions").join(&bundle_name);
         fs::create_dir_all(&bundle).unwrap();
@@ -2099,7 +2140,8 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
-        let install_dir = temp.path().join("bin");
+        let fixture_root = canonical_fixture_root(&temp);
+        let install_dir = fixture_root.join("bin");
         fs::create_dir_all(install_dir.join(".aethyme-managed")).unwrap();
         let engine_path = install_dir.join("aethyme-engine-cli");
         symlink(
@@ -2140,12 +2182,13 @@ mod tests {
         }
 
         let temp = tempfile::tempdir().unwrap();
-        let managed_root = temp.path().join(".aethyme-managed");
+        let fixture_root = canonical_fixture_root(&temp);
+        let managed_root = fixture_root.join(".aethyme-managed");
         fs::create_dir(&managed_root).unwrap();
         let bundle_name = "v0.8.51-0123456789ab";
         let pin = RuntimeBundlePin::acquire_shared(&managed_root, bundle_name).unwrap();
-        let ready_path = temp.path().join("child-ready");
-        let release_path = temp.path().join("child-release");
+        let ready_path = fixture_root.join("child-ready");
+        let release_path = fixture_root.join("child-release");
         let mut child = Command::new(std::env::current_exe().unwrap())
             .arg("--nocapture")
             .arg(CHILD_TEST)
