@@ -466,8 +466,9 @@ fn serve_static(
         path = path.join("index.html");
     }
     let found = servable(directory, &path).or_else(|| {
-        // A client-side route: no extension, so not a missing asset.
-        (spa_fallback && relative.extension().is_none())
+        // Only absent client routes may fall back. An existing but
+        // ineligible path must keep its refusal.
+        (spa_fallback && relative.extension().is_none() && missing_static_path(directory, &path))
             .then(|| servable(directory, &directory.join("index.html")))
             .flatten()
     });
@@ -484,6 +485,33 @@ fn serve_static(
     response.extend_from_slice(body);
     client.write_all(&response)?;
     client.flush()
+}
+
+/// Confirm absence beneath an existing directory inside the served root.
+/// Walking up also handles routes whose intermediate directories are absent;
+/// a dangling link, unreadable path or an ancestor outside the root refuses.
+fn missing_static_path(directory: &Path, path: &Path) -> bool {
+    let Ok(root) = directory.canonicalize() else {
+        return false;
+    };
+    let mut missing = false;
+    for ancestor in path.ancestors() {
+        if !ancestor.starts_with(directory) {
+            return false;
+        }
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                return missing
+                    && ancestor.canonicalize().ok().is_some_and(|resolved| {
+                        resolved.starts_with(&root)
+                            && std::fs::metadata(resolved).is_ok_and(|metadata| metadata.is_dir())
+                    });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => missing = true,
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 /// `path` and its size when it is a file inside `directory` (symlinks
