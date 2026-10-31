@@ -725,7 +725,7 @@ impl Lifecycle {
         for component in &snapshot.components {
             let previous = self
                 .store
-                .components(&env_id)?
+                .components(env_id)?
                 .into_iter()
                 .find(|c| c.component == component.name);
             // Provisioned already: created, or started at some point since.
@@ -747,7 +747,7 @@ impl Lifecycle {
                 .as_ref()
                 .is_some_and(|c| c.phase == ManagedServicePhase::CreatePending);
             self.component_to(
-                &env_id,
+                env_id,
                 &component.name,
                 &[
                     ManagedServicePhase::AdmissionPending,
@@ -766,7 +766,7 @@ impl Lifecycle {
             // Template first (its id reaches provision), then the build from
             // the cache when its inputs are unchanged (#1219).
             let template = {
-                let ctx = self.context(&snapshot, component, &current, attempt);
+                let ctx = self.context(snapshot, component, &current, attempt);
                 self.ensure_template(&ctx)
             };
             let outcome = match template {
@@ -775,7 +775,7 @@ impl Lifecycle {
                     if let Some(id) = template {
                         current.template_ids.insert(component.name.clone(), id);
                     }
-                    let ctx = self.context(&snapshot, component, &current, attempt);
+                    let ctx = self.context(snapshot, component, &current, attempt);
                     match self.cached_build(&ctx) {
                         Err(error) => Err(error),
                         Ok(()) => driver.provision(&ctx),
@@ -788,7 +788,7 @@ impl Lifecycle {
                         receipts.insert(component.name.clone(), receipt.clone());
                     }
                     self.component_to(
-                        &env_id,
+                        env_id,
                         &component.name,
                         &[ManagedServicePhase::Created],
                         None,
