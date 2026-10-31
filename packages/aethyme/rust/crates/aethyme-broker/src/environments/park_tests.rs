@@ -123,6 +123,7 @@ fn up_options() -> UpOptions {
     UpOptions {
         wait: Duration::from_millis(500),
         reconfigure: false,
+        recreate: Vec::new(),
     }
 }
 

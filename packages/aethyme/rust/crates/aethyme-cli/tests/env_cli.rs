@@ -409,3 +409,48 @@ min_profile = "isolated"
     let (code, _) = fixture.json(&["env", "down", up["env_id"].as_str().unwrap()]);
     assert_eq!(code, 0);
 }
+
+/// #1295 through the router: `--component` selects an optional component,
+/// a later plain `env up` keeps it, and an unknown name is refused.
+#[test]
+fn a_selected_optional_component_stays_selected() {
+    let environments = r#"
+schema = 1
+[[profiles]]
+name = "backend"
+[[profiles.components]]
+name = "api"
+runtime = "process"
+listen = true
+start = "exec sleep 300"
+health = { command = "true", timeout_seconds = 10, interval_ms = 50 }
+[[profiles.components]]
+name = "web"
+runtime = "process"
+listen = true
+optional = true
+start = "exec sleep 300"
+health = { command = "true", timeout_seconds = 10, interval_ms = 50 }
+"#;
+    let fixture = Fixture::new(Some(environments));
+    let (code, refused) = fixture.json(&["env", "up", "--component", "nosuch"]);
+    assert_eq!(code, 2, "{refused}");
+    assert_eq!(refused["code"], "unknown_component");
+
+    let (code, up) = fixture.json(&["env", "up", "--wait", "5"]);
+    assert_eq!(code, 0, "{up}");
+    assert!(up["ports"].get("web").is_none(), "optional is off: {up}");
+    let env_id = up["env_id"].as_str().unwrap().to_string();
+
+    let (code, with) = fixture.json(&["env", "up", "--component", "web", "--wait", "5"]);
+    assert_eq!(code, 0, "{with}");
+    assert_eq!(with["env_id"], env_id.as_str(), "added in place");
+    assert!(with["ports"].get("web").is_some(), "{with}");
+
+    let (code, again) = fixture.json(&["env", "up", "--wait", "5"]);
+    assert_eq!(code, 0, "a plain up keeps the selection: {again}");
+    assert!(again["ports"].get("web").is_some(), "{again}");
+
+    let (code, down) = fixture.json(&["env", "down", &env_id]);
+    assert_eq!(code, 0, "{down}");
+}

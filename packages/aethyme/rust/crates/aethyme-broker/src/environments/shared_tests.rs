@@ -764,6 +764,7 @@ fn waking_a_consumer_wakes_its_shared_environment() {
             &super::lifecycle::UpOptions {
                 wait: Duration::from_secs(5),
                 reconfigure: false,
+                recreate: Vec::new(),
             },
         )
         .unwrap()
