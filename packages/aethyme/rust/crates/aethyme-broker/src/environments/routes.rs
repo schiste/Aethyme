@@ -11,6 +11,13 @@
 //! A shared environment's serving slot also answers on a stable alias host
 //! (#1274), recorded in its [`ROUTE_ALIAS_FILE`]. The `serving` owner pointer
 //! selects which slot's alias belongs in a route-table snapshot.
+//!
+//! A routed component may also send some paths elsewhere (#1296): each of
+//! its routes carries `paths`, resolved here to another host in the table
+//! (a component of the same environment, or a shared environment's alias
+//! host) or to an external `http://` URL. The proxy picks the longest
+//! matching prefix, so one address can serve a built app and forward `/api`
+//! and `/ws` to a backend.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -54,6 +61,40 @@ pub struct Route {
     pub static_dir: Option<PathBuf>,
     /// Health timeout: how long a request may be held while this wakes.
     pub wake_timeout_seconds: u64,
+    /// Per-path routes of this component (#1296), longest prefix first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<PathRoute>,
+}
+
+/// Where requests under `prefix` go instead of this route: another route's
+/// `host` in the same table, or an external `url`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PathRoute {
+    pub prefix: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// Whether `path` (a request target, query included) is under `prefix`: the
+/// prefix itself, or followed by `/`, `?` or `#`, so `/api` never matches
+/// `/apix`.
+pub fn prefix_matches(prefix: &str, path: &str) -> bool {
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    match path.strip_prefix(prefix) {
+        Some(rest) => rest.is_empty() || prefix.ends_with('/') || rest.starts_with('/'),
+        None => false,
+    }
+}
+
+/// The path route of `route` for `path`: the longest matching prefix.
+pub fn select_path<'a>(route: &'a Route, path: &str) -> Option<&'a PathRoute> {
+    route
+        .paths
+        .iter()
+        .filter(|candidate| prefix_matches(&candidate.prefix, path))
+        .max_by_key(|candidate| candidate.prefix.len())
 }
 
 pub fn route_table(store: &EnvironmentStore, root: &Path) -> Result<Vec<Route>, StoreError> {
@@ -377,6 +418,40 @@ fn record_routes(record: &EnvironmentRecord, root: &Path, alias: Option<&str>) -
                     .map(|(root, dir)| Path::new(root).join(dir))
             })
             .flatten();
+        let mut paths: Vec<PathRoute> = component
+            .paths
+            .iter()
+            .map(|path| {
+                let (host, url) = if path.to.starts_with("http://") {
+                    (None, Some(path.to.clone()))
+                } else if let Some(shared) = path.to.strip_prefix("shared:") {
+                    (
+                        Some(super::shared::alias_host(
+                            &record.repository,
+                            shared,
+                            domain,
+                        )),
+                        None,
+                    )
+                } else {
+                    (
+                        Some(format!("{}.{namespace}.{domain}", path.to).to_ascii_lowercase()),
+                        None,
+                    )
+                };
+                PathRoute {
+                    prefix: path.prefix.clone(),
+                    host,
+                    url,
+                }
+            })
+            .collect();
+        paths.sort_by(|a, b| {
+            b.prefix
+                .len()
+                .cmp(&a.prefix.len())
+                .then(a.prefix.cmp(&b.prefix))
+        });
         let mut hosts = vec![format!("{}.{namespace}.{domain}", component.name)];
         if first {
             hosts.push(format!("{namespace}.{domain}"));
@@ -395,6 +470,7 @@ fn record_routes(record: &EnvironmentRecord, root: &Path, alias: Option<&str>) -
                 upstream,
                 static_dir: static_dir.clone(),
                 wake_timeout_seconds,
+                paths: paths.clone(),
             });
         }
     }
@@ -452,5 +528,31 @@ mod tests {
 
         let ambiguous_refs = group(&["baseline@refs/heads/feature", "baseline@refs/heads/other"]);
         assert!(ambiguous_refs.default_owner().is_err());
+    }
+
+    /// #1296: the longest matching prefix wins, whatever the declared
+    /// order. (Segment boundaries: `per_path_routes_share_one_address`.)
+    #[test]
+    fn the_longest_matching_prefix_selects_the_path_route() {
+        let path = |prefix: &str| PathRoute {
+            prefix: prefix.into(),
+            host: Some(format!("{prefix}.host")),
+            url: None,
+        };
+        let route = Route {
+            host: "site.localhost".into(),
+            env_id: "e".into(),
+            namespace: "n".into(),
+            component: "site".into(),
+            state: "active",
+            upstream: None,
+            static_dir: None,
+            wake_timeout_seconds: 1,
+            paths: vec![path("/api"), path("/api/v2")],
+        };
+        let selected = |request: &str| select_path(&route, request).map(|p| p.prefix.as_str());
+        assert_eq!(selected("/api/v2/users"), Some("/api/v2"));
+        assert_eq!(selected("/api/v1"), Some("/api"));
+        assert_eq!(selected("/api?q=1"), Some("/api"));
     }
 }
