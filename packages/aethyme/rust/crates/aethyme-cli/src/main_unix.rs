@@ -58,6 +58,9 @@ impl<'a> ParsedCommand<'a> {
             // preflight, because that preflight is allowed to inspect broker
             // state and this gate runs an unpromoted tree-built binary.
             "broker" if tail.first().map(String::as_str) == Some("check-contract") => (None, None),
+            // Host-local health transport does not consume repository schemas
+            // and must not trigger upgrades or broker startup maintenance.
+            "broker" if tail.first().map(String::as_str) == Some("service") => (None, None),
             "broker" => (
                 Some(broker_command_capability(tail)),
                 Some(broker_invocation_surface(tail)),
@@ -1262,6 +1265,20 @@ mod compatibility_command_tests {
                 capability(args),
                 Some(expected),
                 "unexpected capability for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_transport_has_no_repository_compatibility_side_effects() {
+        for action in ["serve", "ping"] {
+            assert_eq!(
+                capability(&["broker", "advanced", "service", action, "/tmp/private"]),
+                None
+            );
+            assert_eq!(
+                surface(&["broker", "advanced", "service", action, "/tmp/private"]),
+                None
             );
         }
     }
