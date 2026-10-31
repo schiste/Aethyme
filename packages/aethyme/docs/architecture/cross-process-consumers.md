@@ -36,6 +36,76 @@ consumer. This file exists so that doesn't happen again.
    `scripts/eval/verify-playground.sh` against any deployed
    playground; it asserts a subset of the contracts below.
 
+## Opt-in broker service transport
+
+`aethyme broker advanced service serve <private-runtime-directory>` runs a
+foreground Unix health service. `service ping <private-runtime-directory>
+[--json]` emits the versioned JSON health response. No service is started
+implicitly and existing broker commands keep their direct execution path.
+Neither command opens or upgrades repository state. The directory is explicit,
+canonical and private to the current user. Frames are bounded to 65,536 bytes,
+versions and request IDs are checked, and unavailable endpoints fail visibly.
+The exact wire schema, permission rules and staged migration are documented in
+[broker-service.md](broker-service.md). Initial external consumers are manual
+operators; no installed hook, scheduled task or application is migrated yet.
+
+The `service::jobs::JobStore` library adds a separate explicitly opened
+SQLite job file (application ID `0x41534a31`, schema 1), durable idempotency keys,
+atomic deduplication and fenced job state transitions. It has no CLI or socket
+consumer in its foundation phase; plain serve/ping never open job storage.
+Its typed operation describes GC planning only. See the durable-store section
+in [broker-service.md](broker-service.md) for identities, state transitions,
+deadlines, cancellation, result bounds and restart limitations. The legacy
+broker database and its schema version are unchanged.
+
+The dependent opt-in worker adds `service serve <directory> --jobs-for <repository>`
+and `service submit`, `lookup`, `status`, `cancel` and `result`. Submit requires
+an explicit request key and absolute job deadline; optional flags select full
+scan and active gate-cache inspection. A private v2 JSON-line protocol accepts
+only typed GC planning, scoped to the server-verified repository UUID and
+filesystem identities. It provides durable lookup, shared outcomes and chunked
+results alongside health protocol v3. Submit/lookup/status/cancel print the v2
+Response envelope; result prints the assembled plan JSON. Exact shapes, null
+semantics, bounds, restart fencing and ambiguous-response handling are specified
+in [broker-service.md](broker-service.md). These are
+manual operator surfaces; existing scripts and automatic jobs are not migrated.
+
+The dependent identity phase adds `service repository <directory> [--json]`,
+the v2 `repository` method/reply, an optional top-level `repository_key` request
+string and the `repository_mismatch` error. Explicit null is refused; absent
+scope retains the legacy wire format. `transport::scoped_job_request` pins every
+operation to the verified service owner before dispatch. Identity fields and
+mixed-version refusal behavior are specified in [broker-service.md](broker-service.md).
+
+The dependent GC client phase adds `broker gc plan --service-directory <directory>
+--request-key <key> --deadline-ms <utc-ms>`. These three options are required
+together and are refused by other actions. This explicit path verifies the
+locally selected repository, pins all requests, and returns the existing plan
+JSON or human output. With none of these options, planning retains its direct
+path. Ambiguous outcomes
+never trigger a local fallback or an automatic retry; recovery and deadline
+semantics are specified in [broker-service.md](broker-service.md).
+
+The dependent discovery phase adds `service directory <private-service-root>
+--jobs-for <repository> [--json]`. Both output modes emit one object:
+`schema_version: 1`, `directory`, and the full `repository` identity (`key`,
+`repository_uuid`, `root`, `common_dir`). It resolves main and linked worktrees
+to one address under an existing caller-selected private root, refuses unsafe
+or overlong paths, and creates no directory, service or broker state. The
+shortened directory name is an address only; consumers must still verify the
+full repository identity before requests. Read-only discovery is specified in
+[broker-service.md](broker-service.md).
+
+The dependent startup phase adds `service ensure <private-service-root>
+--jobs-for <repository> [--json]`. Its JSON flattens the discovery object and
+adds `pid`, `version`, and `started`. Explicit ensure creates only the private
+leaf and service coordination files, serializes startup, and reuses only a
+version-compatible service with the complete verified repository identity.
+Failed owned children are stopped and reaped; existing incompatible endpoints
+are preserved. It submits no work and enables no default routing. Startup
+budgets, log behavior and lifecycle limits are specified in
+[broker-service.md](broker-service.md).
+
 ## Automatic checkout maintenance (v0.8.44)
 
 `AutoCleanupReport` adds optional `sessions_retired` and
