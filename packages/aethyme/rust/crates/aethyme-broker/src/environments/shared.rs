@@ -1322,6 +1322,7 @@ fn proxied_url(root: &Path, record: &EnvironmentRecord, proxy_port: u16) -> Opti
 #[cfg(test)]
 mod operation_key_tests {
     use super::{SharedSpec, declared_spec_for_owner, shared_operation_key};
+    use crate::environments::spec::RedeployOn;
 
     #[test]
     fn shared_operation_key_is_stable_and_scoped_by_repository_and_name() {
