@@ -2071,16 +2071,21 @@ fn cleanup_old_bundles(receipt: &InstallReceipt) -> Result<(), String> {
             .file_type()
             .map_err(|error| format!("inspect {}: {error}", entry.path().display()))?;
         if file_type.is_dir() && !file_type.is_symlink() && !keep.contains(&entry.file_name()) {
-            let bundle_name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| "managed runtime bundle name is not UTF-8".to_string())?;
-            match RuntimeBundlePin::try_acquire_exclusive(&receipt.managed_root, &bundle_name)
-                .map_err(|error| format!("check runtime pin for {bundle_name}: {error}"))?
+            let Ok(bundle_name) = entry.file_name().into_string() else {
+                // Unknown entries are preserved, not treated as an update failure.
+                continue;
+            };
+            match RuntimeBundlePin::try_acquire_exclusive_for_cleanup(
+                &receipt.managed_root,
+                &bundle_name,
+            )
+            .map_err(|error| format!("check runtime pin for {bundle_name}: {error}"))?
             {
-                RuntimeBundlePinAttempt::Busy => continue,
-                RuntimeBundlePinAttempt::Missing => {}
-                RuntimeBundlePinAttempt::Acquired(pin) => {
+                None | Some(RuntimeBundlePinAttempt::Busy) => {
+                    continue;
+                }
+                Some(RuntimeBundlePinAttempt::Missing) => {}
+                Some(RuntimeBundlePinAttempt::Acquired(pin)) => {
                     // The updater holds the exclusive installation lock here,
                     // so no resolver can create a new shared pin after this
                     // exclusive bundle claim is acquired.
@@ -3082,6 +3087,43 @@ mod tests {
                 .exists()
         );
         drop(updater);
+    }
+
+    #[test]
+    fn bootstrap_reclaims_staging_but_preserves_unknown_directory_names() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = fs::canonicalize(temp.path()).unwrap();
+        let install_dir = fixture.join("bin");
+        let target = current_release_target().unwrap();
+        bootstrap_install(
+            &fake_payload(&fixture, "0.2.0", true),
+            &install_dir,
+            &manifest_file(&fixture, "0.2.0"),
+            target,
+        )
+        .unwrap();
+        let versions = install_dir.join(".aethyme-managed/versions");
+        let staging = versions.join(".staging-old");
+        let unknown = versions.join("unknown directory");
+        let non_utf8 = versions.join(std::ffi::OsString::from_vec(vec![0xff]));
+        for path in [&staging, &unknown, &non_utf8] {
+            fs::create_dir(path).unwrap();
+            fs::write(path.join("retained-content"), b"content").unwrap();
+        }
+        let update = bootstrap_install(
+            &fake_payload(&fixture, "0.3.0", true),
+            &install_dir,
+            &manifest_file(&fixture, "0.3.0"),
+            target,
+        )
+        .unwrap();
+        assert!(update.active_bundle.is_dir());
+        assert!(!staging.exists());
+        for path in [&unknown, &non_utf8] {
+            assert_eq!(fs::read(path.join("retained-content")).unwrap(), b"content");
+        }
     }
 
     #[test]
