@@ -369,11 +369,12 @@ enum GuardedExecDispatchEvent {
 fn index_active_lease_paths_by_holder<'lease>(
     lease_paths: impl IntoIterator<Item = (i64, &'lease str)>,
 ) -> std::collections::HashMap<i64, Vec<&'lease str>> {
-    let mut paths_by_holder = std::collections::HashMap::new();
+    let mut paths_by_holder: std::collections::HashMap<i64, Vec<&'lease str>> =
+        std::collections::HashMap::new();
     for (holder_session_id, path) in lease_paths {
         paths_by_holder
             .entry(holder_session_id)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(path);
     }
     paths_by_holder
