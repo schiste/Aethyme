@@ -409,3 +409,88 @@ min_profile = "isolated"
     let (code, _) = fixture.json(&["env", "down", up["env_id"].as_str().unwrap()]);
     assert_eq!(code, 0);
 }
+
+/// #1293 acceptance: the host's `max_pin_seconds` refuses a longer pin.
+#[test]
+fn a_pin_longer_than_the_host_cap_is_refused() {
+    let fixture = Fixture::new(Some(ENVIRONMENTS));
+    std::fs::write(
+        fixture.state.path().join("environments.toml"),
+        "max_pin_seconds = 7200\n",
+    )
+    .unwrap();
+    let (code, refused) =
+        fixture.json(&["env", "pin", "e-none", "--for", "10800", "--reason", "demo"]);
+    assert_eq!(code, 2, "{refused}");
+    assert_eq!(refused["code"], "pin_too_long", "{refused}");
+    let (code, within) =
+        fixture.json(&["env", "pin", "e-none", "--for", "3600", "--reason", "demo"]);
+    assert_ne!(within["code"], "pin_too_long", "{within}");
+    assert_ne!(code, 0, "{within}");
+
+    std::fs::write(
+        fixture.state.path().join("environments.toml"),
+        "max_pin_seconds = 0\n",
+    )
+    .unwrap();
+    let (code, disabled) =
+        fixture.json(&["env", "pin", "e-none", "--for", "60", "--reason", "demo"]);
+    assert_eq!(code, 2, "{disabled}");
+    assert_eq!(disabled["code"], "pin_too_long", "{disabled}");
+
+    for (cap, seconds) in [(60, "60"), (86_400, "86400")] {
+        std::fs::write(
+            fixture.state.path().join("environments.toml"),
+            format!("max_pin_seconds = {cap}\n"),
+        )
+        .unwrap();
+        let (code, accepted_cap) =
+            fixture.json(&["env", "pin", "e-none", "--for", seconds, "--reason", "demo"]);
+        assert_ne!(accepted_cap["code"], "pin_too_long", "{accepted_cap}");
+        assert_ne!(
+            code, 2,
+            "the configured boundary itself is valid: {accepted_cap}"
+        );
+    }
+
+    std::fs::write(
+        fixture.state.path().join("environments.toml"),
+        "max_pin_seconds = 59\n",
+    )
+    .unwrap();
+    let (code, invalid_low) =
+        fixture.json(&["env", "pin", "e-none", "--for", "60", "--reason", "demo"]);
+    assert_eq!(code, 3, "{invalid_low}");
+    assert_eq!(invalid_low["code"], "invalid_host_setting", "{invalid_low}");
+
+    std::fs::write(
+        fixture.state.path().join("environments.toml"),
+        "max_pin_seconds = 86401\n",
+    )
+    .unwrap();
+    let (code, invalid) =
+        fixture.json(&["env", "pin", "e-none", "--for", "60", "--reason", "demo"]);
+    assert_eq!(code, 3, "{invalid}");
+    assert_eq!(invalid["code"], "invalid_host_setting", "{invalid}");
+
+    std::fs::write(
+        fixture.state.path().join("environments.toml"),
+        "max_pin_seconds = \"7200\"\n",
+    )
+    .unwrap();
+    let (code, malformed) =
+        fixture.json(&["env", "pin", "e-none", "--for", "60", "--reason", "demo"]);
+    assert_eq!(code, 3, "{malformed}");
+    assert_eq!(malformed["code"], "host_settings_invalid", "{malformed}");
+
+    let host_settings = fixture.state.path().join("environments.toml");
+    std::fs::remove_file(&host_settings).unwrap();
+    std::fs::create_dir(&host_settings).unwrap();
+    let (code, unreadable) =
+        fixture.json(&["env", "pin", "e-none", "--for", "60", "--reason", "demo"]);
+    assert_eq!(code, 1, "{unreadable}");
+    assert_eq!(
+        unreadable["code"], "host_settings_unreadable",
+        "{unreadable}"
+    );
+}

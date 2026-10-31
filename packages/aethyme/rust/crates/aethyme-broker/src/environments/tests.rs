@@ -372,6 +372,34 @@ fn every_rule_has_a_located_diagnostic() {
 }
 
 #[test]
+fn new_host_keep_awake_keys_require_upgrading_strict_old_readers_first() {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PreviousHostReader {
+        #[serde(default)]
+        pools: std::collections::BTreeMap<String, HostPoolSpec>,
+    }
+
+    let previous = toml::from_str::<PreviousHostReader>("").unwrap();
+    assert!(previous.pools.is_empty());
+    for setting in ["max_pin_seconds = 0\n", "max_exec_busy_seconds = 0\n"] {
+        assert!(
+            toml::from_str::<PreviousHostReader>(setting).is_err(),
+            "the strict pre-change reader rejects {setting:?}"
+        );
+        assert!(
+            toml::from_str::<HostEnvironmentsFile>(setting).is_ok(),
+            "the current reader accepts {setting:?}"
+        );
+    }
+    for seconds in [0, 1, i64::MAX as u64] {
+        let text = format!("max_exec_busy_seconds = {seconds}\n");
+        let host = toml::from_str::<HostEnvironmentsFile>(&text).unwrap();
+        assert_eq!(host.max_exec_busy_seconds, Some(seconds));
+    }
+}
+
+#[test]
 fn a_host_pool_takes_its_limit_from_host_settings_only() {
     let toml = "schema = 1\n[pools.shared]\nscope = \"host\"\n[[profiles]]\nname = \"a\"\nunits = 2\ncomponents = [{ name = \"x\", runtime = \"process\", start = \"x\" }]\n";
     let file = parse(toml);

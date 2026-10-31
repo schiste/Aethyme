@@ -130,6 +130,16 @@ pub fn load_host_file() -> std::io::Result<(String, Loaded<HostEnvironmentsFile>
     }
 }
 
+/// The host settings beside an environments root (`<host state>/
+/// environments` -> `<host state>/environments.toml`). Missing or unreadable
+/// is the default, which caps nothing: failing toward staying awake.
+pub fn host_file_beside(root: &Path) -> HostEnvironmentsFile {
+    root.parent()
+        .and_then(|directory| fs::read_to_string(directory.join(HOST_ENVIRONMENTS_FILE)).ok())
+        .and_then(|text| toml::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
 pub fn parse_loaded<T: serde::de::DeserializeOwned>(
     path: PathBuf,
     label: &str,
