@@ -573,6 +573,43 @@ fn parse_accepts_gc_plan_and_confirmed_apply() {
 }
 
 #[test]
+fn parse_accepts_exact_session_artifact_use_reconciliation() {
+    let plan = super::parse(&args(&[
+        "artifact-use",
+        "reconcile",
+        "plan",
+        "2469",
+        "--json",
+    ]))
+    .unwrap_or_else(|_| panic!("artifact-use reconciliation plan should parse"));
+    assert_eq!(
+        plan.positional,
+        vec!["artifact-use", "reconcile", "plan", "2469"]
+    );
+    assert!(plan.json);
+    super::validate_flags("gc", &plan).unwrap();
+
+    let apply = super::parse(&args(&[
+        "artifact-use",
+        "reconcile",
+        "apply",
+        "2470",
+        "--confirm",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ]))
+    .unwrap_or_else(|_| panic!("artifact-use reconciliation apply should parse"));
+    assert_eq!(
+        apply.positional,
+        vec!["artifact-use", "reconcile", "apply", "2470"]
+    );
+    super::validate_flags("gc", &apply).unwrap();
+    assert_eq!(
+        apply.confirm.as_deref(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
+}
+
+#[test]
 fn parse_accepts_checkpoint_recovery_confirmation() {
     let parsed = super::parse(&args(&[
         "checkpoint",
@@ -1762,4 +1799,33 @@ fn service_lifecycle_confirmation_and_flag_scope_precede_broker_discovery() {
         let parsed = super::parse(&args.map(str::to_owned)).unwrap();
         assert!(super::validate_flags("watch", &parsed).is_err());
     }
+}
+
+#[test]
+fn scheduled_gc_flags_require_specific_actions_and_confirmation_format() {
+    for action in ["install", "activate", "deactivate", "uninstall"] {
+        let parsed = super::parse(&strings(&[
+            "service",
+            action,
+            "--confirm",
+            &"a".repeat(64),
+            "--json",
+        ]))
+        .unwrap_or_else(|_| panic!("service confirmation parses"));
+        assert!(super::validate_flags("gc", &parsed).is_ok());
+        assert!(super::gc_storage::service_confirmation(&parsed).is_ok());
+    }
+    for action in ["plan", "status"] {
+        let parsed = super::parse(&strings(&["service", action, "--confirm", &"a".repeat(64)]))
+            .unwrap_or_else(|_| panic!("parse before action validation"));
+        assert!(super::validate_flags("gc", &parsed).is_err());
+    }
+    let parsed = super::parse(&strings(&[
+        "service",
+        "install",
+        "--confirm",
+        "not-a-digest",
+    ]))
+    .unwrap_or_else(|_| panic!("parse before digest validation"));
+    assert!(super::gc_storage::service_confirmation(&parsed).is_err());
 }

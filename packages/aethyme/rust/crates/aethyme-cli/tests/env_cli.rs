@@ -162,6 +162,37 @@ fn status_on_a_fresh_host_reports_nothing_and_an_absent_supervisor() {
     assert_eq!(value["code"], "not_found");
 }
 
+/// #1289: a profile with no components validates, is what an empty diff
+/// infers when it ranks lowest, and `env up` on it registers nothing.
+#[test]
+fn an_empty_profile_needs_no_environment() {
+    let environments = format!(
+        "schema = 1\n[[profiles]]\nname = \"none\"\n{}",
+        ENVIRONMENTS.trim_start_matches("\nschema = 1\n")
+    );
+    let fixture = Fixture::new(Some(&environments));
+    let (code, value) = fixture.json(&["env", "validate"]);
+    assert_eq!(code, 0, "{value}");
+    let (code, plan) = fixture.json(&["env", "plan", "--profile", "none"]);
+    assert_eq!(code, 0, "{plan}");
+    assert_eq!(plan["start_order"], serde_json::json!([]), "{plan}");
+    for args in [&["env", "up"][..], &["env", "up", "--profile", "none"][..]] {
+        let (code, up) = fixture.json(args);
+        assert_eq!(code, 0, "{up}");
+        assert_eq!(up["schema"], "aethyme.env-up/v1");
+        assert_eq!(up["nothing_needed"], true, "{up}");
+        assert_eq!(up["profile"], "none");
+        assert!(up.get("env_id").is_none(), "{up}");
+    }
+    let (code, status) = fixture.json(&["env", "status"]);
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(status["environments"], serde_json::json!([]));
+    assert_eq!(
+        status["supervisor"]["state"], "absent",
+        "an empty profile starts no supervisor"
+    );
+}
+
 /// #1222 acceptance: ten concurrent starters run exactly one supervisor, and
 /// it exits on its own once nothing needs it.
 #[test]
@@ -437,6 +468,145 @@ health = { command = "true", timeout_seconds = 10, interval_ms = 50 }
     let (code, status) = fixture.json(&["env", "status", &env_id]);
     assert_eq!(code, 0, "{status}");
     assert_eq!(status["urls"]["api"], url.as_str(), "{status}");
+    let (code, down) = fixture.json(&["env", "down", &env_id]);
+    assert_eq!(code, 0, "{down}");
+}
+
+/// #1239: `env budgets` reports declared budgets against what the
+/// orchestrator recorded: nothing before any run, then the cold up and the
+/// down it timed.
+#[test]
+fn budgets_report_recorded_timings_against_declared_budgets() {
+    let environments = r#"
+schema = 1
+[[profiles]]
+name = "backend"
+[[profiles.components]]
+name = "db"
+runtime = "hooks"
+provision = "true"
+destroy = "true"
+[budgets.seconds]
+"up.cold" = 600
+"up.backend" = 30
+down = 60
+[budgets.memory_mib]
+backend = 350
+"#;
+    let fixture = Fixture::new(Some(environments));
+    let (code, before) = fixture.json(&["env", "budgets"]);
+    assert_eq!(code, 0, "{before}");
+    assert_eq!(before["schema"], "aethyme.env-budgets/v1");
+    let status = |value: &serde_json::Value, metric: &str| {
+        value["metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["metric"] == metric)
+            .unwrap_or_else(|| panic!("{metric} missing: {value}"))
+            .clone()
+    };
+    assert_eq!(status(&before, "up.cold")["status"], "no-data");
+    assert_eq!(status(&before, "memory.backend")["status"], "no-data");
+
+    let (code, up) = fixture.json(&["env", "up", "--wait", "5"]);
+    assert_eq!(code, 0, "{up}");
+    let env_id = up["env_id"].as_str().unwrap().to_string();
+    let (code, down) = fixture.json(&["env", "down", &env_id]);
+    assert_eq!(code, 0, "{down}");
+
+    let (code, after) = fixture.json(&["env", "budgets"]);
+    assert_eq!(code, 0, "{after}");
+    let cold = status(&after, "up.cold");
+    assert_eq!(
+        (cold["count"].as_u64(), cold["status"].as_str()),
+        (Some(1), Some("ok")),
+        "{after}"
+    );
+    assert_eq!(status(&after, "down")["count"], 1, "{after}");
+    assert_eq!(
+        status(&after, "up.backend")["status"],
+        "no-data",
+        "no warm up yet"
+    );
+}
+
+/// #1295 through the router: `--component` selects an optional component,
+/// a later plain `env up` keeps it, and an unknown name is refused.
+#[test]
+fn a_selected_optional_component_stays_selected() {
+    let environments = r#"
+schema = 1
+[[profiles]]
+name = "backend"
+[[profiles.components]]
+name = "api"
+runtime = "process"
+listen = true
+start = "exec sleep 300"
+health = { command = "true", timeout_seconds = 10, interval_ms = 50 }
+[[profiles.components]]
+name = "web"
+runtime = "process"
+listen = true
+optional = true
+start = "exec sleep 300"
+health = { command = "true", timeout_seconds = 10, interval_ms = 50 }
+"#;
+    let fixture = Fixture::new(Some(environments));
+    let (code, refused) = fixture.json(&["env", "up", "--component", "nosuch"]);
+    assert_eq!(code, 2, "{refused}");
+    assert_eq!(refused["code"], "unknown_component");
+
+    let (code, up) = fixture.json(&["env", "up", "--wait", "5"]);
+    assert_eq!(code, 0, "{up}");
+    assert!(up["ports"].get("web").is_none(), "optional is off: {up}");
+    let env_id = up["env_id"].as_str().unwrap().to_string();
+
+    let (code, with) = fixture.json(&["env", "up", "--component", "web", "--wait", "5"]);
+    assert_eq!(code, 0, "{with}");
+    assert_eq!(with["env_id"], env_id.as_str(), "added in place");
+    assert!(with["ports"].get("web").is_some(), "{with}");
+
+    let (code, again) = fixture.json(&["env", "up", "--wait", "5"]);
+    assert_eq!(code, 0, "a plain up keeps the selection: {again}");
+    assert!(again["ports"].get("web").is_some(), "{again}");
+
+    let (code, down) = fixture.json(&["env", "down", &env_id]);
+    assert_eq!(code, 0, "{down}");
+}
+
+/// #1294 through the router: `env restart` replaces one component and
+/// reports it; a parked environment is refused with `not_active`.
+#[test]
+fn restart_through_the_cli_reports_the_component_and_refuses_parked() {
+    let environments = r#"
+schema = 1
+[[profiles]]
+name = "backend"
+[[profiles.components]]
+name = "api"
+runtime = "process"
+listen = true
+start = "exec sleep 300"
+health = { command = "true", timeout_seconds = 10, interval_ms = 50 }
+"#;
+    let fixture = Fixture::new(Some(environments));
+    let (code, up) = fixture.json(&["env", "up", "--wait", "5"]);
+    assert_eq!(code, 0, "{up}");
+    let env_id = up["env_id"].as_str().unwrap().to_string();
+    let (code, restarted) = fixture.json(&["env", "restart", &env_id, "api"]);
+    assert_eq!(code, 0, "{restarted}");
+    assert_eq!(restarted["schema"], "aethyme.env-restart/v1");
+    assert_eq!(restarted["restarted"], serde_json::json!(["api"]));
+    assert_eq!(restarted["phase"], "active");
+
+    let (code, parked) = fixture.json(&["env", "park", &env_id]);
+    assert_eq!(code, 0, "{parked}");
+    let (code, refused) = fixture.json(&["env", "restart", &env_id]);
+    assert_eq!(code, 3, "{refused}");
+    assert_eq!(refused["code"], "not_active");
+
     let (code, down) = fixture.json(&["env", "down", &env_id]);
     assert_eq!(code, 0, "{down}");
 }

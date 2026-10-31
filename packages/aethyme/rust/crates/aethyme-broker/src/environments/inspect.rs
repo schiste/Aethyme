@@ -365,6 +365,7 @@ pub(super) fn run_supervise(options: &Options) -> Result<Output, Failure> {
         watch: StoreWatch { store_path },
         proxy_started: false,
         last_sample: None,
+        shared_sync: None,
     };
     let reason = supervisor::run(&config, &mut work, &|| false)
         .map_err(|error| environment_failure(format!("supervisor: {error}")))?;

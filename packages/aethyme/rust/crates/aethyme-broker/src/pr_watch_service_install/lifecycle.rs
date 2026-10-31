@@ -1,11 +1,10 @@
 //! Explicit, exact-namespace launchd control. No provider polling or retries.
 use super::*;
+use crate::scheduled_service::launchd::Observation;
+#[cfg(target_os = "macos")]
+use crate::scheduled_service::launchd::launchctl;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-#[cfg(target_os = "macos")]
-use std::process::Command;
-#[cfg(target_os = "macos")]
-use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn hex(value: &str) -> bool {
@@ -15,7 +14,7 @@ fn hex(value: &str) -> bool {
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
-fn checked_file(path: &Path, uid: u32) -> io::Result<Vec<u8>> {
+pub(crate) fn checked_file(path: &Path, uid: u32) -> io::Result<Vec<u8>> {
     let (bytes, metadata) = existing(path, uid)?
         .ok_or_else(|| invalid("service file is missing; inspect installation first"))?;
     if metadata.nlink() != 1 {
@@ -25,7 +24,12 @@ fn checked_file(path: &Path, uid: u32) -> io::Result<Vec<u8>> {
 }
 
 // Read-only traversal: status and stop must never create an installation.
-fn check_directories(home: &Path, path: &Path, uid: u32, private: bool) -> io::Result<()> {
+pub(crate) fn check_directories(
+    home: &Path,
+    path: &Path,
+    uid: u32,
+    private: bool,
+) -> io::Result<()> {
     directory(home, uid, false)?;
     let mut current = home.to_path_buf();
     for part in path
@@ -105,28 +109,6 @@ fn load(home: &Path, uuid: &str) -> io::Result<(Plan, Vec<u8>, Value)> {
         return Err(invalid("installed service unit changed"));
     }
     Ok((plan, bytes, value))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Observation {
-    Success,
-    Refused,
-    Unknown,
-}
-
-#[cfg(target_os = "macos")]
-fn launchctl(args: &[String]) -> io::Result<Observation> {
-    use crate::bounded_output::{LimitedOutput, output_limited};
-    let output = output_limited(
-        Command::new("/bin/launchctl").args(args),
-        Duration::from_secs(10),
-        64 * 1024,
-    )?;
-    Ok(match output {
-        LimitedOutput::Completed(output) if output.status.success() => Observation::Success,
-        LimitedOutput::Completed(_) => Observation::Refused,
-        LimitedOutput::Deadline | LimitedOutput::OutputLimit => Observation::Unknown,
-    })
 }
 
 fn health(root: &Path, uid: u32, generation: Option<&str>, interval: u64, now_ms: u64) -> Value {

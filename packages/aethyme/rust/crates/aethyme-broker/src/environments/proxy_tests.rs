@@ -163,6 +163,7 @@ fn up(host: &Host, text: &str, worktree: &Path) -> (Lifecycle, String) {
             &UpOptions {
                 wait: Duration::from_secs(1),
                 reconfigure: false,
+                recreate: Vec::new(),
             },
         )
         .unwrap();
@@ -393,5 +394,178 @@ serve_dir = "dist"
         let refused = proxy.get(&site, escape);
         assert!(refused.starts_with("HTTP/1.1 404"), "{escape}: {refused}");
     }
+    // Without spa_fallback a client-side route is not a file.
+    let route = proxy.get(&site, "/o/settings");
+    assert!(route.starts_with("HTTP/1.1 404"), "{route}");
+    lifecycle.down(&id, None).unwrap();
+}
+
+/// #1291: with `spa_fallback`, a client-side route loads `index.html`; a
+/// missing asset (it has an extension) and an escape stay 404.
+#[test]
+fn a_single_page_app_falls_back_to_index_html() {
+    let host = Host::new();
+    let worktree = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(worktree.path().join("dist/assets")).unwrap();
+    std::fs::write(worktree.path().join("dist/index.html"), "<h1>app</h1>").unwrap();
+    std::fs::write(worktree.path().join("dist/health"), "healthy").unwrap();
+    std::fs::File::create(worktree.path().join("dist/oversized"))
+        .unwrap()
+        .set_len(128 * 1024 * 1024)
+        .unwrap();
+    std::fs::create_dir(worktree.path().join("outside")).unwrap();
+    std::fs::write(worktree.path().join("outside/private"), "outside").unwrap();
+    for (target, link) in [
+        ("outside/private", "dist/refused"),
+        ("outside", "dist/refused-parent"),
+        ("dist/absent-target", "dist/dangling"),
+    ] {
+        std::os::unix::fs::symlink(worktree.path().join(target), worktree.path().join(link))
+            .unwrap();
+    }
+    std::fs::write(worktree.path().join("dist/assets/app.js"), "console.log(1)").unwrap();
+    let text = r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "site"
+runtime = "static"
+serve_dir = "dist"
+spa_fallback = true
+"#;
+    let (mut lifecycle, id) = up(&host, text, worktree.path());
+    let namespace = lifecycle
+        .store
+        .get(&id)
+        .unwrap()
+        .unwrap()
+        .namespace
+        .unwrap();
+    let proxy = host.proxy();
+    let site = format!("site.{namespace}.localhost");
+    for route in ["/o/settings", "/o/settings?tab=2", "/deep/link/"] {
+        let page = proxy.get(&site, route);
+        assert!(
+            page.starts_with("HTTP/1.1 200") && page.ends_with("<h1>app</h1>"),
+            "{route}: {page}"
+        );
+        assert!(page.contains("text/html"), "{route}: {page}");
+    }
+    let script = proxy.get(&site, "/assets/app.js");
+    assert!(script.ends_with("console.log(1)"), "{script}");
+    let health = proxy.get(&site, "/health");
+    assert!(health.ends_with("healthy"), "{health}");
+    for missing in [
+        "/missing.js",
+        "/assets/gone.css",
+        "/../escape",
+        "/oversized",
+        "/refused",
+        "/refused-parent/missing-route",
+        "/dangling",
+    ] {
+        let refused = proxy.get(&site, missing);
+        assert!(refused.starts_with("HTTP/1.1 404"), "{missing}: {refused}");
+    }
+    lifecycle.down(&id, None).unwrap();
+}
+
+/// #1296 acceptance: one address serves a static app and forwards `/api` to
+/// the api component, waking it when parked; the prefix is kept, `/apix` is
+/// not under `/api`, and an `http://` target receives its own Host header.
+#[test]
+fn per_path_routes_share_one_address() {
+    if !python_available() {
+        eprintln!("SKIP per-path routes: python3 not available");
+        return;
+    }
+    // An external upstream that echoes the Host header it received.
+    let external = TcpListener::bind("127.0.0.1:0").unwrap();
+    let external_port = external.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in external.incoming().take(1) {
+            let mut stream = stream.unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut buffer = [0u8; 4096];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+            let host = request
+                .lines()
+                .find_map(|line| line.strip_prefix("Host: "))
+                .unwrap_or("none")
+                .to_string();
+            let line = request.lines().next().unwrap_or_default().to_string();
+            let body = format!("{line}|{host}");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    let host = Host::new();
+    let worktree = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(worktree.path().join("dist")).unwrap();
+    std::fs::write(worktree.path().join("dist/index.html"), "from-static").unwrap();
+    std::fs::create_dir_all(worktree.path().join("api")).unwrap();
+    std::fs::write(worktree.path().join("api/hello.txt"), "from-api").unwrap();
+    let text = format!(
+        r#"
+schema = 1
+[ports]
+start = 43250
+end = 43299
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "site"
+runtime = "static"
+serve_dir = "dist"
+paths = [{{ prefix = "/api", to = "api" }}, {{ prefix = "/ext", to = "http://127.0.0.1:{external_port}" }}]
+[[profiles.components]]
+name = "api"
+runtime = "process"
+listen = true
+route = true
+start = "exec python3 -m http.server --bind 127.0.0.1 $AETHYME_ENV_PORT_API"
+health = {{ http = "/", timeout_seconds = 20, interval_ms = 100 }}
+"#
+    );
+    let (mut lifecycle, id) = up(&host, &text, worktree.path());
+    let namespace = lifecycle
+        .store
+        .get(&id)
+        .unwrap()
+        .unwrap()
+        .namespace
+        .unwrap();
+    lifecycle.park(&id, "test").unwrap();
+    let proxy = host.proxy();
+    let site = format!("site.{namespace}.localhost");
+
+    let api = proxy.get(&site, "/api/hello.txt");
+    assert!(api.ends_with("from-api"), "the prefix is kept: {api}");
+    assert_eq!(
+        lifecycle.store.get(&id).unwrap().unwrap().phase,
+        EnvironmentPhase::Active,
+        "a parked path target wakes like a host route"
+    );
+    let index = proxy.get(&site, "/index.html");
+    assert!(index.ends_with("from-static"), "{index}");
+    let not_api = proxy.get(&site, "/apix");
+    assert!(
+        not_api.starts_with("HTTP/1.1 404"),
+        "/apix is not under /api: {not_api}"
+    );
+    let ext = proxy.get(&site, "/ext/x?y=1");
+    assert!(
+        ext.ends_with(&format!(
+            "GET /ext/x?y=1 HTTP/1.1|127.0.0.1:{external_port}"
+        )),
+        "{ext}"
+    );
     lifecycle.down(&id, None).unwrap();
 }

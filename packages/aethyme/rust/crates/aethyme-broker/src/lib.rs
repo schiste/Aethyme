@@ -174,6 +174,8 @@ pub use pr_monitoring::{
     activate as activate_pr_monitoring, active_sessions as pr_monitoring_sessions,
     deactivate as deactivate_pr_monitoring, is_active as pr_monitoring_is_active,
 };
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod gc_sweep_service;
 mod pr_projection;
 mod pr_watch;
 #[cfg(unix)]
@@ -195,6 +197,8 @@ pub mod renamed_targets;
 mod repo_watch;
 mod report;
 mod report_filing;
+#[cfg(unix)]
+mod scheduled_service;
 mod watch_tick_budget;
 pub use chau7_tabs::{
     Chau7DispatchAction, Chau7Resolution, Chau7ResolutionRefusal, Chau7Tab, Chau7TabReadiness,
@@ -675,10 +679,11 @@ pub use types::{
 pub use unpushed::{UnpublishedIntegrationWork, UnpushedSessionWork, UnpushedWorkReport};
 pub use update::{
     INSTALL_RECEIPT_FILENAME, INSTALL_RECEIPT_SCHEMA_VERSION, InstallReceipt, InstallationMethod,
-    InstallationProvenance, SignatureMode, UPDATE_PLAN_SCHEMA_VERSION, UpdateAction, UpdateArchive,
-    UpdateChannel, UpdateError, UpdateExecutionReport, UpdatePlan, bootstrap_install,
-    build_update_plan, current_release_target, detect_installation, execute_confirmed_update,
-    execute_confirmed_update_with, release_target_for, run_update_cli, sha256_bytes,
+    InstallationProvenance, ManagedRuntimeLaunch, SignatureMode, UPDATE_PLAN_SCHEMA_VERSION,
+    UpdateAction, UpdateArchive, UpdateChannel, UpdateError, UpdateExecutionReport, UpdatePlan,
+    bootstrap_install, build_update_plan, current_release_target, detect_installation,
+    execute_confirmed_update, execute_confirmed_update_with, pin_runtime_pair_for_build,
+    release_target_for, run_update_cli, sha256_bytes,
 };
 pub use verify_loop::{
     VerifyLoopCommandReport, VerifyLoopReport, VerifyLoopStep, VerifyLoopStepStatus,
