@@ -129,9 +129,14 @@ pub fn environment_variables(
     for (name, port) in &bindings.ports {
         let suffix = env_suffix(name);
         vars.insert(format!("AETHYME_ENV_PORT_{suffix}"), port.to_string());
+        let entry_path = environment
+            .components
+            .iter()
+            .find(|c| &c.name == name)
+            .and_then(|c| c.entry_path.as_deref());
         vars.insert(
             format!("AETHYME_ENV_URL_{suffix}"),
-            format!("http://127.0.0.1:{port}"),
+            super::compile::component_url(port, entry_path),
         );
     }
     for (name, receipt) in &bindings.receipts {
