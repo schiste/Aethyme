@@ -48,6 +48,25 @@ pub(crate) fn output_limited(
     budget: Duration,
     max_stream_bytes: usize,
 ) -> io::Result<LimitedOutput> {
+    #[cfg(any(unix, windows))]
+    {
+        capture_with_stdin(command, Stdio::null(), budget, max_stream_bytes)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        output_limited_fallback(command, budget, max_stream_bytes)
+    }
+}
+
+// Preserve the existing implementation on targets without a nonblocking pipe
+// probe. Supported Unix/Windows paths own their pipe handles in the caller and
+// leave no detached output readers after cancellation.
+#[cfg(not(any(unix, windows)))]
+fn output_limited_fallback(
+    command: &mut Command,
+    budget: Duration,
+    max_stream_bytes: usize,
+) -> io::Result<LimitedOutput> {
     let started = Instant::now();
     let deadline = started
         .checked_add(budget)
@@ -142,12 +161,21 @@ pub(crate) fn output_limited(
 
 /// Run one child with a finite file-backed stdin and bounded captured output.
 ///
-/// Unlike the reader-thread helpers above, this polls the owned pipe handles
-/// directly. That keeps a descendant which inherited a pipe from leaving a
-/// detached reader thread blocked after the deadline.
+/// Like the null-input capture on Unix/Windows, this polls owned pipe handles
+/// directly. A descendant holding a pipe cannot leave a detached output reader
+/// blocked after the deadline.
 pub(crate) fn output_with_input_limited(
     command: &mut Command,
     input: File,
+    budget: Duration,
+    max_stream_bytes: usize,
+) -> io::Result<LimitedOutput> {
+    capture_with_stdin(command, Stdio::from(input), budget, max_stream_bytes)
+}
+
+fn capture_with_stdin(
+    command: &mut Command,
+    input: Stdio,
     budget: Duration,
     max_stream_bytes: usize,
 ) -> io::Result<LimitedOutput> {
@@ -159,7 +187,7 @@ pub(crate) fn output_with_input_limited(
 
     let mut child = LimitedChild(
         command
-            .stdin(Stdio::from(input))
+            .stdin(input)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?,
@@ -1263,6 +1291,40 @@ mod tests {
             LimitedOutput::Deadline
         ));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_output_closes_pipes_still_inherited_by_a_descendant() {
+        let directory = tempfile::tempdir().unwrap();
+        let result_path = directory.path().join("pipe-result");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "(trap '' PIPE; sleep 0.2; if printf x 2>/dev/null; then printf open > \"$PIPE_RESULT\"; else printf closed > \"$PIPE_RESULT\"; fi) & wait",
+        ]);
+        command.env("PIPE_RESULT", &result_path);
+        assert!(matches!(
+            output_limited(&mut command, Duration::from_millis(80), 32).unwrap(),
+            LimitedOutput::Deadline
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::fs::read(&result_path) {
+                Ok(bytes) if !bytes.is_empty() => {
+                    assert_eq!(bytes, b"closed", "cancelled capture must close its readers");
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => panic!("read descendant result: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant did not report pipe state"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[cfg(unix)]
