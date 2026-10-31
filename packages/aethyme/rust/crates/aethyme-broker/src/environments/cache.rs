@@ -545,12 +545,11 @@ impl Lifecycle {
         // The journal is a file on disk: never let it name anything but a
         // build entry of this cache.
         let builds = self.cache_root().join(BUILDS);
-        if !path.starts_with(&builds)
-            || path.strip_prefix(&builds).map_or(true, |rest| {
-                rest.components().count() != 3
-                    || !rest.components().all(|c| matches!(c, Component::Normal(_)))
-            })
-        {
+        let confined = path.strip_prefix(&builds).is_ok_and(|rest| {
+            rest.components().count() == 3
+                && rest.components().all(|c| matches!(c, Component::Normal(_)))
+        });
+        if !confined {
             return Err(format!(
                 "{}: not an environment build cache entry",
                 candidate.path
