@@ -51,7 +51,7 @@ use sha2::{Digest, Sha256};
 
 use super::compile::CompiledComponent;
 use super::drivers::DriverContext;
-use super::exec::{DriverError, append_log, run_hook};
+use super::exec::{DriverError, append_log, run_hook, run_hook_in_directory_fd};
 use super::lifecycle::Lifecycle;
 use super::spec::Runtime;
 use super::store::EnvironmentStore;
@@ -112,6 +112,66 @@ fn planned_build_cache_lock(
             candidate.path
         )
     })
+}
+
+fn template_prune_identity(
+    entry: &crate::resources::cache_gc_fs::TemplateEntry,
+) -> Result<(String, String, TemplateMarker), String> {
+    const MAX_TEMPLATE_KEY_BYTES: usize = 4096;
+    let marker: TemplateMarker = serde_json::from_slice(&entry.bytes)
+        .map_err(|error| format!("template marker is invalid; retained: {error}"))?;
+    if marker.key.len() > MAX_TEMPLATE_KEY_BYTES
+        || marker.template_destroy.contains('\0')
+        || !valid_cache_env(&marker.env, &marker.pass_env)
+    {
+        return Err("template marker has invalid key, hook, or environment data; retained".into());
+    }
+    let encoded = marker
+        .key
+        .strip_prefix("aethyme-env-template:")
+        .ok_or_else(|| "template marker has no recognized cache key; retained".to_string())?;
+    let (identity, digest) = encoded.rsplit_once(':').ok_or_else(|| {
+        "template marker has no full digest in its cache key; retained".to_string()
+    })?;
+    let (repository, component) = identity
+        .rsplit_once(':')
+        .ok_or_else(|| "template marker has no repository and component; retained".to_string())?;
+    let template_id = digest.get(..16).ok_or_else(|| {
+        "template marker cache key has an invalid full digest; retained".to_string()
+    })?;
+    let lower_hex = |value: &str| {
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if repository.is_empty()
+        || component != entry.component
+        || !single_path_component(component)
+        || repository_dir(repository) != entry.repository
+        || digest.len() != 64
+        || !lower_hex(digest)
+        || marker.template_id != template_id
+        || marker.template_id.len() != 16
+        || !lower_hex(&marker.template_id)
+        || entry.marker_name != format!("{}.json", marker.template_id)
+        || entry.path.file_name().and_then(|name| name.to_str()) != Some(entry.marker_name.as_str())
+    {
+        return Err(
+            "template marker path or cache identity does not match its key; retained".into(),
+        );
+    }
+    Ok((repository.to_string(), marker.key.clone(), marker))
+}
+
+fn valid_cache_env(env: &BTreeMap<String, String>, pass_env: &[String]) -> bool {
+    let valid_name = |name: &str| {
+        let mut bytes = name.bytes();
+        matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    };
+    env.iter()
+        .all(|(name, value)| valid_name(name) && !value.contains('\0'))
+        && pass_env.iter().all(|name| valid_name(name))
 }
 
 /// Whether `path` names a subdirectory of the worktree: relative, non-empty,
@@ -662,60 +722,174 @@ impl Lifecycle {
         })
     }
 
-    /// Evict one entry under its key, re-checking under it that no live
-    /// environment uses it and that nobody used it since it was listed.
-    fn evict_entry(&mut self, entry: &CacheEntry) -> Result<(), String> {
-        let key = entry.key.clone().unwrap_or_else(|| {
-            let path = entry.path.to_string_lossy();
-            format!(
-                "aethyme-env-cache-path:{:x}",
-                Sha256::digest(path.as_bytes())
-            )
-        });
-        let outcome = self.exclusive("environment-cache", &key, PRUNE_WAIT, |this| {
-            let canonical_entry =
-                std::fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
-            match this.entries_in_use() {
-                Ok(in_use) if in_use.contains(&canonical_entry) => {
-                    return Err("in use".to_string());
-                }
-                Ok(_) => {}
-                Err(reason) => return Err(reason),
-            }
-            if entry.kind == "build" && last_used(&entry.path) != entry.last_used {
-                return Err("used since it was listed".to_string());
-            }
-            match entry.kind {
-                "template" => this.evict_template(&entry.path),
-                _ => std::fs::remove_dir_all(&entry.path).map_err(|e| e.to_string()),
-            }
-        });
-        outcome.unwrap_or_else(|| Err("being built or used right now".into()))
-    }
-
-    /// Evict unused entries: every unused one with `all`, else least recently
-    /// used builds until the cache is within its byte budget. Each eviction
-    /// takes the entry's key and re-checks use under it. Templates are
-    /// evicted only through their `template_destroy`; one whose destroy fails
-    /// is kept and reported.
+    /// Evict unused cache entries through descriptor-bound inventory and
+    /// deletion. Builds use the exact historical build lock; templates run
+    /// `template_destroy` only after their marker and containing directory
+    /// identities have been revalidated under the template lock.
     pub fn prune_cache(&mut self, all: bool) -> PruneReport {
         let mut report = PruneReport::default();
-        if let Err(reason) = self.entries_in_use() {
-            report.refused = Some(reason);
-            return report;
-        }
-        let budget = budget_bytes();
-        let everything = self.cache_entries();
-        let mut total: u64 = everything.iter().map(|e| e.bytes).sum();
-        let mut candidates: Vec<CacheEntry> =
-            everything.into_iter().filter(|e| !e.in_use).collect();
-        candidates.sort_by_key(|e| e.last_used.unwrap_or(0));
-        for entry in candidates {
-            if !all && (entry.kind == "template" || total <= budget) {
+        let inventory_deadline = cache_gc_deadline(None);
+        let inventory = match crate::resources::cache_gc_fs::inventory_for_prune(
+            &self.root,
+            inventory_deadline,
+            all,
+        ) {
+            Ok(Some(inventory)) => inventory,
+            Ok(None) => return report,
+            Err(error) => {
+                report.refused = Some(error.to_string());
+                return report;
+            }
+        };
+        let in_use = match entries_in_use_until(&self.store, &self.root, cache_gc_deadline(None)) {
+            Ok(entries) => entries,
+            Err(reason) => {
+                report.refused = Some(reason);
+                return report;
+            }
+        };
+
+        let cache_root = inventory.cache_root.clone();
+        let cache_identity = inventory.cache_identity;
+        let mut total = inventory.host_total_bytes;
+        let mut build_entries = inventory.builds;
+        build_entries.sort_by_key(|entry| entry.last_used_at_ms.unwrap_or(0));
+        let mut template_entries = inventory.templates;
+        template_entries.sort_by(|left, right| left.path.cmp(&right.path));
+
+        let mut valid_templates = Vec::new();
+        for entry in template_entries {
+            if in_use.contains(&entry.path) {
                 continue;
             }
-            match self.evict_entry(&entry) {
-                Ok(()) => {
+            match template_prune_identity(&entry) {
+                Ok((repository, key, marker)) => {
+                    valid_templates.push((entry, repository, key, marker));
+                }
+                Err(reason) => report.kept.push((entry.path, reason)),
+            }
+        }
+        let mut prune_log = if valid_templates.is_empty() {
+            None
+        } else {
+            match crate::resources::cache_gc_fs::open_prune_log(
+                &self.root,
+                &cache_root,
+                cache_identity,
+                super::logs::LOG_CAP_BYTES,
+            ) {
+                Ok(log) => Some(log),
+                Err(error) => {
+                    report.refused = Some(error.to_string());
+                    return report;
+                }
+            }
+        };
+
+        for (entry, repository, key, marker) in valid_templates {
+            let wait = PRUNE_WAIT;
+            let root = self.root.clone();
+            let cache_root_for_delete = cache_root.clone();
+            let expected_contents = entry.bytes.clone();
+            let marker_name = entry.marker_name.clone();
+            let repository_dir = entry.repository.clone();
+            let component = entry.component.clone();
+            let entry_path = entry.path.clone();
+            let parent_identity = entry.parent_identity;
+            let marker_identity = entry.identity;
+            let label = "template_destroy".to_string();
+            let hook_timeout = self.hook_timeout;
+            let outcome = self.exclusive(&repository, &key, wait, |this| {
+                let latest_use =
+                    entries_in_use_until(&this.store, &this.root, cache_gc_deadline(None))?;
+                if latest_use.contains(&entry_path) {
+                    return Err("in use".to_string());
+                }
+                let log = prune_log
+                    .as_mut()
+                    .ok_or_else(|| "secure prune log is unavailable".to_string())?;
+                let marker_for_hook = marker.clone();
+                crate::resources::cache_gc_fs::remove_template_marker(
+                    &root,
+                    &cache_root_for_delete,
+                    cache_identity,
+                    &repository_dir,
+                    &component,
+                    &marker_name,
+                    parent_identity,
+                    marker_identity,
+                    &expected_contents,
+                    move |directory_fd, _contents| {
+                        let mut vars = marker_for_hook.env.clone();
+                        vars.insert(
+                            TEMPLATE_ID_VARIABLE.into(),
+                            marker_for_hook.template_id.clone(),
+                        );
+                        run_hook_in_directory_fd(
+                            &label,
+                            &marker_for_hook.template_destroy,
+                            directory_fd,
+                            &marker_for_hook.pass_env,
+                            &vars,
+                            log,
+                            hook_timeout,
+                        )
+                        .map(|_| ())
+                        .map_err(|error| format!("template_destroy failed: {error}"))
+                    },
+                    None,
+                )
+                .map(|outcome| {
+                    matches!(
+                        outcome,
+                        crate::resources::cache_gc_fs::DeleteOutcome::Removed
+                    )
+                })
+                .map_err(|error| error.to_string())
+            });
+            match outcome.unwrap_or_else(|| Err("being built or used right now".into())) {
+                Ok(true) => report.evicted.push(entry.path),
+                Ok(false) => report.evicted.push(entry.path),
+                Err(reason) => report.kept.push((entry.path, reason)),
+            }
+        }
+
+        let budget = budget_bytes();
+        for entry in build_entries {
+            if !all && total <= budget {
+                break;
+            }
+            if in_use.contains(&entry.path) {
+                continue;
+            }
+            let candidate = crate::GcEnvironmentCacheCandidate {
+                path: entry.path.to_string_lossy().into_owned(),
+                repository: entry.repository.clone(),
+                component: entry.component.clone(),
+                digest: entry.digest.clone(),
+                cache_root: cache_root.to_string_lossy().into_owned(),
+                cache_root_device: cache_identity.device,
+                cache_root_inode: cache_identity.inode,
+                entry_device: entry.identity.device,
+                entry_inode: entry.identity.inode,
+                cache_key: entry.key.clone(),
+                deletion_started: false,
+                estimated_bytes: entry.bytes,
+                estimated_inodes: Some(entry.inodes),
+                last_used_at_ms: entry.last_used_at_ms,
+                reason: "unused build selected by environment cache prune".into(),
+            };
+            if candidate.coordinated_build_lock().is_none() {
+                let reason = if candidate.cache_key.is_none() {
+                    "build has no recorded shared cache lock; retained"
+                } else {
+                    "build's recorded cache lock does not match its path; retained"
+                };
+                report.kept.push((entry.path, reason.into()));
+                continue;
+            }
+            match self.evict_planned_build_with(&candidate, None, || Ok(())) {
+                Ok(_) => {
                     total = total.saturating_sub(entry.bytes);
                     report.evicted.push(entry.path);
                 }
@@ -723,29 +897,6 @@ impl Lifecycle {
             }
         }
         report
-    }
-
-    fn evict_template(&self, marker: &Path) -> Result<(), String> {
-        let record: TemplateMarker = std::fs::read(marker)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .ok_or("unreadable template marker")?;
-        let directory = marker
-            .parent()
-            .ok_or("template marker without a directory")?;
-        let mut vars = record.env.clone();
-        vars.insert(TEMPLATE_ID_VARIABLE.into(), record.template_id.clone());
-        run_hook(
-            "template_destroy",
-            &record.template_destroy,
-            directory,
-            &record.pass_env,
-            &vars,
-            &self.cache_root().join("prune.log"),
-            self.hook_timeout,
-        )
-        .map_err(|error| format!("template_destroy failed: {error}"))?;
-        std::fs::remove_file(marker).map_err(|e| e.to_string())
     }
 }
 

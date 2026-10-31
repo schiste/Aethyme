@@ -182,6 +182,7 @@ destroy = "true"
 
 /// #1219 acceptance: several environments provisioning on a new schema
 /// digest run `template` exactly once, and each provision gets its id.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn concurrent_provisions_share_one_template() {
     let host = tempfile::tempdir().unwrap();
@@ -239,6 +240,7 @@ fn concurrent_provisions_share_one_template() {
     assert!(lifecycle.cache_entries().is_empty());
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_template_whose_destroy_fails_is_kept_and_reported() {
     let host = tempfile::tempdir().unwrap();
@@ -271,6 +273,117 @@ destroy = "true"
         1,
         "never dropped without its destroy"
     );
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn interactive_prune_refuses_unsupported_platform_without_deleting_entries() {
+    let host = tempfile::tempdir().unwrap();
+    let mut lifecycle = lifecycle(host.path());
+    let sentinel = lifecycle
+        .cache_root()
+        .join(super::cache::BUILDS)
+        .join("repo-cache")
+        .join("site")
+        .join("0123456789abcdef")
+        .join("output/index.html");
+    std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+    std::fs::write(&sentinel, b"keep").unwrap();
+
+    let report = lifecycle.prune_cache(true);
+
+    assert!(
+        report
+            .refused
+            .as_deref()
+            .is_some_and(|reason| reason.contains("supported only on macOS and Linux")),
+        "unsupported prune must give an actionable refusal: {report:?}"
+    );
+    assert!(report.evicted.is_empty(), "{report:?}");
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"keep");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn prune_all_refuses_incomplete_template_inventory_before_removing_builds() {
+    let host = tempfile::tempdir().unwrap();
+    let mut lifecycle = lifecycle(host.path());
+    let cache = lifecycle.cache_root();
+    let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let build = cache
+        .join(super::cache::BUILDS)
+        .join("repo-cache")
+        .join("site")
+        .join(&digest[..16]);
+    std::fs::create_dir_all(build.join("output")).unwrap();
+    std::fs::write(
+        build.join(super::cache::KEY_FILE),
+        format!("aethyme-env-build:repo-cache:site:{digest}"),
+    )
+    .unwrap();
+    std::fs::write(build.join(super::cache::COMPLETE), b"").unwrap();
+    std::fs::write(build.join("output/index.html"), b"cached").unwrap();
+
+    let template_dir = cache
+        .join(super::cache::TEMPLATES)
+        .join("repo-cache")
+        .join("database");
+    std::fs::create_dir_all(&template_dir).unwrap();
+    let outside = host.path().join("outside-marker.json");
+    std::fs::write(&outside, b"leave this file alone").unwrap();
+    std::os::unix::fs::symlink(&outside, template_dir.join("1234567890abcdef.json")).unwrap();
+
+    let report = lifecycle.prune_cache(true);
+
+    assert!(report.refused.is_some(), "{report:?}");
+    assert!(report.evicted.is_empty(), "{report:?}");
+    assert!(build.join("output/index.html").exists());
+    assert_eq!(std::fs::read(outside).unwrap(), b"leave this file alone");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn ordinary_prune_does_not_inspect_template_markers() {
+    let host = tempfile::tempdir().unwrap();
+    let mut lifecycle = lifecycle(host.path());
+    let template_dir = lifecycle
+        .cache_root()
+        .join(super::cache::TEMPLATES)
+        .join("repo-cache")
+        .join("database");
+    std::fs::create_dir_all(&template_dir).unwrap();
+    let outside = host.path().join("outside-marker.json");
+    std::fs::write(&outside, b"keep").unwrap();
+    std::os::unix::fs::symlink(&outside, template_dir.join("bad.json")).unwrap();
+
+    let report = lifecycle.prune_cache(false);
+
+    assert!(report.refused.is_none(), "{report:?}");
+    assert!(report.evicted.is_empty(), "{report:?}");
+    assert_eq!(std::fs::read(outside).unwrap(), b"keep");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn prune_retains_a_build_without_its_exact_historical_lock_key() {
+    let host = tempfile::tempdir().unwrap();
+    let mut lifecycle = lifecycle(host.path());
+    let build = lifecycle
+        .cache_root()
+        .join(super::cache::BUILDS)
+        .join("repo-cache")
+        .join("site")
+        .join("0123456789abcdef");
+    std::fs::create_dir_all(build.join("output")).unwrap();
+    std::fs::write(build.join(super::cache::COMPLETE), b"").unwrap();
+    std::fs::write(build.join("output/index.html"), b"cached").unwrap();
+
+    let report = lifecycle.prune_cache(true);
+
+    assert!(report.evicted.is_empty(), "{report:?}");
+    assert_eq!(report.kept.len(), 1, "{report:?}");
+    assert!(report.kept[0].1.contains("no recorded shared cache lock"));
+    assert!(build.join("output/index.html").exists());
 }
 
 fn validation(text: &str) -> Vec<&'static str> {
@@ -360,6 +473,7 @@ fn a_deleted_tracked_input_rebuilds() {
 
 /// Eviction works after the creating worktree is gone, with the component's
 /// own variables.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_template_is_destroyed_after_its_worktree_is_gone() {
     let host = tempfile::tempdir().unwrap();
@@ -373,7 +487,7 @@ name = "p"
 name = "db"
 runtime = "hooks"
 template = "true"
-template_destroy = 'echo "$DB_SERVER $AETHYME_ENV_TEMPLATE_ID" >> "{destroys}"'
+template_destroy = 'printf "%s\n%s\n%s\n" "$DB_SERVER" "$AETHYME_ENV_TEMPLATE_ID" "$PWD" >> "{destroys}"'
 template_inputs = ["db/**"]
 provision = "true"
 destroy = "true"
@@ -388,15 +502,31 @@ env = {{ DB_SERVER = "pg-test" }}
     drop(tree);
     let report = lifecycle.prune_cache(true);
     assert_eq!(report.evicted.len(), 1, "{report:?}");
+    let output = std::fs::read_to_string(&destroys).unwrap();
+    let mut lines = output.lines();
+    assert_eq!(lines.next(), Some("pg-test"), "destroy got component env");
     assert!(
-        std::fs::read_to_string(&destroys)
-            .unwrap()
-            .starts_with("pg-test "),
-        "destroy got the component env"
+        lines.next().is_some_and(|id| id.len() == 16),
+        "destroy got the template id: {output}"
+    );
+    let cwd = std::fs::canonicalize(lifecycle.cache_root())
+        .unwrap()
+        .join(super::cache::TEMPLATES)
+        .join("repo-cache")
+        .join("db");
+    let hook_cwd = Path::new(
+        lines
+            .next()
+            .expect("destroy recorded its working directory"),
+    );
+    assert!(
+        hook_cwd.starts_with(cwd),
+        "destroy ran from its pinned template directory: {hook_cwd:?}"
     );
 }
 
 /// When prune cannot tell what a live environment uses, it evicts nothing.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn prune_evicts_nothing_when_live_use_is_unknown() {
     let host = tempfile::tempdir().unwrap();
