@@ -529,4 +529,30 @@ mod tests {
         let ambiguous_refs = group(&["baseline@refs/heads/feature", "baseline@refs/heads/other"]);
         assert!(ambiguous_refs.default_owner().is_err());
     }
+
+    /// #1296: the longest matching prefix wins, whatever the declared
+    /// order. (Segment boundaries: `per_path_routes_share_one_address`.)
+    #[test]
+    fn the_longest_matching_prefix_selects_the_path_route() {
+        let path = |prefix: &str| PathRoute {
+            prefix: prefix.into(),
+            host: Some(format!("{prefix}.host")),
+            url: None,
+        };
+        let route = Route {
+            host: "site.localhost".into(),
+            env_id: "e".into(),
+            namespace: "n".into(),
+            component: "site".into(),
+            state: "active",
+            upstream: None,
+            static_dir: None,
+            wake_timeout_seconds: 1,
+            paths: vec![path("/api"), path("/api/v2")],
+        };
+        let selected = |request: &str| select_path(&route, request).map(|p| p.prefix.as_str());
+        assert_eq!(selected("/api/v2/users"), Some("/api/v2"));
+        assert_eq!(selected("/api/v1"), Some("/api"));
+        assert_eq!(selected("/api?q=1"), Some("/api"));
+    }
 }
