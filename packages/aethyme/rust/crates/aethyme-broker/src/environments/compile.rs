@@ -158,6 +158,12 @@ pub struct CompiledComponent {
     pub container_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub serve_dir: Option<String>,
+    // Omitted when false so existing snapshots keep their digest.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spa_fallback: bool,
+    // Omitted when unset so existing snapshots keep their digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_path: Option<String>,
     pub cache_inputs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_output: Option<String>,
@@ -323,6 +329,8 @@ fn compile_component(file: &EnvironmentsFile, component: &ComponentSpec) -> Comp
         args: component.args.clone(),
         container_port: component.container_port,
         serve_dir: component.serve_dir.clone(),
+        spa_fallback: component.spa_fallback,
+        entry_path: component.entry_path.clone(),
         cache_inputs: component.cache_inputs.clone(),
         build_output: component.build_output.clone(),
         cache_env: component.cache_env.clone(),
@@ -455,4 +463,9 @@ impl CompiledEnvironment {
         names.dedup();
         names
     }
+}
+
+/// A listening component's URL: loopback, its port, then its `entry_path`.
+pub fn component_url(port: impl std::fmt::Display, entry_path: Option<&str>) -> String {
+    format!("http://127.0.0.1:{port}{}", entry_path.unwrap_or(""))
 }

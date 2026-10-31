@@ -217,6 +217,46 @@ fn every_rule_has_a_located_diagnostic() {
             field: "serve_dir",
         },
         Case {
+            name: "spa fallback outside static",
+            toml: profile("{ name = \"a\", runtime = \"process\", start = \"x\", spa_fallback = true }"),
+            code: "field_not_supported",
+            profile: Some("p"),
+            component: Some("a"),
+            field: "spa_fallback",
+        },
+        Case {
+            name: "entry path without a listener",
+            toml: profile("{ name = \"a\", runtime = \"process\", start = \"x\", entry_path = \"/o/\" }"),
+            code: "field_not_supported",
+            profile: Some("p"),
+            component: Some("a"),
+            field: "entry_path",
+        },
+        Case {
+            name: "entry path on a static component",
+            toml: profile("{ name = \"a\", runtime = \"static\", serve_dir = \"dist\", entry_path = \"/o/\" }"),
+            code: "field_not_supported",
+            profile: Some("p"),
+            component: Some("a"),
+            field: "entry_path",
+        },
+        Case {
+            name: "entry path on a hooks component",
+            toml: profile("{ name = \"a\", runtime = \"hooks\", provision = \"x\", destroy = \"x\", entry_path = \"/o/\" }"),
+            code: "field_not_supported",
+            profile: Some("p"),
+            component: Some("a"),
+            field: "entry_path",
+        },
+        Case {
+            name: "entry path without a leading slash",
+            toml: profile("{ name = \"a\", runtime = \"process\", start = \"x\", entry_path = \"o/\" }"),
+            code: "invalid_path",
+            profile: Some("p"),
+            component: Some("a"),
+            field: "entry_path",
+        },
+        Case {
             name: "process without start",
             toml: profile("{ name = \"a\", runtime = \"process\" }"),
             code: "missing_field",
@@ -329,6 +369,14 @@ fn every_rule_has_a_located_diagnostic() {
             field: "rules.r.min_profile",
         },
         Case {
+            name: "invalid exclude glob",
+            toml: "schema = 1\n[[profiles]]\nname = \"a\"\ncomponents = [{ name = \"x\", runtime = \"process\", start = \"x\" }]\n[[rules]]\nname = \"r\"\npaths = [\"x/**\"]\nexclude = [\"x/[\"]\nmin_profile = \"a\"\n".into(),
+            code: "invalid_glob",
+            profile: None,
+            component: None,
+            field: "rules.r.exclude",
+        },
+        Case {
             name: "uses unknown shared",
             toml: "schema = 1\n[[profiles]]\nname = \"a\"\nuses_shared = [\"base\"]\ncomponents = [{ name = \"x\", runtime = \"process\", start = \"x\" }]\n".into(),
             code: "unknown_shared",
@@ -368,6 +416,34 @@ fn every_rule_has_a_located_diagnostic() {
             "{}: every diagnostic says how to fix it",
             case.name
         );
+    }
+}
+
+#[test]
+fn new_host_keep_awake_keys_require_upgrading_strict_old_readers_first() {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PreviousHostReader {
+        #[serde(default)]
+        pools: std::collections::BTreeMap<String, HostPoolSpec>,
+    }
+
+    let previous = toml::from_str::<PreviousHostReader>("").unwrap();
+    assert!(previous.pools.is_empty());
+    for setting in ["max_pin_seconds = 0\n", "max_exec_busy_seconds = 0\n"] {
+        assert!(
+            toml::from_str::<PreviousHostReader>(setting).is_err(),
+            "the strict pre-change reader rejects {setting:?}"
+        );
+        assert!(
+            toml::from_str::<HostEnvironmentsFile>(setting).is_ok(),
+            "the current reader accepts {setting:?}"
+        );
+    }
+    for seconds in [0, 1, i64::MAX as u64] {
+        let text = format!("max_exec_busy_seconds = {seconds}\n");
+        let host = toml::from_str::<HostEnvironmentsFile>(&text).unwrap();
+        assert_eq!(host.max_exec_busy_seconds, Some(seconds));
     }
 }
 
@@ -615,4 +691,27 @@ fn variables_name_every_port_and_receipt_and_nothing_inherited() {
         !names.iter().any(|n| n == "AETHYME_ENV_PORT_DB"),
         "db does not listen"
     );
+}
+
+/// #1292: a component's `entry_path` is appended to its URL variable, and
+/// only to its own.
+#[test]
+fn an_entry_path_is_appended_to_the_component_url() {
+    let file =
+        parse(&PYTHON_SQLITE.replace("listen = true\n", "listen = true\nentry_path = \"/o/\"\n"));
+    let compiled = compile(
+        &file,
+        &HostEnvironmentsFile::default(),
+        "backend",
+        "env.toml",
+        &context(),
+    )
+    .unwrap();
+    let bindings = super::exec::Bindings {
+        ports: [("api".to_string(), 4000)].into(),
+        ..Default::default()
+    };
+    let vars = super::exec::environment_variables(&compiled, &compiled.components[0], &bindings, 1);
+    assert_eq!(vars["AETHYME_ENV_URL_API"], "http://127.0.0.1:4000/o/");
+    assert_eq!(vars["AETHYME_ENV_PORT_API"], "4000");
 }

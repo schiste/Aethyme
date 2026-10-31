@@ -393,5 +393,79 @@ serve_dir = "dist"
         let refused = proxy.get(&site, escape);
         assert!(refused.starts_with("HTTP/1.1 404"), "{escape}: {refused}");
     }
+    // Without spa_fallback a client-side route is not a file.
+    let route = proxy.get(&site, "/o/settings");
+    assert!(route.starts_with("HTTP/1.1 404"), "{route}");
+    lifecycle.down(&id, None).unwrap();
+}
+
+/// #1291: with `spa_fallback`, a client-side route loads `index.html`; a
+/// missing asset (it has an extension) and an escape stay 404.
+#[test]
+fn a_single_page_app_falls_back_to_index_html() {
+    let host = Host::new();
+    let worktree = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(worktree.path().join("dist/assets")).unwrap();
+    std::fs::write(worktree.path().join("dist/index.html"), "<h1>app</h1>").unwrap();
+    std::fs::write(worktree.path().join("dist/health"), "healthy").unwrap();
+    std::fs::File::create(worktree.path().join("dist/oversized"))
+        .unwrap()
+        .set_len(128 * 1024 * 1024)
+        .unwrap();
+    std::fs::create_dir(worktree.path().join("outside")).unwrap();
+    std::fs::write(worktree.path().join("outside/private"), "outside").unwrap();
+    for (target, link) in [
+        ("outside/private", "dist/refused"),
+        ("outside", "dist/refused-parent"),
+        ("dist/absent-target", "dist/dangling"),
+    ] {
+        std::os::unix::fs::symlink(worktree.path().join(target), worktree.path().join(link))
+            .unwrap();
+    }
+    std::fs::write(worktree.path().join("dist/assets/app.js"), "console.log(1)").unwrap();
+    let text = r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "site"
+runtime = "static"
+serve_dir = "dist"
+spa_fallback = true
+"#;
+    let (mut lifecycle, id) = up(&host, text, worktree.path());
+    let namespace = lifecycle
+        .store
+        .get(&id)
+        .unwrap()
+        .unwrap()
+        .namespace
+        .unwrap();
+    let proxy = host.proxy();
+    let site = format!("site.{namespace}.localhost");
+    for route in ["/o/settings", "/o/settings?tab=2", "/deep/link/"] {
+        let page = proxy.get(&site, route);
+        assert!(
+            page.starts_with("HTTP/1.1 200") && page.ends_with("<h1>app</h1>"),
+            "{route}: {page}"
+        );
+        assert!(page.contains("text/html"), "{route}: {page}");
+    }
+    let script = proxy.get(&site, "/assets/app.js");
+    assert!(script.ends_with("console.log(1)"), "{script}");
+    let health = proxy.get(&site, "/health");
+    assert!(health.ends_with("healthy"), "{health}");
+    for missing in [
+        "/missing.js",
+        "/assets/gone.css",
+        "/../escape",
+        "/oversized",
+        "/refused",
+        "/refused-parent/missing-route",
+        "/dangling",
+    ] {
+        let refused = proxy.get(&site, missing);
+        assert!(refused.starts_with("HTTP/1.1 404"), "{missing}: {refused}");
+    }
     lifecycle.down(&id, None).unwrap();
 }

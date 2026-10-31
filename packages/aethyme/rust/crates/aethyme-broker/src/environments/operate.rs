@@ -81,6 +81,7 @@ fn open(actor: &str, ensure_supervisor: bool) -> Result<(Lifecycle, Option<Strin
 
 fn describe(lifecycle: &Lifecycle, record: &EnvironmentRecord) -> (Value, String) {
     let grant = read_grant(&lifecycle.root, &record.env_id, RESERVATION_GRANT);
+    let urls = super::lifecycle::component_urls(&lifecycle.root, record);
     let mut ports = serde_json::Map::new();
     let mut variables = serde_json::Map::new();
     if let Some(grant) = &grant {
@@ -92,10 +93,9 @@ fn describe(lifecycle: &Lifecycle, record: &EnvironmentRecord) -> (Value, String
                     format!("AETHYME_ENV_PORT_{suffix}"),
                     json!(allocation.value),
                 );
-                variables.insert(
-                    format!("AETHYME_ENV_URL_{suffix}"),
-                    json!(format!("http://127.0.0.1:{}", allocation.value)),
-                );
+                if let Some(url) = urls.get(component) {
+                    variables.insert(format!("AETHYME_ENV_URL_{suffix}"), json!(url));
+                }
             }
         }
     }
@@ -109,11 +109,8 @@ fn describe(lifecycle: &Lifecycle, record: &EnvironmentRecord) -> (Value, String
         record.profile,
         record.phase.as_str()
     );
-    for (component, port) in &ports {
-        text.push_str(&format!(
-            "  {component}: http://127.0.0.1:{}\n",
-            port.as_str().unwrap_or_default()
-        ));
+    for (component, url) in &urls {
+        text.push_str(&format!("  {component}: {url}\n"));
     }
     let value = json!({
         "env_id": record.env_id,
@@ -124,6 +121,7 @@ fn describe(lifecycle: &Lifecycle, record: &EnvironmentRecord) -> (Value, String
         "units_to_wake": record.snapshot.units,
         "pool": record.snapshot.pool.as_ref().map(|pool| json!({"name": pool.name, "limit": pool.limit})),
         "ports": ports,
+        "urls": urls,
         "variables": variables,
         "last_error": record.last_error,
     });
@@ -150,15 +148,27 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
     let (base, changed) =
         super::infer::changed_paths(&workspace.worktree_root).map_err(environment_failure)?;
     let inference = super::infer::infer(file, &changed).map_err(environment_failure)?;
-    let (mut lifecycle, warning) = open("env up", true)?;
     let mut profile = choose_profile(file, &inference, options)?;
+    let empty = |name: &str| {
+        file.profiles
+            .iter()
+            .any(|p| p.name == name && p.components.is_empty())
+    };
+    // An empty profile needs no supervisor: nothing will be registered.
+    let (mut lifecycle, mut warning) = open("env up", !empty(&profile))?;
     if options.profile.is_none()
         && let Some(higher) =
             existing_at_or_above(&lifecycle, &workspace.worktree_root, file, &inference)?
     {
         // Reuse a deliberately higher environment rather than start a second,
         // cheaper one beside it.
+        if empty(&profile) && !empty(&higher) {
+            (lifecycle, warning) = open("env up", true)?;
+        }
         profile = higher;
+    }
+    if empty(&profile) {
+        return Ok(nothing_needed(&profile, base.as_deref(), &inference));
     }
     let context = compile_context(&workspace, &checked.digest);
     let snapshot =
@@ -243,6 +253,27 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
     }
     value["schema"] = json!(UP_SCHEMA);
     Ok((value, text, exit_status::SUCCESS))
+}
+
+/// `env up` on a profile with no components (#1289): nothing is registered,
+/// reserved or started.
+fn nothing_needed(
+    profile: &str,
+    base: Option<&str>,
+    inference: &super::infer::Inference,
+) -> Output {
+    let value = json!({
+        "schema": UP_SCHEMA,
+        "nothing_needed": true,
+        "profile": profile,
+        "inference": {
+            "base": base,
+            "minimum": inference.minimum,
+            "fired": inference.fired,
+        },
+    });
+    let text = format!("no environment needed (profile {profile} has no components)\n");
+    (value, text, exit_status::SUCCESS)
 }
 
 fn required_id(options: &Options) -> Result<String, Failure> {
@@ -338,6 +369,43 @@ pub(super) fn run_pin(options: &Options) -> Result<Output, Failure> {
             exit: exit_status::USAGE,
         });
     };
+    // The host may cap pins below the 24 h ceiling (#1293).
+    let (_, host) = super::load_host_file().map_err(|error| Failure {
+        code: "host_settings_unreadable",
+        message: format!("host settings: {error}"),
+        next_action: "make the host environments.toml readable, then retry the pin".into(),
+        exit: exit_status::ENVIRONMENT,
+    })?;
+    let host = host.value.map_err(|diagnostic| Failure {
+        code: "host_settings_invalid",
+        message: diagnostic.render(),
+        next_action: "correct the host environments.toml before requesting a pin".into(),
+        exit: exit_status::REFUSED,
+    })?;
+    let cap = host
+        .max_pin_seconds
+        .unwrap_or(super::activity::MAX_PIN.as_secs());
+    let max_pin = super::activity::MAX_PIN.as_secs();
+    if cap != 0 && !(60..=max_pin).contains(&cap) {
+        return Err(Failure {
+            code: "invalid_host_setting",
+            message: format!("max_pin_seconds must be 0 or between 60 and {max_pin}, found {cap}"),
+            next_action: format!(
+                "set max_pin_seconds to 0 (disable new pins) or a value from 60 through {max_pin}"
+            ),
+            exit: exit_status::REFUSED,
+        });
+    }
+    if seconds > cap {
+        return Err(Failure {
+            code: "pin_too_long",
+            message: format!("env pin --for {seconds} exceeds this host's max_pin_seconds ({cap})"),
+            next_action: format!(
+                "pin for at most {cap} seconds, or raise max_pin_seconds in the host environments.toml"
+            ),
+            exit: exit_status::USAGE,
+        });
+    }
     let (mut lifecycle, _) = open("env pin", false)?;
     let record = lifecycle
         .pin(&id, Duration::from_secs(seconds), reason)

@@ -246,6 +246,15 @@ pub struct ComponentSpec {
     /// `static`: the directory served, relative to the worktree root.
     #[serde(default)]
     pub serve_dir: Option<String>,
+    /// `static`: serve `index.html` for a GET of a path that is not a file
+    /// and has no extension, so a single-page app's client-side routes load
+    /// (#1291).
+    #[serde(default)]
+    pub spa_fallback: bool,
+    /// The page to open for a listening process, compose or container component.
+    /// Appended to that component's URL (`/o/`, #1292).
+    #[serde(default)]
+    pub entry_path: Option<String>,
     /// E11: build cache inputs.
     #[serde(default)]
     pub cache_inputs: Vec<String>,
@@ -295,6 +304,10 @@ fn default_health_interval() -> u64 {
 pub struct RuleSpec {
     pub name: String,
     pub paths: Vec<String>,
+    /// Paths matching one of these never fire this rule (#1290), so a broad
+    /// rule can have exceptions without changing highest-rank inference.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
     pub min_profile: String,
     #[serde(default)]
     pub reason: Option<String>,
@@ -317,13 +330,22 @@ pub struct SharedSpec {
     pub stateful: bool,
 }
 
-/// Host-scoped settings: `<host state>/environments.toml`. Only host pool
-/// limits live here today.
+/// Host-scoped settings: `<host state>/environments.toml`: host pool limits
+/// and the keep-awake caps (#1293).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostEnvironmentsFile {
     #[serde(default)]
     pub pools: BTreeMap<String, HostPoolSpec>,
+    /// The longest new `env pin --for` accepted (default and ceiling: 24 h).
+    /// Zero disables new pins; lowering the cap does not shorten a stored pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_pin_seconds: Option<u64>,
+    /// How long a proven-live `env exec` marker keeps an environment busy;
+    /// at the cap the command and marker remain, but idle parking may proceed.
+    /// Unknown marker/process state remains busy. Unset: for the command's life.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_exec_busy_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

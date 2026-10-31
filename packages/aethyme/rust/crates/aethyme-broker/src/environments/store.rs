@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 use super::compile::{CompiledEnvironment, EnvironmentOwner};
 use crate::managed_services::ManagedServicePhase;
@@ -25,6 +26,9 @@ pub const ENVIRONMENTS_DB: &str = "environments.db";
 /// v2 (#1211): `environments.main_root`, so destroy can export the recorded
 /// commit after the worktree is gone.
 pub const STORE_SCHEMA_VERSION: i64 = 2;
+const CACHE_GC_MAX_STORE_ROWS: usize = 10_000;
+const CACHE_GC_MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+const CACHE_GC_SQLITE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
@@ -296,6 +300,8 @@ pub enum StoreError {
     Ambiguous(String),
     #[error("stored record is corrupt: {0}")]
     Corrupt(String),
+    #[error("cache-use store read exceeded its bounded deadline")]
+    CacheGcDeadline,
 }
 
 pub fn default_store_path() -> Result<PathBuf, StoreError> {
@@ -306,6 +312,15 @@ pub fn default_store_path() -> Result<PathBuf, StoreError> {
 
 pub struct EnvironmentStore {
     conn: Connection,
+}
+
+/// The subset of an environment record needed to protect build caches from
+/// eviction. This deliberately excludes schema-v2-only fields.
+#[derive(Debug, Clone)]
+pub(crate) struct CacheGcEnvironmentRecord {
+    pub env_id: String,
+    pub phase: EnvironmentPhase,
+    pub snapshot: CompiledEnvironment,
 }
 
 /// `env-` plus 12 lowercase hex: the only shape an id has, checked before an
@@ -326,6 +341,176 @@ fn now_ms() -> i64 {
 }
 
 impl EnvironmentStore {
+    /// Open the environment store for cache-GC reads without applying the
+    /// normal additive schema migration. The queried fields exist in schema
+    /// v1 and v2; an absent database is represented by an empty in-memory
+    /// reader and never created under host state.
+    pub(crate) fn open_default_cache_gc_read_only(
+        deadline: Option<Instant>,
+    ) -> Result<Self, StoreError> {
+        let path = default_store_path()?;
+        match Self::open_cache_gc_read_only_until(&path, deadline)? {
+            Some(store) => Ok(store),
+            None => {
+                let conn = Connection::open_in_memory()?;
+                conn.execute_batch(
+                    "CREATE TABLE environments (
+                       env_id TEXT, phase TEXT, spec_snapshot_json TEXT
+                     );",
+                )?;
+                Ok(Self { conn })
+            }
+        }
+    }
+
+    pub(crate) fn open_cache_gc_read_only(path: &Path) -> Result<Option<Self>, StoreError> {
+        Self::open_cache_gc_read_only_until(path, None)
+    }
+
+    fn open_cache_gc_read_only_until(
+        path: &Path,
+        deadline: Option<Instant>,
+    ) -> Result<Option<Self>, StoreError> {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(StoreError::Io {
+                    path: path.into(),
+                    source,
+                });
+            }
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(StoreError::Io {
+                    path: path.into(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "environments database path is not a regular file",
+                    ),
+                });
+            }
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let wait = deadline.map_or(CACHE_GC_SQLITE_WAIT, |deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(CACHE_GC_SQLITE_WAIT)
+        });
+        conn.busy_timeout(wait)?;
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(StoreError::CacheGcDeadline);
+        }
+        Self::check_version(&conn)?;
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(StoreError::CacheGcDeadline);
+        }
+        let version: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params!["schema_version"],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let version = version
+            .ok_or_else(|| {
+                StoreError::Corrupt("environment store schema version is missing".into())
+            })?
+            .parse::<i64>()
+            .map_err(|_| {
+                StoreError::Corrupt("environment store schema version is invalid".into())
+            })?;
+        if !(1..=STORE_SCHEMA_VERSION).contains(&version) {
+            return Err(StoreError::Corrupt(format!(
+                "unsupported environment store schema version {version}"
+            )));
+        }
+        // Preparing the query also verifies the exact legacy-compatible
+        // columns before any cache candidates can be authorized.
+        conn.prepare("SELECT env_id, phase, spec_snapshot_json FROM environments LIMIT 0")?;
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(StoreError::CacheGcDeadline);
+        }
+        Ok(Some(Self { conn }))
+    }
+
+    pub(crate) fn cache_gc_records(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<CacheGcEnvironmentRecord>, StoreError> {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(StoreError::CacheGcDeadline);
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT env_id, phase, spec_snapshot_json,
+                    length(CAST(env_id AS BLOB)),
+                    length(CAST(phase AS BLOB)),
+                    length(CAST(spec_snapshot_json AS BLOB))
+             FROM environments LIMIT ?1",
+        )?;
+        let mut rows = statement.query(params![(CACHE_GC_MAX_STORE_ROWS + 1) as i64])?;
+        let mut records = Vec::new();
+        let mut snapshot_bytes = 0_usize;
+        while let Some(row) = rows.next()? {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(StoreError::CacheGcDeadline);
+            }
+            if records.len() >= CACHE_GC_MAX_STORE_ROWS {
+                return Err(StoreError::Corrupt(
+                    "cache-use store row limit exceeded".into(),
+                ));
+            }
+            // Check SQLite byte lengths before copying untrusted text into Rust
+            // allocations. In particular, a corrupt row must not turn the
+            // bounded reader into an unbounded String allocation.
+            let env_id_bytes: i64 = row.get(3)?;
+            let phase_bytes: i64 = row.get(4)?;
+            let snapshot_len: i64 = row.get(5)?;
+            if !(0..=16).contains(&env_id_bytes) || !(0..=64).contains(&phase_bytes) {
+                return Err(StoreError::Corrupt(
+                    "cache-use store identifier or phase exceeds its byte limit".into(),
+                ));
+            }
+            let snapshot_len = usize::try_from(snapshot_len)
+                .ok()
+                .filter(|length| *length <= CACHE_GC_MAX_SNAPSHOT_BYTES)
+                .ok_or_else(|| {
+                    StoreError::Corrupt("cache-use snapshot byte limit exceeded".into())
+                })?;
+            snapshot_bytes = snapshot_bytes
+                .checked_add(snapshot_len)
+                .filter(|bytes| *bytes <= CACHE_GC_MAX_SNAPSHOT_BYTES)
+                .ok_or_else(|| {
+                    StoreError::Corrupt("cache-use snapshot byte limit exceeded".into())
+                })?;
+            let env_id: String = row.get(0)?;
+            let phase: String = row.get(1)?;
+            let snapshot_json: String = row.get(2)?;
+            if !valid_env_id(&env_id) {
+                return Err(StoreError::Corrupt(format!(
+                    "environment id {env_id:?} is invalid"
+                )));
+            }
+            let phase = parse_phase(&phase)?;
+            let snapshot = serde_json::from_str(&snapshot_json)
+                .map_err(|error| StoreError::Corrupt(format!("snapshot of {env_id}: {error}")))?;
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(StoreError::CacheGcDeadline);
+            }
+            records.push(CacheGcEnvironmentRecord {
+                env_id,
+                phase,
+                snapshot,
+            });
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(StoreError::CacheGcDeadline);
+        }
+        Ok(records)
+    }
+
     /// Open writable, creating the database and its directory if needed.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent() {

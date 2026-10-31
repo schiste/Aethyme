@@ -12,7 +12,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-mod managed_storage_inventory;
+pub(crate) mod cache_gc_fs;
+pub(crate) mod managed_storage_inventory;
 pub(crate) use managed_storage_inventory::{ManagedStorageOwner, ManagedStorageRootSetBinding};
 
 pub const HOST_RESOURCE_SCHEMA_VERSION: u32 = 1;
@@ -4852,8 +4853,32 @@ fn plan_allocations(
     request: &HostResourceRequest,
     occupied: &[Occupied],
 ) -> Result<(Vec<HostResourceAllocation>, Vec<HostResourceConflict>), HostResourceError> {
+    #[derive(Clone, Copy)]
+    struct CapacityBundle {
+        limit: u32,
+        requested_units: u128,
+        conflicting_limits: bool,
+    }
+
+    let mut capacity_bundles = BTreeMap::<String, CapacityBundle>::new();
+    for requirement in &request.resources {
+        if let HostResourceKind::Capacity { pool, units, limit } = &requirement.resource {
+            let bundle = capacity_bundles
+                .entry(pool.clone())
+                .or_insert(CapacityBundle {
+                    limit: *limit,
+                    requested_units: 0,
+                    conflicting_limits: false,
+                });
+            bundle.conflicting_limits |= bundle.limit != *limit;
+            bundle.requested_units = bundle.requested_units.saturating_add(u128::from(*units));
+        }
+    }
+
     let mut proposed = Vec::new();
     let mut conflicts = Vec::new();
+    let mut checked_capacity_pools = BTreeSet::new();
+    let mut rejected_capacity_pools = BTreeSet::new();
     let seed = &request_digest(request)?[..12];
     for requirement in &request.resources {
         match &requirement.resource {
@@ -4865,10 +4890,18 @@ fn plan_allocations(
                 None,
             )),
             HostResourceKind::TcpPort { start, end } => {
+                // Nothing holds a port between iterations, so a port this
+                // bundle already chose still binds: exclude it explicitly, or
+                // every request over an overlapping range gets the same one
+                // (#1235).
                 let port = (*start..=*end).find(|p| {
+                    let value = p.to_string();
                     !occupied
                         .iter()
-                        .any(|o| o.kind == "tcp_port" && o.value == p.to_string())
+                        .any(|o| o.kind == "tcp_port" && o.value == value)
+                        && !proposed.iter().any(|a: &HostResourceAllocation| {
+                            a.kind == "tcp_port" && a.value == value
+                        })
                         && TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, *p)).is_ok()
                 });
                 if let Some(port) = port {
@@ -4891,43 +4924,76 @@ fn plan_allocations(
                 }
             }
             HostResourceKind::Capacity { pool, units, limit } => {
-                let matching = occupied
-                    .iter()
-                    .filter(|o| o.kind == "capacity" && o.value == *pool)
-                    .collect::<Vec<_>>();
-                if let Some(owner) = matching.iter().find(|o| o.limit != Some(*limit)) {
-                    conflicts.push(conflict(
-                        "capacity_policy_mismatch",
-                        &requirement.key,
-                        "capacity",
-                        format!("{pool}:{units}/{limit}"),
-                        "active pool uses a different limit",
-                        Some(owner.lease_id.clone()),
-                    ));
+                if checked_capacity_pools.insert(pool.clone()) {
+                    let bundle = capacity_bundles.get(pool).ok_or_else(|| {
+                        HostResourceError::InvalidRequest("capacity pool summary is missing".into())
+                    })?;
+                    let matching = occupied
+                        .iter()
+                        .filter(|o| o.kind == "capacity" && o.value == *pool)
+                        .collect::<Vec<_>>();
+                    let mut rejected = false;
+                    if bundle.conflicting_limits {
+                        conflicts.push(conflict(
+                            "capacity_policy_mismatch",
+                            &requirement.key,
+                            "capacity",
+                            format!(
+                                "{pool}:{} units with conflicting limits",
+                                bundle.requested_units
+                            ),
+                            "the request bundle declares different limits for this capacity pool",
+                            None,
+                        ));
+                        rejected = true;
+                    }
+                    if let Some(owner) = matching.iter().find(|o| o.limit != Some(bundle.limit)) {
+                        conflicts.push(conflict(
+                            "capacity_policy_mismatch",
+                            &requirement.key,
+                            "capacity",
+                            format!("{pool}:{}/{limit}", bundle.requested_units),
+                            "active pool uses a different limit",
+                            Some(owner.lease_id.clone()),
+                        ));
+                        rejected = true;
+                    }
+                    if !rejected {
+                        let used = matching
+                            .iter()
+                            .filter_map(|o| o.units)
+                            .fold(0u128, |total, units| {
+                                total.saturating_add(u128::from(units))
+                            });
+                        if used.saturating_add(bundle.requested_units) > u128::from(bundle.limit) {
+                            conflicts.push(conflict(
+                                "resource_contention",
+                                &requirement.key,
+                                "capacity",
+                                format!("{pool}:{}/{limit}", bundle.requested_units),
+                                &format!(
+                                    "pool has {used}/{limit} units allocated by {} live lease(s); this bundle requests {} units",
+                                    matching.len(), bundle.requested_units
+                                ),
+                                matching.first().map(|o| o.lease_id.clone()),
+                            ));
+                            rejected = true;
+                        }
+                    }
+                    if rejected {
+                        rejected_capacity_pools.insert(pool.clone());
+                    }
+                }
+                if rejected_capacity_pools.contains(pool) {
                     continue;
                 }
-                let used = matching.iter().filter_map(|o| o.units).sum::<u32>();
-                if used.saturating_add(*units) > *limit {
-                    conflicts.push(conflict(
-                        "resource_contention",
-                        &requirement.key,
-                        "capacity",
-                        format!("{pool}:{units}/{limit}"),
-                        &format!(
-                            "pool has {used}/{limit} units allocated by {} live lease(s)",
-                            matching.len()
-                        ),
-                        matching.first().map(|o| o.lease_id.clone()),
-                    ));
-                } else {
-                    proposed.push(allocation(
-                        &requirement.key,
-                        "capacity",
-                        pool.clone(),
-                        Some(*units),
-                        Some(*limit),
-                    ));
-                }
+                proposed.push(allocation(
+                    &requirement.key,
+                    "capacity",
+                    pool.clone(),
+                    Some(*units),
+                    Some(*limit),
+                ));
             }
             HostResourceKind::ExclusiveKey { name } => {
                 if let Some(owner) = occupied
@@ -5117,7 +5183,7 @@ fn any_port_bindable(value: &str) -> bool {
 
 fn blocker_recovery(conflict: &HostResourceConflict, leases: &[HostResourceLease]) -> String {
     if conflict.code == "capacity_policy_mismatch" {
-        return "the pool limit differs from an existing holder; use the same limit or wait until the existing lease is released".into();
+        return "use one limit for this pool throughout the request and match any existing holder; waiting cannot change policy".into();
     }
     if let Some(lease) = leases.iter().find(|lease| {
         lease
@@ -5152,7 +5218,7 @@ fn wait_advice(blockers: &[HostResourceBlocker]) -> HostResourceWaitAdvice {
         return HostResourceWaitAdvice {
             waitable: false,
             reason: "capacity_policy_mismatch".into(),
-            action: "align the requested pool limit with the existing lease; waiting cannot change policy".into(),
+            action: "use one limit for this pool throughout the request and match any existing holder; waiting cannot change policy".into(),
         };
     }
     // Only an exact exclusive-key collision is made impossible by this
@@ -7409,6 +7475,156 @@ mod tests {
             Err(HostResourceError::Conflict { .. })
         ));
     }
+
+    #[test]
+    fn same_pool_capacity_requirements_are_summed_for_bundle_admission() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let capacity = |key: &str, units, limit| HostResourceRequirement {
+            key: key.into(),
+            resource: HostResourceKind::Capacity {
+                pool: "workers".into(),
+                units,
+                limit,
+            },
+        };
+
+        let fitting = req(
+            "fitting-bundle",
+            vec![capacity("worker-a", 1, 3), capacity("worker-b", 2, 3)],
+        );
+        let plan = c.plan(&fitting).unwrap();
+        assert!(plan.available);
+        assert_eq!(plan.proposed.len(), 2);
+        let grant = c.acquire(&fitting).unwrap();
+        assert_eq!(grant.lease.allocations.len(), 2);
+        c.release(
+            &grant.lease.lease_id,
+            grant.lease.generation,
+            &grant.ownership_token,
+        )
+        .unwrap();
+
+        let overfull = req(
+            "overfull-bundle",
+            vec![capacity("worker-a", 2, 3), capacity("worker-b", 2, 3)],
+        );
+        let plan = c.plan(&overfull).unwrap();
+        assert!(!plan.available);
+        assert!(plan.proposed.is_empty());
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(plan.conflicts[0].code, "resource_contention");
+        assert_eq!(plan.conflicts[0].requested, "workers:4/3");
+        assert_eq!(
+            conflict_code(c.acquire(&overfull).unwrap_err()),
+            "resource_contention"
+        );
+        assert!(
+            c.list(true)
+                .unwrap()
+                .iter()
+                .all(|lease| lease.request_id != "overfull-bundle"),
+            "an overfull capacity bundle must not create a lease"
+        );
+    }
+
+    #[test]
+    fn same_pool_capacity_requirements_must_use_one_limit() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let request = req(
+            "mixed-limit-bundle",
+            vec![
+                HostResourceRequirement {
+                    key: "worker-a".into(),
+                    resource: HostResourceKind::Capacity {
+                        pool: "workers".into(),
+                        units: 1,
+                        limit: 4,
+                    },
+                },
+                HostResourceRequirement {
+                    key: "worker-b".into(),
+                    resource: HostResourceKind::Capacity {
+                        pool: "workers".into(),
+                        units: 1,
+                        limit: 5,
+                    },
+                },
+            ],
+        );
+
+        let plan = c.plan(&request).unwrap();
+        assert!(!plan.available);
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(plan.conflicts[0].code, "capacity_policy_mismatch");
+        assert!(plan.conflicts[0].owning_lease.is_none());
+        let explanation = c.explain(&request).unwrap();
+        assert!(
+            explanation.blockers[0]
+                .recovery
+                .contains("throughout the request")
+        );
+        assert!(!explanation.wait.waitable);
+        assert_eq!(explanation.wait.reason, "capacity_policy_mismatch");
+        assert!(explanation.wait.action.contains("throughout the request"));
+        assert_eq!(
+            conflict_code(c.acquire(&request).unwrap_err()),
+            "capacity_policy_mismatch"
+        );
+        assert!(
+            c.list(true)
+                .unwrap()
+                .iter()
+                .all(|lease| lease.request_id != "mixed-limit-bundle"),
+            "a capacity-policy mismatch must not create a lease"
+        );
+    }
+
+    #[test]
+    fn same_pool_capacity_total_does_not_wrap() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let request = req(
+            "overflowing-bundle",
+            vec![
+                HostResourceRequirement {
+                    key: "worker-a".into(),
+                    resource: HostResourceKind::Capacity {
+                        pool: "workers".into(),
+                        units: u32::MAX,
+                        limit: u32::MAX,
+                    },
+                },
+                HostResourceRequirement {
+                    key: "worker-b".into(),
+                    resource: HostResourceKind::Capacity {
+                        pool: "workers".into(),
+                        units: 1,
+                        limit: u32::MAX,
+                    },
+                },
+            ],
+        );
+
+        let plan = c.plan(&request).unwrap();
+        assert!(!plan.available);
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(plan.conflicts[0].code, "resource_contention");
+        assert_eq!(plan.conflicts[0].requested, "workers:4294967296/4294967295");
+        assert_eq!(
+            conflict_code(c.acquire(&request).unwrap_err()),
+            "resource_contention"
+        );
+        assert!(
+            c.list(true)
+                .unwrap()
+                .iter()
+                .all(|lease| lease.request_id != "overflowing-bundle"),
+            "a capacity total greater than u32::MAX must not wrap into admission"
+        );
+    }
+
     #[test]
     fn supervised_capacity_hold_survives_dead_supervisor_before_terminal_proof() {
         let t = tempfile::tempdir().unwrap();
@@ -8724,6 +8940,56 @@ mod tests {
             }
         }
         panic!("could not find a free adjacent TCP port pair for the test");
+    }
+
+    /// #1235: several ports over one range in one bundle are distinct, in
+    /// the plan and the grant; a range too narrow for all of them is refused
+    /// whole, never granted with a duplicate.
+    #[test]
+    fn ports_in_one_bundle_are_distinct_or_refused_together() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let (first, second) = adjacent_bindable_ports();
+        let ports = |id: &str, keys: &[&str]| {
+            req(
+                id,
+                keys.iter()
+                    .map(|key| HostResourceRequirement {
+                        key: (*key).into(),
+                        resource: HostResourceKind::TcpPort {
+                            start: first,
+                            end: second,
+                        },
+                    })
+                    .collect(),
+            )
+        };
+        let values = |allocations: &[HostResourceAllocation]| {
+            let mut values: Vec<String> = allocations.iter().map(|a| a.value.clone()).collect();
+            values.sort();
+            values
+        };
+        let expected = vec![first.to_string(), second.to_string()];
+
+        let pair = ports("pair", &["port_api", "port_db"]);
+        let plan = c.plan(&pair).unwrap();
+        assert!(plan.available, "{plan:?}");
+        assert_eq!(values(&plan.proposed), expected);
+        let grant = c.acquire(&pair).unwrap();
+        assert_eq!(values(&grant.lease.allocations), expected);
+        c.release(
+            &grant.lease.lease_id,
+            grant.lease.generation,
+            &grant.ownership_token,
+        )
+        .unwrap();
+
+        let three = ports("three", &["port_api", "port_db", "port_web"]);
+        let plan = c.plan(&three).unwrap();
+        assert!(!plan.available, "{plan:?}");
+        let error = c.acquire(&three).unwrap_err();
+        assert_eq!(conflict_code(error), "resource_contention");
+        assert!(c.list(false).unwrap().is_empty(), "nothing was granted");
     }
 
     #[test]

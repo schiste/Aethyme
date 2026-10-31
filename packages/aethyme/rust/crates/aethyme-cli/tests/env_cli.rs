@@ -78,7 +78,8 @@ impl Fixture {
             .env("AETHYME_HOST_STATE_DIR", self.state.path())
             .env("AETHYME_ENV_SUPERVISOR_LINGER_SECONDS", "1")
             .env("AETHYME_ENV_SUPERVISOR_TICK_MS", "50")
-            .env_remove("XDG_STATE_HOME");
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("AETHYME_WORKTREE_ROOT");
         command
     }
 
@@ -160,6 +161,37 @@ fn status_on_a_fresh_host_reports_nothing_and_an_absent_supervisor() {
     let (code, value) = fixture.json(&["env", "logs", "env-0123456789ab"]);
     assert_eq!(code, 3, "{value}");
     assert_eq!(value["code"], "not_found");
+}
+
+/// #1289: a profile with no components validates, is what an empty diff
+/// infers when it ranks lowest, and `env up` on it registers nothing.
+#[test]
+fn an_empty_profile_needs_no_environment() {
+    let environments = format!(
+        "schema = 1\n[[profiles]]\nname = \"none\"\n{}",
+        ENVIRONMENTS.trim_start_matches("\nschema = 1\n")
+    );
+    let fixture = Fixture::new(Some(&environments));
+    let (code, value) = fixture.json(&["env", "validate"]);
+    assert_eq!(code, 0, "{value}");
+    let (code, plan) = fixture.json(&["env", "plan", "--profile", "none"]);
+    assert_eq!(code, 0, "{plan}");
+    assert_eq!(plan["start_order"], serde_json::json!([]), "{plan}");
+    for args in [&["env", "up"][..], &["env", "up", "--profile", "none"][..]] {
+        let (code, up) = fixture.json(args);
+        assert_eq!(code, 0, "{up}");
+        assert_eq!(up["schema"], "aethyme.env-up/v1");
+        assert_eq!(up["nothing_needed"], true, "{up}");
+        assert_eq!(up["profile"], "none");
+        assert!(up.get("env_id").is_none(), "{up}");
+    }
+    let (code, status) = fixture.json(&["env", "status"]);
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(status["environments"], serde_json::json!([]));
+    assert_eq!(
+        status["supervisor"]["state"], "absent",
+        "an empty profile starts no supervisor"
+    );
 }
 
 /// #1222 acceptance: ten concurrent starters run exactly one supervisor, and
@@ -408,4 +440,218 @@ min_profile = "isolated"
     );
     let (code, _) = fixture.json(&["env", "down", up["env_id"].as_str().unwrap()]);
     assert_eq!(code, 0);
+}
+
+/// #1293 acceptance: the host's `max_pin_seconds` refuses a longer pin.
+#[test]
+fn a_pin_longer_than_the_host_cap_is_refused() {
+    let fixture = Fixture::new(Some(ENVIRONMENTS));
+    std::fs::write(
+        fixture.state.path().join("environments.toml"),
+        "max_pin_seconds = 7200\n",
+    )
+    .unwrap();
+    let (code, refused) =
+        fixture.json(&["env", "pin", "e-none", "--for", "10800", "--reason", "demo"]);
+    assert_eq!(code, 2, "{refused}");
+    assert_eq!(refused["code"], "pin_too_long", "{refused}");
+    let (code, within) =
+        fixture.json(&["env", "pin", "e-none", "--for", "3600", "--reason", "demo"]);
+    assert_ne!(within["code"], "pin_too_long", "{within}");
+    assert_ne!(code, 0, "{within}");
+
+    std::fs::write(
+        fixture.state.path().join("environments.toml"),
+        "max_pin_seconds = 0\n",
+    )
+    .unwrap();
+    let (code, disabled) =
+        fixture.json(&["env", "pin", "e-none", "--for", "60", "--reason", "demo"]);
+    assert_eq!(code, 2, "{disabled}");
+    assert_eq!(disabled["code"], "pin_too_long", "{disabled}");
+
+    for (cap, seconds) in [(60, "60"), (86_400, "86400")] {
+        std::fs::write(
+            fixture.state.path().join("environments.toml"),
+            format!("max_pin_seconds = {cap}\n"),
+        )
+        .unwrap();
+        let (code, accepted_cap) =
+            fixture.json(&["env", "pin", "e-none", "--for", seconds, "--reason", "demo"]);
+        assert_ne!(accepted_cap["code"], "pin_too_long", "{accepted_cap}");
+        assert_ne!(
+            code, 2,
+            "the configured boundary itself is valid: {accepted_cap}"
+        );
+    }
+
+    std::fs::write(
+        fixture.state.path().join("environments.toml"),
+        "max_pin_seconds = 59\n",
+    )
+    .unwrap();
+    let (code, invalid_low) =
+        fixture.json(&["env", "pin", "e-none", "--for", "60", "--reason", "demo"]);
+    assert_eq!(code, 3, "{invalid_low}");
+    assert_eq!(invalid_low["code"], "invalid_host_setting", "{invalid_low}");
+
+    std::fs::write(
+        fixture.state.path().join("environments.toml"),
+        "max_pin_seconds = 86401\n",
+    )
+    .unwrap();
+    let (code, invalid) =
+        fixture.json(&["env", "pin", "e-none", "--for", "60", "--reason", "demo"]);
+    assert_eq!(code, 3, "{invalid}");
+    assert_eq!(invalid["code"], "invalid_host_setting", "{invalid}");
+
+    std::fs::write(
+        fixture.state.path().join("environments.toml"),
+        "max_pin_seconds = \"7200\"\n",
+    )
+    .unwrap();
+    let (code, malformed) =
+        fixture.json(&["env", "pin", "e-none", "--for", "60", "--reason", "demo"]);
+    assert_eq!(code, 3, "{malformed}");
+    assert_eq!(malformed["code"], "host_settings_invalid", "{malformed}");
+
+    let host_settings = fixture.state.path().join("environments.toml");
+    std::fs::remove_file(&host_settings).unwrap();
+    std::fs::create_dir(&host_settings).unwrap();
+    let (code, unreadable) =
+        fixture.json(&["env", "pin", "e-none", "--for", "60", "--reason", "demo"]);
+    assert_eq!(code, 1, "{unreadable}");
+    assert_eq!(
+        unreadable["code"], "host_settings_unreadable",
+        "{unreadable}"
+    );
+}
+
+/// #1292: `env up` and `env status` print each listening component's URL
+/// with its `entry_path`, and `AETHYME_ENV_URL_<C>` carries it.
+#[test]
+fn urls_include_the_component_entry_path() {
+    let environments = r#"
+schema = 1
+[[profiles]]
+name = "backend"
+[[profiles.components]]
+name = "api"
+runtime = "process"
+listen = true
+entry_path = "/o/"
+start = "exec sleep 300"
+health = { command = "true", timeout_seconds = 10, interval_ms = 50 }
+"#;
+    let fixture = Fixture::new(Some(environments));
+    let (code, up) = fixture.json(&["env", "up", "--wait", "5"]);
+    assert_eq!(code, 0, "{up}");
+    let env_id = up["env_id"].as_str().unwrap().to_string();
+    let port = up["ports"]["api"].as_str().unwrap().to_string();
+    let url = format!("http://127.0.0.1:{port}/o/");
+    assert_eq!(up["urls"]["api"], url.as_str(), "{up}");
+    assert_eq!(up["variables"]["AETHYME_ENV_URL_API"], url.as_str(), "{up}");
+    let (code, status) = fixture.json(&["env", "status", &env_id]);
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(status["urls"]["api"], url.as_str(), "{status}");
+    let (code, down) = fixture.json(&["env", "down", &env_id]);
+    assert_eq!(code, 0, "{down}");
+}
+
+/// #1275: `broker gc plan` lists the environment build cache and proposes
+/// the unused build; `gc apply` evicts it and never the one in use.
+#[test]
+fn gc_reclaims_an_unused_environment_build_and_never_a_used_one() {
+    let environments = r#"
+schema = 1
+[[profiles]]
+name = "site"
+[[profiles.components]]
+name = "site"
+runtime = "static"
+serve_dir = "dist"
+build = 'mkdir -p dist && cp web/app.txt dist/index.html'
+cache_inputs = ["web/**"]
+"#;
+    let fixture = Fixture::new(Some(environments));
+    let app = fixture.repo.path().join("web/app.txt");
+    std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+    std::fs::write(&app, "v1").unwrap();
+    let (code, up) = fixture.json(&["env", "up", "--wait", "5"]);
+    assert_eq!(code, 0, "{up}");
+    let old = up["env_id"].as_str().unwrap().to_string();
+    let (code, down) = fixture.json(&["env", "down", &old]);
+    assert_eq!(code, 0, "{down}");
+    let builds = fixture.state.path().join("environments/cache/builds");
+    let entries = |dir: &Path| -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect()
+    };
+    let repository = entries(&builds).pop().unwrap();
+    let unused = entries(&repository.join("site")).pop().unwrap();
+    std::fs::write(&app, "v2").unwrap();
+    let (code, up) = fixture.json(&["env", "up", "--wait", "5"]);
+    assert_eq!(code, 0, "{up}");
+    let live = up["env_id"].as_str().unwrap().to_string();
+
+    let gc = |args: &[&str]| {
+        let output = fixture
+            .command(args)
+            .env("AETHYME_ENV_CACHE_MAX_BYTES", "0")
+            .output()
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "{args:?}: {error}\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+    };
+    // A broker that has placed a worktree knows its root history, which a
+    // complete (applicable) plan needs.
+    let started = fixture.run(&["broker", "start", "--task", "gc", "--short-name", "gc"]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let plan = gc(&["broker", "gc", "plan", "--full-scan", "--json"]);
+    let cache = &plan["environment_cache"];
+    assert_eq!(cache["build_entries"], 2, "{plan}");
+    assert_eq!(cache["in_use_entries"], 1, "{plan}");
+    assert!(
+        plan["environment_caches"]
+            .as_array()
+            .is_some_and(|c| !c.is_empty()),
+        "{plan}"
+    );
+
+    let digest = plan["digest"].as_str().unwrap();
+    assert_eq!(digest.len(), 64, "{plan}");
+    let applied = gc(&[
+        "broker",
+        "gc",
+        "apply",
+        "--confirm",
+        digest,
+        "--full-scan",
+        "--json",
+    ]);
+    assert_eq!(
+        applied["environment_caches_reclaimed"],
+        serde_json::json!([unused.to_string_lossy()]),
+        "{applied}"
+    );
+    assert!(!unused.exists());
+    assert_eq!(
+        entries(&repository.join("site")).len(),
+        1,
+        "the used build is kept"
+    );
+
+    let (code, down) = fixture.json(&["env", "down", &live]);
+    assert_eq!(code, 0, "{down}");
 }

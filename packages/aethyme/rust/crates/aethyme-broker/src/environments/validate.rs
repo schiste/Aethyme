@@ -282,16 +282,18 @@ pub fn validate(
                 "add at least one glob",
             );
         }
-        for pattern in &rule.paths {
-            if let Err(error) = Glob::new(pattern) {
-                c.push(
-                    "invalid_glob",
-                    None,
-                    None,
-                    Some(&format!("{field}.paths")),
-                    format!("{pattern:?}: {error}"),
-                    "fix the glob syntax",
-                );
+        for (list, patterns) in [("paths", &rule.paths), ("exclude", &rule.exclude)] {
+            for pattern in patterns {
+                if let Err(error) = Glob::new(pattern) {
+                    c.push(
+                        "invalid_glob",
+                        None,
+                        None,
+                        Some(&format!("{field}.{list}")),
+                        format!("{pattern:?}: {error}"),
+                        "fix the glob syntax",
+                    );
+                }
             }
         }
     }
@@ -530,16 +532,8 @@ fn validate_profile(
             "declare it under [pools] or remove pool",
         );
     }
-    if profile.components.is_empty() {
-        c.push(
-            "no_components",
-            p,
-            None,
-            Some("components"),
-            "a profile needs at least one component",
-            "add a component",
-        );
-    }
+    // A profile with no components is "no environment needed" (#1289):
+    // the target of rules for diffs that need nothing.
 
     let mut names = BTreeSet::new();
     let mut suffixes: BTreeMap<String, &str> = BTreeMap::new();
@@ -724,6 +718,9 @@ fn validate_component(
             );
         }
     };
+    if component.runtime != Runtime::Static {
+        forbid(c, "spa_fallback", component.spa_fallback);
+    }
     match component.runtime {
         Runtime::Process => {
             require(c, "start", component.start.is_some());
@@ -927,6 +924,33 @@ fn validate_component(
                 "fix the glob syntax",
             );
         }
+    }
+    if component.entry_path.is_some()
+        && (!component.listen || matches!(component.runtime, Runtime::Static | Runtime::Hooks))
+    {
+        c.push(
+            "field_not_supported",
+            p,
+            n,
+            Some("entry_path"),
+            "entry_path requires a listening process, compose or container component",
+            "set entry_path on a component with listen = true, or remove it",
+        );
+    }
+    if let Some(entry_path) = component.entry_path.as_deref()
+        && (!entry_path.starts_with('/')
+            || entry_path
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || c == '#'))
+    {
+        c.push(
+            "invalid_path",
+            p,
+            n,
+            Some("entry_path"),
+            format!("entry_path {entry_path:?} must be a URL path starting with `/`"),
+            "use a path such as \"/o/\"",
+        );
     }
     for (field, value) in [
         ("build_output", component.build_output.as_deref()),
