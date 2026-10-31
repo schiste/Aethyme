@@ -42,10 +42,11 @@ fn lifecycle_failure(error: LifecycleError) -> Failure {
         message: error.to_string(),
         next_action,
         exit: match code {
-            "not_found" | "wrong_phase" | "reconfigure_required" | "recreate_required"
-            | "capacity_timeout" => {
-                exit_status::REFUSED
-            }
+            "not_found"
+            | "wrong_phase"
+            | "reconfigure_required"
+            | "recreate_required"
+            | "capacity_timeout" => exit_status::REFUSED,
             _ => exit_status::FAILED,
         },
     }
@@ -193,8 +194,8 @@ pub(super) fn run_up(options: &Options) -> Result<Output, Failure> {
     // Optional components (E20): the ones the diff enables, the ones named
     // with --component, and the ones the running environment already has,
     // so a later plain `env up` never drops what was selected.
-    let mut selected = super::infer::enabled_components(&snapshot, &changed)
-        .map_err(environment_failure)?;
+    let mut selected =
+        super::infer::enabled_components(&snapshot, &changed).map_err(environment_failure)?;
     for name in &options.components {
         if !snapshot.components.iter().any(|c| &c.name == name) {
             return Err(Failure {

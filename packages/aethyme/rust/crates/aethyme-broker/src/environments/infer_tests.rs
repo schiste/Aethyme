@@ -478,9 +478,12 @@ enabled_by = ["apps/orgs/**"]
         },
     )
     .unwrap();
-    let enabled = |list: &[&str]| super::infer::enabled_components(&snapshot, &paths(list)).unwrap();
+    let enabled =
+        |list: &[&str]| super::infer::enabled_components(&snapshot, &paths(list)).unwrap();
     assert_eq!(
-        enabled(&["apps/orgs/src/main.ts"]).into_iter().collect::<Vec<_>>(),
+        enabled(&["apps/orgs/src/main.ts"])
+            .into_iter()
+            .collect::<Vec<_>>(),
         vec!["orgs".to_string()]
     );
     assert!(enabled(&["apps/customer/x.ts", "README.md"]).is_empty());

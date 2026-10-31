@@ -975,7 +975,12 @@ fn reconfigure_in_place_keeps_the_data_of_unchanged_components() {
     let before = lifecycle
         .up(&first, worktree.path(), None, None, &options())
         .unwrap();
-    let ports_before = std::fs::read(host.root.join(&before.env_id).join("reservation.grant.json")).unwrap();
+    let ports_before = std::fs::read(
+        host.root
+            .join(&before.env_id)
+            .join("reservation.grant.json"),
+    )
+    .unwrap();
     assert_eq!(provisions(&host), 1);
 
     let changed = variant(
@@ -985,7 +990,13 @@ fn reconfigure_in_place_keeps_the_data_of_unchanged_components() {
         &[],
     );
     let after = lifecycle
-        .up(&changed, worktree.path(), None, None, &reconfigure_options(&[]))
+        .up(
+            &changed,
+            worktree.path(),
+            None,
+            None,
+            &reconfigure_options(&[]),
+        )
         .unwrap();
     assert_eq!(after.env_id, before.env_id);
     assert_eq!(after.phase, EnvironmentPhase::Active);
@@ -999,7 +1010,9 @@ fn reconfigure_in_place_keeps_the_data_of_unchanged_components() {
     let notes = lifecycle.store.transitions(&after.env_id, 50).unwrap();
     assert!(
         notes.iter().any(|t| t.reason == "reconfigured"
-            && t.detail.as_ref().is_some_and(|d| d["strategy"] == "in_place")),
+            && t.detail
+                .as_ref()
+                .is_some_and(|d| d["strategy"] == "in_place")),
         "{notes:?}"
     );
 
@@ -1009,7 +1022,13 @@ fn reconfigure_in_place_keeps_the_data_of_unchanged_components() {
         worktree.path(),
         &[],
     );
-    match lifecycle.up(&new_db, worktree.path(), None, None, &reconfigure_options(&[])) {
+    match lifecycle.up(
+        &new_db,
+        worktree.path(),
+        None,
+        None,
+        &reconfigure_options(&[]),
+    ) {
         Err(LifecycleError::RecreateRequired { components, .. }) => {
             assert_eq!(components, vec!["db".to_string()])
         }
@@ -1017,7 +1036,13 @@ fn reconfigure_in_place_keeps_the_data_of_unchanged_components() {
     }
     assert_eq!(provisions(&host), 1, "a refusal destroys nothing");
     lifecycle
-        .up(&new_db, worktree.path(), None, None, &reconfigure_options(&["db"]))
+        .up(
+            &new_db,
+            worktree.path(),
+            None,
+            None,
+            &reconfigure_options(&["db"]),
+        )
         .unwrap();
     assert_eq!(provisions(&host), 2, "confirmed: recreated");
     lifecycle.down(&after.env_id, None).unwrap();

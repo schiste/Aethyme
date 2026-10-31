@@ -492,7 +492,9 @@ impl Lifecycle {
         let destroyed: Vec<&CompiledComponent> = old
             .components
             .iter()
-            .filter(|c| !in_place || plan.changed.contains(&c.name) || plan.removed.contains(&c.name))
+            .filter(|c| {
+                !in_place || plan.changed.contains(&c.name) || plan.removed.contains(&c.name)
+            })
             .collect();
         // A planned environment never provisioned anything.
         let unconfirmed: Vec<String> = destroyed
