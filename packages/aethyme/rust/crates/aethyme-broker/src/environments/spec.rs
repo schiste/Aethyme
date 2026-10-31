@@ -251,6 +251,10 @@ pub struct ComponentSpec {
     /// (#1291).
     #[serde(default)]
     pub spa_fallback: bool,
+    /// The page to open for a listening process, compose or container component.
+    /// Appended to that component's URL (`/o/`, #1292).
+    #[serde(default)]
+    pub entry_path: Option<String>,
     /// E11: build cache inputs.
     #[serde(default)]
     pub cache_inputs: Vec<String>,

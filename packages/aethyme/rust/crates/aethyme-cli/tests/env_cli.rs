@@ -525,3 +525,34 @@ fn a_pin_longer_than_the_host_cap_is_refused() {
         "{unreadable}"
     );
 }
+
+/// #1292: `env up` and `env status` print each listening component's URL
+/// with its `entry_path`, and `AETHYME_ENV_URL_<C>` carries it.
+#[test]
+fn urls_include_the_component_entry_path() {
+    let environments = r#"
+schema = 1
+[[profiles]]
+name = "backend"
+[[profiles.components]]
+name = "api"
+runtime = "process"
+listen = true
+entry_path = "/o/"
+start = "exec sleep 300"
+health = { command = "true", timeout_seconds = 10, interval_ms = 50 }
+"#;
+    let fixture = Fixture::new(Some(environments));
+    let (code, up) = fixture.json(&["env", "up", "--wait", "5"]);
+    assert_eq!(code, 0, "{up}");
+    let env_id = up["env_id"].as_str().unwrap().to_string();
+    let port = up["ports"]["api"].as_str().unwrap().to_string();
+    let url = format!("http://127.0.0.1:{port}/o/");
+    assert_eq!(up["urls"]["api"], url.as_str(), "{up}");
+    assert_eq!(up["variables"]["AETHYME_ENV_URL_API"], url.as_str(), "{up}");
+    let (code, status) = fixture.json(&["env", "status", &env_id]);
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(status["urls"]["api"], url.as_str(), "{status}");
+    let (code, down) = fixture.json(&["env", "down", &env_id]);
+    assert_eq!(code, 0, "{down}");
+}
