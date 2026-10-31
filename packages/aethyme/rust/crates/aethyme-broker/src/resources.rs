@@ -12,7 +12,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-mod managed_storage_inventory;
+pub(crate) mod cache_gc_fs;
+pub(crate) mod managed_storage_inventory;
 pub(crate) use managed_storage_inventory::{ManagedStorageOwner, ManagedStorageRootSetBinding};
 
 pub const HOST_RESOURCE_SCHEMA_VERSION: u32 = 1;

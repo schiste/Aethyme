@@ -1877,6 +1877,41 @@ pub(crate) struct GcJournalForgetReport {
     pub(crate) bytes_forgotten: u64,
 }
 
+fn gc_recovery_action(journal: &GcJournal, complete: bool) -> Option<String> {
+    if complete {
+        return None;
+    }
+    let only_unbound_or_uncoordinated_environment_cache_candidates =
+        !journal.remaining_environment_caches.is_empty()
+            && journal
+                .remaining_environment_caches
+                .iter()
+                .all(|candidate| {
+                    !candidate.has_identity_bound_location()
+                        || candidate.coordinated_build_lock().is_none()
+                })
+            && journal.remaining_rows.is_empty()
+            && journal.remaining_files.is_empty()
+            && journal.remaining_worktrees.is_empty()
+            && journal.remaining_artifacts.is_empty()
+            && journal.remaining_orphans.is_empty()
+            && journal.remaining_gate_caches.is_empty()
+            && journal.remaining_checkpoint_pin_releases.is_empty()
+            && journal.remaining_publication_exposure_expiries.is_empty()
+            && journal.remaining_recovery_archives.is_empty();
+    if only_unbound_or_uncoordinated_environment_cache_candidates {
+        Some(format!(
+            "aethyme broker gc abandon --confirm {}",
+            journal.digest
+        ))
+    } else {
+        Some(format!(
+            "aethyme broker gc apply --confirm {}",
+            journal.digest
+        ))
+    }
+}
+
 impl From<GcPlan> for GcJournal {
     fn from(plan: GcPlan) -> Self {
         Self {
@@ -4762,8 +4797,8 @@ impl Broker {
             }
         };
         // The host environment build cache, this repository's part (#1275).
-        // Walking it is bounded by the cache budget, but a deadline-bound
-        // pass still defers it like the gate cache.
+        // Inventory has fixed entry and time caps; an expired pass defers it
+        // like the gate cache.
         let (environment_cache, environment_caches) = if deadline_expired(deadline) {
             deferred_checks.push("environment_cache_inventory".into());
             (None, Vec::new())
@@ -4771,10 +4806,17 @@ impl Broker {
             match GitRepo::discover(&main_root) {
                 Ok(repo) => crate::environments::cache::host_gc_inventory(
                     &crate::gates::git_origin_fingerprint(&repo),
+                    deadline,
                 ),
                 Err(_) => (None, Vec::new()),
             }
         };
+        if environment_cache
+            .as_ref()
+            .is_some_and(|cache| cache.refusal_code.as_deref() == Some("deadline_exceeded"))
+        {
+            deferred_checks.push("environment_cache_inventory".into());
+        }
         if scan.measures() && size_records_complete {
             crate::warn_unrecorded(
                 "record gate cache sizes",
@@ -9807,23 +9849,67 @@ impl Broker {
         // used it since the plan; one that fails is kept and the run carries
         // on. Operator-invoked only, like the gate cache: the unattended
         // resume must not be what decides to discard a cache.
-        while budget_ms.is_none()
-            && !journal.remaining_environment_caches.is_empty()
-            && !check_deadline(deadline)
-        {
+        let environment_cache_visits = journal.remaining_environment_caches.len();
+        for _ in 0..environment_cache_visits {
+            if budget_ms.is_some()
+                || journal.remaining_environment_caches.is_empty()
+                || check_deadline(deadline)
+            {
+                break;
+            }
             let candidate = journal.remaining_environment_caches[0].clone();
-            match crate::environments::cache::host_gc_evict(&candidate) {
+            if !candidate.has_identity_bound_location() {
+                failures.push(format!(
+                    "{}: {}: this saved candidate predates filesystem-identity binding; no identity was inferred from disk. Archive the pending journal with aethyme broker gc abandon --confirm {} and review a fresh aethyme broker gc plan.",
+                    candidate.path,
+                    crate::retention::GC_ENVIRONMENT_CACHE_IDENTITY_MISSING,
+                    journal.digest
+                ));
+                let pending = journal.remaining_environment_caches.remove(0);
+                journal.remaining_environment_caches.push(pending);
+                write_journal(&journal_path, &journal)?;
+                continue;
+            }
+            let outcome = crate::environments::cache::host_gc_evict(&candidate, deadline, || {
+                let current = journal
+                    .remaining_environment_caches
+                    .first_mut()
+                    .ok_or_else(|| {
+                        "environment cache candidate disappeared from journal".to_string()
+                    })?;
+                if current.path != candidate.path {
+                    return Err("environment cache journal order changed during apply".into());
+                }
+                let should_persist_start = !current.deletion_started;
+                if should_persist_start {
+                    current.deletion_started = true;
+                }
+                if should_persist_start && let Err(error) = write_journal(&journal_path, &journal) {
+                    journal.remaining_environment_caches[0].deletion_started = false;
+                    return Err(error.to_string());
+                }
+                Ok(())
+            });
+            match outcome {
                 Ok(true) => {
                     journal.reclaimed_bytes = journal
                         .reclaimed_bytes
                         .saturating_add(candidate.estimated_bytes);
-                    journal.environment_caches_reclaimed.push(candidate.path);
+                    journal
+                        .environment_caches_reclaimed
+                        .push(candidate.path.clone());
+                    journal.remaining_environment_caches.remove(0);
                 }
                 // Gone is the outcome asked for; this run did not free it.
-                Ok(false) => {}
-                Err(reason) => failures.push(format!("{}: {reason}", candidate.path)),
+                Ok(false) => {
+                    journal.remaining_environment_caches.remove(0);
+                }
+                Err(reason) => {
+                    failures.push(format!("{}: {reason}", candidate.path));
+                    let pending = journal.remaining_environment_caches.remove(0);
+                    journal.remaining_environment_caches.push(pending);
+                }
             }
-            journal.remaining_environment_caches.remove(0);
             write_journal(&journal_path, &journal)?;
         }
 
@@ -10036,8 +10122,7 @@ impl Broker {
             && journal.remaining_environment_caches.is_empty()
             && journal.remaining_orphans.is_empty()
             && journal.remaining_recovery_archives.is_empty();
-        let recovery_action =
-            (!complete).then(|| format!("aethyme broker gc apply --confirm {}", journal.digest));
+        let recovery_action = gc_recovery_action(&journal, complete);
         let report = GcApplyReport {
             digest: journal.digest.clone(),
             complete,
@@ -10088,6 +10173,92 @@ mod tests {
     use super::*;
     use crate::disk_headroom::SweepUrgency;
     use std::cell::RefCell;
+
+    #[test]
+    fn an_old_environment_cache_journal_directs_archive_then_replan() {
+        let digest = "a".repeat(64);
+        let candidate = crate::GcEnvironmentCacheCandidate {
+            path: "/host/environments/cache/builds/repo/component/digest".into(),
+            repository: String::new(),
+            component: "component".into(),
+            digest: "digest".into(),
+            cache_root: String::new(),
+            cache_root_device: 0,
+            cache_root_inode: 0,
+            entry_device: 0,
+            entry_inode: 0,
+            cache_key: None,
+            deletion_started: false,
+            estimated_bytes: 1,
+            estimated_inodes: None,
+            last_used_at_ms: None,
+            reason: "legacy fixture".into(),
+        };
+        let mut journal = GcJournal {
+            schema_version: GC_PLAN_SCHEMA_VERSION,
+            digest: digest.clone(),
+            evaluated_at: 0,
+            age_anchor_ms: Some(0),
+            policy: crate::retention::RetentionPolicy::default(),
+            remaining_rows: Vec::new(),
+            remaining_files: Vec::new(),
+            remaining_worktrees: Vec::new(),
+            remaining_artifacts: Vec::new(),
+            remaining_orphans: Vec::new(),
+            remaining_gate_caches: Vec::new(),
+            remaining_environment_caches: vec![candidate],
+            remaining_checkpoint_pin_releases: Vec::new(),
+            remaining_publication_exposure_expiries: Vec::new(),
+            remaining_recovery_archives: Vec::new(),
+            rows_removed: 0,
+            files_completed: Vec::new(),
+            sessions_cleaned: Vec::new(),
+            artifacts_reclaimed: Vec::new(),
+            orphans_removed: Vec::new(),
+            gate_caches_reclaimed: Vec::new(),
+            environment_caches_reclaimed: Vec::new(),
+            checkpoint_pins_released: Vec::new(),
+            publication_exposures_expired: Vec::new(),
+            recovery_archives_removed: Vec::new(),
+            reclaimed_bytes: 0,
+        };
+
+        let action = gc_recovery_action(&journal, false).unwrap();
+        assert_eq!(
+            action,
+            format!("aethyme broker gc abandon --confirm {digest}")
+        );
+        assert_eq!(journal.remaining_environment_caches.len(), 1);
+
+        {
+            let candidate = &mut journal.remaining_environment_caches[0];
+            candidate.repository = "tmprepo".into();
+            candidate.digest = "0123456789abcdef".into();
+            candidate.path =
+                "/host/environments/cache/builds/tmprepo/component/0123456789abcdef".into();
+            candidate.cache_root = "/host/environments/cache".into();
+            candidate.cache_root_device = 1;
+            candidate.cache_root_inode = 2;
+            candidate.entry_device = 1;
+            candidate.entry_inode = 3;
+        }
+        let expected_abandon = format!("aethyme broker gc abandon --confirm {digest}");
+        assert_eq!(
+            gc_recovery_action(&journal, false).as_deref(),
+            Some(expected_abandon.as_str()),
+            "an identity-bound legacy candidate without its build lock still requires archive and replan"
+        );
+
+        journal.remaining_environment_caches[0].cache_key = Some(format!(
+            "aethyme-env-build:/tmp/repo:component:0123456789abcdef{}",
+            "a".repeat(48)
+        ));
+        let expected = format!("aethyme broker gc apply --confirm {digest}");
+        assert_eq!(
+            gc_recovery_action(&journal, false).as_deref(),
+            Some(expected.as_str())
+        );
+    }
 
     enum ArtifactSweepTestMutation {
         InterruptAfterFirstUnlink {

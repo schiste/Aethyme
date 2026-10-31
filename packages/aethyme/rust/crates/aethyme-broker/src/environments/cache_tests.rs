@@ -424,6 +424,7 @@ fn prune_evicts_nothing_when_live_use_is_unknown() {
 /// #1275: `broker gc plan` proposes the unused build of this repository and
 /// never the one a live environment uses; `gc apply` evicts through the same
 /// key and use check as prune, and keeps an entry used since the plan.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn gc_proposes_and_evicts_only_an_unused_build() {
     let host = tempfile::tempdir().unwrap();
@@ -437,14 +438,29 @@ fn gc_proposes_and_evicts_only_an_unused_build() {
     let live = up(&mut lifecycle, &text, b.path());
     let root = lifecycle.root.clone();
     let plan = |lifecycle: &Lifecycle| {
-        super::cache::gc_inventory(Some(&lifecycle.store), &root, "repo-cache", 0)
+        super::cache::gc_inventory(Some(&lifecycle.store), &root, "repo-cache", 0, None)
     };
 
     let (inventory, candidates) = plan(&lifecycle);
     let inventory = inventory.expect("this repository has cache entries");
-    assert_eq!(inventory.build_entries, 2, "{inventory:?}");
-    assert_eq!(inventory.in_use_entries, 1, "{inventory:?}");
+    assert_eq!(inventory.build_entries, Some(2), "{inventory:?}");
+    assert_eq!(inventory.in_use_entries, Some(1), "{inventory:?}");
     assert_eq!(candidates.len(), 1, "{candidates:?}");
+    let mut legacy_candidate = candidates[0].clone();
+    legacy_candidate.repository.clear();
+    legacy_candidate.cache_root.clear();
+    let refusal = lifecycle
+        .evict_planned_build(&legacy_candidate)
+        .expect_err("a pre-identity plan must not be rebound from current disk state");
+    assert!(
+        refusal.contains("environment_cache_identity_missing"),
+        "{refusal}"
+    );
+    assert!(
+        Path::new(&legacy_candidate.path)
+            .join(super::cache::KEY_FILE)
+            .exists()
+    );
     let used = lifecycle
         .cache_entries()
         .into_iter()
@@ -452,14 +468,42 @@ fn gc_proposes_and_evicts_only_an_unused_build() {
         .unwrap();
     assert_ne!(Path::new(&candidates[0].path), used.path);
     assert!(
-        super::cache::gc_inventory(Some(&lifecycle.store), &root, "other", 0)
+        super::cache::gc_inventory(Some(&lifecycle.store), &root, "other", 0, None)
             .0
             .is_none()
     );
 
     // The used build, even if a plan named it, is kept.
     let mut forged = candidates[0].clone();
-    forged.path = used.path.to_string_lossy().into_owned();
+    let canonical_cache = std::fs::canonicalize(root.join(super::cache::CACHE_DIRECTORY)).unwrap();
+    let canonical_used = std::fs::canonicalize(&used.path).unwrap();
+    let relative_used = canonical_used
+        .strip_prefix(canonical_cache.join(super::cache::BUILDS))
+        .unwrap();
+    let mut components = relative_used.components();
+    forged.repository = components
+        .next()
+        .unwrap()
+        .as_os_str()
+        .to_str()
+        .unwrap()
+        .into();
+    forged.component = components
+        .next()
+        .unwrap()
+        .as_os_str()
+        .to_str()
+        .unwrap()
+        .into();
+    forged.digest = components
+        .next()
+        .unwrap()
+        .as_os_str()
+        .to_str()
+        .unwrap()
+        .into();
+    assert!(components.next().is_none());
+    forged.path = canonical_used.to_string_lossy().into_owned();
     forged.last_used_at_ms = used.last_used;
     let kept = lifecycle.evict_planned_build(&forged).unwrap_err();
     assert!(kept.contains("in use"), "{kept}");
@@ -488,4 +532,98 @@ fn gc_proposes_and_evicts_only_an_unused_build() {
     let kept = lifecycle.evict_planned_build(&candidates[0]).unwrap_err();
     assert!(kept.contains("used since"), "{kept}");
     assert!(complete.exists());
+}
+
+/// A partial host walk is never exposed as a complete report or eviction set.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn gc_withholds_partial_inventory_when_later_repository_is_unsafe() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("environments");
+    let cache = root.join(super::cache::CACHE_DIRECTORY);
+    let repository = "repo-cache";
+    let build = cache
+        .join(super::cache::BUILDS)
+        .join(repository)
+        .join("component")
+        .join("digest");
+    std::fs::create_dir_all(&build).unwrap();
+    std::fs::write(build.join(super::cache::KEY_FILE), "cache-key").unwrap();
+    std::fs::write(build.join(super::cache::COMPLETE), b"").unwrap();
+    std::fs::write(build.join("payload"), b"payload").unwrap();
+
+    let outside = temporary.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("sentinel"), b"keep").unwrap();
+    std::os::unix::fs::symlink(&outside, cache.join(super::cache::BUILDS).join("zz-link")).unwrap();
+
+    let (inventory, candidates) = super::cache::gc_inventory(None, &root, "repo-cache", 0, None);
+    let inventory = inventory.expect("the malformed host cache must be reported");
+    assert!(!inventory.complete, "{inventory:?}");
+    assert_eq!(inventory.refusal_code.as_deref(), Some("unsafe_path"));
+    assert!(inventory.host_total_bytes.is_none());
+    assert!(inventory.build_entries.is_none());
+    assert!(inventory.build_bytes.is_none());
+    assert!(inventory.in_use_entries.is_none());
+    assert!(inventory.in_use_bytes.is_none());
+    assert!(inventory.reclaimable_bytes.is_none());
+    assert!(inventory.template_entries.is_none());
+    assert!(
+        candidates.is_empty(),
+        "partial walk cannot authorize deletion"
+    );
+    assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"keep");
+}
+
+/// A live cacheable environment without readable use metadata authorizes no eviction.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn gc_withholds_candidates_when_a_live_use_record_is_missing() {
+    let host = tempfile::tempdir().unwrap();
+    let counter = host.path().join("builds.log");
+    let text = site(&counter);
+    let mut lifecycle = lifecycle(host.path());
+    let tree = worktree(&[("web/app.txt", "v1")]);
+    let live = up(&mut lifecycle, &text, tree.path());
+    let use_record = lifecycle.root.join(&live).join(super::cache::USES_FILE);
+    std::fs::remove_file(&use_record).unwrap();
+
+    let (inventory, candidates) = super::cache::gc_inventory(
+        Some(&lifecycle.store),
+        &lifecycle.root,
+        "repo-cache",
+        0,
+        None,
+    );
+    let inventory = inventory.expect("the cache entry is present");
+    assert!(!inventory.complete, "{inventory:?}");
+    assert_eq!(inventory.refusal_code.as_deref(), Some("store_unreadable"));
+    assert!(inventory.host_total_bytes.is_none());
+    assert!(candidates.is_empty());
+    assert!(use_record.parent().unwrap().exists());
+    lifecycle.down(&live, None).unwrap();
+}
+
+/// Expired bounded inventory also withholds every count and candidate.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn gc_withholds_inventory_when_deadline_is_already_expired() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("environments");
+    std::fs::create_dir_all(root.join(super::cache::CACHE_DIRECTORY)).unwrap();
+
+    let (inventory, candidates) = super::cache::gc_inventory(
+        None,
+        &root,
+        "repo-cache",
+        0,
+        Some(std::time::Instant::now()),
+    );
+    let inventory = inventory.expect("an incomplete scan is reportable");
+    assert!(!inventory.complete, "{inventory:?}");
+    assert_eq!(inventory.refusal_code.as_deref(), Some("deadline_exceeded"));
+    assert!(inventory.host_total_bytes.is_none());
+    assert!(inventory.build_entries.is_none());
+    assert!(inventory.reclaimable_bytes.is_none());
+    assert!(candidates.is_empty());
 }

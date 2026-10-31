@@ -321,19 +321,51 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool, full_scan: bool
     }
     // The host environment build cache, this repository's part (#1275).
     if let Some(cache) = &plan.environment_cache {
-        out!(
-            "  environment cache: {} in {} {} at {}; {} in use, {} reclaimable; {} {}; budget {} for the whole cache ({} used)",
-            human_bytes(cache.build_bytes),
-            cache.build_entries,
-            crate::broker::plural_word(cache.build_entries, "build", "builds"),
-            cache.root,
-            human_bytes(cache.in_use_bytes),
-            human_bytes(cache.reclaimable_bytes),
-            cache.template_entries,
-            crate::broker::plural_word(cache.template_entries, "template", "templates"),
-            human_bytes(cache.budget_bytes),
-            human_bytes(cache.host_total_bytes),
-        );
+        if cache.complete {
+            if let (
+                Some(build_bytes),
+                Some(build_entries),
+                Some(in_use_bytes),
+                Some(reclaimable_bytes),
+                Some(template_entries),
+                Some(host_total_bytes),
+            ) = (
+                cache.build_bytes,
+                cache.build_entries,
+                cache.in_use_bytes,
+                cache.reclaimable_bytes,
+                cache.template_entries,
+                cache.host_total_bytes,
+            ) {
+                out!(
+                    "  environment cache: {} in {} {} at {}; {} in use, {} reclaimable; {} {}; budget {} for the whole cache ({} used)",
+                    human_bytes(build_bytes),
+                    build_entries,
+                    crate::broker::plural_word(build_entries, "build", "builds"),
+                    cache.root,
+                    human_bytes(in_use_bytes),
+                    human_bytes(reclaimable_bytes),
+                    template_entries,
+                    crate::broker::plural_word(template_entries, "template", "templates"),
+                    human_bytes(cache.budget_bytes),
+                    human_bytes(host_total_bytes),
+                );
+            } else {
+                out!(
+                    "  environment cache: inventory status is invalid at {}",
+                    cache.root
+                );
+            }
+        } else {
+            out!(
+                "  environment cache: incomplete inventory at {}; totals withheld (budget {})",
+                cache.root,
+                human_bytes(cache.budget_bytes),
+            );
+        }
+        if let Some(code) = &cache.refusal_code {
+            out!("    inventory refusal ({code})");
+        }
         if let Some(reason) = &cache.refused {
             out!("    nothing proposed: {reason}");
         }
