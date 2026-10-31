@@ -410,6 +410,65 @@ min_profile = "isolated"
     assert_eq!(code, 0);
 }
 
+/// #1239: `env budgets` reports declared budgets against what the
+/// orchestrator recorded: nothing before any run, then the cold up and the
+/// down it timed.
+#[test]
+fn budgets_report_recorded_timings_against_declared_budgets() {
+    let environments = r#"
+schema = 1
+[[profiles]]
+name = "backend"
+[[profiles.components]]
+name = "db"
+runtime = "hooks"
+provision = "true"
+destroy = "true"
+[budgets.seconds]
+"up.cold" = 600
+"up.backend" = 30
+down = 60
+[budgets.memory_mib]
+backend = 350
+"#;
+    let fixture = Fixture::new(Some(environments));
+    let (code, before) = fixture.json(&["env", "budgets"]);
+    assert_eq!(code, 0, "{before}");
+    assert_eq!(before["schema"], "aethyme.env-budgets/v1");
+    let status = |value: &serde_json::Value, metric: &str| {
+        value["metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["metric"] == metric)
+            .unwrap_or_else(|| panic!("{metric} missing: {value}"))
+            .clone()
+    };
+    assert_eq!(status(&before, "up.cold")["status"], "no-data");
+    assert_eq!(status(&before, "memory.backend")["status"], "no-data");
+
+    let (code, up) = fixture.json(&["env", "up", "--wait", "5"]);
+    assert_eq!(code, 0, "{up}");
+    let env_id = up["env_id"].as_str().unwrap().to_string();
+    let (code, down) = fixture.json(&["env", "down", &env_id]);
+    assert_eq!(code, 0, "{down}");
+
+    let (code, after) = fixture.json(&["env", "budgets"]);
+    assert_eq!(code, 0, "{after}");
+    let cold = status(&after, "up.cold");
+    assert_eq!(
+        (cold["count"].as_u64(), cold["status"].as_str()),
+        (Some(1), Some("ok")),
+        "{after}"
+    );
+    assert_eq!(status(&after, "down")["count"], 1, "{after}");
+    assert_eq!(
+        status(&after, "up.backend")["status"],
+        "no-data",
+        "no warm up yet"
+    );
+}
+
 /// #1295 through the router: `--component` selects an optional component,
 /// a later plain `env up` keeps it, and an unknown name is refused.
 #[test]

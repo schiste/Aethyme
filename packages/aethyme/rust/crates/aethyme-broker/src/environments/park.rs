@@ -33,7 +33,7 @@
 
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -84,7 +84,18 @@ impl Lifecycle {
     ) -> Result<EnvironmentRecord, LifecycleError> {
         let record = self.store.resolve(env_id)?;
         let _operation = self.operation_lock(&record.env_id)?;
-        self.park_locked(&record.env_id, reason)
+        let started = Instant::now();
+        let result = self.park_locked(&record.env_id, reason);
+        if record.phase == EnvironmentPhase::Active {
+            self.record_timing(
+                &record.repository,
+                "park",
+                &record.env_id,
+                started,
+                result.is_ok(),
+            );
+        }
+        result
     }
 
     pub(super) fn park_locked(
@@ -272,7 +283,19 @@ impl Lifecycle {
         let record = self.store.resolve(env_id)?;
         self.wake_shared_dependencies(&record, wait)?;
         let _operation = self.operation_lock(&record.env_id)?;
-        self.wake_locked(&record.env_id, wait)
+        let started = Instant::now();
+        let result = self.wake_locked(&record.env_id, wait);
+        // Waking is a warm up: everything provisioned is kept (#1239).
+        if record.phase == EnvironmentPhase::Parked {
+            self.record_timing(
+                &record.repository,
+                &format!("up.{}", record.profile),
+                &record.env_id,
+                started,
+                result.is_ok(),
+            );
+        }
+        result
     }
 
     /// A consumer's shared environments may have parked while it was parked

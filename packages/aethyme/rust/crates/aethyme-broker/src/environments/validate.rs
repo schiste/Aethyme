@@ -93,6 +93,47 @@ impl Collector<'_> {
     }
 }
 
+/// Budgets must be positive, and a memory budget must name a declared
+/// profile (it is measured per profile). Time metric names are free: hooks
+/// may report their own.
+fn validate_budgets(c: &mut Collector<'_>, file: &EnvironmentsFile) {
+    for (metric, seconds) in &file.budgets.seconds {
+        if metric.is_empty() || *seconds == 0 {
+            c.push(
+                "invalid_budget",
+                None,
+                None,
+                Some("budgets.seconds"),
+                format!(
+                    "budget {metric:?} must be a non-empty name with a positive number of seconds"
+                ),
+                "e.g. [budgets.seconds] \"up.backend\" = 30",
+            );
+        }
+    }
+    for (profile, mib) in &file.budgets.memory_mib {
+        if *mib == 0 {
+            c.push(
+                "invalid_budget",
+                Some(profile),
+                None,
+                Some("budgets.memory_mib"),
+                format!("memory budget for {profile:?} must be a positive number of MiB"),
+                "e.g. [budgets.memory_mib] backend = 350",
+            );
+        } else if !file.profiles.iter().any(|p| &p.name == profile) {
+            c.push(
+                "unknown_profile",
+                Some(profile),
+                None,
+                Some("budgets.memory_mib"),
+                format!("memory budget names {profile:?}, which is not a declared profile"),
+                "use a profile name from [[profiles]]",
+            );
+        }
+    }
+}
+
 /// `[a-z][a-z0-9_-]{0,31}`: names become hostnames, lease keys and
 /// environment-variable suffixes, so they stay in the intersection of all three.
 pub fn valid_name(name: &str) -> bool {
@@ -185,6 +226,7 @@ pub fn validate(
     }
 
     validate_pools(&mut c, file, host, host_label);
+    validate_budgets(&mut c, file);
 
     let mut names = BTreeSet::new();
     let mut ranks: BTreeMap<u32, &str> = BTreeMap::new();

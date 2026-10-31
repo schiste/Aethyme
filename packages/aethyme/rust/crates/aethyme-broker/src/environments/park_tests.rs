@@ -511,6 +511,57 @@ fn up_on_a_parked_environment_wakes_it_and_park_is_idempotent() {
     lifecycle.down(&snapshot.env_id, None).unwrap();
 }
 
+/// #1239: every step Aethyme drives is timed under its metric. A cold up
+/// provisions, a warm up (waking a parked environment) does not; an up of
+/// an environment already up and a repeated park are not timed; a hook's
+/// own durations are recorded from its receipt.
+#[test]
+fn every_lifecycle_step_is_timed_under_its_metric() {
+    let host = Host::new();
+    let worktree = tempfile::tempdir().unwrap();
+    let text = one_unit(43960).replace(
+        "[[profiles.components]]\nname = \"api\"",
+        "[[profiles.components]]\nname = \"db\"\nruntime = \"hooks\"\nprovision = 'echo \"AETHYME_RECEIPT {\\\"metrics\\\": {\\\"clone\\\": 6.5}}\"'\ndestroy = \"true\"\n[[profiles.components]]\nname = \"api\"",
+    );
+    let snapshot = snapshot(&text, worktree.path());
+    let mut lifecycle = host.lifecycle();
+    lifecycle
+        .up(&snapshot, worktree.path(), None, None, &up_options())
+        .unwrap();
+    lifecycle.park(&snapshot.env_id, "test").unwrap();
+    lifecycle.park(&snapshot.env_id, "test").unwrap();
+    lifecycle
+        .up(&snapshot, worktree.path(), None, None, &up_options())
+        .unwrap();
+    lifecycle
+        .up(&snapshot, worktree.path(), None, None, &up_options())
+        .unwrap();
+    lifecycle.down(&snapshot.env_id, None).unwrap();
+
+    let timings = lifecycle.store.timings("repo-park").unwrap();
+    let counts: std::collections::BTreeMap<&str, usize> = timings
+        .iter()
+        .map(|(metric, values)| (metric.as_str(), values.iter().filter(|t| t.ok).count()))
+        .collect();
+    let expected: std::collections::BTreeMap<&str, usize> = [
+        ("up.cold", 1),
+        ("up.p", 1),
+        ("park", 1),
+        ("down", 1),
+        ("provision.db", 1),
+        ("provision.api", 1),
+        ("start.db", 1),
+        ("start.api", 1),
+        ("health.db", 1),
+        ("health.api", 1),
+        ("clone", 1),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(counts, expected);
+    assert_eq!(timings["clone"][0].seconds, 6.5);
+}
+
 fn identity_of(lifecycle: &Lifecycle, env_id: &str, name: &str) -> Option<ComponentIdentity> {
     lifecycle
         .store
