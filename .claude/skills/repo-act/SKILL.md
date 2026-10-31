@@ -659,6 +659,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   example `TMPDIR=/private/tmp`). Preserve both logs and the effective argv;
   a successful environment-only rerun does not classify other failures or
   justify weakening path assertions or marking the full gate passed.
+- When a fixture needs raw filename bytes, do not assume Unix APIs mean the host
+  filesystem accepts every byte sequence. Keep the portable behavior under test
+  on every platform; gate invalid-byte cases to an explicitly supporting target
+  or probe that capability. Do not blanket-ignore creation errors or weaken
+  production path checks to make an unsupported fixture pass.
 - Before a long or frozen Rust inventory, verify each selected
   `--package`/`--test` pair against the owning package's effective Cargo
   targets: the `tests/` defaults and any `[[test]]` or `autotests` settings
