@@ -509,3 +509,82 @@ fn up_on_a_parked_environment_wakes_it_and_park_is_idempotent() {
     }
     lifecycle.down(&snapshot.env_id, None).unwrap();
 }
+
+fn identity_of(lifecycle: &Lifecycle, env_id: &str, name: &str) -> Option<ComponentIdentity> {
+    lifecycle
+        .store
+        .components(env_id)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.component == name)
+        .and_then(|c| c.identity)
+        .and_then(|v| serde_json::from_value(v).ok())
+}
+
+/// #1294 acceptance: restarting one component gives it a new process on the
+/// same port and leaves every other component running as it was; with no
+/// component, every running one restarts; a parked environment is refused
+/// with `not_active`.
+#[test]
+fn restart_replaces_one_component_and_keeps_its_port_and_the_rest() {
+    let host = Host::new();
+    let worktree = tempfile::tempdir().unwrap();
+    let text = format!(
+        "{}{}",
+        one_unit(43360),
+        r#"[[profiles.components]]
+name = "worker"
+runtime = "process"
+depends_on = ["api"]
+start = "exec sleep 300"
+"#
+    );
+    let snapshot = snapshot(&text, worktree.path());
+    let env_id = snapshot.env_id.clone();
+    let mut lifecycle = host.lifecycle();
+    let up = lifecycle
+        .up(&snapshot, worktree.path(), None, None, &up_options())
+        .unwrap();
+    let port = lifecycle.bindings_for(&up).unwrap().ports["api"];
+    let api = identity_of(&lifecycle, &env_id, "api").unwrap();
+    let worker = identity_of(&lifecycle, &env_id, "worker").unwrap();
+
+    let (record, restarted) = lifecycle.restart(&env_id, Some("api")).unwrap();
+    assert_eq!(restarted, vec!["api".to_string()]);
+    assert_eq!(record.phase, EnvironmentPhase::Active);
+    let new_api = identity_of(&lifecycle, &env_id, "api").unwrap();
+    assert_ne!(new_api, api, "a new api process");
+    if let ComponentIdentity::Process(process) = &api {
+        assert_eq!(process.observe(), Observation::Gone, "the old one stopped");
+    }
+    assert_eq!(lifecycle.bindings_for(&record).unwrap().ports["api"], port);
+    assert_eq!(
+        identity_of(&lifecycle, &env_id, "worker"),
+        Some(worker.clone()),
+        "the worker kept running untouched"
+    );
+    assert!(
+        lifecycle
+            .store
+            .transitions(&env_id, 10)
+            .unwrap()
+            .iter()
+            .any(|t| t.reason == "restarted"),
+        "the restart is in the history"
+    );
+
+    let (_, restarted) = lifecycle.restart(&env_id, None).unwrap();
+    assert_eq!(restarted, vec!["api".to_string(), "worker".to_string()]);
+    assert_ne!(identity_of(&lifecycle, &env_id, "worker"), Some(worker));
+
+    match lifecycle.restart(&env_id, Some("nope")) {
+        Err(error) => assert_eq!(error.code(), "not_found"),
+        Ok(_) => panic!("an unknown component restarted"),
+    }
+    lifecycle.park(&env_id, "test").unwrap();
+    match lifecycle.restart(&env_id, Some("api")) {
+        Err(error) => assert_eq!(error.code(), "not_active"),
+        Ok(_) => panic!("a parked environment restarted"),
+    }
+    lifecycle.down(&env_id, None).unwrap();
+}

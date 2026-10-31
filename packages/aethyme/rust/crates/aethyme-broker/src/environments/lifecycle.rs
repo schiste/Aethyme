@@ -65,6 +65,8 @@ pub enum LifecycleError {
         "environment {env_id} was brought up from a different profile snapshot; pass --reconfigure to destroy and recreate it"
     )]
     ReconfigureRequired { env_id: String },
+    #[error("environment {env_id} is {phase}; only an active environment restarts")]
+    NotActive { env_id: String, phase: &'static str },
     #[error("{0}")]
     Io(String),
 }
@@ -79,6 +81,7 @@ impl LifecycleError {
             Self::Driver(error) => error.code(),
             Self::WrongPhase { .. } => "wrong_phase",
             Self::ReconfigureRequired { .. } => "reconfigure_required",
+            Self::NotActive { .. } => "not_active",
             Self::Io(_) => "io_error",
         }
     }
