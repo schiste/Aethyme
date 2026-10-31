@@ -18,8 +18,8 @@ use crate::{
     GcCheckpointPinRelease, GcDeclinedArtifact, GcFileAction, GcFileCandidate,
     GcGateCacheCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcPublicationExposureExpiry,
     GcRecoveryArchiveCandidate, GcRowCandidate, GcWorktreeBlockerSummary, GcWorktreeCandidate,
-    GitRepo, OperationStatus, RecoveryArchiveInventory, RetentionPolicy, load_retention_policy,
-    load_retention_policy_report,
+    GitRepo, OperationStatus, RecoveryArchiveInventory, RetentionPolicy,
+    SessionRetirementDeferredReason, load_retention_policy, load_retention_policy_report,
 };
 
 mod tree_removal;
@@ -159,6 +159,31 @@ pub(crate) const AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY: &str =
 /// Backoff for a whole-checkout cleanup continuation that made no progress.
 pub(crate) const AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY: &str =
     "gc.artifact_sweep.checkout_cleanup_retry_after_ms";
+/// Separate bounded request for open-session retirement. Its retry is
+/// independent of closed-checkout grace and physical-removal cooldowns.
+const SESSION_RETIREMENT_STATE_KEY: &str = "gc.artifact_sweep.session_retirement_state";
+const SESSION_RETIREMENT_STATE_VERSION: u8 = 1;
+const SESSION_RETIREMENT_STATE_CAS_ATTEMPTS: usize = 4;
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct SessionRetirementRequestState {
+    version: u8,
+    requested_generation: i64,
+    completed_generation: i64,
+    retry_after_ms: i64,
+}
+
+impl Default for SessionRetirementRequestState {
+    fn default() -> Self {
+        Self {
+            version: SESSION_RETIREMENT_STATE_VERSION,
+            requested_generation: 0,
+            completed_generation: 0,
+            retry_after_ms: 0,
+        }
+    }
+}
 /// One-time bounded backfill of retained closed Spawned rows when the opt-in
 /// compact policy is enabled. This schedules witnessed candidates; the
 /// per-session outbox and fresh removal proof remain authoritative.
@@ -205,10 +230,18 @@ const AUTO_COMPACT_BACKFILL_PAGE_SIZE: usize = 32;
 fn artifact_worker_cache_lane_duration(
     checkout_cleanup_due: bool,
     compact_checkout_due: bool,
+    session_retirement_due: bool,
 ) -> Duration {
     let mut reserve = Duration::ZERO;
     if checkout_cleanup_due {
         reserve = reserve.saturating_add(AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE);
+    }
+    // Always keep one retirement tranche after the cache lane for requests
+    // that arrive while this singleton worker is busy. When retirement is
+    // already due, keep a second tranche for the pre-cache pass.
+    reserve = reserve.saturating_add(SESSION_RETIREMENT_WORKER_RESERVE);
+    if session_retirement_due {
+        reserve = reserve.saturating_add(SESSION_RETIREMENT_WORKER_RESERVE);
     }
     if compact_checkout_due {
         reserve = reserve.saturating_add(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE);
@@ -260,6 +293,14 @@ fn compact_checkout_pending_is_due(
 /// Each whole-checkout pass has its own bounded tranche; the cursor resumes
 /// after candidates inspected before this deadline.
 const AUTO_CHECKOUT_CLEANUP_WORKER_PASS_BUDGET: Duration = Duration::from_secs(30);
+/// A due session-retirement request keeps its own tranche in the detached
+/// worker, even when the physical checkout-cleanup lane is cooling down.
+const SESSION_RETIREMENT_WORKER_RESERVE: Duration = Duration::from_secs(30);
+const SESSION_RETIREMENT_WORKER_PASS_BUDGET: Duration = Duration::from_secs(30);
+// One pass can inspect up to 128 open sessions. Keep serialized report size
+// bounded even when every inspected session has an unresolved reason.
+const SESSION_RETIREMENT_WORKER_MAX_PASSES: usize = 16;
+const SESSION_RETIREMENT_WORKER_RETRY_MS: i64 = 10 * 60_000;
 /// A general foreground sweep reserves up to one cleanup-worker pass for
 /// whole-checkout work, while leaving at least half of the pass for caches.
 const AUTO_CHECKOUT_CLEANUP_FOREGROUND_RESERVE: Duration = AUTO_CHECKOUT_CLEANUP_WORKER_PASS_BUDGET;
@@ -1336,9 +1377,9 @@ fn recovery_archive_minimum_age_elapsed(
     archive: &crate::cleanup_resolve::OwnedRecoveryArchive,
     now: i64,
 ) -> bool {
-    let Some(minimum_age_ms) = archive.minimum_archive_retention_ms else {
-        return true;
-    };
+    let minimum_age_ms = archive
+        .minimum_archive_retention_ms
+        .unwrap_or(crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS);
     now.checked_sub(archive.created_at_ms)
         .and_then(|age| u64::try_from(age).ok())
         .is_some_and(|age| age >= minimum_age_ms)
@@ -1348,9 +1389,10 @@ fn recovery_archive_minimum_age_elapsed(
 mod recovery_archive_minimum_age_tests {
     use super::recovery_archive_minimum_age_elapsed;
     use crate::cleanup_resolve::OwnedRecoveryArchive;
+    use crate::retention::MIN_RECOVERY_ARCHIVE_RETENTION_MS;
 
     #[test]
-    fn immutable_age_uses_exact_boundary_and_fails_closed_on_clock_overflow() {
+    fn immutable_and_legacy_age_use_exact_boundary_and_fail_closed_on_clock_overflow() {
         let mut archive = OwnedRecoveryArchive {
             path: "/fixture/archive".into(),
             session_id: 1,
@@ -1361,28 +1403,40 @@ mod recovery_archive_minimum_age_tests {
                 available_from_delivery: false,
             }],
             created_at_ms: 100,
-            minimum_archive_retention_ms: Some(1_296_000_000),
+            minimum_archive_retention_ms: Some(MIN_RECOVERY_ARCHIVE_RETENTION_MS),
             prerequisite_refs: Vec::new(),
             retirement_digest: None,
             prerequisite_targets: Vec::new(),
             holds_uncommitted: false,
         };
+        let minimum_age_ms = i64::try_from(MIN_RECOVERY_ARCHIVE_RETENTION_MS).unwrap();
         assert!(!recovery_archive_minimum_age_elapsed(&archive, 99));
         assert!(!recovery_archive_minimum_age_elapsed(
             &archive,
-            1_296_000_099
+            100 + minimum_age_ms - 1
         ));
         assert!(recovery_archive_minimum_age_elapsed(
             &archive,
-            1_296_000_100
+            100 + minimum_age_ms
         ));
         archive.created_at_ms = i64::MIN;
         assert!(!recovery_archive_minimum_age_elapsed(&archive, i64::MAX));
         archive.created_at_ms = 0;
         archive.minimum_archive_retention_ms = Some(u64::MAX);
         assert!(!recovery_archive_minimum_age_elapsed(&archive, i64::MAX));
+        archive.created_at_ms = 100;
         archive.minimum_archive_retention_ms = None;
-        assert!(recovery_archive_minimum_age_elapsed(&archive, 0));
+        assert!(!recovery_archive_minimum_age_elapsed(&archive, 99));
+        assert!(!recovery_archive_minimum_age_elapsed(
+            &archive,
+            100 + minimum_age_ms - 1
+        ));
+        assert!(recovery_archive_minimum_age_elapsed(
+            &archive,
+            100 + minimum_age_ms
+        ));
+        archive.created_at_ms = i64::MIN;
+        assert!(!recovery_archive_minimum_age_elapsed(&archive, i64::MAX));
     }
 }
 
@@ -5250,7 +5304,7 @@ impl Broker {
         let journal_path = self.main_root().join(".aethyme/gc-journal.json");
         let resumed = match load_journal(&journal_path)? {
             Some(journal) => {
-                Some(self.gc_apply_bounded(&journal.digest, Some(policy.startup_budget_ms))?)
+                Some(self.apply_confirmed_gc_journal(journal, policy.startup_budget_ms)?)
             }
             None => None,
         };
@@ -5268,6 +5322,35 @@ impl Broker {
             self.maybe_start_artifact_sweep_worker(false),
         );
         Ok(resumed)
+    }
+
+    /// Resume a confirmed GC journal without probing preparation-cache debt,
+    /// sweeping artifacts, or admitting the detached maintenance worker.
+    /// Explicit cleanup resolve uses this open-time path because it must keep
+    /// normal writable-open recovery while avoiding unrelated cleanup work.
+    pub(crate) fn resume_confirmed_gc_journal_only(
+        &mut self,
+    ) -> Result<Option<GcApplyReport>, BrokerOpError> {
+        if std::env::var_os(ARTIFACT_SWEEP_WORKER_ENV).is_some() {
+            // Worker processes have their own scoped continuation lane and
+            // must not resume operator-authorized whole-repository journals.
+            return Ok(None);
+        }
+        let journal_path = self.main_root().join(".aethyme/gc-journal.json");
+        let Some(journal) = load_journal(&journal_path)? else {
+            return Ok(None);
+        };
+        let policy = load_retention_policy(self.main_root())?;
+        self.apply_confirmed_gc_journal(journal, policy.startup_budget_ms)
+            .map(Some)
+    }
+
+    fn apply_confirmed_gc_journal(
+        &mut self,
+        journal: GcJournal,
+        startup_budget_ms: u64,
+    ) -> Result<GcApplyReport, BrokerOpError> {
+        self.gc_apply_bounded(&journal.digest, Some(startup_budget_ms))
     }
 
     fn request_recovery_for_rotation_debt(&mut self) -> Result<(), BrokerOpError> {
@@ -5500,6 +5583,293 @@ impl Broker {
         self.queue_pending_checkout_cleanup_generation(next_due)
     }
 
+    fn is_session_retirement_state_unavailable(error: &BrokerOpError) -> bool {
+        matches!(
+            error,
+            BrokerOpError::Store(
+                crate::BrokerError::SessionRetirementDatabaseBusy
+                    | crate::BrokerError::InvalidSessionRetirementState(_)
+            )
+        )
+    }
+
+    fn note_invalid_session_retirement_state(&mut self, error: &BrokerOpError) {
+        if matches!(
+            error,
+            BrokerOpError::Store(crate::BrokerError::InvalidSessionRetirementState(_))
+        ) {
+            match self
+                .store()
+                .meta_get_for_session_retirement(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
+            {
+                Ok(current) if current.as_deref() == Some("session_retirement_state_invalid") => {}
+                Ok(current) => crate::warn_unrecorded(
+                    "record invalid session-retirement state",
+                    self.store()
+                        .meta_compare_and_set_for_session_retirement(
+                            ARTIFACT_SWEEP_WORKER_STATUS_KEY,
+                            current.as_deref(),
+                            "session_retirement_state_invalid",
+                        )
+                        .map(|_| ()),
+                ),
+                Err(crate::BrokerError::SessionRetirementDatabaseBusy) => {}
+                Err(error) => crate::warn_unrecorded(
+                    "record invalid session-retirement state",
+                    Err::<(), _>(error),
+                ),
+            }
+        }
+    }
+
+    fn note_session_retirement_state_unavailable(&mut self, error: &BrokerOpError) {
+        match error {
+            BrokerOpError::Store(crate::BrokerError::SessionRetirementDatabaseBusy) => {
+                crate::warn_unrecorded(
+                    "read or update durable session-retirement state",
+                    Err::<(), _>(crate::BrokerError::SessionRetirementDatabaseBusy),
+                );
+            }
+            BrokerOpError::Store(crate::BrokerError::InvalidSessionRetirementState(_)) => {
+                self.note_invalid_session_retirement_state(error);
+                // Keep the diagnostic stable and avoid echoing persisted bytes.
+                crate::warn_unrecorded(
+                    "read durable session-retirement state",
+                    Err::<(), _>("invalid versioned state"),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn load_session_retirement_state(
+        &mut self,
+    ) -> Result<(Option<String>, SessionRetirementRequestState), BrokerOpError> {
+        let raw = self
+            .store()
+            .meta_get_for_session_retirement(SESSION_RETIREMENT_STATE_KEY)?;
+        let Some(encoded) = raw.as_deref() else {
+            return Ok((raw, SessionRetirementRequestState::default()));
+        };
+        let state =
+            serde_json::from_str::<SessionRetirementRequestState>(encoded).map_err(|error| {
+                crate::BrokerError::InvalidSessionRetirementState(format!(
+                    "malformed versioned state: {error}"
+                ))
+            })?;
+        if state.version != SESSION_RETIREMENT_STATE_VERSION
+            || state.requested_generation < 0
+            || state.completed_generation < 0
+            || state.completed_generation > state.requested_generation
+            || state.retry_after_ms < 0
+        {
+            return Err(crate::BrokerError::InvalidSessionRetirementState(
+                "unsupported or inconsistent versioned state".into(),
+            )
+            .into());
+        }
+        Ok((raw, state))
+    }
+
+    fn store_session_retirement_state(
+        &mut self,
+        expected: Option<&str>,
+        state: &SessionRetirementRequestState,
+    ) -> Result<bool, BrokerOpError> {
+        let encoded = serde_json::to_string(state).map_err(|error| {
+            crate::BrokerError::InvalidSessionRetirementState(format!(
+                "could not encode versioned state: {error}"
+            ))
+        })?;
+        self.store()
+            .meta_compare_and_set_for_session_retirement(
+                SESSION_RETIREMENT_STATE_KEY,
+                expected,
+                &encoded,
+            )
+            .map_err(Into::into)
+    }
+
+    fn next_session_retirement_generation(
+        state: &SessionRetirementRequestState,
+    ) -> Result<i64, BrokerOpError> {
+        let requested = state.requested_generation.checked_add(1).ok_or_else(|| {
+            crate::BrokerError::InvalidSessionRetirementState("request generation overflow".into())
+        })?;
+        let completed = state.completed_generation.checked_add(1).ok_or_else(|| {
+            crate::BrokerError::InvalidSessionRetirementState(
+                "completion generation overflow".into(),
+            )
+        })?;
+        Ok(now_ms().max(requested).max(completed).max(1))
+    }
+
+    fn session_retirement_request_state(&mut self) -> Result<(i64, i64), BrokerOpError> {
+        let (_, state) = self.load_session_retirement_state()?;
+        Ok((state.requested_generation, state.completed_generation))
+    }
+
+    fn session_retirement_recovery_state(&mut self) -> Result<Option<bool>, BrokerOpError> {
+        match self.session_retirement_request_state() {
+            Ok((requested, completed)) => Ok(Some(requested > completed)),
+            Err(error) if Self::is_session_retirement_state_unavailable(&error) => {
+                self.note_session_retirement_state_unavailable(&error);
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn session_retirement_recovery_requested(&mut self) -> Result<bool, BrokerOpError> {
+        Ok(self.session_retirement_recovery_state()?.unwrap_or(false))
+    }
+
+    fn session_retirement_due_generation(
+        &mut self,
+        now: i64,
+    ) -> Result<Option<i64>, BrokerOpError> {
+        match self.load_session_retirement_state() {
+            Ok((_, state))
+                if state.requested_generation > state.completed_generation
+                    && state.retry_after_ms <= now =>
+            {
+                Ok(Some(state.requested_generation))
+            }
+            Ok(_) => Ok(None),
+            Err(error) if Self::is_session_retirement_state_unavailable(&error) => {
+                self.note_session_retirement_state_unavailable(&error);
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn request_session_retirement_if_due(
+        &mut self,
+        policy: &RetentionPolicy,
+        scope: ArtifactSweepScope,
+    ) -> Result<Option<i64>, BrokerOpError> {
+        if !scope_runs_checkout_cleanup(scope) || policy.session_abandoned_after_hours == 0 {
+            return Ok(None);
+        }
+        for _ in 0..SESSION_RETIREMENT_STATE_CAS_ATTEMPTS {
+            let (raw, mut state) = match self.load_session_retirement_state() {
+                Ok(value) => value,
+                Err(error) if Self::is_session_retirement_state_unavailable(&error) => {
+                    self.note_session_retirement_state_unavailable(&error);
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            if state.requested_generation > state.completed_generation {
+                return Ok(Some(state.requested_generation));
+            }
+            if state.retry_after_ms > now_ms() {
+                return Ok(None);
+            }
+            let generation = Self::next_session_retirement_generation(&state)?;
+            state.requested_generation = generation;
+            state.retry_after_ms = 0;
+            match self.store_session_retirement_state(raw.as_deref(), &state) {
+                Ok(true) => return Ok(Some(generation)),
+                Ok(false) => {}
+                Err(error) if Self::is_session_retirement_state_unavailable(&error) => {
+                    self.note_session_retirement_state_unavailable(&error);
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        crate::warn_unrecorded(
+            "enqueue durable session-retirement request",
+            Err::<(), _>("compare-and-set contention"),
+        );
+        Ok(None)
+    }
+
+    fn persist_session_retirement_request(
+        &mut self,
+        report: &crate::AutoCleanupReport,
+    ) -> Result<(), BrokerOpError> {
+        if report.retirement_deferred_reasons.is_empty() {
+            return Ok(());
+        }
+        for _ in 0..SESSION_RETIREMENT_STATE_CAS_ATTEMPTS {
+            let (raw, mut state) = match self.load_session_retirement_state() {
+                Ok(value) => value,
+                Err(error) if Self::is_session_retirement_state_unavailable(&error) => {
+                    self.note_session_retirement_state_unavailable(&error);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            if state.requested_generation > state.completed_generation
+                || state.retry_after_ms > now_ms()
+            {
+                return Ok(());
+            }
+            state.requested_generation = Self::next_session_retirement_generation(&state)?;
+            state.retry_after_ms = 0;
+            match self.store_session_retirement_state(raw.as_deref(), &state) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) if Self::is_session_retirement_state_unavailable(&error) => {
+                    self.note_session_retirement_state_unavailable(&error);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        crate::warn_unrecorded(
+            "persist deferred session-retirement request",
+            Err::<(), _>("compare-and-set contention"),
+        );
+        Ok(())
+    }
+
+    /// Complete only the generation whose retirement pass still owns GcLock.
+    /// The request, completion and retry deadline share one CAS state row, so
+    /// completion can advance only while the captured request is still current.
+    fn complete_session_retirement_request(
+        &mut self,
+        request_generation: i64,
+    ) -> Result<(), BrokerOpError> {
+        for _ in 0..SESSION_RETIREMENT_STATE_CAS_ATTEMPTS {
+            let (raw, mut state) = self.load_session_retirement_state()?;
+            if state.requested_generation != request_generation
+                || state.requested_generation <= state.completed_generation
+            {
+                return Ok(());
+            }
+            state.completed_generation = request_generation;
+            state.retry_after_ms = now_ms().saturating_add(SESSION_RETIREMENT_WORKER_RETRY_MS);
+            if self.store_session_retirement_state(raw.as_deref(), &state)? {
+                return Ok(());
+            }
+        }
+        Err(crate::BrokerError::SessionRetirementDatabaseBusy.into())
+    }
+
+    fn defer_session_retirement_request(
+        &mut self,
+        request_generation: i64,
+        reason: &str,
+    ) -> Result<(), BrokerOpError> {
+        for _ in 0..SESSION_RETIREMENT_STATE_CAS_ATTEMPTS {
+            let (raw, mut state) = self.load_session_retirement_state()?;
+            if state.requested_generation != request_generation
+                || state.requested_generation <= state.completed_generation
+            {
+                return Ok(());
+            }
+            state.retry_after_ms = now_ms().saturating_add(SESSION_RETIREMENT_WORKER_RETRY_MS);
+            if self.store_session_retirement_state(raw.as_deref(), &state)? {
+                return self.write_artifact_sweep_worker_status(reason);
+            }
+        }
+        Err(crate::BrokerError::SessionRetirementDatabaseBusy.into())
+    }
+
     /// Record a separate continuation request only when a general automatic
     /// checkout-cleanup pass deferred work. This is called under the sweep's
     /// GC lock; cache backlog alone and FinishDrain never create cleanup
@@ -5509,13 +5879,16 @@ impl Broker {
         scope: ArtifactSweepScope,
         report: &crate::auto_cleanup::AutoCleanupReport,
     ) -> Result<(), BrokerOpError> {
-        let retirement_deferred = !report.retirement_deferred_reasons.is_empty();
         if !matches!(
             scope,
             ArtifactSweepScope::Inline | ArtifactSweepScope::Drain
-        ) || (!report.enabled && !retirement_deferred)
-            || report.deferred == 0
-        {
+        ) {
+            return Ok(());
+        }
+        let retirement_deferred = !report.retirement_deferred_reasons.is_empty();
+        self.persist_session_retirement_request(report)?;
+        let checkout_deferred = report.deferred > report.retirement_deferred_reasons.len();
+        if (!report.enabled && !retirement_deferred) || !checkout_deferred {
             return Ok(());
         }
         let requested = self
@@ -5995,18 +6368,25 @@ impl Broker {
             return self.write_artifact_sweep_worker_status("compact_checkout_candidate_changed");
         }
         let worktree = PathBuf::from(&session.worktree_path);
-        let Some(cohort) = self.closed_artifact_checkout_cohort_for_session(
+        let cohort = match self.closed_artifact_checkout_cohort_for_session_detailed(
             session_id,
             &worktree,
             Some(deadline),
-        )?
-        else {
-            self.store().defer_checkout_cleanup_compactions(
-                &[session_id],
-                now_ms().saturating_add(AUTO_COMPACT_CHECKOUT_RETRY_MS),
-                now_ms(),
-            )?;
-            return self.write_artifact_sweep_worker_status("compact_checkout_cohort_unavailable");
+        )? {
+            crate::auto_cleanup::ClosedArtifactCheckoutCohortResolution::Available(cohort) => {
+                cohort
+            }
+            crate::auto_cleanup::ClosedArtifactCheckoutCohortResolution::Unavailable(reason) => {
+                self.store().defer_checkout_cleanup_compactions(
+                    &[session_id],
+                    now_ms().saturating_add(AUTO_COMPACT_CHECKOUT_RETRY_MS),
+                    now_ms(),
+                )?;
+                return self.write_artifact_sweep_worker_status(&format!(
+                    "compact_checkout_cohort_unavailable session={session_id} reason={}",
+                    reason.code()
+                ));
+            }
         };
         if cohort.owner_session_id() != session_id || cohort.owner_witness().is_none() {
             self.store().defer_checkout_cleanup_compactions(
@@ -6130,20 +6510,27 @@ impl Broker {
         let artifact_pending = self.artifact_sweep_backlog_pending()?
             && crate::AutoCleanupPolicy::artifact_sweep_allowed(&root);
         let checkout_cleanup_pending = self.auto_checkout_cleanup_recovery_requested()?;
+        let session_retirement_pending = self.session_retirement_recovery_requested()?;
         let compact_pending = self.compact_checkout_work_pending()?;
-        if !(artifact_pending || checkout_cleanup_pending || compact_pending) {
+        if !(artifact_pending
+            || checkout_cleanup_pending
+            || session_retirement_pending
+            || compact_pending)
+        {
             return Ok(());
         }
         let now = now_ms();
         let mut artifact_due = artifact_pending;
         let checkout_cleanup_due =
             checkout_cleanup_pending && !self.auto_checkout_cleanup_retry_pending(now)?;
+        let session_retirement_due =
+            session_retirement_pending && self.session_retirement_due_generation(now)?.is_some();
         let compact_due = compact_pending && self.compact_checkout_work_due(now)?;
         if !pressure_request {
             let namespace = self.artifact_sweep_namespace()?.to_string();
             artifact_due &= !worker_retry_pending(self.store(), &namespace, now)?;
         }
-        if !(artifact_due || checkout_cleanup_due || compact_due) {
+        if !(artifact_due || checkout_cleanup_due || session_retirement_due || compact_due) {
             return Ok(());
         }
         let Some((router, _engine)) = artifact_worker_binaries() else {
@@ -6152,6 +6539,9 @@ impl Broker {
             }
             if checkout_cleanup_due {
                 self.defer_auto_checkout_cleanup_worker("runtime_unverified")?;
+            }
+            if session_retirement_due {
+                self.defer_session_retirement_worker("session_retirement_runtime_unverified")?;
             }
             if compact_due {
                 self.defer_auto_compact_checkout_worker(
@@ -6170,6 +6560,9 @@ impl Broker {
             }
             if checkout_cleanup_due {
                 self.defer_auto_checkout_cleanup_worker("runtime_pair_unverified")?;
+            }
+            if session_retirement_due {
+                self.defer_session_retirement_worker("session_retirement_runtime_pair_unverified")?;
             }
             if compact_due {
                 self.defer_auto_compact_checkout_worker(
@@ -6198,6 +6591,11 @@ impl Broker {
                 if checkout_cleanup_due {
                     self.defer_auto_checkout_cleanup_worker("storage_context_unavailable")?;
                 }
+                if session_retirement_due {
+                    self.defer_session_retirement_worker(
+                        "session_retirement_storage_context_unavailable",
+                    )?;
+                }
                 if compact_due {
                     self.defer_auto_compact_checkout_worker(
                         "compact_checkout_storage_context_unavailable",
@@ -6217,6 +6615,11 @@ impl Broker {
                 if checkout_cleanup_due {
                     self.defer_auto_checkout_cleanup_worker(&format!(
                         "worker_launch_failed: {error}"
+                    ))?;
+                }
+                if session_retirement_due {
+                    self.defer_session_retirement_worker(&format!(
+                        "session_retirement_worker_launch_failed: {error}"
                     ))?;
                 }
                 if compact_due {
@@ -6266,9 +6669,17 @@ impl Broker {
         let artifact_pending = self.artifact_sweep_backlog_pending()?
             && crate::AutoCleanupPolicy::artifact_sweep_allowed(self.main_root());
         let checkout_cleanup_pending = self.auto_checkout_cleanup_recovery_requested()?;
+        let session_retirement_state = self.session_retirement_recovery_state()?;
+        let session_retirement_pending = session_retirement_state.unwrap_or(false);
         let compact_pending = self.compact_checkout_work_pending()?;
-        if !(artifact_pending || checkout_cleanup_pending || compact_pending) {
-            self.write_artifact_sweep_worker_status("no_backlog")?;
+        if !(artifact_pending
+            || checkout_cleanup_pending
+            || session_retirement_pending
+            || compact_pending)
+        {
+            if session_retirement_state.is_some() {
+                self.write_artifact_sweep_worker_status("no_backlog")?;
+            }
             return Ok(());
         }
         let namespace = self.artifact_sweep_namespace()?.to_string();
@@ -6277,8 +6688,14 @@ impl Broker {
             artifact_pending && !worker_retry_pending(self.store(), &namespace, now)?;
         let checkout_cleanup_due =
             checkout_cleanup_pending && !self.auto_checkout_cleanup_retry_pending(now)?;
+        let session_retirement_generation = if session_retirement_pending {
+            self.session_retirement_due_generation(now)?
+        } else {
+            None
+        };
+        let session_retirement_due = session_retirement_generation.is_some();
         let compact_due = compact_pending && self.compact_checkout_work_due(now)?;
-        if !(artifact_due || checkout_cleanup_due || compact_due) {
+        if !(artifact_due || checkout_cleanup_due || session_retirement_due || compact_due) {
             self.write_artifact_sweep_worker_status("retry_deferred")?;
             return Ok(());
         }
@@ -6289,6 +6706,9 @@ impl Broker {
             if checkout_cleanup_due {
                 self.defer_auto_checkout_cleanup_worker("runtime_pair_unverified")?;
             }
+            if session_retirement_due {
+                self.defer_session_retirement_worker("session_retirement_runtime_pair_unverified")?;
+            }
             if compact_due {
                 self.defer_auto_compact_checkout_worker(
                     "compact_checkout_runtime_pair_unverified",
@@ -6298,6 +6718,16 @@ impl Broker {
             return Ok(());
         }
         let worker_started = Instant::now();
+        if let Some(request_generation) = session_retirement_generation {
+            let remaining =
+                ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(worker_started.elapsed());
+            let pass_budget = remaining.min(SESSION_RETIREMENT_WORKER_PASS_BUDGET);
+            self.run_session_retirement_recovery_worker_loop_isolated(
+                request_generation,
+                Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
+                Some(pass_budget),
+            )?;
+        }
         let cache_lane_result = if artifact_due {
             (|| {
                 let policy = load_retention_policy(self.main_root())?;
@@ -6310,10 +6740,13 @@ impl Broker {
                     .unwrap_or(0);
                 // Cache discovery/removal shares the singleton process with a
                 // separate cleanup lane. It yields a reserved tranche whenever
-                // both are due so a wide cache backlog cannot starve checkout
-                // progress.
-                let cache_duration =
-                    artifact_worker_cache_lane_duration(checkout_cleanup_due, compact_due);
+                // any due lifecycle lane needs time, so a wide cache backlog
+                // cannot starve retirement or checkout progress.
+                let cache_duration = artifact_worker_cache_lane_duration(
+                    checkout_cleanup_due,
+                    compact_due,
+                    session_retirement_due,
+                );
                 self.run_artifact_sweep_recovery_worker_loop(
                     &policy,
                     request_generation,
@@ -6349,9 +6782,12 @@ impl Broker {
             if compact_due {
                 let remaining =
                     ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(worker_started.elapsed());
-                if let Some(pass_budget) =
-                    compact_checkout_worker_pass_budget(remaining, cleanup_due_before_compact)
-                {
+                let remaining_for_compact =
+                    remaining.saturating_sub(SESSION_RETIREMENT_WORKER_RESERVE);
+                if let Some(pass_budget) = compact_checkout_worker_pass_budget(
+                    remaining_for_compact,
+                    cleanup_due_before_compact,
+                ) {
                     let deadline = Instant::now() + pass_budget;
                     if let Err(error) = broker.auto_compact_checkout_recovery_pass(deadline) {
                         if matches!(error, BrokerOpError::Store(_)) {
@@ -6386,7 +6822,7 @@ impl Broker {
                 broker.run_auto_checkout_cleanup_recovery_worker_loop(
                     request_generation,
                     Some(AUTO_CHECKOUT_CLEANUP_WORKER_MAX_PASSES),
-                    Some(remaining),
+                    Some(remaining.saturating_sub(SESSION_RETIREMENT_WORKER_RESERVE)),
                     |broker, generation, pass_budget| {
                         let Some(pass_budget) = pass_budget else {
                             return Ok(None);
@@ -6395,6 +6831,30 @@ impl Broker {
                         broker.auto_checkout_cleanup_recovery_pass(generation, deadline)
                     },
                 )?;
+            }
+
+            // A request may arrive while this process owns the singleton
+            // worker lock and is spending its cache, compaction, or checkout
+            // tranche. Re-read it last and use only the reserved time left
+            // under the original five-minute worker cap.
+            if let Some(request_generation) = broker.session_retirement_due_generation(now_ms())? {
+                let remaining =
+                    ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(worker_started.elapsed());
+                if remaining.is_zero() {
+                    broker.defer_session_retirement_request(
+                        request_generation,
+                        "session_retirement_post_cache_reserve_unavailable",
+                    )?;
+                    broker.write_artifact_sweep_worker_status(
+                        "session_retirement_post_cache_reserve_unavailable",
+                    )?;
+                } else {
+                    broker.run_session_retirement_recovery_worker_loop_isolated(
+                        request_generation,
+                        Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
+                        Some(remaining.min(SESSION_RETIREMENT_WORKER_PASS_BUDGET)),
+                    )?;
+                }
             }
             Ok(())
         })?;
@@ -6414,6 +6874,179 @@ impl Broker {
             }
         }
         cleanup_lane(self)
+    }
+
+    fn session_retirement_recovery_pass(
+        &mut self,
+        request_generation: i64,
+        deadline: Instant,
+    ) -> Result<Option<(crate::AutoCleanupReport, GcLock)>, BrokerOpError> {
+        let root = self.main_root().to_path_buf();
+        let Ok(_lock) = GcLock::acquire(&root) else {
+            return Ok(None);
+        };
+        let (requested, completed) = self.session_retirement_request_state()?;
+        if requested != request_generation || completed >= request_generation {
+            return Ok(None);
+        }
+        self.retire_abandoned_sessions_for_recovery(Some(deadline))
+            .map(|report| Some((report, _lock)))
+    }
+
+    fn run_session_retirement_recovery_worker_loop(
+        &mut self,
+        request_generation: i64,
+        max_passes: Option<usize>,
+        max_duration: Option<Duration>,
+    ) -> Result<(), BrokerOpError> {
+        let started_at = Instant::now();
+        let mut passes = 0usize;
+        let mut aggregate = crate::AutoCleanupReport::default();
+        let mut has_unresolved_retirement_reasons = false;
+        let mut continuation_reason = None;
+        loop {
+            let remaining = max_duration.map(|limit| limit.saturating_sub(started_at.elapsed()));
+            if remaining.is_some_and(|remaining| remaining.is_zero()) {
+                if let Some(reason) = continuation_reason.take() {
+                    aggregate.deferred = aggregate.deferred.saturating_add(1);
+                    aggregate.retirement_deferred_reasons.push(reason);
+                }
+                self.record_auto_cleanup_report(&aggregate)?;
+                self.defer_session_retirement_request(
+                    request_generation,
+                    &format!("session_retirement_time_limit passes={passes}"),
+                )?;
+                return Ok(());
+            }
+            if max_passes.is_some_and(|limit| passes >= limit) {
+                if let Some(reason) = continuation_reason.take() {
+                    aggregate.deferred = aggregate.deferred.saturating_add(1);
+                    aggregate.retirement_deferred_reasons.push(reason);
+                }
+                self.record_auto_cleanup_report(&aggregate)?;
+                self.defer_session_retirement_request(
+                    request_generation,
+                    &format!("session_retirement_pass_limit passes={passes}"),
+                )?;
+                return Ok(());
+            }
+            passes = passes.saturating_add(1);
+            let pass_budget = remaining
+                .map(|remaining| remaining.min(SESSION_RETIREMENT_WORKER_PASS_BUDGET))
+                .unwrap_or(SESSION_RETIREMENT_WORKER_PASS_BUDGET);
+            let deadline = Instant::now() + pass_budget;
+            let (report, pass_lock) =
+                match self.session_retirement_recovery_pass(request_generation, deadline)? {
+                    Some(pass) => pass,
+                    None => {
+                        let (requested, completed) = self.session_retirement_request_state()?;
+                        if requested == request_generation && completed < request_generation {
+                            if let Some(reason) = continuation_reason.take() {
+                                aggregate.deferred = aggregate.deferred.saturating_add(1);
+                                aggregate.retirement_deferred_reasons.push(reason);
+                            }
+                            self.record_auto_cleanup_report(&aggregate)?;
+                            self.defer_session_retirement_request(
+                                request_generation,
+                                "session_retirement_lock_busy",
+                            )?;
+                        }
+                        return Ok(());
+                    }
+                };
+            aggregate.enabled = report.enabled;
+            aggregate.config_error = report.config_error.clone();
+            aggregate.evaluated_at_ms = report.evaluated_at_ms;
+            aggregate.sessions_retired = aggregate
+                .sessions_retired
+                .saturating_add(report.sessions_retired);
+            let pagination_reasons = report
+                .retirement_deferred_reasons
+                .iter()
+                .filter(|reason| {
+                    matches!(
+                        reason,
+                        SessionRetirementDeferredReason::MoreSessionsRemain { .. }
+                    )
+                })
+                .count();
+            aggregate.deferred = aggregate
+                .deferred
+                .saturating_add(report.deferred.saturating_sub(pagination_reasons));
+            let has_more_sessions = report.retirement_deferred_reasons.iter().any(|reason| {
+                matches!(
+                    reason,
+                    SessionRetirementDeferredReason::MoreSessionsRemain { .. }
+                )
+            });
+            continuation_reason = report
+                .retirement_deferred_reasons
+                .iter()
+                .find(|reason| {
+                    matches!(
+                        reason,
+                        SessionRetirementDeferredReason::MoreSessionsRemain { .. }
+                    )
+                })
+                .cloned();
+            has_unresolved_retirement_reasons |=
+                report.retirement_deferred_reasons.iter().any(|reason| {
+                    !matches!(
+                        reason,
+                        SessionRetirementDeferredReason::MoreSessionsRemain { .. }
+                    )
+                });
+            aggregate.retirement_deferred_reasons.extend(
+                report
+                    .retirement_deferred_reasons
+                    .into_iter()
+                    .filter(|reason| {
+                        !matches!(
+                            reason,
+                            SessionRetirementDeferredReason::MoreSessionsRemain { .. }
+                        )
+                    }),
+            );
+            if has_more_sessions {
+                drop(pass_lock);
+                continue;
+            }
+            self.record_auto_cleanup_report(&aggregate)?;
+            if !has_unresolved_retirement_reasons {
+                self.complete_session_retirement_request(request_generation)?;
+                self.write_artifact_sweep_worker_status(&format!(
+                    "session_retirement_complete passes={passes} retired={}",
+                    aggregate.sessions_retired
+                ))?;
+            } else {
+                self.defer_session_retirement_request(
+                    request_generation,
+                    &format!("session_retirement_deferred passes={passes}"),
+                )?;
+            }
+            drop(pass_lock);
+            return Ok(());
+        }
+    }
+
+    fn run_session_retirement_recovery_worker_loop_isolated(
+        &mut self,
+        request_generation: i64,
+        max_passes: Option<usize>,
+        max_duration: Option<Duration>,
+    ) -> Result<(), BrokerOpError> {
+        match self.run_session_retirement_recovery_worker_loop(
+            request_generation,
+            max_passes,
+            max_duration,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) if Self::is_session_retirement_state_unavailable(&error) => {
+                self.note_session_retirement_state_unavailable(&error);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// The request and completed generation are read and updated while holding
@@ -6599,6 +7232,21 @@ impl Broker {
             &retry_after.to_string(),
         )?;
         self.write_artifact_sweep_worker_status(reason)
+    }
+
+    fn defer_session_retirement_worker(&mut self, reason: &str) -> Result<(), BrokerOpError> {
+        let (requested, completed) = match self.session_retirement_request_state() {
+            Ok(state) => state,
+            Err(error) if Self::is_session_retirement_state_unavailable(&error) => {
+                self.note_session_retirement_state_unavailable(&error);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if requested > completed {
+            self.defer_session_retirement_request(requested, reason)?;
+        }
+        Ok(())
     }
 
     /// The durable worker loop is separated from the installed-runtime gate
@@ -7286,7 +7934,42 @@ impl Broker {
         checkout_cleanup_deadline_override: Option<Instant>,
         discovery_entry_budget: usize,
     ) -> Result<(ArtifactSweepOutcome, usize), BrokerOpError> {
+        let main_root = self.main_root().to_path_buf();
+        let now = now_ms();
+        let (budget_ms, urgency) = self.artifact_sweep_budget(policy, scope);
+        // The total pass budget still covers both lanes. General sweeps reserve
+        // a bounded tail for whole-checkout cleanup so cache discovery cannot
+        // consume the entire foreground budget first.
+        let budget_started_at = Instant::now();
+        let inline_pass_spaced = if scope == ArtifactSweepScope::Inline {
+            let interval_ms = (i64::from(policy.artifact_sweep_interval_hours) * 3_600_000)
+                / urgency.interval_divisor().max(1);
+            let spacing_ms = INLINE_PARTIAL_PASS_SPACING_MS / urgency.interval_divisor().max(1);
+            self.meta_stamp_within(ARTIFACT_SWEEP_STAMP_KEY, now, interval_ms)?
+                || self.meta_stamp_within(ARTIFACT_SWEEP_PROGRESS_KEY, now, spacing_ms)?
+        } else {
+            false
+        };
+        if inline_pass_spaced && policy.artifact_sweep_budget_ms != 0 {
+            return Ok((
+                ArtifactSweepOutcome {
+                    directories_reclaimed: 0,
+                    complete: true,
+                    auto_cleanup: None,
+                },
+                0,
+            ));
+        }
         if policy.artifact_sweep_budget_ms == 0 {
+            if scope_runs_checkout_cleanup(scope) {
+                // The cache lane can be disabled while session retirement is
+                // still enabled. Its single-row zero-timeout CAS can enqueue
+                // without waiting behind the cache worker's lifecycle lock.
+                crate::warn_unrecorded(
+                    "enqueue bounded session-retirement request",
+                    self.request_session_retirement_if_due(policy, scope),
+                );
+            }
             return Ok((
                 ArtifactSweepOutcome {
                     directories_reclaimed: 0,
@@ -7304,30 +7987,6 @@ impl Broker {
             | ArtifactSweepScope::FinishDrain
             | ArtifactSweepScope::AutomaticContinuation => None,
         };
-        let main_root = self.main_root().to_path_buf();
-        let now = now_ms();
-        let (budget_ms, urgency) = self.artifact_sweep_budget(policy, scope);
-        // The total pass budget still covers both lanes. General sweeps reserve
-        // a bounded tail for whole-checkout cleanup so cache discovery cannot
-        // consume the entire foreground budget first.
-        let budget_started_at = Instant::now();
-        if scope == ArtifactSweepScope::Inline {
-            let interval_ms = (i64::from(policy.artifact_sweep_interval_hours) * 3_600_000)
-                / urgency.interval_divisor().max(1);
-            let spacing_ms = INLINE_PARTIAL_PASS_SPACING_MS / urgency.interval_divisor().max(1);
-            if self.meta_stamp_within(ARTIFACT_SWEEP_STAMP_KEY, now, interval_ms)?
-                || self.meta_stamp_within(ARTIFACT_SWEEP_PROGRESS_KEY, now, spacing_ms)?
-            {
-                return Ok((
-                    ArtifactSweepOutcome {
-                        directories_reclaimed: 0,
-                        complete: true,
-                        auto_cleanup: None,
-                    },
-                    0,
-                ));
-            }
-        }
         // Avoid reading cleanup policy on broker opens whose inline pass is
         // already spaced out. The original start still anchors the total cap.
         let cleanup_policy_snapshot = crate::AutoCleanupPolicy::load(self.main_root()).ok();
@@ -7353,6 +8012,20 @@ impl Broker {
         let removal_deadline = deadlines.removal;
         let checkout_cleanup_deadline = deadlines.checkout_cleanup;
         let deadline = discovery_deadline.min(removal_deadline);
+        // This is one zero-timeout CAS row update. It is counted inside the
+        // existing sweep budget and can be admitted while another worker owns
+        // GcLock for cache work.
+        let session_retirement_request = match self.request_session_retirement_if_due(policy, scope)
+        {
+            Ok(request) => request,
+            Err(error) => {
+                crate::warn_unrecorded(
+                    "enqueue bounded session-retirement request",
+                    Err::<(), _>(error),
+                );
+                None
+            }
+        };
         if !crate::AutoCleanupPolicy::artifact_sweep_allowed(self.main_root()) {
             // Strict mode pauses the artifact lane without consuming its pending
             // generation. Ignored-free checkouts may still satisfy their own
@@ -7362,6 +8035,14 @@ impl Broker {
                     let report =
                         self.auto_remove_disposable_checkouts(Some(checkout_cleanup_deadline))?;
                     self.persist_auto_checkout_cleanup_request(scope, &report)?;
+                    if report.retirement_deferred_reasons.is_empty()
+                        && let Some(request_generation) = session_retirement_request
+                    {
+                        crate::warn_unrecorded(
+                            "complete abandoned-session retirement request",
+                            self.complete_session_retirement_request(request_generation),
+                        );
+                    }
                     if scope == ArtifactSweepScope::Inline {
                         self.artifact_sweep_meta_set(
                             ARTIFACT_SWEEP_PROGRESS_KEY,
@@ -8499,6 +9180,14 @@ impl Broker {
                         "persist deferred automatic checkout cleanup request",
                         self.persist_auto_checkout_cleanup_request(scope, &report),
                     );
+                    if report.retirement_deferred_reasons.is_empty()
+                        && let Some(request_generation) = session_retirement_request
+                    {
+                        crate::warn_unrecorded(
+                            "complete abandoned-session retirement request",
+                            self.complete_session_retirement_request(request_generation),
+                        );
+                    }
                     Some(report)
                 }
                 Err(error) => {
@@ -9718,35 +10407,56 @@ mod tests {
     #[test]
     fn compact_worker_has_separate_reserve_and_due_admission() {
         assert_eq!(
-            artifact_worker_cache_lane_duration(false, false),
-            ARTIFACT_SWEEP_WORKER_MAX_DURATION
+            artifact_worker_cache_lane_duration(false, false, false),
+            ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(SESSION_RETIREMENT_WORKER_RESERVE)
         );
         assert_eq!(
-            artifact_worker_cache_lane_duration(true, false),
-            ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE)
-        );
-        assert_eq!(
-            artifact_worker_cache_lane_duration(false, true),
-            ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE)
-        );
-        assert_eq!(
-            artifact_worker_cache_lane_duration(true, true),
+            artifact_worker_cache_lane_duration(true, false, false),
             ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(
                 AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE
+                    .saturating_add(SESSION_RETIREMENT_WORKER_RESERVE)
+            )
+        );
+        assert_eq!(
+            artifact_worker_cache_lane_duration(false, true, false),
+            ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(
+                AUTO_COMPACT_CHECKOUT_WORKER_RESERVE
+                    .saturating_add(SESSION_RETIREMENT_WORKER_RESERVE)
+            )
+        );
+        assert_eq!(
+            artifact_worker_cache_lane_duration(true, true, false),
+            ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(
+                AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE
+                    .saturating_add(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE)
+                    .saturating_add(SESSION_RETIREMENT_WORKER_RESERVE)
+            )
+        );
+        assert_eq!(
+            artifact_worker_cache_lane_duration(false, false, true),
+            ARTIFACT_SWEEP_WORKER_MAX_DURATION
+                .saturating_sub(SESSION_RETIREMENT_WORKER_RESERVE.saturating_mul(2))
+        );
+        assert_eq!(
+            artifact_worker_cache_lane_duration(true, true, true),
+            ARTIFACT_SWEEP_WORKER_MAX_DURATION.saturating_sub(
+                AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE
+                    .saturating_add(SESSION_RETIREMENT_WORKER_RESERVE)
+                    .saturating_add(SESSION_RETIREMENT_WORKER_RESERVE)
                     .saturating_add(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE)
             )
         );
         // Consume the full cache grant plus ordinary handoff time, then feed
         // that remaining budget into the compact-lane admission decision.
         let normal_handoff_overhead = Duration::from_secs(5);
-        let compact_only_cache_budget = artifact_worker_cache_lane_duration(false, true);
+        let compact_only_cache_budget = artifact_worker_cache_lane_duration(false, true, false);
         let compact_only_remaining = ARTIFACT_SWEEP_WORKER_MAX_DURATION
             .saturating_sub(compact_only_cache_budget.saturating_add(normal_handoff_overhead));
-        assert_eq!(compact_only_cache_budget, Duration::from_secs(210));
-        assert_eq!(compact_only_remaining, Duration::from_secs(85));
+        assert_eq!(compact_only_cache_budget, Duration::from_secs(180));
+        assert_eq!(compact_only_remaining, Duration::from_secs(115));
         assert_eq!(
             compact_checkout_worker_pass_budget(compact_only_remaining, false),
-            Some(compact_only_remaining)
+            Some(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE)
         );
         assert_eq!(
             compact_checkout_worker_pass_budget(
@@ -9760,16 +10470,16 @@ mod tests {
             Some(AUTO_COMPACT_CHECKOUT_WORKER_RESERVE)
         );
 
-        let both_due_cache_budget = artifact_worker_cache_lane_duration(true, true);
+        let both_due_cache_budget = artifact_worker_cache_lane_duration(true, true, false);
         let both_due_remaining = ARTIFACT_SWEEP_WORKER_MAX_DURATION
             .saturating_sub(both_due_cache_budget.saturating_add(normal_handoff_overhead));
         let both_due_compact_budget =
             compact_checkout_worker_pass_budget(both_due_remaining, true).unwrap();
-        assert_eq!(both_due_cache_budget, Duration::from_secs(150));
-        assert_eq!(both_due_compact_budget, Duration::from_secs(85));
+        assert_eq!(both_due_cache_budget, Duration::from_secs(120));
+        assert_eq!(both_due_compact_budget, Duration::from_secs(90));
         assert_eq!(
             both_due_remaining.saturating_sub(both_due_compact_budget),
-            AUTO_CHECKOUT_CLEANUP_WORKER_RESERVE
+            Duration::from_secs(85)
         );
         assert_eq!(
             compact_checkout_worker_pass_budget(
@@ -9799,6 +10509,42 @@ mod tests {
             Some(101),
             100
         ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn compact_missing_checkout_reports_reason_and_keeps_request_pending() {
+        let (_temporary, _storage, mut broker, _root) = closed_artifact_sweep_fixture();
+        let (session_id, worktree, _) =
+            closed_artifact_cache(&mut broker, "missing compact checkout");
+        broker
+            .store()
+            .request_closed_spawned_checkout_compactions(&[session_id], 0, now_ms())
+            .unwrap();
+        std::fs::remove_dir_all(&worktree).unwrap();
+
+        broker
+            .auto_compact_checkout_candidate(session_id, Instant::now() + Duration::from_secs(30))
+            .unwrap();
+
+        let expected_status = format!(
+            "compact_checkout_cohort_unavailable session={session_id} reason=checkout_missing"
+        );
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(expected_status.as_str())
+        );
+        assert!(
+            broker
+                .store()
+                .next_pending_checkout_compaction_at()
+                .unwrap()
+                .is_some(),
+            "a missing closed checkout must remain pending until safe terminal reconciliation"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -10636,17 +11382,33 @@ mod tests {
             ],
             ..crate::auto_cleanup::AutoCleanupReport::default()
         };
+        for scope in [
+            ArtifactSweepScope::FinishDrain,
+            ArtifactSweepScope::AutomaticContinuation,
+            ArtifactSweepScope::ClosedSession(7),
+        ] {
+            broker
+                .persist_auto_checkout_cleanup_request(scope, &deferred_retirement)
+                .unwrap();
+            assert!(
+                !broker.session_retirement_recovery_requested().unwrap(),
+                "{scope:?} must not queue session retirement"
+            );
+        }
         broker
             .persist_auto_checkout_cleanup_request(ArtifactSweepScope::Inline, &deferred_retirement)
             .unwrap();
-        let retirement_generation = broker
-            .artifact_sweep_meta_get(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY)
-            .unwrap()
-            .expect("retirement backlog persists even when checkout removal is disabled");
-        assert!(broker.auto_checkout_cleanup_recovery_requested().unwrap());
-        broker
-            .artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY, &retirement_generation)
-            .unwrap();
+        let (retirement_generation, _) = broker.session_retirement_request_state().unwrap();
+        assert!(retirement_generation > 0);
+        assert!(broker.session_retirement_recovery_requested().unwrap());
+        assert!(!broker.auto_checkout_cleanup_recovery_requested().unwrap());
+        let (raw, mut retirement_state) = broker.load_session_retirement_state().unwrap();
+        retirement_state.completed_generation = retirement_generation;
+        assert!(
+            broker
+                .store_session_retirement_state(raw.as_deref(), &retirement_state)
+                .unwrap()
+        );
 
         broker
             .persist_auto_checkout_cleanup_request(ArtifactSweepScope::Drain, &deferred)
@@ -10813,6 +11575,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn retained_checkout_outbox_reconciliation_preserves_cooldown() {
         let temporary = tempfile::tempdir().unwrap();
@@ -10823,7 +11586,12 @@ mod tests {
         git(root, &["commit", "-qm", "fixture"]);
         let storage = crate::test_storage::TestStorage::new();
         let mut broker = storage.open(root).unwrap();
+        let stale = broker
+            .start_worktree("stale open retirement candidate", None)
+            .unwrap();
+        age_open_session_for_retirement(&mut broker, stale.id, Path::new(&stale.worktree_path));
         let connection = rusqlite::Connection::open(broker.store().db_path()).unwrap();
+        let future_checkout_cleanup = now_ms().saturating_add(24 * 60 * 60 * 1_000);
         connection
             .execute(
                 "INSERT INTO sessions (worktree_path, branch, origin, status, cleanup_state,
@@ -10841,6 +11609,13 @@ mod tests {
                 [session_id],
             )
             .unwrap();
+        connection
+            .execute(
+                "UPDATE closed_checkout_cleanup_requests SET not_before_ms = ?1
+                 WHERE session_id = ?2",
+                rusqlite::params![future_checkout_cleanup, session_id],
+            )
+            .unwrap();
         drop(connection);
         broker
             .artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_REQUESTED_KEY, "7")
@@ -10848,9 +11623,7 @@ mod tests {
         broker
             .artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_COMPLETED_KEY, "7")
             .unwrap();
-        let retry_after = now_ms()
-            .saturating_add(ARTIFACT_SWEEP_WORKER_RETRY_MS)
-            .to_string();
+        let retry_after = future_checkout_cleanup.to_string();
         broker
             .artifact_sweep_meta_set(AUTO_CHECKOUT_CLEANUP_RETRY_AFTER_KEY, &retry_after)
             .unwrap();
@@ -10878,6 +11651,190 @@ mod tests {
                 .is_none(),
             "retained checkout must remain an outstanding obligation"
         );
+
+        let policy = load_retention_policy(root).unwrap();
+        let retirement_generation = broker
+            .request_session_retirement_if_due(&policy, ArtifactSweepScope::Inline)
+            .unwrap()
+            .expect("session retirement has an independent request");
+        assert!(
+            broker
+                .auto_checkout_cleanup_retry_pending(now_ms())
+                .unwrap(),
+            "the physical checkout lane remains in cooldown"
+        );
+        assert!(
+            broker
+                .session_retirement_due_generation(now_ms())
+                .unwrap()
+                .is_some(),
+            "retirement admission does not inherit checkout cooldown"
+        );
+        broker
+            .run_session_retirement_recovery_worker_loop(
+                retirement_generation,
+                Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
+                Some(Duration::from_secs(5)),
+            )
+            .unwrap();
+        assert_eq!(
+            broker.store().session(stale.id).unwrap().cleanup_state,
+            crate::SessionCleanupState::Closed,
+            "the stale open session retires despite a future closed-checkout cleanup"
+        );
+        assert!(
+            broker
+                .store()
+                .pending_checkout_cleanup_request(session_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_none(),
+            "retirement does not consume the closed checkout's physical-removal request"
+        );
+        assert!(
+            broker
+                .auto_checkout_cleanup_retry_pending(now_ms())
+                .unwrap(),
+            "retirement leaves the physical-removal cooldown intact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zero_artifact_budget_queues_retirement_even_when_gc_lock_is_busy() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nsession_abandoned_after_hours = 72\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        let stale = broker
+            .start_worktree("zero-budget retirement candidate", None)
+            .unwrap();
+        age_open_session_for_retirement(&mut broker, stale.id, Path::new(&stale.worktree_path));
+        broker
+            .store()
+            .meta_set(
+                SESSION_RETIREMENT_STATE_KEY,
+                &serde_json::to_string(&SessionRetirementRequestState::default()).unwrap(),
+            )
+            .unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_STAMP_KEY, &now_ms().to_string())
+            .unwrap();
+        let policy = load_retention_policy(root).unwrap();
+        let lock = GcLock::acquire(root).unwrap();
+
+        let (outcome, entries) = broker
+            .sweep_artifacts_autonomously_with_progress(&policy, ArtifactSweepScope::Inline)
+            .unwrap();
+        assert!(outcome.complete);
+        assert!(outcome.auto_cleanup.is_none());
+        assert_eq!(entries, 0);
+        assert!(
+            broker.session_retirement_recovery_requested().unwrap(),
+            "the no-cache pass leaves an independent retirement request while another GC holds the lock"
+        );
+        let request_generation = broker.session_retirement_request_state().unwrap().0;
+        assert!(request_generation > 0);
+        drop(lock);
+
+        broker
+            .run_session_retirement_recovery_worker_loop(
+                request_generation,
+                Some(SESSION_RETIREMENT_WORKER_MAX_PASSES),
+                Some(Duration::from_secs(5)),
+            )
+            .unwrap();
+        assert_eq!(
+            broker.store().session(stale.id).unwrap().cleanup_state,
+            crate::SessionCleanupState::Closed
+        );
+        assert_eq!(
+            broker.session_retirement_request_state().unwrap(),
+            (request_generation, request_generation),
+            "the worker completes only the queued generation"
+        );
+    }
+
+    #[test]
+    fn stale_session_retirement_completion_cannot_ack_a_newer_cas_generation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        let policy = load_retention_policy(root).unwrap();
+        let lock = GcLock::acquire(root).unwrap();
+
+        let generation = broker
+            .request_session_retirement_if_due(&policy, ArtifactSweepScope::Inline)
+            .unwrap()
+            .expect("request CAS must not wait for the lifecycle lock");
+        let (raw, mut state) = broker.load_session_retirement_state().unwrap();
+        state.requested_generation = generation.checked_add(1).unwrap();
+        state.completed_generation = generation.saturating_sub(1);
+        state.retry_after_ms = 123;
+        assert!(
+            broker
+                .store_session_retirement_state(raw.as_deref(), &state)
+                .unwrap()
+        );
+
+        broker
+            .complete_session_retirement_request(generation)
+            .unwrap();
+        let (_, after) = broker.load_session_retirement_state().unwrap();
+        assert_eq!(after.requested_generation, generation + 1);
+        assert_eq!(after.completed_generation, generation - 1);
+        assert_eq!(after.retry_after_ms, 123);
+
+        let invalid_state = SessionRetirementRequestState {
+            version: SESSION_RETIREMENT_STATE_VERSION.saturating_add(1),
+            requested_generation: generation + 2,
+            completed_generation: generation + 1,
+            retry_after_ms: 0,
+        };
+        let invalid_raw = serde_json::to_string(&invalid_state).unwrap();
+        broker
+            .store()
+            .meta_set(SESSION_RETIREMENT_STATE_KEY, &invalid_raw)
+            .unwrap();
+        assert_eq!(
+            broker
+                .request_session_retirement_if_due(&policy, ArtifactSweepScope::Inline)
+                .unwrap(),
+            None,
+            "an unknown state version is not reset into retirement authority"
+        );
+        assert_eq!(
+            broker.session_retirement_recovery_state().unwrap(),
+            None,
+            "an invalid private lane does not claim a pending or completed request"
+        );
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(SESSION_RETIREMENT_STATE_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(invalid_raw.as_str()),
+            "unknown state remains fail-closed and inspectable"
+        );
+        drop(lock);
     }
 
     #[test]
@@ -11473,6 +12430,25 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?}");
+    }
+
+    #[cfg(unix)]
+    fn age_open_session_for_retirement(
+        broker: &mut crate::Broker,
+        session_id: i64,
+        worktree_path: &Path,
+    ) {
+        let missing_worktree =
+            worktree_path.with_file_name(format!("missing-retirement-worktree-{session_id}"));
+        let old = now_ms().saturating_sub(80 * 60 * 60 * 1_000);
+        let connection = rusqlite::Connection::open(broker.store().db_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE sessions SET created_at = ?1, updated_at = ?1,
+                 last_activity_at = ?1, worktree_path = ?2 WHERE id = ?3",
+                rusqlite::params![old, missing_worktree.to_string_lossy().as_ref(), session_id],
+            )
+            .unwrap();
     }
 
     #[test]
@@ -12683,6 +13659,87 @@ mod tests {
         ));
     }
 
+    fn repository_with_pending_gc_journal() -> (
+        tempfile::TempDir,
+        PathBuf,
+        crate::test_storage::TestStorage,
+        PathBuf,
+    ) {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(&root, &["add", "README.md"]);
+        git(&root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nartifact_sweep_budget_ms = 0\nstartup_budget_ms = 5000\n",
+        )
+        .unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        // Fresh storage has no managed-worktree registry yet. Establish its
+        // root registration through the real lifecycle so the orphan inventory
+        // can finish before publishing a confirmed recovery journal.
+        let _binding_session = broker
+            .start_worktree("confirmed GC journal fixture", None)
+            .unwrap();
+        let plan = broker.gc_plan().unwrap();
+        assert_eq!(
+            plan.digest.len(),
+            64,
+            "fixture GC plan must be complete: {:?}",
+            plan.deferred_checks
+        );
+        let journal_path = root.join(".aethyme/gc-journal.json");
+        // Model a crash after a complete operator-reviewed plan was durably
+        // published, before its first apply step.
+        write_journal(&journal_path, &GcJournal::from(plan)).unwrap();
+        drop(broker);
+        (temporary, root, storage, journal_path)
+    }
+
+    #[test]
+    fn cleanup_resolve_open_resumes_a_confirmed_gc_journal_without_starting_maintenance() {
+        let (_temporary, root, storage, journal_path) = repository_with_pending_gc_journal();
+        ARTIFACT_WORKER_ADMISSION_ATTEMPTS.with(|attempts| attempts.borrow_mut().clear());
+
+        let _broker = Broker::open_for_cleanup_resolve_with_options(&root, storage.options())
+            .expect("cleanup resolve keeps the ordinary writable broker open");
+
+        assert!(
+            !journal_path.exists(),
+            "a confirmed GC journal must still resume during cleanup-resolve open"
+        );
+        assert_eq!(
+            ARTIFACT_WORKER_ADMISSION_ATTEMPTS.with(|attempts| attempts.borrow().clone()),
+            Vec::<bool>::new(),
+            "cleanup-resolve open must not admit the unrelated artifact-sweep worker"
+        );
+    }
+
+    #[test]
+    fn normal_open_still_resumes_confirmed_gc_journals_and_runs_startup_maintenance() {
+        let (_temporary, root, storage, journal_path) = repository_with_pending_gc_journal();
+        ARTIFACT_WORKER_ADMISSION_ATTEMPTS.with(|attempts| attempts.borrow_mut().clear());
+
+        let _broker = storage
+            .open(&root)
+            .expect("normal writable open retains its startup maintenance");
+
+        assert!(
+            !journal_path.exists(),
+            "normal open must continue resuming confirmed GC journals"
+        );
+        assert_eq!(
+            ARTIFACT_WORKER_ADMISSION_ATTEMPTS.with(|attempts| attempts.borrow().clone()),
+            vec![false],
+            "normal open must retain its artifact-sweep worker admission"
+        );
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn broker_open_keeps_published_rotation_debt_pending_when_sweep_is_disabled() {
@@ -13107,6 +14164,7 @@ mod tests {
         assert_eq!(split.checkout_cleanup, later_cleanup_deadline);
     }
 
+    #[cfg(unix)]
     #[test]
     fn expired_cache_deadlines_still_dispatch_checkout_cleanup() {
         let temporary = tempfile::tempdir().unwrap();
@@ -13169,6 +14227,15 @@ mod tests {
         let disposable_worktree = PathBuf::from(&disposable.worktree_path);
         broker.close(disposable.id).unwrap();
 
+        let stale_open = broker
+            .start_worktree("stale session retirement candidate", None)
+            .unwrap();
+        age_open_session_for_retirement(
+            &mut broker,
+            stale_open.id,
+            Path::new(&stale_open.worktree_path),
+        );
+
         let now = Instant::now();
         let cache_deadline = now - Duration::from_millis(1);
         let checkout_cleanup_deadline = now + Duration::from_secs(30);
@@ -13192,6 +14259,14 @@ mod tests {
         let cleanup = outcome
             .auto_cleanup
             .expect("the independent checkout lane still runs");
+        assert_eq!(
+            cleanup.sessions_retired, 1,
+            "an expired cache deadline cannot consume the retirement tranche"
+        );
+        assert_eq!(
+            broker.store().session(stale_open.id).unwrap().cleanup_state,
+            crate::SessionCleanupState::Closed
+        );
         assert!(cleanup.removed.iter().any(|removed| {
             removed.sessions.contains(&disposable.id)
                 && removed.worktree == disposable_worktree.to_string_lossy().as_ref()

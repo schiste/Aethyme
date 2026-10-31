@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 pub mod activity;
+pub mod budgets;
 pub mod cache;
 pub mod cli;
 pub mod compile;
@@ -44,6 +45,8 @@ pub mod validate;
 
 #[cfg(test)]
 mod activity_tests;
+#[cfg(test)]
+mod budgets_tests;
 #[cfg(test)]
 mod cache_tests;
 #[cfg(test)]
@@ -128,6 +131,16 @@ pub fn load_host_file() -> std::io::Result<(String, Loaded<HostEnvironmentsFile>
         )),
         Err(error) => Err(error),
     }
+}
+
+/// The host settings beside an environments root (`<host state>/
+/// environments` -> `<host state>/environments.toml`). Missing or unreadable
+/// is the default, which caps nothing: failing toward staying awake.
+pub fn host_file_beside(root: &Path) -> HostEnvironmentsFile {
+    root.parent()
+        .and_then(|directory| fs::read_to_string(directory.join(HOST_ENVIRONMENTS_FILE)).ok())
+        .and_then(|text| toml::from_str(&text).ok())
+        .unwrap_or_default()
 }
 
 pub fn parse_loaded<T: serde::de::DeserializeOwned>(

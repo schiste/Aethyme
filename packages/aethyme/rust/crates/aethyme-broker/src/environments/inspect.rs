@@ -123,9 +123,17 @@ pub(super) fn run_status(options: &Options) -> Result<Output, Failure> {
             text.push_str(&format!("  last error: {error}\n"));
         }
         text.push_str(&supervisor_line(&supervisor));
+        // Each listening component's URL, entry path included (#1292).
+        let urls = environments_directory()
+            .map(|root| super::lifecycle::component_urls(&root, &record))
+            .unwrap_or_default();
+        for (component, url) in &urls {
+            text.push_str(&format!("    {component}: {url}\n"));
+        }
         let value = json!({
             "schema": STATUS_SCHEMA,
             "environment": summary(&record),
+            "urls": urls,
             "components": components,
             "recent_transitions": transitions,
             "supervisor": supervisor,
@@ -357,6 +365,7 @@ pub(super) fn run_supervise(options: &Options) -> Result<Output, Failure> {
         watch: StoreWatch { store_path },
         proxy_started: false,
         last_sample: None,
+        shared_sync: None,
     };
     let reason = supervisor::run(&config, &mut work, &|| false)
         .map_err(|error| environment_failure(format!("supervisor: {error}")))?;

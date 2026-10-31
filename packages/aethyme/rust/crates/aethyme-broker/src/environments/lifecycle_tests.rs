@@ -162,6 +162,7 @@ fn options() -> UpOptions {
     UpOptions {
         wait: Duration::from_secs(2),
         reconfigure: false,
+        recreate: Vec::new(),
     }
 }
 
@@ -783,17 +784,21 @@ destroy = "true"
         }
         other => panic!("{other:?}"),
     }
+    let reconfigure = |recreate: &[&str]| UpOptions {
+        wait: Duration::from_secs(2),
+        reconfigure: true,
+        recreate: recreate.iter().map(|c| c.to_string()).collect(),
+    };
+    // #1295: the changed component holds data, so destroying it needs it
+    // named in --recreate.
+    match lifecycle.up(&changed, worktree.path(), None, None, &reconfigure(&[])) {
+        Err(error @ LifecycleError::RecreateRequired { .. }) => {
+            assert_eq!(error.code(), "recreate_required")
+        }
+        other => panic!("{other:?}"),
+    }
     let reconfigured = lifecycle
-        .up(
-            &changed,
-            worktree.path(),
-            None,
-            None,
-            &UpOptions {
-                wait: Duration::from_secs(2),
-                reconfigure: true,
-            },
-        )
+        .up(&changed, worktree.path(), None, None, &reconfigure(&["db"]))
         .unwrap();
     assert_eq!(reconfigured.profile_digest, changed.digest);
     lifecycle.down(&reconfigured.env_id, None).unwrap();
@@ -895,4 +900,180 @@ fn destroy_refuses_a_replacement_repository_at_the_recorded_worktree_path() {
         EnvironmentPhase::Destroyed
     );
     assert_eq!(host.active_leases(&record.env_id), 0);
+}
+
+/// #1295 fixture: a database that counts its provisions, an api, and an
+/// optional web app.
+const VARIANTS: &str = r#"
+schema = 1
+[pools.envs]
+limit = 2
+
+[[profiles]]
+name = "backend"
+units = 1
+
+[[profiles.components]]
+name = "db"
+runtime = "hooks"
+env = { MARKERS = "@MARKERS@" }
+provision = 'echo x >> "$MARKERS/db.provisions"'
+destroy = "true"
+
+[[profiles.components]]
+name = "api"
+runtime = "process"
+depends_on = ["db"]
+listen = true
+env = { VERSION = "1" }
+start = "exec sleep 300"
+health = { command = "true", timeout_seconds = 5, interval_ms = 50 }
+
+[[profiles.components]]
+name = "web"
+runtime = "process"
+depends_on = ["api"]
+listen = true
+optional = true
+start = "exec sleep 300"
+health = { command = "true", timeout_seconds = 5, interval_ms = 50 }
+"#;
+
+fn variant(host: &Host, text: &str, worktree: &Path, select: &[&str]) -> CompiledEnvironment {
+    let text = text.replace("@MARKERS@", &host.markers.to_string_lossy());
+    let mut compiled = snapshot(&text, "backend", worktree, None);
+    super::compile::select_components(
+        &mut compiled,
+        &select.iter().map(|c| c.to_string()).collect(),
+    );
+    compiled
+}
+
+fn provisions(host: &Host) -> usize {
+    std::fs::read_to_string(host.markers.join("db.provisions"))
+        .map(|t| t.lines().count())
+        .unwrap_or(0)
+}
+
+fn reconfigure_options(recreate: &[&str]) -> UpOptions {
+    UpOptions {
+        wait: Duration::from_secs(5),
+        reconfigure: true,
+        recreate: recreate.iter().map(|c| c.to_string()).collect(),
+    }
+}
+
+/// #1295 acceptance: a changed stateless component is replaced in place;
+/// the database keeps its data (provisioned once) and the environment its
+/// id and ports. Changing the database itself needs --recreate.
+#[test]
+fn reconfigure_in_place_keeps_the_data_of_unchanged_components() {
+    let host = Host::new();
+    let worktree = tempfile::tempdir().unwrap();
+    let mut lifecycle = host.lifecycle();
+    let first = variant(&host, VARIANTS, worktree.path(), &[]);
+    let before = lifecycle
+        .up(&first, worktree.path(), None, None, &options())
+        .unwrap();
+    let ports_before = std::fs::read(
+        host.root
+            .join(&before.env_id)
+            .join("reservation.grant.json"),
+    )
+    .unwrap();
+    assert_eq!(provisions(&host), 1);
+
+    let changed = variant(
+        &host,
+        &VARIANTS.replace("VERSION = \"1\"", "VERSION = \"2\""),
+        worktree.path(),
+        &[],
+    );
+    let after = lifecycle
+        .up(
+            &changed,
+            worktree.path(),
+            None,
+            None,
+            &reconfigure_options(&[]),
+        )
+        .unwrap();
+    assert_eq!(after.env_id, before.env_id);
+    assert_eq!(after.phase, EnvironmentPhase::Active);
+    assert_eq!(after.profile_digest, changed.digest);
+    assert_eq!(provisions(&host), 1, "the database was not recreated");
+    assert_eq!(
+        std::fs::read(host.root.join(&after.env_id).join("reservation.grant.json")).unwrap(),
+        ports_before,
+        "same reservation, same ports"
+    );
+    let notes = lifecycle.store.transitions(&after.env_id, 50).unwrap();
+    assert!(
+        notes.iter().any(|t| t.reason == "reconfigured"
+            && t.detail
+                .as_ref()
+                .is_some_and(|d| d["strategy"] == "in_place")),
+        "{notes:?}"
+    );
+
+    let new_db = variant(
+        &host,
+        &VARIANTS.replace("echo x >>", "echo y >>"),
+        worktree.path(),
+        &[],
+    );
+    match lifecycle.up(
+        &new_db,
+        worktree.path(),
+        None,
+        None,
+        &reconfigure_options(&[]),
+    ) {
+        Err(LifecycleError::RecreateRequired { components, .. }) => {
+            assert_eq!(components, vec!["db".to_string()])
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(provisions(&host), 1, "a refusal destroys nothing");
+    lifecycle
+        .up(
+            &new_db,
+            worktree.path(),
+            None,
+            None,
+            &reconfigure_options(&["db"]),
+        )
+        .unwrap();
+    assert_eq!(provisions(&host), 2, "confirmed: recreated");
+    lifecycle.down(&after.env_id, None).unwrap();
+}
+
+/// #1295: selecting an optional component only adds it: no --reconfigure,
+/// the database untouched, its port reserved from the start.
+#[test]
+fn selecting_an_optional_component_adds_it_in_place() {
+    let host = Host::new();
+    let worktree = tempfile::tempdir().unwrap();
+    let mut lifecycle = host.lifecycle();
+    let without = variant(&host, VARIANTS, worktree.path(), &[]);
+    assert!(!without.components.iter().any(|c| c.name == "web"));
+    let before = lifecycle
+        .up(&without, worktree.path(), None, None, &options())
+        .unwrap();
+    let with = variant(&host, VARIANTS, worktree.path(), &["web"]);
+    let after = lifecycle
+        .up(&with, worktree.path(), None, None, &options())
+        .unwrap();
+    assert_eq!(after.env_id, before.env_id);
+    assert_eq!(after.phase, EnvironmentPhase::Active);
+    assert_eq!(provisions(&host), 1);
+    let web = lifecycle
+        .store
+        .components(&after.env_id)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.component == "web")
+        .expect("web was added");
+    assert_eq!(web.phase, ManagedServicePhase::Running);
+    lifecycle.down(&after.env_id, None).unwrap();
 }

@@ -1363,6 +1363,62 @@ fn run_captured_context_worker() {
     );
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn finish_captured_startup_recovery(broker: &mut Broker, entry: &Path) {
+    use crate::preparation::rotation_journal::JournalProbe;
+
+    let context = broker.storage_context();
+    let resource_db = context
+        .host_resource_db_path
+        .as_deref()
+        .expect("fixture captures its host resource database")
+        .to_path_buf();
+    let cache_root = context
+        .preparation_cache_root()
+        .expect("captured preparation root")
+        .expect("fixture captures its preparation root");
+    let root_identity = crate::preparation::rotation_debt::DirectoryIdentity::capture(&cache_root)
+        .expect("capture fixture preparation root identity")
+        .encode()
+        .expect("encode fixture preparation root identity");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let debt = crate::preparation::rotation_journal::probe(
+            &resource_db,
+            &cache_root,
+            Some(&root_identity),
+        )
+        .expect("inspect captured rotation journal");
+        // Recovery removes old content before settling its durable row. The
+        // path alone must not authorize publishing the next synthetic debt.
+        if debt == Some(JournalProbe::NoDebt) && !entry.exists() {
+            break;
+        }
+        assert!(
+            matches!(debt, Some(JournalProbe::Pending | JournalProbe::NoDebt)),
+            "fixture debt became unknown or its published journal disappeared: {debt:?}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "captured recovery did not settle before reseeding: {debt:?}"
+        );
+        if entry.exists() {
+            assert!(
+                broker.artifact_sweep_recovery_requested().unwrap(),
+                "bounded startup must retain the persisted recovery request"
+            );
+        }
+        // Continue through the real captured-context path and finite policy
+        // budget; a detached startup worker may still own the recovery lease.
+        let report = broker
+            .gc_sweep_artifacts()
+            .expect("resume captured cache recovery");
+        assert!(report.budget_ms > 0);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn finish_captured_startup_recovery(broker: &mut Broker, entry: &Path) {
     if entry.exists() {
         assert!(

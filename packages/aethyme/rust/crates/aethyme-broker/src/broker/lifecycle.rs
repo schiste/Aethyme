@@ -88,6 +88,12 @@ fn is_full_commit_oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+#[derive(Clone, Copy)]
+enum StartupGcMaintenance {
+    Full,
+    ConfirmedJournalOnly,
+}
+
 fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -2307,11 +2313,12 @@ fn same_recovery_directory_object(
     left: &crate::worktree_registry::RecoveryArtifactIdentity,
     right: &crate::worktree_registry::RecoveryArtifactIdentity,
 ) -> bool {
+    // APFS directory link counts, like byte sizes, change with membership.
+    // Exact inventories still check them within each publication phase.
     left.device == right.device
         && left.inode == right.inode
         && left.owner == right.owner
         && left.mode == right.mode
-        && left.links == right.links
 }
 
 #[cfg(unix)]
@@ -3077,6 +3084,46 @@ mod fresh_root_recovery_inventory_tests {
         std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(mode)).unwrap();
         let (_, path) = temporary.keep().unwrap();
         path
+    }
+
+    #[test]
+    fn recovery_directory_object_identity_survives_only_membership_changes() {
+        use crate::worktree_registry::RecoveryArtifactIdentity;
+
+        let before = RecoveryArtifactIdentity {
+            device: 1,
+            inode: 2,
+            owner: 3,
+            mode: 0o700,
+            links: 3,
+            bytes: 96,
+        };
+        let after = RecoveryArtifactIdentity {
+            links: 4,
+            bytes: 128,
+            ..before.clone()
+        };
+        assert!(same_recovery_directory_object(&before, &after));
+        for replaced in [
+            RecoveryArtifactIdentity {
+                device: 4,
+                ..after.clone()
+            },
+            RecoveryArtifactIdentity {
+                inode: 4,
+                ..after.clone()
+            },
+            RecoveryArtifactIdentity {
+                owner: 4,
+                ..after.clone()
+            },
+            RecoveryArtifactIdentity {
+                mode: 0o777,
+                ..after.clone()
+            },
+        ] {
+            assert!(!same_recovery_directory_object(&before, &replaced));
+        }
     }
 
     #[test]
@@ -4669,6 +4716,25 @@ impl Broker {
         })
     }
 
+    /// Open for explicit cleanup planning or apply without running unrelated
+    /// autonomous GC maintenance. Normal writable-open recovery and any
+    /// already-confirmed GC journal retain their usual handling.
+    pub(crate) fn open_for_cleanup_resolve(path_inside_repo: &Path) -> Result<Self, BrokerOpError> {
+        Self::open_for_cleanup_resolve_with_options(path_inside_repo, BrokerOpenOptions::default())
+    }
+
+    pub(crate) fn open_for_cleanup_resolve_with_options(
+        path_inside_repo: &Path,
+        options: BrokerOpenOptions,
+    ) -> Result<Self, BrokerOpError> {
+        Self::open_with_graph_impact_provider_and_options_for_gc_maintenance(
+            path_inside_repo,
+            GraphStoreImpactProvider,
+            options,
+            StartupGcMaintenance::ConfirmedJournalOnly,
+        )
+    }
+
     /// Open a broker with storage locations captured before startup maintenance.
     ///
     /// The returned handle and its recovery, worktree, preparation-cache, and
@@ -4799,6 +4865,20 @@ impl Broker {
         graph_impact_provider: impl GraphImpactProvider + 'static,
         options: BrokerOpenOptions,
     ) -> Result<Self, BrokerOpError> {
+        Self::open_with_graph_impact_provider_and_options_for_gc_maintenance(
+            path_inside_repo,
+            graph_impact_provider,
+            options,
+            StartupGcMaintenance::Full,
+        )
+    }
+
+    fn open_with_graph_impact_provider_and_options_for_gc_maintenance(
+        path_inside_repo: &Path,
+        graph_impact_provider: impl GraphImpactProvider + 'static,
+        options: BrokerOpenOptions,
+        startup_gc_maintenance: StartupGcMaintenance,
+    ) -> Result<Self, BrokerOpError> {
         let mut storage_context = BrokerStorageContext::capture(options);
         storage_context.ensure_valid()?;
         let here = GitRepo::discover(path_inside_repo)?;
@@ -4862,7 +4942,15 @@ impl Broker {
         // If current eligibility or an older journal's missing fingerprint
         // prevents continuation, leave the journal for explicit review and
         // report the refusal instead of hiding it.
-        crate::warn_unrecorded("resume GC maintenance", broker.resume_gc_maintenance());
+        match startup_gc_maintenance {
+            StartupGcMaintenance::Full => {
+                crate::warn_unrecorded("resume GC maintenance", broker.resume_gc_maintenance());
+            }
+            StartupGcMaintenance::ConfirmedJournalOnly => crate::warn_unrecorded(
+                "resume confirmed GC journal",
+                broker.resume_confirmed_gc_journal_only(),
+            ),
+        }
         Ok(broker)
     }
 

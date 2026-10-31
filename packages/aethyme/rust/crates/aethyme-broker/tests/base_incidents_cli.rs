@@ -385,7 +385,6 @@ fn start_and_gate_entrypoints_emit_incident_notice_without_claiming_owner_livene
         vec![
             "start",
             "--adopt",
-            "--allow-main-checkout",
             "--task",
             "notice check",
             "--short-name",
@@ -393,7 +392,12 @@ fn start_and_gate_entrypoints_emit_incident_notice_without_claiming_owner_livene
             "--json",
         ],
     ] {
-        let result = cli(&root, &args);
+        // Deliberately bypass test_session_args: it adds the main-checkout
+        // override to adoption fixtures, which would make this refusal pass.
+        let mut command = common::broker_cli_for_fixture(CLI, &[], root.path());
+        command.current_dir(root.path()).args(&args);
+        isolate(&mut command, &root);
+        let result = command.output().unwrap();
         let stderr = String::from_utf8(result.stderr).unwrap();
         assert!(stderr.contains("[base-failure] Incident"), "{stderr}");
         assert!(
@@ -401,9 +405,9 @@ fn start_and_gate_entrypoints_emit_incident_notice_without_claiming_owner_livene
             "{stderr}"
         );
         assert!(stderr.contains("owner liveness not checked"), "{stderr}");
-        // Gate policy is deliberately untrusted and the checkout already has
-        // an owner. The notices must not turn either refusal into success.
-        assert!(!result.status.success());
+        // The gate is deliberately untrusted, and adoption must refuse this
+        // already-owned checkout. Notices must not turn refusal into success.
+        assert!(!result.status.success(), "{stderr}");
     }
 }
 

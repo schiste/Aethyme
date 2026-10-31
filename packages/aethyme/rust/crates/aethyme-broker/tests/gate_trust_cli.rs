@@ -28,6 +28,9 @@ impl Fixture {
         let repo = tempfile::tempdir().unwrap();
         let host = tempfile::tempdir().unwrap();
         let fixture = Self { repo, host };
+        for directory in ["cache", "preparation-cache"] {
+            std::fs::create_dir_all(fixture.host.path().join(directory)).unwrap();
+        }
         let root = fixture.root();
         fixture.git(&root, &["init", "-q", "-b", "main"]);
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
@@ -71,10 +74,29 @@ impl Fixture {
     }
 
     fn command(&self, program: &str, cwd: &Path) -> Command {
-        let mut command = Command::new(program);
+        let mut command = if program == CLI {
+            common::broker_cli(CLI, &[])
+        } else {
+            Command::new(program)
+        };
         command
             .current_dir(cwd)
-            .env("AETHYME_HOST_STATE_DIR", self.host.path())
+            .env(
+                "AETHYME_HOST_STATE_DIR",
+                self.host.path().canonicalize().unwrap(),
+            )
+            .env(
+                "AETHYME_HOST_CACHE_DIR",
+                self.host.path().join("cache").canonicalize().unwrap(),
+            )
+            .env(
+                "AETHYME_PREPARATION_CACHE_ROOT",
+                self.host
+                    .path()
+                    .join("preparation-cache")
+                    .canonicalize()
+                    .unwrap(),
+            )
             .env_remove(ESCAPE)
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@t")
@@ -130,26 +152,15 @@ impl Fixture {
         serde_json::from_slice(&output.stdout).unwrap()
     }
 
-    /// Adopt a linked worktree on `main` with one committed change.
+    /// Create a natively bound worktree on `main` with one committed change.
     fn session(&self, name: &str) -> (PathBuf, String) {
-        let worktree = self.root().join(".aethyme/worktrees").join(name);
-        std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
-        self.git(
-            &self.root(),
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                &format!("agent/{name}"),
-                worktree.to_str().unwrap(),
-                "main",
-            ],
-        );
-        let adopted = self.run(&worktree, &["start", "--adopt", "--task", name, "--json"]);
-        succeeded(&adopted);
-        let adopted: serde_json::Value = serde_json::from_slice(&adopted.stdout).unwrap();
-        let session = adopted["id"].as_i64().unwrap().to_string();
+        // Adoption observes an existing checkout; it does not establish a
+        // fresh worktree-root binding. Exercise the native placement flow.
+        let started = self.run(&self.root(), &["start", "--task", name, "--json"]);
+        succeeded(&started);
+        let started: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+        let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
+        let session = started["id"].as_i64().unwrap().to_string();
         self.commit_change(&worktree, name);
         (worktree, session)
     }

@@ -2131,6 +2131,23 @@ impl BrokerStore {
         environment: &GateEnvironment,
         cache_provenance: Option<&crate::GateCacheProvenance>,
     ) -> Result<i64, BrokerError> {
+        self.record_gate_result_with_execution_profile_and_cache_bypass(
+            result,
+            environment,
+            cache_provenance,
+            None,
+        )
+    }
+
+    /// Record a gate result and, when requested, atomically keep that result
+    /// out of the reusable verdict cache.
+    pub fn record_gate_result_with_execution_profile_and_cache_bypass(
+        &mut self,
+        result: &NewGateResult,
+        environment: &GateEnvironment,
+        cache_provenance: Option<&crate::GateCacheProvenance>,
+        cache_bypass_reason: Option<&str>,
+    ) -> Result<i64, BrokerError> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -2178,6 +2195,16 @@ impl BrokerStore {
                 cache_provenance,
             )),
         )?;
+        if let Some(reason) = cache_bypass_reason {
+            debug_assert_eq!(result.status, GateStatus::Fail);
+            debug_assert_eq!(result.failure_class, Some(GateFailureClass::TestFailure));
+            tx.execute(
+                "UPDATE gate_results
+                 SET cleared_at = ?1, cleared_reason = ?2
+                 WHERE id = ?3",
+                params![now, reason, id],
+            )?;
+        }
         tx.commit()?;
         Ok(id)
     }
