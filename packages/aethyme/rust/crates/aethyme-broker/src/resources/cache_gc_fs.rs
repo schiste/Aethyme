@@ -1,4 +1,4 @@
-//! Bounded descriptor-relative inventory and removal for environment build
+//! Bounded descriptor-relative inventory, logging, and removal for environment
 //! cache entries. The selected host-state root is canonicalized once; every
 //! descendant is then opened without following links or crossing the cache
 //! root's mount identity.
@@ -9,9 +9,12 @@ use std::ffi::CStr;
 use std::ffi::{CString, OsStr, OsString};
 use std::fmt;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-use std::io::Read;
+use std::fs::File;
+use std::io;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -30,6 +33,10 @@ const MAX_DEPTH: usize = 64;
 const MAX_DURATION: Duration = Duration::from_secs(3);
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const MAX_KEY_BYTES: usize = 4096;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const MAX_TEMPLATE_MARKER_BYTES: usize = 1024 * 1024;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const MAX_TEMPLATE_MARKER_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CacheGcFsError {
@@ -72,12 +79,120 @@ pub(crate) struct BuildEntry {
 }
 
 #[derive(Debug)]
+pub(crate) struct TemplateEntry {
+    pub repository: String,
+    pub component: String,
+    pub marker_name: String,
+    pub path: PathBuf,
+    pub bytes: Vec<u8>,
+    pub parent_identity: CacheFsIdentity,
+    pub identity: CacheFsIdentity,
+}
+
+#[derive(Debug)]
 pub(crate) struct CacheInventory {
     pub cache_root: PathBuf,
     pub cache_identity: CacheFsIdentity,
     pub host_total_bytes: u64,
     pub builds: Vec<BuildEntry>,
+    pub templates: Vec<TemplateEntry>,
     pub templates_by_repository: std::collections::BTreeMap<String, usize>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const CACHE_PRUNE_TAIL_WINDOW_BYTES: u64 = 256 * 1024;
+
+#[derive(Debug)]
+pub(crate) struct CachePruneLog {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    cache_fd: OwnedFd,
+    environment_root: PathBuf,
+    cache_identity: CacheFsIdentity,
+    cache_path: PathBuf,
+    cap: u64,
+}
+
+impl CachePruneLog {
+    pub(crate) fn append(&mut self, _text: &str) -> io::Result<()> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            validate_cache_root_path(
+                &self.environment_root,
+                &self.cache_path,
+                self.cache_identity,
+            )
+            .map_err(cache_io_error)?;
+            append_prune_log(
+                self.cache_fd.as_raw_fd(),
+                &self.environment_root,
+                &self.cache_path,
+                self.cache_identity,
+                self.cap,
+                _text,
+            )
+            .map_err(cache_io_error)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "safe environment-cache logs are supported only on macOS and Linux",
+            ))
+        }
+    }
+
+    pub(crate) fn tail(&mut self, _lines: usize) -> io::Result<Vec<String>> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            validate_cache_root_path(
+                &self.environment_root,
+                &self.cache_path,
+                self.cache_identity,
+            )
+            .map_err(cache_io_error)?;
+            tail_prune_log(
+                self.cache_fd.as_raw_fd(),
+                &self.environment_root,
+                &self.cache_path,
+                self.cache_identity,
+                _lines,
+            )
+            .map_err(cache_io_error)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "safe environment-cache logs are supported only on macOS and Linux",
+            ))
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn cache_io_error(error: CacheGcFsError) -> io::Error {
+    io::Error::other(error.to_string())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn read_log_tail(file: &mut File, lines: usize) -> io::Result<Vec<String>> {
+    if lines == 0 {
+        return Ok(Vec::new());
+    }
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(CACHE_PRUNE_TAIL_WINDOW_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    (&mut *file)
+        .take(CACHE_PRUNE_TAIL_WINDOW_BYTES)
+        .read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut all: Vec<&str> = text.lines().collect();
+    if start > 0 && !all.is_empty() {
+        all.remove(0);
+    }
+    let skip = all.len().saturating_sub(lines);
+    Ok(all[skip..].iter().map(|line| (*line).to_string()).collect())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,6 +471,405 @@ fn open_cache_root(environment_root: &Path) -> Result<Option<CacheRoot>, CacheGc
         identity: identity(&cache_stat),
         device,
     }))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn open_log_file(
+    cache_fd: libc::c_int,
+    cache_path: &Path,
+    name: &std::ffi::CStr,
+    path: &Path,
+    create: bool,
+) -> Result<File, CacheGcFsError> {
+    let before = match fs::stat_at(cache_fd, name, libc::AT_SYMLINK_NOFOLLOW) {
+        Ok(stat) => Some(stat),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && create => None,
+        Err(error) => return Err(io_error("log_unreadable", path, error)),
+    };
+    if let Some(before) = before.as_ref() {
+        if fs::file_type(before) != libc::S_IFREG || before.st_nlink != 1 || before.st_size < 0 {
+            return Err(CacheGcFsError::new(
+                "unsafe_path",
+                format!(
+                    "{} is not a singly-linked regular prune log",
+                    path.display()
+                ),
+            ));
+        }
+    }
+
+    let mut flags =
+        libc::O_RDWR | libc::O_APPEND | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    if create {
+        flags |= libc::O_CREAT;
+    }
+    // SAFETY: `cache_fd` is the pinned cache directory and `name` is a single
+    // NUL-terminated component. O_NOFOLLOW prevents opening a symlink target.
+    let raw = unsafe { libc::openat(cache_fd, name.as_ptr(), flags, 0o600 as libc::mode_t) };
+    if raw < 0 {
+        return Err(io_error("log_unreadable", path, io::Error::last_os_error()));
+    }
+    // SAFETY: openat returned a new owned descriptor, transferred exactly
+    // once into File.
+    let file = unsafe { File::from_raw_fd(raw) };
+    let opened = fs::fstat(file.as_raw_fd(), path)
+        .map_err(|error| io_error("log_unreadable", path, error))?;
+    if fs::file_type(&opened) != libc::S_IFREG || opened.st_nlink != 1 || opened.st_size < 0 {
+        return Err(CacheGcFsError::new(
+            "unsafe_path",
+            format!(
+                "{} is not a singly-linked regular prune log",
+                path.display()
+            ),
+        ));
+    }
+    if let Some(before) = before.as_ref() {
+        verify_same(before, &opened, path)?;
+    }
+    verify_same_mount(cache_fd, cache_path, file.as_raw_fd(), path)?;
+    let named = fs::stat_at(cache_fd, name, libc::AT_SYMLINK_NOFOLLOW)
+        .map_err(|error| io_error("log_unreadable", path, error))?;
+    verify_same(&opened, &named, path)?;
+    Ok(file)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn open_prune_log(
+    environment_root: &Path,
+    expected_cache_path: &Path,
+    expected_cache_identity: CacheFsIdentity,
+    cap: u64,
+) -> Result<CachePruneLog, CacheGcFsError> {
+    let cache = open_cache_root(environment_root)?.ok_or_else(|| {
+        CacheGcFsError::new("identity_changed", "environment cache root disappeared")
+    })?;
+    if cache.path != expected_cache_path || cache.identity != expected_cache_identity {
+        return Err(CacheGcFsError::new(
+            "identity_changed",
+            "environment cache root changed before opening the prune log",
+        ));
+    }
+    let log_name = CString::new("prune.log").expect("constant has no NUL");
+    let rotated_name = CString::new("prune.log.1").expect("constant has no NUL");
+    let log_path = cache.path.join("prune.log");
+    let rotated_path = cache.path.join("prune.log.1");
+
+    let current_before =
+        match fs::stat_at(cache.fd.as_raw_fd(), &log_name, libc::AT_SYMLINK_NOFOLLOW) {
+            Ok(stat) => Some(stat),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(io_error("log_unreadable", &log_path, error)),
+        };
+    if let Some(current_before) = current_before {
+        if fs::file_type(&current_before) != libc::S_IFREG
+            || current_before.st_nlink != 1
+            || current_before.st_size < 0
+        {
+            return Err(CacheGcFsError::new(
+                "unsafe_path",
+                format!(
+                    "{} is not a singly-linked regular prune log",
+                    log_path.display()
+                ),
+            ));
+        }
+        if current_before.st_size as u64 > cap {
+            let current_file = open_log_file(
+                cache.fd.as_raw_fd(),
+                &cache.path,
+                &log_name,
+                &log_path,
+                false,
+            )?;
+            let opened_current = fs::fstat(current_file.as_raw_fd(), &log_path)
+                .map_err(|error| io_error("log_unreadable", &log_path, error))?;
+            verify_same(&current_before, &opened_current, &log_path)?;
+            // SAFETY: fchmod changes the already-opened regular log, not a
+            // path that could be redirected through a symlink.
+            if unsafe { libc::fchmod(current_file.as_raw_fd(), 0o600) } < 0 {
+                return Err(io_error(
+                    "log_unreadable",
+                    &log_path,
+                    io::Error::last_os_error(),
+                ));
+            }
+            let rotated_before = match fs::stat_at(
+                cache.fd.as_raw_fd(),
+                &rotated_name,
+                libc::AT_SYMLINK_NOFOLLOW,
+            ) {
+                Ok(stat) => Some(stat),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(io_error("log_unreadable", &rotated_path, error)),
+            };
+            if let Some(rotated_before) = rotated_before {
+                if fs::file_type(&rotated_before) != libc::S_IFREG || rotated_before.st_nlink != 1 {
+                    return Err(CacheGcFsError::new(
+                        "unsafe_path",
+                        format!(
+                            "{} is not a singly-linked regular prune log",
+                            rotated_path.display()
+                        ),
+                    ));
+                }
+                let rotated_file =
+                    fs::openat_regular(cache.fd.as_raw_fd(), &rotated_name, &rotated_path)
+                        .map_err(|error| CacheGcFsError::new("unsafe_path", error.to_string()))?;
+                let opened_rotated = fs::fstat(rotated_file.as_raw_fd(), &rotated_path)
+                    .map_err(|error| io_error("log_unreadable", &rotated_path, error))?;
+                verify_same(&rotated_before, &opened_rotated, &rotated_path)?;
+                verify_same_mount(
+                    cache.fd.as_raw_fd(),
+                    &cache.path,
+                    rotated_file.as_raw_fd(),
+                    &rotated_path,
+                )?;
+                let rotated_named = fs::stat_at(
+                    cache.fd.as_raw_fd(),
+                    &rotated_name,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+                .map_err(|error| io_error("log_unreadable", &rotated_path, error))?;
+                verify_same(&rotated_before, &rotated_named, &rotated_path)?;
+                // SAFETY: the name is one component in the pinned cache root;
+                // unlinkat removes the old log entry without following links.
+                if unsafe { libc::unlinkat(cache.fd.as_raw_fd(), rotated_name.as_ptr(), 0) } < 0 {
+                    return Err(io_error(
+                        "log_rotation_failed",
+                        &rotated_path,
+                        io::Error::last_os_error(),
+                    ));
+                }
+            }
+            let current_named =
+                fs::stat_at(cache.fd.as_raw_fd(), &log_name, libc::AT_SYMLINK_NOFOLLOW)
+                    .map_err(|error| io_error("log_unreadable", &log_path, error))?;
+            verify_same(&current_before, &current_named, &log_path)?;
+            // SAFETY: both names are single components relative to the pinned
+            // cache root; renameat moves the log entry and never follows it.
+            if unsafe {
+                libc::renameat(
+                    cache.fd.as_raw_fd(),
+                    log_name.as_ptr(),
+                    cache.fd.as_raw_fd(),
+                    rotated_name.as_ptr(),
+                )
+            } < 0
+            {
+                return Err(io_error(
+                    "log_rotation_failed",
+                    &log_path,
+                    io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: the cache root descriptor is open and owns the renamed
+            // directory entries whose rotation is being made durable.
+            if unsafe { libc::fsync(cache.fd.as_raw_fd()) } < 0 {
+                return Err(io_error(
+                    "log_rotation_failed",
+                    &rotated_path,
+                    io::Error::last_os_error(),
+                ));
+            }
+        }
+    }
+
+    let current = open_log_file(
+        cache.fd.as_raw_fd(),
+        &cache.path,
+        &log_name,
+        &log_path,
+        true,
+    )?;
+    // SAFETY: fchmod changes the mode of the already-opened regular log file,
+    // not a path that could be redirected through a symlink.
+    if unsafe { libc::fchmod(current.as_raw_fd(), 0o600) } < 0 {
+        return Err(io_error(
+            "log_unreadable",
+            &log_path,
+            io::Error::last_os_error(),
+        ));
+    }
+
+    let rotated = match fs::stat_at(
+        cache.fd.as_raw_fd(),
+        &rotated_name,
+        libc::AT_SYMLINK_NOFOLLOW,
+    ) {
+        Ok(_) => {
+            let file = open_log_file(
+                cache.fd.as_raw_fd(),
+                &cache.path,
+                &rotated_name,
+                &rotated_path,
+                false,
+            )?;
+            // SAFETY: fchmod changes the already-opened regular log, not a
+            // path that could be redirected through a symlink.
+            if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } < 0 {
+                return Err(io_error(
+                    "log_unreadable",
+                    &rotated_path,
+                    io::Error::last_os_error(),
+                ));
+            }
+            Some(file)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(io_error("log_unreadable", &rotated_path, error)),
+    };
+    drop(current);
+    drop(rotated);
+    Ok(CachePruneLog {
+        cache_fd: cache.fd,
+        environment_root: environment_root.to_path_buf(),
+        cache_identity: cache.identity,
+        cache_path: cache.path,
+        cap,
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn validate_cache_root_path(
+    environment_root: &Path,
+    expected_cache_path: &Path,
+    expected_cache_identity: CacheFsIdentity,
+) -> Result<(), CacheGcFsError> {
+    let cache = open_cache_root(environment_root)?.ok_or_else(|| {
+        CacheGcFsError::new("identity_changed", "environment cache root disappeared")
+    })?;
+    if cache.path != expected_cache_path || cache.identity != expected_cache_identity {
+        return Err(CacheGcFsError::new(
+            "identity_changed",
+            "environment cache root changed while the prune log was open",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn verify_cache_root_fd(
+    cache_fd: libc::c_int,
+    cache_path: &Path,
+    expected_cache_identity: CacheFsIdentity,
+) -> Result<(), CacheGcFsError> {
+    let stat = fs::fstat(cache_fd, cache_path)
+        .map_err(|error| io_error("root_unreadable", cache_path, error))?;
+    if fs::file_type(&stat) != libc::S_IFDIR || identity(&stat) != expected_cache_identity {
+        return Err(CacheGcFsError::new(
+            "identity_changed",
+            "pinned environment cache root changed while pruning",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn append_prune_log(
+    cache_fd: libc::c_int,
+    environment_root: &Path,
+    cache_path: &Path,
+    cache_identity: CacheFsIdentity,
+    cap: u64,
+    text: &str,
+) -> Result<(), CacheGcFsError> {
+    // The root check also applies the normal cap rotation through the selected
+    // cache path. Actual writes remain anchored to the cache fd retained when
+    // the prune sink was created.
+    let _validated = open_prune_log(environment_root, cache_path, cache_identity, cap)?;
+    verify_cache_root_fd(cache_fd, cache_path, cache_identity)?;
+    let name = CString::new("prune.log").expect("constant has no NUL");
+    let path = cache_path.join("prune.log");
+    let mut file = open_log_file(cache_fd, cache_path, &name, &path, true)?;
+    let before = fs::fstat(file.as_raw_fd(), &path)
+        .map_err(|error| io_error("log_unreadable", &path, error))?;
+    verify_same_mount(cache_fd, cache_path, file.as_raw_fd(), &path)?;
+    file.write_all(text.as_bytes())
+        .map_err(|error| io_error("log_write_failed", &path, error))?;
+    let opened_after = fs::fstat(file.as_raw_fd(), &path)
+        .map_err(|error| io_error("log_write_failed", &path, error))?;
+    verify_same_object(&before, &opened_after, &path)?;
+    let named_after = fs::stat_at(cache_fd, &name, libc::AT_SYMLINK_NOFOLLOW)
+        .map_err(|error| io_error("log_write_failed", &path, error))?;
+    verify_same(&opened_after, &named_after, &path)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn open_existing_log(
+    cache_fd: libc::c_int,
+    cache_path: &Path,
+    name: &std::ffi::CStr,
+) -> Result<Option<File>, CacheGcFsError> {
+    let name_text = name.to_string_lossy();
+    let path = cache_path.join(name_text.as_ref());
+    let before = match fs::stat_at(cache_fd, name, libc::AT_SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error("log_unreadable", &path, error)),
+    };
+    if fs::file_type(&before) != libc::S_IFREG || before.st_nlink != 1 {
+        return Err(CacheGcFsError::new(
+            "unsafe_path",
+            format!(
+                "{} is not a singly-linked regular prune log",
+                path.display()
+            ),
+        ));
+    }
+    let file = fs::openat_regular(cache_fd, name, &path)
+        .map_err(|error| CacheGcFsError::new("unsafe_path", error.to_string()))?;
+    let opened = fs::fstat(file.as_raw_fd(), &path)
+        .map_err(|error| io_error("log_unreadable", &path, error))?;
+    verify_same(&before, &opened, &path)?;
+    verify_same_mount(cache_fd, cache_path, file.as_raw_fd(), &path)?;
+    let named = fs::stat_at(cache_fd, name, libc::AT_SYMLINK_NOFOLLOW)
+        .map_err(|error| io_error("log_unreadable", &path, error))?;
+    verify_same(&opened, &named, &path)?;
+    Ok(Some(file))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn tail_prune_log(
+    cache_fd: libc::c_int,
+    environment_root: &Path,
+    cache_path: &Path,
+    cache_identity: CacheFsIdentity,
+    lines: usize,
+) -> Result<Vec<String>, CacheGcFsError> {
+    validate_cache_root_path(environment_root, cache_path, cache_identity)?;
+    verify_cache_root_fd(cache_fd, cache_path, cache_identity)?;
+    let current_name = CString::new("prune.log").expect("constant has no NUL");
+    let rotated_name = CString::new("prune.log.1").expect("constant has no NUL");
+    let mut current = open_existing_log(cache_fd, cache_path, &current_name)?;
+    let mut rotated = open_existing_log(cache_fd, cache_path, &rotated_name)?;
+    let mut collected = match current.as_mut() {
+        Some(file) => read_log_tail(file, lines)
+            .map_err(|error| io_error("log_read_failed", &cache_path.join("prune.log"), error))?,
+        None => Vec::new(),
+    };
+    if collected.len() < lines {
+        if let Some(file) = rotated.as_mut() {
+            let mut older = read_log_tail(file, lines - collected.len()).map_err(|error| {
+                io_error("log_read_failed", &cache_path.join("prune.log.1"), error)
+            })?;
+            older.append(&mut collected);
+            collected = older;
+        }
+    }
+    Ok(collected)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn open_prune_log(
+    _environment_root: &Path,
+    _expected_cache_path: &Path,
+    _expected_cache_identity: CacheFsIdentity,
+    _cap: u64,
+) -> Result<CachePruneLog, CacheGcFsError> {
+    Err(CacheGcFsError::new(
+        "unsupported_platform",
+        "safe environment-cache logs are supported only on macOS and Linux",
+    ))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1020,9 +1534,144 @@ fn count_templates(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+fn list_templates(
+    templates_fd: libc::c_int,
+    templates_path: &Path,
+    device: u64,
+    budget: &mut Budget,
+) -> Result<
+    (
+        Vec<TemplateEntry>,
+        std::collections::BTreeMap<String, usize>,
+    ),
+    CacheGcFsError,
+> {
+    let mut entries = Vec::new();
+    let mut counts = std::collections::BTreeMap::new();
+    let mut total_marker_bytes = 0_usize;
+    for repository in list_entries(templates_fd, templates_path, device, budget)? {
+        let repository_name = utf8_name(&repository, templates_path)?;
+        let repository_fd =
+            open_child_directory(templates_fd, &repository, templates_path, device)?;
+        let repository_path = templates_path.join(&repository_name);
+        let mut count = 0_usize;
+        for component in list_entries(repository_fd.as_raw_fd(), &repository_path, device, budget)?
+        {
+            let component_name = utf8_name(&component, &repository_path)?;
+            let component_fd = open_child_directory(
+                repository_fd.as_raw_fd(),
+                &component,
+                &repository_path,
+                device,
+            )?;
+            let component_path = repository_path.join(&component_name);
+            let component_stat = fs::fstat(component_fd.as_raw_fd(), &component_path)
+                .map_err(|error| io_error("entry_unreadable", &component_path, error))?;
+            for marker in list_entries(component_fd.as_raw_fd(), &component_path, device, budget)? {
+                let marker_name = utf8_name(&marker, &component_path)?;
+                let marker_path = component_path.join(&marker_name);
+                if fs::file_type(&marker.stat) != libc::S_IFREG
+                    || !has_bounded_file_size(marker.stat.st_size, MAX_TEMPLATE_MARKER_BYTES)
+                {
+                    return Err(CacheGcFsError::new(
+                        "unsafe_path",
+                        format!(
+                            "{} is not a bounded regular template marker",
+                            marker_path.display()
+                        ),
+                    ));
+                }
+                let mut file =
+                    fs::openat_regular(component_fd.as_raw_fd(), &marker.c_name, &marker_path)
+                        .map_err(|error| CacheGcFsError::new("unsafe_path", error.to_string()))?;
+                let opened = fs::fstat(file.as_raw_fd(), &marker_path)
+                    .map_err(|error| io_error("entry_unreadable", &marker_path, error))?;
+                verify_same(&marker.stat, &opened, &marker_path)?;
+                verify_same_mount(
+                    component_fd.as_raw_fd(),
+                    &component_path,
+                    file.as_raw_fd(),
+                    &marker_path,
+                )?;
+                let mut bytes = Vec::with_capacity(marker.stat.st_size as usize);
+                file.take((MAX_TEMPLATE_MARKER_BYTES + 1) as u64)
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| io_error("metadata_unreadable", &marker_path, error))?;
+                if bytes.len() > MAX_TEMPLATE_MARKER_BYTES {
+                    return Err(CacheGcFsError::new(
+                        "metadata_limit",
+                        format!(
+                            "{} exceeds the template marker size limit",
+                            marker_path.display()
+                        ),
+                    ));
+                }
+                total_marker_bytes = total_marker_bytes
+                    .checked_add(bytes.len())
+                    .filter(|total| *total <= MAX_TEMPLATE_MARKER_TOTAL_BYTES)
+                    .ok_or_else(|| {
+                        CacheGcFsError::new(
+                            "metadata_limit",
+                            "template markers exceed the total inventory byte limit",
+                        )
+                    })?;
+                let named_after = fs::stat_at(
+                    component_fd.as_raw_fd(),
+                    &marker.c_name,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+                .map_err(|error| io_error("metadata_unreadable", &marker_path, error))?;
+                verify_same(&marker.stat, &named_after, &marker_path)?;
+                budget.check()?;
+                count = count.checked_add(1).ok_or_else(|| {
+                    CacheGcFsError::new("size_overflow", "template entry count overflowed")
+                })?;
+                entries.push(TemplateEntry {
+                    repository: repository_name.clone(),
+                    component: component_name.clone(),
+                    marker_name,
+                    path: marker_path,
+                    bytes,
+                    parent_identity: identity(&component_stat),
+                    identity: identity(&marker.stat),
+                });
+            }
+        }
+        if count > 0 {
+            counts.insert(repository_name, count);
+        }
+    }
+    Ok((entries, counts))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn inventory(
     environment_root: &Path,
     deadline: Option<Instant>,
+) -> Result<Option<CacheInventory>, CacheGcFsError> {
+    inventory_impl(environment_root, deadline, false, true)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn inventory_for_prune(
+    environment_root: &Path,
+    deadline: Option<Instant>,
+    include_templates: bool,
+) -> Result<Option<CacheInventory>, CacheGcFsError> {
+    inventory_impl(
+        environment_root,
+        deadline,
+        include_templates,
+        include_templates,
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn inventory_impl(
+    environment_root: &Path,
+    deadline: Option<Instant>,
+    include_templates: bool,
+    collect_template_counts: bool,
 ) -> Result<Option<CacheInventory>, CacheGcFsError> {
     let mut budget = Budget::new(deadline);
     budget.check()?;
@@ -1047,8 +1696,11 @@ pub(crate) fn inventory(
         }
     }
     let builds_fd = optional_directory(cache.fd.as_raw_fd(), &cache.path, "builds", cache.device)?;
-    let templates_fd =
-        optional_directory(cache.fd.as_raw_fd(), &cache.path, "templates", cache.device)?;
+    let templates_fd = if include_templates || collect_template_counts {
+        optional_directory(cache.fd.as_raw_fd(), &cache.path, "templates", cache.device)?
+    } else {
+        None
+    };
     let (builds, host_total_bytes) = if let Some(fd) = builds_fd {
         list_builds(
             fd.as_raw_fd(),
@@ -1059,15 +1711,29 @@ pub(crate) fn inventory(
     } else {
         (Vec::new(), 0)
     };
-    let templates_by_repository = if let Some(fd) = templates_fd {
-        count_templates(
-            fd.as_raw_fd(),
-            &cache.path.join("templates"),
-            cache.device,
-            &mut budget,
-        )?
+    let (templates, templates_by_repository) = if let Some(fd) = templates_fd {
+        if include_templates {
+            list_templates(
+                fd.as_raw_fd(),
+                &cache.path.join("templates"),
+                cache.device,
+                &mut budget,
+            )?
+        } else if collect_template_counts {
+            (
+                Vec::new(),
+                count_templates(
+                    fd.as_raw_fd(),
+                    &cache.path.join("templates"),
+                    cache.device,
+                    &mut budget,
+                )?,
+            )
+        } else {
+            (Vec::new(), std::collections::BTreeMap::new())
+        }
     } else {
-        std::collections::BTreeMap::new()
+        (Vec::new(), std::collections::BTreeMap::new())
     };
     budget.check()?;
     Ok(Some(CacheInventory {
@@ -1075,6 +1741,7 @@ pub(crate) fn inventory(
         cache_identity: cache.identity,
         host_total_bytes,
         builds,
+        templates,
         templates_by_repository,
     }))
 }
@@ -1240,6 +1907,272 @@ fn remove_directory_contents(
     let after = fs::fstat(directory_fd, path)
         .map_err(|error| CacheGcFsError::new("entry_unreadable", error.to_string()))?;
     verify_same_object(initial_stat, &after, path)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn open_template_parent(
+    cache: &CacheRoot,
+    repository: &str,
+    component: &str,
+) -> Result<Option<(OwnedFd, libc::stat, PathBuf)>, CacheGcFsError> {
+    for name in [repository, component] {
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\0')
+        {
+            return Err(CacheGcFsError::new(
+                "unsafe_path",
+                "template marker path is not component-safe",
+            ));
+        }
+    }
+    let Some(templates_fd) =
+        optional_directory(cache.fd.as_raw_fd(), &cache.path, "templates", cache.device)?
+    else {
+        return Ok(None);
+    };
+    let templates_path = cache.path.join("templates");
+    let repository_name = CString::new(repository)
+        .map_err(|_| CacheGcFsError::new("unsafe_path", "template repository contains NUL"))?;
+    let repository_path = templates_path.join(repository);
+    let repository_stat = match fs::stat_at(
+        templates_fd.as_raw_fd(),
+        &repository_name,
+        libc::AT_SYMLINK_NOFOLLOW,
+    ) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error("entry_unreadable", &repository_path, error)),
+    };
+    let repository_entry = Entry {
+        name: OsString::from(repository),
+        c_name: repository_name,
+        stat: repository_stat,
+    };
+    let repository_fd = open_child_directory(
+        templates_fd.as_raw_fd(),
+        &repository_entry,
+        &templates_path,
+        cache.device,
+    )?;
+    let component_name = CString::new(component)
+        .map_err(|_| CacheGcFsError::new("unsafe_path", "template component contains NUL"))?;
+    let component_path = repository_path.join(component);
+    let component_stat = match fs::stat_at(
+        repository_fd.as_raw_fd(),
+        &component_name,
+        libc::AT_SYMLINK_NOFOLLOW,
+    ) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error("entry_unreadable", &component_path, error)),
+    };
+    let component_entry = Entry {
+        name: OsString::from(component),
+        c_name: component_name,
+        stat: component_stat,
+    };
+    let component_fd = open_child_directory(
+        repository_fd.as_raw_fd(),
+        &component_entry,
+        &repository_path,
+        cache.device,
+    )?;
+    let opened = fs::fstat(component_fd.as_raw_fd(), &component_path)
+        .map_err(|error| io_error("entry_unreadable", &component_path, error))?;
+    verify_same(&component_stat, &opened, &component_path)?;
+    Ok(Some((component_fd, component_stat, component_path)))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn remove_template_marker(
+    environment_root: &Path,
+    expected_cache_path: &Path,
+    expected_cache_identity: CacheFsIdentity,
+    repository: &str,
+    component: &str,
+    marker_name: &str,
+    expected_parent_identity: CacheFsIdentity,
+    expected_marker_identity: CacheFsIdentity,
+    expected_contents: &[u8],
+    before_unlink: impl FnOnce(libc::c_int, &[u8]) -> Result<(), String>,
+    deadline: Option<Instant>,
+) -> Result<DeleteOutcome, CacheGcFsError> {
+    let mut budget = Budget::new(deadline);
+    budget.check()?;
+    let cache = open_cache_root(environment_root)?.ok_or_else(|| {
+        CacheGcFsError::new("identity_changed", "environment state root disappeared")
+    })?;
+    if cache.path != expected_cache_path || cache.identity != expected_cache_identity {
+        return Err(CacheGcFsError::new(
+            "identity_changed",
+            "environment cache root changed since template inventory",
+        ));
+    }
+    let Some((parent_fd, parent_stat, parent_path)) =
+        open_template_parent(&cache, repository, component)?
+    else {
+        return Err(CacheGcFsError::new(
+            "identity_changed",
+            "template marker parent disappeared since inventory",
+        ));
+    };
+    if identity(&parent_stat) != expected_parent_identity {
+        return Err(CacheGcFsError::new(
+            "identity_changed",
+            "template marker parent changed since inventory",
+        ));
+    }
+    if marker_name.is_empty()
+        || marker_name == "."
+        || marker_name == ".."
+        || marker_name.contains('/')
+        || marker_name.contains('\0')
+    {
+        return Err(CacheGcFsError::new(
+            "unsafe_path",
+            "template marker name is not one component",
+        ));
+    }
+    let name = CString::new(marker_name)
+        .map_err(|_| CacheGcFsError::new("unsafe_path", "template marker name contains NUL"))?;
+    let marker_path = parent_path.join(marker_name);
+    let before = fs::stat_at(parent_fd.as_raw_fd(), &name, libc::AT_SYMLINK_NOFOLLOW)
+        .map_err(|error| io_error("entry_unreadable", &marker_path, error))?;
+    if fs::file_type(&before) != libc::S_IFREG
+        || identity(&before) != expected_marker_identity
+        || !has_bounded_file_size(before.st_size, MAX_TEMPLATE_MARKER_BYTES)
+    {
+        return Err(CacheGcFsError::new(
+            "identity_changed",
+            "template marker identity or type changed since inventory",
+        ));
+    }
+    let mut file = fs::openat_regular(parent_fd.as_raw_fd(), &name, &marker_path)
+        .map_err(|error| CacheGcFsError::new("unsafe_path", error.to_string()))?;
+    let opened = fs::fstat(file.as_raw_fd(), &marker_path)
+        .map_err(|error| io_error("entry_unreadable", &marker_path, error))?;
+    verify_same(&before, &opened, &marker_path)?;
+    verify_same_mount(
+        parent_fd.as_raw_fd(),
+        &parent_path,
+        file.as_raw_fd(),
+        &marker_path,
+    )?;
+    let mut bytes = Vec::with_capacity(before.st_size as usize);
+    file.take((MAX_TEMPLATE_MARKER_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_error("metadata_unreadable", &marker_path, error))?;
+    if bytes.len() > MAX_TEMPLATE_MARKER_BYTES || bytes != expected_contents {
+        return Err(CacheGcFsError::new(
+            "identity_changed",
+            "template marker contents changed since inventory",
+        ));
+    }
+    let named = fs::stat_at(parent_fd.as_raw_fd(), &name, libc::AT_SYMLINK_NOFOLLOW)
+        .map_err(|error| io_error("entry_unreadable", &marker_path, error))?;
+    verify_same(&before, &named, &marker_path)?;
+    budget.check()?;
+    before_unlink(parent_fd.as_raw_fd(), &bytes)
+        .map_err(|error| CacheGcFsError::new("template_destroy_failed", error))?;
+    // The hook has its own configured timeout. Start a fresh bounded
+    // filesystem budget for the identity recheck and marker unlink.
+    let mut budget = Budget::new(None);
+    budget.check()?;
+
+    // The hook has succeeded. If it removed the marker itself, sync its pinned
+    // parent and report completion; otherwise remove only the original file.
+    let after_hook = match fs::stat_at(parent_fd.as_raw_fd(), &name, libc::AT_SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // SAFETY: `parent_fd` is the pinned component directory whose
+            // marker entry the successful hook removed.
+            if unsafe { libc::fsync(parent_fd.as_raw_fd()) } < 0 {
+                return Err(io_error(
+                    "marker_sync_failed",
+                    &marker_path,
+                    io::Error::last_os_error(),
+                ));
+            }
+            return Ok(DeleteOutcome::Removed);
+        }
+        Err(error) => return Err(io_error("entry_unreadable", &marker_path, error)),
+    };
+    if fs::file_type(&after_hook) != libc::S_IFREG
+        || identity(&after_hook) != expected_marker_identity
+        || !has_bounded_file_size(after_hook.st_size, MAX_TEMPLATE_MARKER_BYTES)
+    {
+        return Err(CacheGcFsError::new(
+            "identity_changed",
+            "template marker was replaced while template_destroy ran; replacement retained",
+        ));
+    }
+    let mut after_file = fs::openat_regular(parent_fd.as_raw_fd(), &name, &marker_path)
+        .map_err(|error| CacheGcFsError::new("unsafe_path", error.to_string()))?;
+    let opened_after = fs::fstat(after_file.as_raw_fd(), &marker_path)
+        .map_err(|error| io_error("entry_unreadable", &marker_path, error))?;
+    verify_same(&after_hook, &opened_after, &marker_path)?;
+    verify_same_mount(
+        parent_fd.as_raw_fd(),
+        &parent_path,
+        after_file.as_raw_fd(),
+        &marker_path,
+    )?;
+    let mut after_bytes = Vec::with_capacity(after_hook.st_size.max(0) as usize);
+    after_file
+        .take((MAX_TEMPLATE_MARKER_BYTES + 1) as u64)
+        .read_to_end(&mut after_bytes)
+        .map_err(|error| io_error("metadata_unreadable", &marker_path, error))?;
+    if after_bytes != bytes {
+        return Err(CacheGcFsError::new(
+            "identity_changed",
+            "template marker contents changed while template_destroy ran; replacement retained",
+        ));
+    }
+    let named_after = fs::stat_at(parent_fd.as_raw_fd(), &name, libc::AT_SYMLINK_NOFOLLOW)
+        .map_err(|error| io_error("entry_unreadable", &marker_path, error))?;
+    verify_same(&after_hook, &named_after, &marker_path)?;
+    // SAFETY: `name` is one component relative to the pinned component
+    // directory; unlinkat removes the marker itself without following links.
+    if unsafe { libc::unlinkat(parent_fd.as_raw_fd(), name.as_ptr(), 0) } < 0 {
+        return Err(io_error(
+            "delete_failed",
+            &marker_path,
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `parent_fd` is the pinned component directory whose marker was
+    // just removed; syncing makes that removal durable.
+    if unsafe { libc::fsync(parent_fd.as_raw_fd()) } < 0 {
+        return Err(io_error(
+            "marker_sync_failed",
+            &marker_path,
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(DeleteOutcome::Removed)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn remove_template_marker(
+    _environment_root: &Path,
+    _expected_cache_path: &Path,
+    _expected_cache_identity: CacheFsIdentity,
+    _repository: &str,
+    _component: &str,
+    _marker_name: &str,
+    _expected_parent_identity: CacheFsIdentity,
+    _expected_marker_identity: CacheFsIdentity,
+    _expected_contents: &[u8],
+    _before_unlink: impl FnOnce(libc::c_int, &[u8]) -> Result<(), String>,
+    _deadline: Option<Instant>,
+) -> Result<DeleteOutcome, CacheGcFsError> {
+    Err(CacheGcFsError::new(
+        "unsupported_platform",
+        "safe environment-cache template removal is supported only on macOS and Linux",
+    ))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1445,6 +2378,18 @@ fn remove_build_with_marker_hook(
 pub(crate) fn inventory(
     _environment_root: &Path,
     _deadline: Option<Instant>,
+) -> Result<Option<CacheInventory>, CacheGcFsError> {
+    Err(CacheGcFsError::new(
+        "unsupported_platform",
+        "safe environment-cache inventory is supported only on macOS and Linux",
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn inventory_for_prune(
+    _environment_root: &Path,
+    _deadline: Option<Instant>,
+    _include_templates: bool,
 ) -> Result<Option<CacheInventory>, CacheGcFsError> {
     Err(CacheGcFsError::new(
         "unsupported_platform",
@@ -1974,6 +2919,83 @@ mod tests {
         let _entry = build_tree(&root);
         let error = inventory(&root, Some(Instant::now())).unwrap_err();
         assert_eq!(error.code, "deadline_exceeded");
+    }
+
+    #[test]
+    fn prune_log_rotates_and_tails_through_the_pinned_cache_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("state");
+        std::fs::create_dir_all(root.join("cache")).unwrap();
+        let cache = open_cache_root(&root).unwrap().unwrap();
+        let mut log = open_prune_log(&root, &cache.path, cache.identity, 1).unwrap();
+
+        log.append("old line\n").unwrap();
+        log.append("new line\n").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(cache.path.join("prune.log")).unwrap(),
+            "new line\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cache.path.join("prune.log.1")).unwrap(),
+            "old line\n"
+        );
+        assert_eq!(log.tail(2).unwrap(), ["old line", "new line"]);
+    }
+
+    #[test]
+    fn prune_log_refuses_a_symlink_without_writing_its_target() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("state");
+        let cache_path = root.join("cache");
+        std::fs::create_dir_all(&cache_path).unwrap();
+        let outside = temporary.path().join("outside.log");
+        std::fs::write(&outside, b"keep me").unwrap();
+        std::os::unix::fs::symlink(&outside, cache_path.join("prune.log")).unwrap();
+        let cache = open_cache_root(&root).unwrap().unwrap();
+
+        let error = open_prune_log(&root, &cache.path, cache.identity, 1024).unwrap_err();
+
+        assert_eq!(error.code, "unsafe_path");
+        assert_eq!(std::fs::read(outside).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn template_marker_replacement_during_destroy_is_preserved() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("state");
+        let component = root.join("cache/templates/repo/component");
+        std::fs::create_dir_all(&component).unwrap();
+        let marker_path = component.join("1234567890abcdef.json");
+        std::fs::write(&marker_path, b"initial marker").unwrap();
+        let inventory = inventory_for_prune(&root, None, true).unwrap().unwrap();
+        let marker = inventory.templates.first().unwrap();
+        let replacement_path = component.join("replacement.tmp");
+        let marker_path_for_hook = marker_path.clone();
+        let replacement = b"replacement marker".to_vec();
+
+        let error = remove_template_marker(
+            &root,
+            &inventory.cache_root,
+            inventory.cache_identity,
+            &marker.repository,
+            &marker.component,
+            &marker.marker_name,
+            marker.parent_identity,
+            marker.identity,
+            &marker.bytes,
+            move |_directory_fd, _contents| {
+                std::fs::write(&replacement_path, &replacement)
+                    .map_err(|error| error.to_string())?;
+                std::fs::rename(&replacement_path, &marker_path_for_hook)
+                    .map_err(|error| error.to_string())
+            },
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "identity_changed");
+        assert_eq!(std::fs::read(marker_path).unwrap(), b"replacement marker");
     }
 }
 

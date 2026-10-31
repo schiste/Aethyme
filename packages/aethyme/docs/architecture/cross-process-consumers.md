@@ -722,6 +722,12 @@ materialize an output after payload deletion starts. Filesystem inventory and
 removal also stop when mount identity cannot be checked or changes during
 descent.
 
+Interactive `aethyme env cache prune` uses the same identity-bound inventory
+and exact existing cache-key rule. Its descriptor-relative filesystem handling
+and pinned-directory template hook runner are supported only on macOS and
+Linux; on other platforms the command refuses before deleting entries or
+running hooks.
+
 ### Affected gate-selection timing (#481)
 
 | Source | Invokes / assumes | Failure mode |
