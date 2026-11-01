@@ -407,7 +407,10 @@ impl EnvironmentStore {
                        env_id TEXT, phase TEXT, spec_snapshot_json TEXT
                      );",
                 )?;
-                Ok(Self { conn })
+                Ok(Self {
+                    conn,
+                    record_timings: false,
+                })
             }
         }
     }
@@ -482,7 +485,10 @@ impl EnvironmentStore {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(StoreError::CacheGcDeadline);
         }
-        Ok(Some(Self { conn }))
+        Ok(Some(Self {
+            conn,
+            record_timings: false,
+        }))
     }
 
     pub(crate) fn cache_gc_records(

@@ -1212,7 +1212,7 @@ fn read_key(fd: libc::c_int, path: &Path) -> Result<Option<String>, CacheGcFsErr
             ),
         ));
     }
-    let mut file = fs::openat_regular(fd, &name, &path.join(".key"))
+    let file = fs::openat_regular(fd, &name, &path.join(".key"))
         .map_err(|error| CacheGcFsError::new("metadata_unreadable", error.to_string()))?;
     let opened = fs::fstat(file.as_raw_fd(), &path.join(".key"))
         .map_err(|error| CacheGcFsError::new("metadata_unreadable", error.to_string()))?;
@@ -1283,7 +1283,7 @@ pub(crate) fn read_regular_file(
             format!("{} is not a bounded regular file", path.display()),
         ));
     }
-    let mut file = fs::openat_regular(directory.as_raw_fd(), &name_c, &path)
+    let file = fs::openat_regular(directory.as_raw_fd(), &name_c, &path)
         .map_err(|error| CacheGcFsError::new("metadata_unreadable", error.to_string()))?;
     let opened = fs::fstat(file.as_raw_fd(), &path)
         .map_err(|error| CacheGcFsError::new("metadata_unreadable", error.to_string()))?;
@@ -1581,7 +1581,7 @@ fn list_templates(
                         ),
                     ));
                 }
-                let mut file =
+                let file =
                     fs::openat_regular(component_fd.as_raw_fd(), &marker.c_name, &marker_path)
                         .map_err(|error| CacheGcFsError::new("unsafe_path", error.to_string()))?;
                 let opened = fs::fstat(file.as_raw_fd(), &marker_path)
@@ -2000,7 +2000,7 @@ pub(crate) fn remove_template_marker(
     before_unlink: impl FnOnce(libc::c_int, &[u8]) -> Result<(), String>,
     deadline: Option<Instant>,
 ) -> Result<DeleteOutcome, CacheGcFsError> {
-    let mut budget = Budget::new(deadline);
+    let budget = Budget::new(deadline);
     budget.check()?;
     let cache = open_cache_root(environment_root)?.ok_or_else(|| {
         CacheGcFsError::new("identity_changed", "environment state root disappeared")
@@ -2050,7 +2050,7 @@ pub(crate) fn remove_template_marker(
             "template marker identity or type changed since inventory",
         ));
     }
-    let mut file = fs::openat_regular(parent_fd.as_raw_fd(), &name, &marker_path)
+    let file = fs::openat_regular(parent_fd.as_raw_fd(), &name, &marker_path)
         .map_err(|error| CacheGcFsError::new("unsafe_path", error.to_string()))?;
     let opened = fs::fstat(file.as_raw_fd(), &marker_path)
         .map_err(|error| io_error("entry_unreadable", &marker_path, error))?;
@@ -2079,7 +2079,7 @@ pub(crate) fn remove_template_marker(
         .map_err(|error| CacheGcFsError::new("template_destroy_failed", error))?;
     // The hook has its own configured timeout. Start a fresh bounded
     // filesystem budget for the identity recheck and marker unlink.
-    let mut budget = Budget::new(None);
+    let budget = Budget::new(None);
     budget.check()?;
 
     // The hook has succeeded. If it removed the marker itself, sync its pinned
@@ -2109,7 +2109,7 @@ pub(crate) fn remove_template_marker(
             "template marker was replaced while template_destroy ran; replacement retained",
         ));
     }
-    let mut after_file = fs::openat_regular(parent_fd.as_raw_fd(), &name, &marker_path)
+    let after_file = fs::openat_regular(parent_fd.as_raw_fd(), &name, &marker_path)
         .map_err(|error| CacheGcFsError::new("unsafe_path", error.to_string()))?;
     let opened_after = fs::fstat(after_file.as_raw_fd(), &marker_path)
         .map_err(|error| io_error("entry_unreadable", &marker_path, error))?;
@@ -2276,7 +2276,7 @@ fn remove_build_with_marker_hook(
     }
     let observed_marker = completion_marker(build_fd.as_raw_fd(), &build_path)?;
     let observed_last_used = observed_marker.map(|marker| marker.last_used_at_ms);
-    let last_used_is_expected = observed_last_used == expected_last_used_at_ms;
+    let last_used_is_expected = observed_last_used == Some(expected_last_used_at_ms);
     if (deletion_started && observed_marker.is_some())
         || (!deletion_started && !last_used_is_expected)
     {
@@ -2750,6 +2750,35 @@ mod tests {
     }
 
     #[test]
+    fn missing_completion_marker_cannot_start_deletion_with_an_unknown_timestamp() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("state");
+        let entry_path = build_tree(&root);
+        let inventory = inventory(&root, None).unwrap().unwrap();
+        let candidate = inventory.builds.first().unwrap();
+        std::fs::remove_file(entry_path.join(".complete")).unwrap();
+
+        let refused = remove_build(
+            &root,
+            &inventory.cache_root,
+            inventory.cache_identity,
+            &candidate.repository,
+            &candidate.component,
+            &candidate.digest,
+            candidate.identity,
+            candidate.key.as_deref(),
+            None,
+            false,
+            || panic!("missing completion evidence must not authorize a deletion receipt"),
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(refused.code, "used_since_plan");
+        assert!(entry_path.join("output/app.bin").exists());
+    }
+
+    #[test]
     fn interrupted_payload_removal_keeps_marker_invalidated_and_rejects_recompletion() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("state");
@@ -2904,7 +2933,7 @@ mod tests {
 
     #[test]
     fn entry_budget_refuses_the_next_path_before_inventory_continues() {
-        let budget = Budget {
+        let mut budget = Budget {
             deadline: Instant::now() + Duration::from_secs(1),
             entries: MAX_ENTRIES,
         };

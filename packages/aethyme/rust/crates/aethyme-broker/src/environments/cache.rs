@@ -49,7 +49,7 @@ use globset::{GlobBuilder, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::compile::CompiledComponent;
+use super::compile::{CompiledComponent, CompiledEnvironment};
 use super::drivers::DriverContext;
 use super::exec::{DriverError, append_log, run_hook, run_hook_in_directory_fd};
 use super::lifecycle::Lifecycle;
@@ -964,7 +964,7 @@ fn entries_in_use(store: &EnvironmentStore, root: &Path) -> Result<Vec<PathBuf>,
             }
             match std::fs::canonicalize(&entry) {
                 Ok(path) => {
-                    entries.insert(path);
+                    entries.push(path);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
@@ -1528,7 +1528,8 @@ mod cache_gc_lock_tests {
         let digest = format!("0123456789abcdef{}", "a".repeat(48));
         let key = format!("aethyme-env-build:{repository}:component:{digest}");
 
-        let lock = planned_build_cache_lock(&candidate(Some(key.clone()))).unwrap();
+        let candidate = candidate(Some(key.clone()));
+        let lock = planned_build_cache_lock(&candidate).unwrap();
 
         assert_eq!(lock, (repository, key.as_str()));
     }
