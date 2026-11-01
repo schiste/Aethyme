@@ -79,10 +79,13 @@ fn task_lease_classification_uses_normalized_actions_and_preserves_polling() {
         ]),
         ObservationOnly
     );
-    assert_eq!(classify(&["events"]), ObservationOnly);
-    assert_eq!(classify(&["metrics"]), ObservationOnly);
-    assert_eq!(classify(&["insights"]), ObservationOnly);
-    assert_eq!(classify(&["handoff", "--session", "17"]), ObservationOnly);
+    assert_eq!(classify(&["advanced", "events"]), ObservationOnly);
+    assert_eq!(classify(&["advanced", "metrics"]), ObservationOnly);
+    assert_eq!(classify(&["advanced", "insights"]), ObservationOnly);
+    assert_eq!(
+        classify(&["advanced", "handoff", "--session", "17"]),
+        ObservationOnly
+    );
     assert_eq!(
         classify(&["unblock"]),
         ObservationOnly,
@@ -93,20 +96,28 @@ fn task_lease_classification_uses_normalized_actions_and_preserves_polling() {
         classify(&["advanced", "exec-status", "--session", "17"]),
         ObservationOnly
     );
-    assert_eq!(classify(&["worktrees"]), ObservationOnly);
-    assert_eq!(classify(&["queue"]), ObservationOnly);
-    assert_eq!(classify(&["queue", "history"]), ObservationOnly);
-    assert_eq!(classify(&["report", "list"]), ObservationOnly);
+    assert_eq!(classify(&["advanced", "worktrees"]), ObservationOnly);
+    assert_eq!(classify(&["advanced", "queue"]), ObservationOnly);
+    assert_eq!(classify(&["advanced", "queue", "history"]), ObservationOnly);
+    assert_eq!(classify(&["advanced", "report", "list"]), ObservationOnly);
     assert_eq!(
-        classify(&["report", "show", "captured.json"]),
-        ObservationOnly
-    );
-    assert_eq!(
-        classify(&["report", "render", "captured.json", "--form", "form.yml"]),
+        classify(&["advanced", "report", "show", "captured.json"]),
         ObservationOnly
     );
     assert_eq!(
         classify(&[
+            "advanced",
+            "report",
+            "render",
+            "captured.json",
+            "--form",
+            "form.yml"
+        ]),
+        ObservationOnly
+    );
+    assert_eq!(
+        classify(&[
+            "advanced",
             "report",
             "render",
             "captured.json",
@@ -119,6 +130,7 @@ fn task_lease_classification_uses_normalized_actions_and_preserves_polling() {
     );
     assert_eq!(
         classify(&[
+            "advanced",
             "quality-report",
             "plan",
             "captured.json",
@@ -129,14 +141,28 @@ fn task_lease_classification_uses_normalized_actions_and_preserves_polling() {
         ]),
         ObservationOnly
     );
-    assert_eq!(classify(&["deliveries", "list"]), ObservationOnly);
-    assert_eq!(classify(&["watch", "pr", "list"]), ObservationOnly);
     assert_eq!(
-        classify(&["watch", "repo", "events", "--id", "42"]),
+        classify(&["advanced", "deliveries", "list"]),
         ObservationOnly
     );
     assert_eq!(
-        classify(&["watch", "pr", "monitoring", "status", "--session", "17"]),
+        classify(&["advanced", "watch", "pr", "list"]),
+        ObservationOnly
+    );
+    assert_eq!(
+        classify(&["advanced", "watch", "repo", "events", "--id", "42"]),
+        ObservationOnly
+    );
+    assert_eq!(
+        classify(&[
+            "advanced",
+            "watch",
+            "pr",
+            "monitoring",
+            "status",
+            "--session",
+            "17"
+        ]),
         ObservationOnly
     );
     assert_eq!(
@@ -145,7 +171,7 @@ fn task_lease_classification_uses_normalized_actions_and_preserves_polling() {
     );
     assert_eq!(classify(&["gc", "plan"]), ObservationOnly);
     assert_eq!(
-        classify(&["events", "prune", "--keep-days", "30"]),
+        classify(&["advanced", "events", "prune", "--keep-days", "30"]),
         OtherWork
     );
     assert_eq!(
@@ -266,7 +292,14 @@ fn closed_session_admission_exceptions_are_narrowly_scoped() {
         "--session",
         "17"
     ]));
-    assert!(!reaches_handler(&["exec", "--session", "17", "--", "true"]));
+    assert!(!reaches_handler(&[
+        "advanced",
+        "exec",
+        "--session",
+        "17",
+        "--",
+        "true"
+    ]));
     assert!(!reaches_handler(&[
         "submit",
         "prepare",
