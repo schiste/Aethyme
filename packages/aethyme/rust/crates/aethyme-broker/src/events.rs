@@ -133,6 +133,7 @@ pub fn session_holder_bound_payload(
 /// `session.holder_bound` for a holder that explicitly entered the guarded
 /// task-lease protocol. Ordinary start/adopt and legacy rebinding events do
 /// not gain an expiry lease until guarded admission upgrades them.
+#[cfg(test)]
 pub(crate) fn session_holder_task_lease_bound_payload(
     holder: &crate::session_holder::AgentProcess,
     reason: &str,
@@ -147,9 +148,7 @@ pub(crate) fn session_holder_task_lease_heartbeat_payload(
     existing: &serde_json::Value,
 ) -> Option<String> {
     let mut payload = existing.clone();
-    if payload.as_object().is_none() {
-        return None;
-    }
+    payload.as_object()?;
     payload["task_lease"] = json!(crate::session_holder::TaskLease::current());
     Some(payload.to_string())
 }
@@ -160,9 +159,7 @@ pub(crate) fn session_holder_task_lease_downgraded_payload(
     existing: &serde_json::Value,
 ) -> Option<String> {
     let mut payload = existing.clone();
-    if payload.as_object_mut()?.remove("task_lease").is_none() {
-        return None;
-    }
+    payload.as_object_mut()?.remove("task_lease")?;
     Some(payload.to_string())
 }
 

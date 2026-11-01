@@ -2985,14 +2985,14 @@ fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseComma
             TaskLeaseCommandClass::GuardedWork
         }
         "status" | "readiness" | "worktree-root" | "adopt" | "start" | "start-agent" | "report"
-        | "quality-report" | "external-events" | "reclaim" | "deliveries" | "review"
-        | "review-thread" | "console" | "resources" | "agents" | "ownership" | "merge-chain"
-        | "advisories" | "exposures" | "note" | "operations" | "gates" | "watch" | "pr"
-        | "hooks" | "handoff" | "finish" | "close" | "gc" | "worktrees" | "storage" | "metrics"
-        | "insights" | "blockers" | "unblock" | "doctor" | "quick-test" | "trust"
+        | "quality-report" | "external-events" | "deliveries" | "review" | "review-thread"
+        | "console" | "resources" | "agents" | "ownership" | "merge-chain" | "advisories"
+        | "exposures" | "note" | "operations" | "gates" | "watch" | "pr" | "hooks" | "finish"
+        | "close" | "gc" | "storage" | "unblock" | "doctor" | "quick-test" | "trust"
         | "verify-loop" | "e2e" | "init" | "certify" | "scaffold" | "promotion-record"
-        | "checkpoint" | "queue" | "promote" | "ship" | "integration" | "events"
-        | "exec-status" => TaskLeaseCommandClass::OtherWork,
+        | "checkpoint" | "promote" | "ship" | "integration" | "events" => {
+            TaskLeaseCommandClass::OtherWork
+        }
         _ => TaskLeaseCommandClass::NoSessionWork,
     }
 }
