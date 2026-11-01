@@ -486,6 +486,8 @@ pub enum BrokerOpError {
     InvalidAdvisory { reason: String },
     #[error("invalid broker note: {reason}")]
     InvalidSessionNote { reason: String },
+    #[error("invalid owners request: {reason}")]
+    InvalidOwnersRequest { reason: String },
     #[error(
         "session {session_id} cannot acknowledge note {note_id}, which belongs to session {recipient_session_id}"
     )]
@@ -1473,6 +1475,12 @@ pub struct DoctorReport {
     /// environment is a trend to act on, not a broken broker.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub environment_budgets_over: Vec<crate::environments::budgets::MetricReport>,
+    /// Automation issue writes the repository policy refused, as the local
+    /// journal keeps them (#1238): with `[automation] issues = "deny"` an
+    /// outcome reaches GitHub nowhere, so this is where it is seen. Reported,
+    /// never counted against [`Self::healthy`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub automation_issue_refusals: Vec<crate::OutcomeIssueRefusal>,
     /// Milliseconds each doctor phase took (#460).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub phase_timings_ms: std::collections::BTreeMap<String, u64>,
@@ -3545,7 +3553,9 @@ mod cleanup;
 mod finish;
 mod gates;
 mod leases;
+mod owners;
 pub(crate) use leases::{AbandonedSessionCloseOutcome, validate_session_commit_args};
+pub use owners::{CommitOwner, MAX_OWNER_COMMITS, OwnedCommit, OwnersReport};
 pub(crate) mod lifecycle;
 mod scope_capture;
 mod status;

@@ -128,6 +128,10 @@ pub const ADVANCED_VERBS: &[(&str, &str)] = &[
         "agents",
         "list live sessions with activity-derived liveness",
     ),
+    (
+        "owners",
+        "name the sessions behind landed commits, with liveness",
+    ),
     ("handoff", "read a finished session's persisted handoff"),
     ("queue", "show the merge queue"),
     (
@@ -178,6 +182,10 @@ pub const ADVANCED_VERBS: &[(&str, &str)] = &[
     (
         "issues",
         "one issue per automation outcome, opened, updated and closed",
+    ),
+    (
+        "outcomes",
+        "report an automation's failure or recovery to its declared rule",
     ),
     (
         "external-events",

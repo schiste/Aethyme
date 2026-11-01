@@ -114,6 +114,8 @@ use most:
 - `aethyme broker advanced report render`
 - `aethyme broker advanced report file`
 - `aethyme broker advanced issues upsert`
+- `aethyme broker advanced outcomes report`
+- `aethyme broker advanced owners`
 - `aethyme broker advanced integration status`
 - `aethyme broker advanced integration reconcile`
 - `aethyme broker advanced quick-test`
@@ -639,8 +641,9 @@ a reason.
 - `aethyme broker advanced exposures plan [--json]`
 - `aethyme broker advanced exposures apply --session <id> --confirm <sha256> [--json]`
 - `aethyme broker advanced note send --session <sender> --to-session <recipient> --message <text> [--json]`
+- `aethyme broker advanced note send --from automation:<name> --to-session <recipient> --message <text> [--fingerprint <key>] [--json]`
 - `aethyme broker advanced note list --session <recipient> [--json]`
-- `aethyme broker advanced note ack --session <recipient> --id <note-id> [--json]`
+- `aethyme broker advanced note ack --session <recipient> (--id <note-id> | --automation-id <note-id>) [--json]`
 
 Repository-owned dependency preparation is optional and declarative. When
 `.aethyme/prepare.toml` exists, `start` and `adopt` return a structured
@@ -903,6 +906,8 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker advanced report render <filename> --form <form.yml> [--output <name>.issue.md] [--json]`
 - `aethyme broker advanced report file <path> --repo <owner/name> --confirm <sha256> [--json]`
 - `aethyme broker advanced issues upsert --repo <owner/name> --fingerprint <key> (--title <title> --body-file <path> [--label <label>]... | --resolve [--body-file <path>]) [--session <id>] [--json]`
+- `aethyme broker advanced outcomes report --source <kind:name> (--failed --title <title> [--commits <from>..<to>] | --recovered) [--body-file <path>] [--key <key>] [--session <id>] [--json]`
+- `aethyme broker advanced owners --commits <from>..<to> [--path <glob>]... [--json]`
 - `aethyme broker advanced ship plan --entry <id> [--json]`
 - `aethyme broker advanced ship execute --entry <id> --confirm <full-integration-sha> [--sync-main] [--break-glass --reason <authorization>] [--json]`
 - `aethyme broker advanced integration status [--json]`
@@ -1086,6 +1091,18 @@ Note text remains only in the repository's broker database. The append-only
 timestamps, and the sent byte count, never message text. Notes are for terse
 handoffs such as “coordinate `src/router.rs` before editing”; they do not claim
 paths, refresh leases, alter gates, or replace task descriptions.
+
+An automation, which has no session, sends with `--from automation:<name>`
+instead of `--session` (#1238); the name is 1-64 lowercase letters, digits,
+`.`, `_` or `-`. The same message bounds apply, and the recipient must not be
+closed. With `--fingerprint <key>`, a repeat from the same sender while its
+earlier note to that recipient is unread is not queued again: the earlier note
+is returned with `deduplicated: true`. Automation notes surface on stderr with
+their own `note ack --automation-id <id>` command, reach the agent through the
+`UserPromptSubmit` and `PostToolUse` hooks without a reply line, and list under
+`automation_notes` in `note list`, whose `unread_count` counts both kinds.
+Their events, `automation.note.sent` and `automation.note.acknowledged`, carry
+the sender label, routing IDs and byte count, never message text.
 
 Every promotion also creates one authoritative path exposure owned by its
 queue entry. It contains the exact promoted SHA and repository-relative path

@@ -385,6 +385,41 @@ fn notes_reach_the_agent_after_its_next_tool_call_once() {
     );
 }
 
+/// #1238: an automation, which has no session, reaches a live session's
+/// agent the same way: after its next tool call, once, with no reply line.
+#[test]
+fn automation_notes_reach_the_agent_after_its_next_tool_call_once() {
+    let fixture = Fixture::new();
+    let (me, my_tree) = fixture.start("Recipient task", "recipient");
+    let me_id = me.to_string();
+    fixture.run(&[
+        "broker",
+        "advanced",
+        "note",
+        "send",
+        "--from",
+        "automation:prebuild",
+        "--to-session",
+        &me_id,
+        "--message",
+        "migration 0042 failed on main; tracked in #77",
+    ]);
+
+    let tool = serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "ls"}});
+    let delivered = context(&fixture.hook(&my_tree, "PostToolUse", &tool));
+    assert!(
+        delivered.contains(
+            "Note from automation:prebuild: migration 0042 failed on main; tracked in #77"
+        ),
+        "{delivered}"
+    );
+    assert!(!delivered.contains("reply:"), "{delivered}");
+    assert!(
+        fixture.hook(&my_tree, "PostToolUse", &tool).is_empty(),
+        "a delivered automation note is not repeated"
+    );
+}
+
 #[test]
 fn session_start_names_live_sessions_changing_files_it_leases() {
     let fixture = Fixture::new();

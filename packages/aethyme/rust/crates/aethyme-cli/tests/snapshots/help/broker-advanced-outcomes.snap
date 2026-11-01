@@ -1,0 +1,12 @@
+exit: 0
+--- stdout
+  aethyme broker advanced outcomes report --source <kind:name> --failed --title <title> [--body-file <path>] [--key <key>] [--commits <from>..<to>] [--session <id>] [--json]
+  aethyme broker advanced outcomes report --source <kind:name> --recovered [--body-file <path>] [--key <key>] [--session <id>] [--json]
+      Report an automation's failure or recovery to its [[automation.outcomes]]
+      rule on the default branch (#1238). A failure resolves the owners of
+      --commits (with notify_owners, narrowed to the rule's paths), keeps one
+      issue for outcome:<source>[:<key>] naming every owner's branch and pull
+      request, and notes each live owner with a link to it. A recovery
+      resolves the issue. Every action is reported with its status; exit 3
+      when one was refused or failed, after the report.
+--- stderr

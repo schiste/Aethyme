@@ -178,6 +178,7 @@ pub use pr_monitoring::{
 #[cfg(any(target_os = "macos", all(test, unix)))]
 mod gc_sweep_service;
 mod outcome_issues;
+mod outcome_report;
 mod pr_projection;
 mod pr_watch;
 #[cfg(unix)]
@@ -282,23 +283,23 @@ pub use broker::{
     BypassedIntegration, CLEANUP_PLAN_SCHEMA_VERSION, CheckpointRecoveryAction,
     CheckpointRefusalCode, CleanupDisposition, CleanupPlan, CleanupProvenance,
     CleanupRepresentation, CleanupRetention, CleanupSweepFailure, CleanupSweepReport,
-    CleanupWorktreePlan, DoctorRepairStatus, DoctorReport, FinishCleanupHandoff,
+    CleanupWorktreePlan, CommitOwner, DoctorRepairStatus, DoctorReport, FinishCleanupHandoff,
     FinishCleanupReport, FinishDelivery, FinishGateCacheSource, FinishGateRun,
     FinishGraphIntegrity, FinishHandoff, FinishLease, FinishLeaseState, FinishOptions,
     FinishPendingWork, FinishReport, FinishStatus, GuardedExecReport,
     HEALTH_CHECK_ELIGIBILITY_BUDGET, IntegrationBypassReason, IntegrationDeliveryState,
     IntegrationLiveSession, IntegrationMovementNotice, IntegrationNextAction,
     IntegrationStabilityReport, IntegrationStatusView, LeaseBlocker, LeaseClaimReport,
-    LeaseOverlapRelation, LeasePathPlan, LeasePlan, LeasePlanOverlap, OwnershipAuditReport,
-    PromotedConflict, PromotedIntegrationEntry, RecentCommandFailure, RepairAction,
-    RepairGateSelection, RepairReport, RepairSource, RepresentationScan, RetentionConfigStatus,
-    SESSION_NOTE_MAX_BYTES, SemanticGateAdvice, SemanticGateSelection, SemanticGateSource,
-    SemanticGateSourceStatus, SemanticGateSuggestionChain, SessionCheckpointApplyReport,
-    SessionCheckpointRecoveryPlan, SessionHandoffReport, SessionStartBase,
-    SessionStartBaseEvidence, StartAgentReport, StartReport, StatusAdvice, StatusAdviceSeverity,
-    StatusBrief, StatusIntegrationRelation, StatusSummary, StatusView, VersionRepairReport,
-    VersionRepairStep, WORKTREE_ROOT_SCHEMA_VERSION, WorktreePlacement, WorktreeRootPlan,
-    WorktreeRootSource,
+    LeaseOverlapRelation, LeasePathPlan, LeasePlan, LeasePlanOverlap, MAX_OWNER_COMMITS,
+    OwnedCommit, OwnersReport, OwnershipAuditReport, PromotedConflict, PromotedIntegrationEntry,
+    RecentCommandFailure, RepairAction, RepairGateSelection, RepairReport, RepairSource,
+    RepresentationScan, RetentionConfigStatus, SESSION_NOTE_MAX_BYTES, SemanticGateAdvice,
+    SemanticGateSelection, SemanticGateSource, SemanticGateSourceStatus,
+    SemanticGateSuggestionChain, SessionCheckpointApplyReport, SessionCheckpointRecoveryPlan,
+    SessionHandoffReport, SessionStartBase, SessionStartBaseEvidence, StartAgentReport,
+    StartReport, StatusAdvice, StatusAdviceSeverity, StatusBrief, StatusIntegrationRelation,
+    StatusSummary, StatusView, VersionRepairReport, VersionRepairStep,
+    WORKTREE_ROOT_SCHEMA_VERSION, WorktreePlacement, WorktreeRootPlan, WorktreeRootSource,
 };
 pub use change_classification::{
     CHANGE_CLASSIFICATION_SCHEMA_VERSION, ChangeClassification, ChangeClassificationError,
@@ -452,8 +453,15 @@ pub use operations::{
 };
 pub use outcome_issues::{
     AUTOMATION_ISSUES_POLICY_KEY, AutomationIssuesPolicy, IssueRef, OUTCOME_ISSUE_SCHEMA,
-    OutcomeIssueAction, OutcomeIssueError, OutcomeIssueGh, OutcomeIssueRequest, OutcomeIssueResult,
-    SystemGh, outcome_marker, upsert_outcome_issue, upsert_outcome_issue_for_repository,
+    OutcomeIssueAction, OutcomeIssueError, OutcomeIssueGh, OutcomeIssueRefusal,
+    OutcomeIssueRequest, OutcomeIssueResult, OutcomeRule, SystemGh, outcome_marker,
+    recent_outcome_issue_refusals, upsert_outcome_issue, upsert_outcome_issue_for_repository,
+    valid_outcome_source,
+};
+pub use outcome_report::{
+    OUTCOME_REPORT_SCHEMA, OutcomeActionRecord, OutcomeIssueSink, OutcomeReport,
+    OutcomeReportError, OutcomeReportRequest, RepositoryIssueSink, outcome_fingerprint,
+    outcome_note_sender, report_outcome,
 };
 pub use overlap_pairs::{
     BUDGET_EXHAUSTED_REASON, OverlapPair, OverlapSeverity, overlap_state_reads,
@@ -672,10 +680,10 @@ pub use store::BrokerStore;
 pub use types::{
     Advisory, AdvisoryAction, AdvisoryAudience, AdvisoryDeliveryMetric, AdvisoryDeliverySummary,
     AdvisoryDeliverySurface, AdvisoryEvidence, AdvisoryList, AdvisoryProducer,
-    AdvisoryResolutionState, AdvisorySeverity, CoordinatedOperation,
-    DEFAULT_OPERATION_HISTORY_LIMIT, EntryExposureResolutionKind, EntryExposureState,
-    EntryPathExposure, Event, GateCacheProvenance, GateDef, GateEnvironment, GateFailureClass,
-    GateResult, GateStatus, Lease, LeaseKind, MAX_OPERATION_HISTORY_LIMIT,
+    AdvisoryResolutionState, AdvisorySeverity, AutomationNote, AutomationNoteSend,
+    CoordinatedOperation, DEFAULT_OPERATION_HISTORY_LIMIT, EntryExposureResolutionKind,
+    EntryExposureState, EntryPathExposure, Event, GateCacheProvenance, GateDef, GateEnvironment,
+    GateFailureClass, GateResult, GateStatus, Lease, LeaseKind, MAX_OPERATION_HISTORY_LIMIT,
     MAX_SESSION_SHORT_NAME_CHARS, MERGE_QUEUE_HISTORY_SCHEMA_VERSION, MergeQueueEntry,
     MergeQueueHistoryPage, MergeQueueStatusCount, MergeStatus, NewAdvisory,
     NewCoordinatedOperation, NewGateResult, NewPrWatchState, NewSession, OperationEffect,
