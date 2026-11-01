@@ -1034,15 +1034,41 @@ pub(super) fn run_budgets(options: &Options) -> Result<Output, Failure> {
             ));
         }
     }
-    Ok((
-        json!({
-            "schema": super::cli::BUDGETS_SCHEMA,
-            "repository": repository,
-            "metrics": metrics,
-        }),
-        text,
-        exit_status::SUCCESS,
-    ))
+    let mut value = json!({
+        "schema": super::cli::BUDGETS_SCHEMA,
+        "repository": repository,
+        "metrics": metrics,
+    });
+    if options.act {
+        let mut store = EnvironmentStore::open_default()
+            .map_err(|error| environment_failure(error.to_string()))?;
+        let outcomes =
+            super::budget_outcomes::act_for_repository(&workspace.worktree_root, &mut store)
+                .map_err(environment_failure)?
+                .ok_or_else(|| Failure {
+                    code: "outcomes_not_enabled",
+                    message: format!("{ENVIRONMENTS_FILE} does not set [budgets.outcomes] issue = true"),
+                    next_action: "add [budgets.outcomes] with issue = true, and allow [automation] issues on the default branch".into(),
+                    exit: exit_status::REFUSED,
+                })?;
+        text.push_str(&format!(
+            "outcomes: {} metric(s) had a new window\n",
+            outcomes.windows
+        ));
+        for action in &outcomes.actions {
+            text.push_str(&format!(
+                "  {:?} {} ({}): {} {}\n",
+                action.action.kind,
+                action.action.metric,
+                action.action.reason,
+                action.status,
+                action.detail
+            ));
+        }
+        value["outcomes"] = serde_json::to_value(&outcomes)
+            .map_err(|error| environment_failure(error.to_string()))?;
+    }
+    Ok((value, text, exit_status::SUCCESS))
 }
 
 pub(super) fn run_calibrate(options: &Options) -> Result<Output, Failure> {
@@ -1285,6 +1311,10 @@ pub struct LifecycleWork {
     /// for health for up to its wake timeout, which must never delay lease
     /// renewal. At most one runs at a time.
     pub shared_sync: Option<std::thread::JoinHandle<()>>,
+    /// When budget outcomes were last evaluated (#1239), and the thread doing
+    /// it: issue writes reach GitHub, so they never run on the tick.
+    pub last_budget_outcomes: Option<std::time::Instant>,
+    pub budget_outcomes: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LifecycleWork {
@@ -1301,6 +1331,32 @@ impl LifecycleWork {
         }
         self.shared_sync = Some(std::thread::spawn(job));
         true
+    }
+}
+
+/// Evaluate the budget outcomes of every repository with environments on
+/// this host. Failures are warnings: a refused or failed issue write is
+/// retried on the metric's next window.
+fn run_budget_outcomes(roots: &std::collections::BTreeSet<std::path::PathBuf>) {
+    let Ok(mut store) = EnvironmentStore::open_default() else {
+        return;
+    };
+    for root in roots {
+        match super::budget_outcomes::act_for_repository(root, &mut store) {
+            Ok(Some(outcomes)) => {
+                for action in outcomes.actions.iter().filter(|a| a.status == "failed") {
+                    eprintln!(
+                        "warning: aethyme env supervisor: budget issue for {} not written: {}",
+                        action.action.metric, action.detail
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "warning: aethyme env supervisor: budget outcomes for {}: {error}",
+                root.display()
+            ),
+        }
     }
 }
 
@@ -1374,6 +1430,35 @@ impl super::supervisor::SupervisorWork for LifecycleWork {
                     "sample environment resources",
                     lifecycle.sample_active(super::activity::now_ms()),
                 );
+            }
+            if self
+                .last_budget_outcomes
+                .is_none_or(|at| at.elapsed() >= super::budget_outcomes::SUPERVISOR_INTERVAL)
+                && self
+                    .budget_outcomes
+                    .as_ref()
+                    .is_none_or(|h| h.is_finished())
+            {
+                self.last_budget_outcomes = Some(std::time::Instant::now());
+                if let Some(finished) = self.budget_outcomes.take()
+                    && finished.join().is_err()
+                {
+                    eprintln!("warning: aethyme env supervisor: budget outcomes panicked");
+                }
+                let roots: std::collections::BTreeSet<std::path::PathBuf> = lifecycle
+                    .store
+                    .list(None)
+                    .map(|records| {
+                        records
+                            .into_iter()
+                            .filter_map(|r| r.main_root.map(std::path::PathBuf::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !roots.is_empty() {
+                    self.budget_outcomes =
+                        Some(std::thread::spawn(move || run_budget_outcomes(&roots)));
+                }
             }
             // Live environments need renewal even when nothing is moving.
             let live = lifecycle

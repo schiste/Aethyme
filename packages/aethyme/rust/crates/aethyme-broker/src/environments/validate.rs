@@ -134,6 +134,47 @@ fn validate_budgets(c: &mut Collector<'_>, file: &EnvironmentsFile) {
     }
 }
 
+/// `[budgets.outcomes]`: at least one window, and a failure rate that is a
+/// percentage.
+fn validate_budget_outcomes(c: &mut Collector<'_>, file: &EnvironmentsFile) {
+    let Some(outcomes) = &file.budgets.outcomes else {
+        return;
+    };
+    if outcomes.windows == 0 {
+        c.push(
+            "invalid_budget",
+            None,
+            None,
+            Some("budgets.outcomes.windows"),
+            "windows must be at least 1",
+            "e.g. [budgets.outcomes] windows = 3",
+        );
+    }
+    if outcomes
+        .failure_rate_pct
+        .is_some_and(|pct| pct == 0 || pct > 100)
+    {
+        c.push(
+            "invalid_budget",
+            None,
+            None,
+            Some("budgets.outcomes.failure_rate_pct"),
+            "failure_rate_pct must be between 1 and 100",
+            "e.g. [budgets.outcomes] failure_rate_pct = 50",
+        );
+    }
+    if outcomes.labels.iter().any(|l| l.trim().is_empty()) {
+        c.push(
+            "invalid_budget",
+            None,
+            None,
+            Some("budgets.outcomes.labels"),
+            "labels must be non-empty",
+            "e.g. [budgets.outcomes] labels = [\"environments\"]",
+        );
+    }
+}
+
 /// `[a-z][a-z0-9_-]{0,31}`: names become hostnames, lease keys and
 /// environment-variable suffixes, so they stay in the intersection of all three.
 pub fn valid_name(name: &str) -> bool {
@@ -227,6 +268,7 @@ pub fn validate(
 
     validate_pools(&mut c, file, host, host_label);
     validate_budgets(&mut c, file);
+    validate_budget_outcomes(&mut c, file);
 
     let mut names = BTreeSet::new();
     let mut ranks: BTreeMap<u32, &str> = BTreeMap::new();
