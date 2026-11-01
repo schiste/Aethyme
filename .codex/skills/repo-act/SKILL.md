@@ -19,6 +19,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   producer or template, including lines beyond the initial excerpt. A missing
   value in a selected span does not establish that the output omits it.
 - Identify the nearest fast test or validation command before editing.
+- When adding a typed runtime configuration key, trace the parser,
+  certification known-key lists, and templates for that section. Update each
+  maintained surface and add regression coverage that the new key and existing
+  valid keys are not reported as unknown.
 - For implementation and version audits, search production source and maintained
   guides before archived qualification payloads or raw logs. Frozen transcripts
   can match unrelated version strings and overwhelm source results; search them
