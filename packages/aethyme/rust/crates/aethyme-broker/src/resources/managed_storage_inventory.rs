@@ -1132,7 +1132,7 @@ fn scan_complete(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn open_absolute_directory_nofollow(
+pub(crate) fn open_absolute_directory_nofollow(
     path: &Path,
 ) -> Result<std::os::fd::OwnedFd, HostResourceError> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -1187,7 +1187,7 @@ fn open_absolute_directory_nofollow(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn openat_directory(
+pub(crate) fn openat_directory(
     parent: libc::c_int,
     name: &std::ffi::CStr,
     path: &Path,
@@ -1210,7 +1210,7 @@ fn openat_directory(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn openat_regular(
+pub(crate) fn openat_regular(
     parent: libc::c_int,
     name: &std::ffi::CStr,
     path: &Path,
@@ -1233,7 +1233,7 @@ fn openat_regular(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn stat_at(
+pub(crate) fn stat_at(
     parent: libc::c_int,
     name: &std::ffi::CStr,
     flags: libc::c_int,
@@ -1249,7 +1249,7 @@ fn stat_at(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn fstat(fd: libc::c_int, path: &Path) -> Result<libc::stat, HostResourceError> {
+pub(crate) fn fstat(fd: libc::c_int, path: &Path) -> Result<libc::stat, HostResourceError> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `fd` is an open descriptor and `stat` points to writable
     // uninitialized output storage for the system call.
@@ -1261,19 +1261,21 @@ fn fstat(fd: libc::c_int, path: &Path) -> Result<libc::stat, HostResourceError> 
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn cstring_from_os(value: &std::ffi::OsStr) -> Result<std::ffi::CString, HostResourceError> {
+pub(crate) fn cstring_from_os(
+    value: &std::ffi::OsStr,
+) -> Result<std::ffi::CString, HostResourceError> {
     use std::os::unix::ffi::OsStrExt as _;
     std::ffi::CString::new(value.as_bytes())
         .map_err(|_| scan_refusal("path component contained an invalid NUL"))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn file_type(stat: &libc::stat) -> libc::mode_t {
+pub(crate) fn file_type(stat: &libc::stat) -> libc::mode_t {
     stat.st_mode & libc::S_IFMT
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn same_identity(left: &libc::stat, right: &libc::stat) -> bool {
+pub(crate) fn same_identity(left: &libc::stat, right: &libc::stat) -> bool {
     left.st_dev == right.st_dev
         && left.st_ino == right.st_ino
         && file_type(left) == file_type(right)
@@ -1283,7 +1285,7 @@ fn same_identity(left: &libc::stat, right: &libc::stat) -> bool {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn ensure_same_identity(
+pub(crate) fn ensure_same_identity(
     expected: &libc::stat,
     actual: &libc::stat,
     message: &str,
@@ -1317,7 +1319,7 @@ fn parse_filesystem_identity(value: &str) -> Result<u64, HostResourceError> {
     clippy::unnecessary_cast,
     reason = "libc::dev_t differs across supported operating systems"
 )]
-fn device_id(stat: &libc::stat) -> u64 {
+pub(crate) fn device_id(stat: &libc::stat) -> u64 {
     stat.st_dev as u64
 }
 
@@ -1350,12 +1352,12 @@ fn validate_lower_hex_identifier(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn scan_refusal(message: &str) -> HostResourceError {
+pub(crate) fn scan_refusal(message: &str) -> HostResourceError {
     managed_storage_refusal("managed_storage_inventory_incomplete", message)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn io_failure(path: &Path) -> HostResourceError {
+pub(crate) fn io_failure(path: &Path) -> HostResourceError {
     HostResourceError::Io {
         path: path.to_path_buf(),
         source: std::io::Error::last_os_error(),
@@ -1363,7 +1365,7 @@ fn io_failure(path: &Path) -> HostResourceError {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn set_errno(value: libc::c_int) {
+pub(crate) fn set_errno(value: libc::c_int) {
     // SAFETY: the platform errno accessor returns a writable pointer to this
     // thread's errno slot, valid for the current thread.
     unsafe {
@@ -1372,7 +1374,7 @@ fn set_errno(value: libc::c_int) {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn get_errno() -> libc::c_int {
+pub(crate) fn get_errno() -> libc::c_int {
     // SAFETY: the platform errno accessor returns a readable pointer to this
     // thread's errno slot, valid for the current thread.
     unsafe { *errno_location() }

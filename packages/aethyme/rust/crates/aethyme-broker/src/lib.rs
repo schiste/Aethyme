@@ -39,6 +39,7 @@ mod cleanup_audit;
 mod cleanup_batch;
 mod cleanup_resolve;
 mod clock;
+pub mod service;
 /// The shared `.aethyme` configuration loader (#1223): `<stem>.toml`,
 /// `<stem>.yaml` or `<stem>.yml`, exactly one, as one `toml::Value`.
 pub mod config_source {

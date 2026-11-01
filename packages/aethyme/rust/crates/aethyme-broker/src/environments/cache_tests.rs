@@ -183,6 +183,7 @@ destroy = "true"
 
 /// #1219 acceptance: several environments provisioning on a new schema
 /// digest run `template` exactly once, and each provision gets its id.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn concurrent_provisions_share_one_template() {
     let host = tempfile::tempdir().unwrap();
@@ -240,6 +241,7 @@ fn concurrent_provisions_share_one_template() {
     assert!(lifecycle.cache_entries().is_empty());
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_template_whose_destroy_fails_is_kept_and_reported() {
     let host = tempfile::tempdir().unwrap();
@@ -272,6 +274,117 @@ destroy = "true"
         1,
         "never dropped without its destroy"
     );
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn interactive_prune_refuses_unsupported_platform_without_deleting_entries() {
+    let host = tempfile::tempdir().unwrap();
+    let mut lifecycle = lifecycle(host.path());
+    let sentinel = lifecycle
+        .cache_root()
+        .join(super::cache::BUILDS)
+        .join("repo-cache")
+        .join("site")
+        .join("0123456789abcdef")
+        .join("output/index.html");
+    std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+    std::fs::write(&sentinel, b"keep").unwrap();
+
+    let report = lifecycle.prune_cache(true);
+
+    assert!(
+        report
+            .refused
+            .as_deref()
+            .is_some_and(|reason| reason.contains("supported only on macOS and Linux")),
+        "unsupported prune must give an actionable refusal: {report:?}"
+    );
+    assert!(report.evicted.is_empty(), "{report:?}");
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"keep");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn prune_all_refuses_incomplete_template_inventory_before_removing_builds() {
+    let host = tempfile::tempdir().unwrap();
+    let mut lifecycle = lifecycle(host.path());
+    let cache = lifecycle.cache_root();
+    let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let build = cache
+        .join(super::cache::BUILDS)
+        .join("repo-cache")
+        .join("site")
+        .join(&digest[..16]);
+    std::fs::create_dir_all(build.join("output")).unwrap();
+    std::fs::write(
+        build.join(super::cache::KEY_FILE),
+        format!("aethyme-env-build:repo-cache:site:{digest}"),
+    )
+    .unwrap();
+    std::fs::write(build.join(super::cache::COMPLETE), b"").unwrap();
+    std::fs::write(build.join("output/index.html"), b"cached").unwrap();
+
+    let template_dir = cache
+        .join(super::cache::TEMPLATES)
+        .join("repo-cache")
+        .join("database");
+    std::fs::create_dir_all(&template_dir).unwrap();
+    let outside = host.path().join("outside-marker.json");
+    std::fs::write(&outside, b"leave this file alone").unwrap();
+    std::os::unix::fs::symlink(&outside, template_dir.join("1234567890abcdef.json")).unwrap();
+
+    let report = lifecycle.prune_cache(true);
+
+    assert!(report.refused.is_some(), "{report:?}");
+    assert!(report.evicted.is_empty(), "{report:?}");
+    assert!(build.join("output/index.html").exists());
+    assert_eq!(std::fs::read(outside).unwrap(), b"leave this file alone");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn ordinary_prune_does_not_inspect_template_markers() {
+    let host = tempfile::tempdir().unwrap();
+    let mut lifecycle = lifecycle(host.path());
+    let template_dir = lifecycle
+        .cache_root()
+        .join(super::cache::TEMPLATES)
+        .join("repo-cache")
+        .join("database");
+    std::fs::create_dir_all(&template_dir).unwrap();
+    let outside = host.path().join("outside-marker.json");
+    std::fs::write(&outside, b"keep").unwrap();
+    std::os::unix::fs::symlink(&outside, template_dir.join("bad.json")).unwrap();
+
+    let report = lifecycle.prune_cache(false);
+
+    assert!(report.refused.is_none(), "{report:?}");
+    assert!(report.evicted.is_empty(), "{report:?}");
+    assert_eq!(std::fs::read(outside).unwrap(), b"keep");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn prune_retains_a_build_without_its_exact_historical_lock_key() {
+    let host = tempfile::tempdir().unwrap();
+    let mut lifecycle = lifecycle(host.path());
+    let build = lifecycle
+        .cache_root()
+        .join(super::cache::BUILDS)
+        .join("repo-cache")
+        .join("site")
+        .join("0123456789abcdef");
+    std::fs::create_dir_all(build.join("output")).unwrap();
+    std::fs::write(build.join(super::cache::COMPLETE), b"").unwrap();
+    std::fs::write(build.join("output/index.html"), b"cached").unwrap();
+
+    let report = lifecycle.prune_cache(true);
+
+    assert!(report.evicted.is_empty(), "{report:?}");
+    assert_eq!(report.kept.len(), 1, "{report:?}");
+    assert!(report.kept[0].1.contains("no recorded shared cache lock"));
+    assert!(build.join("output/index.html").exists());
 }
 
 fn validation(text: &str) -> Vec<&'static str> {
@@ -361,6 +474,7 @@ fn a_deleted_tracked_input_rebuilds() {
 
 /// Eviction works after the creating worktree is gone, with the component's
 /// own variables.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_template_is_destroyed_after_its_worktree_is_gone() {
     let host = tempfile::tempdir().unwrap();
@@ -374,7 +488,7 @@ name = "p"
 name = "db"
 runtime = "hooks"
 template = "true"
-template_destroy = 'echo "$DB_SERVER $AETHYME_ENV_TEMPLATE_ID" >> "{destroys}"'
+template_destroy = 'printf "%s\n%s\n%s\n" "$DB_SERVER" "$AETHYME_ENV_TEMPLATE_ID" "$PWD" >> "{destroys}"'
 template_inputs = ["db/**"]
 provision = "true"
 destroy = "true"
@@ -389,15 +503,31 @@ env = {{ DB_SERVER = "pg-test" }}
     drop(tree);
     let report = lifecycle.prune_cache(true);
     assert_eq!(report.evicted.len(), 1, "{report:?}");
+    let output = std::fs::read_to_string(&destroys).unwrap();
+    let mut lines = output.lines();
+    assert_eq!(lines.next(), Some("pg-test"), "destroy got component env");
     assert!(
-        std::fs::read_to_string(&destroys)
-            .unwrap()
-            .starts_with("pg-test "),
-        "destroy got the component env"
+        lines.next().is_some_and(|id| id.len() == 16),
+        "destroy got the template id: {output}"
+    );
+    let cwd = std::fs::canonicalize(lifecycle.cache_root())
+        .unwrap()
+        .join(super::cache::TEMPLATES)
+        .join("repo-cache")
+        .join("db");
+    let hook_cwd = Path::new(
+        lines
+            .next()
+            .expect("destroy recorded its working directory"),
+    );
+    assert!(
+        hook_cwd.starts_with(cwd),
+        "destroy ran from its pinned template directory: {hook_cwd:?}"
     );
 }
 
 /// When prune cannot tell what a live environment uses, it evicts nothing.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn prune_evicts_nothing_when_live_use_is_unknown() {
     let host = tempfile::tempdir().unwrap();
@@ -425,6 +555,7 @@ fn prune_evicts_nothing_when_live_use_is_unknown() {
 /// #1275: `broker gc plan` proposes the unused build of this repository and
 /// never the one a live environment uses; `gc apply` evicts through the same
 /// key and use check as prune, and keeps an entry used since the plan.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn gc_proposes_and_evicts_only_an_unused_build() {
     let host = tempfile::tempdir().unwrap();
@@ -438,14 +569,29 @@ fn gc_proposes_and_evicts_only_an_unused_build() {
     let live = up(&mut lifecycle, &text, b.path());
     let root = lifecycle.root.clone();
     let plan = |lifecycle: &Lifecycle| {
-        super::cache::gc_inventory(Some(&lifecycle.store), &root, "repo-cache", 0)
+        super::cache::gc_inventory(Some(&lifecycle.store), &root, "repo-cache", 0, None)
     };
 
     let (inventory, candidates) = plan(&lifecycle);
     let inventory = inventory.expect("this repository has cache entries");
-    assert_eq!(inventory.build_entries, 2, "{inventory:?}");
-    assert_eq!(inventory.in_use_entries, 1, "{inventory:?}");
+    assert_eq!(inventory.build_entries, Some(2), "{inventory:?}");
+    assert_eq!(inventory.in_use_entries, Some(1), "{inventory:?}");
     assert_eq!(candidates.len(), 1, "{candidates:?}");
+    let mut legacy_candidate = candidates[0].clone();
+    legacy_candidate.repository.clear();
+    legacy_candidate.cache_root.clear();
+    let refusal = lifecycle
+        .evict_planned_build(&legacy_candidate)
+        .expect_err("a pre-identity plan must not be rebound from current disk state");
+    assert!(
+        refusal.contains("environment_cache_identity_missing"),
+        "{refusal}"
+    );
+    assert!(
+        Path::new(&legacy_candidate.path)
+            .join(super::cache::KEY_FILE)
+            .exists()
+    );
     let used = lifecycle
         .cache_entries()
         .into_iter()
@@ -453,14 +599,42 @@ fn gc_proposes_and_evicts_only_an_unused_build() {
         .unwrap();
     assert_ne!(Path::new(&candidates[0].path), used.path);
     assert!(
-        super::cache::gc_inventory(Some(&lifecycle.store), &root, "other", 0)
+        super::cache::gc_inventory(Some(&lifecycle.store), &root, "other", 0, None)
             .0
             .is_none()
     );
 
     // The used build, even if a plan named it, is kept.
     let mut forged = candidates[0].clone();
-    forged.path = used.path.to_string_lossy().into_owned();
+    let canonical_cache = std::fs::canonicalize(root.join(super::cache::CACHE_DIRECTORY)).unwrap();
+    let canonical_used = std::fs::canonicalize(&used.path).unwrap();
+    let relative_used = canonical_used
+        .strip_prefix(canonical_cache.join(super::cache::BUILDS))
+        .unwrap();
+    let mut components = relative_used.components();
+    forged.repository = components
+        .next()
+        .unwrap()
+        .as_os_str()
+        .to_str()
+        .unwrap()
+        .into();
+    forged.component = components
+        .next()
+        .unwrap()
+        .as_os_str()
+        .to_str()
+        .unwrap()
+        .into();
+    forged.digest = components
+        .next()
+        .unwrap()
+        .as_os_str()
+        .to_str()
+        .unwrap()
+        .into();
+    assert!(components.next().is_none());
+    forged.path = canonical_used.to_string_lossy().into_owned();
     forged.last_used_at_ms = used.last_used;
     let kept = lifecycle.evict_planned_build(&forged).unwrap_err();
     assert!(kept.contains("in use"), "{kept}");
@@ -519,4 +693,98 @@ ref = "default_branch"
             .contains(&"invalid_glob")
     );
     assert!(validation(&text("redeploy_on = \"inputs\"\ninputs = [\"db/**\"]")).is_empty());
+}
+
+/// A partial host walk is never exposed as a complete report or eviction set.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn gc_withholds_partial_inventory_when_later_repository_is_unsafe() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("environments");
+    let cache = root.join(super::cache::CACHE_DIRECTORY);
+    let repository = "repo-cache";
+    let build = cache
+        .join(super::cache::BUILDS)
+        .join(repository)
+        .join("component")
+        .join("digest");
+    std::fs::create_dir_all(&build).unwrap();
+    std::fs::write(build.join(super::cache::KEY_FILE), "cache-key").unwrap();
+    std::fs::write(build.join(super::cache::COMPLETE), b"").unwrap();
+    std::fs::write(build.join("payload"), b"payload").unwrap();
+
+    let outside = temporary.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("sentinel"), b"keep").unwrap();
+    std::os::unix::fs::symlink(&outside, cache.join(super::cache::BUILDS).join("zz-link")).unwrap();
+
+    let (inventory, candidates) = super::cache::gc_inventory(None, &root, "repo-cache", 0, None);
+    let inventory = inventory.expect("the malformed host cache must be reported");
+    assert!(!inventory.complete, "{inventory:?}");
+    assert_eq!(inventory.refusal_code.as_deref(), Some("unsafe_path"));
+    assert!(inventory.host_total_bytes.is_none());
+    assert!(inventory.build_entries.is_none());
+    assert!(inventory.build_bytes.is_none());
+    assert!(inventory.in_use_entries.is_none());
+    assert!(inventory.in_use_bytes.is_none());
+    assert!(inventory.reclaimable_bytes.is_none());
+    assert!(inventory.template_entries.is_none());
+    assert!(
+        candidates.is_empty(),
+        "partial walk cannot authorize deletion"
+    );
+    assert_eq!(std::fs::read(outside.join("sentinel")).unwrap(), b"keep");
+}
+
+/// A live cacheable environment without readable use metadata authorizes no eviction.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn gc_withholds_candidates_when_a_live_use_record_is_missing() {
+    let host = tempfile::tempdir().unwrap();
+    let counter = host.path().join("builds.log");
+    let text = site(&counter);
+    let mut lifecycle = lifecycle(host.path());
+    let tree = worktree(&[("web/app.txt", "v1")]);
+    let live = up(&mut lifecycle, &text, tree.path());
+    let use_record = lifecycle.root.join(&live).join(super::cache::USES_FILE);
+    std::fs::remove_file(&use_record).unwrap();
+
+    let (inventory, candidates) = super::cache::gc_inventory(
+        Some(&lifecycle.store),
+        &lifecycle.root,
+        "repo-cache",
+        0,
+        None,
+    );
+    let inventory = inventory.expect("the cache entry is present");
+    assert!(!inventory.complete, "{inventory:?}");
+    assert_eq!(inventory.refusal_code.as_deref(), Some("store_unreadable"));
+    assert!(inventory.host_total_bytes.is_none());
+    assert!(candidates.is_empty());
+    assert!(use_record.parent().unwrap().exists());
+    lifecycle.down(&live, None).unwrap();
+}
+
+/// Expired bounded inventory also withholds every count and candidate.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn gc_withholds_inventory_when_deadline_is_already_expired() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("environments");
+    std::fs::create_dir_all(root.join(super::cache::CACHE_DIRECTORY)).unwrap();
+
+    let (inventory, candidates) = super::cache::gc_inventory(
+        None,
+        &root,
+        "repo-cache",
+        0,
+        Some(std::time::Instant::now()),
+    );
+    let inventory = inventory.expect("an incomplete scan is reportable");
+    assert!(!inventory.complete, "{inventory:?}");
+    assert_eq!(inventory.refusal_code.as_deref(), Some("deadline_exceeded"));
+    assert!(inventory.host_total_bytes.is_none());
+    assert!(inventory.build_entries.is_none());
+    assert!(inventory.reclaimable_bytes.is_none());
+    assert!(candidates.is_empty());
 }
