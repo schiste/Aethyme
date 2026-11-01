@@ -217,6 +217,14 @@ fn every_rule_has_a_located_diagnostic() {
             field: "serve_dir",
         },
         Case {
+            name: "spa fallback outside static",
+            toml: profile("{ name = \"a\", runtime = \"process\", start = \"x\", spa_fallback = true }"),
+            code: "field_not_supported",
+            profile: Some("p"),
+            component: Some("a"),
+            field: "spa_fallback",
+        },
+        Case {
             name: "process without start",
             toml: profile("{ name = \"a\", runtime = \"process\" }"),
             code: "missing_field",

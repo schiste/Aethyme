@@ -59,6 +59,9 @@ pub struct Route {
     /// Directory served for a `static` component.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub static_dir: Option<PathBuf>,
+    /// Serve `index.html` for extensionless paths that are not files (#1291).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub spa_fallback: bool,
     /// Health timeout: how long a request may be held while this wakes.
     pub wake_timeout_seconds: u64,
     /// Per-path routes of this component (#1296), longest prefix first.
@@ -469,6 +472,7 @@ fn record_routes(record: &EnvironmentRecord, root: &Path, alias: Option<&str>) -
                 state: record.phase.as_str(),
                 upstream,
                 static_dir: static_dir.clone(),
+                spa_fallback: component.spa_fallback,
                 wake_timeout_seconds,
                 paths: paths.clone(),
             });
@@ -547,6 +551,7 @@ mod tests {
             state: "active",
             upstream: None,
             static_dir: None,
+            spa_fallback: false,
             wake_timeout_seconds: 1,
             paths: vec![path("/api"), path("/api/v2")],
         };

@@ -477,7 +477,7 @@ fn handle(mut client: TcpStream, config: &ProxyConfig) -> io::Result<()> {
         touch_debounced(&config.root, &host_route.env_id);
     }
     if let Some(directory) = &route.static_dir {
-        return serve_static(&mut client, &head, directory);
+        return serve_static(&mut client, &head, directory, route.spa_fallback);
     }
     let Some(port) = route.upstream else {
         return respond(
@@ -543,7 +543,12 @@ fn content_type(path: &Path) -> &'static str {
     }
 }
 
-fn serve_static(client: &mut TcpStream, head: &Head, directory: &Path) -> io::Result<()> {
+fn serve_static(
+    client: &mut TcpStream,
+    head: &Head,
+    directory: &Path,
+    spa_fallback: bool,
+) -> io::Result<()> {
     if head.method != "GET" && head.method != "HEAD" {
         return respond(
             client,
@@ -565,18 +570,16 @@ fn serve_static(client: &mut TcpStream, head: &Head, directory: &Path) -> io::Re
     if path.is_dir() {
         path = path.join("index.html");
     }
-    // Resolve symlinks and refuse anything outside the served directory.
-    let inside = path
-        .canonicalize()
-        .ok()
-        .zip(directory.canonicalize().ok())
-        .is_some_and(|(file, root)| file.starts_with(root));
-    let size = std::fs::metadata(&path)
-        .map(|m| m.len())
-        .unwrap_or(u64::MAX);
-    if !inside || size > STATIC_LIMIT {
+    let found = servable(directory, &path).or_else(|| {
+        // Only absent client routes may fall back. An existing but
+        // ineligible path must keep its refusal.
+        (spa_fallback && relative.extension().is_none() && missing_static_path(directory, &path))
+            .then(|| servable(directory, &directory.join("index.html")))
+            .flatten()
+    });
+    let Some((path, size)) = found else {
         return respond(client, "404 Not Found", "text/plain", &[], b"not found\n");
-    }
+    };
     let body = std::fs::read(&path)?;
     let body: &[u8] = if head.method == "HEAD" { &[] } else { &body };
     let mut response = format!(
@@ -587,6 +590,46 @@ fn serve_static(client: &mut TcpStream, head: &Head, directory: &Path) -> io::Re
     response.extend_from_slice(body);
     client.write_all(&response)?;
     client.flush()
+}
+
+/// Confirm absence beneath an existing directory inside the served root.
+/// Walking up also handles routes whose intermediate directories are absent;
+/// a dangling link, unreadable path or an ancestor outside the root refuses.
+fn missing_static_path(directory: &Path, path: &Path) -> bool {
+    let Ok(root) = directory.canonicalize() else {
+        return false;
+    };
+    let mut missing = false;
+    for ancestor in path.ancestors() {
+        if !ancestor.starts_with(directory) {
+            return false;
+        }
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                return missing
+                    && ancestor.canonicalize().ok().is_some_and(|resolved| {
+                        resolved.starts_with(&root)
+                            && std::fs::metadata(resolved).is_ok_and(|metadata| metadata.is_dir())
+                    });
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => missing = true,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// `path` and its size when it is a file inside `directory` (symlinks
+/// resolved) small enough to serve.
+fn servable(directory: &Path, path: &Path) -> Option<(PathBuf, u64)> {
+    let inside = path
+        .canonicalize()
+        .ok()
+        .zip(directory.canonicalize().ok())
+        .is_some_and(|(file, root)| file.starts_with(root));
+    let metadata = std::fs::metadata(path).ok()?;
+    (inside && metadata.is_file() && metadata.len() <= STATIC_LIMIT)
+        .then(|| (path.to_path_buf(), metadata.len()))
 }
 
 fn authorized(head: &Head, token: &str) -> bool {
