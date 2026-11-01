@@ -125,8 +125,10 @@ pub struct RetentionPolicy {
     pub idle_session_artifact_hours: u32,
     /// Wall-clock budget for the autonomous artifact sweep. `0` disables it.
     pub artifact_sweep_budget_ms: u64,
-    /// Proactive free-space reserve for bounded cache maintenance, measured
-    /// independently on each affected volume. This is a scheduling signal,
+    /// Proactive free-space reserve for bounded cache maintenance, sampled
+    /// independently on discovered placement and cache volumes. Foreground
+    /// sampling is bounded; detached continuation includes recorded session roots.
+    /// This is a scheduling signal,
     /// never authority to delete active or unproven data. Values below gate
     /// headroom retain that existing safety threshold.
     pub artifact_sweep_headroom_bytes: u64,
