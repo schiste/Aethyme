@@ -356,6 +356,12 @@ fn invalid_fingerprints_and_repositories_are_rejected() {
 #[test]
 fn the_policy_defaults_to_deny_and_rejects_typos() {
     assert!(!AutomationIssuesPolicy::from_config_text("").unwrap().allow);
+    // A table that only lists labels still denies: `issues` must say allow.
+    assert!(
+        !AutomationIssuesPolicy::from_config_text("[automation]\nissue_labels = [\"x\"]\n")
+            .unwrap()
+            .allow
+    );
     assert!(
         !AutomationIssuesPolicy::from_config_text("[automation]\nissues = \"deny\"\n")
             .unwrap()

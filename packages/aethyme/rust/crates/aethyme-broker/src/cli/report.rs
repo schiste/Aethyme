@@ -768,10 +768,7 @@ pub(super) fn run_issues(parsed: Parsed) -> Result<(), UsageError> {
         Some(_) => Some(open_broker(parsed.read_only_snapshot)?),
         None => None,
     };
-    let coordinated = broker
-        .as_mut()
-        .zip(parsed.session)
-        .map(|(broker, session)| (broker, session));
+    let coordinated = broker.as_mut().zip(parsed.session);
     let outcome = crate::upsert_outcome_issue_for_repository(&repo, &request, coordinated)
         .map_err(|error| UsageError::Exit {
             message: format!("{}: {error}", error.code()),
