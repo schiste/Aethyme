@@ -614,14 +614,15 @@ mod tests {
 
     fn lifecycle_claim_contends_in_order(first: &str, second: &str) {
         let repository = tempfile::tempdir().unwrap();
-        let checkout = repository.path().join("linked-worktree");
+        let repository_root = repository.path().canonicalize().unwrap();
+        let checkout = repository_root.join("linked-worktree");
         std::fs::create_dir(&checkout).unwrap();
-        let primary_alias = repository.path().join(".");
-        let held_by_first = acquire_repository_lifecycle_lock(repository.path())
+        let primary_alias = repository_root.join(".");
+        let held_by_first = acquire_repository_lifecycle_lock(&repository_root)
             .unwrap_or_else(|error| panic!("{first} claim failed: {error}"));
         let lock_path = repository_lifecycle_lock_path(&primary_alias).unwrap();
         assert!(
-            lock_path.starts_with(repository.path().join(".aethyme/run")),
+            lock_path.starts_with(repository_root.join(".aethyme/run")),
             "the persistent claim must be rooted in primary repository state"
         );
         assert!(

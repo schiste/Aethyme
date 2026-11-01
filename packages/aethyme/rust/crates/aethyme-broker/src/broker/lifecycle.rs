@@ -2818,6 +2818,10 @@ mod fresh_root_recovery_inventory_tests {
         builder.create(path).unwrap();
     }
 
+    fn canonical_temp_root(directory: &tempfile::TempDir) -> PathBuf {
+        directory.path().canonicalize().unwrap()
+    }
+
     fn git(repository: &Path, arguments: &[&str]) {
         let output = Command::new("git")
             .arg("-C")
@@ -2977,9 +2981,10 @@ mod fresh_root_recovery_inventory_tests {
     #[test]
     fn root_inventory_accepts_only_missing_empty_and_exact_marker_prefixes() {
         let temporary = tempfile::tempdir().unwrap();
-        let repository = temporary.path().join("repository");
+        let temporary_root = canonical_temp_root(&temporary);
+        let repository = temporary_root.join("repository");
         create_private_directory(&repository);
-        let root = temporary.path().join("reserved-root");
+        let root = temporary_root.join("reserved-root");
         let expected_marker = marker(&repository);
 
         assert_eq!(
@@ -3017,9 +3022,10 @@ mod fresh_root_recovery_inventory_tests {
     #[test]
     fn cargo_inventory_accepts_only_empty_or_exact_writer_bytes() {
         let temporary = tempfile::tempdir().unwrap();
-        let repository = temporary.path().join("repository");
+        let temporary_root = canonical_temp_root(&temporary);
+        let repository = temporary_root.join("repository");
         create_private_directory(&repository);
-        let root = temporary.path().join("reserved-root");
+        let root = temporary_root.join("reserved-root");
         create_private_directory(&root);
         let expected_marker = marker(&repository);
         std::fs::write(
@@ -3132,7 +3138,8 @@ mod fresh_root_recovery_inventory_tests {
 
         let expected_bytes = crate::broker::WORKTREE_CARGO_CONFIG.as_bytes();
         let owner = tempfile::tempdir().unwrap();
-        let root = owner.path().join("root");
+        let owner_root = canonical_temp_root(&owner);
+        let root = owner_root.join("root");
         create_private_directory(&root);
         let cargo = root.join(".cargo");
         create_private_directory(&cargo);
@@ -3166,7 +3173,7 @@ mod fresh_root_recovery_inventory_tests {
         // directory before binding is finalized.
         normalize_fresh_root_recovery_cargo(&root, &root_identity, &after_link_recovery).unwrap();
 
-        let paired_root = owner.path().join("paired-root");
+        let paired_root = owner_root.join("paired-root");
         create_private_directory(&paired_root);
         let paired_cargo = paired_root.join(".cargo");
         create_private_directory(&paired_cargo);
