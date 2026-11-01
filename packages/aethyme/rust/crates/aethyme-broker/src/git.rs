@@ -11418,9 +11418,19 @@ mod sparse_worktree_tests {
     }
 
     fn add_git_exclude(root: &Path, pattern: &str) {
-        let exclude =
-            PathBuf::from(super::run_git(root, &["rev-parse", "--absolute-git-dir"]).unwrap())
-                .join("info/exclude");
+        let exclude = PathBuf::from(
+            super::run_git(
+                root,
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "info/exclude",
+                ],
+            )
+            .unwrap(),
+        );
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
         let mut ignore_rules = std::fs::read(&exclude).unwrap_or_default();
         ignore_rules.extend_from_slice(b"\n");
         ignore_rules.extend_from_slice(pattern.as_bytes());
@@ -11769,6 +11779,16 @@ mod sparse_worktree_tests {
                 add_git_exclude(worktree, "omitted/deep/ignored-recovery-sentinel.txt");
                 std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
                 std::fs::write(&sentinel, "ignored recovery sentinel").unwrap();
+                git(
+                    worktree,
+                    &[
+                        "check-ignore",
+                        "--quiet",
+                        "--no-index",
+                        "--",
+                        "omitted/deep/ignored-recovery-sentinel.txt",
+                    ],
+                );
                 git(
                     worktree,
                     &[
