@@ -273,7 +273,7 @@ fn calibrate_fits_a_full_pool_in_the_budget() {
         "and the limit is not needlessly low"
     );
 
-    let diff = proposal_diff(CALIBRATED, &calibration);
+    let diff = proposal_diff(CALIBRATED, Some(&calibration), &[]);
     assert!(diff.contains(&format!("+limit = {limit}")), "{diff}");
     assert!(diff.contains("+units = 3"), "{diff}");
     assert!(
@@ -305,7 +305,7 @@ fn a_thin_consuming_profile_withholds_every_proposal() {
             .iter()
             .all(|p| p.proposed_units.is_none())
     );
-    assert_eq!(proposal_diff(CALIBRATED, &calibration), "");
+    assert_eq!(proposal_diff(CALIBRATED, Some(&calibration), &[]), "");
 }
 
 /// Every repository pool may be full at once: they share the budget. Host
