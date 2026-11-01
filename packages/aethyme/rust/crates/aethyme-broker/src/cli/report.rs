@@ -790,3 +790,132 @@ pub(super) fn run_issues(parsed: Parsed) -> Result<(), UsageError> {
     }
     Ok(())
 }
+
+/// `broker outcomes report` (#1238).
+pub(super) fn run_outcomes(parsed: Parsed) -> Result<(), UsageError> {
+    match parsed.positional.first().map(String::as_str) {
+        Some("report") if parsed.positional.len() == 1 => {}
+        Some("report") => {
+            return Err(UsageError::Message(
+                "outcomes report takes no positional arguments".into(),
+            ));
+        }
+        Some(other) => {
+            return Err(UsageError::Message(format!(
+                "unknown outcomes action {other:?}; expected report"
+            )));
+        }
+        None => {
+            return Err(UsageError::Message(
+                "outcomes requires an action: report".into(),
+            ));
+        }
+    }
+    let source = parsed.outcome_source.clone().ok_or_else(|| {
+        UsageError::Message("outcomes report requires --source <kind>:<name>".into())
+    })?;
+    let failed = match (parsed.outcome_failed, parsed.outcome_recovered) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => {
+            return Err(UsageError::Message(
+                "outcomes report requires exactly one of --failed or --recovered".into(),
+            ));
+        }
+    };
+    if !failed && (parsed.commits.is_some() || parsed.title.is_some()) {
+        return Err(UsageError::Message(
+            "--commits and --title apply only to --failed".into(),
+        ));
+    }
+    let body = match parsed.body_file.as_ref() {
+        Some(path) => {
+            let metadata = std::fs::metadata(path).map_err(|error| {
+                UsageError::Message(format!(
+                    "cannot read --body-file {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if metadata.len() > 1024 * 1024 {
+                return Err(UsageError::Message(format!(
+                    "--body-file {} is larger than 1 MiB",
+                    path.display()
+                )));
+            }
+            Some(std::fs::read_to_string(path).map_err(|error| {
+                UsageError::Message(format!(
+                    "cannot read --body-file {}: {error}",
+                    path.display()
+                ))
+            })?)
+        }
+        None => None,
+    };
+    let request = crate::OutcomeReportRequest {
+        source,
+        failed,
+        key: parsed.outcome_key.clone(),
+        commits: parsed.commits.clone(),
+        title: parsed.title.clone(),
+        body,
+    };
+    let cwd = std::env::current_dir().map_err(|error| UsageError::Message(error.to_string()))?;
+    let repo = crate::GitRepo::discover(&cwd)?;
+    let policy =
+        crate::AutomationIssuesPolicy::load_trusted(&repo).map_err(|error| UsageError::Exit {
+            message: format!("invalid_automation_policy: {error}"),
+            code: 1,
+        })?;
+    let repository = repo
+        .remote_url("origin")
+        .ok()
+        .and_then(|url| crate::environments::budget_outcomes::github_slug(&url));
+    let mut broker = open_broker(false)?;
+    let mut sink = crate::RepositoryIssueSink {
+        repo: &repo,
+        session: parsed.session,
+    };
+    let report = crate::report_outcome(
+        &mut broker,
+        &policy.outcomes,
+        repository.as_deref(),
+        &request,
+        &mut sink,
+        now_ms(),
+    )
+    .map_err(|error| UsageError::Exit {
+        message: format!("{}: {error}", error.code()),
+        code: 3,
+    })?;
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        out!(
+            "Outcome {} {} ({}).",
+            report.source,
+            report.state,
+            report.fingerprint
+        );
+        for action in &report.actions {
+            out!(
+                "  {:<8} {:<12} {}{}",
+                action.kind,
+                action.status,
+                action.target.as_deref().unwrap_or("-"),
+                action
+                    .code
+                    .as_deref()
+                    .map(|code| format!(" ({code})"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    if report.incomplete() {
+        return Err(UsageError::Exit {
+            message: "outcome_actions_incomplete: at least one action was refused or failed; see the report"
+                .into(),
+            code: 3,
+        });
+    }
+    Ok(())
+}

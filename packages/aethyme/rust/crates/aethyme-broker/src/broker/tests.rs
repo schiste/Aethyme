@@ -1128,6 +1128,7 @@ fn doctor_report(
         hooks_path: None,
         leftover_integration_work: None,
         environment_budgets_over: Vec::new(),
+        automation_issue_refusals: Vec::new(),
         phase_timings_ms: Default::default(),
         deferred_checks: Vec::new(),
         budget_cut: Vec::new(),

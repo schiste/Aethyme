@@ -199,6 +199,15 @@ Usage:
       unlisted-label and over-budget requests write nothing and are recorded
       locally. Writes are journaled before they run; with --session they go
       through the coordinated GitHub operation layer.
+  aethyme broker outcomes report --source <kind:name> --failed --title <title> [--body-file <path>] [--key <key>] [--commits <from>..<to>] [--session <id>] [--json]
+  aethyme broker outcomes report --source <kind:name> --recovered [--body-file <path>] [--key <key>] [--session <id>] [--json]
+      Report an automation's failure or recovery to its [[automation.outcomes]]
+      rule on the default branch (#1238). A failure resolves the owners of
+      --commits (with notify_owners, narrowed to the rule's paths), keeps one
+      issue for outcome:<source>[:<key>] naming every owner's branch and pull
+      request, and notes each live owner with a link to it. A recovery
+      resolves the issue. Every action is reported with its status; exit 3
+      when one was refused or failed, after the report.
   aethyme broker external-events ingest <normalized.json> [--json]
       Ingest one adapter-verified, digest-bound normalized event. The strict
       schema rejects provider payload fields and stores only allowlisted
@@ -1687,6 +1696,14 @@ struct Parsed {
     labels: Vec<String>,
     /// `issues upsert --resolve`.
     resolve: bool,
+    /// `outcomes report --source` (#1238).
+    outcome_source: Option<String>,
+    /// `outcomes report --failed`.
+    outcome_failed: bool,
+    /// `outcomes report --recovered`.
+    outcome_recovered: bool,
+    /// `outcomes report --key`.
+    outcome_key: Option<String>,
     /// `owners --commits`: the landed range to resolve (#1238).
     commits: Option<String>,
     output: Option<PathBuf>,
@@ -1849,6 +1866,10 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         body_file: None,
         labels: Vec::new(),
         resolve: false,
+        outcome_source: None,
+        outcome_failed: false,
+        outcome_recovered: false,
+        outcome_key: None,
         commits: None,
         output: None,
         grant_out: None,
@@ -2297,6 +2318,24 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
                     .clone(),
             ),
             "--resolve" => parsed.resolve = true,
+            "--failed" => parsed.outcome_failed = true,
+            "--recovered" => parsed.outcome_recovered = true,
+            "--source" => {
+                parsed.outcome_source = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message(
+                            "--source requires <kind>:<name>".into(),
+                        ))?
+                        .clone(),
+                )
+            }
+            "--key" => {
+                parsed.outcome_key = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--key requires a value".into()))?
+                        .clone(),
+                )
+            }
             "--title" => {
                 parsed.title = Some(
                     iter.next()
@@ -2816,6 +2855,7 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         "report" => run_report(parsed)?,
         "quality-report" => run_quality_report(parsed)?,
         "issues" => run_issues(parsed)?,
+        "outcomes" => run_outcomes(parsed)?,
         "external-events" => run_external_events(parsed)?,
         "reclaim" => {
             let action = reclaim_action.ok_or_else(|| {

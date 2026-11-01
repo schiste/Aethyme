@@ -2492,6 +2492,10 @@ impl Broker {
             budget_cut.push("environment_budgets".into());
             Vec::new()
         };
+        // A journal that cannot be read is not a broker fault; `issues
+        // upsert` reports it when it next runs.
+        let automation_issue_refusals =
+            crate::recent_outcome_issue_refusals(&self.main_root).unwrap_or_default();
         phase("total", started);
 
         Ok(DoctorReport {
@@ -2508,6 +2512,7 @@ impl Broker {
             hooks_path,
             leftover_integration_work,
             environment_budgets_over,
+            automation_issue_refusals,
             phase_timings_ms,
             deferred_checks: budget_cut.clone(),
             budget_cut,
