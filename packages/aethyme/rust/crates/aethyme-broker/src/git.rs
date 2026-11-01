@@ -4147,6 +4147,62 @@ impl GitRepo {
         run_git(&self.root, &["rev-parse", &format!("{commit}^1")])
     }
 
+    /// The newest `limit` commits in `from..to` touching any of `globs`
+    /// (every commit when empty), returned oldest first.
+    pub fn commits_touching(
+        &self,
+        from: &str,
+        to: &str,
+        globs: &[String],
+        limit: usize,
+    ) -> Result<Vec<String>, GitError> {
+        let range = format!("{from}..{to}");
+        let max = format!("--max-count={limit}");
+        let pathspecs: Vec<String> = globs.iter().map(|glob| format!(":(glob){glob}")).collect();
+        let mut args = vec!["rev-list", max.as_str(), range.as_str()];
+        if !pathspecs.is_empty() {
+            args.push("--");
+            args.extend(pathspecs.iter().map(String::as_str));
+        }
+        let mut commits: Vec<String> = run_git(&self.root, &args)?
+            .lines()
+            .map(str::to_string)
+            .collect();
+        commits.reverse();
+        Ok(commits)
+    }
+
+    /// The commit on `head`'s first-parent line that brought `commit` in:
+    /// `commit` itself when it lies on that line, otherwise the oldest
+    /// first-parent descendant of it, the merge that landed it.
+    pub fn landing_commit(&self, commit: &str, head: &str) -> Result<String, GitError> {
+        let commit = run_git(
+            &self.root,
+            &["rev-parse", "--verify", &format!("{commit}^{{commit}}")],
+        )?;
+        let range = format!("{commit}..{head}");
+        let listed = run_git(
+            &self.root,
+            &["rev-list", "--first-parent", "--ancestry-path", &range],
+        )?;
+        let Some(oldest) = listed.lines().last() else {
+            return Ok(commit);
+        };
+        let parents = self.commit_parents(oldest)?;
+        Ok(
+            if parents.first().map(String::as_str) == Some(commit.as_str()) {
+                commit
+            } else {
+                oldest.to_string()
+            },
+        )
+    }
+
+    /// One commit's subject line.
+    pub fn commit_subject(&self, commit: &str) -> Result<String, GitError> {
+        run_git(&self.root, &["log", "-1", "--format=%s", commit])
+    }
+
     /// Every commit reachable from `head`, `head` included: one `rev-list`
     /// that answers `is_ancestor(commit, head)` for any number of commits by
     /// membership.
