@@ -154,15 +154,18 @@ fn finish_can_be_retried_after_close_without_changing_finite_holder_binding() {
         .unwrap()
         .id;
     let db_path = broker.store().db_path().to_path_buf();
-    drop(broker);
 
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
         .arg("finish_can_be_retried_after_close_without_changing_finite_holder_binding")
         .arg("--nocapture")
         .current_dir(repository.path())
-        .env(CHILD_SESSION_ENV, session.id.to_string())
-        .output()
-        .unwrap();
+        .env(CHILD_SESSION_ENV, session.id.to_string());
+    broker
+        .configure_storage_context_for_child(&mut child)
+        .expect("bind the child CLI to fixture-owned storage");
+    drop(broker);
+    let output = child.output().unwrap();
     assert!(
         output.status.success(),
         "child test failed: stdout={} stderr={}",
@@ -252,6 +255,17 @@ fn session_operation_guard_is_acquired_before_startup_maintenance() {
         .id;
     let before_activity = broker.store().session(session.id).unwrap().last_activity_at;
     let db_path = broker.store().db_path().to_path_buf();
+
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .arg("session_operation_guard_is_acquired_before_startup_maintenance")
+        .arg("--nocapture")
+        .current_dir(repository.path())
+        .env(CHILD_SESSION_ENV, session.id.to_string())
+        .env(crate::session_holder::AGENT_PID_ENV, parent.pid.to_string());
+    broker
+        .configure_storage_context_for_child(&mut child)
+        .expect("bind the child CLI to fixture-owned storage");
     drop(broker);
 
     let retirement_guard = crate::file_lock::try_acquire_session_operation_guard(
@@ -261,14 +275,7 @@ fn session_operation_guard_is_acquired_before_startup_maintenance() {
     )
     .unwrap()
     .expect("simulated retirement owns the exclusive startup fence");
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .arg("session_operation_guard_is_acquired_before_startup_maintenance")
-        .arg("--nocapture")
-        .current_dir(repository.path())
-        .env(CHILD_SESSION_ENV, session.id.to_string())
-        .env(crate::session_holder::AGENT_PID_ENV, parent.pid.to_string())
-        .output()
-        .unwrap();
+    let output = child.output().unwrap();
     drop(retirement_guard);
     assert!(
         output.status.success(),
