@@ -3002,12 +3002,12 @@ fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseComma
 /// operation guard, and open sessions follow the normal heartbeat/downgrade
 /// path below.
 fn closed_session_command_reaches_handler(subcommand: &str, parsed: &Parsed) -> bool {
-    match (subcommand, parsed.positional.first().map(String::as_str)) {
-        ("leases", Some("claim")) => true,
-        ("review", Some("request" | "unlock" | "reassign")) => true,
-        ("reclaim", Some("apply")) => true,
-        _ => false,
-    }
+    matches!(
+        (subcommand, parsed.positional.first().map(String::as_str)),
+        ("leases", Some("claim"))
+            | ("review", Some("request" | "unlock" | "reassign"))
+            | ("reclaim", Some("apply"))
+    )
 }
 
 fn heartbeat_session_task_lease(

@@ -161,11 +161,11 @@ impl BrokerStore {
         if caller != Some(&bound_holder) {
             return Ok(crate::session_holder::TaskLeaseDowngrade::NotHolder);
         }
-        let legacy_payload = crate::events::session_holder_bound_payload(
-            &bound_holder,
-            "task_lease_protocol_downgraded",
-            None,
-        );
+        let Some(legacy_payload) =
+            crate::events::session_holder_task_lease_downgraded_payload(&payload)
+        else {
+            return Ok(crate::session_holder::TaskLeaseDowngrade::NotHolder);
+        };
         insert_event(
             &tx,
             at_ms,
@@ -1838,7 +1838,7 @@ mod finish_lease_query_tests {
     }
 
     #[test]
-    fn unsupported_lease_binding_is_protected_and_exact_holder_can_downgrade_it() {
+    fn downgrade_and_reupgrade_preserve_binding_provenance() {
         let temp = tempfile::tempdir().unwrap();
         let mut store = BrokerStore::open(&temp.path().join("broker.db")).unwrap();
         let session = store
@@ -1854,10 +1854,16 @@ mod finish_lease_query_tests {
             started: "Fri Oct 23 09:01:00 2026".into(),
             command: "/opt/codex agent --session 8".into(),
         };
+        let previous = crate::session_holder::AgentProcess {
+            pid: 2700,
+            started: "Fri Oct 23 08:00:00 2026".into(),
+            command: "/opt/codex previous-holder".into(),
+        };
         let mut payload: serde_json::Value = serde_json::from_str(
-            &crate::events::session_holder_bound_payload(&holder, "registered", None),
+            &crate::events::session_holder_bound_payload(&holder, "take_over", Some(&previous)),
         )
         .unwrap();
+        payload["binding_annotation"] = serde_json::json!("preserve-me");
         payload["task_lease"] = serde_json::json!({"version": 2, "duration_ms": 86_400_000});
         store
             .append_event(
@@ -1901,12 +1907,33 @@ mod finish_lease_query_tests {
             .unwrap()
             .unwrap();
         assert_eq!(crate::session_holder::task_lease(&downgraded), None);
-        assert!(
-            downgraded
-                .payload_json
-                .as_deref()
-                .unwrap()
-                .contains("task_lease_protocol_downgraded")
+        let downgraded_payload: serde_json::Value =
+            serde_json::from_str(downgraded.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(downgraded_payload["reason"], "take_over");
+        assert_eq!(downgraded_payload["previous_pid"], previous.pid);
+        assert_eq!(downgraded_payload["previous_started"], previous.started);
+        assert_eq!(downgraded_payload["binding_annotation"], "preserve-me");
+        assert!(downgraded_payload.get("task_lease").is_none());
+
+        assert_eq!(
+            store
+                .heartbeat_session_task_lease(session.id, &holder, now_ms())
+                .unwrap(),
+            crate::session_holder::TaskLeaseHeartbeat::Upgraded
+        );
+        let reupgraded = store
+            .latest_session_holder_event(session.id)
+            .unwrap()
+            .unwrap();
+        let reupgraded_payload: serde_json::Value =
+            serde_json::from_str(reupgraded.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(reupgraded_payload["reason"], "take_over");
+        assert_eq!(reupgraded_payload["previous_pid"], previous.pid);
+        assert_eq!(reupgraded_payload["previous_started"], previous.started);
+        assert_eq!(reupgraded_payload["binding_annotation"], "preserve-me");
+        assert_eq!(
+            crate::session_holder::task_lease(&reupgraded),
+            Some(crate::session_holder::TaskLease::current())
         );
     }
 

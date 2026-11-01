@@ -147,11 +147,22 @@ pub(crate) fn session_holder_task_lease_heartbeat_payload(
     existing: &serde_json::Value,
 ) -> Option<String> {
     let mut payload = existing.clone();
-    let object = payload.as_object_mut()?;
-    object.insert(
-        "task_lease".into(),
-        json!(crate::session_holder::TaskLease::current()),
-    );
+    if payload.as_object().is_none() {
+        return None;
+    }
+    payload["task_lease"] = json!(crate::session_holder::TaskLease::current());
+    Some(payload.to_string())
+}
+
+/// Remove only the task-lease extension while preserving the holder binding
+/// and any other additive payload fields.
+pub(crate) fn session_holder_task_lease_downgraded_payload(
+    existing: &serde_json::Value,
+) -> Option<String> {
+    let mut payload = existing.clone();
+    if payload.as_object_mut()?.remove("task_lease").is_none() {
+        return None;
+    }
     Some(payload.to_string())
 }
 
