@@ -2631,13 +2631,12 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
     // Resolve through a non-mutating snapshot first, then acquire the exact
     // session guard before advisory delivery, holder admission, or a handler
     // can open mutable broker state and run maintenance.
-    let session_operation = if task_lease_command
-        == TaskLeaseCommandClass::ClosedSessionAdministration
-    {
-        None
-    } else {
-        acquire_session_operation_context(&parsed, subcommand == "finish")?
-    };
+    let session_operation =
+        if task_lease_command == TaskLeaseCommandClass::ClosedSessionAdministration {
+            None
+        } else {
+            acquire_session_operation_context(&parsed, subcommand == "finish")?
+        };
     surface_command_advisories(subcommand, &parsed);
     admit_session_holder(subcommand, &parsed)?;
     let heartbeat = if subcommand == "heartbeat" {
@@ -2732,9 +2731,7 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         "heartbeat" => run_heartbeat(
             parsed,
             heartbeat.ok_or_else(|| {
-                UsageError::Message(
-                    "session heartbeat requires an acquired operation guard".into(),
-                )
+                UsageError::Message("session heartbeat requires an acquired operation guard".into())
             })?,
         )?,
         "finish" => run_finish(parsed)?,
@@ -2848,12 +2845,14 @@ fn acquire_session_operation_context(
     // stale explicit ID cannot start work on a session that has already
     // crossed its retirement CAS.
     let current_store = crate::BrokerStore::open_snapshot_in_repo(&main_root)?;
-    let current = current_store.session(session_id).map_err(|error| match error {
-        crate::BrokerError::SessionNotFound(_) => UsageError::Message(format!(
-            "session {session_id} was retired before this command could start"
-        )),
-        other => other.into(),
-    })?;
+    let current = current_store
+        .session(session_id)
+        .map_err(|error| match error {
+            crate::BrokerError::SessionNotFound(_) => UsageError::Message(format!(
+                "session {session_id} was retired before this command could start"
+            )),
+            other => other.into(),
+        })?;
     let session_open =
         current.cleanup_state == crate::SessionCleanupState::Open && !current.status.is_closed();
     if !session_open && !allow_closed {
@@ -2927,31 +2926,32 @@ fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseComma
             TaskLeaseCommandClass::ObservationOnly
         }
         "gc" if action == Some("plan") => TaskLeaseCommandClass::ObservationOnly,
-        "heartbeat" | "commit" | "exec" | "gh" | "git" | "prepare" | "push" | "submit"
-        | "sync" => TaskLeaseCommandClass::GuardedWork,
-        "gates" if matches!(action, Some("run" | "pre-push")) => {
+        "heartbeat" | "commit" | "exec" | "gh" | "git" | "prepare" | "push" | "submit" | "sync" => {
             TaskLeaseCommandClass::GuardedWork
         }
+        "gates" if matches!(action, Some("run" | "pre-push")) => TaskLeaseCommandClass::GuardedWork,
         "resources" if action == Some("artifact-run") => TaskLeaseCommandClass::GuardedWork,
-        "leases" if matches!(
-            action,
-            Some("claim" | "release" | "request-release" | "ack" | "decline" | "wait")
-        ) => TaskLeaseCommandClass::GuardedWork,
-        "note" if matches!(action, Some("send" | "ack")) => {
+        "leases"
+            if matches!(
+                action,
+                Some("claim" | "release" | "request-release" | "ack" | "decline" | "wait")
+            ) =>
+        {
             TaskLeaseCommandClass::GuardedWork
         }
+        "note" if matches!(action, Some("send" | "ack")) => TaskLeaseCommandClass::GuardedWork,
         "ownership" if matches!(action, Some("claim" | "release")) => {
             TaskLeaseCommandClass::GuardedWork
         }
-        "status" | "readiness" | "worktree-root" | "adopt" | "start" | "start-agent"
-        | "report" | "quality-report" | "external-events" | "reclaim" | "deliveries"
-        | "review" | "review-thread" | "console" | "resources" | "agents" | "ownership"
-        | "merge-chain" | "advisories" | "exposures" | "note" | "operations" | "gates"
-        | "watch" | "pr" | "hooks" | "handoff" | "finish" | "close" | "gc" | "worktrees"
-        | "storage" | "cleanup" | "metrics" | "insights" | "blockers" | "unblock" | "doctor"
-        | "quick-test" | "trust" | "verify-loop" | "e2e" | "init" | "certify" | "scaffold"
-        | "promotion-record" | "checkpoint" | "queue" | "promote" | "ship" | "integration"
-        | "events" | "exec-status" => TaskLeaseCommandClass::OtherWork,
+        "status" | "readiness" | "worktree-root" | "adopt" | "start" | "start-agent" | "report"
+        | "quality-report" | "external-events" | "reclaim" | "deliveries" | "review"
+        | "review-thread" | "console" | "resources" | "agents" | "ownership" | "merge-chain"
+        | "advisories" | "exposures" | "note" | "operations" | "gates" | "watch" | "pr"
+        | "hooks" | "handoff" | "finish" | "close" | "gc" | "worktrees" | "storage" | "cleanup"
+        | "metrics" | "insights" | "blockers" | "unblock" | "doctor" | "quick-test" | "trust"
+        | "verify-loop" | "e2e" | "init" | "certify" | "scaffold" | "promotion-record"
+        | "checkpoint" | "queue" | "promote" | "ship" | "integration" | "events"
+        | "exec-status" => TaskLeaseCommandClass::OtherWork,
         _ => TaskLeaseCommandClass::NoSessionWork,
     }
 }
@@ -2977,7 +2977,9 @@ fn heartbeat_session_task_lease(
         let bound_holder = latest
             .as_ref()
             .and_then(|event| event.payload_json.as_deref())
-            .and_then(|payload| serde_json::from_str::<crate::session_holder::AgentProcess>(payload).ok());
+            .and_then(|payload| {
+                serde_json::from_str::<crate::session_holder::AgentProcess>(payload).ok()
+            });
         if bound_holder.as_ref() != Some(&caller) {
             return Err(UsageError::Message(format!(
                 "session {} has a task lease bound to a different or unreadable holder; run the command as that holder or adopt the session first",
@@ -3012,12 +3014,10 @@ fn downgrade_unsupported_session_operation(
     )? {
         crate::session_holder::TaskLeaseDowngrade::NotFinite
         | crate::session_holder::TaskLeaseDowngrade::Downgraded => Ok(()),
-        crate::session_holder::TaskLeaseDowngrade::NotHolder => Err(UsageError::Message(
-            format!(
-                "session {} has a finite task lease; this command is not covered by its child-lifetime protocol and must be run by the current holder or after takeover",
-                context.session_id
-            ),
-        )),
+        crate::session_holder::TaskLeaseDowngrade::NotHolder => Err(UsageError::Message(format!(
+            "session {} has a finite task lease; this command is not covered by its child-lifetime protocol and must be run by the current holder or after takeover",
+            context.session_id
+        ))),
     }
 }
 

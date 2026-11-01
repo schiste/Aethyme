@@ -484,10 +484,9 @@ impl RecordedHolderProcessTable {
         deadline: Option<Instant>,
     ) -> Option<&crate::reclaim::OpenFileSnapshot> {
         if self.process_use_snapshot.is_none() {
-            let budget = deadline.map_or(
-                Duration::from_secs(10),
-                |deadline| deadline.saturating_duration_since(Instant::now()),
-            );
+            let budget = deadline.map_or(Duration::from_secs(10), |deadline| {
+                deadline.saturating_duration_since(Instant::now())
+            });
             if budget.is_zero() {
                 return None;
             }
@@ -720,9 +719,8 @@ pub(crate) fn task_lease_expired(
 /// five-minute write interval. Clock rollback can delay a renewal but never
 /// shortens the task lease.
 pub(crate) fn task_lease_renewal_due(event: &crate::Event, now_ms: i64) -> bool {
-    task_lease(event).is_some_and(|_| {
-        now_ms.saturating_sub(event.ts) >= TASK_LEASE_RENEWAL_INTERVAL_MS
-    })
+    task_lease(event)
+        .is_some_and(|_| now_ms.saturating_sub(event.ts) >= TASK_LEASE_RENEWAL_INTERVAL_MS)
 }
 
 /// Record `caller` as the session's holder, unconditionally. For `start` and
@@ -1053,8 +1051,14 @@ mod tests {
         assert_eq!(task_lease(&event), Some(TaskLease::current()));
         assert_eq!(task_lease_expired(&event, 1_000, deadline - 1), Some(false));
         assert_eq!(task_lease_expired(&event, 1_000, deadline), Some(true));
-        assert!(!task_lease_renewal_due(&event, event.ts + TASK_LEASE_RENEWAL_INTERVAL_MS - 1));
-        assert!(task_lease_renewal_due(&event, event.ts + TASK_LEASE_RENEWAL_INTERVAL_MS));
+        assert!(!task_lease_renewal_due(
+            &event,
+            event.ts + TASK_LEASE_RENEWAL_INTERVAL_MS - 1
+        ));
+        assert!(task_lease_renewal_due(
+            &event,
+            event.ts + TASK_LEASE_RENEWAL_INTERVAL_MS
+        ));
 
         let legacy = crate::events::session_holder_bound_payload(&holder, "registered", None);
         assert_eq!(task_lease_from_payload(&legacy), None);
@@ -1093,7 +1097,10 @@ mod tests {
 
         assert!(matches!(
             admit(&mut store, session_id, &caller, &table, false),
-            Err(crate::BrokerOpError::SessionHeldByAnotherAgent { holder_pid: 3731, .. })
+            Err(crate::BrokerOpError::SessionHeldByAnotherAgent {
+                holder_pid: 3731,
+                ..
+            })
         ));
         assert_eq!(recorded_holder(&store, session_id).unwrap(), Some(holder));
     }

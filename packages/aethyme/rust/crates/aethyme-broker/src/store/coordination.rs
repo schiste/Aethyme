@@ -49,9 +49,9 @@ impl BrokerStore {
         let Ok(payload) = serde_json::from_str::<serde_json::Value>(payload_text) else {
             return Ok(crate::session_holder::TaskLeaseHeartbeat::LegacyProtected);
         };
-        let Ok(bound_holder) = serde_json::from_value::<crate::session_holder::AgentProcess>(
-            payload.clone(),
-        ) else {
+        let Ok(bound_holder) =
+            serde_json::from_value::<crate::session_holder::AgentProcess>(payload.clone())
+        else {
             return Ok(crate::session_holder::TaskLeaseHeartbeat::LegacyProtected);
         };
         if &bound_holder != caller {
@@ -154,9 +154,9 @@ impl BrokerStore {
         let Ok(payload) = serde_json::from_str::<serde_json::Value>(payload_text) else {
             return Ok(crate::session_holder::TaskLeaseDowngrade::NotFinite);
         };
-        let Ok(bound_holder) = serde_json::from_value::<crate::session_holder::AgentProcess>(
-            payload.clone(),
-        ) else {
+        let Ok(bound_holder) =
+            serde_json::from_value::<crate::session_holder::AgentProcess>(payload.clone())
+        else {
             return Ok(crate::session_holder::TaskLeaseDowngrade::NotFinite);
         };
         if payload.get("task_lease").is_none() {
@@ -290,7 +290,7 @@ impl BrokerStore {
     ) -> Result<bool, BrokerError> {
         self.conn
             .query_row(
-            "SELECT EXISTS(
+                "SELECT EXISTS(
                     SELECT 1 FROM coordinated_operations
                     WHERE session_id = ?1 AND effect <> 'read'
                       AND status IN ('prepared', 'running', 'outcome_unknown')
@@ -1810,11 +1810,13 @@ mod finish_lease_query_tests {
             .unwrap()
             .unwrap();
         assert!(renewed.id > upgraded.id);
-        assert!(renewed
-            .payload_json
-            .as_deref()
-            .unwrap()
-            .contains("task_lease_heartbeat"));
+        assert!(
+            renewed
+                .payload_json
+                .as_deref()
+                .unwrap()
+                .contains("task_lease_heartbeat")
+        );
         assert_eq!(
             store
                 .heartbeat_session_task_lease(session.id, &other, now + 400_000)
@@ -1895,11 +1897,13 @@ mod finish_lease_query_tests {
             .unwrap()
             .unwrap();
         assert_eq!(crate::session_holder::task_lease(&downgraded), None);
-        assert!(downgraded
-            .payload_json
-            .as_deref()
-            .unwrap()
-            .contains("task_lease_protocol_downgraded"));
+        assert!(
+            downgraded
+                .payload_json
+                .as_deref()
+                .unwrap()
+                .contains("task_lease_protocol_downgraded")
+        );
     }
 
     #[test]
@@ -1909,34 +1913,24 @@ mod finish_lease_query_tests {
         let session = store
             .register_session(&new_session("task-lease-exec-witness", temp.path()))
             .unwrap();
-        assert!(!store
-            .session_has_unresolved_operations(session.id)
-            .unwrap());
+        assert!(!store.session_has_unresolved_operations(session.id).unwrap());
 
         let starting = store.begin_guarded_exec_receipt(session.id).unwrap();
-        assert!(store
-            .session_has_unresolved_operations(session.id)
-            .unwrap());
+        assert!(store.session_has_unresolved_operations(session.id).unwrap());
         store
             .mark_guarded_exec_not_started(session.id, &starting)
             .unwrap();
-        assert!(!store
-            .session_has_unresolved_operations(session.id)
-            .unwrap());
+        assert!(!store.session_has_unresolved_operations(session.id).unwrap());
 
         let running = store.begin_guarded_exec_receipt(session.id).unwrap();
         store
             .mark_guarded_exec_running(session.id, &running)
             .unwrap();
-        assert!(store
-            .session_has_unresolved_operations(session.id)
-            .unwrap());
+        assert!(store.session_has_unresolved_operations(session.id).unwrap());
         store
             .complete_guarded_exec_command(session.id, &running, "succeeded", Some(0), "verified")
             .unwrap();
-        assert!(!store
-            .session_has_unresolved_operations(session.id)
-            .unwrap());
+        assert!(!store.session_has_unresolved_operations(session.id).unwrap());
     }
 
     #[test]
