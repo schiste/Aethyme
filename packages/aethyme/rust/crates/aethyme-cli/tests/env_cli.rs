@@ -762,6 +762,67 @@ destroy = "true"
     );
 }
 
+/// #1239 with #1238: `env budgets --act` refuses without `[budgets.outcomes]
+/// issue = true`; with it, a metric over budget for `windows` windows asks
+/// for an issue, the repository's default `deny` policy refuses it without
+/// touching GitHub, and the refusal leaves the issue unmarked. With no new
+/// runs there is no new window and nothing to do.
+#[test]
+fn budgets_act_follows_outcomes_and_the_automation_policy() {
+    let base = r#"
+schema = 1
+[[profiles]]
+name = "backend"
+[[profiles.components]]
+name = "db"
+runtime = "hooks"
+provision = 'echo "AETHYME_RECEIPT {\"metrics\": {\"clone\": 50}}"'
+destroy = "true"
+[budgets.seconds]
+clone = 1
+"#;
+    let disabled = Fixture::new(Some(base));
+    let (code, refused) = disabled.json(&["env", "budgets", "--act"]);
+    assert_eq!(code, 3, "{refused}");
+    assert_eq!(refused["code"], "outcomes_not_enabled");
+
+    let fixture = Fixture::new(Some(&format!(
+        "{base}[budgets.outcomes]\nissue = true\nwindows = 1\n"
+    )));
+    git(
+        fixture.repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/aethyme-test/budget-fixture.git",
+        ],
+    );
+    let (code, up) = fixture.json(&["env", "up", "--wait", "5"]);
+    assert_eq!(code, 0, "{up}");
+    let (code, acted) = fixture.json(&["env", "budgets", "--act"]);
+    assert_eq!(code, 0, "{acted}");
+    let actions = acted["outcomes"]["actions"].as_array().unwrap();
+    assert_eq!(actions.len(), 1, "{acted}");
+    assert_eq!(actions[0]["kind"], "upsert");
+    assert_eq!(actions[0]["metric"], "clone");
+    assert_eq!(actions[0]["status"], "failed");
+    assert!(
+        actions[0]["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("automation_issues_denied"),
+        "{acted}"
+    );
+    let (code, again) = fixture.json(&["env", "budgets", "--act"]);
+    assert_eq!(code, 0, "{again}");
+    assert_eq!(again["outcomes"]["windows"], 0, "{again}");
+    assert!(again["outcomes"]["actions"].as_array().unwrap().is_empty());
+    let env_id = up["env_id"].as_str().unwrap().to_string();
+    let (code, down) = fixture.json(&["env", "down", &env_id]);
+    assert_eq!(code, 0, "{down}");
+}
+
 /// #1295 through the router: `--component` selects an optional component,
 /// a later plain `env up` keeps it, and an unknown name is refused.
 #[test]

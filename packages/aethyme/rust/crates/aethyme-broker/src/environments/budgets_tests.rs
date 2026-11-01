@@ -42,6 +42,7 @@ fn statuses_follow_p50_and_p95_against_the_budget() {
             ("up.cold".to_string(), 3600),
         ]),
         memory_mib: BTreeMap::from([("backend".to_string(), 350)]),
+        ..BudgetsSpec::default()
     };
     let mut up = ok(&[10.0, 12.0, 20.0, 25.0]);
     up.push(Timing {
@@ -204,6 +205,7 @@ fn calibrate_proposes_raises_and_tightens_from_enough_runs() {
         .into_iter()
         .collect(),
         memory_mib: [("backend".to_string(), 1000)].into_iter().collect(),
+        ..BudgetsSpec::default()
     };
     let runs = |value: f64| ok(&[value; MIN_PROPOSAL_VALUES]);
     let timings: BTreeMap<String, Vec<Timing>> = [

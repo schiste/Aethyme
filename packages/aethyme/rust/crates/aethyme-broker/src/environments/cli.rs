@@ -151,7 +151,7 @@ Usage:
       Declared budgets with 10+ successful runs get a proposal too: p95
       plus 50% headroom, to raise one whose p50 is over or tighten one more
       than twice that.
-  aethyme env budgets [--json]
+  aethyme env budgets [--act] [--json]
       Compare recorded timings and measured footprints with the
       [budgets.seconds] / [budgets.memory_mib] declared in environments.toml:
       per metric (up.<profile> for a warm up, up.cold for one that
@@ -160,8 +160,14 @@ Usage:
       memory.<profile>)
       the count, p50, p95, latest, the trend between the older and newer
       halves of the window, and ok (p95 within budget), watch (only p50
-      within), over, no-data or no-budget. Read-only. Timings are not
-      recorded under CI unless AETHYME_ENV_TIMINGS=1.
+      within), over, no-data or no-budget. Timings are not recorded under
+      CI unless AETHYME_ENV_TIMINGS=1. --act carries out
+      [budgets.outcomes] (issue = true): a metric over budget, or failing
+      more than failure_rate_pct, for `windows` consecutive windows (default
+      3; a window is an evaluation with new runs) opens one issue through
+      `broker advanced issues upsert` under the repository's [automation]
+      policy; back to ok, it is resolved. The supervisor does this every
+      15 minutes. Without --act, read-only.
   aethyme env cache list|prune [--all] [--json]
       Content-addressed build outputs (build + cache_inputs, output in
       build_output or serve_dir) shared across worktrees, and database
@@ -217,6 +223,8 @@ pub(super) struct Options {
     pub(super) range: Option<String>,
     pub(super) force: bool,
     pub(super) ram_fraction: f64,
+    /// `env budgets --act` (#1239): carry out breach outcomes.
+    pub(super) act: bool,
 }
 
 pub fn run(args: &[String]) -> u8 {
@@ -317,6 +325,7 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
         range: None,
         force: false,
         ram_fraction: super::metrics::DEFAULT_RAM_FRACTION,
+        act: false,
     };
     let number = |value: Option<&String>, flag: &str| -> Result<usize, Failure> {
         value
@@ -360,6 +369,7 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
             }
             "--force" if command == "shared" => options.force = true,
             "--all" if command == "cache" => options.all = true,
+            "--act" if command == "budgets" => options.act = true,
             "--ram-fraction" if command == "calibrate" => {
                 options.ram_fraction = args
                     .next()

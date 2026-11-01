@@ -62,6 +62,36 @@ pub struct BudgetsSpec {
     pub seconds: BTreeMap<String, u64>,
     #[serde(default)]
     pub memory_mib: BTreeMap<String, u64>,
+    /// What a sustained breach does (#1239 with #1238). Absent: nothing
+    /// beyond the report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcomes: Option<BudgetOutcomesSpec>,
+}
+
+/// `[budgets.outcomes]`: a metric over budget (or failing too often) for
+/// `windows` consecutive evaluation windows opens one issue through the
+/// #1238 issue upsert; back to `ok`, the issue is resolved. A window is an
+/// evaluation that saw new runs of that metric.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetOutcomesSpec {
+    /// Open and resolve issues. Off by default: the repository's
+    /// `automation_issues` policy must also allow it.
+    #[serde(default)]
+    pub issue: bool,
+    #[serde(default = "default_outcome_windows")]
+    pub windows: u32,
+    /// Also a breach: more than this share of a window's runs failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_rate_pct: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+}
+
+pub const DEFAULT_OUTCOME_WINDOWS: u32 = 3;
+
+fn default_outcome_windows() -> u32 {
+    DEFAULT_OUTCOME_WINDOWS
 }
 
 fn default_idle_seconds() -> u64 {

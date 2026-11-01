@@ -100,6 +100,14 @@ CREATE TABLE IF NOT EXISTS environment_timings (
   ok INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS environment_timings_metric ON environment_timings(repository, metric, ok, seq);
+CREATE TABLE IF NOT EXISTS budget_outcomes (
+  repository TEXT NOT NULL,
+  metric TEXT NOT NULL,
+  head INTEGER NOT NULL,
+  consecutive INTEGER NOT NULL,
+  issue_open INTEGER NOT NULL,
+  PRIMARY KEY (repository, metric)
+);
 ";
 
 /// Timings kept per (repository, metric, outcome) (#1239).
@@ -1055,6 +1063,100 @@ impl EnvironmentStore {
 
     /// Measured byte samples per profile of one repository (unknown
     /// measurements excluded).
+    /// The newest record of every metric of one repository: the highest
+    /// timing `seq` per metric, and the highest sample `seq` per profile as
+    /// `memory.<profile>`. A budget outcome window is one that saw a head
+    /// move (#1239).
+    pub fn metric_heads(
+        &self,
+        repository: &str,
+    ) -> Result<std::collections::BTreeMap<String, i64>, StoreError> {
+        let mut heads = std::collections::BTreeMap::new();
+        let mut statement = self.conn.prepare(
+            "SELECT metric, max(seq) FROM environment_timings WHERE repository = ?1 GROUP BY metric",
+        )?;
+        for row in statement.query_map(params![repository], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })? {
+            let (metric, head) = row?;
+            heads.insert(metric, head);
+        }
+        if self.has_samples_table()? {
+            let mut statement = self.conn.prepare(
+                "SELECT profile, max(seq) FROM environment_samples
+                 WHERE repository = ?1 AND bytes IS NOT NULL GROUP BY profile",
+            )?;
+            for row in statement.query_map(params![repository], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })? {
+                let (profile, head) = row?;
+                heads.insert(format!("memory.{profile}"), head);
+            }
+        }
+        Ok(heads)
+    }
+
+    /// Budget outcome state per metric of one repository (#1239).
+    pub fn budget_outcomes(
+        &self,
+        repository: &str,
+    ) -> Result<std::collections::BTreeMap<String, super::budget_outcomes::OutcomeState>, StoreError>
+    {
+        let has_table = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'budget_outcomes'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !has_table {
+            return Ok(Default::default());
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT metric, head, consecutive, issue_open FROM budget_outcomes WHERE repository = ?1",
+        )?;
+        let rows = statement.query_map(params![repository], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                super::budget_outcomes::OutcomeState {
+                    head: row.get(1)?,
+                    consecutive: row.get::<_, i64>(2)? as u32,
+                    issue_open: row.get(3)?,
+                },
+            ))
+        })?;
+        let mut states = std::collections::BTreeMap::new();
+        for row in rows {
+            let (metric, state) = row?;
+            states.insert(metric, state);
+        }
+        Ok(states)
+    }
+
+    pub fn set_budget_outcome(
+        &mut self,
+        repository: &str,
+        metric: &str,
+        state: &super::budget_outcomes::OutcomeState,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO budget_outcomes (repository, metric, head, consecutive, issue_open)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(repository, metric) DO UPDATE SET head = excluded.head,
+               consecutive = excluded.consecutive, issue_open = excluded.issue_open",
+            params![
+                repository,
+                metric,
+                state.head,
+                state.consecutive as i64,
+                state.issue_open
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn footprints(
         &self,
         repository: &str,
