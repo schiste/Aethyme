@@ -444,11 +444,11 @@ fn status_reports_the_collaboration_fence() {
         String::from_utf8_lossy(&output.stderr)
     );
     let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    // A fresh database requires the v58 durable artifact-use protocol.
+    // The current v60 compatibility floor protects task-operation-guard writers.
     assert_eq!(
         status["collaboration_fence"],
         serde_json::json!({
-            "min_compatible_schema": 58,
+            "min_compatible_schema": 60,
             "reason": "collaboration capture required",
             "source": "committed",
             "state": "active",
@@ -458,7 +458,7 @@ fn status_reports_the_collaboration_fence() {
     assert!(
         String::from_utf8_lossy(&text.stdout).contains(&format!(
             "Collaboration fence: broker.db requires schema {}",
-            58
+            60
         )),
         "{}",
         String::from_utf8_lossy(&text.stdout)
