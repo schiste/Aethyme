@@ -722,11 +722,16 @@ fn on_post_tool_use(cwd: &std::path::Path) -> HookOutcome {
     let Some(session) = current_session(&mut snapshot, &canonical) else {
         return HookOutcome::Silent;
     };
-    let unread = snapshot
-        .store_ref()
+    let store = snapshot.store_ref();
+    let unread = !store
         .unread_session_notes(session.id)
-        .unwrap_or_default();
-    if unread.is_empty() {
+        .unwrap_or_default()
+        .is_empty()
+        || !store
+            .unread_automation_notes(session.id)
+            .unwrap_or_default()
+            .is_empty();
+    if !unread {
         return HookOutcome::Silent;
     }
     drop(snapshot);
@@ -744,10 +749,23 @@ fn deliver_notes(broker: &mut Broker, session: &Session) -> HookOutcome {
         .store()
         .unread_session_notes(session.id)
         .unwrap_or_default();
-    if unread.is_empty() {
+    let automation = broker
+        .store()
+        .unread_automation_notes(session.id)
+        .unwrap_or_default();
+    if unread.is_empty() && automation.is_empty() {
         return HookOutcome::Silent;
     }
-    let mut lines = Vec::with_capacity(unread.len() * 2);
+    let mut lines = Vec::with_capacity((unread.len() + automation.len()) * 2);
+    for note in &automation {
+        // An automation cannot be replied to; the note itself says what
+        // failed and where it is tracked.
+        lines.push(format!("Note from {}: {}", note.sender, note.message));
+        crate::warn_unrecorded(
+            "acknowledge a delivered automation note",
+            broker.store().acknowledge_automation_note(note.id),
+        );
+    }
     for note in &unread {
         lines.push(format!(
             "Note from session {}: {}",
