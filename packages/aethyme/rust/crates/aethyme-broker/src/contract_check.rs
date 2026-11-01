@@ -679,9 +679,10 @@ fn unified_diff(repo_root: &Path, revisions: &[&str]) -> Result<Vec<String>, Str
 /// sides now.
 struct TrackedSymbolMatcher<'a> {
     symbols: Vec<&'a str>,
+    fallbacks: Vec<Vec<usize>>,
 }
 
-/// Bound storage before allocating the borrowed literal index. A large regex
+/// Bound storage before allocating the literal index and prefix tables. A large regex
 /// set can fall back to scanning every NFA state for every input byte; direct
 /// literal searches avoid that path without changing the boundary contract.
 fn build_symbol_matcher(
@@ -704,8 +705,12 @@ fn build_symbol_matcher(
         }
     }
     let retained_bytes = count
-        .checked_mul(std::mem::size_of::<&str>())
-        .and_then(|bytes| bytes.checked_add(symbol_bytes))
+        .checked_mul(std::mem::size_of::<&str>() + std::mem::size_of::<Vec<usize>>())
+        .and_then(|bytes| {
+            symbol_bytes
+                .checked_mul(1 + std::mem::size_of::<usize>())
+                .and_then(|source| bytes.checked_add(source))
+        })
         .ok_or_else(|| "tracked contract symbol index exceeds the size limit".to_string())?;
     if retained_bytes > matcher_size_limit {
         return Err(format!(
@@ -727,26 +732,97 @@ fn build_symbol_matcher(
         ));
     }
     symbols.extend(tracked.iter().map(String::as_str).filter(|s| !s.is_empty()));
-    Ok(TrackedSymbolMatcher { symbols })
+    let mut fallbacks = Vec::new();
+    fallbacks
+        .try_reserve_exact(count)
+        .map_err(|error| format!("could not allocate tracked contract fallback index: {error}"))?;
+    let mut allocated_bytes = symbols
+        .capacity()
+        .checked_mul(std::mem::size_of::<&str>())
+        .and_then(|bytes| {
+            fallbacks
+                .capacity()
+                .checked_mul(std::mem::size_of::<Vec<usize>>())
+                .and_then(|index| bytes.checked_add(index))
+        })
+        .and_then(|bytes| bytes.checked_add(symbol_bytes))
+        .ok_or_else(|| "tracked contract fallback index exceeds the size limit".to_string())?;
+    for symbol in &symbols {
+        let fallback = build_literal_fallback(symbol)?;
+        allocated_bytes = fallback
+            .capacity()
+            .checked_mul(std::mem::size_of::<usize>())
+            .and_then(|bytes| allocated_bytes.checked_add(bytes))
+            .ok_or_else(|| "tracked contract fallback index exceeds the size limit".to_string())?;
+        if allocated_bytes > matcher_size_limit {
+            return Err(format!(
+                "tracked contract fallback index exceeds the {matcher_size_limit}-byte limit"
+            ));
+        }
+        fallbacks.push(fallback);
+    }
+    Ok(TrackedSymbolMatcher { symbols, fallbacks })
+}
+
+/// KMP prefix lengths guarantee linear work even for overlapping, rejected
+/// occurrences. Build once per literal, within the index's preflight budget.
+fn build_literal_fallback(symbol: &str) -> Result<Vec<usize>, String> {
+    let bytes = symbol.as_bytes();
+    let mut fallback = Vec::new();
+    fallback.try_reserve_exact(bytes.len()).map_err(|error| {
+        format!("could not allocate tracked contract literal fallback: {error}")
+    })?;
+    fallback.resize(bytes.len(), 0);
+    let mut matched = 0;
+    for offset in 1..bytes.len() {
+        while matched > 0 && bytes[offset] != bytes[matched] {
+            matched = fallback[matched - 1];
+        }
+        if bytes[offset] == bytes[matched] {
+            matched += 1;
+        }
+        fallback[offset] = matched;
+    }
+    Ok(fallback)
 }
 
 /// Report each literal at most once per line, just as the former regex set did.
-fn literal_symbol_matches(body: &str, symbol: &str) -> bool {
-    let Some(first) = symbol.chars().next() else {
+fn literal_symbol_matches(body: &str, symbol: &str, fallback: &[usize]) -> bool {
+    if symbol.is_empty() {
+        return false;
+    }
+    let is_word = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-');
+    let boundary_matches = |start: usize, end: usize| {
+        (start == 0 || !is_word(body.as_bytes()[start - 1]))
+            && (end == body.len() || !is_word(body.as_bytes()[end]))
+    };
+    let Some(first) = body.find(symbol) else {
         return false;
     };
-    let is_word = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-');
-    let mut cursor = 0;
-    while let Some(relative) = body[cursor..].find(symbol) {
-        let start = cursor + relative;
-        let end = start + symbol.len();
-        let left_boundary = start == 0 || !is_word(body.as_bytes()[start - 1]);
-        let right_boundary = end == body.len() || !is_word(body.as_bytes()[end]);
-        if left_boundary && right_boundary {
-            return true;
+    if boundary_matches(first, first + symbol.len()) {
+        return true;
+    }
+    // Fast substring search handles the common absent/first-valid cases. If
+    // boundaries reject the first occurrence, use KMP rather than restarting
+    // substring search at every overlapping offset (which can be quadratic).
+    // Byte slices are intentional: a complete valid UTF-8 literal cannot
+    // match starting within a continuation sequence.
+    let pattern = symbol.as_bytes();
+    let mut matched = 0;
+    for (relative, byte) in body.as_bytes()[first + 1..].iter().enumerate() {
+        while matched > 0 && *byte != pattern[matched] {
+            matched = fallback[matched - 1];
         }
-        // Retain overlapping occurrences while staying on a UTF-8 boundary.
-        cursor = start + first.len_utf8();
+        if *byte == pattern[matched] {
+            matched += 1;
+        }
+        if matched == pattern.len() {
+            let end = first + 1 + relative + 1;
+            if boundary_matches(end - pattern.len(), end) {
+                return true;
+            }
+            matched = fallback[matched - 1];
+        }
     }
     false
 }
@@ -778,7 +854,7 @@ fn find_touched_symbols_with_limit(
         &matcher.symbols,
         |body, visit_match| {
             for (id, symbol) in matcher.symbols.iter().enumerate() {
-                if literal_symbol_matches(body, symbol) {
+                if literal_symbol_matches(body, symbol, &matcher.fallbacks[id]) {
                     visit_match(id);
                 }
             }
@@ -1645,7 +1721,11 @@ mod tests {
                         format!("{left}{symbol}{symbol}{right}"),
                     ] {
                         assert_eq!(
-                            literal_symbol_matches(&body, symbol),
+                            literal_symbol_matches(
+                                &body,
+                                symbol,
+                                &build_literal_fallback(symbol).unwrap()
+                            ),
                             oracle.is_match(&body),
                             "symbol={symbol:?}, body={body:?}"
                         );
@@ -1653,8 +1733,26 @@ mod tests {
                 }
             }
         }
-        assert!(literal_symbol_matches("xé.é.é", "é.é"));
-        assert!(literal_symbol_matches("xa.a.a", "a.a"));
+        assert!(literal_symbol_matches(
+            "xé.é.é",
+            "é.é",
+            &build_literal_fallback("é.é").unwrap()
+        ));
+        assert!(literal_symbol_matches(
+            "xa.a.a",
+            "a.a",
+            &build_literal_fallback("a.a").unwrap()
+        ));
+    }
+
+    #[test]
+    fn long_rejected_overlaps_use_linear_fallback() {
+        let symbol = "a".repeat(1024 * 1024);
+        let body = "a".repeat(2 * 1024 * 1024);
+        let fallback = build_literal_fallback(&symbol).unwrap();
+        assert!(!literal_symbol_matches(&body, &symbol, &fallback));
+        let body = format!("{body} {symbol}");
+        assert!(literal_symbol_matches(&body, &symbol, &fallback));
     }
 
     #[test]
@@ -1678,6 +1776,12 @@ mod tests {
             vec!["contract-entry-1024"]
         );
         assert_eq!(findings["contract-entry-1024"].len(), 1);
+    }
+
+    #[test]
+    fn matcher_budget_includes_overlap_fallback_tables() {
+        let tracked = BTreeSet::from(["a".repeat(1024)]);
+        assert!(build_symbol_matcher(&tracked, 2048).is_err());
     }
 
     #[test]
