@@ -1053,7 +1053,7 @@ impl Broker {
         self.agent_views(self.store.live_sessions()?, now_ms)
     }
 
-    fn agent_views(
+    pub(super) fn agent_views(
         &self,
         sessions: Vec<Session>,
         now_ms: i64,

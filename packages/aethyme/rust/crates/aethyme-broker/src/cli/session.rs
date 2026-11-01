@@ -1783,6 +1783,84 @@ pub(super) fn run_agents(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+/// `broker owners`: the sessions behind landed commits (#1238).
+pub(super) fn run_owners(parsed: Parsed) -> Result<(), UsageError> {
+    let range = parsed
+        .commits
+        .clone()
+        .ok_or_else(|| UsageError::Message("owners requires --commits <from>..<to>".into()))?;
+    if let Some(extra) = parsed.positional.first() {
+        return Err(UsageError::Message(format!(
+            "owners takes no positional arguments; got {extra:?}"
+        )));
+    }
+    let broker = open_broker(parsed.read_only_snapshot)?;
+    let report = broker.owners(&range, &parsed.planned_paths, now_ms())?;
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    let scope = if report.paths.is_empty() {
+        String::new()
+    } else {
+        format!(" touching {}", report.paths.join(", "))
+    };
+    out!(
+        "{} commit(s) in {}{}{}.",
+        report.commits.len(),
+        report.range,
+        scope,
+        if report.truncated {
+            format!(" (newest {} only)", crate::MAX_OWNER_COMMITS)
+        } else {
+            String::new()
+        }
+    );
+    if report.owners.is_empty() {
+        out!("No owning session found.");
+    } else {
+        out!(
+            "{:<6} {:<8} {:<5} {:<6} {:<40} COMMITS",
+            "ID",
+            "STATUS",
+            "LIVE",
+            "PR",
+            "BRANCH"
+        );
+        for owner in &report.owners {
+            out!(
+                "{:<6} {:<8} {:<5} {:<6} {:<40} {}",
+                owner.session_id,
+                owner.status.as_str(),
+                if owner.live { "yes" } else { "no" },
+                owner
+                    .pull_request
+                    .map(|number| format!("#{number}"))
+                    .unwrap_or_else(|| "-".into()),
+                owner.branch,
+                owner
+                    .commits
+                    .iter()
+                    .map(|sha| &sha[..sha.len().min(9)])
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+        }
+    }
+    if !report.unowned.is_empty() {
+        out!(
+            "Without an owning session: {}",
+            report
+                .unowned
+                .iter()
+                .map(|sha| &sha[..sha.len().min(9)])
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+    Ok(())
+}
+
 /// `broker handoff`.
 pub(super) fn run_handoff(parsed: Parsed) -> Result<(), UsageError> {
     let broker = open_broker(parsed.read_only_snapshot)?;
