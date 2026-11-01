@@ -2210,12 +2210,10 @@ mod scan_tests {
             open_file_snapshot_blocker_for_session_worktree(&complete, worktree, Some(77)),
             None
         );
-        assert!(open_file_snapshot_blocker_for_session_worktree(
-            &complete,
-            worktree,
-            Some(78)
-        )
-        .is_some());
+        assert!(
+            open_file_snapshot_blocker_for_session_worktree(&complete, worktree, Some(78))
+                .is_some()
+        );
 
         let open_file = OpenFileUse {
             descriptor: "3".into(),
@@ -2223,21 +2221,25 @@ mod scan_tests {
             path: worktree.join("notes.txt"),
             ..cwd.clone()
         };
-        assert!(open_file_snapshot_blocker_for_session_worktree(
-            &OpenFileSnapshot::Complete(vec![cwd.clone(), open_file]),
-            worktree,
-            Some(77)
-        )
-        .is_some());
-        assert!(open_file_snapshot_blocker_for_session_worktree(
-            &OpenFileSnapshot::Incomplete {
-                reason: "partial process listing".into(),
-                observed: vec![cwd],
-            },
-            worktree,
-            Some(77)
-        )
-        .is_some());
+        assert!(
+            open_file_snapshot_blocker_for_session_worktree(
+                &OpenFileSnapshot::Complete(vec![cwd.clone(), open_file]),
+                worktree,
+                Some(77)
+            )
+            .is_some()
+        );
+        assert!(
+            open_file_snapshot_blocker_for_session_worktree(
+                &OpenFileSnapshot::Incomplete {
+                    reason: "partial process listing".into(),
+                    observed: vec![cwd],
+                },
+                worktree,
+                Some(77)
+            )
+            .is_some()
+        );
     }
 
     fn set_index_age(worktree: &Path, age: std::time::Duration) {

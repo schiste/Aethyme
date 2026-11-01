@@ -554,13 +554,15 @@ mod tests {
         // operation's durable artifact/gate/journal witnesses, not by leaking
         // the lock into unrelated long-lived helpers.
         drop(shared);
-        assert!(try_acquire_session_operation_guard(
-            repository.path(),
-            41,
-            SessionOperationLockMode::Exclusive,
-        )
-        .unwrap()
-        .is_some());
+        assert!(
+            try_acquire_session_operation_guard(
+                repository.path(),
+                41,
+                SessionOperationLockMode::Exclusive,
+            )
+            .unwrap()
+            .is_some()
+        );
         std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"done\n")
             .expect("release child barrier");
         child.wait().expect("wait for lock-holding child");

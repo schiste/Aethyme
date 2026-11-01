@@ -692,9 +692,7 @@ impl Broker {
             crate::session_holder::RecordedHolderLiveness::Unknown => {
                 return Ok(AbandonedSessionCloseOutcome::HolderUnavailable);
             }
-            crate::session_holder::RecordedHolderLiveness::Alive
-                if live_task_holder.is_none() =>
-            {
+            crate::session_holder::RecordedHolderLiveness::Alive if live_task_holder.is_none() => {
                 return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
             }
             crate::session_holder::RecordedHolderLiveness::Gone
@@ -848,8 +846,8 @@ impl Broker {
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
             }
-            let Some(open_files) = process_table
-                .process_use_snapshot_for_retirement(self.main_root(), deadline)
+            let Some(open_files) =
+                process_table.process_use_snapshot_for_retirement(self.main_root(), deadline)
             else {
                 return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
             };
@@ -926,8 +924,8 @@ impl Broker {
                     })
                 })
             }) {
-                Some(expired_at) => crate::lease_liveness::
-                    assess_for_abandonment_with_task_lease_expiry(
+                Some(expired_at) => {
+                    crate::lease_liveness::assess_for_abandonment_with_task_lease_expiry(
                         self.store_ref(),
                         &explicit_leases,
                         lease_table,
@@ -935,7 +933,8 @@ impl Broker {
                         lease_policy,
                         session_id,
                         expired_at,
-                    ),
+                    )
+                }
                 None => crate::lease_liveness::assess_for_abandonment(
                     self.store_ref(),
                     &explicit_leases,
@@ -3851,7 +3850,10 @@ mod generic_guarded_exec_tests {
         broker
             .store()
             .connection()
-            .execute("UPDATE events SET ts = ?1 WHERE id = ?2", rusqlite::params![ts, event.id])
+            .execute(
+                "UPDATE events SET ts = ?1 WHERE id = ?2",
+                rusqlite::params![ts, event.id],
+            )
             .unwrap();
         event.id
     }
@@ -3863,10 +3865,7 @@ mod generic_guarded_exec_tests {
         alive: bool,
     ) -> crate::session_holder::RecordedHolderProcessTable {
         let rows = if alive {
-            format!(
-                "{} 1 {} {}\n",
-                holder.pid, holder.started, holder.command
-            )
+            format!("{} 1 {} {}\n", holder.pid, holder.started, holder.command)
         } else {
             String::new()
         };
@@ -3888,7 +3887,9 @@ mod generic_guarded_exec_tests {
             "[retention]\nexpire_abandoned_task_leases = true\nsession_abandoned_after_hours = 72\n",
         )
         .unwrap();
-        let session = broker.start_worktree("expired live task holder", None).unwrap();
+        let session = broker
+            .start_worktree("expired live task holder", None)
+            .unwrap();
         broker
             .store()
             .claim_lease(session.id, "tracked.txt", None)
@@ -3914,7 +3915,14 @@ mod generic_guarded_exec_tests {
             .unwrap();
 
         assert_eq!(outcome, AbandonedSessionCloseOutcome::Closed);
-        assert!(broker.store().session(session.id).unwrap().status.is_closed());
+        assert!(
+            broker
+                .store()
+                .session(session.id)
+                .unwrap()
+                .status
+                .is_closed()
+        );
         assert!(
             broker
                 .store()
@@ -3973,14 +3981,23 @@ mod generic_guarded_exec_tests {
         producer.finish_not_started().unwrap();
 
         assert_eq!(outcome, AbandonedSessionCloseOutcome::OperationActive);
-        assert!(!broker.store().session(session.id).unwrap().status.is_closed());
+        assert!(
+            !broker
+                .store()
+                .session(session.id)
+                .unwrap()
+                .status
+                .is_closed()
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn finite_binding_with_in_progress_preparation_defers_close() {
         let (repository, _storage, mut broker) = fixture();
-        let session = broker.start_worktree("active preparation witness", None).unwrap();
+        let session = broker
+            .start_worktree("active preparation witness", None)
+            .unwrap();
         let prepare_config = "schema_version = 1\n\n[[steps]]\nname = \"deps\"\ncommand = [\"sh\", \"-c\", \"true\"]\ninputs = []\noutputs = []\ncache = \"repository_shared\"\nrequired_for_hooks = false\n";
         std::fs::create_dir_all(Path::new(&session.worktree_path).join(".aethyme")).unwrap();
         std::fs::write(
@@ -4028,7 +4045,14 @@ mod generic_guarded_exec_tests {
             .unwrap();
 
         assert_eq!(outcome, AbandonedSessionCloseOutcome::OperationActive);
-        assert!(!broker.store().session(session.id).unwrap().status.is_closed());
+        assert!(
+            !broker
+                .store()
+                .session(session.id)
+                .unwrap()
+                .status
+                .is_closed()
+        );
     }
 
     #[cfg(unix)]
@@ -4063,14 +4087,23 @@ mod generic_guarded_exec_tests {
             outcome,
             AbandonedSessionCloseOutcome::OperationEvidenceUnavailable
         );
-        assert!(!broker.store().session(session.id).unwrap().status.is_closed());
+        assert!(
+            !broker
+                .store()
+                .session(session.id)
+                .unwrap()
+                .status
+                .is_closed()
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn session_operation_guard_busy_defers_abandoned_close() {
         let (_repository, _storage, mut broker) = fixture();
-        let session = broker.start_worktree("operation guard blocker", None).unwrap();
+        let session = broker
+            .start_worktree("operation guard blocker", None)
+            .unwrap();
         age_worktree_for_task_retirement(&mut broker, &session);
         let shared = crate::file_lock::try_acquire_session_operation_guard(
             broker.main_root(),
@@ -4094,7 +4127,14 @@ mod generic_guarded_exec_tests {
         drop(shared);
 
         assert_eq!(outcome, AbandonedSessionCloseOutcome::OperationGuardBusy);
-        assert!(!broker.store().session(session.id).unwrap().status.is_closed());
+        assert!(
+            !broker
+                .store()
+                .session(session.id)
+                .unwrap()
+                .status
+                .is_closed()
+        );
     }
 
     #[test]

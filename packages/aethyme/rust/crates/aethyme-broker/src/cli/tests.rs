@@ -28,7 +28,10 @@ fn task_lease_classification_uses_normalized_actions_and_preserves_polling() {
         ObservationOnly
     );
     assert_eq!(classify(&["leases"]), ObservationOnly);
-    assert_eq!(classify(&["note", "list", "--session", "17"]), ObservationOnly);
+    assert_eq!(
+        classify(&["note", "list", "--session", "17"]),
+        ObservationOnly
+    );
     assert_eq!(classify(&["ownership", "list"]), ObservationOnly);
     assert_eq!(classify(&["hooks", "status"]), ObservationOnly);
     assert_eq!(
@@ -52,7 +55,10 @@ fn task_lease_classification_uses_normalized_actions_and_preserves_polling() {
         ObservationOnly
     );
     assert_eq!(classify(&["gc", "plan"]), ObservationOnly);
-    assert_eq!(classify(&["finish", "cleanup", "42"]), ClosedSessionAdministration);
+    assert_eq!(
+        classify(&["finish", "cleanup", "42"]),
+        ClosedSessionAdministration
+    );
     assert_eq!(
         classify(&["finish", "cleanup", "resolve", "42", "--archive"]),
         ClosedSessionAdministration
@@ -121,7 +127,9 @@ fn finish_can_be_retried_after_close_without_changing_finite_holder_binding() {
     git(&["commit", "-qm", "fixture"]);
     let storage = crate::test_storage::TestStorage::new();
     let mut broker = storage.open(repository.path()).unwrap();
-    let session = broker.start_worktree("closed finish fixture", None).unwrap();
+    let session = broker
+        .start_worktree("closed finish fixture", None)
+        .unwrap();
     broker.close(session.id).unwrap();
     let parent = crate::session_holder::ProcessTable::snapshot()
         .expect("the parent process table is readable")
@@ -181,7 +189,11 @@ fn finish_can_be_retried_after_close_without_changing_finite_holder_binding() {
 fn session_operation_guard_is_acquired_before_startup_maintenance() {
     const CHILD_SESSION_ENV: &str = "AETHYME_SESSION_GUARD_STARTUP_TEST_SESSION";
     if let Ok(session_id) = std::env::var(CHILD_SESSION_ENV) {
-        let args = vec!["heartbeat".to_owned(), "--session".to_owned(), session_id.clone()];
+        let args = vec![
+            "heartbeat".to_owned(),
+            "--session".to_owned(),
+            session_id.clone(),
+        ];
         let result = super::run_inner(&args, &super::CompatibilityMode::Normal);
         let Err(UsageError::Message(message)) = result else {
             panic!("the startup shared-lock refusal must precede broker open");
@@ -213,7 +225,9 @@ fn session_operation_guard_is_acquired_before_startup_maintenance() {
     git(&["commit", "-qm", "fixture"]);
     let storage = crate::test_storage::TestStorage::new();
     let mut broker = storage.open(repository.path()).unwrap();
-    let session = broker.start_worktree("startup guard fixture", None).unwrap();
+    let session = broker
+        .start_worktree("startup guard fixture", None)
+        .unwrap();
     let parent = crate::session_holder::ProcessTable::snapshot()
         .expect("the parent process table is readable")
         .process(std::process::id() as i64)
