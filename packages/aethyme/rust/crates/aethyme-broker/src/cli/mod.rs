@@ -2631,12 +2631,16 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
     // Resolve through a non-mutating snapshot first, then acquire the exact
     // session guard before advisory delivery, holder admission, or a handler
     // can open mutable broker state and run maintenance.
-    let session_operation =
-        if task_lease_command == TaskLeaseCommandClass::ClosedSessionAdministration {
-            None
-        } else {
-            acquire_session_operation_context(&parsed, subcommand == "finish")?
-        };
+    let session_operation = if task_lease_command
+        == TaskLeaseCommandClass::ClosedSessionAdministration
+    {
+        None
+    } else {
+        acquire_session_operation_context(
+            &parsed,
+            subcommand == "finish" || closed_session_command_reaches_handler(subcommand, &parsed),
+        )?
+    };
     surface_command_advisories(subcommand, &parsed);
     admit_session_holder(subcommand, &parsed)?;
     let heartbeat = if subcommand == "heartbeat" {
@@ -2899,6 +2903,7 @@ enum TaskLeaseCommandClass {
 
 fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseCommandClass {
     let action = parsed.positional.first().map(String::as_str);
+    let nested_action = parsed.positional.get(1).map(String::as_str);
     match subcommand {
         "prepare" if action == Some("status") => TaskLeaseCommandClass::ObservationOnly,
         "leases" if matches!(action, None | Some("plan" | "explain" | "export")) => {
@@ -2922,9 +2927,45 @@ fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseComma
         "operations" if matches!(action, None | Some("list" | "show")) => {
             TaskLeaseCommandClass::ObservationOnly
         }
+        "operations" if action == Some("stats") => TaskLeaseCommandClass::ObservationOnly,
         "gates" if matches!(action, Some("status" | "manifest" | "scope")) => {
             TaskLeaseCommandClass::ObservationOnly
         }
+        "gates" if action == Some("incidents") && nested_action == Some("list") => {
+            TaskLeaseCommandClass::ObservationOnly
+        }
+        "events" if action != Some("prune") => TaskLeaseCommandClass::ObservationOnly,
+        "external-events" if matches!(action, Some("list" | "show")) => {
+            TaskLeaseCommandClass::ObservationOnly
+        }
+        "report"
+            if matches!(action, Some("list" | "show"))
+                || (action == Some("render") && parsed.output.is_none()) =>
+        {
+            TaskLeaseCommandClass::ObservationOnly
+        }
+        "quality-report" if action == Some("plan") => TaskLeaseCommandClass::ObservationOnly,
+        "deliveries" if action == Some("list") => TaskLeaseCommandClass::ObservationOnly,
+        "watch"
+            if (matches!(action, Some("pr" | "repo"))
+                && matches!(nested_action, Some("list" | "show" | "events" | "batches")))
+                || (action == Some("pr")
+                    && nested_action == Some("monitoring")
+                    && parsed.positional.get(2).map(String::as_str) == Some("status"))
+                || (action == Some("pr")
+                    && nested_action == Some("service")
+                    && matches!(
+                        parsed.positional.get(2).map(String::as_str),
+                        Some("plan" | "status")
+                    )) =>
+        {
+            TaskLeaseCommandClass::ObservationOnly
+        }
+        "handoff" | "metrics" | "insights" | "blockers" | "exec-status" | "queue" | "worktrees" => {
+            TaskLeaseCommandClass::ObservationOnly
+        }
+        "reclaim" if action == Some("plan") => TaskLeaseCommandClass::ObservationOnly,
+        "reclaim" => TaskLeaseCommandClass::OtherWork,
         "gc" if action == Some("plan") => TaskLeaseCommandClass::ObservationOnly,
         "heartbeat" | "commit" | "exec" | "gh" | "git" | "prepare" | "push" | "submit" | "sync" => {
             TaskLeaseCommandClass::GuardedWork
@@ -2954,6 +2995,19 @@ fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseComma
         | "exec-status" => TaskLeaseCommandClass::OtherWork,
         _ => TaskLeaseCommandClass::NoSessionWork,
     }
+}
+
+/// These operations need to reach their domain handler for the established
+/// closed-session refusal or lifecycle action. They still hold the shared
+/// operation guard, and open sessions follow the normal heartbeat/downgrade
+/// path below.
+fn closed_session_command_reaches_handler(subcommand: &str, parsed: &Parsed) -> bool {
+    matches!(
+        (subcommand, parsed.positional.first().map(String::as_str)),
+        ("leases", Some("claim"))
+            | ("review", Some("request" | "unlock" | "reassign"))
+            | ("reclaim", Some("apply"))
+    )
 }
 
 fn heartbeat_session_task_lease(
