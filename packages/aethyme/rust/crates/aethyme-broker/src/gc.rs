@@ -967,6 +967,62 @@ fn artifact_sweep_headroom_threshold(configured_bytes: u64) -> u64 {
     configured_bytes.max(crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES)
 }
 
+fn artifact_sweep_budget_roots_for_scope(
+    scope: ArtifactSweepScope,
+    main_root: &Path,
+    bounded_worktree_roots: &[PathBuf],
+    session_worktree_roots: &[PathBuf],
+    preparation_cache_roots: &[PathBuf],
+    closed_session_worktree_root: Option<&Path>,
+) -> BTreeSet<PathBuf> {
+    let mut roots = BTreeSet::from([main_root.to_path_buf()]);
+    match scope {
+        ArtifactSweepScope::Inline
+        | ArtifactSweepScope::Drain
+        | ArtifactSweepScope::FinishDrain => {
+            // Foreground scopes use the small, captured placement candidate
+            // list. Do not enumerate every session just to choose a budget.
+            roots.extend(bounded_worktree_roots.iter().cloned());
+            roots.extend(preparation_cache_roots.iter().cloned());
+        }
+        ArtifactSweepScope::AutomaticContinuation => {
+            // The detached worker has its own discovery budget and can sample
+            // the precise roots recorded for all sessions.
+            roots.extend(session_worktree_roots.iter().cloned());
+            roots.extend(preparation_cache_roots.iter().cloned());
+        }
+        ArtifactSweepScope::ClosedSession(_) => {
+            if let Some(root) = closed_session_worktree_root {
+                roots.insert(root.to_path_buf());
+            }
+        }
+    }
+    roots
+}
+
+fn artifact_sweep_worktree_roots_from_plan(plan: &crate::WorktreeRootPlan) -> Vec<PathBuf> {
+    let mut roots = crate::broker::lifecycle::worktree_root_candidates_for(plan)
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect::<Vec<_>>();
+    // New placement avoids a configured root below its admission headroom,
+    // but existing sessions may still be there and need reclamation. Include
+    // that one root for sampling only after the earlier mount, presence and
+    // repository-containment checks have passed.
+    if plan.preferred_source == Some(crate::WorktreeRootSource::RepositoryConfig)
+        && plan
+            .preferred_unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.ends_with("(worktrees.min_free_bytes)"))
+        && let Some(root) = &plan.preferred_root
+    {
+        roots.push(root.clone());
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 fn scope_runs_checkout_cleanup(scope: ArtifactSweepScope) -> bool {
     !matches!(
         scope,
@@ -7673,19 +7729,64 @@ impl Broker {
 
     fn artifact_sweep_budget_roots(&mut self, scope: ArtifactSweepScope) -> BTreeSet<PathBuf> {
         let main_root = self.main_root().to_path_buf();
-        // The detached worker can reclaim caches from external worktree and
-        // preparation-cache volumes. Looking only at the main checkout misses
-        // pressure on those filesystems (the main checkout is often elsewhere).
-        let mut roots = BTreeSet::from([main_root.clone()]);
-        if scope == ArtifactSweepScope::AutomaticContinuation {
-            if let Ok(paths) = self.store().session_worktree_paths() {
-                roots.extend(paths.into_iter().map(PathBuf::from));
+        let bounded_worktree_roots = match scope {
+            ArtifactSweepScope::Inline
+            | ArtifactSweepScope::Drain
+            | ArtifactSweepScope::FinishDrain => {
+                let context = self.storage_context();
+                let plan = crate::broker::lifecycle::plan_worktree_root_with_context(
+                    &main_root,
+                    context.git_common_dir.as_deref(),
+                    context,
+                );
+                artifact_sweep_worktree_roots_from_plan(&plan)
             }
-            if let Ok(cache_roots) = self.preparation_cache_root_bindings_for_maintenance() {
-                roots.extend(cache_roots.into_iter().map(|binding| binding.path));
+            ArtifactSweepScope::AutomaticContinuation | ArtifactSweepScope::ClosedSession(_) => {
+                Vec::new()
             }
-        }
-        roots
+        };
+        let session_worktree_roots = if scope == ArtifactSweepScope::AutomaticContinuation {
+            self.store()
+                .session_worktree_paths()
+                .unwrap_or_default()
+                .into_iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let preparation_cache_roots = if matches!(scope, ArtifactSweepScope::ClosedSession(_)) {
+            Vec::new()
+        } else if scope == ArtifactSweepScope::AutomaticContinuation {
+            self.preparation_cache_root_bindings_for_maintenance()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|binding| binding.path)
+                .collect::<Vec<_>>()
+        } else {
+            self.storage_context()
+                .preparation_cache_root_binding()
+                .ok()
+                .flatten()
+                .map(|binding| vec![binding.path])
+                .unwrap_or_default()
+        };
+        let closed_session_worktree_root = match scope {
+            ArtifactSweepScope::ClosedSession(session_id) => self
+                .store()
+                .session(session_id)
+                .ok()
+                .map(|session| PathBuf::from(session.worktree_path)),
+            _ => None,
+        };
+        artifact_sweep_budget_roots_for_scope(
+            scope,
+            &main_root,
+            &bounded_worktree_roots,
+            &session_worktree_roots,
+            &preparation_cache_roots,
+            closed_session_worktree_root.as_deref(),
+        )
     }
 
     /// Reclaim build caches from one just-closed session while retaining its
@@ -15994,6 +16095,99 @@ mod tests {
                 60_000
             );
         }
+    }
+
+    #[test]
+    fn low_space_configured_worktree_root_remains_a_bounded_pressure_sample() {
+        let preferred = PathBuf::from("/configured/repository-key");
+        let fallback = PathBuf::from("/host/worktrees/repository-key");
+        let legacy = PathBuf::from("/repository/.aethyme/worktrees");
+        let plan = crate::WorktreeRootPlan {
+            schema_version: 1,
+            repository_root: PathBuf::from("/repository"),
+            repository_key: "repository-key".into(),
+            preferred_root: Some(preferred.clone()),
+            preferred_source: Some(crate::WorktreeRootSource::RepositoryConfig),
+            root_container: Some(PathBuf::from("/configured")),
+            legacy_fallback_root: legacy.clone(),
+            preferred_outside_repository: true,
+            host_state_fallback_root: Some(fallback.clone()),
+            preferred_unavailable_reason: Some(
+                "/configured has low free space (worktrees.min_free_bytes)".into(),
+            ),
+            storage_context_refusal: None,
+        };
+
+        let roots = artifact_sweep_worktree_roots_from_plan(&plan);
+        assert_eq!(roots.len(), 3, "placement sampling stays bounded");
+        assert!(roots.contains(&preferred));
+        assert!(roots.contains(&fallback));
+        assert!(roots.contains(&legacy));
+
+        let mut unavailable_root = plan;
+        unavailable_root.preferred_unavailable_reason =
+            Some("configured volume is not mounted".into());
+        assert!(
+            !artifact_sweep_worktree_roots_from_plan(&unavailable_root)
+                .contains(&PathBuf::from("/configured/repository-key")),
+            "a missing or refused root must not be mistaken for an affected volume"
+        );
+    }
+
+    #[test]
+    fn artifact_sweep_headroom_roots_cover_bounded_and_targeted_scopes() {
+        let main_root = PathBuf::from("/repository");
+        let bounded_worktree_roots = vec![PathBuf::from("/external/worktrees")];
+        let session_worktree_roots = vec![PathBuf::from("/older/custom/session")];
+        let preparation_cache_roots = vec![PathBuf::from("/external/cache")];
+        let targeted_worktree_root = PathBuf::from("/targeted/closed/session");
+
+        for scope in [
+            ArtifactSweepScope::Inline,
+            ArtifactSweepScope::Drain,
+            ArtifactSweepScope::FinishDrain,
+        ] {
+            let roots = artifact_sweep_budget_roots_for_scope(
+                scope,
+                &main_root,
+                &bounded_worktree_roots,
+                &session_worktree_roots,
+                &preparation_cache_roots,
+                None,
+            );
+            assert!(roots.contains(&main_root), "{scope:?}");
+            assert!(roots.contains(&bounded_worktree_roots[0]), "{scope:?}");
+            assert!(roots.contains(&preparation_cache_roots[0]), "{scope:?}");
+            assert!(
+                !roots.contains(&session_worktree_roots[0]),
+                "foreground scope {scope:?} must not enumerate every session root"
+            );
+        }
+
+        let roots = artifact_sweep_budget_roots_for_scope(
+            ArtifactSweepScope::ClosedSession(42),
+            &main_root,
+            &bounded_worktree_roots,
+            &session_worktree_roots,
+            &preparation_cache_roots,
+            Some(&targeted_worktree_root),
+        );
+        assert_eq!(
+            roots,
+            BTreeSet::from([main_root.clone(), targeted_worktree_root.clone()]),
+            "a close-triggered pass samples only its exact worktree and the main root"
+        );
+
+        let roots = artifact_sweep_budget_roots_for_scope(
+            ArtifactSweepScope::AutomaticContinuation,
+            &main_root,
+            &bounded_worktree_roots,
+            &session_worktree_roots,
+            &preparation_cache_roots,
+            None,
+        );
+        assert!(roots.contains(&session_worktree_roots[0]));
+        assert!(roots.contains(&preparation_cache_roots[0]));
     }
 
     #[test]
