@@ -313,6 +313,7 @@ fn closed_session_admission_exceptions_are_narrowly_scoped() {
 #[test]
 fn finish_can_be_retried_after_close_without_changing_finite_holder_binding() {
     const CHILD_SESSION_ENV: &str = "AETHYME_FINISH_CLOSED_SESSION_TEST_SESSION";
+    const CHILD_EXPECT_CLOSED_ENV: &str = "AETHYME_FINISH_CLOSED_SESSION_TEST_EXPECT_CLOSED";
     if let Ok(session_id) = std::env::var(CHILD_SESSION_ENV) {
         let args = vec![
             "finish".to_owned(),
@@ -321,8 +322,17 @@ fn finish_can_be_retried_after_close_without_changing_finite_holder_binding() {
             "--keep-worktree".to_owned(),
             "--json".to_owned(),
         ];
-        super::run_inner(&args, &super::CompatibilityMode::Normal)
-            .expect("a repeat finish should inspect the closed row and report its state");
+        let result = super::run_inner(&args, &super::CompatibilityMode::Normal);
+        if std::env::var(CHILD_EXPECT_CLOSED_ENV).as_deref() == Ok("true") {
+            result.expect("a repeat finish should inspect the closed row and report its state");
+        } else {
+            match result {
+                Err(super::UsageError::Exit { message, code })
+                    if code == crate::exit_status::REFUSED
+                        && message.contains("held by another live agent process") => {}
+                other => panic!("open finish must retain foreign-holder refusal: {other:?}"),
+            }
+        }
         return;
     }
 
@@ -352,18 +362,51 @@ fn finish_can_be_retried_after_close_without_changing_finite_holder_binding() {
     let session = broker
         .start_worktree("closed finish fixture", None)
         .unwrap();
-    broker.close(session.id).unwrap();
-    let parent = crate::session_holder::ProcessTable::snapshot()
-        .expect("the parent process table is readable")
-        .process(std::process::id() as i64)
-        .expect("the test process appears in its process table");
+
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            match self.0.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(error) => eprintln!("cannot inspect holder fixture process: {error}"),
+            }
+            if let Err(error) = self.0.kill() {
+                eprintln!("holder fixture cleanup: {error}");
+            }
+            if let Err(error) = self.0.wait() {
+                eprintln!("holder fixture wait: {error}");
+            }
+        }
+    }
+    let holder_process = OwnedChild(
+        std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start the owned sibling holder process"),
+    );
+    let holder_pid = i64::from(holder_process.0.id());
+    let process_table = crate::session_holder::ProcessTable::snapshot()
+        .expect("the parent process table is readable");
+    let holder = process_table
+        .process(holder_pid)
+        .expect("the owned sibling appears in its process table");
+    let parent_pid = std::process::id() as i64;
+    assert_ne!(holder.pid, parent_pid);
+    assert!(
+        process_table.process(parent_pid).is_some(),
+        "the spawned CLI caller override must resolve to this live parent"
+    );
     broker
         .store()
         .append_event(
             crate::events::SESSION_HOLDER_BOUND,
             Some(session.id),
             Some(&crate::events::session_holder_task_lease_bound_payload(
-                &parent,
+                &holder,
                 "task_lease_enabled",
                 None,
             )),
@@ -377,23 +420,50 @@ fn finish_can_be_retried_after_close_without_changing_finite_holder_binding() {
         .id;
     let db_path = broker.store().db_path().to_path_buf();
 
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-    child
-        .arg("finish_can_be_retried_after_close_without_changing_finite_holder_binding")
-        .arg("--nocapture")
-        .current_dir(repository.path())
-        .env(CHILD_SESSION_ENV, session.id.to_string());
-    broker
-        .configure_storage_context_for_child(&mut child)
-        .expect("bind the child CLI to fixture-owned storage");
-    drop(broker);
-    let output = child.output().unwrap();
+    let run_finish_child = |broker: &crate::Broker, expect_closed: bool| {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .arg("finish_can_be_retried_after_close_without_changing_finite_holder_binding")
+            .arg("--nocapture")
+            .current_dir(repository.path())
+            .env(CHILD_SESSION_ENV, session.id.to_string())
+            .env(CHILD_EXPECT_CLOSED_ENV, expect_closed.to_string());
+        broker
+            .configure_storage_context_for_child(&mut child)
+            .expect("bind the child CLI to fixture-owned storage");
+        child.env(
+            crate::session_holder::AGENT_PID_ENV,
+            std::process::id().to_string(),
+        );
+        child.output().unwrap()
+    };
+
+    let open_finish = run_finish_child(&broker, false);
     assert!(
-        output.status.success(),
-        "child test failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        open_finish.status.success(),
+        "open-finish child test failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&open_finish.stdout),
+        String::from_utf8_lossy(&open_finish.stderr)
     );
+    assert!(
+        !broker
+            .store()
+            .session(session.id)
+            .unwrap()
+            .status
+            .is_closed(),
+        "an open session with a foreign holder must remain open"
+    );
+
+    broker.close(session.id).unwrap();
+    let closed_finish = run_finish_child(&broker, true);
+    assert!(
+        closed_finish.status.success(),
+        "closed-finish child test failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&closed_finish.stdout),
+        String::from_utf8_lossy(&closed_finish.stderr)
+    );
+    drop(broker);
 
     let conn = rusqlite::Connection::open(db_path).unwrap();
     let after_event_id: i64 = conn

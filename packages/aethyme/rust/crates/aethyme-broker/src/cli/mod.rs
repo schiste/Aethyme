@@ -2684,7 +2684,17 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         )?
     };
     surface_command_advisories(subcommand, &parsed);
-    admit_session_holder(subcommand, &parsed)?;
+    // A closed `finish` is an idempotent recovery path, not new work for the
+    // session. The guarded snapshot above already established that the row is
+    // closed, and its shared operation guard stays held through the handler.
+    // Holder admission still applies to open sessions and every other command.
+    let closed_finish_retry = subcommand == "finish"
+        && session_operation
+            .as_ref()
+            .is_some_and(|context| !context.session_open);
+    if !closed_finish_retry {
+        admit_session_holder(subcommand, &parsed)?;
+    }
     let heartbeat = if subcommand == "heartbeat" {
         Some(heartbeat_session_task_lease(session_operation.as_ref())?)
     } else if session_operation
