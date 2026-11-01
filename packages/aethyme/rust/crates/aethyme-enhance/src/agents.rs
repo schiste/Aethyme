@@ -311,6 +311,37 @@ fn render_broker_protocol_compact(repo: &Path) -> String {
     // The heading keeps "Broker Coordination": `certify`'s agents-protocol
     // check, local-only deploy verification and the upgrade classifier all
     // recognize a broker-configured policy by that phrase.
+    let protocol = render_push_aware_protocol(repo);
+    if automation_issues_allowed(repo) {
+        return format!("{protocol}\n\n{AUTOMATION_ISSUES_NOTE}");
+    }
+    protocol
+}
+
+/// Automations may keep outcome issues here (#1238). Stated only when the
+/// repository opted in, so an agent permission layer can allowlist exactly
+/// this command rather than raw `gh issue` writes.
+const AUTOMATION_ISSUES_NOTE: &str = "This repository's `[automation] issues` policy lets \
+automations keep one issue per failing outcome through `aethyme broker advanced \
+issues upsert --fingerprint <key>`; it opens, comments on and closes only issues \
+carrying its `<!-- aethyme-outcome:<key> -->` marker. It is for automation \
+outcomes only.";
+
+/// Whether `.aethyme/config.toml` sets `[automation] issues = "allow"`.
+/// Anything else reads as deny, as the broker reads it.
+fn automation_issues_allowed(repo: &Path) -> bool {
+    repository_config(repo)
+        .and_then(|config| {
+            config
+                .get("automation")?
+                .get("issues")?
+                .as_str()
+                .map(|value| value == "allow")
+        })
+        .unwrap_or(false)
+}
+
+fn render_push_aware_protocol(repo: &Path) -> String {
     if pushes_session_branches(repo) {
         // Work that lives only in a worktree is lost with it, and a local
         // integration branch nobody publishes grows unnoticed: one repository
@@ -1255,6 +1286,30 @@ mod tests {
         let doc = render_agents_document(Some(&unconfigured)).unwrap();
         assert!(!doc.contains("pr_size"), "{doc}");
         std::fs::remove_dir_all(&unconfigured).unwrap();
+    }
+
+    #[test]
+    fn automation_issues_policy_is_stated_only_when_allowed() {
+        let allowed = broker_repo_with_config(
+            "automation-issues-on",
+            "schema = 1\n[automation]\nissues = \"allow\"\n",
+        );
+        let doc = render_agents_document(Some(&allowed)).unwrap();
+        assert!(doc.contains("`[automation] issues` policy"), "{doc}");
+        assert!(doc.contains("issues upsert --fingerprint <key>"), "{doc}");
+        std::fs::remove_dir_all(&allowed).unwrap();
+        for (tag, config) in [
+            (
+                "automation-issues-deny",
+                "schema = 1\n[automation]\nissues = \"deny\"\n",
+            ),
+            ("automation-issues-absent", "schema = 1\n"),
+        ] {
+            let repo = broker_repo_with_config(tag, config);
+            let doc = render_agents_document(Some(&repo)).unwrap();
+            assert!(!doc.contains("[automation]"), "{tag}: {doc}");
+            std::fs::remove_dir_all(&repo).unwrap();
+        }
     }
 
     #[test]

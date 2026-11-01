@@ -188,6 +188,16 @@ Usage:
       report as the broker-owned neutral/advisory PR summary. Publication is
       opt-in and uses the coordinated GitHub operation lane; it never changes
       gate selection or CI certification.
+  aethyme broker issues upsert --repo <owner/name> --fingerprint <key> --title <title> --body-file <path> [--label <label>]... [--session <id>] [--json]
+  aethyme broker issues upsert --repo <owner/name> --fingerprint <key> --resolve [--body-file <path>] [--session <id>] [--json]
+      Keep one issue per automation outcome (#1238). The first failure opens
+      an issue carrying a hidden <!-- aethyme-outcome:<key> --> marker; a
+      repeat comments on it at most once per issue_comment_interval_minutes;
+      --resolve comments and closes it. Opt-in on the default branch:
+      [automation] issues = allow, issue_labels and issues_per_day. Denied,
+      unlisted-label and over-budget requests write nothing and are recorded
+      locally. Writes are journaled before they run; with --session they go
+      through the coordinated GitHub operation layer.
   aethyme broker external-events ingest <normalized.json> [--json]
       Ingest one adapter-verified, digest-bound normalized event. The strict
       schema rejects provider payload fields and stores only allowlisted
@@ -1644,6 +1654,14 @@ struct Parsed {
     write_resolution_template: Option<PathBuf>,
     worktree: Option<PathBuf>,
     title: Option<String>,
+    /// `issues upsert --fingerprint`: the outcome key (#1238).
+    fingerprint: Option<String>,
+    /// `issues upsert --body-file`.
+    body_file: Option<PathBuf>,
+    /// `issues upsert --label`, repeatable.
+    labels: Vec<String>,
+    /// `issues upsert --resolve`.
+    resolve: bool,
     output: Option<PathBuf>,
     grant_out: Option<PathBuf>,
     cleanup_command: Option<String>,
@@ -1795,6 +1813,10 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         write_resolution_template: None,
         worktree: None,
         title: None,
+        fingerprint: None,
+        body_file: None,
+        labels: Vec::new(),
+        resolve: false,
         output: None,
         grant_out: None,
         cleanup_command: None,
@@ -2182,6 +2204,26 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
                         .clone(),
                 ))
             }
+            "--fingerprint" => {
+                parsed.fingerprint = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--fingerprint requires a value".into()))?
+                        .clone(),
+                )
+            }
+            "--body-file" => {
+                parsed.body_file = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or(UsageError::Message("--body-file requires a path".into()))?
+                        .clone(),
+                ))
+            }
+            "--label" => parsed.labels.push(
+                iter.next()
+                    .ok_or(UsageError::Message("--label requires a value".into()))?
+                    .clone(),
+            ),
+            "--resolve" => parsed.resolve = true,
             "--title" => {
                 parsed.title = Some(
                     iter.next()
@@ -2673,6 +2715,7 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         "start-agent" => run_start_agent(parsed)?,
         "report" => run_report(parsed)?,
         "quality-report" => run_quality_report(parsed)?,
+        "issues" => run_issues(parsed)?,
         "external-events" => run_external_events(parsed)?,
         "reclaim" => {
             let action = reclaim_action.ok_or_else(|| {

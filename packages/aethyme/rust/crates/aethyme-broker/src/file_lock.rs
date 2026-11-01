@@ -98,6 +98,12 @@ fn repository_runtime_lock_path(main_root: &Path, name: &str) -> io::Result<std:
     Ok(repository_runtime_directory(main_root)?.join(name))
 }
 
+/// The primary repository's real `.aethyme/run` directory, created if absent
+/// and refused when it is a symlink or escapes the repository.
+pub(crate) fn repository_run_directory(main_root: &Path) -> io::Result<std::path::PathBuf> {
+    repository_runtime_directory(main_root)
+}
+
 /// Which side of the per-session command/retirement fence to acquire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionOperationLockMode {

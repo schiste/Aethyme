@@ -176,6 +176,7 @@ pub use pr_monitoring::{
 };
 #[cfg(any(target_os = "macos", all(test, unix)))]
 mod gc_sweep_service;
+mod outcome_issues;
 mod pr_projection;
 mod pr_watch;
 #[cfg(unix)]
@@ -447,6 +448,11 @@ pub use operations::{
     OperationReconciliation, OperationReconciliationRecovery, OperationReconciliationState,
     OperationShowReport, PostMergeCleanupReport, PostMergeCleanupState, QueueWait,
     UnknownOutcomeRecovery, classify_gh, classify_git,
+};
+pub use outcome_issues::{
+    AUTOMATION_ISSUES_POLICY_KEY, AutomationIssuesPolicy, IssueRef, OUTCOME_ISSUE_SCHEMA,
+    OutcomeIssueAction, OutcomeIssueError, OutcomeIssueGh, OutcomeIssueRequest, OutcomeIssueResult,
+    SystemGh, outcome_marker, upsert_outcome_issue, upsert_outcome_issue_for_repository,
 };
 pub use overlap_pairs::{
     BUDGET_EXHAUSTED_REASON, OverlapPair, OverlapSeverity, overlap_state_reads,

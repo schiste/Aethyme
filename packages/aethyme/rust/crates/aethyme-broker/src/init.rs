@@ -587,6 +587,15 @@ pub const CONFIG_SCHEMA_VERSION: i64 = 1;
 const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("promote", &["mode", "branch"]),
     ("delivery", &["default", "push_session_branches"]),
+    (
+        "automation",
+        &[
+            "issues",
+            "issue_labels",
+            "issues_per_day",
+            "issue_comment_interval_minutes",
+        ],
+    ),
     ("broker", &["pr"]),
     ("leases", &["ignore", "routing"]),
     ("graph", &["authority", "repository"]),
