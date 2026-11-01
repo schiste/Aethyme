@@ -34,7 +34,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 59;
+pub const SCHEMA_VERSION: i64 = 60;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -102,7 +102,11 @@ pub const SCHEMA_VERSION: i64 = 59;
 ///   Its triggers ignore heartbeat-only updates, so active work does not
 ///   repeatedly invalidate a bounded history scan. Older v58 writers still
 ///   pass through the triggers, so the compatibility floor remains v58.
-pub const MIN_COMPATIBLE_SCHEMA: i64 = 58;
+/// - v60: fences writers that predate the per-session operation lock and
+///   renewable task-lease protocol. The floor blocks fresh old opens, but an
+///   already-open v59 process is not revoked; operators must drain those
+///   clients before enabling abandoned task-lease expiry.
+pub const MIN_COMPATIBLE_SCHEMA: i64 = 60;
 
 /// Migration that introduced profile-bound gate-cache reads and writes.
 const EXECUTION_PROFILE_CACHE_SCHEMA: i64 = 52;
@@ -115,6 +119,11 @@ const CLEARED_GATE_HISTORY_SCHEMA: i64 = 47;
 /// checkout probes, waits, and child dispatch. Old open connections are not
 /// revoked by the floor; cleanup activation still requires an operator drain.
 const ARTIFACT_USE_PROTOCOL_SCHEMA: i64 = 58;
+
+/// The first binaries that coordinate session work with finite holder leases.
+/// Keep expiry disabled by default and require an explicit old-client drain;
+/// the schema floor cannot revoke already-open v59 handles.
+const TASK_LEASE_PROTOCOL_SCHEMA: i64 = 60;
 
 /// The first schema whose binaries implement required collaboration capture
 /// (#660): the version of [`MIGRATION_V51`].
@@ -2082,6 +2091,10 @@ BEGIN
 END;
 ";
 
+// Protocol-only fence: older writers do not hold the per-session operation
+// lock and cannot safely renew or downgrade finite task ownership.
+const MIGRATION_V60: &str = "SELECT 1;";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -2142,6 +2155,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V57,
     MIGRATION_V58,
     MIGRATION_V59,
+    MIGRATION_V60,
 ];
 
 /// Migrations that only add columns. One is skipped when every column it adds
@@ -2472,7 +2486,9 @@ fn record_min_compatible_schema(conn: &Connection) -> Result<(), BrokerError> {
 }
 
 fn compatibility_floor_for_migration(version: i64) -> Option<i64> {
-    if version >= ARTIFACT_USE_PROTOCOL_SCHEMA {
+    if version >= TASK_LEASE_PROTOCOL_SCHEMA {
+        Some(TASK_LEASE_PROTOCOL_SCHEMA)
+    } else if version >= ARTIFACT_USE_PROTOCOL_SCHEMA {
         Some(ARTIFACT_USE_PROTOCOL_SCHEMA)
     } else if version >= EXECUTION_PROFILE_CACHE_SCHEMA {
         Some(EXECUTION_PROFILE_CACHE_SCHEMA)
@@ -3025,11 +3041,10 @@ mod tests {
     fn v58_fences_old_writers_before_protocol_dependent_reclamation() {
         let conn = migrated_through(57);
         set_meta(&conn, "min_compatible_schema", 52);
-
-        migrate(&conn).unwrap();
-
-        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
-        assert_eq!(MIN_COMPATIBLE_SCHEMA, 58);
+        conn.execute_batch(MIGRATION_V58).unwrap();
+        set_meta(&conn, "schema_version", 58);
+        record_min_compatible_schema_floor(&conn, ARTIFACT_USE_PROTOCOL_SCHEMA).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 58);
         assert_eq!(
             conn.query_row(
                 "SELECT value FROM meta WHERE key = 'min_compatible_schema'",
@@ -3039,9 +3054,39 @@ mod tests {
             .unwrap(),
             "58"
         );
-        assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 58).unwrap());
-        assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 57).unwrap());
+        assert!(schema_is_compatible_with(&conn, 58, 58).unwrap());
+        assert!(!schema_is_compatible_with(&conn, 58, 57).unwrap());
         assert_eq!(MIGRATIONS[57], MIGRATION_V58);
+    }
+
+    #[test]
+    fn v60_fences_old_writers_before_finite_task_expiry() {
+        let conn = migrated_through(59);
+        set_meta(&conn, "min_compatible_schema", 58);
+        let before: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(current_version(&conn).unwrap(), 60);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, TASK_LEASE_PROTOCOL_SCHEMA);
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM meta WHERE key = 'min_compatible_schema'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "60"
+        );
+        assert!(schema_is_compatible_with(&conn, 60, 60).unwrap());
+        assert!(!schema_is_compatible_with(&conn, 60, 59).unwrap());
+        assert_eq!(MIGRATIONS[59], MIGRATION_V60);
+        let after: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, after, "v60 is a protocol-only migration");
     }
 
     #[test]
@@ -3211,9 +3256,9 @@ mod tests {
 
         migrate(&conn).unwrap();
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
-        assert_eq!(MIN_COMPATIBLE_SCHEMA, 58);
-        assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 58).unwrap());
-        assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 57).unwrap());
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 60);
+        assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 60).unwrap());
+        assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 59).unwrap());
 
         let nullable: i64 = conn
             .query_row(
@@ -3256,10 +3301,10 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-                "58"
+                "60"
             );
-            assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 58).unwrap());
-            assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 57).unwrap());
+            assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 60).unwrap());
+            assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 59).unwrap());
 
             let nullable: i64 = conn
                 .query_row(
@@ -3329,7 +3374,7 @@ mod tests {
 
         migrate(&conn).unwrap();
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
-        assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 58).unwrap());
+        assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 60).unwrap());
         let columns = conn
             .prepare("PRAGMA table_info(gate_results)")
             .unwrap()
@@ -3443,14 +3488,14 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(floor, "58", "v58 requires artifact-use-aware writers");
+        assert_eq!(floor, "60", "v60 requires task-lease-aware writers");
         raise_collaboration_fence(&conn, "committed").unwrap();
         assert_eq!(
             collaboration_fence(&conn)
                 .unwrap()
                 .unwrap()
                 .min_compatible_schema,
-            58
+            60
         );
         assert!(!schema_is_compatible_with(&conn, 51, 50).unwrap());
     }

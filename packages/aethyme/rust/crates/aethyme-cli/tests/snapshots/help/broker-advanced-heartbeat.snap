@@ -1,0 +1,7 @@
+exit: 0
+--- stdout
+  aethyme broker advanced heartbeat --session <id> [--json]
+      Renew the exact current holder's task lease for long-running work.
+      Guarded session commands renew it automatically; send this at least once
+      every 24 hours during a quiet task.
+--- stderr
