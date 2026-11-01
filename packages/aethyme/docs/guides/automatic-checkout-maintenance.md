@@ -1,6 +1,6 @@
 # Automatic checkout maintenance
 
-Last Updated: 2026-10-29
+Last Updated: 2026-11-01
 
 A session becoming closed and its checkout being removed are separate steps.
 Idle-session retirement makes a checkout eligible for later inspection; it does
@@ -9,23 +9,64 @@ records, content delivery, protected files, process use, and current policy.
 
 ## Retention windows
 
-The default open-session abandonment window is 72 hours. Maintenance uses the
-latest recorded activity and worktree activity, and protects a session when its
-recorded task holder is alive or its identity cannot be checked. A shared agent
-service is not evidence that every task it once hosted remains active.
+The default open-session abandonment window is five days (120 hours).
+Maintenance uses the latest recorded activity and worktree activity. A live
+recorded task holder remains protected unless the repository explicitly opts
+into the finite task-lease protocol described below; unknown identity remains
+protected. A shared agent service is not evidence that every task it once
+hosted remains active.
 Implicit file leases describe the session's diff and are released atomically
 with an otherwise eligible retirement; they do not keep an abandoned session
-open forever. An explicit claim with active or unknown holder liveness still
-protects its session and needs resolution before retirement.
+open forever. Explicit claims with active or unknown holder liveness still
+protect their session unless the exact live holder's opted-in task lease has
+expired and its stale grace has elapsed.
 
 Closed checkouts have a 15-day grace period. Configure retention in the primary
 repository's `.aethyme/broker.toml`:
 
 ```toml
 [retention]
-session_abandoned_after_hours = 72
+session_abandoned_after_hours = 120
 closed_worktree_grace_hours = 360
+# Off by default; requires a coordinated broker upgrade and client drain.
+expire_abandoned_task_leases = false
 ```
+
+### Finite task leases
+
+Task-lease expiry is off by default. First upgrade every broker writer to
+schema 60, stop and drain all older clients with open database connections,
+then set `expire_abandoned_task_leases = true` in the primary repository's
+`.aethyme/broker.toml`. The schema floor blocks new old writers; it cannot revoke
+an already-open database handle. Do not enable this setting while an older
+broker process may still be writing.
+
+When a guarded session command first runs, its exact current holder can upgrade
+the holder binding to task-lease version 1. The lease lasts 24 hours and
+recognized guarded work renews it at most once every five minutes. A quiet
+long-running task should send an explicit heartbeat at least once every
+24 hours:
+
+```sh
+aethyme broker advanced heartbeat --session <id>
+```
+
+Expiry alone never closes a session. The normal five-day inactivity window,
+the exact holder binding, worktree identity and metadata, operation guard, gate,
+preparation, artifact-use and process-use witnesses, and the final database
+compare-and-swap must also allow retirement. A live `session.pid`, active child,
+unresolved operation, in-progress preparation, unreadable inventory, or unknown
+evidence keeps the session open. Eligible retirement closes session metadata;
+it does not authorize physical checkout removal.
+
+Legacy and malformed holder bindings do not gain finite age-expiry authority.
+Known session work without a durable child witness first downgrades the binding
+to the existing process-lifetime protection. In particular, the managed
+`hooks pre-commit` path still runs raw shell gates without a durable child
+marker, so it downgrades a finite binding before running them. A later guarded
+command can upgrade it again. Until that hook path gains its own child witness,
+a quiet session that only runs commits can remain protected while its recorded
+holder process stays alive.
 
 Retirement runs in bounded pages with a durable cursor, so an old backlog does
 not require one unbounded foreground pass. Unreadable retention configuration

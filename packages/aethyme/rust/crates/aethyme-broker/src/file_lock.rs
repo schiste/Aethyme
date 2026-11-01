@@ -98,6 +98,88 @@ fn repository_runtime_lock_path(main_root: &Path, name: &str) -> io::Result<std:
     Ok(repository_runtime_directory(main_root)?.join(name))
 }
 
+/// Which side of the per-session command/retirement fence to acquire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionOperationLockMode {
+    Shared,
+    Exclusive,
+}
+
+/// A per-session operation fence. The shared lock remains close-on-exec so a
+/// detached helper cannot pin a session forever. Native artifact, gate, and
+/// coordinated-operation witnesses protect children after the broker parent
+/// exits; retirement refuses when those inventories are unknown.
+#[derive(Debug)]
+pub(crate) enum SessionOperationGuard {
+    Shared(SharedSessionOperationLock),
+    Exclusive(ExclusiveFileLock),
+}
+
+#[derive(Debug)]
+pub(crate) struct SharedSessionOperationLock {
+    _file: File,
+}
+
+/// Try to serialize one session's admitted work against abandoned retirement.
+/// The lock file is persistent and remains outside any worktree the operation
+/// may remove. A busy lock is an ordinary retryable refusal; path or lock
+/// protocol errors remain errors and must not be interpreted as an idle
+/// session.
+pub(crate) fn try_acquire_session_operation_guard(
+    main_root: &Path,
+    session_id: i64,
+    mode: SessionOperationLockMode,
+) -> io::Result<Option<SessionOperationGuard>> {
+    if session_id <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session operation guard requires a positive session ID",
+        ));
+    }
+    let name = format!("session-operation-{session_id}.lock");
+    let path = repository_runtime_lock_path(main_root, &name)?;
+    let file = open_lock_file_nofollow(&path)?;
+    match mode {
+        SessionOperationLockMode::Shared => {
+            match file.try_lock_shared() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            }
+            if repository_runtime_lock_path(main_root, &name)? != path {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "session operation lock path changed while it was acquired",
+                ));
+            }
+            verify_named_lock_file(&path, &file)?;
+            Ok(Some(SessionOperationGuard::Shared(
+                SharedSessionOperationLock { _file: file },
+            )))
+        }
+        SessionOperationLockMode::Exclusive => {
+            let Some(lock) = ExclusiveFileLock::try_acquire(file)? else {
+                return Ok(None);
+            };
+            if repository_runtime_lock_path(main_root, &name)? != path {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "session operation lock path changed while it was acquired",
+                ));
+            }
+            verify_named_lock_file(&path, &lock.file)?;
+            Ok(Some(SessionOperationGuard::Exclusive(lock)))
+        }
+    }
+}
+
+/// Whether this host supports the nonblocking per-session advisory lock used
+/// by the guarded expiry protocol. Descendants are protected separately by
+/// durable producer/process witnesses rather than inheriting this descriptor.
+pub(crate) const fn session_operation_guard_supported() -> bool {
+    cfg!(unix)
+}
+
 fn repository_runtime_directory(main_root: &Path) -> io::Result<std::path::PathBuf> {
     let root = main_root.canonicalize()?;
     let state_dir = root.join(".aethyme");
@@ -403,6 +485,85 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn session_operation_guards_are_scoped_to_one_session() {
+        let repository = tempfile::tempdir().unwrap();
+        let shared = try_acquire_session_operation_guard(
+            repository.path(),
+            41,
+            SessionOperationLockMode::Shared,
+        )
+        .unwrap()
+        .expect("first session operation should be admitted");
+        assert!(
+            try_acquire_session_operation_guard(
+                repository.path(),
+                41,
+                SessionOperationLockMode::Exclusive,
+            )
+            .unwrap()
+            .is_none(),
+            "retirement must wait while an operation is admitted"
+        );
+        let unrelated = try_acquire_session_operation_guard(
+            repository.path(),
+            42,
+            SessionOperationLockMode::Exclusive,
+        )
+        .unwrap();
+        assert!(unrelated.is_some(), "another session stays independent");
+        drop(unrelated);
+        drop(shared);
+        assert!(
+            try_acquire_session_operation_guard(
+                repository.path(),
+                41,
+                SessionOperationLockMode::Exclusive,
+            )
+            .unwrap()
+            .is_some(),
+            "exclusive retirement can proceed after the operation ends"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_does_not_extend_shared_session_operation_after_parent_exits() {
+        let repository = tempfile::tempdir().unwrap();
+        let shared = try_acquire_session_operation_guard(
+            repository.path(),
+            41,
+            SessionOperationLockMode::Shared,
+        )
+        .unwrap()
+        .expect("operation should be admitted");
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf ready; read _"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn child behind a readiness barrier");
+        let mut ready = [0_u8; 5];
+        std::io::Read::read_exact(child.stdout.as_mut().unwrap(), &mut ready)
+            .expect("child reaches its read barrier");
+        assert_eq!(&ready, b"ready");
+
+        // Session guards stay close-on-exec. Child lifetime is covered by the
+        // operation's durable artifact/gate/journal witnesses, not by leaking
+        // the lock into unrelated long-lived helpers.
+        drop(shared);
+        assert!(try_acquire_session_operation_guard(
+            repository.path(),
+            41,
+            SessionOperationLockMode::Exclusive,
+        )
+        .unwrap()
+        .is_some());
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"done\n")
+            .expect("release child barrier");
+        child.wait().expect("wait for lock-holding child");
     }
 
     #[test]

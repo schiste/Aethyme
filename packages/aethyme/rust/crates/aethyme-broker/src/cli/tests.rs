@@ -1,6 +1,284 @@
 use super::{UsageError, owned_comment_from_view, repository_wide_publication_lines};
 
 #[test]
+fn task_lease_classification_uses_normalized_actions_and_preserves_polling() {
+    fn classify(public_args: &[&str]) -> super::TaskLeaseCommandClass {
+        let public_args = public_args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>();
+        let resolution = super::surface::resolve(&public_args);
+        assert!(resolution.refusal.is_none(), "{public_args:?}");
+        let subcommand = resolution.args.first().expect("resolved command");
+        let parsed = super::parse(&resolution.args[1..]).expect("normalized command parses");
+        super::task_lease_command_class(subcommand, &parsed)
+    }
+
+    use super::TaskLeaseCommandClass::{
+        ClosedSessionAdministration, GuardedWork, ObservationOnly, OtherWork,
+    };
+
+    assert_eq!(
+        classify(&["submit", "prepare", "status", "--session", "17"]),
+        ObservationOnly,
+        "the public alias normalizes to prepare status and does not renew or downgrade"
+    );
+    assert_eq!(
+        classify(&["leases", "plan", "src/lib.rs", "--session", "17"]),
+        ObservationOnly
+    );
+    assert_eq!(classify(&["leases"]), ObservationOnly);
+    assert_eq!(classify(&["note", "list", "--session", "17"]), ObservationOnly);
+    assert_eq!(classify(&["ownership", "list"]), ObservationOnly);
+    assert_eq!(classify(&["hooks", "status"]), ObservationOnly);
+    assert_eq!(
+        classify(&["review", "show", "--session", "17"]),
+        ObservationOnly
+    );
+    assert_eq!(
+        classify(&["representation", "status", "--session", "17"]),
+        ObservationOnly
+    );
+    assert_eq!(
+        classify(&["representation", "scan", "--session", "17"]),
+        ObservationOnly
+    );
+    assert_eq!(classify(&["operations", "list"]), ObservationOnly);
+    assert_eq!(classify(&["operations", "show", "42"]), ObservationOnly);
+    assert_eq!(classify(&["gates", "status"]), ObservationOnly);
+    assert_eq!(classify(&["gates", "manifest"]), ObservationOnly);
+    assert_eq!(
+        classify(&["gates", "scope", "--base", "HEAD~1", "--head", "HEAD"]),
+        ObservationOnly
+    );
+    assert_eq!(classify(&["gc", "plan"]), ObservationOnly);
+    assert_eq!(classify(&["finish", "cleanup", "42"]), ClosedSessionAdministration);
+    assert_eq!(
+        classify(&["finish", "cleanup", "resolve", "42", "--archive"]),
+        ClosedSessionAdministration
+    );
+    assert_eq!(classify(&["finish", "cleanup", "audit"]), ObservationOnly);
+    assert_eq!(
+        classify(&["finish", "cleanup", "--all-cleaned"]),
+        ObservationOnly
+    );
+    assert_eq!(
+        classify(&["finish", "cleanup", "--all-cleaned", "--apply"]),
+        ClosedSessionAdministration
+    );
+    assert_eq!(
+        classify(&["leases", "claim", "src/lib.rs", "--session", "17"]),
+        GuardedWork
+    );
+    assert_eq!(
+        classify(&["leases", "release", "src/lib.rs", "--session", "17"]),
+        GuardedWork
+    );
+    assert_eq!(
+        classify(&["hooks", "pre-commit"]),
+        OtherWork,
+        "the raw-shell hook has no durable child witness and must drop finite expiry first"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn finish_can_be_retried_after_close_without_changing_finite_holder_binding() {
+    const CHILD_SESSION_ENV: &str = "AETHYME_FINISH_CLOSED_SESSION_TEST_SESSION";
+    if let Ok(session_id) = std::env::var(CHILD_SESSION_ENV) {
+        let args = vec![
+            "finish".to_owned(),
+            "--session".to_owned(),
+            session_id,
+            "--keep-worktree".to_owned(),
+            "--json".to_owned(),
+        ];
+        super::run_inner(&args, &super::CompatibilityMode::Normal)
+            .expect("a repeat finish should inspect the closed row and report its state");
+        return;
+    }
+
+    let repository = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repository.path())
+            .env("GIT_AUTHOR_NAME", "closed finish test")
+            .env("GIT_AUTHOR_EMAIL", "closed-finish@example.invalid")
+            .env("GIT_COMMITTER_NAME", "closed finish test")
+            .env("GIT_COMMITTER_EMAIL", "closed-finish@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repository.path().join("tracked.txt"), "fixture\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-qm", "fixture"]);
+    let storage = crate::test_storage::TestStorage::new();
+    let mut broker = storage.open(repository.path()).unwrap();
+    let session = broker.start_worktree("closed finish fixture", None).unwrap();
+    broker.close(session.id).unwrap();
+    let parent = crate::session_holder::ProcessTable::snapshot()
+        .expect("the parent process table is readable")
+        .process(std::process::id() as i64)
+        .expect("the test process appears in its process table");
+    broker
+        .store()
+        .append_event(
+            crate::events::SESSION_HOLDER_BOUND,
+            Some(session.id),
+            Some(&crate::events::session_holder_task_lease_bound_payload(
+                &parent,
+                "task_lease_enabled",
+                None,
+            )),
+        )
+        .unwrap();
+    let before_event_id = broker
+        .store()
+        .latest_session_holder_event(session.id)
+        .unwrap()
+        .unwrap()
+        .id;
+    let db_path = broker.store().db_path().to_path_buf();
+    drop(broker);
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("finish_can_be_retried_after_close_without_changing_finite_holder_binding")
+        .arg("--nocapture")
+        .current_dir(repository.path())
+        .env(CHILD_SESSION_ENV, session.id.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child test failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let after_event_id: i64 = conn
+        .query_row(
+            "SELECT MAX(id) FROM events WHERE session_id = ?1 AND kind = 'session.holder_bound'",
+            [session.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        after_event_id, before_event_id,
+        "a repeat finish on a closed session must not heartbeat or downgrade its holder"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn session_operation_guard_is_acquired_before_startup_maintenance() {
+    const CHILD_SESSION_ENV: &str = "AETHYME_SESSION_GUARD_STARTUP_TEST_SESSION";
+    if let Ok(session_id) = std::env::var(CHILD_SESSION_ENV) {
+        let args = vec!["heartbeat".to_owned(), "--session".to_owned(), session_id.clone()];
+        let result = super::run_inner(&args, &super::CompatibilityMode::Normal);
+        let Err(UsageError::Message(message)) = result else {
+            panic!("the startup shared-lock refusal must precede broker open");
+        };
+        assert!(message.contains(&format!("session {session_id} is being retired")));
+        return;
+    }
+
+    let repository = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repository.path())
+            .env("GIT_AUTHOR_NAME", "startup guard test")
+            .env("GIT_AUTHOR_EMAIL", "startup-guard@example.invalid")
+            .env("GIT_COMMITTER_NAME", "startup guard test")
+            .env("GIT_COMMITTER_EMAIL", "startup-guard@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repository.path().join("tracked.txt"), "fixture\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-qm", "fixture"]);
+    let storage = crate::test_storage::TestStorage::new();
+    let mut broker = storage.open(repository.path()).unwrap();
+    let session = broker.start_worktree("startup guard fixture", None).unwrap();
+    let parent = crate::session_holder::ProcessTable::snapshot()
+        .expect("the parent process table is readable")
+        .process(std::process::id() as i64)
+        .expect("the test process appears in its process table");
+    broker
+        .store()
+        .append_event(
+            crate::events::SESSION_HOLDER_BOUND,
+            Some(session.id),
+            Some(&crate::events::session_holder_bound_payload(
+                &parent,
+                "registered",
+                None,
+            )),
+        )
+        .unwrap();
+    let before_event_id = broker
+        .store()
+        .latest_session_holder_event(session.id)
+        .unwrap()
+        .unwrap()
+        .id;
+    let before_activity = broker.store().session(session.id).unwrap().last_activity_at;
+    let db_path = broker.store().db_path().to_path_buf();
+    drop(broker);
+
+    let retirement_guard = crate::file_lock::try_acquire_session_operation_guard(
+        repository.path(),
+        session.id,
+        crate::file_lock::SessionOperationLockMode::Exclusive,
+    )
+    .unwrap()
+    .expect("simulated retirement owns the exclusive startup fence");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("session_operation_guard_is_acquired_before_startup_maintenance")
+        .arg("--nocapture")
+        .current_dir(repository.path())
+        .env(CHILD_SESSION_ENV, session.id.to_string())
+        .env(crate::session_holder::AGENT_PID_ENV, parent.pid.to_string())
+        .output()
+        .unwrap();
+    drop(retirement_guard);
+    assert!(
+        output.status.success(),
+        "child test failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let (activity_after, event_after): (i64, i64) = conn
+        .query_row(
+            "SELECT s.last_activity_at,
+                    (SELECT MAX(id) FROM events WHERE session_id = s.id
+                     AND kind = 'session.holder_bound')
+             FROM sessions s WHERE s.id = ?1",
+            [session.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(activity_after, before_activity);
+    assert_eq!(event_after, before_event_id);
+}
+
+#[test]
 fn exec_timeout_is_parsed_separately_from_child_arguments() {
     let args = [
         "--session",
