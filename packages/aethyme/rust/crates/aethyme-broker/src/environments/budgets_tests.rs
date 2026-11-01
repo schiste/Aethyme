@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use super::budgets::{hook_metrics, percentile, report};
+use super::budgets::{MIN_PROPOSAL_VALUES, hook_metrics, over_budget, percentile, propose, report};
 use super::spec::{BudgetsSpec, EnvironmentsFile, HostEnvironmentsFile};
 use super::store::{EnvironmentStore, TIMINGS_KEPT, Timing};
 use super::{Loaded, parse_loaded};
@@ -159,4 +159,127 @@ destroy = "true"
     assert_eq!(validation(&zero), vec!["invalid_budget"]);
     let unknown = format!("{base}[budgets.memory_mib]\nfrontend = 100\n");
     assert_eq!(validation(&unknown), vec!["unknown_profile"]);
+}
+
+/// `doctor` lists only the metrics that are `over`, never `watch` or `ok`.
+#[test]
+fn doctor_lists_only_metrics_over_budget() {
+    let budgets = BudgetsSpec {
+        seconds: [
+            ("park".to_string(), 10),
+            ("down".to_string(), 10),
+            ("up.cold".to_string(), 10),
+        ]
+        .into_iter()
+        .collect(),
+        ..BudgetsSpec::default()
+    };
+    let timings: BTreeMap<String, Vec<Timing>> = [
+        ("park".to_string(), ok(&[1.0, 2.0, 3.0])),
+        // p50 within, p95 over: watch.
+        ("down".to_string(), ok(&[1.0, 2.0, 50.0])),
+        ("up.cold".to_string(), ok(&[20.0, 30.0, 40.0])),
+    ]
+    .into_iter()
+    .collect();
+    let over: Vec<String> = over_budget(report(&budgets, &timings, &BTreeMap::new()))
+        .into_iter()
+        .map(|m| m.metric)
+        .collect();
+    assert_eq!(over, vec!["up.cold".to_string()]);
+}
+
+/// `calibrate` proposes a budget change only from enough successful runs,
+/// raising one whose p50 is over and tightening one the p95 with headroom
+/// beats by more than half; a budget met with ordinary headroom is kept.
+#[test]
+fn calibrate_proposes_raises_and_tightens_from_enough_runs() {
+    let budgets = BudgetsSpec {
+        seconds: [
+            ("up.cold".to_string(), 10),
+            ("park".to_string(), 100),
+            ("down".to_string(), 12),
+            ("thin".to_string(), 10),
+        ]
+        .into_iter()
+        .collect(),
+        memory_mib: [("backend".to_string(), 1000)].into_iter().collect(),
+    };
+    let runs = |value: f64| ok(&[value; MIN_PROPOSAL_VALUES]);
+    let timings: BTreeMap<String, Vec<Timing>> = [
+        ("up.cold".to_string(), runs(20.0)),
+        ("park".to_string(), runs(4.0)),
+        ("down".to_string(), runs(6.0)),
+        ("thin".to_string(), ok(&[50.0; MIN_PROPOSAL_VALUES - 1])),
+    ]
+    .into_iter()
+    .collect();
+    let footprints: BTreeMap<String, Vec<u64>> = [(
+        "backend".to_string(),
+        vec![200 * 1024 * 1024; MIN_PROPOSAL_VALUES],
+    )]
+    .into_iter()
+    .collect();
+    let proposals: Vec<(String, &str, u64, u64)> =
+        propose(&report(&budgets, &timings, &footprints))
+            .into_iter()
+            .map(|p| (p.key, p.reason, p.current, p.proposed))
+            .collect();
+    assert_eq!(
+        proposals,
+        vec![
+            ("park".to_string(), "tighten", 100, 6),
+            ("up.cold".to_string(), "raise", 10, 30),
+            ("backend".to_string(), "tighten", 1000, 300),
+        ]
+    );
+}
+
+/// The proposal is written into the diff under its own section, keeping a
+/// quoted key quoted and leaving every other line alone.
+#[test]
+fn calibrate_diff_rewrites_only_the_proposed_budget_lines() {
+    let original = "schema = 1\n[budgets.seconds]\n\"up.cold\" = 10\npark = 100\ndown = 12\n[budgets.memory_mib]\nbackend = 1000\npark = 7\n";
+    let proposals = vec![
+        super::budgets::BudgetProposal {
+            metric: "up.cold".into(),
+            unit: "seconds",
+            key: "up.cold".into(),
+            current: 10,
+            proposed: 30,
+            count: 10,
+            p50: 20.0,
+            p95: 20.0,
+            reason: "raise",
+        },
+        super::budgets::BudgetProposal {
+            metric: "memory.backend".into(),
+            unit: "memory_mib",
+            key: "backend".into(),
+            current: 1000,
+            proposed: 300,
+            count: 10,
+            p50: 200.0,
+            p95: 200.0,
+            reason: "tighten",
+        },
+    ];
+    let diff = super::metrics::proposal_diff(original, None, &proposals);
+    let changed: Vec<&str> = diff
+        .lines()
+        .filter(|l| {
+            (l.starts_with('+') || l.starts_with('-'))
+                && !l.starts_with("+++")
+                && !l.starts_with("---")
+        })
+        .collect();
+    assert_eq!(
+        changed,
+        vec![
+            "-\"up.cold\" = 10",
+            "+\"up.cold\" = 30",
+            "-backend = 1000",
+            "+backend = 300",
+        ]
+    );
 }
