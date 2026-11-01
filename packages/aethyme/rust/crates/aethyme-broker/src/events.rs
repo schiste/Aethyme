@@ -127,15 +127,38 @@ pub fn session_holder_bound_payload(
     reason: &str,
     previous: Option<&crate::session_holder::AgentProcess>,
 ) -> String {
-    json!({
+    session_holder_bound_payload_with_task_lease(holder, reason, previous, false)
+}
+
+/// `session.holder_bound` for a holder that explicitly entered the guarded
+/// task-lease protocol. Ordinary start/adopt and legacy rebinding events do
+/// not gain an expiry lease until guarded admission upgrades them.
+pub(crate) fn session_holder_task_lease_bound_payload(
+    holder: &crate::session_holder::AgentProcess,
+    reason: &str,
+    previous: Option<&crate::session_holder::AgentProcess>,
+) -> String {
+    session_holder_bound_payload_with_task_lease(holder, reason, previous, true)
+}
+
+fn session_holder_bound_payload_with_task_lease(
+    holder: &crate::session_holder::AgentProcess,
+    reason: &str,
+    previous: Option<&crate::session_holder::AgentProcess>,
+    task_lease: bool,
+) -> String {
+    let mut payload = json!({
         "pid": holder.pid,
         "started": holder.started,
         "command": holder.command,
         "reason": reason,
         "previous_pid": previous.map(|process| process.pid),
         "previous_started": previous.map(|process| process.started.as_str()),
-    })
-    .to_string()
+    });
+    if task_lease {
+        payload["task_lease"] = json!(crate::session_holder::TaskLease::current());
+    }
+    payload.to_string()
 }
 
 /// `session.holder_gone`: the holder the broker found no longer running.

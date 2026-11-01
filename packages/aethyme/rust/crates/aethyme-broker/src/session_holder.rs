@@ -29,6 +29,74 @@ const PROCESS_TABLE_STREAM_LIMIT: usize = 4 * 1024 * 1024;
 /// to declare the caller unidentified.
 pub const AGENT_PID_ENV: &str = "AETHYME_AGENT_PID";
 
+/// The finite holder lease written by current broker builds. Expiry is only
+/// actionable when the repository explicitly enables the task-lease policy.
+pub(crate) const TASK_LEASE_VERSION: u32 = 1;
+pub(crate) const TASK_LEASE_DURATION_MS: i64 = 24 * 60 * 60 * 1_000;
+pub(crate) const TASK_LEASE_RENEWAL_INTERVAL_MS: i64 = 5 * 60 * 1_000;
+pub(crate) const TASK_CLOSE_PROCESS_USE_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskLease {
+    pub version: u32,
+    pub duration_ms: i64,
+}
+
+/// Outcome of an explicit same-holder task-lease heartbeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TaskLeaseHeartbeat {
+    /// The five-minute renewal interval elapsed and a new holder event landed.
+    Renewed,
+    /// The current binding is still fresh; only session activity was touched.
+    Current,
+    /// A valid legacy binding was upgraded by its current holder under guard.
+    Upgraded,
+    /// An unsupported command downgraded the binding to process-lifetime
+    /// protection before it began work.
+    Downgraded,
+    /// The current process is not the exact recorded holder.
+    NotHolder,
+    /// The holder event or lease version is malformed or unsupported.
+    LegacyProtected,
+}
+
+impl TaskLeaseHeartbeat {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Renewed => "renewed",
+            Self::Current => "current",
+            Self::Upgraded => "upgraded",
+            Self::Downgraded => "downgraded",
+            Self::NotHolder => "not_holder",
+            Self::LegacyProtected => "legacy_protected",
+        }
+    }
+}
+
+/// Whether an unsupported command safely removed age-expiry authority before
+/// it was allowed to act for the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskLeaseDowngrade {
+    NotFinite,
+    Downgraded,
+    NotHolder,
+}
+
+impl TaskLease {
+    pub(crate) const fn current() -> Self {
+        Self {
+            version: TASK_LEASE_VERSION,
+            duration_ms: TASK_LEASE_DURATION_MS,
+        }
+    }
+
+    pub(crate) fn is_supported(self) -> bool {
+        self.version == TASK_LEASE_VERSION && self.duration_ms == TASK_LEASE_DURATION_MS
+    }
+}
+
 /// One agent process, as identified by `ps`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AgentProcess {
@@ -280,6 +348,10 @@ pub enum HolderCheck {
     Bound { reason: &'static str },
     /// The caller is not an identifiable agent and was let through unbound.
     Unidentified,
+    /// The latest holder event is malformed or uses an unknown task-lease
+    /// protocol. The command remains admissible under the existing policy,
+    /// but this event is never replaced by an age-expiring binding.
+    UnknownBinding,
 }
 
 /// Whether a PID-less session's recorded task holder is still the same
@@ -301,6 +373,7 @@ pub(crate) struct RecordedHolderProcessTable {
     prefetched_event_ids: HashMap<i64, i64>,
     observed_event_ids: HashMap<i64, i64>,
     snapshot: Option<Option<ProcessTable>>,
+    process_use_snapshot: Option<(Instant, crate::reclaim::OpenFileSnapshot)>,
     #[cfg(test)]
     snapshots_taken: usize,
 }
@@ -399,6 +472,51 @@ impl RecordedHolderProcessTable {
         (self.observed_event_ids.get(&session_id) == Some(&event_id))
             .then(|| self.snapshot.as_ref().and_then(Option::as_ref))
             .flatten()
+    }
+
+    /// Share one complete-or-unknown `lsof` observation across all retirement
+    /// candidates in this maintenance pass. The caller supplies its remaining
+    /// deadline; once this pass's snapshot ages out, later rows defer instead
+    /// of starting another ten-second process scan.
+    pub(crate) fn process_use_snapshot_for_retirement(
+        &mut self,
+        root: &Path,
+        deadline: Option<Instant>,
+    ) -> Option<&crate::reclaim::OpenFileSnapshot> {
+        if self.process_use_snapshot.is_none() {
+            let budget = deadline.map_or(Duration::from_secs(10), |deadline| {
+                deadline.saturating_duration_since(Instant::now())
+            });
+            if budget.is_zero() {
+                return None;
+            }
+            self.process_use_snapshot = Some((
+                Instant::now(),
+                crate::reclaim::open_file_snapshot_under_with_budget(root, budget),
+            ));
+        }
+        let (captured_at, snapshot) = self.process_use_snapshot.as_ref()?;
+        (captured_at.elapsed() <= TASK_CLOSE_PROCESS_USE_SNAPSHOT_MAX_AGE).then_some(snapshot)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_process_use_snapshot_for_test(
+        &mut self,
+        snapshot: crate::reclaim::OpenFileSnapshot,
+    ) {
+        self.process_use_snapshot = Some((Instant::now(), snapshot));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_holder_process_table_for_test(
+        &mut self,
+        session_id: i64,
+        event_id: i64,
+        snapshot: ProcessTable,
+    ) {
+        self.prefetched_event_ids.insert(session_id, event_id);
+        self.observed_event_ids.insert(session_id, event_id);
+        self.snapshot = Some(Some(snapshot));
     }
 }
 
@@ -556,6 +674,55 @@ pub fn recorded_holder(
         .and_then(|payload| serde_json::from_str::<AgentProcess>(payload).ok()))
 }
 
+/// Read the explicit lease on one exact holder event. Missing, malformed or
+/// unknown-version records are legacy ownership and never acquire age-based
+/// close authority.
+pub(crate) fn task_lease(event: &crate::Event) -> Option<TaskLease> {
+    task_lease_from_payload(event.payload_json.as_deref()?)
+}
+
+pub(crate) fn task_lease_from_payload(payload: &str) -> Option<TaskLease> {
+    let payload = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    let lease = serde_json::from_value::<TaskLease>(payload.get("task_lease")?.clone()).ok()?;
+    lease.is_supported().then_some(lease)
+}
+
+/// Whether this holder event carries the versioned task-lease extension,
+/// including malformed and future-version values. Unsupported values never
+/// grant age-expiry authority, but still require child-use witnesses before a
+/// gone holder can be retired.
+pub(crate) fn task_lease_binding_present(event: &crate::Event) -> bool {
+    event
+        .payload_json
+        .as_deref()
+        .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .is_some_and(|payload| payload.get("task_lease").is_some())
+}
+
+/// Whether the task lease from this holder event has expired. Activity newer
+/// than the binding timestamp extends its deadline; legacy and malformed
+/// payloads return `None` so callers cannot confuse them with expiry.
+pub(crate) fn task_lease_expired(
+    event: &crate::Event,
+    last_activity_at: i64,
+    now_ms: i64,
+) -> Option<bool> {
+    let lease = task_lease(event)?;
+    let deadline = event
+        .ts
+        .max(last_activity_at)
+        .saturating_add(lease.duration_ms);
+    Some(now_ms >= deadline)
+}
+
+/// A current lease binding may be renewed by a guarded command only after the
+/// five-minute write interval. Clock rollback can delay a renewal but never
+/// shortens the task lease.
+pub(crate) fn task_lease_renewal_due(event: &crate::Event, now_ms: i64) -> bool {
+    task_lease(event)
+        .is_some_and(|_| now_ms.saturating_sub(event.ts) >= TASK_LEASE_RENEWAL_INTERVAL_MS)
+}
+
 /// Record `caller` as the session's holder, unconditionally. For `start` and
 /// `start --adopt`, which create the session from the calling agent.
 pub fn bind(
@@ -593,7 +760,26 @@ pub fn admit(
     if is_shared_agent_service(&agent.command) {
         return Ok(HolderCheck::Unidentified);
     }
-    let Some(holder) = recorded_holder(store, session_id)? else {
+    let latest = store.latest_session_holder_event(session_id)?;
+    let holder = match latest.as_ref() {
+        None => None,
+        Some(event) => {
+            let Some(payload_text) = event.payload_json.as_deref() else {
+                return Ok(HolderCheck::UnknownBinding);
+            };
+            let Ok(payload) = serde_json::from_str::<serde_json::Value>(payload_text) else {
+                return Ok(HolderCheck::UnknownBinding);
+            };
+            let Ok(holder) = serde_json::from_value::<AgentProcess>(payload.clone()) else {
+                return Ok(HolderCheck::UnknownBinding);
+            };
+            // An unsupported task-lease extension is legacy ownership, not
+            // authority to replace the process identity check. Keep the
+            // holder's existing process-lifetime protection.
+            Some(holder)
+        }
+    };
+    let Some(holder) = holder else {
         record(store, session_id, agent, reason::FIRST_USE, None)?;
         return Ok(HolderCheck::Bound {
             reason: reason::FIRST_USE,
@@ -840,6 +1026,84 @@ mod tests {
  2100  2023 Fri Oct  2 15:31:00 2026     /bin/bash -lc git status
  3000     1 Fri Oct  2 15:40:00 2026     /usr/bin/nohup zsh queue.sh
 ";
+
+    #[test]
+    fn finite_task_lease_is_versioned_and_uses_newer_activity_as_its_clock() {
+        let holder = AgentProcess {
+            pid: 3731,
+            started: "Fri Oct 23 08:42:41 2026".into(),
+            command: "/opt/codex exec task".into(),
+        };
+        let payload = crate::events::session_holder_task_lease_bound_payload(
+            &holder,
+            "task_lease_enabled",
+            None,
+        );
+        let event = crate::Event {
+            id: 1,
+            schema_version: 1,
+            ts: 10_000,
+            kind: crate::events::SESSION_HOLDER_BOUND.into(),
+            session_id: Some(7),
+            payload_json: Some(payload),
+        };
+        let deadline = 1_000 + TASK_LEASE_DURATION_MS;
+        assert_eq!(task_lease(&event), Some(TaskLease::current()));
+        assert_eq!(task_lease_expired(&event, 1_000, deadline - 1), Some(false));
+        assert_eq!(task_lease_expired(&event, 1_000, deadline), Some(true));
+        assert!(!task_lease_renewal_due(
+            &event,
+            event.ts + TASK_LEASE_RENEWAL_INTERVAL_MS - 1
+        ));
+        assert!(task_lease_renewal_due(
+            &event,
+            event.ts + TASK_LEASE_RENEWAL_INTERVAL_MS
+        ));
+
+        let legacy = crate::events::session_holder_bound_payload(&holder, "registered", None);
+        assert_eq!(task_lease_from_payload(&legacy), None);
+        for malformed in [
+            r#"{"pid":1,"started":"s","command":"c","task_lease":{"version":2,"duration_ms":86400000}}"#,
+            r#"{"pid":1,"started":"s","command":"c","task_lease":{"version":1,"duration_ms":86400000,"future":true}}"#,
+            r#"{"pid":1,"started":"s","command":"c","task_lease":null}"#,
+        ] {
+            assert_eq!(task_lease_from_payload(malformed), None, "{malformed}");
+        }
+    }
+
+    #[test]
+    fn malformed_lease_extension_does_not_discard_live_holder_protection() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = crate::BrokerStore::open(&temporary.path().join("broker.db")).unwrap();
+        let session_id = register_holder_test_session(&mut store);
+        let table = ProcessTable::parse(
+            "3731 1 Fri Oct 23 08:42:41 2026 /opt/codex agent --session 7\n\
+             5000 1 Fri Oct 23 09:01:00 2026 /opt/codex agent --session 8\n",
+        );
+        let holder = table.process(3731).unwrap();
+        let caller = Caller::Agent(table.process(5000).unwrap());
+        let mut payload: serde_json::Value = serde_json::from_str(
+            &crate::events::session_holder_bound_payload(&holder, "registered", None),
+        )
+        .unwrap();
+        payload["task_lease"] = serde_json::json!({"version": 9, "duration_ms": 86_400_000});
+        store
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session_id),
+                Some(&payload.to_string()),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            admit(&mut store, session_id, &caller, &table, false),
+            Err(crate::BrokerOpError::SessionHeldByAnotherAgent {
+                holder_pid: 3731,
+                ..
+            })
+        ));
+        assert_eq!(recorded_holder(&store, session_id).unwrap(), Some(holder));
+    }
 
     #[cfg(unix)]
     fn snapshot_command(stdout: &str, stderr: &str, status: &str) -> Command {
@@ -1301,6 +1565,7 @@ mod tests {
             prefetched_event_ids: HashMap::from([(session.id, holder_event_id)]),
             observed_event_ids: HashMap::from([(session.id, holder_event_id)]),
             snapshot: Some(Some(table)),
+            process_use_snapshot: None,
             snapshots_taken: 0,
         };
         assert_eq!(
@@ -1311,6 +1576,7 @@ mod tests {
             prefetched_event_ids: HashMap::from([(session.id, holder_event_id)]),
             observed_event_ids: HashMap::from([(session.id, holder_event_id)]),
             snapshot: Some(Some(ProcessTable::parse(""))),
+            process_use_snapshot: None,
             snapshots_taken: 0,
         };
         assert_eq!(

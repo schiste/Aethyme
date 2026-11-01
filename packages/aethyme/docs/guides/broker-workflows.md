@@ -1,6 +1,6 @@
 # Broker Follow-Up Workflows
 
-Last Updated: 2026-10-10
+Last Updated: 2026-11-01
 
 This guide covers broker workflows that matter after the basic
 start-edit-submit loop: preparing declared worktree dependencies, reusing a session worktree, choosing fresh or cached
@@ -97,6 +97,15 @@ does not delete existing dependencies. Fix the declared command or input and
 run the printed retry command. Hooks that require preparation refuse before
 gates run and leave staged changes untouched. See the
 [CLI reference](../reference/cli.md) for the schema and state model.
+
+For shared package-manager stores, add `shared_package_caches` to a
+`repository_shared` step. The supported names are `pnpm`, `npm`, `uv`, and
+`pip`; each creates a directory under the preparation digest's shared cache and
+exports its path as `AETHYME_PREPARE_PNPM_STORE_DIR`,
+`AETHYME_PREPARE_NPM_CACHE_DIR`, `AETHYME_PREPARE_UV_CACHE_DIR`, or
+`AETHYME_PREPARE_PIP_CACHE_DIR`. The command must explicitly use the variable
+for the selected manager. The broker does not override package-manager
+settings such as `PNPM_HOME` or `UV_CACHE_DIR`.
 
 ## Recover External Main Movement
 
@@ -203,6 +212,33 @@ missing, unplugged, inside the repository or below its free-space floor, and
 `start` says why, so machines without the drive keep working. Worktrees on the
 drive are locked, so nothing prunes or cleans them up while it is away. See the
 CLI reference for the rules.
+
+### Sparse new-session checkouts
+
+Full checkouts remain the default. To make newly allocated sessions sparse,
+add literal tracked directories to `[worktrees].sparse_paths` in
+`.aethyme/config.toml`:
+
+```toml
+[worktrees]
+sparse_paths = ["packages/aethyme/rust/crates/aethyme-broker"]
+```
+
+The broker validates each configured path against the selected base commit's
+Git tree. The entries must be repository-relative directory paths; globs,
+traversal components and symlink or submodule entries are refused by falling
+back to a full checkout with a warning. Sparse setup also falls back to a full
+checkout when the installed Git cannot apply it. Cone mode keeps root-level
+files and files immediately inside the ancestor directories needed to reach
+each selected directory, in addition to all files below each selected
+directory. The sparse index stays disabled for compatibility.
+
+Explicit `broker start --path` leases add their directory to the new checkout
+(the parent directory for a file lease), so the claimed source is present.
+Include any other directories needed by your task, context tools, dependency
+preparation and gates. Sparse checkout does not infer those inputs or prepare
+dependencies. An absent or empty `sparse_paths` keeps full checkouts, and
+`--reuse` or `--adopt` never changes an existing worktree's sparsity.
 
 When continuing the same task, reuse its broker session/worktree instead of
 creating another checkout. For a follow-up task, use `broker start --reuse`
@@ -1317,13 +1353,19 @@ backlog too large for one budget still drains.
 Broker open runs before every command, including the agent hook on each tool
 call, so its share of that work is small and fixed: at most 250 ms per open,
 never scaled by disk pressure, and an open continues an unfinished pass at most
-once every 10 minutes (about every 25 seconds when the disk is below the gate
-headroom). The full `artifact_sweep_budget_ms` -- multiplied when the disk is
-below the gate headroom -- is spent by commands that exist to reclaim disk:
+once every 10 minutes (about every 25 seconds when a swept volume is below
+`[retention].artifact_sweep_headroom_bytes`). That reserve defaults to 16 GiB
+and its effective threshold is clamped to the existing 8 GiB gate headroom.
+The full `artifact_sweep_budget_ms` is spent by commands that exist to
+reclaim disk:
 `aethyme broker gc sweep`, which runs a pass now regardless of cadence, and
-`finish`, which continues an unfinished pass before the agent leaves. Before
-this split, a repository whose backlog outlasted one budget paid the full
-budget -- a minute under pressure -- on every command.
+`finish`, which continues an unfinished pass before the agent leaves. Those
+full passes scale up when any sampled worktree or cache volume is below the
+configured reserve. Foreground passes sample the captured placement candidates
+and cache root; detached continuation also samples recorded session roots,
+including older custom placements. Before this split, a repository whose
+backlog outlasted one budget paid the full budget -- a minute under pressure --
+on every command.
 
 Autonomous sweeps operate on closed sessions only. Quiet-agent time and shallow
 directory timestamps cannot prove a deeply nested cache is no longer being

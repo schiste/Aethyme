@@ -1,6 +1,6 @@
 # CLI Reference
 
-Last Updated: 2026-10-24
+Last Updated: 2026-11-01
 
 ## Install
 
@@ -600,6 +600,7 @@ with a pending rename, while ambiguous or mismatched identity is refused with
 a reason.
 - `aethyme broker submit prepare status --session <id> [--json]`
 - `aethyme broker submit prepare --session <id> [--offline] [--wait <duration>] [--json]`
+- `aethyme broker advanced heartbeat --session <id> [--json]` — renew the exact current holder's task lease during quiet work; guarded commands renew automatically.
 - `aethyme broker advanced exec --session <id> [--non-interactive] [--json] -- <command>`
 - `aethyme broker advanced exec-status --session <id> [--receipt <32-hex-id> | --limit <1..100>] [--json]`
 - `aethyme broker advanced git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] -- <git-args>`
