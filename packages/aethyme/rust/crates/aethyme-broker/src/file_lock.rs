@@ -111,8 +111,8 @@ pub(crate) enum SessionOperationLockMode {
 /// exits; retirement refuses when those inventories are unknown.
 #[derive(Debug)]
 pub(crate) enum SessionOperationGuard {
-    Shared(SharedSessionOperationLock),
-    Exclusive(ExclusiveFileLock),
+    Shared { _lock: SharedSessionOperationLock },
+    Exclusive { _lock: ExclusiveFileLock },
 }
 
 #[derive(Debug)]
@@ -153,9 +153,9 @@ pub(crate) fn try_acquire_session_operation_guard(
                 ));
             }
             verify_named_lock_file(&path, &file)?;
-            Ok(Some(SessionOperationGuard::Shared(
-                SharedSessionOperationLock { _file: file },
-            )))
+            Ok(Some(SessionOperationGuard::Shared {
+                _lock: SharedSessionOperationLock { _file: file },
+            }))
         }
         SessionOperationLockMode::Exclusive => {
             let Some(lock) = ExclusiveFileLock::try_acquire(file)? else {
@@ -168,7 +168,7 @@ pub(crate) fn try_acquire_session_operation_guard(
                 ));
             }
             verify_named_lock_file(&path, &lock.file)?;
-            Ok(Some(SessionOperationGuard::Exclusive(lock)))
+            Ok(Some(SessionOperationGuard::Exclusive { _lock: lock }))
         }
     }
 }

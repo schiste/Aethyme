@@ -959,14 +959,13 @@ impl Broker {
         {
             return Ok(AbandonedSessionCloseOutcome::Changed);
         }
-        if task_lease_binding_present {
-            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        if task_lease_binding_present
+            && (deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
                 || process_table
                     .process_use_snapshot_for_retirement(self.main_root(), deadline)
-                    .is_none()
-            {
-                return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
-            }
+                    .is_none())
+        {
+            return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
         }
 
         // Retention policy can be edited while the process and filesystem
@@ -3946,7 +3945,7 @@ mod generic_guarded_exec_tests {
     #[cfg(unix)]
     #[test]
     fn finite_binding_with_orphan_artifact_marker_defers_close() {
-        let (repository, _storage, mut broker) = fixture();
+        let (_repository, _storage, mut broker) = fixture();
         let session = broker.start_worktree("orphan task child", None).unwrap();
         let old = age_worktree_for_task_retirement(&mut broker, &session);
         let holder = task_lease_holder(i64::MAX);
@@ -4058,7 +4057,7 @@ mod generic_guarded_exec_tests {
     #[cfg(unix)]
     #[test]
     fn finite_binding_with_incomplete_process_inventory_defers_close() {
-        let (repository, _storage, mut broker) = fixture();
+        let (_repository, _storage, mut broker) = fixture();
         let session = broker.start_worktree("unknown process use", None).unwrap();
         let old = age_worktree_for_task_retirement(&mut broker, &session);
         let holder = task_lease_holder(i64::MAX);

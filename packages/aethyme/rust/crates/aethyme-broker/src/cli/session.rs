@@ -2034,9 +2034,6 @@ pub(super) fn run_heartbeat(
                 "session {session_id} has a legacy or unsupported holder binding; it remains protected from task-lease expiry"
             )))
         }
-        crate::session_holder::TaskLeaseHeartbeat::Downgraded => Err(UsageError::Message(
-            "heartbeat was unexpectedly downgraded; retry the command".into(),
-        )),
     }
 }
 
