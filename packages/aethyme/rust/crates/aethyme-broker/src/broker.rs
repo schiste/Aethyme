@@ -1841,6 +1841,14 @@ pub struct CleanupRetention {
     /// status can explain a bad file without failing before it can report it.
     #[serde(skip_serializing_if = "RetentionConfigStatus::is_healthy")]
     pub retention_config: RetentionConfigStatus,
+    /// One bounded, namespace-scoped snapshot of the last artifact sweep.
+    /// This is read from broker metadata; status does not scan the filesystem.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_artifact_sweep: Option<crate::ArtifactSweepLastReport>,
+    /// A malformed or unreadable saved report is described here without
+    /// failing the rest of status or hiding the rest of its evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_artifact_sweep_error: Option<String>,
     /// Directories under a broker worktree root that no session row claims
     /// (#176). Unsized on this path -- status runs often, and the count is
     /// the signal; `gc plan` measures the bytes.
@@ -3141,6 +3149,7 @@ fn push_auto_cleanup_advice(view: &mut StatusView, report: Option<crate::AutoCle
                 | crate::SessionRetirementDeferredReason::HolderLivenessUnavailable { .. }
                 | crate::SessionRetirementDeferredReason::WorktreeActivityUnavailable { .. }
                 | crate::SessionRetirementDeferredReason::LeaseLivenessUnavailable { .. }
+                | crate::SessionRetirementDeferredReason::OperationEvidenceUnavailable { .. }
         )
     });
     if report.removed.is_empty()
