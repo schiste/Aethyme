@@ -3211,6 +3211,15 @@ fn push_auto_cleanup_advice(view: &mut StatusView, report: Option<crate::AutoCle
                 } => format!(
                     "session {session_id} remains open because worktree activity metadata could not be checked"
                 ),
+                crate::SessionRetirementDeferredReason::OperationGuardBusy { session_id } => format!(
+                    "session {session_id} retirement will retry after its admitted session operation finishes"
+                ),
+                crate::SessionRetirementDeferredReason::OperationActive { session_id } => format!(
+                    "session {session_id} remains open because session work or a child operation is active"
+                ),
+                crate::SessionRetirementDeferredReason::OperationEvidenceUnavailable { session_id } => format!(
+                    "session {session_id} remains open because operation or child-use evidence could not be checked"
+                ),
                 crate::SessionRetirementDeferredReason::LifecycleBusy { session_id } => format!(
                     "session {session_id} retirement will retry after the repository lifecycle operation"
                 ),

@@ -3489,7 +3489,7 @@ impl Broker {
         let namespace = self.storage_context().artifact_sweep_namespace()?;
         let key = scoped_artifact_sweep_key(&namespace, ARTIFACT_SWEEP_LAST_REPORT_KEY);
         let Some(value) = bounded_text_meta_get(
-            self.store(),
+            self.store_ref(),
             &key,
             ARTIFACT_SWEEP_LAST_REPORT_MAX_BYTES,
             "scoped artifact-sweep report",
