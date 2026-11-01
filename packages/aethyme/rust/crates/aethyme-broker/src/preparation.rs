@@ -144,6 +144,8 @@ pub enum PreparationError {
     LivenessIncomplete { reason: String },
     #[error("dependency preparation storage at {path} is unavailable: {reason}")]
     StorageUnavailable { path: PathBuf, reason: String },
+    #[error("shared package-cache directory {path:?} is unsafe: {reason}")]
+    SharedPackageCachePathInvalid { path: PathBuf, reason: String },
     #[error(transparent)]
     HostResource(#[from] crate::HostResourceError),
 }
@@ -957,7 +959,6 @@ impl Broker {
         let main_root = self.main_root().to_path_buf();
         let mut heartbeat = PreparationHeartbeat::new(Instant::now());
         for step in &config.steps {
-            let environment = preparation_step_environment(cache_dir.as_deref(), step);
             let command = if offline {
                 step.offline_command
                     .as_ref()
@@ -972,6 +973,8 @@ impl Broker {
             )
             .map_err(BrokerOpError::from)
             .and_then(|()| {
+                let environment = preparation_step_environment(cache_dir.as_deref(), step)
+                    .map_err(BrokerOpError::from)?;
                 let supervisor = match next_supervisor.take() {
                     Some(supervisor) => supervisor,
                     None => self.start_preparation_exec_supervisor()?,
@@ -1281,24 +1284,89 @@ fn validate_config(config: &PreparationConfig) -> Result<(), PreparationError> {
 fn preparation_step_environment(
     cache_dir: Option<&Path>,
     step: &PreparationStep,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>, PreparationError> {
     let Some(cache_dir) = cache_dir else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut environment = vec![(
         "AETHYME_PREPARE_CACHE_DIR".into(),
         cache_dir.to_string_lossy().into_owned(),
     )];
-    environment.extend(step.shared_package_caches.iter().map(|package_cache| {
-        (
+    for package_cache in &step.shared_package_caches {
+        let path =
+            ensure_shared_package_cache_directory(cache_dir, package_cache.directory_name())?;
+        environment.push((
             package_cache.environment_variable().into(),
-            cache_dir
-                .join(package_cache.directory_name())
-                .to_string_lossy()
-                .into_owned(),
-        )
-    }));
-    environment
+            path.to_string_lossy().into_owned(),
+        ));
+    }
+    Ok(environment)
+}
+
+fn ensure_shared_package_cache_directory(
+    cache_root: &Path,
+    directory_name: &str,
+) -> Result<PathBuf, PreparationError> {
+    let invalid = |path: &Path, reason: &str| PreparationError::SharedPackageCachePathInvalid {
+        path: path.to_path_buf(),
+        reason: reason.to_owned(),
+    };
+    let root_metadata =
+        fs::symlink_metadata(cache_root).map_err(|source| PreparationError::Io {
+            path: cache_root.to_path_buf(),
+            source,
+        })?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(invalid(
+            cache_root,
+            "the bound cache root is not a real directory",
+        ));
+    }
+    let canonical_root = fs::canonicalize(cache_root).map_err(|source| PreparationError::Io {
+        path: cache_root.to_path_buf(),
+        source,
+    })?;
+    let path = cache_root.join(directory_name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(invalid(&path, "symlinks are refused"));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(invalid(&path, "the existing path is not a directory"));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                return Err(PreparationError::Io {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        },
+        Err(source) => return Err(PreparationError::Io { path, source }),
+    }
+    let metadata = fs::symlink_metadata(&path).map_err(|source| PreparationError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(invalid(&path, "the selected path is not a real directory"));
+    }
+    let canonical_path = fs::canonicalize(&path).map_err(|source| PreparationError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    if canonical_path.parent() != Some(canonical_root.as_path())
+        || canonical_path.file_name().and_then(|name| name.to_str()) != Some(directory_name)
+    {
+        return Err(invalid(
+            &path,
+            "the selected directory resolves outside the bound cache root",
+        ));
+    }
+    Ok(path)
 }
 
 fn validate_managed_storage_profile(
@@ -4392,7 +4460,11 @@ mod tests {
 
     #[test]
     fn package_cache_paths_stay_under_the_bound_cache_and_are_opt_in() {
-        let cache_root = Path::new("/host-cache/canonical-repository/0123456789ab");
+        let cache_owner = tempfile::tempdir().unwrap();
+        let cache_root = cache_owner
+            .path()
+            .join("host-cache/canonical-repository/0123456789ab");
+        fs::create_dir_all(&cache_root).unwrap();
         let mut base_config = config();
         let mut shared_step = base_config.steps.remove(0);
         shared_step.cache = PreparationCachePolicy::RepositoryShared;
@@ -4403,7 +4475,7 @@ mod tests {
             PreparationPackageCache::Pip,
         ];
 
-        let environment = preparation_step_environment(Some(cache_root), &shared_step);
+        let environment = preparation_step_environment(Some(&cache_root), &shared_step).unwrap();
         assert_eq!(
             environment,
             vec![
@@ -4437,21 +4509,95 @@ mod tests {
         let mut another_step = shared_step.clone();
         another_step.name = "tools".into();
         assert_eq!(
-            preparation_step_environment(Some(cache_root), &another_step),
+            preparation_step_environment(Some(&cache_root), &another_step).unwrap(),
             environment,
             "steps selecting the same manager reuse its digest-specific store"
         );
 
         let mut local_config = config();
         let local_step = local_config.steps.remove(0);
-        let local_environment = preparation_step_environment(Some(cache_root), &local_step);
+        let local_environment =
+            preparation_step_environment(Some(&cache_root), &local_step).unwrap();
         assert_eq!(local_environment.len(), 1);
         assert_eq!(
-            local_environment[0].0,
-            "AETHYME_PREPARE_CACHE_DIR",
+            local_environment[0].0, "AETHYME_PREPARE_CACHE_DIR",
             "unlisted package caches are not exposed to the step"
         );
-        assert!(preparation_step_environment(None, &shared_step).is_empty());
+        assert!(
+            preparation_step_environment(None, &shared_step)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_cache_environment_rejects_symlink_leaf_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let owner = tempfile::tempdir().unwrap();
+        let cache_root = owner.path().join("cache");
+        let outside = owner.path().join("outside");
+        fs::create_dir(&cache_root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("preserve.txt"), b"untouched").unwrap();
+        symlink(&outside, cache_root.join("uv-cache")).unwrap();
+
+        let mut step = config().steps.remove(0);
+        step.cache = PreparationCachePolicy::RepositoryShared;
+        step.shared_package_caches = vec![PreparationPackageCache::Uv];
+        assert!(matches!(
+            preparation_step_environment(Some(&cache_root), &step),
+            Err(PreparationError::SharedPackageCachePathInvalid { .. })
+        ));
+        assert_eq!(
+            fs::read(outside.join("preserve.txt")).unwrap(),
+            b"untouched"
+        );
+        assert!(
+            fs::symlink_metadata(cache_root.join("uv-cache"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let file_leaf = cache_root.join("npm-cache");
+        fs::write(&file_leaf, b"preserve file").unwrap();
+        step.shared_package_caches = vec![PreparationPackageCache::Npm];
+        assert!(matches!(
+            preparation_step_environment(Some(&cache_root), &step),
+            Err(PreparationError::SharedPackageCachePathInvalid { .. })
+        ));
+        assert_eq!(fs::read(file_leaf).unwrap(), b"preserve file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_shared_cache_alias_reaches_child_environment_alone() {
+        let owner = tempfile::tempdir().unwrap();
+        let cache_root = owner.path().join("cache");
+        fs::create_dir(&cache_root).unwrap();
+        let mut step = config().steps.remove(0);
+        step.cache = PreparationCachePolicy::RepositoryShared;
+        step.shared_package_caches = vec![PreparationPackageCache::Uv];
+        let environment = preparation_step_environment(Some(&cache_root), &step).unwrap();
+        assert!(cache_root.join("uv-cache").is_dir());
+
+        let child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "printf '%s|%s' \"$AETHYME_PREPARE_UV_CACHE_DIR\" \"${AETHYME_PREPARE_NPM_CACHE_DIR-unset}\"",
+            ])
+            .envs(environment)
+            .env_remove("AETHYME_PREPARE_NPM_CACHE_DIR")
+            .output()
+            .unwrap();
+        assert!(child.status.success());
+        let stdout = String::from_utf8(child.stdout).unwrap();
+        assert_eq!(
+            stdout,
+            format!("{}|unset", cache_root.join("uv-cache").display())
+        );
     }
 
     #[test]
@@ -4461,9 +4607,11 @@ mod tests {
         let mut base = config();
         base.steps[0].cache = PreparationCachePolicy::RepositoryShared;
         base.shared_cache = Some(SharedCacheBudget::default());
-        assert!(serde_json::to_value(&base).unwrap()["steps"][0]
-            .get("shared_package_caches")
-            .is_none());
+        assert!(
+            serde_json::to_value(&base).unwrap()["steps"][0]
+                .get("shared_package_caches")
+                .is_none()
+        );
 
         let base_digest = preparation_digest(root.path(), &base, 1).unwrap();
         let mut uv = base.clone();
@@ -4481,7 +4629,10 @@ mod tests {
             inputs = [\"lock.file\"]\n\
             outputs = [\"vendor/\"]\n\
             shared_package_caches = [\"uv\"]\n";
-        assert!(parse_config(base).is_err(), "worktree-local sharing is refused");
+        assert!(
+            parse_config(base).is_err(),
+            "worktree-local sharing is refused"
+        );
 
         let shared = format!("{base}cache = \"repository_shared\"\n");
         assert!(parse_config(&shared).is_ok());

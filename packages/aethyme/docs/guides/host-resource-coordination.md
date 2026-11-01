@@ -246,6 +246,8 @@ it does not set or override package-manager environment variables. For
 example, a uv command can use
 `UV_CACHE_DIR="${UV_CACHE_DIR:-$AETHYME_PREPARE_UV_CACHE_DIR}" uv sync` to
 preserve a caller-provided cache location.
+The broker creates selected alias directories under the bound cache root and
+refuses symlink or non-directory leaves before it starts the command.
 
 `CARGO_HOME` is not a cache-only directory: it also holds configuration,
 credentials, and installed executables. It is deliberately not a supported

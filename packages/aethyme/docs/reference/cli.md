@@ -704,6 +704,8 @@ package-manager environment variables. `CARGO_HOME` is intentionally not a
 shared-cache option because it also contains Cargo configuration, credentials,
 and installed executables; the broker leaves it untouched. Keep generated
 worktree outputs such as `node_modules/`, `.venv/`, and `target/` per worktree.
+Before starting a command, the broker creates each selected alias directory if
+needed and refuses symlink or non-directory leaves under the bound cache root.
 
 By default, the broker derives the shared preparation cache from the captured
 host-resource database location. To place that cache on a separate volume, set
