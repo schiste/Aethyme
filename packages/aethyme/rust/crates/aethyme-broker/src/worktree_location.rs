@@ -53,7 +53,7 @@ impl WorktreeLocationConfig {
         let Some(section) = value.get("worktrees") else {
             return Ok(None);
         };
-        let config: Self = section
+        let mut config: Self = section
             .clone()
             .try_into()
             .map_err(|error| format!("[worktrees] is invalid: {error}"))?;

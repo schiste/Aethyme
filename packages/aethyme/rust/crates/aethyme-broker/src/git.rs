@@ -10728,34 +10728,36 @@ mod sparse_worktree_tests {
             .unwrap_or_else(|error| panic!("git {}: {error}", args.join(" ")));
     }
 
-    fn repository() -> tempfile::TempDir {
-        let root = tempfile::tempdir().unwrap();
-        git(root.path(), &["init", "-q", "--template=", "-b", "main"]);
-        git(root.path(), &["config", "user.name", "Sparse checkout test"]);
+    fn repository() -> (tempfile::TempDir, std::path::PathBuf) {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q", "--template=", "-b", "main"]);
+        git(&root, &["config", "user.name", "Sparse checkout test"]);
         git(
-            root.path(),
+            &root,
             &["config", "user.email", "sparse-checkout@example.invalid"],
         );
-        std::fs::write(root.path().join("README.md"), "root file").unwrap();
+        std::fs::write(root.join("README.md"), "root file").unwrap();
         for (relative, contents) in [
             ("included/source.rs", "selected source"),
             ("omitted/deep/data.txt", "omitted source proof"),
         ] {
-            let path = root.path().join(relative);
+            let path = root.join(relative);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, contents).unwrap();
         }
-        git(root.path(), &["add", "-A"]);
-        git(root.path(), &["commit", "-qm", "initial"]);
-        root
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "initial"]);
+        (fixture, root)
     }
 
     #[test]
     fn sparse_checkout_keeps_root_files_and_omissions_clean_for_git_status() {
-        let root = repository();
-        let repo = GitRepo::discover(root.path()).unwrap();
+        let (fixture, root) = repository();
+        let repo = GitRepo::discover(&root).unwrap();
         let base = repo.head_commit().unwrap();
-        let worktree_path = root.path().join("linked/sparse");
+        let worktree_path = fixture.path().join("linked/sparse");
         let (worktree, fallback) = repo
             .worktree_add_with_sparse_paths(
                 &worktree_path,
@@ -10770,6 +10772,31 @@ mod sparse_worktree_tests {
         assert!(worktree_path.join("included/source.rs").is_file());
         assert!(!worktree_path.join("omitted/deep/data.txt").exists());
         assert!(worktree.dirty_paths().unwrap().is_empty());
+        assert!(
+            root.join("omitted/deep/data.txt").is_file(),
+            "sparse checkout must not omit files from the primary checkout"
+        );
+        assert!(repo.dirty_paths().unwrap().is_empty());
+        assert_eq!(
+            super::run_git(
+                &worktree_path,
+                &["config", "--bool", "--worktree", "core.sparseCheckout"]
+            )
+            .unwrap()
+            .trim(),
+            "true",
+            "the sparse setting belongs to the linked worktree"
+        );
+        assert!(
+            matches!(
+                super::run_git(
+                    &root,
+                    &["config", "--bool", "--worktree", "core.sparseCheckout"]
+                ),
+                Err(GitError::Git { .. })
+            ),
+            "the primary checkout must not inherit the linked worktree's sparse setting"
+        );
         assert_eq!(
             worktree
                 .file_at_commit(&base, "omitted/deep/data.txt")
@@ -10795,10 +10822,10 @@ mod sparse_worktree_tests {
 
     #[test]
     fn sparse_setup_failure_restores_a_complete_full_checkout() {
-        let root = repository();
-        let repo = GitRepo::discover(root.path()).unwrap();
+        let (fixture, root) = repository();
+        let repo = GitRepo::discover(&root).unwrap();
         let base = repo.head_commit().unwrap();
-        let worktree_path = root.path().join("linked/fallback");
+        let worktree_path = fixture.path().join("linked/fallback");
         let (worktree, fallback) = repo
             .worktree_add_with_sparse_paths_using(
                 &worktree_path,
@@ -10832,11 +10859,11 @@ mod sparse_worktree_tests {
     #[cfg(unix)]
     #[test]
     fn sparse_config_directory_validation_uses_tree_objects_without_following_symlinks() {
-        let root = repository();
-        std::os::unix::fs::symlink("included", root.path().join("alias")).unwrap();
-        git(root.path(), &["add", "-A"]);
-        git(root.path(), &["commit", "-qm", "add directory symlink"]);
-        let repo = GitRepo::discover(root.path()).unwrap();
+        let (_fixture, root) = repository();
+        std::os::unix::fs::symlink("included", root.join("alias")).unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "add directory symlink"]);
+        let repo = GitRepo::discover(&root).unwrap();
         let base = repo.head_commit().unwrap();
         assert!(repo.commit_has_directory(&base, "included").unwrap());
         assert!(!repo.commit_has_directory(&base, "alias").unwrap());
