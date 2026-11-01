@@ -1662,8 +1662,10 @@ impl Broker {
         session_id: i64,
         worktree: &Path,
         deadline: Option<Instant>,
-    ) -> Result<Option<ClosedArtifactCheckoutCohort>, BrokerOpError> {
-        self.closed_artifact_checkout_cohort_for_session_mode(session_id, worktree, deadline, false)
+    ) -> Result<ClosedArtifactCheckoutCohortResolution, BrokerOpError> {
+        self.closed_artifact_checkout_cohort_for_session_detailed_mode(
+            session_id, worktree, deadline, false,
+        )
     }
 
     fn closed_artifact_checkout_cohort_for_session_mode(
@@ -3691,7 +3693,7 @@ mod tests {
                     .advance_cleanup_cohort_scan(Some(deadline))
                     .unwrap();
             }
-            let cohort = self
+            let cohort = match self
                 .broker
                 .closed_artifact_checkout_cohort_for_session_readonly(
                     self.session.id,
@@ -3699,7 +3701,12 @@ mod tests {
                     Some(deadline),
                 )
                 .unwrap()
-                .expect("fixture should produce a complete closed checkout cohort");
+            {
+                super::ClosedArtifactCheckoutCohortResolution::Available(cohort) => cohort,
+                super::ClosedArtifactCheckoutCohortResolution::Unavailable(reason) => {
+                    panic!("fixture cohort refused: {}", reason.code())
+                }
+            };
 
             let repository = GitRepo::discover(&self.primary_root).unwrap();
             let git_common_dir = repository.git_common_dir().unwrap();
@@ -3817,7 +3824,16 @@ mod tests {
             .closed_artifact_checkout_cohort_for_session_readonly(session.id, &worktree, None)
             .unwrap();
         if before.as_ref().map(|state| state.2) != Some(true) {
-            assert!(result.is_none());
+            let expected = if before.is_none() {
+                super::ClosedArtifactCheckoutCohortUnavailableReason::IndexMissing
+            } else {
+                super::ClosedArtifactCheckoutCohortUnavailableReason::IndexIncomplete
+            };
+            assert!(matches!(
+                result,
+                super::ClosedArtifactCheckoutCohortResolution::Unavailable(reason)
+                    if reason == expected
+            ));
         }
         let after = broker
             .store()

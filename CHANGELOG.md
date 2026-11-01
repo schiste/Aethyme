@@ -4,6 +4,23 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.53] - 2026-11-01
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0853).
+
+### Added
+
+- Renewable task ownership, opt-in expiry, bounded proactive maintenance and durable cleanup diagnostics, with a five-day default closed-checkout grace period.
+- Opt-in sparse worktrees and shared package-download caches while retaining isolated writable environments and full-checkout fallback.
+- Explicit, default-off repository service commands for private, identity-bound shared GC planning, with pinned runtime pairs and orderly shutdown. Service job-history retention remains unbounded; this release does not qualify its opt-in use for bounded storage.
+- Environment restart, optional components, path routes, entry URLs, static SPA fallback, empty profiles, rule exclusions, input-sensitive shared redeployment, and recorded budget reporting.
+
+### Fixed
+
+- Environment cache reclamation uses bounded inventories, exact filesystem identity, coordinated use checks and resumable deletion journals. Incomplete evidence retains cache entries; cache storage is not yet charged to the managed-storage ledger.
+- Bundled resource requests receive distinct ports and cumulative same-pool capacity checks; environment pin and busy limits are validated consistently.
+- Closed-session finish remains idempotent without rebinding ownership. Cleanup writer tests and captured child output have bounded waits.
+
 ## [0.8.52] - 2026-10-31
 
 ### Added

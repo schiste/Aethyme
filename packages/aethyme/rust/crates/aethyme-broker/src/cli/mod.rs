@@ -24,6 +24,7 @@ mod render;
 mod report;
 mod resources;
 mod review;
+mod service;
 mod session;
 mod ship;
 mod status;
@@ -902,6 +903,11 @@ Usage:
       here is recreated for you: a reclaimed worktree pays a cold build next
       time.
   aethyme broker gc plan [--include-active-gate-cache] [--full-scan] [--json]
+  aethyme broker gc plan --service-directory <directory> --request-key <key> --deadline-ms <utc-ms> [--include-active-gate-cache] [--full-scan] [--json]
+      The explicit service form verifies this repository's owner, submits or
+      joins durable planning and prints the same plan. All three service
+      options are required together. No service startup or local fallback;
+      retain the key and exact future deadline (at most 30 minutes) for retry.
       Report exact retention-eligible rows, runtime files, represented
       worktrees/refs, finished sessions' build caches, this repository's gate
       cache, estimated bytes, blockers, and (when complete) a stable plan digest. The newest
@@ -1146,6 +1152,11 @@ fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 
         return crate::exit_status::USAGE;
     }
     let started = std::time::Instant::now();
+    // The opt-in host service has its own bounded parser and never opens a
+    // repository, runs startup maintenance or fast-forwards a checkout.
+    if args.first().map(String::as_str) == Some("service") {
+        return service::run_service(&args[1..]);
+    }
     maybe_fast_forward_main_checkout(args, &mode);
     // Dispatched before the shared parser: the contract check is a CI/gate
     // entry point with its own flags (`--base`, `--pr-body`) and its own
@@ -1694,6 +1705,9 @@ struct Parsed {
     /// `gc plan`/`gc apply`: request exhaustive inventory instead of the
     /// default deadline-bound operator scan.
     full_scan: bool,
+    service_directory: Option<PathBuf>,
+    request_key: Option<String>,
+    deadline_ms: Option<i64>,
     /// `worktrees --measure`: walk every checkout instead of a budget.
     measure: bool,
     /// `gates affected --timings`: emit the timing object instead of the array.
@@ -1845,6 +1859,9 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         dry_run: false,
         include_active_gate_cache: false,
         full_scan: false,
+        service_directory: None,
+        request_key: None,
+        deadline_ms: None,
         measure: false,
         timings: false,
         destructive: false,
@@ -1934,6 +1951,34 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
             "--dry-run" => parsed.dry_run = true,
             "--include-active-gate-cache" => parsed.include_active_gate_cache = true,
             "--full-scan" => parsed.full_scan = true,
+            "--service-directory" | "--request-key" | "--deadline-ms" => {
+                if parsed
+                    .given_flags
+                    .iter()
+                    .filter(|flag| *flag == arg)
+                    .count()
+                    != 1
+                {
+                    return Err(UsageError::Message(format!("{arg} must not be repeated")));
+                }
+                let value = iter
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        UsageError::Message(format!("{arg} requires a nonempty value"))
+                    })?;
+                match arg.as_str() {
+                    "--service-directory" => parsed.service_directory = Some(value.into()),
+                    "--request-key" => parsed.request_key = Some(value.clone()),
+                    _ => {
+                        parsed.deadline_ms = Some(value.parse().map_err(|_| {
+                            UsageError::Message(
+                                "--deadline-ms requires integer UTC milliseconds".into(),
+                            )
+                        })?)
+                    }
+                }
+            }
             "--measure" => parsed.measure = true,
             "--timings" => parsed.timings = true,
             "--from-provider" => parsed.from_provider = true,

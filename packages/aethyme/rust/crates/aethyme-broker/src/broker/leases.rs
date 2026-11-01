@@ -369,6 +369,34 @@ enum GuardedExecDispatchEvent {
     OutcomeUnknown(&'static str),
 }
 
+fn index_active_lease_paths_by_holder<'lease>(
+    lease_paths: impl IntoIterator<Item = (i64, &'lease str)>,
+) -> std::collections::HashMap<i64, Vec<&'lease str>> {
+    let mut paths_by_holder: std::collections::HashMap<i64, Vec<&'lease str>> =
+        std::collections::HashMap::new();
+    for (holder_session_id, path) in lease_paths {
+        paths_by_holder
+            .entry(holder_session_id)
+            .or_default()
+            .push(path);
+    }
+    paths_by_holder
+}
+
+fn holder_has_overlapping_active_lease(
+    paths_by_holder: &std::collections::HashMap<i64, Vec<&str>>,
+    holder_session_id: i64,
+    path: &str,
+) -> bool {
+    paths_by_holder
+        .get(&holder_session_id)
+        .is_some_and(|paths| {
+            paths
+                .iter()
+                .any(|lease_path| crate::leases::paths_overlap(path, lease_path))
+        })
+}
+
 impl Broker {
     // ── agents (liveness) ─────────────────────────────────────────────
 
@@ -1678,10 +1706,13 @@ impl Broker {
         &self,
     ) -> Result<Vec<crate::lease_requests::LeaseReleaseRequest>, BrokerOpError> {
         let leases = self.store.active_leases()?;
+        let paths_by_holder = index_active_lease_paths_by_holder(
+            leases
+                .iter()
+                .map(|lease| (lease.session_id, lease.path.as_str())),
+        );
         crate::lease_requests::requests(&self.store, |holder, path| {
-            leases.iter().any(|lease| {
-                lease.session_id == holder && crate::leases::paths_overlap(path, &lease.path)
-            })
+            holder_has_overlapping_active_lease(&paths_by_holder, holder, path)
         })
     }
 
@@ -5681,5 +5712,50 @@ mod generic_guarded_exec_tests {
             command_start,
             BrokerOpError::Spawn { command: ref name, .. } if name == "command"
         ));
+    }
+}
+
+#[cfg(test)]
+mod active_lease_path_index_tests {
+    use super::{holder_has_overlapping_active_lease, index_active_lease_paths_by_holder};
+
+    #[test]
+    fn indexed_holder_checks_match_linear_overlap_for_all_paths() {
+        let leases = [
+            (10, "src/lib.rs"),
+            (10, "src/lib.rs"), // Duplicate rows preserve the any-match result.
+            (10, "generated/"),
+            (20, "src/"),
+            (30, "assets/icon.svg"),
+        ];
+        let indexed = index_active_lease_paths_by_holder(leases.iter().copied());
+        let probes = [
+            (10, "src/lib.rs", true),
+            (10, "generated/child.rs", true),
+            (20, "src/lib.rs", true),
+            (10, "src/", true),
+            (10, "src/sibling.rs", false),
+            (10, "generated-sibling/a", false),
+            // Another holder's exact lease must not satisfy this query.
+            (30, "src/lib.rs", false),
+            (10, "assets/icon.svg", false),
+            (30, "assets/icon.svg", true),
+            (99, "generated/child.rs", false),
+        ];
+
+        for (holder, path, expected) in probes {
+            let linear = leases.iter().any(|(lease_holder, lease_path)| {
+                *lease_holder == holder && crate::leases::paths_overlap(path, lease_path)
+            });
+            let actual = holder_has_overlapping_active_lease(&indexed, holder, path);
+            assert_eq!(
+                linear, expected,
+                "linear result for holder {holder} and {path}"
+            );
+            assert_eq!(
+                actual, linear,
+                "indexed result for holder {holder} and {path}"
+            );
+        }
     }
 }

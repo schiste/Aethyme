@@ -5,6 +5,7 @@ aethyme broker advanced — the full broker surface beyond the public verbs
 Usage: aethyme broker advanced <verb> [args...]
 
 Verbs:
+  service          explicit opt-in foreground service and health requests
   leases           inspect, claim, plan, export or release path ownership
   ownership        claim, list or release a named operation such as a release
   git              run Git through the durable operation coordinator
