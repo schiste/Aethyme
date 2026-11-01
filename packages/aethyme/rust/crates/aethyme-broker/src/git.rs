@@ -11421,6 +11421,7 @@ mod sparse_worktree_tests {
         let exclude =
             PathBuf::from(super::run_git(root, &["rev-parse", "--absolute-git-dir"]).unwrap())
                 .join("info/exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
         let mut ignore_rules = std::fs::read(&exclude).unwrap_or_default();
         ignore_rules.extend_from_slice(b"\n");
         ignore_rules.extend_from_slice(pattern.as_bytes());
