@@ -78,7 +78,8 @@ impl Fixture {
             .env("AETHYME_HOST_STATE_DIR", self.state.path())
             .env("AETHYME_ENV_SUPERVISOR_LINGER_SECONDS", "1")
             .env("AETHYME_ENV_SUPERVISOR_TICK_MS", "50")
-            .env_remove("XDG_STATE_HOME");
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("AETHYME_WORKTREE_ROOT");
         command
     }
 
@@ -439,6 +440,104 @@ min_profile = "isolated"
     );
     let (code, _) = fixture.json(&["env", "down", up["env_id"].as_str().unwrap()]);
     assert_eq!(code, 0);
+}
+
+/// #1275: `broker gc plan` lists the environment build cache and proposes
+/// the unused build; `gc apply` evicts it and never the one in use.
+#[test]
+fn gc_reclaims_an_unused_environment_build_and_never_a_used_one() {
+    let environments = r#"
+schema = 1
+[[profiles]]
+name = "site"
+[[profiles.components]]
+name = "site"
+runtime = "static"
+serve_dir = "dist"
+build = 'mkdir -p dist && cp web/app.txt dist/index.html'
+cache_inputs = ["web/**"]
+"#;
+    let fixture = Fixture::new(Some(environments));
+    let app = fixture.repo.path().join("web/app.txt");
+    std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+    std::fs::write(&app, "v1").unwrap();
+    let (code, up) = fixture.json(&["env", "up", "--wait", "5"]);
+    assert_eq!(code, 0, "{up}");
+    let old = up["env_id"].as_str().unwrap().to_string();
+    let (code, down) = fixture.json(&["env", "down", &old]);
+    assert_eq!(code, 0, "{down}");
+    let builds = fixture.state.path().join("environments/cache/builds");
+    let entries = |dir: &Path| -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect()
+    };
+    let repository = entries(&builds).pop().unwrap();
+    let unused = entries(&repository.join("site")).pop().unwrap();
+    std::fs::write(&app, "v2").unwrap();
+    let (code, up) = fixture.json(&["env", "up", "--wait", "5"]);
+    assert_eq!(code, 0, "{up}");
+    let live = up["env_id"].as_str().unwrap().to_string();
+
+    let gc = |args: &[&str]| {
+        let output = fixture
+            .command(args)
+            .env("AETHYME_ENV_CACHE_MAX_BYTES", "0")
+            .output()
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "{args:?}: {error}\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+    };
+    // A broker that has placed a worktree knows its root history, which a
+    // complete (applicable) plan needs.
+    let started = fixture.run(&["broker", "start", "--task", "gc", "--short-name", "gc"]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let plan = gc(&["broker", "gc", "plan", "--full-scan", "--json"]);
+    let cache = &plan["environment_cache"];
+    assert_eq!(cache["build_entries"], 2, "{plan}");
+    assert_eq!(cache["in_use_entries"], 1, "{plan}");
+    assert!(
+        plan["environment_caches"]
+            .as_array()
+            .is_some_and(|c| !c.is_empty()),
+        "{plan}"
+    );
+
+    let digest = plan["digest"].as_str().unwrap();
+    assert_eq!(digest.len(), 64, "{plan}");
+    let applied = gc(&[
+        "broker",
+        "gc",
+        "apply",
+        "--confirm",
+        digest,
+        "--full-scan",
+        "--json",
+    ]);
+    assert_eq!(
+        applied["environment_caches_reclaimed"],
+        serde_json::json!([unused.to_string_lossy()]),
+        "{applied}"
+    );
+    assert!(!unused.exists());
+    assert_eq!(
+        entries(&repository.join("site")).len(),
+        1,
+        "the used build is kept"
+    );
+
+    let (code, down) = fixture.json(&["env", "down", &live]);
+    assert_eq!(code, 0, "{down}");
 }
 
 /// #1293 acceptance: the host's `max_pin_seconds` refuses a longer pin.

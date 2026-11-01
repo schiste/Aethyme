@@ -422,6 +422,75 @@ fn prune_evicts_nothing_when_live_use_is_unknown() {
     lifecycle.down(&live, None).unwrap();
 }
 
+/// #1275: `broker gc plan` proposes the unused build of this repository and
+/// never the one a live environment uses; `gc apply` evicts through the same
+/// key and use check as prune, and keeps an entry used since the plan.
+#[test]
+fn gc_proposes_and_evicts_only_an_unused_build() {
+    let host = tempfile::tempdir().unwrap();
+    let counter = host.path().join("builds.log");
+    let text = site(&counter);
+    let mut lifecycle = lifecycle(host.path());
+    let a = worktree(&[("web/app.txt", "v1")]);
+    let b = worktree(&[("web/app.txt", "v2")]);
+    let old = up(&mut lifecycle, &text, a.path());
+    lifecycle.down(&old, None).unwrap();
+    let live = up(&mut lifecycle, &text, b.path());
+    let root = lifecycle.root.clone();
+    let plan = |lifecycle: &Lifecycle| {
+        super::cache::gc_inventory(Some(&lifecycle.store), &root, "repo-cache", 0)
+    };
+
+    let (inventory, candidates) = plan(&lifecycle);
+    let inventory = inventory.expect("this repository has cache entries");
+    assert_eq!(inventory.build_entries, 2, "{inventory:?}");
+    assert_eq!(inventory.in_use_entries, 1, "{inventory:?}");
+    assert_eq!(candidates.len(), 1, "{candidates:?}");
+    let used = lifecycle
+        .cache_entries()
+        .into_iter()
+        .find(|e| e.in_use)
+        .unwrap();
+    assert_ne!(Path::new(&candidates[0].path), used.path);
+    assert!(
+        super::cache::gc_inventory(Some(&lifecycle.store), &root, "other", 0)
+            .0
+            .is_none()
+    );
+
+    // The used build, even if a plan named it, is kept.
+    let mut forged = candidates[0].clone();
+    forged.path = used.path.to_string_lossy().into_owned();
+    forged.last_used_at_ms = used.last_used;
+    let kept = lifecycle.evict_planned_build(&forged).unwrap_err();
+    assert!(kept.contains("in use"), "{kept}");
+    assert!(used.path.exists());
+    // Nothing outside the build cache, whatever the journal says.
+    forged.path = a.path().to_string_lossy().into_owned();
+    forged.last_used_at_ms = None;
+    assert!(lifecycle.evict_planned_build(&forged).is_err());
+    assert!(a.path().exists());
+
+    assert_eq!(lifecycle.evict_planned_build(&candidates[0]), Ok(true));
+    assert!(!Path::new(&candidates[0].path).exists());
+    assert_eq!(lifecycle.evict_planned_build(&candidates[0]), Ok(false));
+
+    // Used between plan and apply: kept.
+    lifecycle.down(&live, None).unwrap();
+    let (_, candidates) = plan(&lifecycle);
+    assert_eq!(candidates.len(), 1, "{candidates:?}");
+    let complete = Path::new(&candidates[0].path).join(super::cache::COMPLETE);
+    std::fs::File::options()
+        .write(true)
+        .open(&complete)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
+        .unwrap();
+    let kept = lifecycle.evict_planned_build(&candidates[0]).unwrap_err();
+    assert!(kept.contains("used since"), "{kept}");
+    assert!(complete.exists());
+}
+
 /// #1297: `redeploy_on = "inputs"` needs inputs, and they must be globs.
 #[test]
 fn redeploy_on_inputs_needs_valid_inputs() {
