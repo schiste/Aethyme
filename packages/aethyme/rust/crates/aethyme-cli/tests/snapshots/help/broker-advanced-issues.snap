@@ -1,0 +1,13 @@
+exit: 0
+--- stdout
+  aethyme broker advanced issues upsert --repo <owner/name> --fingerprint <key> --title <title> --body-file <path> [--label <label>]... [--session <id>] [--json]
+  aethyme broker advanced issues upsert --repo <owner/name> --fingerprint <key> --resolve [--body-file <path>] [--session <id>] [--json]
+      Keep one issue per automation outcome (#1238). The first failure opens
+      an issue carrying a hidden <!-- aethyme-outcome:<key> --> marker; a
+      repeat comments on it at most once per issue_comment_interval_minutes;
+      --resolve comments and closes it. Opt-in on the default branch:
+      [automation] issues = allow, issue_labels and issues_per_day. Denied,
+      unlisted-label and over-budget requests write nothing and are recorded
+      locally. Writes are journaled before they run; with --session they go
+      through the coordinated GitHub operation layer.
+--- stderr

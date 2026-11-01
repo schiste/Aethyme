@@ -329,6 +329,7 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
         Some("exposures") => args.get(1).map(String::as_str) == Some("apply"),
         Some("report") => args.get(1).map(String::as_str) == Some("file"),
         Some("quality-report") => args.get(1).map(String::as_str) != Some("plan"),
+        Some("issues") => true,
         Some("external-events") => matches!(
             args.get(1).map(String::as_str),
             Some("ingest" | "reconcile")

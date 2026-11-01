@@ -692,3 +692,101 @@ pub(super) fn report_main_root() -> Result<PathBuf, UsageError> {
     let repo = crate::GitRepo::discover(&cwd)?;
     Ok(repo.main_root()?)
 }
+
+/// `broker issues upsert`: one issue per automation outcome (#1238).
+pub(super) fn run_issues(parsed: Parsed) -> Result<(), UsageError> {
+    match parsed.positional.first().map(String::as_str) {
+        Some("upsert") if parsed.positional.len() == 1 => {}
+        Some(other) if other != "upsert" => {
+            return Err(UsageError::Message(format!(
+                "unknown issues action {other:?}; expected upsert"
+            )));
+        }
+        Some(_) => {
+            return Err(UsageError::Message(
+                "issues upsert takes no positional arguments".into(),
+            ));
+        }
+        None => {
+            return Err(UsageError::Message(
+                "issues requires an action: upsert".into(),
+            ));
+        }
+    }
+    let repository = parsed
+        .repository
+        .clone()
+        .ok_or_else(|| UsageError::Message("issues upsert requires --repo <owner/name>".into()))?;
+    let fingerprint = parsed
+        .fingerprint
+        .clone()
+        .ok_or_else(|| UsageError::Message("issues upsert requires --fingerprint <key>".into()))?;
+    if !parsed.resolve && parsed.title.is_none() {
+        return Err(UsageError::Message(
+            "issues upsert requires --title unless --resolve is given".into(),
+        ));
+    }
+    let body = match parsed.body_file.as_ref() {
+        Some(path) => {
+            let metadata = std::fs::metadata(path).map_err(|error| {
+                UsageError::Message(format!(
+                    "cannot read --body-file {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if metadata.len() > 1024 * 1024 {
+                return Err(UsageError::Message(format!(
+                    "--body-file {} is larger than 1 MiB",
+                    path.display()
+                )));
+            }
+            Some(std::fs::read_to_string(path).map_err(|error| {
+                UsageError::Message(format!(
+                    "cannot read --body-file {}: {error}",
+                    path.display()
+                ))
+            })?)
+        }
+        None if parsed.resolve => None,
+        None => {
+            return Err(UsageError::Message(
+                "issues upsert requires --body-file unless --resolve is given".into(),
+            ));
+        }
+    };
+    let request = crate::OutcomeIssueRequest {
+        repository,
+        fingerprint,
+        title: parsed.title.clone().unwrap_or_default(),
+        body,
+        labels: parsed.labels.clone(),
+        resolve: parsed.resolve,
+    };
+    let cwd = std::env::current_dir().map_err(|error| UsageError::Message(error.to_string()))?;
+    let repo = crate::GitRepo::discover(&cwd)?;
+    let mut broker = match parsed.session {
+        Some(_) => Some(open_broker(parsed.read_only_snapshot)?),
+        None => None,
+    };
+    let coordinated = broker.as_mut().zip(parsed.session);
+    let outcome = crate::upsert_outcome_issue_for_repository(&repo, &request, coordinated)
+        .map_err(|error| UsageError::Exit {
+            message: format!("{}: {error}", error.code()),
+            code: 1,
+        })?;
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&outcome)?);
+    } else {
+        out!("{}", outcome.message);
+        if let Some(url) = outcome.issue_url.as_deref() {
+            out!("Issue: {url}");
+        }
+    }
+    if outcome.action == crate::OutcomeIssueAction::Refused {
+        return Err(UsageError::Exit {
+            message: format!("{}: {}", outcome.code.unwrap_or("refused"), outcome.message),
+            code: 3,
+        });
+    }
+    Ok(())
+}
