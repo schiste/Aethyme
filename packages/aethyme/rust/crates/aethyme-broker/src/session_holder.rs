@@ -53,9 +53,6 @@ pub(crate) enum TaskLeaseHeartbeat {
     Current,
     /// A valid legacy binding was upgraded by its current holder under guard.
     Upgraded,
-    /// An unsupported command downgraded the binding to process-lifetime
-    /// protection before it began work.
-    Downgraded,
     /// The current process is not the exact recorded holder.
     NotHolder,
     /// The holder event or lease version is malformed or unsupported.
@@ -68,7 +65,6 @@ impl TaskLeaseHeartbeat {
             Self::Renewed => "renewed",
             Self::Current => "current",
             Self::Upgraded => "upgraded",
-            Self::Downgraded => "downgraded",
             Self::NotHolder => "not_holder",
             Self::LegacyProtected => "legacy_protected",
         }
