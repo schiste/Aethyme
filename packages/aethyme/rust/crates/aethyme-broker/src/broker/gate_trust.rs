@@ -63,7 +63,8 @@ pub struct GatePolicy {
 impl GatePolicy {
     /// Digest gates by name and `definition_hash` -- which already covers the
     /// command and every field that changes how it executes -- and preparation
-    /// by each step and runtime command.
+    /// by each step and runtime command. Explicit shared package-cache aliases
+    /// are included because they change the environment available to a step.
     pub(crate) fn from_parts(gates: &[Gate], prepare: Option<&PreparationConfig>) -> Self {
         let mut commands = Vec::new();
         let mut gate_digests = gates
@@ -95,11 +96,16 @@ impl GatePolicy {
                 if let Some(offline) = &step.offline_command {
                     commands.push(argv_command("prepare.offline_step", &step.name, offline));
                 }
-                prepare_digests.push(serde_json::json!({
+                let mut step_digest = serde_json::json!({
                     "step": step.name,
                     "command": step.command,
                     "offline_command": step.offline_command,
-                }));
+                });
+                if !step.shared_package_caches.is_empty() {
+                    step_digest["shared_package_caches"] =
+                        serde_json::json!(&step.shared_package_caches);
+                }
+                prepare_digests.push(step_digest);
             }
         }
         let bytes = serde_json::to_vec(&serde_json::json!({
@@ -755,6 +761,27 @@ mod tests {
         let two = GatePolicy::from_parts(&[], Some(&config("curl")));
         assert!(one.runs_commands());
         assert_ne!(one.policy_sha256, two.policy_sha256);
+    }
+
+    #[test]
+    fn only_nonempty_shared_package_cache_aliases_change_the_policy() {
+        let policy = |cache_field: &str| {
+            let config = crate::preparation::parse_config(&format!(
+                "schema_version = 1\n[[steps]]\nname = \"deps\"\ncommand = [\"install\"]\n\
+                 outputs = [\"out\"]\ncache = \"repository_shared\"\n{cache_field}"
+            ))
+            .unwrap();
+            GatePolicy::from_parts(&[], Some(&config))
+        };
+        let omitted = policy("");
+        let empty = policy("shared_package_caches = []\n");
+        let uv = policy("shared_package_caches = [\"uv\"]\n");
+        let pnpm_uv = policy("shared_package_caches = [\"pnpm\", \"uv\"]\n");
+        let uv_pnpm = policy("shared_package_caches = [\"uv\", \"pnpm\"]\n");
+
+        assert_eq!(omitted.policy_sha256, empty.policy_sha256);
+        assert_ne!(omitted.policy_sha256, uv.policy_sha256);
+        assert_eq!(pnpm_uv.policy_sha256, uv_pnpm.policy_sha256);
     }
 
     #[test]

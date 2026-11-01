@@ -1,6 +1,6 @@
 # CLI Reference
 
-Last Updated: 2026-10-24
+Last Updated: 2026-11-01
 
 ## Install
 
@@ -600,6 +600,7 @@ with a pending rename, while ambiguous or mismatched identity is refused with
 a reason.
 - `aethyme broker submit prepare status --session <id> [--json]`
 - `aethyme broker submit prepare --session <id> [--offline] [--wait <duration>] [--json]`
+- `aethyme broker advanced heartbeat --session <id> [--json]` — renew the exact current holder's task lease during quiet work; guarded commands renew automatically.
 - `aethyme broker advanced exec --session <id> [--non-interactive] [--json] -- <command>`
 - `aethyme broker advanced exec-status --session <id> [--receipt <32-hex-id> | --limit <1..100>] [--json]`
 - `aethyme broker advanced git --session <id> [--repo <owner/name>] [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] -- <git-args>`
@@ -674,6 +675,38 @@ in Git. `worktree_local` steps receive no shared cache. A
 serialized in per-user host state by canonical remote identity, renewed while
 the command runs, and released afterward. The cache path and ownership token
 are absent from JSON and broker journals.
+
+Steps with `cache = "repository_shared"` may declare `shared_package_caches`
+to expose package-manager-specific directories beneath that same identity- and
+digest-bound cache:
+`pnpm` provides `AETHYME_PREPARE_PNPM_STORE_DIR`, `npm` provides
+`AETHYME_PREPARE_NPM_CACHE_DIR`, `uv` provides `AETHYME_PREPARE_UV_CACHE_DIR`,
+and `pip` provides `AETHYME_PREPARE_PIP_CACHE_DIR`. The broker only supplies
+these Aethyme paths when the step declares them; its command must explicitly
+route the manager to the path. For example, this uses the shared uv download
+cache by default, while keeping `.venv/` in the worktree; if the caller already
+set a nonempty `UV_CACHE_DIR`, the command preserves that value:
+
+```toml
+[[steps]]
+name = "python-dependencies"
+command = ["sh", "-c", 'UV_CACHE_DIR="${UV_CACHE_DIR:-$AETHYME_PREPARE_UV_CACHE_DIR}" uv sync']
+offline_command = ["sh", "-c", 'UV_CACHE_DIR="${UV_CACHE_DIR:-$AETHYME_PREPARE_UV_CACHE_DIR}" uv sync --offline']
+inputs = ["pyproject.toml", "uv.lock"]
+outputs = [".venv/"]
+cache = "repository_shared"
+shared_package_caches = ["uv"]
+```
+
+Use `--store-dir "$AETHYME_PREPARE_PNPM_STORE_DIR"` for pnpm, or the
+package manager's explicit cache option for npm and pip. These aliases do not
+set `PNPM_HOME`, `UV_CACHE_DIR`, `npm_config_cache`, `PIP_CACHE_DIR`, or other
+package-manager environment variables. `CARGO_HOME` is intentionally not a
+shared-cache option because it also contains Cargo configuration, credentials,
+and installed executables; the broker leaves it untouched. Keep generated
+worktree outputs such as `node_modules/`, `.venv/`, and `target/` per worktree.
+Before starting a command, the broker creates each selected alias directory if
+needed and refuses symlink or non-directory leaves under the bound cache root.
 
 By default, the broker derives the shared preparation cache from the captured
 host-resource database location. To place that cache on a separate volume, set
@@ -1745,7 +1778,7 @@ gate_results_days = 30
 terminal_merge_queue_days = 180
 command_metrics_days = 30
 closed_worktrees_days = 7
-closed_worktree_grace_hours = 360
+closed_worktree_grace_hours = 120
 publication_exposure_days = 30
 retained_bytes_budget = 1073741824
 artifact_reclaim_days = 0
@@ -1753,6 +1786,7 @@ orphan_worktree_roots_days = 1
 session_abandoned_after_hours = 72
 idle_session_artifact_hours = 24
 artifact_sweep_budget_ms = 5000
+artifact_sweep_headroom_bytes = 17179869184
 artifact_sweep_interval_hours = 24
 artefact_directories = [] # e.g. [".pnpm-store"]; additive to built-ins
 startup_budget_ms = 25
@@ -1787,6 +1821,13 @@ outputs. Raise `artifact_reclaim_days` to trade disk space for faster worktree
 reuse, or set `artifact_sweep_budget_ms = 0` to disable autonomous cache
 reclamation entirely.
 
+`artifact_sweep_headroom_bytes` (default 16 GiB) is the proactive free-space
+threshold for pressure-scaled cache cleanup. Setting it to `0` uses the
+existing 8 GiB gate safety floor. This changes only bounded sweep cadence and
+budget; it does not change gate admission or grant deletion authority. Older
+binaries report and ignore this field while continuing to apply the retention
+settings they understand.
+
 `closed_worktrees_days` applies only to closed worktrees without representation
 proof: it is the age grace period before GC reports a `retention_age` blocker.
 Worktrees whose cleanup proof represents their contribution are eligible
@@ -1794,13 +1835,13 @@ regardless of age, while their build caches remain governed by
 `artifact_reclaim_days`. The age setting never authorizes removal of an
 unproven contribution.
 
-`closed_worktree_grace_hours` (default 360 hours / 15 days, `0` for none) is how long GC waits
+`closed_worktree_grace_hours` (default 120 hours / 5 days, `0` for none) is how long GC waits
 after a state-only close (`aethyme broker finish close`) before proposing the
 checkout it kept. A clean checkout whose work is represented on a delivery
 target is proposed once the grace period has passed; until then the plan
 reports a `closed_worktree_grace` blocker with the checkout's bytes. Explicit
 cleanup does not wait: `finish cleanup <id>` and `finish cleanup --all-cleaned`
-both skip the grace period, so for up to 15 days after a close `gc plan` can
+both skip the grace period, so for up to 5 days after a close `gc plan` can
 list fewer worktree candidates than `finish cleanup --all-cleaned` does. A closed session's checkout that a live session
 now uses is never proposed (`live_worktree`), and a closed adopted checkout is
 only reported (`adopted_worktree`): the broker did not create it and GC never
@@ -2041,14 +2082,23 @@ worktrees, and it skips live sessions. It runs at most once per
 stays off the hot path of every broker command. If that budget expires before a
 backlog is scanned, the remaining caches are not held for a full interval: a
 broker open continues the pass at most once every 10 minutes (every ~25 seconds
-below the gate headroom), `finish` continues it with the full budget, and
-`gc sweep` runs a full-budget pass on demand. Its cadence stamp lives in the
+below the configured proactive headroom threshold), `finish` continues it with
+the full budget, and `gc sweep` runs a full-budget pass on demand. Its cadence stamp lives in the
 broker database rather than under `.aethyme/`, where a durable runtime file would
 register as a dirty path to the checkout-cleanliness gates. A sweep with no
 closed worktree does not consume the cadence window, so the first command after
 a session closes can reclaim its caches. With an explicitly disabled policy, or
 to clear an existing backlog immediately, use `gc sweep` (which needs the policy enabled), or `gc plan` and digest-confirmed
 `gc apply`.
+
+`gc sweep` reports logical regular-file sizes observed during traversal for
+entries whose unlink later succeeded, preparation-cache bytes separately, and
+exact blocker counts. Concurrent writes can change file sizes before unlink,
+and neither byte field measures physical space returned to the volume. The
+scoped last-pass snapshot is available as
+`cleanup_retention.last_artifact_sweep` in `broker status --json`. Completion
+describes the artifact-cache lane, while whole-checkout cleanup has a separate
+report.
 
 Worktree storage is host-scoped while the records that own it are
 repository-local, so a deleted repository leaves a worktree tree that no database

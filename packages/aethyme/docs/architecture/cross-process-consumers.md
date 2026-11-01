@@ -51,7 +51,8 @@ protected metadata roots, active use and unresolved ownership continue to retain
 data. Selected ignored directories stay opaque; nested metadata inside them is
 disposable too.
 Standalone ignored files are outside this new directory policy. The separate
-whole-checkout grace remains 360 hours by default.
+whole-checkout grace is 120 hours (5 days) by default. Recovery archive
+retention remains 15 days.
 
 Broker schema 58 raises the compatibility floor to 58 for the gate-use protocol.
 Already-open older clients must drain before enabling destructive automatic
@@ -444,6 +445,24 @@ root identity. Preparation writers, rotation recovery, and cache reclamation
 use the same captured root and repository-scoped lease. The root setting
 changes placement only; it does not impose a disk quota or bound arbitrary
 writes made by preparation commands.
+
+### Shared package-manager content caches
+
+A `repository_shared` preparation step may opt into `shared_package_caches`
+with unique values `pnpm`, `npm`, `uv`, or `pip`. The broker exposes only the
+selected `AETHYME_PREPARE_*_DIR` paths, each beneath the existing canonical
+remote identity and preparation-digest directory. Steps selecting the same
+manager under one digest reuse that manager's directory. The pnpm alias keeps
+the existing `AETHYME_PREPARE_CACHE_DIR/pnpm-store` path. The command must
+explicitly route its manager to the alias; native package-manager variables
+remain caller-controlled. `CARGO_HOME` is deliberately unsupported because it
+also contains configuration, credentials, and executables. The broker does
+not share worktree outputs such as `node_modules/`, `.venv/`, or `target/`.
+
+The preparation schema remains version 1. An empty list is omitted from the
+serialized configuration to preserve existing preparation digests; a
+nonempty selection changes the digest and trusted prepare policy, and requires
+trust before execution.
 
 ### Managed-storage ledger schema v4
 

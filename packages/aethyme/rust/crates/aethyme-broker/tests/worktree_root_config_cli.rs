@@ -9,6 +9,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use aethyme_broker::GitRepo;
+
 mod common;
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
@@ -116,6 +118,20 @@ impl Fixture {
     }
 }
 
+fn add_sparse_fixture_files(fx: &Fixture) {
+    for (relative, contents) in [
+        ("src/included/file.rs", "included source"),
+        ("src/planned/current.rs", "planned source"),
+        ("src/omitted/deep/file.rs", "omitted proof"),
+    ] {
+        let path = fx.repo.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    git(&fx.repo, &["add", "-A"]);
+    git(&fx.repo, &["commit", "-qm", "add sparse checkout fixtures"]);
+}
+
 fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -126,6 +142,110 @@ fn without_the_key_worktrees_stay_in_the_default_location() {
     let started = fx.start("default");
     assert_eq!(started["worktree_placement"]["source"], "host_state");
     assert!(started["worktree_placement"]["fallback_reason"].is_null());
+}
+
+#[test]
+fn sparse_checkout_is_opt_in_and_leased_paths_are_present_without_false_deletions() {
+    let fx = fixture();
+    add_sparse_fixture_files(&fx);
+    fx.configure("sparse_paths = [\"src/included\"]\n");
+
+    let output = fx.run(&[
+        "start",
+        "--task",
+        "sparse checkout with a leased path",
+        "--path",
+        "src/planned/new.rs",
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let started: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
+    let base = started["start_base"]["commit"].as_str().unwrap();
+    assert!(
+        worktree.join("README.md").is_file(),
+        "cone mode includes root files"
+    );
+    assert!(worktree.join("src/included/file.rs").is_file());
+    assert!(worktree.join("src/planned/current.rs").is_file());
+    assert!(
+        !worktree.join("src/omitted/deep/file.rs").exists(),
+        "unselected tracked files should stay absent"
+    );
+
+    let checkout = GitRepo::discover(&worktree).unwrap();
+    assert!(checkout.dirty_paths().unwrap().is_empty());
+    assert_eq!(
+        checkout
+            .file_at_commit(base, "src/omitted/deep/file.rs")
+            .unwrap()
+            .as_deref(),
+        Some("omitted proof"),
+        "source proofs must still read omitted files from the selected commit"
+    );
+    std::fs::write(worktree.join("src/included/file.rs"), "edited source").unwrap();
+    assert_eq!(
+        checkout.dirty_paths().unwrap(),
+        vec!["src/included/file.rs"],
+        "sparse omissions must not appear as deletions"
+    );
+    git(&worktree, &["checkout", "--", "src/included/file.rs"]);
+    assert!(checkout.dirty_paths().unwrap().is_empty());
+    GitRepo::discover(&fx.repo)
+        .unwrap()
+        .worktree_remove(&worktree, false)
+        .unwrap();
+    assert!(
+        !worktree.exists(),
+        "clean sparse worktrees remain removable"
+    );
+}
+
+#[test]
+fn missing_sparse_input_falls_back_to_a_full_checkout_with_a_warning() {
+    let fx = fixture();
+    add_sparse_fixture_files(&fx);
+    fx.configure("sparse_paths = [\"src/missing\"]\n");
+
+    let output = fx.run(&["start", "--task", "missing sparse input", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let warning = String::from_utf8_lossy(&output.stderr);
+    assert!(warning.contains("src/missing"), "{warning}");
+    assert!(warning.contains("full checkout"), "{warning}");
+    let started: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
+    assert!(worktree.join("src/included/file.rs").is_file());
+    assert!(worktree.join("src/planned/current.rs").is_file());
+    assert!(worktree.join("src/omitted/deep/file.rs").is_file());
+    assert!(
+        GitRepo::discover(&worktree)
+            .unwrap()
+            .dirty_paths()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn full_checkout_remains_the_default_without_sparse_paths() {
+    let fx = fixture();
+    add_sparse_fixture_files(&fx);
+
+    let started = fx.start("full checkout default");
+    let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
+    assert!(worktree.join("src/included/file.rs").is_file());
+    assert!(worktree.join("src/planned/current.rs").is_file());
+    assert!(worktree.join("src/omitted/deep/file.rs").is_file());
 }
 
 #[test]

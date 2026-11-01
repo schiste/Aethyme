@@ -1644,19 +1644,65 @@ fn render_gc_sweep(report: &crate::ArtifactSweepReport) {
         "directories"
     };
     out!(
-        "artifact sweep: reclaimed {} build-output {noun} within {} ms{}",
+        "artifact sweep: reclaimed {} build-output {noun} and {} filesystem entries within {} ms{}",
         report.directories_reclaimed,
+        report.entries_reclaimed,
         report.budget_ms,
         if report.disk_pressured {
-            " (disk below the gate headroom: pressured budget)"
+            " (below configured proactive headroom; pressure-scaled budget)"
         } else {
             ""
         }
     );
+    out!("  scope: {} at {}", report.scope, report.at_ms);
+    out!(
+        "  logical file bytes observed during traversal for later-unlinked entries: {} (sizes can change before unlink; physical space recovered is not measured)",
+        human_bytes(report.observed_logical_file_bytes)
+    );
+    if report.preparation_cache_bytes_reclaimed > 0 {
+        out!(
+            "  preparation-cache bytes reported: {}",
+            human_bytes(report.preparation_cache_bytes_reclaimed)
+        );
+    }
+    if report.disk_pressured {
+        out!(
+            "  proactive headroom threshold: {}",
+            human_bytes(report.headroom_threshold_bytes)
+        );
+    }
+    if !report.bytes_accounting_complete {
+        out!("  byte accounting: incomplete after a tree-removal error");
+    }
+    if report.blockers.total > 0 {
+        let by_reason = report
+            .blockers
+            .by_reason
+            .iter()
+            .map(|(reason, count)| format!("{reason}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out!(
+            "  blockers: {} total ({by_reason}); {} examples omitted",
+            report.blockers.total,
+            report.blockers.omitted_examples
+        );
+        for example in report.blockers.examples.iter().take(5) {
+            out!(
+                "    {}{}",
+                example.reason,
+                example
+                    .path
+                    .as_deref()
+                    .map(|path| format!(": {path}"))
+                    .unwrap_or_default()
+            );
+        }
+    }
     if report.complete {
-        out!("  complete: every eligible session was visited");
+        out!("  complete: every eligible artifact cache was visited");
     } else {
-        out!("  paused at the budget; run `aethyme broker gc sweep` again to continue");
+        out!("  artifact cache pass paused; run `aethyme broker gc sweep` again to continue");
     }
     match report.legacy_unscoped_state {
         crate::ArtifactSweepLegacyUnscopedState::Clear => {

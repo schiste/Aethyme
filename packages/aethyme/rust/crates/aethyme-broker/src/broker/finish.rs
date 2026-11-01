@@ -1350,11 +1350,11 @@ mod checkout_cleanup_grace_tests {
     #[test]
     fn close_scheduling_uses_compact_opt_in_without_lowering_archive_retention() {
         let mut retention = crate::RetentionPolicy::default();
-        assert_eq!(retention.closed_worktree_grace_hours, 15 * 24);
+        assert_eq!(retention.closed_worktree_grace_hours, 5 * 24);
         assert_eq!(
             checkout_cleanup_request_policy_for(SessionOrigin::Spawned, &retention, true),
             Some(CheckoutCleanupRequestPolicy {
-                grace_hours: 15 * 24,
+                grace_hours: 5 * 24,
                 compact_checkout: false,
             })
         );
@@ -1363,11 +1363,11 @@ mod checkout_cleanup_grace_tests {
         assert_eq!(
             checkout_cleanup_request_policy_for(SessionOrigin::Spawned, &retention, true),
             Some(CheckoutCleanupRequestPolicy {
-                grace_hours: 15 * 24,
+                grace_hours: 5 * 24,
                 compact_checkout: true,
             })
         );
-        assert_eq!(retention.closed_worktree_grace_hours, 15 * 24);
+        assert_eq!(retention.closed_worktree_grace_hours, 5 * 24);
         assert_eq!(
             checkout_cleanup_request_policy_for(SessionOrigin::Adopted, &retention, true),
             None
