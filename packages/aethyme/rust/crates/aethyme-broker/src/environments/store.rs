@@ -415,6 +415,7 @@ impl EnvironmentStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn open_cache_gc_read_only(path: &Path) -> Result<Option<Self>, StoreError> {
         Self::open_cache_gc_read_only_until(path, None)
     }

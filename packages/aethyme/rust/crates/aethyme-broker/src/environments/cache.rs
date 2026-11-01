@@ -1551,6 +1551,7 @@ mod cache_gc_lock_tests {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("environments");
         let entry = root
+            .join(CACHE_DIRECTORY)
             .join(BUILDS)
             .join(repository_dir("/tmp/repo"))
             .join("component")

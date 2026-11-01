@@ -272,12 +272,15 @@ impl ServiceSignals {
         // SAFETY: `sigaction` is a plain C struct whose zeroed form is valid;
         // `sigemptyset` initializes its signal mask before installation.
         let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        // SAFETY: Zero is valid output storage; successful sigaction fills the prior disposition.
         let mut previous_int = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        // SAFETY: Zero is valid output storage; successful sigaction fills the prior disposition.
         let mut previous_term = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        // SAFETY: Zeroed sigset_t storage is initialized by sigemptyset before use.
         let mut watched = unsafe { std::mem::zeroed::<libc::sigset_t>() };
         set_service_signal_set(&mut action.sa_mask, &[])?;
         set_service_signal_set(&mut watched, &[libc::SIGINT, libc::SIGTERM])?;
-        action.sa_sigaction = stop_service_on_signal as libc::sighandler_t;
+        action.sa_sigaction = stop_service_on_signal as *const () as libc::sighandler_t;
         action.sa_flags = 0;
         // SAFETY: the action and output disposition are live, correctly aligned
         // `sigaction` structs for the duration of the call.
@@ -299,6 +302,7 @@ impl ServiceSignals {
         // SAFETY: both signal sets are live and aligned; `previous_mask` is a
         // writable output for the prior mask of the current thread.
         let mut previous_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        // SAFETY: watched is initialized and previous_mask is writable, aligned output storage.
         let result =
             unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &watched, &mut previous_mask) };
         if result != 0 {

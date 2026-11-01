@@ -101,7 +101,7 @@ fn cache_gc_reads_schema_v1_without_migrating_it() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].env_id, env_id);
     assert_eq!(records[0].phase, EnvironmentPhase::Active);
-    assert_eq!(records[0].snapshot.repository, "repo-cache");
+    assert_eq!(records[0].snapshot.repository, "repo-0123456789abcdef");
     drop(reader);
 
     assert_eq!(std::fs::read(&path).unwrap(), before);

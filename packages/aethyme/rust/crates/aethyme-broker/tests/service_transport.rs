@@ -128,7 +128,7 @@ fn incomplete_client_does_not_block_health_or_incompatible_version_reply() {
     write_frame(
         &mut client,
         &Request {
-            protocol_version: 3,
+            protocol_version: PROTOCOL_VERSION + 1,
             ..Request::ping(9)
         },
     )

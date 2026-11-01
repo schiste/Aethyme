@@ -635,6 +635,11 @@ fn gc_proposes_and_evicts_only_an_unused_build() {
         .into();
     assert!(components.next().is_none());
     forged.path = canonical_used.to_string_lossy().into_owned();
+    forged.cache_key = Some(
+        used.key
+            .clone()
+            .expect("used build has a recorded lock key"),
+    );
     forged.last_used_at_ms = used.last_used;
     let kept = lifecycle.evict_planned_build(&forged).unwrap_err();
     assert!(kept.contains("in use"), "{kept}");

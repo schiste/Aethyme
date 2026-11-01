@@ -245,7 +245,7 @@ fn mount_identity(fd: libc::c_int, path: &Path) -> Result<MountIdentity, CacheGc
                 format!("{} has no kernel mount identity", path.display()),
             ));
         }
-        return Ok(MountIdentity(stat.stx_mnt_id.to_ne_bytes().to_vec()));
+        Ok(MountIdentity(stat.stx_mnt_id.to_ne_bytes().to_vec()))
     }
 
     #[cfg(target_os = "macos")]
@@ -378,7 +378,7 @@ fn io_error(code: &'static str, path: &Path, error: impl fmt::Display) -> CacheG
 fn identity(stat: &libc::stat) -> CacheFsIdentity {
     CacheFsIdentity {
         device: fs::device_id(stat),
-        inode: stat.st_ino as u64,
+        inode: stat.st_ino,
     }
 }
 
@@ -486,16 +486,16 @@ fn open_log_file(
         Err(error) if error.kind() == io::ErrorKind::NotFound && create => None,
         Err(error) => return Err(io_error("log_unreadable", path, error)),
     };
-    if let Some(before) = before.as_ref() {
-        if fs::file_type(before) != libc::S_IFREG || before.st_nlink != 1 || before.st_size < 0 {
-            return Err(CacheGcFsError::new(
-                "unsafe_path",
-                format!(
-                    "{} is not a singly-linked regular prune log",
-                    path.display()
-                ),
-            ));
-        }
+    if let Some(before) = before.as_ref()
+        && (fs::file_type(before) != libc::S_IFREG || before.st_nlink != 1 || before.st_size < 0)
+    {
+        return Err(CacheGcFsError::new(
+            "unsafe_path",
+            format!(
+                "{} is not a singly-linked regular prune log",
+                path.display()
+            ),
+        ));
     }
 
     let mut flags =
@@ -847,14 +847,13 @@ fn tail_prune_log(
             .map_err(|error| io_error("log_read_failed", &cache_path.join("prune.log"), error))?,
         None => Vec::new(),
     };
-    if collected.len() < lines {
-        if let Some(file) = rotated.as_mut() {
-            let mut older = read_log_tail(file, lines - collected.len()).map_err(|error| {
-                io_error("log_read_failed", &cache_path.join("prune.log.1"), error)
-            })?;
-            older.append(&mut collected);
-            collected = older;
-        }
+    if collected.len() < lines
+        && let Some(file) = rotated.as_mut()
+    {
+        let mut older = read_log_tail(file, lines - collected.len())
+            .map_err(|error| io_error("log_read_failed", &cache_path.join("prune.log.1"), error))?;
+        older.append(&mut collected);
+        collected = older;
     }
     Ok(collected)
 }
@@ -1747,10 +1746,13 @@ fn inventory_impl(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+type OpenedBuildDirectory = (OwnedFd, libc::stat, OwnedFd, CString, PathBuf);
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn open_relative_directory(
     cache: &CacheRoot,
     relative: [&str; 3],
-) -> Result<Option<(OwnedFd, libc::stat, OwnedFd, CString, PathBuf)>, CacheGcFsError> {
+) -> Result<Option<OpenedBuildDirectory>, CacheGcFsError> {
     let builds_name = CString::new("builds").expect("constant has no NUL");
     let builds_path = cache.path.join("builds");
     let builds_stat = match fs::stat_at(
@@ -1987,6 +1989,7 @@ fn open_template_parent(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)] // Keep each deletion-proof identity and hook explicit.
 pub(crate) fn remove_template_marker(
     environment_root: &Path,
     expected_cache_path: &Path,
@@ -2156,6 +2159,7 @@ pub(crate) fn remove_template_marker(
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[allow(clippy::too_many_arguments)] // Keep each deletion-proof identity and hook explicit.
 pub(crate) fn remove_template_marker(
     _environment_root: &Path,
     _expected_cache_path: &Path,
@@ -2176,6 +2180,7 @@ pub(crate) fn remove_template_marker(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)] // Keep each deletion-proof identity and hook explicit.
 pub(crate) fn remove_build(
     environment_root: &Path,
     expected_cache_path: &Path,
@@ -2208,6 +2213,7 @@ pub(crate) fn remove_build(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)] // Keep each deletion-proof identity and hook explicit.
 fn remove_build_with_marker_hook(
     environment_root: &Path,
     expected_cache_path: &Path,
@@ -2645,7 +2651,7 @@ mod tests {
     fn removal_refuses_a_replaced_ancestor_without_traversing_its_symlink() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("state");
-        let entry_path = build_tree(&root);
+        build_tree(&root);
         let inventory = inventory(&root, None).unwrap().unwrap();
         let candidate = inventory.builds.first().unwrap();
         let builds = root.join("cache/builds");
@@ -2674,7 +2680,16 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.code, "unsafe_path");
-        assert!(entry_path.join("output/app.bin").exists());
+        assert_eq!(
+            std::fs::read(saved_repo.join("component/digest/output/app.bin")).unwrap(),
+            b"payload"
+        );
+        assert!(
+            std::fs::symlink_metadata(&repo_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(
             std::fs::read(outside.join("sentinel")).unwrap(),
             b"leave me"
@@ -3029,6 +3044,7 @@ mod tests {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[allow(clippy::too_many_arguments)] // Keep each deletion-proof identity and hook explicit.
 pub(crate) fn remove_build(
     _environment_root: &Path,
     _expected_cache_path: &Path,

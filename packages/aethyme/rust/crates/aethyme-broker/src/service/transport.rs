@@ -473,6 +473,7 @@ mod tests {
     #[test]
     fn failed_client_worker_spawn_drains_workers_already_started() {
         let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let path = root.path().canonicalize().unwrap();
         let server = Server::bind(&path).unwrap();
         let mut first_client = UnixStream::connect(&server.socket).unwrap();
