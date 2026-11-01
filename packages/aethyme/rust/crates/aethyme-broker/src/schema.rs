@@ -34,7 +34,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 60;
+pub const SCHEMA_VERSION: i64 = 61;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -106,6 +106,9 @@ pub const SCHEMA_VERSION: i64 = 60;
 ///   renewable task-lease protocol. The floor blocks fresh old opens, but an
 ///   already-open v59 process is not revoked; operators must drain those
 ///   clients before enabling abandoned task-lease expiry.
+/// - v61: one new table for automation notes (#1238). An older binary never
+///   names it, so it neither shows nor acknowledges them; nothing existing
+///   changes, so the floor stays v60.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 60;
 
 /// Migration that introduced profile-bound gate-cache reads and writes.
@@ -2095,6 +2098,24 @@ END;
 // lock and cannot safely renew or downgrade finite task ownership.
 const MIGRATION_V60: &str = "SELECT 1;";
 
+/// v61: notes an automation sends to a live session (#1238). Session notes
+/// need a sending session; an automation has none, so its identity is a
+/// typed `automation:<name>` label. A fingerprint lets a repeating
+/// automation keep at most one unread note per recipient.
+const MIGRATION_V61: &str = "
+CREATE TABLE IF NOT EXISTS automation_notes (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender               TEXT NOT NULL CHECK (sender LIKE 'automation:%'),
+    recipient_session_id INTEGER NOT NULL REFERENCES sessions (id),
+    message              TEXT NOT NULL,
+    fingerprint          TEXT,
+    created_at           INTEGER NOT NULL,
+    acknowledged_at      INTEGER
+);
+CREATE INDEX IF NOT EXISTS automation_notes_by_recipient
+    ON automation_notes (recipient_session_id, acknowledged_at, id);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -2156,6 +2177,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V58,
     MIGRATION_V59,
     MIGRATION_V60,
+    MIGRATION_V61,
 ];
 
 /// Migrations that only add columns. One is skipped when every column it adds
@@ -2198,6 +2220,7 @@ const TABLE_MIGRATIONS: &[(i64, &str, &[&str])] = &[
             "closed_checkout_cleanup_requests",
         ],
     ),
+    (61, MIGRATION_V61, &["automation_notes"]),
 ];
 
 const TRIGGER_MIGRATIONS: &[(i64, &str, &[&str])] = &[(
@@ -3064,12 +3087,16 @@ mod tests {
         let conn = migrated_through(59);
         set_meta(&conn, "min_compatible_schema", 58);
         let before: i64 = conn
-            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'automation_notes%'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
 
         migrate(&conn).unwrap();
 
-        assert_eq!(current_version(&conn).unwrap(), 60);
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(MIN_COMPATIBLE_SCHEMA, TASK_LEASE_PROTOCOL_SCHEMA);
         assert_eq!(
             conn.query_row(
@@ -3084,9 +3111,47 @@ mod tests {
         assert!(!schema_is_compatible_with(&conn, 60, 59).unwrap());
         assert_eq!(MIGRATIONS[59], MIGRATION_V60);
         let after: i64 = conn
-            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'automation_notes%'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(before, after, "v60 is a protocol-only migration");
+    }
+
+    /// v61 only adds the automation notes table (#1238): a v60 binary
+    /// stays compatible, and nothing it reads or writes changes.
+    #[test]
+    fn v61_automation_notes_keep_the_v60_compatibility_floor() {
+        let conn = migrated_through(60);
+        set_meta(&conn, "min_compatible_schema", 60);
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(current_version(&conn).unwrap(), 61);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 60);
+        assert!(schema_is_compatible_with(&conn, 61, 60).unwrap());
+        assert_eq!(MIGRATIONS[60], MIGRATION_V61);
+        conn.execute(
+            "INSERT INTO sessions (worktree_path, branch, origin, status, created_at, updated_at, last_activity_at)
+             VALUES ('/w', 'b', 'adopted', 'active', 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        let session: i64 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO automation_notes (sender, recipient_session_id, message, created_at)
+             VALUES ('automation:x', ?1, 'm', 0)",
+            [session],
+        )
+        .unwrap();
+        let refused = conn.execute(
+            "INSERT INTO automation_notes (sender, recipient_session_id, message, created_at)
+             VALUES ('session:1', ?1, 'm', 0)",
+            [session],
+        );
+        assert!(refused.is_err(), "a non-automation sender is refused");
     }
 
     #[test]
