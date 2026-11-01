@@ -666,7 +666,7 @@ fn gc_proposes_and_evicts_only_an_unused_build() {
         .set_modified(std::time::SystemTime::now() + Duration::from_secs(5))
         .unwrap();
     let kept = lifecycle.evict_planned_build(&candidates[0]).unwrap_err();
-    assert!(kept.contains("used since"), "{kept}");
+    assert!(kept.starts_with("used_since_plan:"), "{kept}");
     assert!(complete.exists());
 }
 
