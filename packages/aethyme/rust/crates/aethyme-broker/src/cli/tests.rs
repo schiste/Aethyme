@@ -362,18 +362,51 @@ fn finish_can_be_retried_after_close_without_changing_finite_holder_binding() {
     let session = broker
         .start_worktree("closed finish fixture", None)
         .unwrap();
-    broker.close(session.id).unwrap();
-    let parent = crate::session_holder::ProcessTable::snapshot()
-        .expect("the parent process table is readable")
-        .process(std::process::id() as i64)
-        .expect("the test process appears in its process table");
+
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            match self.0.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(error) => eprintln!("cannot inspect holder fixture process: {error}"),
+            }
+            if let Err(error) = self.0.kill() {
+                eprintln!("holder fixture cleanup: {error}");
+            }
+            if let Err(error) = self.0.wait() {
+                eprintln!("holder fixture wait: {error}");
+            }
+        }
+    }
+    let holder_process = OwnedChild(
+        std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start the owned sibling holder process"),
+    );
+    let holder_pid = i64::from(holder_process.0.id());
+    let process_table = crate::session_holder::ProcessTable::snapshot()
+        .expect("the parent process table is readable");
+    let holder = process_table
+        .process(holder_pid)
+        .expect("the owned sibling appears in its process table");
+    let parent_pid = std::process::id() as i64;
+    assert_ne!(holder.pid, parent_pid);
+    assert!(
+        process_table.process(parent_pid).is_some(),
+        "the spawned CLI caller override must resolve to this live parent"
+    );
     broker
         .store()
         .append_event(
             crate::events::SESSION_HOLDER_BOUND,
             Some(session.id),
             Some(&crate::events::session_holder_task_lease_bound_payload(
-                &parent,
+                &holder,
                 "task_lease_enabled",
                 None,
             )),
@@ -398,6 +431,10 @@ fn finish_can_be_retried_after_close_without_changing_finite_holder_binding() {
         broker
             .configure_storage_context_for_child(&mut child)
             .expect("bind the child CLI to fixture-owned storage");
+        child.env(
+            crate::session_holder::AGENT_PID_ENV,
+            std::process::id().to_string(),
+        );
         child.output().unwrap()
     };
 
