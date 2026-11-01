@@ -267,10 +267,17 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   worktree's. A shared configured path can still cause per-worktree copies when
   the store is on another filesystem; pnpm documents this for `storeDir` and
   `packageImportMethod` in its [v10 settings](https://github.com/pnpm/pnpm.io/blob/main/versioned_docs/version-10.x/settings.md).
-- When substituting a prebuilt Rust test binary for Cargo, inspect the effective
-  Cargo `[env]` configuration: Cargo injects those values into test child
-  processes, while direct execution does not. Replay and record relevant values
-  explicitly, or classify the direct run as non-equivalent.
+- When substituting a prebuilt Rust test binary for Cargo or nextest, inspect the
+  effective workspace `.cargo/config.toml [env]`, selected
+  `packages/aethyme/rust/.config/nextest.toml` profile and `test-like-ci.sh`
+  setup. Recreate the environment and harness settings required by the selected
+  tests; here, `AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS` and
+  `AETHYME_TEST_AVAILABLE_BYTES` control synthetic fixture trust and headroom.
+  Apply these test-only values to the test process and its fixture subprocesses
+  only, never to production smoke or rollout commands; trust tests may deliberately
+  remove the trust escape. If direct execution fails with harness settings absent,
+  restore them and rerun before calling the behavior a product defect; otherwise
+  classify the direct run as non-equivalent.
 - Before optimizing a release workflow's version-contract test, trace its child
   binary helper: a test helper can invoke a Cargo binary build and compile a
   second debug copy before the shipping release build. When the workflow already
