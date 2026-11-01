@@ -363,6 +363,7 @@ pub use gates::{
     select_gates, verify_gate_scope_manifest,
 };
 pub use gc::{
+    ArtifactSweepBlockerExample, ArtifactSweepBlockerSummary, ArtifactSweepLastReport,
     ArtifactSweepLegacyUnscopedState, ArtifactSweepOutcome, ArtifactSweepReport,
     GC_PLAN_SCHEMA_VERSION, INLINE_ARTIFACT_SWEEP_BUDGET_MS,
     UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES,

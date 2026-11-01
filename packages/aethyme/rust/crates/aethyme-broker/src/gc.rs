@@ -26,6 +26,7 @@ mod tree_removal;
 pub(crate) use tree_removal::{
     PinnedTreeRemoval, TreeObjectIdentity, TreeRemoval, TreeRemovalError, remove_condemned_tree,
     remove_condemned_tree_with_progress_and_guard,
+    remove_condemned_tree_with_progress_and_observed_file_bytes_and_guard,
 };
 
 pub const GC_PLAN_SCHEMA_VERSION: u32 = 4;
@@ -139,6 +140,11 @@ const ARTIFACT_SWEEP_BLOCKED_DIAGNOSTICS_MAX: usize = 32;
 /// Last diagnosed unavailable marker set; replaced or cleared to avoid an
 /// append-only event for every retry of the same blocked paths.
 const ARTIFACT_SWEEP_BLOCKED_PATHS_KEY: &str = "gc.artifact_sweep.blocked_paths";
+/// One namespaced JSON snapshot of the most recent completed sweep attempt.
+/// It replaces the previous report, so routine maintenance does not grow the
+/// event table on every pass.
+const ARTIFACT_SWEEP_LAST_REPORT_KEY: &str = "gc.artifact_sweep.last_report";
+const ARTIFACT_SWEEP_LAST_REPORT_MAX_BYTES: usize = 16 * 1024;
 /// Bounded JSON for the capped diagnostic list: each entry has one path capped
 /// to 128 characters plus a fixed reason and JSON framing.
 const ARTIFACT_SWEEP_BLOCKED_PATHS_VALUE_MAX_BYTES: usize =
@@ -338,12 +344,92 @@ pub(crate) enum ArtifactSweepScope {
     ClosedSession(i64),
 }
 
+impl ArtifactSweepScope {
+    fn label(self) -> String {
+        match self {
+            Self::Inline => "inline".into(),
+            Self::Drain => "drain".into(),
+            Self::FinishDrain => "finish_drain".into(),
+            Self::AutomaticContinuation => "automatic_continuation".into(),
+            Self::ClosedSession(session_id) => format!("closed_session:{session_id}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactSweepBlockerExample {
+    pub path: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactSweepBlockerSummary {
+    /// Exact number of distinct blocked paths/reasons found in this pass.
+    pub total: usize,
+    /// Exact count per reason, computed before examples are capped.
+    pub by_reason: BTreeMap<String, usize>,
+    /// Number of blockers omitted from the bounded example list.
+    pub omitted_examples: usize,
+    pub examples: Vec<ArtifactSweepBlockerExample>,
+}
+
+/// Durable, identity-scoped snapshot of the most recent sweep attempt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactSweepLastReport {
+    pub at_ms: i64,
+    pub scope: String,
+    /// Completion covers the artifact cache lane. Whole-checkout cleanup has
+    /// its separate report on explicit sweep output.
+    pub complete: bool,
+    pub directories_reclaimed: usize,
+    pub entries_reclaimed: usize,
+    /// Logical regular-file lengths observed before entries whose unlink later
+    /// succeeded. Concurrent writers can change lengths between observation
+    /// and unlink; preparation-cache bytes are reported separately.
+    pub observed_logical_file_bytes: u64,
+    /// False when preparation recovery or tree removal could not account for
+    /// all progress. A partial tree-removal error does not expose its byte
+    /// counter.
+    pub bytes_accounting_complete: bool,
+    pub preparation_cache_bytes_reclaimed: u64,
+    pub blockers: ArtifactSweepBlockerSummary,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ArtifactSweepOutcome {
     pub directories_reclaimed: usize,
+    pub entries_reclaimed: usize,
+    /// Logical regular-file lengths observed before entries whose unlink later
+    /// succeeded. Concurrent writers can change lengths between observation
+    /// and unlink; preparation-cache bytes are reported separately.
+    pub observed_logical_file_bytes: u64,
+    /// Separately reported source so cache recovery remains auditable.
+    pub preparation_cache_bytes_reclaimed: u64,
+    pub bytes_accounting_complete: bool,
+    pub blockers: ArtifactSweepBlockerSummary,
+    /// Completion covers the artifact cache lane; auto-cleanup has its own
+    /// report and is not folded into this flag.
     pub complete: bool,
     /// The checkout auto-cleanup pass that ran in this sweep (#588), if any.
     pub auto_cleanup: Option<crate::AutoCleanupReport>,
+}
+
+impl ArtifactSweepOutcome {
+    fn no_work(complete: bool, auto_cleanup: Option<crate::AutoCleanupReport>) -> Self {
+        Self {
+            directories_reclaimed: 0,
+            entries_reclaimed: 0,
+            observed_logical_file_bytes: 0,
+            preparation_cache_bytes_reclaimed: 0,
+            bytes_accounting_complete: true,
+            blockers: ArtifactSweepBlockerSummary::default(),
+            complete,
+            auto_cleanup,
+        }
+    }
 }
 
 /// Result of an explicit `gc sweep`.
@@ -357,7 +443,20 @@ pub enum ArtifactSweepLegacyUnscopedState {
 /// Result of an explicit `gc sweep`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ArtifactSweepReport {
+    pub at_ms: i64,
+    pub scope: String,
     pub directories_reclaimed: usize,
+    pub entries_reclaimed: usize,
+    /// Logical regular-file lengths observed before entries whose unlink later
+    /// succeeded. Concurrent writers can change lengths between observation
+    /// and unlink; preparation-cache bytes are reported separately.
+    pub observed_logical_file_bytes: u64,
+    pub preparation_cache_bytes_reclaimed: u64,
+    pub bytes_accounting_complete: bool,
+    pub blockers: ArtifactSweepBlockerSummary,
+    pub headroom_threshold_bytes: u64,
+    /// Completion covers the artifact cache lane. Whole-checkout cleanup is
+    /// represented independently by `auto_cleanup`.
     pub complete: bool,
     pub budget_ms: u64,
     pub disk_pressured: bool,
@@ -486,10 +585,56 @@ struct BlockedInterruptedPath {
     reason: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArtifactSweepRemovalProgress {
+    entries_reclaimed: usize,
+    observed_logical_file_bytes: u64,
+    bytes_accounting_complete: bool,
+    complete: bool,
+}
+
+impl ArtifactSweepRemovalProgress {
+    fn no_work(complete: bool) -> Self {
+        Self {
+            entries_reclaimed: 0,
+            observed_logical_file_bytes: 0,
+            bytes_accounting_complete: true,
+            complete,
+        }
+    }
+}
+
 fn bounded_artifact_diagnostic_path(path: &str) -> String {
     path.chars()
         .take(ARTIFACT_SWEEP_DIAGNOSTIC_PATH_MAX_CHARS)
         .collect()
+}
+
+fn summarize_artifact_sweep_blockers(
+    blocked: &[BlockedInterruptedPath],
+) -> ArtifactSweepBlockerSummary {
+    let mut by_reason = BTreeMap::new();
+    for blocker in blocked {
+        *by_reason.entry(blocker.reason.to_string()).or_insert(0) += 1;
+    }
+    let example_limit = ARTIFACT_SWEEP_BLOCKED_DIAGNOSTICS_MAX.saturating_sub(1);
+    let examples = blocked
+        .iter()
+        .take(example_limit)
+        .map(|blocker| ArtifactSweepBlockerExample {
+            path: blocker
+                .path
+                .as_deref()
+                .map(bounded_artifact_diagnostic_path),
+            reason: blocker.reason.to_string(),
+        })
+        .collect::<Vec<_>>();
+    ArtifactSweepBlockerSummary {
+        total: blocked.len(),
+        by_reason,
+        omitted_examples: blocked.len().saturating_sub(examples.len()),
+        examples,
+    }
 }
 
 struct ScopedArtifactSweepWriter<'a> {
@@ -816,6 +961,10 @@ fn artifact_sweep_budget_ms(
             policy_budget_ms.saturating_mul(urgency.budget_scale())
         }
     }
+}
+
+fn artifact_sweep_headroom_threshold(configured_bytes: u64) -> u64 {
+    configured_bytes.max(crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES)
 }
 
 fn scope_runs_checkout_cleanup(scope: ArtifactSweepScope) -> bool {
@@ -3157,10 +3306,11 @@ fn scoped_artifact_sweep_key(namespace: &str, legacy_key: &str) -> String {
     format!("gc.artifact_sweep.v2.{namespace}.{suffix}")
 }
 
-fn bounded_legacy_artifact_sweep_meta_get(
+fn bounded_text_meta_get(
     store: &crate::BrokerStore,
     key: &str,
     max_bytes: usize,
+    field_label: &str,
 ) -> Result<Option<String>, BrokerOpError> {
     let value = store
         .connection()
@@ -3193,17 +3343,24 @@ fn bounded_legacy_artifact_sweep_meta_get(
             String::from_utf8(bytes)
                 .map(Some)
                 .map_err(|_| BrokerOpError::InvalidStorageContext {
-                    reason: format!("legacy artifact-sweep field {key} is not UTF-8")
-                        .into_boxed_str(),
+                    reason: format!("{field_label} {key} is not UTF-8").into_boxed_str(),
                 })
         }
         Some(_) => Err(BrokerOpError::InvalidStorageContext {
             reason: format!(
-                "legacy artifact-sweep field {key} is non-text or exceeds its {max_bytes}-byte inspection bound"
+                "{field_label} {key} is non-text or exceeds its {max_bytes}-byte inspection bound"
             )
             .into_boxed_str(),
         }),
     }
+}
+
+fn bounded_legacy_artifact_sweep_meta_get(
+    store: &crate::BrokerStore,
+    key: &str,
+    max_bytes: usize,
+) -> Result<Option<String>, BrokerOpError> {
+    bounded_text_meta_get(store, key, max_bytes, "legacy artifact-sweep field")
 }
 
 impl Broker {
@@ -3268,6 +3425,71 @@ impl Broker {
         let key = self.artifact_sweep_key(legacy_key)?;
         self.store().meta_set(&key, value)?;
         Ok(())
+    }
+
+    pub(crate) fn last_artifact_sweep_report(
+        &self,
+    ) -> Result<Option<ArtifactSweepLastReport>, BrokerOpError> {
+        let namespace = self.storage_context().artifact_sweep_namespace()?;
+        let key = scoped_artifact_sweep_key(&namespace, ARTIFACT_SWEEP_LAST_REPORT_KEY);
+        let Some(value) = bounded_text_meta_get(
+            self.store(),
+            &key,
+            ARTIFACT_SWEEP_LAST_REPORT_MAX_BYTES,
+            "scoped artifact-sweep report",
+        )?
+        else {
+            return Ok(None);
+        };
+        serde_json::from_str(&value).map(Some).map_err(|error| {
+            BrokerOpError::InvalidStorageContext {
+                reason: format!("scoped artifact-sweep report is invalid JSON: {error}")
+                    .into_boxed_str(),
+            }
+        })
+    }
+
+    fn persist_last_artifact_sweep_report(
+        &mut self,
+        at_ms: i64,
+        scope: ArtifactSweepScope,
+        outcome: &ArtifactSweepOutcome,
+    ) -> Result<(), BrokerOpError> {
+        let mut report = ArtifactSweepLastReport {
+            at_ms,
+            scope: scope.label(),
+            complete: outcome.complete,
+            directories_reclaimed: outcome.directories_reclaimed,
+            entries_reclaimed: outcome.entries_reclaimed,
+            observed_logical_file_bytes: outcome.observed_logical_file_bytes,
+            bytes_accounting_complete: outcome.bytes_accounting_complete,
+            preparation_cache_bytes_reclaimed: outcome.preparation_cache_bytes_reclaimed,
+            blockers: outcome.blockers.clone(),
+        };
+        loop {
+            let encoded = serde_json::json!(&report).to_string();
+            if encoded.len() <= ARTIFACT_SWEEP_LAST_REPORT_MAX_BYTES {
+                return self.artifact_sweep_meta_set(ARTIFACT_SWEEP_LAST_REPORT_KEY, &encoded);
+            }
+            if report.blockers.examples.pop().is_none() {
+                return Err(BrokerOpError::InvalidStorageContext {
+                    reason: "scoped artifact-sweep report exceeds its bounded metadata size after examples are omitted".into(),
+                });
+            }
+            report.blockers.omitted_examples = report.blockers.omitted_examples.saturating_add(1);
+        }
+    }
+
+    fn record_last_artifact_sweep_report(
+        &mut self,
+        at_ms: i64,
+        scope: ArtifactSweepScope,
+        outcome: &ArtifactSweepOutcome,
+    ) -> bool {
+        let result = self.persist_last_artifact_sweep_report(at_ms, scope, outcome);
+        let recorded = result.is_ok();
+        crate::warn_unrecorded("record last artifact-sweep report", result);
+        recorded
     }
 
     /// Inspect the nine pre-v2 sweep keys within their write bounds. Any
@@ -5420,7 +5642,17 @@ impl Broker {
             self.maybe_start_artifact_sweep_worker(false),
         );
         Ok(ArtifactSweepReport {
+            at_ms: now_ms(),
+            scope: ArtifactSweepScope::Drain.label(),
             directories_reclaimed: outcome.directories_reclaimed,
+            entries_reclaimed: outcome.entries_reclaimed,
+            observed_logical_file_bytes: outcome.observed_logical_file_bytes,
+            preparation_cache_bytes_reclaimed: outcome.preparation_cache_bytes_reclaimed,
+            bytes_accounting_complete: outcome.bytes_accounting_complete,
+            blockers: outcome.blockers,
+            headroom_threshold_bytes: artifact_sweep_headroom_threshold(
+                policy.artifact_sweep_headroom_bytes,
+            ),
             complete: outcome.complete,
             budget_ms,
             disk_pressured: urgency == crate::disk_headroom::SweepUrgency::Pressured,
@@ -7397,6 +7629,8 @@ impl Broker {
     ) -> (u64, crate::disk_headroom::SweepUrgency) {
         let main_root = self.main_root().to_path_buf();
         let roots = self.artifact_sweep_budget_roots(scope);
+        let required_headroom_bytes =
+            artifact_sweep_headroom_threshold(policy.artifact_sweep_headroom_bytes);
         // One free-space sample per filesystem: many hundreds of session
         // roots may share the same mounted volume.
         let mut sampled_devices = BTreeSet::new();
@@ -7422,7 +7656,7 @@ impl Broker {
                 crate::disk_headroom::available_headroom_at_or_above_for(&main_root, &path);
             if crate::disk_headroom::sweep_urgency_with_inodes(
                 headroom.map(|value| value.bytes),
-                crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES,
+                required_headroom_bytes,
                 headroom.and_then(|value| value.inodes),
                 crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
             ) == crate::disk_headroom::SweepUrgency::Pressured
@@ -7500,9 +7734,9 @@ impl Broker {
         deadline: Instant,
         blocked: &mut Vec<BlockedInterruptedPath>,
         removed: &mut Vec<String>,
-    ) -> Result<(usize, bool), BrokerOpError> {
+    ) -> Result<ArtifactSweepRemovalProgress, BrokerOpError> {
         if candidates.is_empty() {
-            return Ok((0, true));
+            return Ok(ArtifactSweepRemovalProgress::no_work(true));
         }
         let Some(expected_cohort) = expected_cohort else {
             for path in candidates {
@@ -7511,7 +7745,7 @@ impl Broker {
                     reason: "closed_checkout_cohort_unavailable",
                 });
             }
-            return Ok((0, false));
+            return Ok(ArtifactSweepRemovalProgress::no_work(false));
         };
         let owner_session_id = expected_cohort.owner_session_id();
         let _lifecycle_claim = match self.try_claim_worktree_lifecycle() {
@@ -7523,7 +7757,7 @@ impl Broker {
                         reason: "worktree_lifecycle_contended",
                     });
                 }
-                return Ok((0, false));
+                return Ok(ArtifactSweepRemovalProgress::no_work(false));
             }
             Err(_) => {
                 for path in candidates {
@@ -7532,11 +7766,11 @@ impl Broker {
                         reason: "worktree_lifecycle_unavailable",
                     });
                 }
-                return Ok((0, false));
+                return Ok(ArtifactSweepRemovalProgress::no_work(false));
             }
         };
         if check_deadline(Some(deadline)) {
-            return Ok((0, false));
+            return Ok(ArtifactSweepRemovalProgress::no_work(false));
         }
         if crate::AutoCleanupPolicy::load(self.main_root())
             .ok()
@@ -7550,7 +7784,7 @@ impl Broker {
                     reason: "ignored_directory_policy_changed",
                 });
             }
-            return Ok((0, false));
+            return Ok(ArtifactSweepRemovalProgress::no_work(false));
         }
 
         let artifact_use_reclaimer =
@@ -7577,7 +7811,7 @@ impl Broker {
                             reason,
                         });
                     }
-                    return Ok((0, false));
+                    return Ok(ArtifactSweepRemovalProgress::no_work(false));
                 }
                 Err(_) => {
                     for path in candidates {
@@ -7586,11 +7820,11 @@ impl Broker {
                             reason: "artifact_use_inventory_unavailable",
                         });
                     }
-                    return Ok((0, false));
+                    return Ok(ArtifactSweepRemovalProgress::no_work(false));
                 }
             };
         if check_deadline(Some(deadline)) {
-            return Ok((0, false));
+            return Ok(ArtifactSweepRemovalProgress::no_work(false));
         }
         let current_cohort =
             self.closed_artifact_checkout_cohort_snapshot(owner_session_id, root, Some(deadline))?;
@@ -7601,7 +7835,7 @@ impl Broker {
                     reason: "closed_checkout_cohort_changed",
                 });
             }
-            return Ok((0, false));
+            return Ok(ArtifactSweepRemovalProgress::no_work(false));
         }
         if self
             .refuse_live_checkout_until(owner_session_id, root, deadline)
@@ -7613,7 +7847,7 @@ impl Broker {
                     reason: "live_checkout_or_alias_detected",
                 });
             }
-            return Ok((0, false));
+            return Ok(ArtifactSweepRemovalProgress::no_work(false));
         }
         let checkout_result = {
             let _git_deadline = crate::git::limit_git_until(deadline);
@@ -7628,12 +7862,14 @@ impl Broker {
                         reason: "ignored_directory_git_discovery_unavailable",
                     });
                 }
-                return Ok((0, false));
+                return Ok(ArtifactSweepRemovalProgress::no_work(false));
             }
         };
 
         let _artifact_use_reclaimer = artifact_use_reclaimer;
         let mut entries_reclaimed = 0usize;
+        let mut observed_logical_file_bytes = 0u64;
+        let mut bytes_accounting_complete = true;
         let mut complete = true;
         for path in candidates {
             if check_deadline(Some(deadline)) {
@@ -7789,7 +8025,7 @@ impl Broker {
                     final_revalidation_complete = true;
                     Ok(())
                 };
-                remove_condemned_tree_with_progress_and_guard(
+                remove_condemned_tree_with_progress_and_observed_file_bytes_and_guard(
                     path,
                     None,
                     Some(deadline),
@@ -7797,8 +8033,9 @@ impl Broker {
                 )
             };
             match removal_result {
-                Ok((TreeRemoval::Complete, count)) => {
+                Ok((TreeRemoval::Complete, count, bytes)) => {
                     entries_reclaimed = entries_reclaimed.saturating_add(count);
+                    observed_logical_file_bytes = observed_logical_file_bytes.saturating_add(bytes);
                     let mut updated_paths = queued_paths.clone();
                     updated_paths.retain(|queued| queued != &path_key);
                     match persist_interrupted_ignored_directories(
@@ -7821,12 +8058,14 @@ impl Broker {
                         Err(error) => return Err(error),
                     }
                 }
-                Ok((TreeRemoval::Interrupted, count)) => {
+                Ok((TreeRemoval::Interrupted, count, bytes)) => {
                     entries_reclaimed = entries_reclaimed.saturating_add(count);
+                    observed_logical_file_bytes = observed_logical_file_bytes.saturating_add(bytes);
                     complete = false;
                 }
                 Err(error) => {
                     entries_reclaimed = entries_reclaimed.saturating_add(error.entries_reclaimed);
+                    bytes_accounting_complete = false;
                     blocked.push(BlockedInterruptedPath {
                         path: Some(path_key),
                         reason: "ignored_directory_removal_unavailable",
@@ -7835,7 +8074,12 @@ impl Broker {
                 }
             }
         }
-        Ok((entries_reclaimed, complete))
+        Ok(ArtifactSweepRemovalProgress {
+            entries_reclaimed,
+            observed_logical_file_bytes,
+            bytes_accounting_complete,
+            complete,
+        })
     }
 
     fn sweep_artifacts_autonomously(
@@ -7951,14 +8195,7 @@ impl Broker {
             false
         };
         if inline_pass_spaced && policy.artifact_sweep_budget_ms != 0 {
-            return Ok((
-                ArtifactSweepOutcome {
-                    directories_reclaimed: 0,
-                    complete: true,
-                    auto_cleanup: None,
-                },
-                0,
-            ));
+            return Ok((ArtifactSweepOutcome::no_work(true, None), 0));
         }
         if policy.artifact_sweep_budget_ms == 0 {
             if scope_runs_checkout_cleanup(scope) {
@@ -7970,14 +8207,7 @@ impl Broker {
                     self.request_session_retirement_if_due(policy, scope),
                 );
             }
-            return Ok((
-                ArtifactSweepOutcome {
-                    directories_reclaimed: 0,
-                    complete: true,
-                    auto_cleanup: None,
-                },
-                0,
-            ));
+            return Ok((ArtifactSweepOutcome::no_work(true, None), 0));
         }
         let namespace = self.ensure_artifact_sweep_namespace()?;
         let closed_session_id = match scope {
@@ -8056,29 +8286,23 @@ impl Broker {
             } else {
                 None
             };
-            return Ok((
-                ArtifactSweepOutcome {
-                    directories_reclaimed: 0,
-                    complete: false,
-                    auto_cleanup,
-                },
-                0,
-            ));
+            let outcome = ArtifactSweepOutcome::no_work(false, auto_cleanup);
+            self.record_last_artifact_sweep_report(now, scope, &outcome);
+            return Ok((outcome, 0));
         }
         // A concurrent GC owns the artifact namespace; skip rather than race.
         let Ok(_lock) = GcLock::acquire(&main_root) else {
             return Ok((
-                ArtifactSweepOutcome {
-                    directories_reclaimed: 0,
+                ArtifactSweepOutcome::no_work(
                     // An explicit sweep did not inspect the namespace and
                     // must remain retryable while another GC owns its lock.
-                    complete: closed_session_id.is_none()
+                    closed_session_id.is_none()
                         && !matches!(
                             scope,
                             ArtifactSweepScope::AutomaticContinuation | ArtifactSweepScope::Drain
                         ),
-                    auto_cleanup: None,
-                },
+                    None,
+                ),
                 0,
             ));
         };
@@ -8111,6 +8335,8 @@ impl Broker {
             0
         };
         let mut preparation_entries_reclaimed = 0usize;
+        let mut preparation_cache_bytes_reclaimed = 0u64;
+        let mut preparation_bytes_accounting_complete = true;
         let mut scan_completed = !closed_cohort_index_failed;
         if closed_session_id.is_none() {
             // Cache roots are shared across repositories and clones, while the
@@ -8151,6 +8377,8 @@ impl Broker {
                 },
             };
             preparation_entries_reclaimed = preparation_sweep.filesystem_entries_reclaimed;
+            preparation_cache_bytes_reclaimed = preparation_sweep.bytes_reclaimed;
+            preparation_bytes_accounting_complete = preparation_sweep.complete;
             scan_completed &= preparation_sweep.complete;
             if preparation_sweep.entries_removed > 0 {
                 let payload = serde_json::json!({
@@ -8169,6 +8397,8 @@ impl Broker {
         }
         let mut removed = Vec::new();
         let mut entries_reclaimed = preparation_entries_reclaimed;
+        let mut observed_logical_file_bytes = 0u64;
+        let mut bytes_accounting_complete = preparation_bytes_accounting_complete;
         let mut eligible_worktree_seen = false;
         let cursor = self
             .artifact_sweep_meta_get(ARTIFACT_SWEEP_CURSOR_KEY)?
@@ -8659,21 +8889,24 @@ impl Broker {
                         .any(|ignored_root| dir.starts_with(ignored_root))
                 });
                 if let Some(cleanup_policy) = ignored_directory_policy.as_ref() {
-                    let (reclaimed, ignored_complete) = self
-                        .reclaim_ignored_directory_roots_under_claims(
-                            &root,
-                            expected_ignored_cohort.as_ref(),
-                            &ignored_directory_candidates,
-                            &namespace,
-                            &mut ignored_directory_paths,
-                            &mut ignored_directory_queue_valid,
-                            cleanup_policy,
-                            removal_deadline,
-                            &mut blocked_interrupted_paths,
-                            &mut removed,
-                        )?;
-                    entries_reclaimed = entries_reclaimed.saturating_add(reclaimed);
-                    if !ignored_complete {
+                    let ignored_progress = self.reclaim_ignored_directory_roots_under_claims(
+                        &root,
+                        expected_ignored_cohort.as_ref(),
+                        &ignored_directory_candidates,
+                        &namespace,
+                        &mut ignored_directory_paths,
+                        &mut ignored_directory_queue_valid,
+                        cleanup_policy,
+                        removal_deadline,
+                        &mut blocked_interrupted_paths,
+                        &mut removed,
+                    )?;
+                    entries_reclaimed =
+                        entries_reclaimed.saturating_add(ignored_progress.entries_reclaimed);
+                    observed_logical_file_bytes = observed_logical_file_bytes
+                        .saturating_add(ignored_progress.observed_logical_file_bytes);
+                    bytes_accounting_complete &= ignored_progress.bytes_accounting_complete;
+                    if !ignored_progress.complete {
                         session_scan_complete = false;
                     }
                 }
@@ -8899,7 +9132,7 @@ impl Broker {
                             Ok(())
                         }
                     };
-                    remove_condemned_tree_with_progress_and_guard(
+                    remove_condemned_tree_with_progress_and_observed_file_bytes_and_guard(
                         &dir,
                         deferrable,
                         Some(removal_deadline),
@@ -8907,8 +9140,10 @@ impl Broker {
                     )
                 };
                 match removal_result {
-                    Ok((TreeRemoval::Complete, count)) => {
+                    Ok((TreeRemoval::Complete, count, bytes)) => {
                         entries_reclaimed = entries_reclaimed.saturating_add(count);
+                        observed_logical_file_bytes =
+                            observed_logical_file_bytes.saturating_add(bytes);
                         let mut updated_paths = interrupted_paths.clone();
                         updated_paths.retain(|path| path != &dir_key);
                         match persist_interrupted_paths(self.store(), &namespace, &updated_paths) {
@@ -8927,13 +9162,16 @@ impl Broker {
                     }
                     // The path was durably queued before any unlink. The next
                     // pass will retry it even if removal consumed its witness.
-                    Ok((TreeRemoval::Interrupted, count)) => {
+                    Ok((TreeRemoval::Interrupted, count, bytes)) => {
                         entries_reclaimed = entries_reclaimed.saturating_add(count);
+                        observed_logical_file_bytes =
+                            observed_logical_file_bytes.saturating_add(bytes);
                         session_scan_complete = false;
                     }
                     Err(error) => {
                         entries_reclaimed =
                             entries_reclaimed.saturating_add(error.entries_reclaimed);
+                        bytes_accounting_complete = false;
                         blocked_interrupted_paths.push(BlockedInterruptedPath {
                             path: Some(dir_key),
                             reason: "removal_unavailable",
@@ -9101,14 +9339,14 @@ impl Broker {
                 .then_with(|| left.reason.cmp(right.reason))
         });
         blocked_interrupted_paths.dedup();
-        let omitted_blocked_diagnostics = blocked_interrupted_paths.len()
-            > ARTIFACT_SWEEP_BLOCKED_DIAGNOSTICS_MAX.saturating_sub(1);
-        let mut blocked = blocked_interrupted_paths
+        let blocker_summary = summarize_artifact_sweep_blockers(&blocked_interrupted_paths);
+        let omitted_blocked_diagnostics = blocker_summary.omitted_examples > 0;
+        let mut blocked = blocker_summary
+            .examples
             .iter()
-            .take(ARTIFACT_SWEEP_BLOCKED_DIAGNOSTICS_MAX.saturating_sub(1))
             .map(|blocked| {
                 serde_json::json!({
-                    "path": blocked.path.as_deref().map(bounded_artifact_diagnostic_path),
+                    "path": blocked.path,
                     "reason": blocked.reason,
                 })
             })
@@ -9201,14 +9439,18 @@ impl Broker {
         } else {
             None
         };
-        Ok((
-            ArtifactSweepOutcome {
-                directories_reclaimed: removed.len(),
-                complete: scan_completed,
-                auto_cleanup,
-            },
+        let outcome = ArtifactSweepOutcome {
+            directories_reclaimed: removed.len(),
             entries_reclaimed,
-        ))
+            observed_logical_file_bytes,
+            preparation_cache_bytes_reclaimed,
+            bytes_accounting_complete,
+            blockers: blocker_summary,
+            complete: scan_completed,
+            auto_cleanup,
+        };
+        self.record_last_artifact_sweep_report(now, scope, &outcome);
+        Ok((outcome, entries_reclaimed))
     }
 
     /// Apply or resume an authorized plan. A budget is used by amortized
@@ -11240,6 +11482,7 @@ mod tests {
                             directories_reclaimed: 0,
                             complete: false,
                             auto_cleanup: None,
+                            ..ArtifactSweepOutcome::no_work(false, None)
                         },
                         0,
                     ))
@@ -11280,8 +11523,10 @@ mod tests {
                     Ok((
                         ArtifactSweepOutcome {
                             directories_reclaimed: 1,
+                            entries_reclaimed: 1,
                             complete: true,
                             auto_cleanup: None,
+                            ..ArtifactSweepOutcome::no_work(true, None)
                         },
                         1,
                     ))
@@ -12226,8 +12471,10 @@ mod tests {
                     Ok((
                         ArtifactSweepOutcome {
                             directories_reclaimed: 1,
+                            entries_reclaimed: 1,
                             complete: false,
                             auto_cleanup: None,
+                            ..ArtifactSweepOutcome::no_work(false, None)
                         },
                         1,
                     ))
@@ -12275,8 +12522,10 @@ mod tests {
                     Ok((
                         ArtifactSweepOutcome {
                             directories_reclaimed: 1,
+                            entries_reclaimed: 1,
                             complete: true,
                             auto_cleanup: None,
+                            ..ArtifactSweepOutcome::no_work(true, None)
                         },
                         1,
                     ))
@@ -12330,6 +12579,7 @@ mod tests {
                             directories_reclaimed: 0,
                             complete: false,
                             auto_cleanup: None,
+                            ..ArtifactSweepOutcome::no_work(false, None)
                         },
                         1,
                     ))
@@ -12430,6 +12680,134 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn blocker_summary_keeps_exact_reason_counts_before_example_cap() {
+        let blocked = (0..40)
+            .map(|index| BlockedInterruptedPath {
+                path: Some(format!("/worktree/cache-{index}")),
+                reason: if index < 23 {
+                    "removal_unavailable"
+                } else {
+                    "queue_update_unavailable"
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let summary = summarize_artifact_sweep_blockers(&blocked);
+
+        assert_eq!(summary.total, 40);
+        assert_eq!(summary.by_reason.get("removal_unavailable"), Some(&23));
+        assert_eq!(summary.by_reason.get("queue_update_unavailable"), Some(&17));
+        assert_eq!(
+            summary.examples.len(),
+            ARTIFACT_SWEEP_BLOCKED_DIAGNOSTICS_MAX - 1
+        );
+        assert_eq!(summary.omitted_examples, 9);
+    }
+
+    #[test]
+    fn last_artifact_sweep_report_survives_broker_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(root.path().join("README.md"), "fixture\n").unwrap();
+        git(root.path(), &["add", "README.md"]);
+        git(root.path(), &["commit", "-qm", "init"]);
+        std::fs::create_dir_all(root.path().join(".aethyme")).unwrap();
+        std::fs::write(
+            root.path().join(".aethyme/broker.toml"),
+            "[retention]\nartifact_sweep_budget_ms = 0\n",
+        )
+        .unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root.path()).unwrap();
+        let mut outcome = ArtifactSweepOutcome::no_work(false, None);
+        outcome.directories_reclaimed = 2;
+        outcome.entries_reclaimed = 7;
+        outcome.observed_logical_file_bytes = 4096;
+        outcome.preparation_cache_bytes_reclaimed = 512;
+        outcome.blockers = ArtifactSweepBlockerSummary {
+            total: 1,
+            by_reason: BTreeMap::from([("removal_unavailable".into(), 1)]),
+            omitted_examples: 0,
+            examples: vec![ArtifactSweepBlockerExample {
+                path: Some("/worktree/target".into()),
+                reason: "removal_unavailable".into(),
+            }],
+        };
+        broker
+            .persist_last_artifact_sweep_report(
+                1234,
+                ArtifactSweepScope::ClosedSession(77),
+                &outcome,
+            )
+            .unwrap();
+        drop(broker);
+
+        let mut reopened = storage.open(root.path()).unwrap();
+        reopened.artifact_sweep_namespace.take();
+        let report = reopened.last_artifact_sweep_report().unwrap().unwrap();
+        assert!(reopened.artifact_sweep_namespace.get().is_none());
+        assert_eq!(report.at_ms, 1234);
+        assert_eq!(report.scope, "closed_session:77");
+        assert!(!report.complete);
+        assert_eq!(report.directories_reclaimed, 2);
+        assert_eq!(report.entries_reclaimed, 7);
+        assert_eq!(report.observed_logical_file_bytes, 4096);
+        assert_eq!(report.preparation_cache_bytes_reclaimed, 512);
+        assert_eq!(report.blockers.total, 1);
+        assert_eq!(
+            report.blockers.by_reason.get("removal_unavailable"),
+            Some(&1)
+        );
+
+        let namespace = reopened
+            .storage_context()
+            .artifact_sweep_namespace()
+            .unwrap();
+        let key = scoped_artifact_sweep_key(&namespace, ARTIFACT_SWEEP_LAST_REPORT_KEY);
+        reopened.store().meta_set(&key, "{").unwrap();
+        assert!(reopened.last_artifact_sweep_report().is_err());
+    }
+
+    #[test]
+    fn last_artifact_sweep_report_write_failure_is_advisory() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(root.path().join("README.md"), "fixture\n").unwrap();
+        git(root.path(), &["add", "README.md"]);
+        git(root.path(), &["commit", "-qm", "init"]);
+        std::fs::create_dir_all(root.path().join(".aethyme")).unwrap();
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root.path()).unwrap();
+        let namespace = broker.storage_context().artifact_sweep_namespace().unwrap();
+        let key = scoped_artifact_sweep_key(&namespace, ARTIFACT_SWEEP_LAST_REPORT_KEY);
+        let quoted_key = key.replace('\'', "''");
+        broker
+            .store()
+            .connection()
+            .execute("DELETE FROM meta WHERE key = ?1", [&key])
+            .unwrap();
+        broker
+            .store()
+            .connection()
+            .execute_batch(&format!(
+                "CREATE TRIGGER reject_last_sweep_report BEFORE INSERT ON meta \
+                 WHEN NEW.key = '{quoted_key}' BEGIN \
+                 SELECT RAISE(ABORT, 'injected last-report write failure'); END;"
+            ))
+            .unwrap();
+
+        let outcome = ArtifactSweepOutcome::no_work(false, None);
+        assert!(!broker.record_last_artifact_sweep_report(
+            1234,
+            ArtifactSweepScope::Inline,
+            &outcome,
+        ));
+        assert_eq!(broker.last_artifact_sweep_report().unwrap(), None);
     }
 
     #[cfg(unix)]
@@ -15616,6 +15994,28 @@ mod tests {
                 60_000
             );
         }
+    }
+
+    #[test]
+    fn proactive_sweep_headroom_uses_configured_threshold_but_keeps_gate_floor() {
+        let gib = 1024u64 * 1024 * 1024;
+        let configured = 16 * gib;
+        let threshold = artifact_sweep_headroom_threshold(configured);
+        assert_eq!(threshold, configured);
+        assert_eq!(
+            crate::disk_headroom::sweep_urgency_with_inodes(
+                Some(12 * gib),
+                threshold,
+                Some(crate::disk_headroom::MIN_GATE_HEADROOM_INODES),
+                crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
+            ),
+            SweepUrgency::Pressured,
+            "the proactive threshold should accelerate cleanup before the 8 GiB gate floor"
+        );
+        assert_eq!(
+            artifact_sweep_headroom_threshold(0),
+            crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES
+        );
     }
 
     #[test]

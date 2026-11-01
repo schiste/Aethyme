@@ -1775,7 +1775,7 @@ gate_results_days = 30
 terminal_merge_queue_days = 180
 command_metrics_days = 30
 closed_worktrees_days = 7
-closed_worktree_grace_hours = 360
+closed_worktree_grace_hours = 120
 publication_exposure_days = 30
 retained_bytes_budget = 1073741824
 artifact_reclaim_days = 0
@@ -1783,6 +1783,7 @@ orphan_worktree_roots_days = 1
 session_abandoned_after_hours = 72
 idle_session_artifact_hours = 24
 artifact_sweep_budget_ms = 5000
+artifact_sweep_headroom_bytes = 17179869184
 artifact_sweep_interval_hours = 24
 artefact_directories = [] # e.g. [".pnpm-store"]; additive to built-ins
 startup_budget_ms = 25
@@ -1817,6 +1818,13 @@ outputs. Raise `artifact_reclaim_days` to trade disk space for faster worktree
 reuse, or set `artifact_sweep_budget_ms = 0` to disable autonomous cache
 reclamation entirely.
 
+`artifact_sweep_headroom_bytes` (default 16 GiB) is the proactive free-space
+threshold for pressure-scaled cache cleanup. Setting it to `0` uses the
+existing 8 GiB gate safety floor. This changes only bounded sweep cadence and
+budget; it does not change gate admission or grant deletion authority. Older
+binaries report and ignore this field while continuing to apply the retention
+settings they understand.
+
 `closed_worktrees_days` applies only to closed worktrees without representation
 proof: it is the age grace period before GC reports a `retention_age` blocker.
 Worktrees whose cleanup proof represents their contribution are eligible
@@ -1824,13 +1832,13 @@ regardless of age, while their build caches remain governed by
 `artifact_reclaim_days`. The age setting never authorizes removal of an
 unproven contribution.
 
-`closed_worktree_grace_hours` (default 360 hours / 15 days, `0` for none) is how long GC waits
+`closed_worktree_grace_hours` (default 120 hours / 5 days, `0` for none) is how long GC waits
 after a state-only close (`aethyme broker finish close`) before proposing the
 checkout it kept. A clean checkout whose work is represented on a delivery
 target is proposed once the grace period has passed; until then the plan
 reports a `closed_worktree_grace` blocker with the checkout's bytes. Explicit
 cleanup does not wait: `finish cleanup <id>` and `finish cleanup --all-cleaned`
-both skip the grace period, so for up to 15 days after a close `gc plan` can
+both skip the grace period, so for up to 5 days after a close `gc plan` can
 list fewer worktree candidates than `finish cleanup --all-cleaned` does. A closed session's checkout that a live session
 now uses is never proposed (`live_worktree`), and a closed adopted checkout is
 only reported (`adopted_worktree`): the broker did not create it and GC never
@@ -2071,14 +2079,23 @@ worktrees, and it skips live sessions. It runs at most once per
 stays off the hot path of every broker command. If that budget expires before a
 backlog is scanned, the remaining caches are not held for a full interval: a
 broker open continues the pass at most once every 10 minutes (every ~25 seconds
-below the gate headroom), `finish` continues it with the full budget, and
-`gc sweep` runs a full-budget pass on demand. Its cadence stamp lives in the
+below the configured proactive headroom threshold), `finish` continues it with
+the full budget, and `gc sweep` runs a full-budget pass on demand. Its cadence stamp lives in the
 broker database rather than under `.aethyme/`, where a durable runtime file would
 register as a dirty path to the checkout-cleanliness gates. A sweep with no
 closed worktree does not consume the cadence window, so the first command after
 a session closes can reclaim its caches. With an explicitly disabled policy, or
 to clear an existing backlog immediately, use `gc sweep` (which needs the policy enabled), or `gc plan` and digest-confirmed
 `gc apply`.
+
+`gc sweep` reports logical regular-file sizes observed during traversal for
+entries whose unlink later succeeded, preparation-cache bytes separately, and
+exact blocker counts. Concurrent writes can change file sizes before unlink,
+and neither byte field measures physical space returned to the volume. The
+scoped last-pass snapshot is available as
+`cleanup_retention.last_artifact_sweep` in `broker status --json`. Completion
+describes the artifact-cache lane, while whole-checkout cleanup has a separate
+report.
 
 Worktree storage is host-scoped while the records that own it are
 repository-local, so a deleted repository leaves a worktree tree that no database

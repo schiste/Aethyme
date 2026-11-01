@@ -846,6 +846,8 @@ fn cleanup_retention_severity_scales_by_count_bytes_and_policy_age() {
         worktree_inode_unmeasured: 0,
         severity: super::StatusAdviceSeverity::Warning,
         retention_config: Default::default(),
+        last_artifact_sweep: None,
+        last_artifact_sweep_error: None,
     };
     let unmeetable = super::cleanup_retention_warning(&retention).unwrap();
     assert!(unmeetable.contains("aethyme broker gc plan"));
