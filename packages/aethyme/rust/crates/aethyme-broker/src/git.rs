@@ -6460,62 +6460,185 @@ impl GitRepo {
         }
     }
 
+    fn verify_fresh_sparse_recovery_worktree(
+        &self,
+        dest: &Path,
+        branch: &str,
+        base: &str,
+    ) -> Result<GitRepo, GitError> {
+        let expected_base = self.resolve_commit_checked(base)?;
+        let expected_branch = format!("refs/heads/{branch}");
+        let destination = dest.canonicalize().map_err(|source| GitError::Spawn {
+            args: format!("canonicalize sparse recovery path {}", dest.display()),
+            source,
+        })?;
+        let inventory = self.worktree_inventory()?;
+        let matching = inventory
+            .iter()
+            .filter(|entry| {
+                entry.path == dest
+                    || entry.path.canonicalize().ok().as_deref() == Some(destination.as_path())
+            })
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Err(GitError::UntrustedOutput {
+                detail: format!(
+                    "expected one registered worktree at {}, found {}",
+                    dest.display(),
+                    matching.len()
+                ),
+            });
+        }
+        let entry = matching[0];
+        if entry.prunable
+            || entry.bare
+            || entry.detached
+            || entry.locked
+            || entry.branch.as_deref() != Some(expected_branch.as_str())
+            || entry.head.as_deref() != Some(expected_base.as_str())
+        {
+            return Err(GitError::UntrustedOutput {
+                detail: format!(
+                    "worktree at {} no longer has branch {expected_branch} at {expected_base}",
+                    dest.display()
+                ),
+            });
+        }
+        let branch_tip = run_git(&self.root, &["rev-parse", "--verify", &expected_branch])?;
+        if branch_tip != expected_base {
+            return Err(GitError::UntrustedOutput {
+                detail: format!(
+                    "branch {expected_branch} moved from {expected_base} to {branch_tip}"
+                ),
+            });
+        }
+
+        let worktree = GitRepo::discover(dest)?;
+        let discovered_root = worktree
+            .root()
+            .canonicalize()
+            .map_err(|source| GitError::Spawn {
+                args: format!("canonicalize discovered worktree {}", worktree.root().display()),
+                source,
+            })?;
+        if discovered_root != destination {
+            return Err(GitError::UntrustedOutput {
+                detail: format!(
+                    "Git discovered {} for sparse recovery path {}",
+                    discovered_root.display(),
+                    dest.display()
+                ),
+            });
+        }
+        let expected_common = self.git_common_dir()?.canonicalize().map_err(|source| {
+            GitError::Spawn {
+                args: "canonicalize repository git common directory".into(),
+                source,
+            }
+        })?;
+        let actual_common = worktree.git_common_dir()?.canonicalize().map_err(|source| {
+            GitError::Spawn {
+                args: "canonicalize sparse worktree git common directory".into(),
+                source,
+            }
+        })?;
+        if actual_common != expected_common
+            || worktree.current_branch()? != branch
+            || worktree.head_commit()? != expected_base
+        {
+            return Err(GitError::UntrustedOutput {
+                detail: format!(
+                    "discovered checkout at {} is not the expected branch {expected_branch} at {expected_base}",
+                    dest.display()
+                ),
+            });
+        }
+
+        let dirty_paths = worktree.dirty_paths()?;
+        if !dirty_paths.is_empty() {
+            return Err(GitError::UntrustedOutput {
+                detail: format!(
+                    "worktree at {} has tracked or untracked changes ({})",
+                    dest.display(),
+                    dirty_paths.len()
+                ),
+            });
+        }
+        let untracked_paths = worktree.untracked_paths_readonly()?;
+        if !untracked_paths.is_empty() {
+            return Err(GitError::UntrustedOutput {
+                detail: format!(
+                    "worktree at {} has untracked files ({})",
+                    dest.display(),
+                    untracked_paths.len()
+                ),
+            });
+        }
+        let ignored_paths = worktree.ignored_paths_readonly()?;
+        if !ignored_paths.is_empty() {
+            return Err(GitError::UntrustedOutput {
+                detail: format!(
+                    "worktree at {} has ignored files that recovery could overwrite ({})",
+                    dest.display(),
+                    ignored_paths.len()
+                ),
+            });
+        }
+        Ok(worktree)
+    }
+
+    fn sparse_recovery_retained_error(
+        dest: &Path,
+        branch: &str,
+        base: &str,
+        reason: impl std::fmt::Display,
+    ) -> GitError {
+        GitError::Git {
+            args: "sparse-checkout recovery".into(),
+            stderr: format!(
+                "{reason}; partial worktree retained at {} on branch {branch} (expected base {base}); inspect it before cleanup",
+                dest.display()
+            ),
+        }
+    }
+
     fn restore_full_checkout_after_sparse_failure(
         &self,
         dest: &Path,
         branch: &str,
         base: &str,
     ) -> Result<GitRepo, GitError> {
-        let in_place = (|| {
-            run_git(dest, &["sparse-checkout", "disable"])?;
-            // `disable` restores sparse-omitted files. Reset against the
-            // selected base as a second check that the fresh checkout is full.
-            run_git(dest, &["reset", "--hard", base])?;
-            GitRepo::discover(dest)
-        })();
-        let in_place_error = match in_place {
-            Ok(repo) => return Ok(repo),
-            Err(error) => error,
-        };
-
-        // Older Git versions may not have `sparse-checkout`, or the command
-        // may have failed before it could establish worktree-local settings.
-        // This checkout has not been returned to a caller yet, so it contains
-        // no session edits; remove it, then recreate its unchanged branch tip
-        // with the ordinary full-checkout path.
-        self.worktree_remove(dest, true).map_err(|remove_error| GitError::Git {
-            args: "remove partial sparse worktree".into(),
-            stderr: format!(
-                "in-place full-checkout recovery failed: {in_place_error}; removing the fresh partial worktree failed: {remove_error}"
-            ),
-        })?;
-        let expected_base = run_git(&self.root, &["rev-parse", "--verify", base])?;
-        let branch_tip = run_git(&self.root, &["rev-parse", "--verify", branch])?;
-        if branch_tip != expected_base {
-            return Err(GitError::Git {
-                args: format!("verify fresh branch {branch}"),
-                stderr: format!(
-                    "branch moved during sparse-checkout recovery (expected {expected_base}, found {branch_tip}); it was preserved"
-                ),
-            });
-        }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| GitError::Spawn {
-                args: format!("create_dir_all {}", parent.display()),
-                source,
+        // The fresh path is not yet handed to a caller, but hooks or another
+        // process can still write there. Prove its identity and contents before
+        // disabling sparsity, and retain it if the proof or recovery fails.
+        // Never use reset --hard or force removal on this recovery path.
+        let worktree = self
+            .verify_fresh_sparse_recovery_worktree(dest, branch, base)
+            .map_err(|error| {
+                Self::sparse_recovery_retained_error(
+                    dest,
+                    branch,
+                    base,
+                    format!("refusing recovery because checkout identity or cleanliness is unproven: {error}"),
+                )
             })?;
-        }
-        run_git(
-            &self.root,
-            &["worktree", "add", dest.to_str().unwrap_or_default(), branch],
-        )
-        .map_err(|recreate_error| GitError::Git {
-            args: "recreate full worktree after sparse-checkout failure".into(),
-            stderr: format!(
-                "in-place full-checkout recovery failed: {in_place_error}; full worktree recreation failed: {recreate_error}"
-            ),
+        run_git(worktree.root(), &["sparse-checkout", "disable"]).map_err(|error| {
+            Self::sparse_recovery_retained_error(
+                dest,
+                branch,
+                base,
+                format!("could not disable sparse checkout: {error}"),
+            )
         })?;
-        GitRepo::discover(dest)
+        self.verify_fresh_sparse_recovery_worktree(dest, branch, base)
+            .map_err(|error| {
+                Self::sparse_recovery_retained_error(
+                    dest,
+                    branch,
+                    base,
+                    format!("full-checkout verification failed: {error}"),
+                )
+            })
     }
 
     /// Remove a linked worktree. `force` discards uncommitted changes —
@@ -10832,7 +10955,18 @@ mod sparse_worktree_tests {
                 "agent/fallback",
                 &base,
                 &["included".to_string()],
-                |_, _| {
+                |worktree, _| {
+                    git(
+                        worktree,
+                        &[
+                            "sparse-checkout",
+                            "set",
+                            "--cone",
+                            "--no-sparse-index",
+                            "--",
+                            "included",
+                        ],
+                    );
                     Err(GitError::Git {
                         args: "sparse-checkout set".into(),
                         stderr: "injected failure".into(),
@@ -10854,6 +10988,117 @@ mod sparse_worktree_tests {
         );
         assert!(worktree.dirty_paths().unwrap().is_empty());
         repo.worktree_remove(&worktree_path, false).unwrap();
+    }
+
+    #[test]
+    fn sparse_recovery_retains_tracked_and_untracked_edits() {
+        let (fixture, root) = repository();
+        let repo = GitRepo::discover(&root).unwrap();
+        let base = repo.head_commit().unwrap();
+        let worktree_path = fixture.path().join("linked/dirty-fallback");
+        let error = match repo.worktree_add_with_sparse_paths_using(
+            &worktree_path,
+            "agent/dirty-fallback",
+            &base,
+            &["included".to_string()],
+            |worktree, _| {
+                git(
+                    worktree,
+                    &[
+                        "sparse-checkout",
+                        "set",
+                        "--cone",
+                        "--no-sparse-index",
+                        "--",
+                        "included",
+                    ],
+                );
+                std::fs::write(
+                    worktree.join("included/source.rs"),
+                    "tracked recovery sentinel",
+                )
+                .unwrap();
+                std::fs::write(
+                    worktree.join("included/untracked-recovery-sentinel.txt"),
+                    "untracked recovery sentinel",
+                )
+                .unwrap();
+                Err(GitError::Git {
+                    args: "sparse-checkout set".into(),
+                    stderr: "injected failure after edits".into(),
+                })
+            },
+        ) {
+            Ok(_) => panic!("dirty sparse recovery unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        let error_text = error.to_string();
+        assert!(error_text.contains("partial worktree retained"), "{error_text}");
+        let tracked = worktree_path.join("included/source.rs");
+        assert_eq!(
+            std::fs::read_to_string(tracked).unwrap(),
+            "tracked recovery sentinel"
+        );
+        let untracked = worktree_path.join("included/untracked-recovery-sentinel.txt");
+        assert_eq!(
+            std::fs::read_to_string(untracked).unwrap(),
+            "untracked recovery sentinel"
+        );
+        let retained = GitRepo::discover(&worktree_path).unwrap();
+        assert_eq!(retained.current_branch().unwrap(), "agent/dirty-fallback");
+        assert_eq!(retained.head_commit().unwrap(), base);
+    }
+
+    #[test]
+    fn sparse_recovery_retains_a_worktree_whose_head_moved() {
+        let (fixture, root) = repository();
+        let repo = GitRepo::discover(&root).unwrap();
+        let base = repo.head_commit().unwrap();
+        let worktree_path = fixture.path().join("linked/moved-head");
+        let error = match repo.worktree_add_with_sparse_paths_using(
+            &worktree_path,
+            "agent/moved-head",
+            &base,
+            &["included".to_string()],
+            |worktree, _| {
+                git(
+                    worktree,
+                    &[
+                        "sparse-checkout",
+                        "set",
+                        "--cone",
+                        "--no-sparse-index",
+                        "--",
+                        "included",
+                    ],
+                );
+                std::fs::write(
+                    worktree.join("included/source.rs"),
+                    "moved head recovery sentinel",
+                )
+                .unwrap();
+                git(worktree, &["add", "included/source.rs"]);
+                git(worktree, &["commit", "-qm", "move sparse recovery head"]);
+                Err(GitError::Git {
+                    args: "sparse-checkout set".into(),
+                    stderr: "injected failure after head move".into(),
+                })
+            },
+        ) {
+            Ok(_) => panic!("moved-head sparse recovery unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        let error_text = error.to_string();
+        assert!(error_text.contains("partial worktree retained"), "{error_text}");
+        let retained = GitRepo::discover(&worktree_path).unwrap();
+        assert_eq!(retained.current_branch().unwrap(), "agent/moved-head");
+        assert_ne!(retained.head_commit().unwrap(), base);
+        assert_eq!(
+            std::fs::read_to_string(worktree_path.join("included/source.rs")).unwrap(),
+            "moved head recovery sentinel"
+        );
     }
 
     #[cfg(unix)]
