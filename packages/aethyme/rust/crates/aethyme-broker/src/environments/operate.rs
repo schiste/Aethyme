@@ -95,6 +95,7 @@ fn open(actor: &str, ensure_supervisor: bool) -> Result<(Lifecycle, Option<Strin
 
 fn describe(lifecycle: &Lifecycle, record: &EnvironmentRecord) -> (Value, String) {
     let grant = read_grant(&lifecycle.root, &record.env_id, RESERVATION_GRANT);
+    let urls = super::lifecycle::component_urls(&lifecycle.root, record);
     let mut ports = serde_json::Map::new();
     let mut variables = serde_json::Map::new();
     if let Some(grant) = &grant {
@@ -115,10 +116,9 @@ fn describe(lifecycle: &Lifecycle, record: &EnvironmentRecord) -> (Value, String
                     format!("AETHYME_ENV_PORT_{suffix}"),
                     json!(allocation.value),
                 );
-                variables.insert(
-                    format!("AETHYME_ENV_URL_{suffix}"),
-                    json!(format!("http://127.0.0.1:{}", allocation.value)),
-                );
+                if let Some(url) = urls.get(component) {
+                    variables.insert(format!("AETHYME_ENV_URL_{suffix}"), json!(url));
+                }
             }
         }
     }
@@ -132,11 +132,8 @@ fn describe(lifecycle: &Lifecycle, record: &EnvironmentRecord) -> (Value, String
         record.profile,
         record.phase.as_str()
     );
-    for (component, port) in &ports {
-        text.push_str(&format!(
-            "  {component}: http://127.0.0.1:{}\n",
-            port.as_str().unwrap_or_default()
-        ));
+    for (component, url) in &urls {
+        text.push_str(&format!("  {component}: {url}\n"));
     }
     let value = json!({
         "env_id": record.env_id,
@@ -147,6 +144,7 @@ fn describe(lifecycle: &Lifecycle, record: &EnvironmentRecord) -> (Value, String
         "units_to_wake": record.snapshot.units,
         "pool": record.snapshot.pool.as_ref().map(|pool| json!({"name": pool.name, "limit": pool.limit})),
         "ports": ports,
+        "urls": urls,
         "variables": variables,
         "last_error": record.last_error,
     });

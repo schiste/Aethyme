@@ -232,6 +232,30 @@ pub fn read_grant(root: &Path, env_id: &str, name: &str) -> Option<HostResourceG
     serde_json::from_slice(&text).ok()
 }
 
+/// Each listening component's URL, entry path included (#1292), from the
+/// environment's reservation grant. Empty when the grant is unreadable.
+pub fn component_urls(root: &Path, record: &EnvironmentRecord) -> BTreeMap<String, String> {
+    let mut urls = BTreeMap::new();
+    let Some(grant) = read_grant(root, &record.env_id, RESERVATION_GRANT) else {
+        return urls;
+    };
+    for allocation in &grant.lease.allocations {
+        if let Some(component) = allocation.key.strip_prefix("port_") {
+            let entry_path = record
+                .snapshot
+                .components
+                .iter()
+                .find(|c| c.name == component)
+                .and_then(|c| c.entry_path.as_deref());
+            urls.insert(
+                component.to_string(),
+                super::compile::component_url(&allocation.value, entry_path),
+            );
+        }
+    }
+    urls
+}
+
 pub(super) fn bindings_from(
     grant: Option<&HostResourceGrant>,
     worktree: &Path,

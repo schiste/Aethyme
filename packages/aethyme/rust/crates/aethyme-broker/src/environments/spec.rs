@@ -263,6 +263,11 @@ pub struct ComponentSpec {
     /// `static`: the directory served, relative to the worktree root.
     #[serde(default)]
     pub serve_dir: Option<String>,
+    /// The page to open for a listening process, compose or container component.
+    /// Appended to that component's URL (`/o/`, #1292).
+    #[serde(default)]
+    pub entry_path: Option<String>,
+
     /// `static`: serve `index.html` for a GET of a path that is not a file
     /// and has no extension, so a single-page app's client-side routes load
     /// (#1291).
