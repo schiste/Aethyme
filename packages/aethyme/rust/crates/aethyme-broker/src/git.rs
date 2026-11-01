@@ -1748,9 +1748,8 @@ fn worktree_path_exists_or_is_obstructed(root: &Path, path: &[u8]) -> Result<boo
         })?,
     );
 
-    let components = relative.components().collect::<Vec<_>>();
     if relative.is_absolute()
-        || components.iter().any(|component| {
+        || relative.components().any(|component| {
             matches!(
                 component,
                 Component::CurDir
@@ -1766,10 +1765,11 @@ fn worktree_path_exists_or_is_obstructed(root: &Path, path: &[u8]) -> Result<boo
     }
 
     let mut candidate = root.to_path_buf();
-    for (index, component) in components.iter().enumerate() {
+    let component_count = relative.components().count();
+    for (index, component) in relative.components().enumerate() {
         candidate.push(component.as_os_str());
         match fs::symlink_metadata(&candidate) {
-            Ok(metadata) if index + 1 < components.len() => {
+            Ok(metadata) if index + 1 < component_count => {
                 if metadata.file_type().is_symlink() || !metadata.is_dir() {
                     return Ok(true);
                 }
@@ -11645,6 +11645,12 @@ mod sparse_worktree_tests {
         );
         assert!(worktree_path.join("README.md").is_file());
         assert!(worktree_path.join("omitted/deep/data.txt").is_file());
+        assert!(worktree.dirty_paths().unwrap().is_empty());
+        assert_eq!(
+            worktree.current_branch().unwrap(),
+            "agent/before-set-fallback"
+        );
+        assert_eq!(worktree.head_commit().unwrap(), base);
         assert_eq!(
             super::run_git(
                 &root,
