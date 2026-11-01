@@ -21,6 +21,7 @@ Verbs:
   hooks            install, remove or inspect the managed git hooks
   trust            approve this repository's gate and prepare commands
   agents           list live sessions with activity-derived liveness
+  owners           name the sessions behind landed commits, with liveness
   handoff          read a finished session's persisted handoff
   queue            show the merge queue
   integration      inspect, wait on or reconcile the integration branch
