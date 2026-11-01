@@ -1,6 +1,6 @@
 # Broker Follow-Up Workflows
 
-Last Updated: 2026-10-10
+Last Updated: 2026-11-01
 
 This guide covers broker workflows that matter after the basic
 start-edit-submit loop: preparing declared worktree dependencies, reusing a session worktree, choosing fresh or cached
@@ -97,6 +97,15 @@ does not delete existing dependencies. Fix the declared command or input and
 run the printed retry command. Hooks that require preparation refuse before
 gates run and leave staged changes untouched. See the
 [CLI reference](../reference/cli.md) for the schema and state model.
+
+For shared package-manager stores, add `shared_package_caches` to a
+`repository_shared` step. The supported names are `pnpm`, `npm`, `uv`, and
+`pip`; each creates a directory under the preparation digest's shared cache and
+exports its path as `AETHYME_PREPARE_PNPM_STORE_DIR`,
+`AETHYME_PREPARE_NPM_CACHE_DIR`, `AETHYME_PREPARE_UV_CACHE_DIR`, or
+`AETHYME_PREPARE_PIP_CACHE_DIR`. The command must explicitly use the variable
+for the selected manager. The broker does not override package-manager
+settings such as `PNPM_HOME` or `UV_CACHE_DIR`.
 
 ## Recover External Main Movement
 
@@ -1344,13 +1353,19 @@ backlog too large for one budget still drains.
 Broker open runs before every command, including the agent hook on each tool
 call, so its share of that work is small and fixed: at most 250 ms per open,
 never scaled by disk pressure, and an open continues an unfinished pass at most
-once every 10 minutes (about every 25 seconds when the disk is below the gate
-headroom). The full `artifact_sweep_budget_ms` -- multiplied when the disk is
-below the gate headroom -- is spent by commands that exist to reclaim disk:
+once every 10 minutes (about every 25 seconds when a swept volume is below
+`[retention].artifact_sweep_headroom_bytes`). That reserve defaults to 16 GiB
+and its effective threshold is clamped to the existing 8 GiB gate headroom.
+The full `artifact_sweep_budget_ms` is spent by commands that exist to
+reclaim disk:
 `aethyme broker gc sweep`, which runs a pass now regardless of cadence, and
-`finish`, which continues an unfinished pass before the agent leaves. Before
-this split, a repository whose backlog outlasted one budget paid the full
-budget -- a minute under pressure -- on every command.
+`finish`, which continues an unfinished pass before the agent leaves. Those
+full passes scale up when any sampled worktree or cache volume is below the
+configured reserve. Foreground passes sample the captured placement candidates
+and cache root; detached continuation also samples recorded session roots,
+including older custom placements. Before this split, a repository whose
+backlog outlasted one budget paid the full budget -- a minute under pressure --
+on every command.
 
 Autonomous sweeps operate on closed sessions only. Quiet-agent time and shallow
 directory timestamps cannot prove a deeply nested cache is no longer being
