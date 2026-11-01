@@ -147,6 +147,12 @@ pub struct LeaseLivenessView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HolderObservation {
     Running,
+    /// The exact live holder's opted-in task lease has expired. This is a
+    /// distinct basis from process death: the holder process remains alive,
+    /// but the persisted task lease and its stale grace have elapsed.
+    TaskLeaseExpired {
+        since: i64,
+    },
     /// Gone; `since` is when the broker first saw it gone (epoch ms).
     Gone {
         since: i64,
@@ -187,6 +193,18 @@ pub fn classify(
                 LeaseLiveness::Active
             };
             (liveness, evidence("holder_running", None, None, true))
+        }
+        HolderObservation::TaskLeaseExpired { since } => {
+            let grace_ends_at = since.saturating_add(policy.stale_grace_ms);
+            (
+                LeaseLiveness::Stale,
+                evidence(
+                    "task_lease_expired",
+                    Some(*since),
+                    Some(grace_ends_at),
+                    now_ms < grace_ends_at,
+                ),
+            )
         }
         HolderObservation::Gone { since } => {
             let grace_ends_at = since.saturating_add(policy.stale_grace_ms);
@@ -373,6 +391,29 @@ pub(crate) fn assess_for_abandonment(
     assess_for_cleanup(store, leases, table, now_ms, policy, true)
 }
 
+/// As for ordinary abandonment, but classify an exact still-running holder
+/// as a typed task-lease expiry. The caller supplies only expiry evidence it
+/// revalidated from the current holder event and session activity.
+pub(crate) fn assess_for_abandonment_with_task_lease_expiry(
+    store: &crate::BrokerStore,
+    leases: &[crate::Lease],
+    table: Option<&crate::session_holder::ProcessTable>,
+    now_ms: i64,
+    policy: LeaseLivenessPolicy,
+    session_id: i64,
+    expired_at: i64,
+) -> Result<Vec<LeaseLivenessView>, crate::BrokerOpError> {
+    assess_for_cleanup_with_task_lease_expiry(
+        store,
+        leases,
+        table,
+        now_ms,
+        policy,
+        true,
+        Some((session_id, expired_at)),
+    )
+}
+
 fn assess_for_cleanup(
     store: &crate::BrokerStore,
     leases: &[crate::Lease],
@@ -381,21 +422,50 @@ fn assess_for_cleanup(
     policy: LeaseLivenessPolicy,
     abandoned_session: bool,
 ) -> Result<Vec<LeaseLivenessView>, crate::BrokerOpError> {
+    assess_for_cleanup_with_task_lease_expiry(
+        store,
+        leases,
+        table,
+        now_ms,
+        policy,
+        abandoned_session,
+        None,
+    )
+}
+
+fn assess_for_cleanup_with_task_lease_expiry(
+    store: &crate::BrokerStore,
+    leases: &[crate::Lease],
+    table: Option<&crate::session_holder::ProcessTable>,
+    now_ms: i64,
+    policy: LeaseLivenessPolicy,
+    abandoned_session: bool,
+    task_lease_expiry: Option<(i64, i64)>,
+) -> Result<Vec<LeaseLivenessView>, crate::BrokerOpError> {
     let mut holders = std::collections::HashMap::new();
     let mut views = Vec::with_capacity(leases.len());
     for lease in leases {
         let ((observation, pid), activity) = match holders.entry(lease.session_id) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => entry.insert((
-                observe_holder_for_cleanup(
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let (mut observation, pid) = observe_holder_for_cleanup(
                     store,
                     lease.session_id,
                     table,
                     now_ms,
                     abandoned_session,
-                )?,
-                store.session(lease.session_id)?.last_activity_at,
-            )),
+                )?;
+                if matches!(observation, HolderObservation::Running)
+                    && let Some((expired_session_id, since)) = task_lease_expiry
+                    && expired_session_id == lease.session_id
+                {
+                    observation = HolderObservation::TaskLeaseExpired { since };
+                }
+                entry.insert((
+                    (observation, pid),
+                    store.session(lease.session_id)?.last_activity_at,
+                ))
+            }
         };
         let (liveness, liveness_evidence) = classify(
             lease.released_at.is_some(),
@@ -860,6 +930,31 @@ mod tests {
             !evidence.holds,
             "past the grace a stale lease no longer holds"
         );
+    }
+
+    #[test]
+    fn task_lease_expiry_has_its_own_basis_and_stale_grace() {
+        let expired_at = 50 * MINUTE;
+        let expired = HolderObservation::TaskLeaseExpired { since: expired_at };
+        let (within, evidence) =
+            classify(false, &expired, Some(7), 0, expired_at + MINUTE, policy());
+        assert_eq!(within, LeaseLiveness::Stale);
+        assert_eq!(evidence.basis, "task_lease_expired");
+        assert_eq!(evidence.stale_since, Some(expired_at));
+        assert_eq!(evidence.grace_ends_at, Some(expired_at + 15 * MINUTE));
+        assert!(evidence.holds);
+
+        let (past, evidence) = classify(
+            false,
+            &expired,
+            Some(7),
+            0,
+            expired_at + 15 * MINUTE,
+            policy(),
+        );
+        assert_eq!(past, LeaseLiveness::Stale);
+        assert_eq!(evidence.basis, "task_lease_expired");
+        assert!(!evidence.holds);
     }
 
     #[test]

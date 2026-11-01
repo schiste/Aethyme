@@ -340,6 +340,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   TempDir); create that root before the first broker child and pass it explicitly
   to CLI children too. Assert the precondition at the real fixture entrypoint,
   before subprocess dispatch; configuring a path does not create its directory.
+  For linked-worktree fixtures, resolve Git-owned paths with
+  `git rev-parse --path-format=absolute --git-path <path>` rather than appending
+  paths to `--absolute-git-dir`: shared `info/exclude` lives in the common
+  directory. Verify intended ignored content with
+  `git check-ignore --quiet --no-index -- <path>` before exercising cleanup;
+  a setup failure or merely untracked file cannot prove ignored-file retention.
   An inherited
   `AETHYME_WORKTREE_ROOT` can otherwise place worktrees outside the fixture and
   leave stale Git pointers after teardown. The environment override is a

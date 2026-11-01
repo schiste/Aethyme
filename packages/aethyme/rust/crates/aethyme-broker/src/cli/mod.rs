@@ -133,6 +133,10 @@ Usage:
       refuses while the session holds commits no remote has, unless
       --abandon --reason records that they are being left behind. Prefer
       finish for normal lifecycle use.
+  aethyme broker heartbeat --session <id> [--json]
+      Renew the exact current holder's task lease for long-running work.
+      Guarded session commands renew it automatically; send this at least once
+      every 24 hours during a quiet task.
   aethyme broker finish --session <id> [--timeout <1..86400 seconds>] [--keep-worktree] [--abandon --reason <why>] [--json]
       Higher-level lifecycle close: closes only when the session has no
       dirty WIP and no committed work waiting for submit/promotion. Where
@@ -2662,8 +2666,46 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
     if routine_status(args) {
         parsed.read_only_snapshot = true;
     }
+    let task_lease_command = task_lease_command_class(subcommand, &parsed);
+    if task_lease_command == TaskLeaseCommandClass::ObservationOnly {
+        parsed.read_only_snapshot = true;
+    }
+    // Resolve through a non-mutating snapshot first, then acquire the exact
+    // session guard before advisory delivery, holder admission, or a handler
+    // can open mutable broker state and run maintenance.
+    let session_operation = if task_lease_command
+        == TaskLeaseCommandClass::ClosedSessionAdministration
+    {
+        None
+    } else {
+        acquire_session_operation_context(
+            &parsed,
+            subcommand == "finish" || closed_session_command_reaches_handler(subcommand, &parsed),
+        )?
+    };
     surface_command_advisories(subcommand, &parsed);
     admit_session_holder(subcommand, &parsed)?;
+    let heartbeat = if subcommand == "heartbeat" {
+        Some(heartbeat_session_task_lease(session_operation.as_ref())?)
+    } else if session_operation
+        .as_ref()
+        .is_some_and(|context| context.session_open)
+        && task_lease_command == TaskLeaseCommandClass::GuardedWork
+    {
+        if crate::file_lock::session_operation_guard_supported() {
+            heartbeat_session_task_lease(session_operation.as_ref())?;
+        }
+        None
+    } else if session_operation
+        .as_ref()
+        .is_some_and(|context| context.session_open)
+        && task_lease_command == TaskLeaseCommandClass::OtherWork
+    {
+        downgrade_unsupported_session_operation(session_operation.as_ref())?;
+        None
+    } else {
+        None
+    };
 
     match subcommand.as_str() {
         "readiness" => run_readiness(parsed)?,
@@ -2733,6 +2775,12 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         "init" => run_init(parsed)?,
         "certify" | "scaffold" => run_certify_scaffold(parsed, subcommand)?,
         "handoff" => run_handoff(parsed)?,
+        "heartbeat" => run_heartbeat(
+            parsed,
+            heartbeat.ok_or_else(|| {
+                UsageError::Message("session heartbeat requires an acquired operation guard".into())
+            })?,
+        )?,
         "finish" => run_finish(parsed)?,
         "close" => run_close(parsed)?,
         "gc" => run_gc(parsed)?,
@@ -2760,7 +2808,315 @@ const HOLDER_GUARDED: &[&str] = &[
     "gh",
     "commit",
     "review-thread",
+    "heartbeat",
 ];
+
+struct SessionOperationContext {
+    main_root: std::path::PathBuf,
+    session_id: i64,
+    session_open: bool,
+    _guard: crate::file_lock::SessionOperationGuard,
+}
+
+/// Acquire a shared per-session guard before any mutating broker open can run
+/// maintenance. Explicit IDs are checked against a read-only snapshot. With
+/// no ID, only the exact current registered worktree is eligible; no arbitrary
+/// path or parent-directory inference is used. `finish` may inspect a closed
+/// row under the same guard to preserve its idempotent recovery path; new work
+/// remains refused for every other command.
+fn acquire_session_operation_context(
+    parsed: &Parsed,
+    allow_closed: bool,
+) -> Result<Option<SessionOperationContext>, UsageError> {
+    if parsed.read_only_snapshot {
+        return Ok(None);
+    }
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(_) if parsed.session.is_none() => return Ok(None),
+        Err(error) => {
+            return Err(UsageError::Message(format!(
+                "cannot resolve the current checkout for session guard: {error}"
+            )));
+        }
+    };
+    let checkout = match crate::GitRepo::discover(&cwd) {
+        Ok(checkout) => checkout,
+        Err(_) if parsed.session.is_none() => return Ok(None),
+        Err(error) => {
+            return Err(UsageError::Message(format!(
+                "cannot resolve the repository for session guard: {error}"
+            )));
+        }
+    };
+    let main_root = match checkout.main_root() {
+        Ok(main_root) => main_root,
+        Err(_) if parsed.session.is_none() => return Ok(None),
+        Err(error) => {
+            return Err(UsageError::Message(format!(
+                "cannot resolve the primary repository for session guard: {error}"
+            )));
+        }
+    };
+    if parsed.session.is_none() && checkout.root() == main_root {
+        return Ok(None);
+    }
+    if !main_root.join(crate::BROKER_DB_RELPATH).is_file() {
+        return Ok(None);
+    }
+    let store = crate::BrokerStore::open_snapshot_in_repo(&main_root)?;
+    let session_id = match parsed.session {
+        Some(session_id) => session_id,
+        None => match store.session_for_worktree(checkout.root().to_string_lossy().as_ref())? {
+            Some(session) => session.id,
+            None => return Ok(None),
+        },
+    };
+    match store.session(session_id) {
+        Ok(_) => {}
+        Err(crate::BrokerError::SessionNotFound(_)) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let guard = crate::file_lock::try_acquire_session_operation_guard(
+        &main_root,
+        session_id,
+        crate::file_lock::SessionOperationLockMode::Shared,
+    )?
+    .ok_or_else(|| {
+        UsageError::Message(format!(
+            "session {session_id} is being retired; retry this command after maintenance finishes"
+        ))
+    })?;
+    // Retirement may win after the read-only lookup but before the shared
+    // guard is acquired. Revalidate the row while holding the guard so a
+    // stale explicit ID cannot start work on a session that has already
+    // crossed its retirement CAS.
+    let current_store = crate::BrokerStore::open_snapshot_in_repo(&main_root)?;
+    let current = current_store
+        .session(session_id)
+        .map_err(|error| match error {
+            crate::BrokerError::SessionNotFound(_) => UsageError::Message(format!(
+                "session {session_id} was retired before this command could start"
+            )),
+            other => other.into(),
+        })?;
+    let session_open =
+        current.cleanup_state == crate::SessionCleanupState::Open && !current.status.is_closed();
+    if !session_open && !allow_closed {
+        return Err(UsageError::Message(format!(
+            "session {session_id} is already closed; it cannot start new session work"
+        )));
+    }
+    if parsed.session.is_none() {
+        let checkout_root = checkout.root().to_string_lossy().into_owned();
+        let current_binding = current_store.session_for_worktree(&checkout_root)?;
+        if current_binding.as_ref().map(|session| session.id) != Some(session_id)
+            || current.worktree_path != checkout_root
+        {
+            return Err(UsageError::Message(
+                "the current checkout stopped resolving to the same open broker session while acquiring its operation guard".into(),
+            ));
+        }
+    }
+    Ok(Some(SessionOperationContext {
+        main_root,
+        session_id,
+        session_open,
+        _guard: guard,
+    }))
+}
+
+/// Commands with an existing session ownership or active-work protocol renew
+/// the holder lease. Read-only polling stays observation-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskLeaseCommandClass {
+    /// Read-only inspection must not extend the lease or downgrade it.
+    ObservationOnly,
+    /// Existing command protocols leave durable witnesses for child use.
+    GuardedWork,
+    /// Known session work without a child-lifetime witness drops finite
+    /// expiry authority before it starts.
+    OtherWork,
+    /// Administrative cleanup acts on an already-closed session and must not
+    /// be rejected by the open-session admission fence or renew its task lease.
+    ClosedSessionAdministration,
+    /// Invalid command names never reach a handler and cannot use a session.
+    NoSessionWork,
+}
+
+fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseCommandClass {
+    let action = parsed.positional.first().map(String::as_str);
+    let nested_action = parsed.positional.get(1).map(String::as_str);
+    match subcommand {
+        "prepare" if action == Some("status") => TaskLeaseCommandClass::ObservationOnly,
+        "leases" if matches!(action, None | Some("plan" | "explain" | "export")) => {
+            TaskLeaseCommandClass::ObservationOnly
+        }
+        "note" if action == Some("list") => TaskLeaseCommandClass::ObservationOnly,
+        "ownership" if matches!(action, None | Some("list")) => {
+            TaskLeaseCommandClass::ObservationOnly
+        }
+        "hooks" if matches!(action, Some("status" | "snippet")) => {
+            TaskLeaseCommandClass::ObservationOnly
+        }
+        "review" if action == Some("show") => TaskLeaseCommandClass::ObservationOnly,
+        "representation" if matches!(action, None | Some("scan" | "status")) => {
+            TaskLeaseCommandClass::ObservationOnly
+        }
+        "cleanup" if action == Some("audit") || (parsed.all_cleaned && !parsed.apply) => {
+            TaskLeaseCommandClass::ObservationOnly
+        }
+        "cleanup" => TaskLeaseCommandClass::ClosedSessionAdministration,
+        "operations" if matches!(action, None | Some("list" | "show")) => {
+            TaskLeaseCommandClass::ObservationOnly
+        }
+        "operations" if action == Some("stats") => TaskLeaseCommandClass::ObservationOnly,
+        "gates" if matches!(action, Some("status" | "manifest" | "scope")) => {
+            TaskLeaseCommandClass::ObservationOnly
+        }
+        "gates" if action == Some("incidents") && nested_action == Some("list") => {
+            TaskLeaseCommandClass::ObservationOnly
+        }
+        "events" if action != Some("prune") => TaskLeaseCommandClass::ObservationOnly,
+        "external-events" if matches!(action, Some("list" | "show")) => {
+            TaskLeaseCommandClass::ObservationOnly
+        }
+        "report"
+            if matches!(action, Some("list" | "show"))
+                || (action == Some("render") && parsed.output.is_none()) =>
+        {
+            TaskLeaseCommandClass::ObservationOnly
+        }
+        "quality-report" if action == Some("plan") => TaskLeaseCommandClass::ObservationOnly,
+        "deliveries" if action == Some("list") => TaskLeaseCommandClass::ObservationOnly,
+        "watch"
+            if (matches!(action, Some("pr" | "repo"))
+                && matches!(nested_action, Some("list" | "show" | "events" | "batches")))
+                || (action == Some("pr")
+                    && nested_action == Some("monitoring")
+                    && parsed.positional.get(2).map(String::as_str) == Some("status"))
+                || (action == Some("pr")
+                    && nested_action == Some("service")
+                    && matches!(
+                        parsed.positional.get(2).map(String::as_str),
+                        Some("plan" | "status")
+                    )) =>
+        {
+            TaskLeaseCommandClass::ObservationOnly
+        }
+        "handoff" | "metrics" | "insights" | "blockers" | "exec-status" | "queue" | "worktrees" => {
+            TaskLeaseCommandClass::ObservationOnly
+        }
+        "reclaim" if action == Some("plan") => TaskLeaseCommandClass::ObservationOnly,
+        "reclaim" => TaskLeaseCommandClass::OtherWork,
+        "gc" if action == Some("plan") => TaskLeaseCommandClass::ObservationOnly,
+        "heartbeat" | "commit" | "exec" | "gh" | "git" | "prepare" | "push" | "submit" | "sync" => {
+            TaskLeaseCommandClass::GuardedWork
+        }
+        "gates" if matches!(action, Some("run" | "pre-push")) => TaskLeaseCommandClass::GuardedWork,
+        "resources" if action == Some("artifact-run") => TaskLeaseCommandClass::GuardedWork,
+        "leases"
+            if matches!(
+                action,
+                Some("claim" | "release" | "request-release" | "ack" | "decline" | "wait")
+            ) =>
+        {
+            TaskLeaseCommandClass::GuardedWork
+        }
+        "note" if matches!(action, Some("send" | "ack")) => TaskLeaseCommandClass::GuardedWork,
+        "ownership" if matches!(action, Some("claim" | "release")) => {
+            TaskLeaseCommandClass::GuardedWork
+        }
+        "status" | "readiness" | "worktree-root" | "adopt" | "start" | "start-agent" | "report"
+        | "quality-report" | "external-events" | "deliveries" | "review" | "review-thread"
+        | "console" | "resources" | "agents" | "ownership" | "merge-chain" | "advisories"
+        | "exposures" | "note" | "operations" | "gates" | "watch" | "pr" | "hooks" | "finish"
+        | "close" | "gc" | "storage" | "unblock" | "doctor" | "quick-test" | "trust"
+        | "verify-loop" | "e2e" | "init" | "certify" | "scaffold" | "promotion-record"
+        | "checkpoint" | "promote" | "ship" | "integration" | "events" => {
+            TaskLeaseCommandClass::OtherWork
+        }
+        _ => TaskLeaseCommandClass::NoSessionWork,
+    }
+}
+
+/// These operations need to reach their domain handler for the established
+/// closed-session refusal or lifecycle action. They still hold the shared
+/// operation guard, and open sessions follow the normal heartbeat/downgrade
+/// path below.
+fn closed_session_command_reaches_handler(subcommand: &str, parsed: &Parsed) -> bool {
+    matches!(
+        (subcommand, parsed.positional.first().map(String::as_str)),
+        ("leases", Some("claim"))
+            | ("review", Some("request" | "unlock" | "reassign"))
+            | ("reclaim", Some("apply"))
+    )
+}
+
+fn heartbeat_session_task_lease(
+    context: Option<&SessionOperationContext>,
+) -> Result<crate::session_holder::TaskLeaseHeartbeat, UsageError> {
+    let context = context.ok_or_else(|| {
+        UsageError::Message("heartbeat requires a registered session in this repository".into())
+    })?;
+    if !crate::file_lock::session_operation_guard_supported() {
+        return Ok(crate::session_holder::TaskLeaseHeartbeat::LegacyProtected);
+    }
+    let crate::session_holder::Caller::Agent(caller) = crate::session_holder::caller() else {
+        return Ok(crate::session_holder::TaskLeaseHeartbeat::NotHolder);
+    };
+    let mut store = crate::BrokerStore::open_in_repo(&context.main_root)?;
+    let latest = store.latest_session_holder_event(context.session_id)?;
+    if latest
+        .as_ref()
+        .is_some_and(crate::session_holder::task_lease_binding_present)
+    {
+        let bound_holder = latest
+            .as_ref()
+            .and_then(|event| event.payload_json.as_deref())
+            .and_then(|payload| {
+                serde_json::from_str::<crate::session_holder::AgentProcess>(payload).ok()
+            });
+        if bound_holder.as_ref() != Some(&caller) {
+            return Err(UsageError::Message(format!(
+                "session {} has a task lease bound to a different or unreadable holder; run the command as that holder or adopt the session first",
+                context.session_id
+            )));
+        }
+    }
+    store
+        .heartbeat_session_task_lease(context.session_id, &caller, crate::clock::epoch_ms())
+        .map_err(UsageError::from)
+}
+
+/// Before an opted-in session starts a command outside the known durable-child
+/// protocols, remove its finite lease while the shared session guard is held.
+/// This keeps the existing live-process protection authoritative for that
+/// session until a guarded command explicitly upgrades it again.
+fn downgrade_unsupported_session_operation(
+    context: Option<&SessionOperationContext>,
+) -> Result<(), UsageError> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    let caller = match crate::session_holder::caller() {
+        crate::session_holder::Caller::Agent(caller) => Some(caller),
+        crate::session_holder::Caller::Unidentified => None,
+    };
+    let mut store = crate::BrokerStore::open_in_repo(&context.main_root)?;
+    match store.downgrade_session_task_lease_for_holder(
+        context.session_id,
+        caller.as_ref(),
+        crate::clock::epoch_ms(),
+    )? {
+        crate::session_holder::TaskLeaseDowngrade::NotFinite
+        | crate::session_holder::TaskLeaseDowngrade::Downgraded => Ok(()),
+        crate::session_holder::TaskLeaseDowngrade::NotHolder => Err(UsageError::Message(format!(
+            "session {} has a finite task lease; this command is not covered by its child-lifetime protocol and must be run by the current holder or after takeover",
+            context.session_id
+        ))),
+    }
+}
 
 /// Refuse a command for a session that another live agent process holds,
 /// unless `--take-over`. Anything this check cannot establish -- no broker
@@ -2812,18 +3168,25 @@ fn admit_caller(
             .ok()
             .as_deref(),
     );
-    if let HolderCheck::Bound {
-        reason: why @ (reason::TAKE_OVER | reason::HOLDER_GONE),
-    } = crate::session_holder::admit(store, session_id, &caller, &table, take_over)?
-    {
-        eprintln!(
-            "note: session {session_id} is now held by this agent ({})",
-            if why == reason::TAKE_OVER {
-                "taken over from a live holder"
-            } else {
-                "its previous holder is no longer running"
-            }
-        );
+    match crate::session_holder::admit(store, session_id, &caller, &table, take_over)? {
+        HolderCheck::Bound {
+            reason: why @ (reason::TAKE_OVER | reason::HOLDER_GONE),
+        } => {
+            eprintln!(
+                "note: session {session_id} is now held by this agent ({})",
+                if why == reason::TAKE_OVER {
+                    "taken over from a live holder"
+                } else {
+                    "its previous holder is no longer running"
+                }
+            );
+        }
+        HolderCheck::UnknownBinding => {
+            return Err(UsageError::Message(format!(
+                "session {session_id} has unreadable holder metadata; refusing to replace its process-lifetime protection"
+            )));
+        }
+        HolderCheck::Held | HolderCheck::Bound { .. } | HolderCheck::Unidentified => {}
     }
     Ok(())
 }

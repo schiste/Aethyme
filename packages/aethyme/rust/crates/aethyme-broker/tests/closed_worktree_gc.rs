@@ -196,7 +196,7 @@ fn an_unlanded_closed_worktree_is_not_proposed() {
 
 #[test]
 fn a_closed_worktree_inside_its_grace_period_is_not_proposed() {
-    // No key: the shipped 15 day default applies.
+    // No key: the shipped 5 day checkout grace applies.
     let (_tmp, mut broker) = repository(None);
     let (id, worktree) = session_with_commit(&mut broker, "recent", true);
     broker.close(id).unwrap();
@@ -342,8 +342,8 @@ fn cleanup_keeps_the_time_a_session_was_first_closed() {
 }
 
 #[test]
-fn default_close_grace_keeps_fourteen_days_but_expires_after_fifteen() {
-    for (days, expected_proposed) in [(14, false), (16, true)] {
+fn default_close_grace_keeps_four_days_but_expires_after_five() {
+    for (days, expected_proposed) in [(4, false), (5, true)] {
         let (tmp, mut broker) = repository(None);
         let (id, _worktree) = session_with_commit(&mut broker, "default-grace", true);
         broker.close(id).unwrap();

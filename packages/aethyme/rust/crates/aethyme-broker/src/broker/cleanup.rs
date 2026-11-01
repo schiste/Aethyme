@@ -3664,6 +3664,14 @@ impl Broker {
         // budget is not a pass -- the bytes it skipped are exactly the ones
         // that would have decided it.
         let over_retained_bytes_budget = budget_verdict.exceeded();
+        let (last_artifact_sweep, last_artifact_sweep_error) =
+            match self.last_artifact_sweep_report() {
+                Ok(report) => (report, None),
+                Err(error) => (
+                    None,
+                    Some(error.to_string().chars().take(240).collect::<String>()),
+                ),
+            };
         Ok(CleanupRetention {
             inventory_complete,
             inventory_deferred_sessions: deferred,
@@ -3700,6 +3708,8 @@ impl Broker {
             worktree_inode_unmeasured,
             severity,
             retention_config,
+            last_artifact_sweep,
+            last_artifact_sweep_error,
             reconciliation,
             closed_worktrees,
         })

@@ -889,6 +889,8 @@ pub const RECENT_WORK_WINDOW_MS: i64 = 3 * 3_600_000;
 pub(crate) struct OpenFileUse {
     pub pid: u32,
     pub command: String,
+    pub descriptor: String,
+    pub file_type: Option<String>,
     pub path: PathBuf,
 }
 
@@ -953,6 +955,45 @@ pub(crate) fn open_file_snapshot_blocker_for_worktree(
         OpenFileSnapshot::Incomplete { reason, observed } => Some(incomplete_open_file_reason(
             reason,
             open_file_use_for_worktree(worktree, observed),
+        )),
+    }
+}
+
+/// Report process use of one session worktree. For a live task holder only,
+/// its exact `cwd` directory record is harmless to metadata retirement: the
+/// checkout itself remains protected from physical removal by the normal
+/// cleanup checks. Every other descriptor, and every incomplete inventory,
+/// blocks retirement.
+pub(crate) fn open_file_snapshot_blocker_for_session_worktree(
+    snapshot: &OpenFileSnapshot,
+    worktree: &Path,
+    live_holder_pid: Option<i64>,
+) -> Option<String> {
+    let canonical = std::fs::canonicalize(worktree).ok();
+    let is_under_worktree = |open: &OpenFileUse| {
+        open.path.starts_with(worktree)
+            || canonical
+                .as_ref()
+                .is_some_and(|canonical| open.path.starts_with(canonical))
+    };
+    let is_holder_cwd = |open: &OpenFileUse| {
+        live_holder_pid == Some(i64::from(open.pid))
+            && open.descriptor == "cwd"
+            && open.file_type.as_deref() == Some("DIR")
+            && canonical
+                .as_ref()
+                .is_some_and(|canonical| open.path == *canonical)
+    };
+    match snapshot {
+        OpenFileSnapshot::Complete(open_files) => open_files
+            .iter()
+            .find(|open| is_under_worktree(open) && !is_holder_cwd(open))
+            .map(open_file_use_reason),
+        OpenFileSnapshot::Incomplete { reason, observed } => Some(incomplete_open_file_reason(
+            reason,
+            observed
+                .iter()
+                .find(|open| is_under_worktree(open) && !is_holder_cwd(open)),
         )),
     }
 }
@@ -1081,6 +1122,19 @@ const OPEN_FILE_SNAPSHOT_MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 /// nonzero-exit, malformed, or empty results remain `Incomplete` rather than
 /// being interpreted as no process use.
 pub(crate) fn open_file_snapshot_under(root: &Path) -> OpenFileSnapshot {
+    open_file_snapshot_under_with_budget(root, OPEN_FILE_SNAPSHOT_BUDGET)
+}
+
+/// Make one bounded system-wide `lsof` observation within the caller's
+/// remaining maintenance budget. A zero budget does not start the process.
+pub(crate) fn open_file_snapshot_under_with_budget(
+    root: &Path,
+    budget: Duration,
+) -> OpenFileSnapshot {
+    let budget = budget.min(OPEN_FILE_SNAPSHOT_BUDGET);
+    if budget.is_zero() {
+        return incomplete_open_file_snapshot("maintenance deadline left no time for lsof");
+    }
     // `lsof` lives in /usr/sbin on macOS, which a trimmed PATH (a launchd
     // job, a test harness) leaves out; the standard locations are tried too
     // (#588). A successfully spawned but incomplete listing is not retried as
@@ -1090,7 +1144,7 @@ pub(crate) fn open_file_snapshot_under(root: &Path) -> OpenFileSnapshot {
         command.args(["-w", "-n", "-P", "-F0pcfnt"]);
         match crate::bounded_output::output_limited(
             &mut command,
-            OPEN_FILE_SNAPSHOT_BUDGET,
+            budget,
             OPEN_FILE_SNAPSHOT_MAX_STREAM_BYTES,
         ) {
             Ok(output) => return snapshot_from_lsof_capture(output, root),
@@ -1202,6 +1256,7 @@ fn parse_lsof_records(
     let mut saw_name = false;
     let mut saw_file_for_process = false;
     let mut awaiting_name = false;
+    let mut descriptor: Option<String> = None;
     let mut file_type: Option<String> = None;
     let mut open_files = Vec::new();
 
@@ -1238,6 +1293,7 @@ fn parse_lsof_records(
                 command = None;
                 saw_process = true;
                 saw_file_for_process = false;
+                descriptor = None;
                 file_type = None;
             }
             b'c' => {
@@ -1277,8 +1333,18 @@ fn parse_lsof_records(
                         "lsof file descriptor had no pathname record".into(),
                     ));
                 }
+                let Some(parsed_descriptor) = std::str::from_utf8(value)
+                    .ok()
+                    .filter(|descriptor| !descriptor.is_empty())
+                else {
+                    return Err((
+                        open_files,
+                        "lsof file descriptor had an invalid descriptor name".into(),
+                    ));
+                };
                 awaiting_name = true;
                 saw_file_for_process = true;
+                descriptor = Some(parsed_descriptor.to_string());
                 file_type = None;
             }
             b't' => {
@@ -1329,6 +1395,7 @@ fn parse_lsof_records(
                     // keep other empty or unknown names incomplete so a
                     // missing path cannot authorize deletion.
                     if matches!(file_type.as_deref(), Some("NPOLICY" | "NEXUS" | "PIPE")) {
+                        descriptor = None;
                         file_type = None;
                         continue;
                     }
@@ -1355,9 +1422,15 @@ fn parse_lsof_records(
                     open_files.push(OpenFileUse {
                         pid,
                         command: command.clone(),
+                        descriptor: descriptor
+                            .as_deref()
+                            .expect("an open pathname follows a descriptor")
+                            .to_string(),
+                        file_type: file_type.clone(),
                         path,
                     });
                 }
+                descriptor = None;
                 file_type = None;
             }
             _ => {
@@ -1873,6 +1946,8 @@ mod scan_tests {
             &[OpenFileUse {
                 pid: 4321,
                 command: "node".into(),
+                descriptor: "3".into(),
+                file_type: Some("REG".into()),
                 path: p("/w/busy/web/vite.log"),
             }],
         );
@@ -1895,6 +1970,8 @@ mod scan_tests {
             &[OpenFileUse {
                 pid: 4321,
                 command: "node".into(),
+                descriptor: "3".into(),
+                file_type: Some("REG".into()),
                 path: p("/w/app-2/src/main.rs"),
             }],
         );
@@ -1903,7 +1980,7 @@ mod scan_tests {
 
     #[test]
     fn lsof_records_retain_process_identity_and_are_narrowed_to_the_root() {
-        let listing = b"p123\0cnode\0\nfcwd\0n/w/root/web/vite.log\0\nf3\0n/w/root/path\nwith-newline\0\np9\0csh\0\nf4\0n/w/other/file\0\n";
+        let listing = b"p123\0cnode\0\nfcwd\0tDIR\0n/w/root\0\nf3\0tREG\0n/w/root/path\nwith-newline\0\np9\0csh\0\nf4\0tREG\0n/w/other/file\0\n";
         let OpenFileSnapshot::Complete(open_files) =
             parse_lsof_output(true, listing, &[], Path::new("/w/root"))
         else {
@@ -1912,8 +1989,12 @@ mod scan_tests {
         assert_eq!(open_files.len(), 2);
         assert_eq!(open_files[0].pid, 123);
         assert_eq!(open_files[0].command, "node");
-        assert_eq!(open_files[0].path, p("/w/root/web/vite.log"));
+        assert_eq!(open_files[0].descriptor, "cwd");
+        assert_eq!(open_files[0].file_type.as_deref(), Some("DIR"));
+        assert_eq!(open_files[0].path, p("/w/root"));
         assert_eq!(open_files[1].pid, 123);
+        assert_eq!(open_files[1].descriptor, "3");
+        assert_eq!(open_files[1].file_type.as_deref(), Some("REG"));
         assert_eq!(open_files[1].path, p("/w/root/path\nwith-newline"));
 
         let without_final_linefeed = &listing[..listing.len() - 1];
@@ -2063,6 +2144,8 @@ mod scan_tests {
             &[OpenFileUse {
                 pid: 4321,
                 command: "node\nwatcher".into(),
+                descriptor: "3".into(),
+                file_type: Some("REG".into()),
                 path: p("/w/busy/node_modules/.pnpm-store/index"),
             }],
         );
@@ -2080,6 +2163,8 @@ mod scan_tests {
         let open = OpenFileUse {
             pid: 77,
             command: "node".into(),
+            descriptor: "3".into(),
+            file_type: Some("REG".into()),
             path: p("/w/repo/node_modules/.pnpm-store/index"),
         };
         let complete = OpenFileSnapshot::Complete(vec![open.clone()]);
@@ -2107,6 +2192,54 @@ mod scan_tests {
         assert!(reason.contains("/w/repo/node_modules/.pnpm-store/index"));
         assert!(reason.contains("incomplete"));
         assert!(reason.contains("kept for safety"));
+    }
+
+    #[test]
+    fn only_the_live_holders_exact_worktree_cwd_is_allowed_for_metadata_close() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path();
+        let cwd = OpenFileUse {
+            pid: 77,
+            command: "agent".into(),
+            descriptor: "cwd".into(),
+            file_type: Some("DIR".into()),
+            path: std::fs::canonicalize(worktree).unwrap(),
+        };
+        let complete = OpenFileSnapshot::Complete(vec![cwd.clone()]);
+        assert_eq!(
+            open_file_snapshot_blocker_for_session_worktree(&complete, worktree, Some(77)),
+            None
+        );
+        assert!(
+            open_file_snapshot_blocker_for_session_worktree(&complete, worktree, Some(78))
+                .is_some()
+        );
+
+        let open_file = OpenFileUse {
+            descriptor: "3".into(),
+            file_type: Some("REG".into()),
+            path: worktree.join("notes.txt"),
+            ..cwd.clone()
+        };
+        assert!(
+            open_file_snapshot_blocker_for_session_worktree(
+                &OpenFileSnapshot::Complete(vec![cwd.clone(), open_file]),
+                worktree,
+                Some(77)
+            )
+            .is_some()
+        );
+        assert!(
+            open_file_snapshot_blocker_for_session_worktree(
+                &OpenFileSnapshot::Incomplete {
+                    reason: "partial process listing".into(),
+                    observed: vec![cwd],
+                },
+                worktree,
+                Some(77)
+            )
+            .is_some()
+        );
     }
 
     fn set_index_age(worktree: &Path, age: std::time::Duration) {

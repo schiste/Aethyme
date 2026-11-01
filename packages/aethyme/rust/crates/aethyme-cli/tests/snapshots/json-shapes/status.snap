@@ -89,6 +89,22 @@
     "inodes_free": "integer",
     "inventory_complete": "bool",
     "inventory_deferred_sessions": "integer",
+    "last_artifact_sweep": {
+      "at_ms": "integer",
+      "blockers": {
+        "by_reason": {},
+        "examples": [],
+        "omitted_examples": "integer",
+        "total": "integer"
+      },
+      "bytes_accounting_complete": "bool",
+      "complete": "bool",
+      "directories_reclaimed": "integer",
+      "entries_reclaimed": "integer",
+      "observed_logical_file_bytes": "integer",
+      "preparation_cache_bytes_reclaimed": "integer",
+      "scope": "string"
+    },
     "oldest_closed_age_days": "integer",
     "over_retained_bytes_budget": "bool",
     "reconciliation": {

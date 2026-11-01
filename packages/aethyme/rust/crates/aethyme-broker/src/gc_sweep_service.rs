@@ -1060,7 +1060,15 @@ mod tests {
         assert_eq!(receipt.error.unwrap().len(), 256);
         assert!(receipt.directories_reclaimed.is_none());
         let report = crate::ArtifactSweepReport {
+            at_ms: 1,
+            scope: "inline".into(),
             directories_reclaimed: 0,
+            entries_reclaimed: 0,
+            observed_logical_file_bytes: 0,
+            preparation_cache_bytes_reclaimed: 0,
+            bytes_accounting_complete: true,
+            blockers: crate::ArtifactSweepBlockerSummary::default(),
+            headroom_threshold_bytes: crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES,
             complete: false,
             budget_ms: 250,
             disk_pressured: false,

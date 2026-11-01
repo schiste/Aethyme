@@ -89,6 +89,10 @@ pub const ADVANCED_VERBS: &[(&str, &str)] = &[
     ("git", "run Git through the durable operation coordinator"),
     ("gh", "run GitHub CLI through the same coordinator"),
     (
+        "heartbeat",
+        "renew the exact current holder's lease during quiet task work",
+    ),
+    (
         "merge-chain",
         "land pull requests in order, each verified on its merge commit",
     ),

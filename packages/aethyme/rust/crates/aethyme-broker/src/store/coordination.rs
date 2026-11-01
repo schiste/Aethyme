@@ -1,6 +1,189 @@
 use super::*;
 
 impl BrokerStore {
+    /// Touch activity and renew or upgrade the task lease only for the exact
+    /// current holder. The caller must already hold the session's shared
+    /// operation guard; this transaction makes the holder comparison and the
+    /// appended event one CAS against concurrent rebinds.
+    pub(crate) fn heartbeat_session_task_lease(
+        &mut self,
+        session_id: i64,
+        caller: &crate::session_holder::AgentProcess,
+        at_ms: i64,
+    ) -> Result<crate::session_holder::TaskLeaseHeartbeat, BrokerError> {
+        if session_id <= 0 {
+            return Err(BrokerError::SessionNotFound(session_id));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state: Option<(String, String)> = tx
+            .query_row(
+                "SELECT status, cleanup_state FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((status, cleanup_state)) = state else {
+            return Err(BrokerError::SessionNotFound(session_id));
+        };
+        if cleanup_state != "open" || status == "cleaned" {
+            return Err(BrokerError::SessionNotOpen(session_id));
+        }
+        let event = tx
+            .query_row(
+                "SELECT id, schema_version, ts, kind, session_id, payload_json
+                 FROM events
+                 WHERE session_id = ?1 AND kind = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![session_id, crate::events::SESSION_HOLDER_BOUND],
+                event_from_row,
+            )
+            .optional()?;
+        let Some(event) = event else {
+            return Ok(crate::session_holder::TaskLeaseHeartbeat::NotHolder);
+        };
+        let Some(payload_text) = event.payload_json.as_deref() else {
+            return Ok(crate::session_holder::TaskLeaseHeartbeat::LegacyProtected);
+        };
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(payload_text) else {
+            return Ok(crate::session_holder::TaskLeaseHeartbeat::LegacyProtected);
+        };
+        let Ok(bound_holder) =
+            serde_json::from_value::<crate::session_holder::AgentProcess>(payload.clone())
+        else {
+            return Ok(crate::session_holder::TaskLeaseHeartbeat::LegacyProtected);
+        };
+        if &bound_holder != caller {
+            return Ok(crate::session_holder::TaskLeaseHeartbeat::NotHolder);
+        }
+        let lease_present = payload.get("task_lease").is_some();
+        let supported_lease = payload
+            .get("task_lease")
+            .cloned()
+            .and_then(|value| {
+                serde_json::from_value::<crate::session_holder::TaskLease>(value).ok()
+            })
+            .filter(|lease| lease.is_supported());
+        let heartbeat = if !lease_present {
+            crate::session_holder::TaskLeaseHeartbeat::Upgraded
+        } else if supported_lease.is_none() {
+            // A present but malformed or future-version field is not a legacy
+            // binding. Preserve it as process-lifetime protection.
+            return Ok(crate::session_holder::TaskLeaseHeartbeat::LegacyProtected);
+        } else if crate::session_holder::task_lease_renewal_due(&event, at_ms) {
+            crate::session_holder::TaskLeaseHeartbeat::Renewed
+        } else {
+            crate::session_holder::TaskLeaseHeartbeat::Current
+        };
+
+        if matches!(
+            heartbeat,
+            crate::session_holder::TaskLeaseHeartbeat::Upgraded
+                | crate::session_holder::TaskLeaseHeartbeat::Renewed
+        ) {
+            let Some(payload) =
+                crate::events::session_holder_task_lease_heartbeat_payload(&payload)
+            else {
+                return Ok(crate::session_holder::TaskLeaseHeartbeat::LegacyProtected);
+            };
+            insert_event(
+                &tx,
+                at_ms,
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session_id),
+                Some(&payload),
+            )?;
+        }
+        tx.execute(
+            "UPDATE sessions
+             SET last_activity_at = MAX(last_activity_at, ?2),
+                 updated_at = MAX(updated_at + 1, ?3)
+             WHERE id = ?1 AND cleanup_state = 'open' AND status != 'cleaned'",
+            params![session_id, at_ms, now_ms()],
+        )?;
+        tx.commit()?;
+        Ok(heartbeat)
+    }
+
+    /// Remove age-expiry authority before a session command whose child
+    /// lifetime is not covered by a durable operation witness. The exact
+    /// current holder remains protected by the legacy process-lifetime rule.
+    pub(crate) fn downgrade_session_task_lease_for_holder(
+        &mut self,
+        session_id: i64,
+        caller: Option<&crate::session_holder::AgentProcess>,
+        at_ms: i64,
+    ) -> Result<crate::session_holder::TaskLeaseDowngrade, BrokerError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state: Option<(String, String)> = tx
+            .query_row(
+                "SELECT status, cleanup_state FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((status, cleanup_state)) = state else {
+            return Err(BrokerError::SessionNotFound(session_id));
+        };
+        if cleanup_state != "open" || status == "cleaned" {
+            return Err(BrokerError::SessionNotOpen(session_id));
+        }
+        let event = tx
+            .query_row(
+                "SELECT id, schema_version, ts, kind, session_id, payload_json
+                 FROM events
+                 WHERE session_id = ?1 AND kind = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![session_id, crate::events::SESSION_HOLDER_BOUND],
+                event_from_row,
+            )
+            .optional()?;
+        let Some(event) = event else {
+            return Ok(crate::session_holder::TaskLeaseDowngrade::NotFinite);
+        };
+        let Some(payload_text) = event.payload_json.as_deref() else {
+            return Ok(crate::session_holder::TaskLeaseDowngrade::NotFinite);
+        };
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(payload_text) else {
+            return Ok(crate::session_holder::TaskLeaseDowngrade::NotFinite);
+        };
+        let Ok(bound_holder) =
+            serde_json::from_value::<crate::session_holder::AgentProcess>(payload.clone())
+        else {
+            return Ok(crate::session_holder::TaskLeaseDowngrade::NotFinite);
+        };
+        if payload.get("task_lease").is_none() {
+            return Ok(crate::session_holder::TaskLeaseDowngrade::NotFinite);
+        }
+        if caller != Some(&bound_holder) {
+            return Ok(crate::session_holder::TaskLeaseDowngrade::NotHolder);
+        }
+        let Some(legacy_payload) =
+            crate::events::session_holder_task_lease_downgraded_payload(&payload)
+        else {
+            return Ok(crate::session_holder::TaskLeaseDowngrade::NotHolder);
+        };
+        insert_event(
+            &tx,
+            at_ms,
+            crate::events::SESSION_HOLDER_BOUND,
+            Some(session_id),
+            Some(&legacy_payload),
+        )?;
+        tx.execute(
+            "UPDATE sessions
+             SET last_activity_at = MAX(last_activity_at, ?2),
+                 updated_at = MAX(updated_at + 1, ?3)
+             WHERE id = ?1 AND cleanup_state = 'open' AND status != 'cleaned'",
+            params![session_id, at_ms, now_ms()],
+        )?;
+        tx.commit()?;
+        Ok(crate::session_holder::TaskLeaseDowngrade::Downgraded)
+    }
+
     /// Most recent coordinated operations for a report, newest first.
     /// When a session is selected, unrelated operations stay out of the
     /// snapshot rather than broadening its diagnostic scope.
@@ -92,6 +275,30 @@ impl BrokerStore {
             operations.push(row??);
         }
         Ok(operations)
+    }
+
+    /// Whether this session still owns a durable operation without a settled
+    /// outcome. These journals survive a broker crash while a coordinated
+    /// `git`/`gh` write or guarded command may still be running.
+    pub(crate) fn session_has_unresolved_operations(
+        &self,
+        session_id: i64,
+    ) -> Result<bool, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM coordinated_operations
+                    WHERE session_id = ?1 AND effect <> 'read'
+                      AND status IN ('prepared', 'running', 'outcome_unknown')
+                 ) OR EXISTS(
+                    SELECT 1 FROM guarded_exec_receipts
+                    WHERE session_id = ?1
+                      AND phase IN ('starting', 'running', 'outcome_unknown')
+                 )",
+                [session_id],
+                |row| row.get(0),
+            )
+            .map_err(BrokerError::from)
     }
 
     /// Persist the child-owner witness without resurrecting a concurrently
@@ -1523,6 +1730,238 @@ mod finish_lease_query_tests {
             log_path: None,
             agent_identity: None,
         }
+    }
+
+    #[test]
+    fn guarded_heartbeat_upgrades_renews_and_rejects_another_holder() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open(&temp.path().join("broker.db")).unwrap();
+        let session = store
+            .register_session(&new_session("task-lease", temp.path()))
+            .unwrap();
+        let holder = crate::session_holder::AgentProcess {
+            pid: 3731,
+            started: "Fri Oct 23 08:42:41 2026".into(),
+            command: "/opt/codex agent --session 7".into(),
+        };
+        let other = crate::session_holder::AgentProcess {
+            pid: 5000,
+            started: "Fri Oct 23 09:01:00 2026".into(),
+            command: "/opt/codex agent --session 8".into(),
+        };
+        store
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session.id),
+                Some(&crate::events::session_holder_bound_payload(
+                    &holder,
+                    "registered",
+                    None,
+                )),
+            )
+            .unwrap();
+        let now = now_ms();
+
+        assert_eq!(
+            store
+                .heartbeat_session_task_lease(session.id, &holder, now)
+                .unwrap(),
+            crate::session_holder::TaskLeaseHeartbeat::Upgraded
+        );
+        let upgraded = store
+            .latest_session_holder_event(session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::session_holder::task_lease(&upgraded),
+            Some(crate::session_holder::TaskLease::current())
+        );
+        let upgraded_payload: serde_json::Value =
+            serde_json::from_str(upgraded.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(upgraded_payload["reason"], "registered");
+        assert!(upgraded_payload.get("previous_pid").is_some());
+        assert_eq!(
+            store
+                .heartbeat_session_task_lease(session.id, &holder, now + 1_000)
+                .unwrap(),
+            crate::session_holder::TaskLeaseHeartbeat::Current
+        );
+        assert_eq!(
+            store
+                .latest_session_holder_event(session.id)
+                .unwrap()
+                .unwrap()
+                .id,
+            upgraded.id,
+            "renewal writes stay at most once per five minutes"
+        );
+        assert_eq!(
+            store
+                .heartbeat_session_task_lease(
+                    session.id,
+                    &holder,
+                    now + crate::session_holder::TASK_LEASE_RENEWAL_INTERVAL_MS,
+                )
+                .unwrap(),
+            crate::session_holder::TaskLeaseHeartbeat::Renewed
+        );
+        let renewed = store
+            .latest_session_holder_event(session.id)
+            .unwrap()
+            .unwrap();
+        assert!(renewed.id > upgraded.id);
+        let renewed_payload: serde_json::Value =
+            serde_json::from_str(renewed.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(renewed_payload["reason"], "registered");
+        assert_eq!(
+            renewed_payload["previous_pid"],
+            upgraded_payload["previous_pid"]
+        );
+        assert_eq!(
+            crate::session_holder::task_lease(&renewed),
+            Some(crate::session_holder::TaskLease::current())
+        );
+        assert_eq!(
+            store
+                .heartbeat_session_task_lease(session.id, &other, now + 400_000)
+                .unwrap(),
+            crate::session_holder::TaskLeaseHeartbeat::NotHolder
+        );
+        assert_eq!(
+            store
+                .latest_session_holder_event(session.id)
+                .unwrap()
+                .unwrap()
+                .id,
+            renewed.id
+        );
+    }
+
+    #[test]
+    fn downgrade_and_reupgrade_preserve_binding_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open(&temp.path().join("broker.db")).unwrap();
+        let session = store
+            .register_session(&new_session("task-lease-downgrade", temp.path()))
+            .unwrap();
+        let holder = crate::session_holder::AgentProcess {
+            pid: 3731,
+            started: "Fri Oct 23 08:42:41 2026".into(),
+            command: "/opt/codex agent --session 7".into(),
+        };
+        let other = crate::session_holder::AgentProcess {
+            pid: 5000,
+            started: "Fri Oct 23 09:01:00 2026".into(),
+            command: "/opt/codex agent --session 8".into(),
+        };
+        let previous = crate::session_holder::AgentProcess {
+            pid: 2700,
+            started: "Fri Oct 23 08:00:00 2026".into(),
+            command: "/opt/codex previous-holder".into(),
+        };
+        let mut payload: serde_json::Value = serde_json::from_str(
+            &crate::events::session_holder_bound_payload(&holder, "take_over", Some(&previous)),
+        )
+        .unwrap();
+        payload["binding_annotation"] = serde_json::json!("preserve-me");
+        payload["task_lease"] = serde_json::json!({"version": 2, "duration_ms": 86_400_000});
+        store
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session.id),
+                Some(&payload.to_string()),
+            )
+            .unwrap();
+        let before = store
+            .latest_session_holder_event(session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .heartbeat_session_task_lease(session.id, &holder, now_ms())
+                .unwrap(),
+            crate::session_holder::TaskLeaseHeartbeat::LegacyProtected
+        );
+        assert_eq!(
+            store
+                .latest_session_holder_event(session.id)
+                .unwrap()
+                .unwrap()
+                .id,
+            before.id
+        );
+        assert_eq!(
+            store
+                .downgrade_session_task_lease_for_holder(session.id, Some(&other), now_ms())
+                .unwrap(),
+            crate::session_holder::TaskLeaseDowngrade::NotHolder
+        );
+        assert_eq!(
+            store
+                .downgrade_session_task_lease_for_holder(session.id, Some(&holder), now_ms())
+                .unwrap(),
+            crate::session_holder::TaskLeaseDowngrade::Downgraded
+        );
+        let downgraded = store
+            .latest_session_holder_event(session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(crate::session_holder::task_lease(&downgraded), None);
+        let downgraded_payload: serde_json::Value =
+            serde_json::from_str(downgraded.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(downgraded_payload["reason"], "take_over");
+        assert_eq!(downgraded_payload["previous_pid"], previous.pid);
+        assert_eq!(downgraded_payload["previous_started"], previous.started);
+        assert_eq!(downgraded_payload["binding_annotation"], "preserve-me");
+        assert!(downgraded_payload.get("task_lease").is_none());
+
+        assert_eq!(
+            store
+                .heartbeat_session_task_lease(session.id, &holder, now_ms())
+                .unwrap(),
+            crate::session_holder::TaskLeaseHeartbeat::Upgraded
+        );
+        let reupgraded = store
+            .latest_session_holder_event(session.id)
+            .unwrap()
+            .unwrap();
+        let reupgraded_payload: serde_json::Value =
+            serde_json::from_str(reupgraded.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(reupgraded_payload["reason"], "take_over");
+        assert_eq!(reupgraded_payload["previous_pid"], previous.pid);
+        assert_eq!(reupgraded_payload["previous_started"], previous.started);
+        assert_eq!(reupgraded_payload["binding_annotation"], "preserve-me");
+        assert_eq!(
+            crate::session_holder::task_lease(&reupgraded),
+            Some(crate::session_holder::TaskLease::current())
+        );
+    }
+
+    #[test]
+    fn unresolved_guarded_exec_receipts_are_retirement_witnesses() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = BrokerStore::open(&temp.path().join("broker.db")).unwrap();
+        let session = store
+            .register_session(&new_session("task-lease-exec-witness", temp.path()))
+            .unwrap();
+        assert!(!store.session_has_unresolved_operations(session.id).unwrap());
+
+        let starting = store.begin_guarded_exec_receipt(session.id).unwrap();
+        assert!(store.session_has_unresolved_operations(session.id).unwrap());
+        store
+            .mark_guarded_exec_not_started(session.id, &starting)
+            .unwrap();
+        assert!(!store.session_has_unresolved_operations(session.id).unwrap());
+
+        let running = store.begin_guarded_exec_receipt(session.id).unwrap();
+        store
+            .mark_guarded_exec_running(session.id, &running)
+            .unwrap();
+        assert!(store.session_has_unresolved_operations(session.id).unwrap());
+        store
+            .complete_guarded_exec_command(session.id, &running, "succeeded", Some(0), "verified")
+            .unwrap();
+        assert!(!store.session_has_unresolved_operations(session.id).unwrap());
     }
 
     #[test]
