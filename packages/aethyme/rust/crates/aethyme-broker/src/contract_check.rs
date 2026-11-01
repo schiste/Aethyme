@@ -57,13 +57,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use regex::{RegexSet, RegexSetBuilder};
-
 /// Tokens shorter than this are too noisy to track (`a`, `it`, `of`).
 const MIN_SYMBOL_LEN: usize = 4;
 
-/// Bound the escaped pattern source and compiled matcher retained for one
-/// contract scan. A larger registry fails as an unknown scan, never clean.
+/// Bound literal source bytes and the borrowed matcher index for one contract
+/// scan. A larger registry fails as an unknown scan, never clean.
 const MAX_SYMBOL_PATTERN_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SYMBOL_SET_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -681,64 +679,76 @@ fn unified_diff(repo_root: &Path, revisions: &[&str]) -> Result<Vec<String>, Str
 /// sides now.
 struct TrackedSymbolMatcher<'a> {
     symbols: Vec<&'a str>,
-    patterns: Option<RegexSet>,
 }
 
-/// Compile the tracked literals once, with the same ASCII-byte boundary rule
-/// used by the former per-symbol scanner. In valid UTF-8, every non-ASCII
-/// scalar is a boundary just as each of its bytes was previously.
+/// Bound storage before allocating the borrowed literal index. A large regex
+/// set can fall back to scanning every NFA state for every input byte; direct
+/// literal searches avoid that path without changing the boundary contract.
 fn build_symbol_matcher(
     tracked: &BTreeSet<String>,
-    compiled_size_limit: usize,
+    matcher_size_limit: usize,
 ) -> Result<TrackedSymbolMatcher<'_>, String> {
-    const PREFIX: &str = r"(?:\A|[^A-Za-z0-9_-])";
-    const SUFFIX: &str = r"(?:\z|[^A-Za-z0-9_-])";
-
     let mut symbol_bytes = 0usize;
-    let mut pattern_bytes = 0usize;
-    let mut symbols = Vec::new();
-    let mut patterns = Vec::new();
-    for symbol in tracked.iter().map(String::as_str).filter(|s| !s.is_empty()) {
+    let mut count = 0usize;
+    for symbol in tracked.iter().filter(|s| !s.is_empty()) {
         symbol_bytes = symbol_bytes
             .checked_add(symbol.len())
             .ok_or_else(|| "tracked contract symbols exceed the size limit".to_string())?;
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| "tracked contract symbol count exceeds the size limit".to_string())?;
         if symbol_bytes > MAX_SYMBOL_PATTERN_BYTES {
             return Err(format!(
                 "tracked contract symbols exceed the {MAX_SYMBOL_PATTERN_BYTES}-byte source limit"
             ));
         }
-        let pattern = format!("{PREFIX}{}{SUFFIX}", regex::escape(symbol));
-        pattern_bytes = pattern_bytes
-            .checked_add(pattern.len())
-            .ok_or_else(|| "tracked contract symbol patterns exceed the size limit".to_string())?;
-        if pattern_bytes > MAX_SYMBOL_PATTERN_BYTES {
-            return Err(format!(
-                "tracked contract symbol patterns exceed the {MAX_SYMBOL_PATTERN_BYTES}-byte source limit"
-            ));
+    }
+    let retained_bytes = count
+        .checked_mul(std::mem::size_of::<&str>())
+        .and_then(|bytes| bytes.checked_add(symbol_bytes))
+        .ok_or_else(|| "tracked contract symbol index exceeds the size limit".to_string())?;
+    if retained_bytes > matcher_size_limit {
+        return Err(format!(
+            "tracked contract symbol index exceeds the {matcher_size_limit}-byte limit"
+        ));
+    }
+    let mut symbols = Vec::new();
+    symbols
+        .try_reserve_exact(count)
+        .map_err(|error| format!("could not allocate tracked contract symbol index: {error}"))?;
+    let allocated_bytes = symbols
+        .capacity()
+        .checked_mul(std::mem::size_of::<&str>())
+        .and_then(|bytes| bytes.checked_add(symbol_bytes))
+        .ok_or_else(|| "tracked contract symbol index exceeds the size limit".to_string())?;
+    if allocated_bytes > matcher_size_limit {
+        return Err(format!(
+            "tracked contract symbol index exceeds the {matcher_size_limit}-byte limit"
+        ));
+    }
+    symbols.extend(tracked.iter().map(String::as_str).filter(|s| !s.is_empty()));
+    Ok(TrackedSymbolMatcher { symbols })
+}
+
+/// Report each literal at most once per line, just as the former regex set did.
+fn literal_symbol_matches(body: &str, symbol: &str) -> bool {
+    let Some(first) = symbol.chars().next() else {
+        return false;
+    };
+    let is_word = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-');
+    let mut cursor = 0;
+    while let Some(relative) = body[cursor..].find(symbol) {
+        let start = cursor + relative;
+        let end = start + symbol.len();
+        let left_boundary = start == 0 || !is_word(body.as_bytes()[start - 1]);
+        let right_boundary = end == body.len() || !is_word(body.as_bytes()[end]);
+        if left_boundary && right_boundary {
+            return true;
         }
-        symbols.push(symbol);
-        patterns.push(pattern);
+        // Retain overlapping occurrences while staying on a UTF-8 boundary.
+        cursor = start + first.len_utf8();
     }
-
-    if patterns.is_empty() {
-        return Ok(TrackedSymbolMatcher {
-            symbols,
-            patterns: None,
-        });
-    }
-
-    let patterns = RegexSetBuilder::new(patterns)
-        .size_limit(compiled_size_limit)
-        .build()
-        .map_err(|error| {
-            format!(
-                "could not compile tracked contract symbols within the {compiled_size_limit}-byte limit: {error}"
-            )
-        })?;
-    Ok(TrackedSymbolMatcher {
-        symbols,
-        patterns: Some(patterns),
-    })
+    false
 }
 
 /// Find tracked symbols whose occurrences are reduced by a diff.
@@ -759,16 +769,18 @@ fn find_touched_symbols_with_limit(
     matcher_size_limit: usize,
 ) -> Result<BTreeMap<String, Vec<String>>, String> {
     let matcher = build_symbol_matcher(tracked, matcher_size_limit)?;
-    let Some(patterns) = matcher.patterns.as_ref() else {
+    if matcher.symbols.is_empty() {
         return Ok(BTreeMap::new());
-    };
+    }
 
     Ok(find_touched_symbols_by_filepair(
         diff_lines,
         &matcher.symbols,
         |body, visit_match| {
-            for id in patterns.matches(body).iter() {
-                visit_match(id);
+            for (id, symbol) in matcher.symbols.iter().enumerate() {
+                if literal_symbol_matches(body, symbol) {
+                    visit_match(id);
+                }
             }
         },
     ))
@@ -1613,6 +1625,59 @@ mod tests {
         let diff = vec!["- any removed line".to_string()];
 
         assert!(find_touched_symbols(&diff, &tracked).unwrap().is_empty());
+    }
+
+    #[test]
+    fn literal_search_matches_independent_regex_boundary_oracle() {
+        let symbols = ["foo", "foo.bar", ".bar", "aba", "éé", "é.é", "a+b", "[x]"];
+        let edges = ["", " ", "x", "_", "-", ".", "é", "\n"];
+        for symbol in symbols {
+            let oracle = regex::Regex::new(&format!(
+                r"(?:\A|[^A-Za-z0-9_-]){}(?:\z|[^A-Za-z0-9_-])",
+                regex::escape(symbol)
+            ))
+            .unwrap();
+            for left in edges {
+                for right in edges {
+                    for body in [
+                        format!("{left}{symbol}{right}"),
+                        format!("x{symbol} {left}{symbol}{right}"),
+                        format!("{left}{symbol}{symbol}{right}"),
+                    ] {
+                        assert_eq!(
+                            literal_symbol_matches(&body, symbol),
+                            oracle.is_match(&body),
+                            "symbol={symbol:?}, body={body:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(literal_symbol_matches("xé.é.é", "é.é"));
+        assert!(literal_symbol_matches("xa.a.a", "a.a"));
+    }
+
+    #[test]
+    fn large_literal_inventory_keeps_filepair_accounting() {
+        let tracked: BTreeSet<String> = (0..2048)
+            .map(|id| format!("contract-entry-{id:04}"))
+            .collect();
+        let row = tracked.iter().cloned().collect::<Vec<_>>().join(" ");
+        let diff = vec![
+            "diff --git a/registry b/registry".to_string(),
+            format!("-{row}"),
+            format!("+{row}"),
+            "diff --git a/entry b/entry".to_string(),
+            "-contract-entry-1024".to_string(),
+            "diff --git a/other b/other".to_string(),
+            "+contract-entry-1024".to_string(),
+        ];
+        let findings = find_touched_symbols(&diff, &tracked).unwrap();
+        assert_eq!(
+            findings.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["contract-entry-1024"]
+        );
+        assert_eq!(findings["contract-entry-1024"].len(), 1);
     }
 
     #[test]
