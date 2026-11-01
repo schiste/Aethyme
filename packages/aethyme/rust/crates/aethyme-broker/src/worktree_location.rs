@@ -82,7 +82,7 @@ impl WorktreeLocationConfig {
 
 /// Validate and normalize cone-mode directory paths before passing them to Git.
 /// The sparse paths are literal repository paths, never gitignore patterns.
-fn validate_sparse_paths(paths: &mut Vec<String>) -> Result<(), String> {
+fn validate_sparse_paths(paths: &mut [String]) -> Result<(), String> {
     let mut seen = std::collections::BTreeSet::new();
     for path in paths.iter_mut() {
         let normalized = path.strip_suffix('/').unwrap_or(path.as_str());
