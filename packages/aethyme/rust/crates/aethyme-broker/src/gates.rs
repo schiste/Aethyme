@@ -1037,6 +1037,201 @@ pub(crate) fn running_session_gates(main_root: &Path, session_id: i64) -> Vec<St
     running
 }
 
+/// Checked session-scoped gate evidence for guarded task retirement. An
+/// unreadable, replaced, malformed or incomplete witness set is unknown, never
+/// proof of inactivity. Signal zero probes process groups without signalling
+/// their members, including children whose original group leader has exited.
+/// Empty means no session PID witness was found under a stable path; callers
+/// must also hold the session operation fence and check artifact producers,
+/// coordinated operations, preparation state and direct process use.
+pub(crate) fn checked_running_session_gates_until(
+    main_root: &Path,
+    session_id: i64,
+    mut expired: impl FnMut() -> bool,
+    entry_budget: usize,
+) -> Option<Vec<String>> {
+    if session_id <= 0 || expired() {
+        return None;
+    }
+    let mut directories = Vec::new();
+    for path in [
+        main_root.to_path_buf(),
+        main_root.join(".aethyme"),
+        main_root.join(".aethyme/run"),
+        running_dir(main_root),
+    ] {
+        if expired() {
+            return None;
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                directories.push((path, metadata));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && path != main_root => {
+                // A missing child beneath an exchanged parent is unknown.
+                // Recheck every observed ancestor and the absent leaf rather
+                // than treating a transient lookup failure as an empty set.
+                for (parent, before) in &directories {
+                    if expired() {
+                        return None;
+                    }
+                    let after = std::fs::symlink_metadata(parent).ok()?;
+                    if !same_gate_directory_version(before, &after) {
+                        return None;
+                    }
+                }
+                if !matches!(std::fs::symlink_metadata(&path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+                {
+                    return None;
+                }
+                return (!expired()).then(Vec::new);
+            }
+            _ => return None,
+        }
+    }
+    let run_dir = running_dir(main_root);
+    let entries = std::fs::read_dir(&run_dir).ok()?;
+    let prefix = format!("{session_id}-");
+    let mut running = Vec::new();
+    for (seen, entry) in entries.enumerate() {
+        if expired() || seen >= entry_budget {
+            return None;
+        }
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let name = name.to_str()?;
+        let Some(gate) = name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".pid"))
+        else {
+            continue;
+        };
+        if gate.is_empty() {
+            return None;
+        }
+        let record = read_gate_pidfile_with_parser_until(
+            &entry.path(),
+            &mut expired,
+            parse_checked_gate_pid_record,
+        )
+        .ok()??;
+        if checked_gate_record_active(&record)? {
+            running.push(gate.to_string());
+        }
+    }
+    // Recheck the complete path version, including ancestors, so a transient
+    // redirection or newly inserted registry entry invalidates the inventory.
+    for (path, before) in &directories {
+        if expired() {
+            return None;
+        }
+        let after = std::fs::symlink_metadata(path).ok()?;
+        if !same_gate_directory_version(before, &after) {
+            return None;
+        }
+    }
+    running.sort();
+    (!expired()).then_some(running)
+}
+
+fn same_gate_directory_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    if !left.is_dir() || !right.is_dir() || right.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+fn same_gate_directory_version(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    if !same_gate_directory_identity(left, right) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.mtime() == right.mtime()
+            && left.mtime_nsec() == right.mtime_nsec()
+            && left.ctime() == right.ctime()
+            && left.ctime_nsec() == right.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+fn parse_checked_gate_pid_record(content: &str) -> Option<GatePidRecord> {
+    let fields = content.split_whitespace().take(6).collect::<Vec<_>>();
+    if !matches!(fields.len(), 2..=5) {
+        return None;
+    }
+    let record = GatePidRecord::parse(content)?;
+    if record.pgid <= 1 {
+        return None;
+    }
+    if let Some(pid) = fields.get(2)
+        && *pid != "-"
+        && pid.parse::<i32>().ok().is_none_or(|pid| pid <= 1)
+    {
+        return None;
+    }
+    if let Some(start) = fields.get(3)
+        && *start != "-"
+        && start.parse::<u64>().is_err()
+    {
+        return None;
+    }
+    Some(record)
+}
+
+fn checked_gate_record_active(record: &GatePidRecord) -> Option<bool> {
+    if record.pgid <= 1 || record.pid.is_some_and(|pid| pid <= 1) {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: signal zero observes the strictly positive recorded group
+        // without sending a signal or changing any process state.
+        let status = unsafe { libc::killpg(record.pgid, 0) };
+        if status == 0 {
+            return Some(true);
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EPERM) => return Some(true),
+            Some(libc::ESRCH) => {}
+            _ => return None,
+        }
+        if let Some(pid) = record.pid {
+            if let Some(start) = process_start_time(pid) {
+                return Some(record.start.is_none_or(|recorded| recorded == start));
+            }
+            // A missing start-time observation may reflect an observation
+            // failure. Only ESRCH independently proves the leader is absent.
+            // SAFETY: signal zero only probes the positive parsed leader PID.
+            if unsafe { libc::kill(pid, 0) } == 0 {
+                return None;
+            }
+            return match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ESRCH) => Some(false),
+                _ => None,
+            };
+        }
+        Some(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _record = record;
+        None
+    }
+}
+
 /// Evidence that a gate of the repository rooted at `main_root` is running
 /// right now, one human-readable line per witness. Empty means none was found.
 ///
@@ -1270,6 +1465,14 @@ fn read_gate_pidfile_until(
     path: &Path,
     expired: &mut impl FnMut() -> bool,
 ) -> Result<Option<GatePidRecord>, ()> {
+    read_gate_pidfile_with_parser_until(path, expired, GatePidRecord::parse)
+}
+
+fn read_gate_pidfile_with_parser_until(
+    path: &Path,
+    expired: &mut impl FnMut() -> bool,
+    parse: fn(&str) -> Option<GatePidRecord>,
+) -> Result<Option<GatePidRecord>, ()> {
     if expired() {
         return Err(());
     }
@@ -1324,7 +1527,7 @@ fn read_gate_pidfile_until(
         return Err(());
     }
     let content = std::str::from_utf8(&bytes).map_err(|_| ())?;
-    Ok(GatePidRecord::parse(content))
+    Ok(parse(content))
 }
 
 /// What a gate pidfile says about the process group it names.
@@ -6462,18 +6665,33 @@ mod tests {
         use std::os::unix::process::CommandExt;
         assert!(gate_process_group_absent(0));
         assert!(!gate_process_group_absent(-1));
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("5")
+        let mut child = std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
             .process_group(0)
             .spawn()
             .unwrap();
         let process_group = i32::try_from(child.id()).unwrap();
         let absent = gate_process_group_absent(process_group);
+        let record = GatePidRecord {
+            pgid: process_group,
+            tree: "synthetic".into(),
+            pid: Some(i32::MAX),
+            start: Some(1),
+            run: None,
+        };
+        let checked_active = checked_gate_record_active(&record);
         // Signal only this still-owned, unreaped child, never a saved group id.
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(!absent, "a live group was treated as quiescent");
+        assert_eq!(
+            checked_active,
+            Some(true),
+            "a live group protects children even when its recorded leader is absent"
+        );
         assert!(gate_process_group_absent(process_group));
+        assert_eq!(checked_gate_record_active(&record), Some(false));
     }
 
     #[test]
@@ -7180,6 +7398,83 @@ mod tests {
                 .iter()
                 .any(|item| item.contains("gate pidfile gate.pid is unreadable"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_session_gate_inventory_refuses_unknown_or_incomplete_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            checked_running_session_gates_until(root.path(), 7, || false, 8),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            checked_running_session_gates_until(root.path(), 7, || true, 8),
+            None
+        );
+        std::fs::create_dir_all(running_dir(root.path())).unwrap();
+        std::fs::write(running_dir(root.path()).join("7-check.pid"), "malformed").unwrap();
+        assert_eq!(
+            checked_running_session_gates_until(root.path(), 7, || false, 8),
+            None
+        );
+        assert_eq!(
+            checked_running_session_gates_until(root.path(), 7, || false, 0),
+            None
+        );
+        assert_eq!(
+            checked_running_session_gates_until(root.path(), 8, || false, 8),
+            Some(Vec::new()),
+            "unrelated session records do not become a global blocker"
+        );
+        std::fs::remove_file(running_dir(root.path()).join("7-check.pid")).unwrap();
+        std::fs::remove_dir(running_dir(root.path())).unwrap();
+        std::fs::write(running_dir(root.path()), "not a directory").unwrap();
+        assert_eq!(
+            checked_running_session_gates_until(root.path(), 7, || false, 8),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_session_gate_inventory_rejects_symlinked_witness_directories_and_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".aethyme/run")).unwrap();
+        std::os::unix::fs::symlink("missing", running_dir(root.path())).unwrap();
+        assert_eq!(
+            checked_running_session_gates_until(root.path(), 7, || false, 8),
+            None
+        );
+        std::fs::remove_file(running_dir(root.path())).unwrap();
+        std::fs::create_dir_all(running_dir(root.path())).unwrap();
+        std::os::unix::fs::symlink("missing", running_dir(root.path()).join("7-check.pid"))
+            .unwrap();
+        assert_eq!(
+            checked_running_session_gates_until(root.path(), 7, || false, 8),
+            None
+        );
+    }
+
+    #[test]
+    fn checked_gate_pid_parser_preserves_legacy_records_and_refuses_ambiguous_fields() {
+        for valid in ["42 tree", "42 tree 42 100", "42 tree 42 100 run-id"] {
+            assert!(parse_checked_gate_pid_record(valid).is_some(), "{valid}");
+        }
+        for invalid in [
+            "0 tree",
+            "-42 tree",
+            "1 tree",
+            "42 tree nope 100",
+            "42 tree 0 100",
+            "42 tree 42 nope",
+            "42 tree 42 100 run-id extra",
+        ] {
+            assert!(
+                parse_checked_gate_pid_record(invalid).is_none(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
