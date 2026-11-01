@@ -6518,7 +6518,10 @@ impl GitRepo {
             .root()
             .canonicalize()
             .map_err(|source| GitError::Spawn {
-                args: format!("canonicalize discovered worktree {}", worktree.root().display()),
+                args: format!(
+                    "canonicalize discovered worktree {}",
+                    worktree.root().display()
+                ),
                 source,
             })?;
         if discovered_root != destination {
@@ -6530,18 +6533,20 @@ impl GitRepo {
                 ),
             });
         }
-        let expected_common = self.git_common_dir()?.canonicalize().map_err(|source| {
-            GitError::Spawn {
-                args: "canonicalize repository git common directory".into(),
-                source,
-            }
-        })?;
-        let actual_common = worktree.git_common_dir()?.canonicalize().map_err(|source| {
-            GitError::Spawn {
+        let expected_common =
+            self.git_common_dir()?
+                .canonicalize()
+                .map_err(|source| GitError::Spawn {
+                    args: "canonicalize repository git common directory".into(),
+                    source,
+                })?;
+        let actual_common = worktree
+            .git_common_dir()?
+            .canonicalize()
+            .map_err(|source| GitError::Spawn {
                 args: "canonicalize sparse worktree git common directory".into(),
                 source,
-            }
-        })?;
+            })?;
         if actual_common != expected_common
             || worktree.current_branch()? != branch
             || worktree.head_commit()? != expected_base
@@ -10935,10 +10940,7 @@ mod sparse_worktree_tests {
             vec!["included/source.rs"],
             "sparse omissions must not become deleted paths"
         );
-        git(
-            &worktree_path,
-            &["checkout", "--", "included/source.rs"],
-        );
+        git(&worktree_path, &["checkout", "--", "included/source.rs"]);
         assert!(worktree.dirty_paths().unwrap().is_empty());
         repo.worktree_remove(&worktree_path, false).unwrap();
     }
@@ -11034,7 +11036,10 @@ mod sparse_worktree_tests {
         };
 
         let error_text = error.to_string();
-        assert!(error_text.contains("partial worktree retained"), "{error_text}");
+        assert!(
+            error_text.contains("partial worktree retained"),
+            "{error_text}"
+        );
         let tracked = worktree_path.join("included/source.rs");
         assert_eq!(
             std::fs::read_to_string(tracked).unwrap(),
@@ -11091,7 +11096,10 @@ mod sparse_worktree_tests {
         };
 
         let error_text = error.to_string();
-        assert!(error_text.contains("partial worktree retained"), "{error_text}");
+        assert!(
+            error_text.contains("partial worktree retained"),
+            "{error_text}"
+        );
         let retained = GitRepo::discover(&worktree_path).unwrap();
         assert_eq!(retained.current_branch().unwrap(), "agent/moved-head");
         assert_ne!(retained.head_commit().unwrap(), base);

@@ -2701,21 +2701,27 @@ impl Broker {
                 }
                 crate::broker::AbandonedSessionCloseOutcome::OperationGuardBusy => {
                     summary.deferred += 1;
-                    summary.reasons.push(SessionRetirementDeferredReason::OperationGuardBusy {
-                        session_id: session.id,
-                    });
+                    summary
+                        .reasons
+                        .push(SessionRetirementDeferredReason::OperationGuardBusy {
+                            session_id: session.id,
+                        });
                 }
                 crate::broker::AbandonedSessionCloseOutcome::OperationActive => {
                     summary.deferred += 1;
-                    summary.reasons.push(SessionRetirementDeferredReason::OperationActive {
-                        session_id: session.id,
-                    });
+                    summary
+                        .reasons
+                        .push(SessionRetirementDeferredReason::OperationActive {
+                            session_id: session.id,
+                        });
                 }
                 crate::broker::AbandonedSessionCloseOutcome::OperationEvidenceUnavailable => {
                     summary.deferred += 1;
-                    summary.reasons.push(SessionRetirementDeferredReason::OperationEvidenceUnavailable {
-                        session_id: session.id,
-                    });
+                    summary.reasons.push(
+                        SessionRetirementDeferredReason::OperationEvidenceUnavailable {
+                            session_id: session.id,
+                        },
+                    );
                 }
                 crate::broker::AbandonedSessionCloseOutcome::DatabaseBusy => {
                     summary.deferred += 1;

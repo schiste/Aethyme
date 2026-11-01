@@ -592,7 +592,10 @@ const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("graph", &["authority", "repository"]),
     ("review", &["trigger", "routing", "reporting", "projection"]),
     ("collaboration", crate::collaboration_submit::KNOWN_SETTINGS),
-    ("worktrees", &["root", "min_free_bytes", "max_checkouts", "sparse_paths"]),
+    (
+        "worktrees",
+        &["root", "min_free_bytes", "max_checkouts", "sparse_paths"],
+    ),
     ("worktree_freshness", &["max_age_seconds"]),
     ("session", &["guidance"]),
 ];
@@ -2080,7 +2083,10 @@ mod retention_certification_tests {
     #[test]
     fn artifact_or_orphan_only_debt_never_certifies_as_clear() {
         let mut health = empty_health();
-        assert_eq!(retention_certification_check(&health).status, CheckStatus::Pass);
+        assert_eq!(
+            retention_certification_check(&health).status,
+            CheckStatus::Pass
+        );
         health.candidate_artifacts = 1;
         let artifacts = retention_certification_check(&health);
         assert_eq!(artifacts.status, CheckStatus::Warn);

@@ -1378,7 +1378,10 @@ mod tests {
         );
         assert_eq!(policy.artifact_reclaim_days, 0);
         assert_eq!(policy.artifact_sweep_budget_ms, 5_000);
-        assert_eq!(policy.artifact_sweep_headroom_bytes, 16 * 1024 * 1024 * 1024);
+        assert_eq!(
+            policy.artifact_sweep_headroom_bytes,
+            16 * 1024 * 1024 * 1024
+        );
         assert_eq!(policy.routine_size_budget_ms, 200);
         assert_eq!(policy.size_record_ttl_hours, 24);
         assert_eq!(policy.retained_bytes_budget, 1_073_741_824);
@@ -1390,9 +1393,21 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(repo.path().join(".aethyme")).unwrap();
         let config = repo.path().join(BROKER_CONFIG_RELPATH);
-        std::fs::write(&config, "[retention]\nexpire_abandoned_task_leases = true\n").unwrap();
-        assert!(load_retention_policy(repo.path()).unwrap().expire_abandoned_task_leases);
-        std::fs::write(&config, "[retention]\nexpire_abandoned_task_leases = \"yes\"\n").unwrap();
+        std::fs::write(
+            &config,
+            "[retention]\nexpire_abandoned_task_leases = true\n",
+        )
+        .unwrap();
+        assert!(
+            load_retention_policy(repo.path())
+                .unwrap()
+                .expire_abandoned_task_leases
+        );
+        std::fs::write(
+            &config,
+            "[retention]\nexpire_abandoned_task_leases = \"yes\"\n",
+        )
+        .unwrap();
         assert!(load_retention_policy(repo.path()).is_err());
     }
 

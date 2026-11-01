@@ -7831,9 +7831,7 @@ impl Broker {
             );
         }
         if let Some(reason) = sparse_setup_fallback {
-            eprintln!(
-                "warning: sparse checkout setup failed ({reason}); created a full checkout"
-            );
+            eprintln!("warning: sparse checkout setup failed ({reason}); created a full checkout");
         }
         if placement.source == WorktreeRootSource::RepositoryConfig {
             // A failed lock must not fail the start, but it leaves the
