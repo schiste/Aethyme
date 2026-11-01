@@ -344,6 +344,27 @@ fn replacing_below_minimum_keeps_pinned_environments() {
     lifecycle.down(&pinned, None).unwrap();
 }
 
+/// #1290: a rule's `exclude` carves exceptions out of a broad rule; the
+/// highest-rank rule still wins for everything it does match.
+#[test]
+fn an_excluded_path_never_fires_its_rule() {
+    let text = RULES.replace(
+        "paths = [\"server/**\", \"src/**/*.rs\"]\n",
+        "paths = [\"server/**\", \"src/**/*.rs\"]\nexclude = [\"server/docs/**\"]\n",
+    );
+    let loaded: Loaded<EnvironmentsFile> = parse_loaded(PathBuf::from("t"), "t", &text);
+    let file = loaded.value.unwrap_or_else(|d| panic!("{}", d.render()));
+
+    let docs = infer(&file, &paths(&["server/docs/api.md"])).unwrap();
+    assert_eq!(docs.minimum, "static", "{docs:?}");
+    assert!(docs.fired.is_empty(), "{docs:?}");
+    assert_eq!(docs.unmatched, paths(&["server/docs/api.md"]));
+
+    let code = infer(&file, &paths(&["server/docs/api.md", "server/main.rs"])).unwrap();
+    assert_eq!(code.minimum, "backend", "{code:?}");
+    assert_eq!(code.fired[0].paths, paths(&["server/main.rs"]));
+}
+
 /// #1273: a session whose committed changes raise the minimum above its
 /// running environment is reported for `broker status`, and stops being
 /// reported once an environment meeting the minimum runs.

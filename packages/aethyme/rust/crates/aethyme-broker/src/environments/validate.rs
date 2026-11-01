@@ -324,16 +324,18 @@ pub fn validate(
                 "add at least one glob",
             );
         }
-        for pattern in &rule.paths {
-            if let Err(error) = Glob::new(pattern) {
-                c.push(
-                    "invalid_glob",
-                    None,
-                    None,
-                    Some(&format!("{field}.paths")),
-                    format!("{pattern:?}: {error}"),
-                    "fix the glob syntax",
-                );
+        for (list, patterns) in [("paths", &rule.paths), ("exclude", &rule.exclude)] {
+            for pattern in patterns {
+                if let Err(error) = Glob::new(pattern) {
+                    c.push(
+                        "invalid_glob",
+                        None,
+                        None,
+                        Some(&format!("{field}.{list}")),
+                        format!("{pattern:?}: {error}"),
+                        "fix the glob syntax",
+                    );
+                }
             }
         }
     }

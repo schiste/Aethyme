@@ -333,6 +333,10 @@ fn default_health_interval() -> u64 {
 pub struct RuleSpec {
     pub name: String,
     pub paths: Vec<String>,
+    /// Paths matching one of these never fire this rule (#1290), so a broad
+    /// rule can have exceptions without changing highest-rank inference.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
     pub min_profile: String,
     #[serde(default)]
     pub reason: Option<String>,

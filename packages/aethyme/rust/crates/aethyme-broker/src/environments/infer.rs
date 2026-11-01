@@ -2,7 +2,8 @@
 //!
 //! `[[rules]]` map changed paths to a minimum profile. The session's diff
 //! against its base fires rules; the inferred minimum is the highest-ranked
-//! profile any fired rule names, or `default_profile` when none fires.
+//! profile any fired rule names, or `default_profile` when none fires. A
+//! path matching a rule's `exclude` never fires that rule (#1290).
 //!
 //! Inference is **raise-only**: `env up` refuses a profile ranked below the
 //! minimum and lists the rules and paths that fired. A higher profile is
@@ -101,10 +102,11 @@ pub fn infer(file: &EnvironmentsFile, paths: &[String]) -> Result<Inference, Str
     let mut matched = vec![false; paths.len()];
     for rule in &file.rules {
         let set = rule_set(&rule.paths)?;
+        let exclude = rule_set(&rule.exclude)?;
         let hits: Vec<String> = paths
             .iter()
             .enumerate()
-            .filter(|(_, path)| set.is_match(path.as_str()))
+            .filter(|(_, path)| set.is_match(path.as_str()) && !exclude.is_match(path.as_str()))
             .map(|(index, path)| {
                 matched[index] = true;
                 path.clone()
