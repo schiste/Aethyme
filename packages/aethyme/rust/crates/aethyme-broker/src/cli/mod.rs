@@ -476,11 +476,15 @@ Usage:
       Rebuild the plan, journal a second exact remote observation, and resolve
       only contained exposures and advisories without live lease overlap.
   aethyme broker note send --session <sender> --to-session <recipient> --message <text> [--json]
+  aethyme broker note send --from automation:<name> --to-session <recipient> --message <text> [--fingerprint <key>] [--json]
   aethyme broker note list --session <recipient> [--json]
-  aethyme broker note ack --session <recipient> --id <note-id> [--json]
+  aethyme broker note ack --session <recipient> (--id <note-id> | --automation-id <note-id>) [--json]
       Send, inspect, and acknowledge bounded repository-local coordination
       notes between live sessions. Unread notes surface on the recipient's
       next broker command; event payloads never contain message text.
+      An automation, which has no session, sends with --from (#1238); with
+      --fingerprint a repeat while its last note is unread is not queued
+      again. Automation notes surface and acknowledge like session notes.
   aethyme broker gates validate [--json]
       Parse and validate .aethyme/gates.toml.
   aethyme broker gates incidents list [--json]
@@ -1598,6 +1602,10 @@ struct Parsed {
     open_pr: bool,
     session: Option<i64>,
     to_session: Option<i64>,
+    /// `note send --from automation:<name>` (#1238).
+    note_from: Option<String>,
+    /// `note ack --automation-id`.
+    automation_note_id: Option<i64>,
     cross_session: Option<i64>,
     ref_write_acknowledged: bool,
     note_id: Option<i64>,
@@ -1772,6 +1780,8 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         open_pr: false,
         session: None,
         to_session: None,
+        note_from: None,
+        automation_note_id: None,
         cross_session: None,
         ref_write_acknowledged: false,
         note_id: None,
@@ -2496,6 +2506,23 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
                 ))?;
                 parsed.cross_session = Some(value.parse().map_err(|_| {
                     UsageError::Message("--cross-session must be an integer session id".into())
+                })?);
+            }
+            "--from" => {
+                parsed.note_from = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message(
+                            "--from requires automation:<name>".into(),
+                        ))?
+                        .clone(),
+                )
+            }
+            "--automation-id" => {
+                let value = iter.next().ok_or(UsageError::Message(
+                    "--automation-id requires a value".into(),
+                ))?;
+                parsed.automation_note_id = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--automation-id must be an integer note id".into())
                 })?);
             }
             "--to-session" => {
@@ -3318,17 +3345,28 @@ fn surface_command_advisories(subcommand: &str, parsed: &Parsed) {
     for line in crate::advisories::session_notice_lines(&advisories) {
         eprintln!("{line}");
     }
-    let Ok(notes) = store.unread_session_notes(session_id) else {
-        return;
-    };
-    for note in notes {
-        eprintln!(
-            "Unread broker note {} from session {}: {}",
-            note.id, note.sender_session_id, note.message
-        );
-        eprintln!(
-            "  acknowledge: aethyme broker advanced note ack --session {} --id {}",
-            session_id, note.id
-        );
+    if let Ok(notes) = store.unread_session_notes(session_id) {
+        for note in notes {
+            eprintln!(
+                "Unread broker note {} from session {}: {}",
+                note.id, note.sender_session_id, note.message
+            );
+            eprintln!(
+                "  acknowledge: aethyme broker advanced note ack --session {} --id {}",
+                session_id, note.id
+            );
+        }
+    }
+    if let Ok(notes) = store.unread_automation_notes(session_id) {
+        for note in notes {
+            eprintln!(
+                "Unread note {} from {}: {}",
+                note.id, note.sender, note.message
+            );
+            eprintln!(
+                "  acknowledge: aethyme broker advanced note ack --session {} --automation-id {}",
+                session_id, note.id
+            );
+        }
     }
 }

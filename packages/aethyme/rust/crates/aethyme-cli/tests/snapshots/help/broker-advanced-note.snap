@@ -1,9 +1,13 @@
 exit: 0
 --- stdout
   aethyme broker advanced note send --session <sender> --to-session <recipient> --message <text> [--json]
+  aethyme broker advanced note send --from automation:<name> --to-session <recipient> --message <text> [--fingerprint <key>] [--json]
   aethyme broker advanced note list --session <recipient> [--json]
-  aethyme broker advanced note ack --session <recipient> --id <note-id> [--json]
+  aethyme broker advanced note ack --session <recipient> (--id <note-id> | --automation-id <note-id>) [--json]
       Send, inspect, and acknowledge bounded repository-local coordination
       notes between live sessions. Unread notes surface on the recipient's
       next broker command; event payloads never contain message text.
+      An automation, which has no session, sends with --from (#1238); with
+      --fingerprint a repeat while its last note is unread is not queued
+      again. Automation notes surface and acknowledge like session notes.
 --- stderr

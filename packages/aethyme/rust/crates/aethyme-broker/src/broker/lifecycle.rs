@@ -5687,25 +5687,7 @@ impl Broker {
                 reason: "sender and recipient must be different live sessions".into(),
             });
         }
-        let message = message.trim();
-        if message.is_empty() {
-            return Err(BrokerOpError::InvalidSessionNote {
-                reason: "message must not be empty".into(),
-            });
-        }
-        if message.len() > SESSION_NOTE_MAX_BYTES {
-            return Err(BrokerOpError::InvalidSessionNote {
-                reason: format!(
-                    "message is {} bytes; maximum is {SESSION_NOTE_MAX_BYTES}",
-                    message.len()
-                ),
-            });
-        }
-        if message.chars().any(char::is_control) {
-            return Err(BrokerOpError::InvalidSessionNote {
-                reason: "message must be one line of plain text without control characters".into(),
-            });
-        }
+        let message = validated_note_message(message)?;
         for (role, id) in [
             ("sender", sender_session_id),
             ("recipient", recipient_session_id),
@@ -5722,18 +5704,90 @@ impl Broker {
             .record_session_note(sender_session_id, recipient_session_id, message)?)
     }
 
+    /// Send a note from an automation, which has no session (#1238), to a
+    /// session that is not closed. With a fingerprint, a repeat while the
+    /// previous note is still unread returns that note instead of queueing
+    /// another, so a recurring check never floods its recipient.
+    pub fn send_automation_note(
+        &mut self,
+        sender: &str,
+        recipient_session_id: i64,
+        message: &str,
+        fingerprint: Option<&str>,
+    ) -> Result<crate::types::AutomationNoteSend, BrokerOpError> {
+        validate_automation_sender(sender)?;
+        let message = validated_note_message(message)?;
+        if let Some(fingerprint) = fingerprint
+            && (fingerprint.is_empty()
+                || fingerprint.len() > AUTOMATION_NOTE_FINGERPRINT_MAX_BYTES
+                || fingerprint
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control()))
+        {
+            return Err(BrokerOpError::InvalidSessionNote {
+                reason: format!(
+                    "fingerprint must be 1-{AUTOMATION_NOTE_FINGERPRINT_MAX_BYTES} bytes without whitespace"
+                ),
+            });
+        }
+        let recipient = self.store.session(recipient_session_id)?;
+        if recipient.status.is_closed() {
+            return Err(BrokerOpError::InvalidSessionNote {
+                reason: format!("recipient session {recipient_session_id} is closed"),
+            });
+        }
+        let (note, deduplicated) = self.store.record_automation_note(
+            sender,
+            recipient_session_id,
+            message,
+            fingerprint,
+        )?;
+        Ok(crate::types::AutomationNoteSend { note, deduplicated })
+    }
+
+    pub fn acknowledge_automation_note(
+        &mut self,
+        recipient_session_id: i64,
+        note_id: i64,
+    ) -> Result<crate::types::AutomationNote, BrokerOpError> {
+        let recipient = self.store.session(recipient_session_id)?;
+        if recipient.status.is_closed() {
+            return Err(BrokerOpError::InvalidSessionNote {
+                reason: format!("recipient session {recipient_session_id} is closed"),
+            });
+        }
+        let note = self
+            .store
+            .automation_note(note_id)?
+            .ok_or(BrokerError::AutomationNoteNotFound(note_id))?;
+        if note.recipient_session_id != recipient_session_id {
+            return Err(BrokerOpError::SessionNoteRecipientMismatch {
+                session_id: recipient_session_id,
+                note_id,
+                recipient_session_id: note.recipient_session_id,
+            });
+        }
+        Ok(self.store.acknowledge_automation_note(note_id)?)
+    }
+
     pub fn session_note_list(
         &self,
         recipient_session_id: i64,
     ) -> Result<SessionNoteList, BrokerOpError> {
         self.store.session(recipient_session_id)?;
         let notes = self.store.session_notes(recipient_session_id)?;
+        let automation_notes = self.store.automation_notes(recipient_session_id)?;
         let unread_count = notes
             .iter()
             .filter(|note| note.acknowledged_at.is_none())
-            .count();
+            .count()
+            + automation_notes
+                .iter()
+                .filter(|note| note.acknowledged_at.is_none())
+                .count();
         Ok(SessionNoteList {
             notes,
+            automation_notes,
             unread_count,
         })
     }
@@ -11792,5 +11846,62 @@ mod graph_write_fence_tests {
         drop(snapshot);
         let _broker = storage.open(&root).unwrap();
         assert!(marker.is_file());
+    }
+}
+
+/// Most bytes in an automation note's fingerprint.
+pub const AUTOMATION_NOTE_FINGERPRINT_MAX_BYTES: usize = 128;
+
+/// Prefix every automation note sender carries.
+pub const AUTOMATION_SENDER_PREFIX: &str = "automation:";
+
+/// A note body is one trimmed line of plain text within the size bound,
+/// whoever sends it.
+fn validated_note_message(message: &str) -> Result<&str, BrokerOpError> {
+    let message = message.trim();
+    if message.is_empty() {
+        return Err(BrokerOpError::InvalidSessionNote {
+            reason: "message must not be empty".into(),
+        });
+    }
+    if message.len() > SESSION_NOTE_MAX_BYTES {
+        return Err(BrokerOpError::InvalidSessionNote {
+            reason: format!(
+                "message is {} bytes; maximum is {SESSION_NOTE_MAX_BYTES}",
+                message.len()
+            ),
+        });
+    }
+    if message.chars().any(char::is_control) {
+        return Err(BrokerOpError::InvalidSessionNote {
+            reason: "message must be one line of plain text without control characters".into(),
+        });
+    }
+    Ok(message)
+}
+
+/// `automation:<name>`, the name 1-64 lowercase ASCII letters, digits, `.`,
+/// `_` or `-`, starting with a letter or digit.
+fn validate_automation_sender(sender: &str) -> Result<(), BrokerOpError> {
+    let valid = sender
+        .strip_prefix(AUTOMATION_SENDER_PREFIX)
+        .is_some_and(|name| {
+            (1..=64).contains(&name.len())
+                && name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                && name.chars().all(|c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')
+                })
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(BrokerOpError::InvalidSessionNote {
+            reason: format!(
+                "sender {sender:?} must be automation:<name>, the name 1-64 lowercase letters, digits, '.', '_' or '-'"
+            ),
+        })
     }
 }

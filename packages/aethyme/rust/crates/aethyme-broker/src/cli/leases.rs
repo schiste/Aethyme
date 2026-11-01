@@ -1033,7 +1033,51 @@ pub(super) fn run_exposures(parsed: Parsed) -> Result<(), UsageError> {
 pub(super) fn run_note(parsed: Parsed) -> Result<(), UsageError> {
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     match parsed.positional.first().map(String::as_str) {
+        Some("send") if parsed.positional.len() == 1 && parsed.note_from.is_some() => {
+            if parsed.session.is_some() {
+                return Err(UsageError::Message(
+                    "note send takes --session <sender> or --from automation:<name>, not both"
+                        .into(),
+                ));
+            }
+            let sender = parsed.note_from.as_deref().unwrap_or_default();
+            let recipient = parsed.to_session.ok_or_else(|| {
+                UsageError::Message("note send requires --to-session <recipient>".into())
+            })?;
+            let message = parsed
+                .message
+                .as_deref()
+                .ok_or_else(|| UsageError::Message("note send requires --message <text>".into()))?;
+            let sent = broker.send_automation_note(
+                sender,
+                recipient,
+                message,
+                parsed.fingerprint.as_deref(),
+            )?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&sent)?);
+            } else if sent.deduplicated {
+                out!(
+                    "Automation note {} from {} to session {} is still unread; not sent again.",
+                    sent.note.id,
+                    sent.note.sender,
+                    sent.note.recipient_session_id
+                );
+            } else {
+                out!(
+                    "Sent automation note {} from {} to session {}.",
+                    sent.note.id,
+                    sent.note.sender,
+                    sent.note.recipient_session_id
+                );
+            }
+        }
         Some("send") if parsed.positional.len() == 1 => {
+            if parsed.fingerprint.is_some() {
+                return Err(UsageError::Message(
+                    "--fingerprint applies only to note send --from automation:<name>".into(),
+                ));
+            }
             let sender = parsed.session.ok_or_else(|| {
                 UsageError::Message("note send requires --session <sender>".into())
             })?;
@@ -1063,33 +1107,64 @@ pub(super) fn run_note(parsed: Parsed) -> Result<(), UsageError> {
             let list = broker.session_note_list(recipient)?;
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&list)?);
-            } else if list.notes.is_empty() {
+            } else if list.notes.is_empty() && list.automation_notes.is_empty() {
                 out!("No broker notes for session {recipient}.");
             } else {
-                out!("{:<5} {:<8} {:<14} MESSAGE", "ID", "FROM", "STATE");
+                let state = |acknowledged: Option<i64>| {
+                    if acknowledged.is_some() {
+                        "acknowledged"
+                    } else {
+                        "unread"
+                    }
+                };
+                out!("{:<6} {:<24} {:<14} MESSAGE", "ID", "FROM", "STATE");
                 for note in &list.notes {
                     out!(
-                        "{:<5} {:<8} {:<14} {}",
+                        "{:<6} {:<24} {:<14} {}",
                         note.id,
-                        note.sender_session_id,
-                        if note.acknowledged_at.is_some() {
-                            "acknowledged"
-                        } else {
-                            "unread"
-                        },
+                        format!("session {}", note.sender_session_id),
+                        state(note.acknowledged_at),
+                        note.message
+                    );
+                }
+                for note in &list.automation_notes {
+                    out!(
+                        "{:<6} {:<24} {:<14} {}",
+                        format!("a{}", note.id),
+                        note.sender,
+                        state(note.acknowledged_at),
                         note.message
                     );
                 }
                 out!("Unread: {}", list.unread_count);
+                if !list.automation_notes.is_empty() {
+                    out!("Acknowledge an aN row with --automation-id N.");
+                }
             }
         }
         Some("ack") if parsed.positional.len() == 1 => {
             let recipient = parsed.session.ok_or_else(|| {
                 UsageError::Message("note ack requires --session <recipient>".into())
             })?;
-            let note_id = parsed
-                .note_id
-                .ok_or_else(|| UsageError::Message("note ack requires --id <note-id>".into()))?;
+            if let Some(note_id) = parsed.automation_note_id {
+                if parsed.note_id.is_some() {
+                    return Err(UsageError::Message(
+                        "note ack takes --id or --automation-id, not both".into(),
+                    ));
+                }
+                let note = broker.acknowledge_automation_note(recipient, note_id)?;
+                if parsed.json {
+                    out!("{}", serde_json::to_string_pretty(&note)?);
+                } else {
+                    out!("Acknowledged automation note {}.", note.id);
+                }
+                return Ok(());
+            }
+            let note_id = parsed.note_id.ok_or_else(|| {
+                UsageError::Message(
+                    "note ack requires --id <note-id> or --automation-id <note-id>".into(),
+                )
+            })?;
             let note = broker.acknowledge_session_note(recipient, note_id)?;
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&note)?);
