@@ -28,8 +28,10 @@ const RETENTION_POLICY_FIELDS: &[&str] = &[
     "artifact_reclaim_days",
     "orphan_worktree_roots_days",
     "session_abandoned_after_hours",
+    "expire_abandoned_task_leases",
     "idle_session_artifact_hours",
     "artifact_sweep_budget_ms",
+    "artifact_sweep_headroom_bytes",
     "artifact_sweep_interval_hours",
     "artefact_directories",
     "startup_budget_ms",
@@ -112,6 +114,10 @@ pub struct RetentionPolicy {
     /// raising this trades disk against how long a dead session's disk is
     /// held -- never against whether committed work survives.
     pub session_abandoned_after_hours: u32,
+    /// Opt in to guarded expiry of versioned task ownership after upgrading
+    /// and draining older clients. Legacy or unknown holder evidence remains
+    /// protected. This changes metadata eligibility, never deletion proofs.
+    pub expire_abandoned_task_leases: bool,
     /// Legacy configuration field retained so older `.aethyme/broker.toml`
     /// files continue to parse. Autonomous sweeps always preserve caches from
     /// open sessions because quiet-agent time and shallow directory timestamps
@@ -119,6 +125,11 @@ pub struct RetentionPolicy {
     pub idle_session_artifact_hours: u32,
     /// Wall-clock budget for the autonomous artifact sweep. `0` disables it.
     pub artifact_sweep_budget_ms: u64,
+    /// Proactive free-space reserve for bounded cache maintenance, measured
+    /// independently on each affected volume. This is a scheduling signal,
+    /// never authority to delete active or unproven data. Values below gate
+    /// headroom retain that existing safety threshold.
+    pub artifact_sweep_headroom_bytes: u64,
     /// Minimum spacing between autonomous artifact sweeps.
     pub artifact_sweep_interval_hours: u32,
     /// Additional single-component directory names that may be treated as
@@ -166,7 +177,7 @@ impl Default for RetentionPolicy {
             terminal_merge_queue_days: 180,
             command_metrics_days: 30,
             closed_worktrees_days: 7,
-            closed_worktree_grace_hours: 15 * 24,
+            closed_worktree_grace_hours: 5 * 24,
             auto_cleanup_worktrees_on_finish: true,
             compact_closed_worktrees: false,
             publication_exposure_days: 30,
@@ -174,8 +185,10 @@ impl Default for RetentionPolicy {
             artifact_reclaim_days: 0,
             orphan_worktree_roots_days: 1,
             session_abandoned_after_hours: 72,
+            expire_abandoned_task_leases: false,
             idle_session_artifact_hours: 24,
             artifact_sweep_budget_ms: 5_000,
+            artifact_sweep_headroom_bytes: 16 * 1024 * 1024 * 1024,
             artifact_sweep_interval_hours: 24,
             artefact_directories: Vec::new(),
             startup_budget_ms: 25,
@@ -1356,18 +1369,31 @@ mod tests {
         assert!(policy.terminal_events_days >= policy.gate_results_days);
         assert!(policy.terminal_merge_queue_days >= policy.gate_results_days);
         assert!(policy.startup_budget_ms <= 25);
-        assert_eq!(policy.closed_worktree_grace_hours, 360);
+        assert_eq!(policy.closed_worktree_grace_hours, 120);
         assert!(!policy.compact_closed_worktrees);
+        assert!(!policy.expire_abandoned_task_leases);
         assert_eq!(
             policy.compact_archive_minimum_retention_ms(),
             15 * 24 * 60 * 60 * 1_000
         );
         assert_eq!(policy.artifact_reclaim_days, 0);
         assert_eq!(policy.artifact_sweep_budget_ms, 5_000);
+        assert_eq!(policy.artifact_sweep_headroom_bytes, 16 * 1024 * 1024 * 1024);
         assert_eq!(policy.routine_size_budget_ms, 200);
         assert_eq!(policy.size_record_ttl_hours, 24);
         assert_eq!(policy.retained_bytes_budget, 1_073_741_824);
         assert!(policy.artefact_directories.is_empty());
+    }
+
+    #[test]
+    fn task_lease_expiry_requires_explicit_boolean_opt_in() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".aethyme")).unwrap();
+        let config = repo.path().join(BROKER_CONFIG_RELPATH);
+        std::fs::write(&config, "[retention]\nexpire_abandoned_task_leases = true\n").unwrap();
+        assert!(load_retention_policy(repo.path()).unwrap().expire_abandoned_task_leases);
+        std::fs::write(&config, "[retention]\nexpire_abandoned_task_leases = \"yes\"\n").unwrap();
+        assert!(load_retention_policy(repo.path()).is_err());
     }
 
     #[test]

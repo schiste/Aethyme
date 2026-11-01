@@ -234,8 +234,11 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
         });
         let retention = &report.retention;
         let pending = retention.pending_recovery_digest.is_some();
-        let eligible =
-            retention.candidate_rows + retention.candidate_files + retention.candidate_worktrees;
+        let eligible = retention.candidate_rows
+            + retention.candidate_files
+            + retention.candidate_worktrees
+            + retention.candidate_artifacts
+            + retention.candidate_orphans;
         checks.push(Check {
             id: "certify.retention",
             status: if pending || eligible > 0 {
@@ -249,10 +252,12 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
                 )
             } else {
                 format!(
-                    "{} eligible rows, {} files, {} worktrees; {} reclaimable bytes; {} protected findings",
+                    "{} eligible rows, {} files, {} worktrees, {} artifacts, {} orphans; {} reclaimable bytes; {} protected findings",
                     retention.candidate_rows,
                     retention.candidate_files,
                     retention.candidate_worktrees,
+                    retention.candidate_artifacts,
+                    retention.candidate_orphans,
                     retention.estimated_reclaimable_bytes,
                     retention.blockers,
                 )
