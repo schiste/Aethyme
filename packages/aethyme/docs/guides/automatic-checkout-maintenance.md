@@ -9,7 +9,7 @@ records, content delivery, protected files, process use, and current policy.
 
 ## Retention windows
 
-The default open-session abandonment window is five days (120 hours).
+The default open-session abandonment window is three days (72 hours).
 Maintenance uses the latest recorded activity and worktree activity. A live
 recorded task holder remains protected unless the repository explicitly opts
 into the finite task-lease protocol described below; unknown identity remains
@@ -21,13 +21,13 @@ open forever. Explicit claims with active or unknown holder liveness still
 protect their session unless the exact live holder's opted-in task lease has
 expired and its stale grace has elapsed.
 
-Closed checkouts have a 15-day grace period. Configure retention in the primary
+Closed checkouts have a five-day grace period. Configure retention in the primary
 repository's `.aethyme/broker.toml`:
 
 ```toml
 [retention]
-session_abandoned_after_hours = 120
-closed_worktree_grace_hours = 360
+session_abandoned_after_hours = 72
+closed_worktree_grace_hours = 120
 # Off by default; requires a coordinated broker upgrade and client drain.
 expire_abandoned_task_leases = false
 ```
@@ -51,7 +51,7 @@ long-running task should send an explicit heartbeat at least once every
 aethyme broker advanced heartbeat --session <id>
 ```
 
-Expiry alone never closes a session. The normal five-day inactivity window,
+Expiry alone never closes a session. The normal three-day inactivity window,
 the exact holder binding, worktree identity and metadata, operation guard, gate,
 preparation, artifact-use and process-use witnesses, and the final database
 compare-and-swap must also allow retirement. A live `session.pid`, active child,
@@ -91,7 +91,7 @@ defer the attempt. Adopted and legacy rows without an original ownership
 witness require an explicit reviewed retirement plan; the broker does not
 invent a witness for an existing directory.
 
-This opt-in can compact a checkout during its ordinary 15-day grace period.
+This opt-in can compact a checkout during its ordinary five-day grace period.
 Every retirement archive records a minimum retention floor of at least 15 days
 and at least the configured `closed_worktree_grace_hours`, measured from the
 archive's recorded creation time. The floor is stored in the archive receipt

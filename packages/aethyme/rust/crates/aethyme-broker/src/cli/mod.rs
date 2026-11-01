@@ -2947,8 +2947,8 @@ fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseComma
         | "quality-report" | "external-events" | "reclaim" | "deliveries" | "review"
         | "review-thread" | "console" | "resources" | "agents" | "ownership" | "merge-chain"
         | "advisories" | "exposures" | "note" | "operations" | "gates" | "watch" | "pr"
-        | "hooks" | "handoff" | "finish" | "close" | "gc" | "worktrees" | "storage" | "cleanup"
-        | "metrics" | "insights" | "blockers" | "unblock" | "doctor" | "quick-test" | "trust"
+        | "hooks" | "handoff" | "finish" | "close" | "gc" | "worktrees" | "storage" | "metrics"
+        | "insights" | "blockers" | "unblock" | "doctor" | "quick-test" | "trust"
         | "verify-loop" | "e2e" | "init" | "certify" | "scaffold" | "promotion-record"
         | "checkpoint" | "queue" | "promote" | "ship" | "integration" | "events"
         | "exec-status" => TaskLeaseCommandClass::OtherWork,
