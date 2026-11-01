@@ -206,6 +206,39 @@ pub fn certification_facts(repo_hint: &Path) -> Result<CertificationFacts, Broke
     })
 }
 
+fn retention_certification_check(retention: &crate::GcHealth) -> Check {
+    let pending = retention.pending_recovery_digest.is_some();
+    let eligible = retention.candidate_rows
+        + retention.candidate_files
+        + retention.candidate_worktrees
+        + retention.candidate_artifacts
+        + retention.candidate_orphans;
+    Check {
+        id: "certify.retention",
+        status: if pending || eligible > 0 {
+            CheckStatus::Warn
+        } else {
+            CheckStatus::Pass
+        },
+        detail: if let Some(digest) = &retention.pending_recovery_digest {
+            format!(
+                "confirmed GC recovery is pending; resume with `aethyme broker gc apply --confirm {digest}`"
+            )
+        } else {
+            format!(
+                "{} eligible rows, {} files, {} worktrees, {} artifacts, {} orphans; {} reclaimable bytes; {} protected findings",
+                retention.candidate_rows,
+                retention.candidate_files,
+                retention.candidate_worktrees,
+                retention.candidate_artifacts,
+                retention.candidate_orphans,
+                retention.estimated_reclaimable_bytes,
+                retention.blockers,
+            )
+        },
+    }
+}
+
 /// The certification method: read-only, deterministic checks only.
 pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
     let facts = certification_facts(repo_hint)?;
@@ -232,37 +265,7 @@ pub fn certify(repo_hint: &Path) -> Result<InitReport, BrokerOpError> {
             },
             detail: format!("integrity: {}", report.integrity),
         });
-        let retention = &report.retention;
-        let pending = retention.pending_recovery_digest.is_some();
-        let eligible = retention.candidate_rows
-            + retention.candidate_files
-            + retention.candidate_worktrees
-            + retention.candidate_artifacts
-            + retention.candidate_orphans;
-        checks.push(Check {
-            id: "certify.retention",
-            status: if pending || eligible > 0 {
-                CheckStatus::Warn
-            } else {
-                CheckStatus::Pass
-            },
-            detail: if let Some(digest) = &retention.pending_recovery_digest {
-                format!(
-                    "confirmed GC recovery is pending; resume with `aethyme broker gc apply --confirm {digest}`"
-                )
-            } else {
-                format!(
-                    "{} eligible rows, {} files, {} worktrees, {} artifacts, {} orphans; {} reclaimable bytes; {} protected findings",
-                    retention.candidate_rows,
-                    retention.candidate_files,
-                    retention.candidate_worktrees,
-                    retention.candidate_artifacts,
-                    retention.candidate_orphans,
-                    retention.estimated_reclaimable_bytes,
-                    retention.blockers,
-                )
-            },
-        });
+        checks.push(retention_certification_check(&report.retention));
         for id in &report.missing_worktrees {
             checks.push(Check {
                 id: "certify.missing-worktree",
@@ -2035,5 +2038,62 @@ mod config_counterpart_tests {
 
         assert_eq!(check.status, CheckStatus::Fail);
         assert!(!toml.exists());
+    }
+}
+
+#[cfg(test)]
+mod retention_certification_tests {
+    use super::{CheckStatus, retention_certification_check};
+
+    fn empty_health() -> crate::GcHealth {
+        crate::GcHealth {
+            deferred_checks: Vec::new(),
+            policy: crate::RetentionPolicy::default(),
+            retention_config_warnings: Vec::new(),
+            pending_recovery_digest: None,
+            candidate_rows: 0,
+            candidate_files: 0,
+            candidate_worktrees: 0,
+            candidate_artifacts: 0,
+            candidate_orphans: 0,
+            estimated_reclaimable_bytes: 0,
+            estimated_reclaimable_inodes: None,
+            estimated_retained_bytes: 0,
+            estimated_retained_inodes: None,
+            estimated_blocked_bytes: 0,
+            estimated_blocked_inodes: None,
+            over_retained_bytes_budget: false,
+            retained_bytes_deficit: 0,
+            clears_retained_bytes_budget: true,
+            reclaim_order: crate::ReclaimOrder::OldestFirst,
+            budget_verdict: crate::BudgetVerdict::Within,
+            unmeasured_directory_count: 0,
+            artifact_worktrees_not_scanned: 0,
+            sizes_measured_at_ms: None,
+            blockers: 0,
+            unclaimed_worktree_count: 0,
+            unclaimed_worktree_bytes: 0,
+            closed_worktrees: Default::default(),
+        }
+    }
+
+    #[test]
+    fn artifact_or_orphan_only_debt_never_certifies_as_clear() {
+        let mut health = empty_health();
+        assert_eq!(retention_certification_check(&health).status, CheckStatus::Pass);
+        health.candidate_artifacts = 1;
+        let artifacts = retention_certification_check(&health);
+        assert_eq!(artifacts.status, CheckStatus::Warn);
+        assert!(artifacts.detail.contains("1 artifacts"));
+        health.candidate_artifacts = 0;
+        health.candidate_orphans = 2;
+        let orphans = retention_certification_check(&health);
+        assert_eq!(orphans.status, CheckStatus::Warn);
+        assert!(orphans.detail.contains("2 orphans"));
+        health.candidate_orphans = 0;
+        health.pending_recovery_digest = Some("fixture-digest".into());
+        let pending = retention_certification_check(&health);
+        assert_eq!(pending.status, CheckStatus::Warn);
+        assert!(pending.detail.contains("gc apply --confirm fixture-digest"));
     }
 }
