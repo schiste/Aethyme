@@ -168,6 +168,10 @@ pub const ADVANCED_VERBS: &[(&str, &str)] = &[
     ("report", "capture, render and file diagnostic reports"),
     ("quality-report", "publish a quality report as a PR summary"),
     (
+        "issues",
+        "one issue per automation outcome, opened, updated and closed",
+    ),
+    (
         "external-events",
         "ingest and reconcile normalized external events",
     ),

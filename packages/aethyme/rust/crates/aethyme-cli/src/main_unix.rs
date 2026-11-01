@@ -132,6 +132,7 @@ fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapa
         (Some("checkpoint"), Some("apply")) => CommandCapability::RecoveryWrite,
         (Some("report"), Some("file")) => CommandCapability::RecoveryWrite,
         (Some("quality-report"), Some("plan")) => CommandCapability::DiagnosticRead,
+        (Some("issues"), Some("upsert")) => CommandCapability::SharedMutation,
         (Some("operations" | "resources"), Some("reconcile"))
         | (Some("advisories"), Some("ack")) => CommandCapability::RecoveryWrite,
         (Some("external-events"), Some("ingest" | "reconcile")) => {
