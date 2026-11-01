@@ -274,6 +274,13 @@ blocked.
    The help snapshot test derives public verbs from the surface table; keep the
    no-side-effect help coverage in sync as well.
 
+   Before committing, stage only the intended session-owned paths explicitly
+   with `git add <path>...`; never use `git add .` or `git add -A`, and
+   inspect `git diff --cached`. The broker commit command does not stage files.
+   If it fails, inspect its receipt and the worktree status to confirm whether
+   a commit was created. Do not push or open a PR until a successful commit is
+   confirmed.
+
    For a local commit in your own active session, use
    `aethyme broker commit --session <your-session-id> -- <git-commit-args>`.
    It checks the registered worktree and branch, audits complete bounded path
