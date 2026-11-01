@@ -589,7 +589,7 @@ const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("graph", &["authority", "repository"]),
     ("review", &["trigger", "routing", "reporting", "projection"]),
     ("collaboration", crate::collaboration_submit::KNOWN_SETTINGS),
-    ("worktrees", &["root", "min_free_bytes"]),
+    ("worktrees", &["root", "min_free_bytes", "max_checkouts", "sparse_paths"]),
     ("worktree_freshness", &["max_age_seconds"]),
     ("session", &["guidance"]),
 ];
@@ -1253,6 +1253,8 @@ const CONFIG_TEMPLATE: &str = "\
 #   [leases.routing] category = [\"path/\", \"exact/file\"]
 #   [worktrees] root  absolute directory for session worktrees (default: per-user host state)
 #   [worktrees] min_free_bytes  free space the root must keep (default: gate headroom)
+#   [worktrees] max_checkouts  maximum linked checkouts (default 32; 0 disables)
+#   [worktrees] sparse_paths  optional tracked directories for new session checkouts
 #   [worktree_freshness] max_age_seconds  prior-observation stale threshold (default 900)
 #     An age at or above the threshold is stale; zero marks all prior observations stale.
 #   [session] guidance  working agreement `broker start` shows (default built in; [] disables)
@@ -1984,6 +1986,7 @@ mod config_key_tests {
     #[test]
     fn worktrees_root_and_floor_are_known_keys() {
         assert!(unknown("[worktrees]\nroot = \"/Volumes/T7/wt\"\nmin_free_bytes = 1\n").is_empty());
+        assert!(unknown("[worktrees]\nmax_checkouts = 32\nsparse_paths = [\"src\"]\n").is_empty());
         assert_eq!(unknown("[worktrees]\npath = \"/x\"\n"), ["worktrees.path"]);
     }
 

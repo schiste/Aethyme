@@ -1,6 +1,6 @@
 # Closed-session worktree cleanup
 
-Last Updated: 2026-10-29
+Last Updated: 2026-11-01
 
 Removing a session worktree is a reviewed operation, with one deterministic
 exception described under *Automatic removal* below. A closed session is not
@@ -145,7 +145,7 @@ keep = ["*-investigation"]     # worktrees never removed automatically
 ```
 
 State-only closed checkouts also respect `[retention]
-closed_worktree_grace_hours` in `.aethyme/broker.toml` (360 hours / 15 days by default;
+closed_worktree_grace_hours` in `.aethyme/broker.toml` (120 hours / 5 days by default;
 `0` disables the window). Automatic checkout cleanup and reviewed whole-checkout
 GC share this check; in-place artifact reclamation has its own retention rules.
 Automatic apply reloads retention before removal, so a newly raised grace
