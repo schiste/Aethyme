@@ -4,6 +4,7 @@
 //! [worktrees]
 //! root = "/Volumes/T7/aethyme-worktrees"
 //! min_free_bytes = 8589934592
+//! sparse_paths = ["packages/aethyme"]
 //! ```
 //!
 //! The default stays the per-user host-state root. A configured root
@@ -27,6 +28,11 @@ pub struct WorktreeLocationConfig {
     /// Maximum registered linked checkouts, across all placement roots.
     /// Omission means 32; explicit zero disables this allocation guard.
     pub max_checkouts: Option<u32>,
+    /// Tracked repository-relative directories to include in newly created
+    /// session worktrees. An empty list keeps the existing full-checkout
+    /// behavior; explicit `start --path` leases are added to this cone.
+    #[serde(default)]
+    pub sparse_paths: Vec<String>,
 }
 
 impl WorktreeLocationConfig {
@@ -47,7 +53,7 @@ impl WorktreeLocationConfig {
         let Some(section) = value.get("worktrees") else {
             return Ok(None);
         };
-        let config: Self = section
+        let mut config: Self = section
             .clone()
             .try_into()
             .map_err(|error| format!("[worktrees] is invalid: {error}"))?;
@@ -59,6 +65,7 @@ impl WorktreeLocationConfig {
                 root.display()
             ));
         }
+        validate_sparse_paths(&mut config.sparse_paths)?;
         Ok(Some(config))
     }
 
@@ -71,6 +78,48 @@ impl WorktreeLocationConfig {
             None => Ok(None),
         }
     }
+}
+
+
+/// Validate and normalize cone-mode directory paths before passing them to Git.
+/// The sparse paths are literal repository paths, never gitignore patterns.
+fn validate_sparse_paths(paths: &mut Vec<String>) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for path in paths.iter_mut() {
+        let normalized = path.strip_suffix('/').unwrap_or(path.as_str());
+        let drive_relative = normalized.as_bytes().get(1) == Some(&b':');
+        if normalized.is_empty()
+            || Path::new(normalized).is_absolute()
+            || normalized.starts_with('\\')
+            || drive_relative
+        {
+            return Err(format!(
+                "[worktrees] sparse_paths entries must be repository-relative directories, got {path:?}"
+            ));
+        }
+        if normalized.chars().any(|character| {
+            character.is_control() || matches!(character, '\\' | '*' | '?' | '[' | ']')
+        }) {
+            return Err(format!(
+                "[worktrees] sparse_paths entries must be literal directory paths without control characters or glob syntax, got {path:?}"
+            ));
+        }
+        if normalized
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".." | ".git"))
+        {
+            return Err(format!(
+                "[worktrees] sparse_paths entries cannot contain empty, `.`, `..`, or `.git` components, got {path:?}"
+            ));
+        }
+        if !seen.insert(normalized.to_string()) {
+            return Err(format!(
+                "[worktrees] sparse_paths contains duplicate directory {normalized:?}"
+            ));
+        }
+        *path = normalized.to_string();
+    }
+    Ok(())
 }
 
 /// Why `base` cannot hold worktrees right now, if it cannot.
@@ -203,10 +252,36 @@ mod tests {
             crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES
         );
         assert_eq!(config.max_checkouts(), 32);
+        assert!(config.sparse_paths.is_empty());
         assert_eq!(
             WorktreeLocationConfig::from_config_text("schema = 1\n").unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn sparse_paths_are_literal_relative_directories_and_normalize_trailing_slashes() {
+        let config = WorktreeLocationConfig::from_config_text(
+            "[worktrees]\nsparse_paths = [\"packages/aethyme/\", \"docs\"]\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(config.sparse_paths, vec!["packages/aethyme", "docs"]);
+
+        for invalid in [
+            "/absolute",
+            "../outside",
+            "packages//aethyme",
+            "packages/.git/config",
+            "packages/*",
+            "C:/worktree",
+        ] {
+            let text = format!("[worktrees]\nsparse_paths = [{invalid:?}]\n");
+            assert!(
+                WorktreeLocationConfig::from_config_text(&text).is_err(),
+                "accepted unsafe sparse path {invalid:?}"
+            );
+        }
     }
 
     #[test]

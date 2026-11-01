@@ -7692,6 +7692,68 @@ impl Broker {
         })
     }
 
+    /// Sparse checkout is an explicit repository-configured opt-in. Validate
+    /// its roots against the selected commit's Git tree (without following
+    /// working-tree symlinks), then add explicit lease paths so every claimed
+    /// source is present in a newly allocated session checkout.
+    fn sparse_paths_for_new_session(
+        &self,
+        base: &str,
+        planned_paths: &[String],
+    ) -> (Vec<String>, Option<String>) {
+        let settings = match crate::worktree_location::WorktreeLocationConfig::load(&self.main_root)
+        {
+            Ok(Some(settings)) => settings,
+            Ok(None) => return (Vec::new(), None),
+            Err(error) => {
+                return (
+                    Vec::new(),
+                    Some(format!("[worktrees] configuration is invalid: {error}")),
+                );
+            }
+        };
+        if settings.sparse_paths.is_empty() {
+            return (Vec::new(), None);
+        }
+        for path in &settings.sparse_paths {
+            match self.repo.commit_has_directory(base, path) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return (
+                        Vec::new(),
+                        Some(format!(
+                            "configured sparse directory {path:?} is not a tracked directory in base {base}"
+                        )),
+                    );
+                }
+                Err(error) => {
+                    return (
+                        Vec::new(),
+                        Some(format!(
+                            "could not verify configured sparse directory {path:?} in base {base}: {error}"
+                        )),
+                    );
+                }
+            }
+        }
+
+        let mut paths = settings.sparse_paths;
+        for planned in planned_paths {
+            let directory = if planned.ends_with('/') {
+                let directory = planned.trim_end_matches('/');
+                (!directory.is_empty()).then_some(directory)
+            } else {
+                planned.rsplit_once('/').map(|(parent, _)| parent)
+            };
+            if let Some(directory) = directory {
+                paths.push(directory.to_string());
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        (paths, None)
+    }
+
     fn create_session_worktree(
         &mut self,
         task: &str,
@@ -7738,24 +7800,41 @@ impl Broker {
         timed_start_phase(&mut phase_timings_ms, "storage_admission", || {
             self.preflight_session_checkout_storage(&placement)
         })?;
-        let worktree = match timed_start_phase(&mut phase_timings_ms, "git_worktree_add", || {
-            self.repo
-                .worktree_add(&worktree_path, &branch, &start_base.commit)
-        }) {
-            Ok(worktree) => worktree,
-            Err(error) => {
-                let primary = BrokerOpError::Git(error);
-                let recovery =
-                    inspect_partial_worktree_creation(&self.repo, &worktree_path, &branch);
-                if recovery.is_empty() {
-                    return Err(primary);
+        let (sparse_paths, sparse_plan_fallback) =
+            self.sparse_paths_for_new_session(&start_base.commit, planned_paths);
+        let (worktree, sparse_setup_fallback) =
+            match timed_start_phase(&mut phase_timings_ms, "git_worktree_add", || {
+                self.repo.worktree_add_with_sparse_paths(
+                    &worktree_path,
+                    &branch,
+                    &start_base.commit,
+                    &sparse_paths,
+                )
+            }) {
+                Ok(created) => created,
+                Err(error) => {
+                    let primary = BrokerOpError::Git(error);
+                    let recovery =
+                        inspect_partial_worktree_creation(&self.repo, &worktree_path, &branch);
+                    if recovery.is_empty() {
+                        return Err(primary);
+                    }
+                    return Err(BrokerOpError::StartAgentRollback {
+                        primary: Box::new(primary),
+                        recovery,
+                    });
                 }
-                return Err(BrokerOpError::StartAgentRollback {
-                    primary: Box::new(primary),
-                    recovery,
-                });
-            }
-        };
+            };
+        if let Some(reason) = sparse_plan_fallback {
+            eprintln!(
+                "warning: sparse checkout inputs were unavailable ({reason}); created a full checkout"
+            );
+        }
+        if let Some(reason) = sparse_setup_fallback {
+            eprintln!(
+                "warning: sparse checkout setup failed ({reason}); created a full checkout"
+            );
+        }
         if placement.source == WorktreeRootSource::RepositoryConfig {
             // A failed lock must not fail the start, but it leaves the
             // registration unprotected while the drive is unplugged, so say so.

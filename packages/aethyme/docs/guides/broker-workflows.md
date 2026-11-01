@@ -204,6 +204,33 @@ missing, unplugged, inside the repository or below its free-space floor, and
 drive are locked, so nothing prunes or cleans them up while it is away. See the
 CLI reference for the rules.
 
+### Sparse new-session checkouts
+
+Full checkouts remain the default. To make newly allocated sessions sparse,
+add literal tracked directories to `[worktrees].sparse_paths` in
+`.aethyme/config.toml`:
+
+```toml
+[worktrees]
+sparse_paths = ["packages/aethyme/rust/crates/aethyme-broker"]
+```
+
+The broker validates each configured path against the selected base commit's
+Git tree. The entries must be repository-relative directory paths; globs,
+traversal components and symlink or submodule entries are refused by falling
+back to a full checkout with a warning. Sparse setup also falls back to a full
+checkout when the installed Git cannot apply it. Cone mode keeps root-level
+files and files immediately inside the ancestor directories needed to reach
+each selected directory, in addition to all files below each selected
+directory. The sparse index stays disabled for compatibility.
+
+Explicit `broker start --path` leases add their directory to the new checkout
+(the parent directory for a file lease), so the claimed source is present.
+Include any other directories needed by your task, context tools, dependency
+preparation and gates. Sparse checkout does not infer those inputs or prepare
+dependencies. An absent or empty `sparse_paths` keeps full checkouts, and
+`--reuse` or `--adopt` never changes an existing worktree's sparsity.
+
 When continuing the same task, reuse its broker session/worktree instead of
 creating another checkout. For a follow-up task, use `broker start --reuse`
 and inspect its reported baseline before editing. For a new task, prepare

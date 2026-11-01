@@ -6333,6 +6333,15 @@ impl GitRepo {
     /// Create a linked worktree at `dest` on new branch `branch` starting
     /// from `base`, returning a handle on it.
     pub fn worktree_add(&self, dest: &Path, branch: &str, base: &str) -> Result<GitRepo, GitError> {
+        self.worktree_add_full(dest, branch, base)
+    }
+
+    fn worktree_add_full(
+        &self,
+        dest: &Path,
+        branch: &str,
+        base: &str,
+    ) -> Result<GitRepo, GitError> {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|source| GitError::Spawn {
                 args: format!("create_dir_all {}", parent.display()),
@@ -6350,6 +6359,162 @@ impl GitRepo {
                 base,
             ],
         )?;
+        GitRepo::discover(dest)
+    }
+
+    /// Create a linked worktree, optionally materializing only the requested
+    /// cone-mode directories. Sparse setup is intentionally scoped to a fresh
+    /// worktree: callers must not use this for reuse or adoption.
+    pub(crate) fn worktree_add_with_sparse_paths(
+        &self,
+        dest: &Path,
+        branch: &str,
+        base: &str,
+        sparse_paths: &[String],
+    ) -> Result<(GitRepo, Option<String>), GitError> {
+        self.worktree_add_with_sparse_paths_using(
+            dest,
+            branch,
+            base,
+            sparse_paths,
+            |worktree, paths| {
+                let mut args = vec![
+                    "sparse-checkout".to_string(),
+                    "set".to_string(),
+                    "--cone".to_string(),
+                    "--no-sparse-index".to_string(),
+                    "--".to_string(),
+                ];
+                args.extend(paths.iter().cloned());
+                let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+                run_git(worktree, &args).map(|_| ())
+            },
+        )
+    }
+
+    fn worktree_add_with_sparse_paths_using(
+        &self,
+        dest: &Path,
+        branch: &str,
+        base: &str,
+        sparse_paths: &[String],
+        apply_sparse: impl FnOnce(&Path, &[String]) -> Result<(), GitError>,
+    ) -> Result<(GitRepo, Option<String>), GitError> {
+        if sparse_paths.is_empty() {
+            return self
+                .worktree_add_full(dest, branch, base)
+                .map(|repo| (repo, None));
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| GitError::Spawn {
+                args: format!("create_dir_all {}", parent.display()),
+                source,
+            })?;
+        }
+        run_git(
+            &self.root,
+            &[
+                "worktree",
+                "add",
+                "--no-checkout",
+                "-b",
+                branch,
+                dest.to_str().unwrap_or_default(),
+                base,
+            ],
+        )?;
+
+        match apply_sparse(dest, sparse_paths) {
+            Ok(()) => GitRepo::discover(dest).map(|repo| (repo, None)),
+            Err(sparse_error) => {
+                let reason = sparse_error.to_string();
+                match self.restore_full_checkout_after_sparse_failure(dest, branch, base) {
+                    Ok(repo) => Ok((repo, Some(reason))),
+                    Err(recovery_error) => Err(GitError::Git {
+                        args: "sparse-checkout recovery".into(),
+                        stderr: format!(
+                            "sparse setup failed: {sparse_error}; full-checkout recovery failed: {recovery_error}"
+                        ),
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Check that a path is a tracked directory in a specific commit. Only a
+    /// tree object is accepted, so symlinks and submodules cannot be mistaken
+    /// for directories when validating sparse configuration.
+    pub(crate) fn commit_has_directory(
+        &self,
+        commit: &str,
+        relative_path: &str,
+    ) -> Result<bool, GitError> {
+        let object = format!("{commit}:{relative_path}");
+        match run_git(&self.root, &["cat-file", "-t", &object]) {
+            Ok(object_type) => Ok(object_type == "tree"),
+            // A missing path, symlink blob or gitlink is not a sparse root.
+            // Treat Git's object lookup refusal as a safe full-checkout
+            // fallback; process and timeout errors remain visible to callers.
+            Err(GitError::Git { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn restore_full_checkout_after_sparse_failure(
+        &self,
+        dest: &Path,
+        branch: &str,
+        base: &str,
+    ) -> Result<GitRepo, GitError> {
+        let in_place = (|| {
+            run_git(dest, &["sparse-checkout", "disable"])?;
+            // `disable` restores sparse-omitted files. Reset against the
+            // selected base as a second check that the fresh checkout is full.
+            run_git(dest, &["reset", "--hard", base])?;
+            GitRepo::discover(dest)
+        })();
+        let in_place_error = match in_place {
+            Ok(repo) => return Ok(repo),
+            Err(error) => error,
+        };
+
+        // Older Git versions may not have `sparse-checkout`, or the command
+        // may have failed before it could establish worktree-local settings.
+        // This checkout has not been returned to a caller yet, so it contains
+        // no session edits; remove it, then recreate its unchanged branch tip
+        // with the ordinary full-checkout path.
+        self.worktree_remove(dest, true).map_err(|remove_error| GitError::Git {
+            args: "remove partial sparse worktree".into(),
+            stderr: format!(
+                "in-place full-checkout recovery failed: {in_place_error}; removing the fresh partial worktree failed: {remove_error}"
+            ),
+        })?;
+        let expected_base = run_git(&self.root, &["rev-parse", "--verify", base])?;
+        let branch_tip = run_git(&self.root, &["rev-parse", "--verify", branch])?;
+        if branch_tip != expected_base {
+            return Err(GitError::Git {
+                args: format!("verify fresh branch {branch}"),
+                stderr: format!(
+                    "branch moved during sparse-checkout recovery (expected {expected_base}, found {branch_tip}); it was preserved"
+                ),
+            });
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| GitError::Spawn {
+                args: format!("create_dir_all {}", parent.display()),
+                source,
+            })?;
+        }
+        run_git(
+            &self.root,
+            &["worktree", "add", dest.to_str().unwrap_or_default(), branch],
+        )
+        .map_err(|recreate_error| GitError::Git {
+            args: "recreate full worktree after sparse-checkout failure".into(),
+            stderr: format!(
+                "in-place full-checkout recovery failed: {in_place_error}; full worktree recreation failed: {recreate_error}"
+            ),
+        })?;
         GitRepo::discover(dest)
     }
 
@@ -10550,5 +10715,157 @@ mod config_tree_record_tests {
             GitRepo::strict_config_tree_records(b"unterminated", &args),
             Err(GitError::UntrustedOutput { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod sparse_worktree_tests {
+    use super::{GitError, GitRepo};
+    use std::path::Path;
+
+    fn git(root: &Path, args: &[&str]) {
+        super::run_isolated_graph_git(root, args)
+            .unwrap_or_else(|error| panic!("git {}: {error}", args.join(" ")));
+    }
+
+    fn repository() -> (tempfile::TempDir, std::path::PathBuf) {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q", "--template=", "-b", "main"]);
+        git(&root, &["config", "user.name", "Sparse checkout test"]);
+        git(
+            &root,
+            &["config", "user.email", "sparse-checkout@example.invalid"],
+        );
+        std::fs::write(root.join("README.md"), "root file").unwrap();
+        for (relative, contents) in [
+            ("included/source.rs", "selected source"),
+            ("omitted/deep/data.txt", "omitted source proof"),
+        ] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "initial"]);
+        (fixture, root)
+    }
+
+    #[test]
+    fn sparse_checkout_keeps_root_files_and_omissions_clean_for_git_status() {
+        let (fixture, root) = repository();
+        let repo = GitRepo::discover(&root).unwrap();
+        let base = repo.head_commit().unwrap();
+        let worktree_path = fixture.path().join("linked/sparse");
+        let (worktree, fallback) = repo
+            .worktree_add_with_sparse_paths(
+                &worktree_path,
+                "agent/sparse",
+                &base,
+                &["included".to_string()],
+            )
+            .unwrap();
+
+        assert!(fallback.is_none(), "sparse mode unexpectedly fell back");
+        assert!(worktree_path.join("README.md").is_file());
+        assert!(worktree_path.join("included/source.rs").is_file());
+        assert!(!worktree_path.join("omitted/deep/data.txt").exists());
+        assert!(worktree.dirty_paths().unwrap().is_empty());
+        assert!(
+            root.join("omitted/deep/data.txt").is_file(),
+            "sparse checkout must not omit files from the primary checkout"
+        );
+        assert!(repo.dirty_paths().unwrap().is_empty());
+        assert_eq!(
+            super::run_git(
+                &worktree_path,
+                &["config", "--bool", "--worktree", "core.sparseCheckout"]
+            )
+            .unwrap()
+            .trim(),
+            "true",
+            "the sparse setting belongs to the linked worktree"
+        );
+        assert!(
+            matches!(
+                super::run_git(
+                    &root,
+                    &["config", "--bool", "--worktree", "core.sparseCheckout"]
+                ),
+                Err(GitError::Git { .. })
+            ),
+            "the primary checkout must not inherit the linked worktree's sparse setting"
+        );
+        assert_eq!(
+            worktree
+                .file_at_commit(&base, "omitted/deep/data.txt")
+                .unwrap()
+                .as_deref(),
+            Some("omitted source proof"),
+            "commit-backed source reads must still see sparse-omitted files"
+        );
+
+        std::fs::write(worktree_path.join("included/source.rs"), "edited").unwrap();
+        assert_eq!(
+            worktree.dirty_paths().unwrap(),
+            vec!["included/source.rs"],
+            "sparse omissions must not become deleted paths"
+        );
+        git(
+            &worktree_path,
+            &["checkout", "--", "included/source.rs"],
+        );
+        assert!(worktree.dirty_paths().unwrap().is_empty());
+        repo.worktree_remove(&worktree_path, false).unwrap();
+    }
+
+    #[test]
+    fn sparse_setup_failure_restores_a_complete_full_checkout() {
+        let (fixture, root) = repository();
+        let repo = GitRepo::discover(&root).unwrap();
+        let base = repo.head_commit().unwrap();
+        let worktree_path = fixture.path().join("linked/fallback");
+        let (worktree, fallback) = repo
+            .worktree_add_with_sparse_paths_using(
+                &worktree_path,
+                "agent/fallback",
+                &base,
+                &["included".to_string()],
+                |_, _| {
+                    Err(GitError::Git {
+                        args: "sparse-checkout set".into(),
+                        stderr: "injected failure".into(),
+                    })
+                },
+            )
+            .unwrap();
+
+        assert!(
+            fallback
+                .as_deref()
+                .is_some_and(|reason| reason.contains("injected failure"))
+        );
+        assert!(worktree_path.join("README.md").is_file());
+        assert!(worktree_path.join("included/source.rs").is_file());
+        assert!(
+            worktree_path.join("omitted/deep/data.txt").is_file(),
+            "full-checkout recovery left a tracked file omitted"
+        );
+        assert!(worktree.dirty_paths().unwrap().is_empty());
+        repo.worktree_remove(&worktree_path, false).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sparse_config_directory_validation_uses_tree_objects_without_following_symlinks() {
+        let (_fixture, root) = repository();
+        std::os::unix::fs::symlink("included", root.join("alias")).unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "add directory symlink"]);
+        let repo = GitRepo::discover(&root).unwrap();
+        let base = repo.head_commit().unwrap();
+        assert!(repo.commit_has_directory(&base, "included").unwrap());
+        assert!(!repo.commit_has_directory(&base, "alias").unwrap());
     }
 }
