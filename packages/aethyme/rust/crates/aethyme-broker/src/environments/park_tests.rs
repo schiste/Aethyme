@@ -59,8 +59,11 @@ impl Host {
     }
 
     fn lifecycle(&self) -> Lifecycle {
+        let mut store = EnvironmentStore::open(&self.store).unwrap();
+        // Timings are off under CI by default; these tests assert them.
+        store.set_records_timings(true);
         Lifecycle {
-            store: EnvironmentStore::open(&self.store).unwrap(),
+            store,
             coordinator: HostResourceCoordinator::open(&self.db).unwrap(),
             root: self.root.clone(),
             holder_pid: None,
@@ -550,16 +553,64 @@ fn every_lifecycle_step_is_timed_under_its_metric() {
         ("down", 1),
         ("provision.db", 1),
         ("provision.api", 1),
-        ("start.db", 1),
-        ("start.api", 1),
-        ("health.db", 1),
-        ("health.api", 1),
+        // The warm up woke the environment: its components are timed too.
+        ("start.db", 2),
+        ("start.api", 2),
+        ("health.db", 2),
+        ("health.api", 2),
         ("clone", 1),
     ]
     .into_iter()
     .collect();
     assert_eq!(counts, expected);
     assert_eq!(timings["clone"][0].seconds, 6.5);
+}
+
+/// #1239: with recording off (CI without an opt-in), lifecycle steps and
+/// hook-reported metrics record nothing, and the hook's receipt is still
+/// kept: only the measurement is skipped, never the work.
+#[test]
+fn timings_off_record_nothing_and_keep_receipts() {
+    let host = Host::new();
+    let worktree = tempfile::tempdir().unwrap();
+    let text = one_unit(43980).replace(
+        "[[profiles.components]]\nname = \"api\"",
+        "[[profiles.components]]\nname = \"db\"\nruntime = \"hooks\"\nprovision = 'echo \"AETHYME_RECEIPT {\\\"metrics\\\": {\\\"clone\\\": 6.5}}\"'\ndestroy = \"true\"\n[[profiles.components]]\nname = \"api\"",
+    )
+    // The api is healthy only when it sees the db's receipt, as a later
+    // component does through AETHYME_ENV_RECEIPT_<NAME>.
+    .replace(
+        "command = \"true\", timeout_seconds = 5",
+        "command = 'test -n \"$AETHYME_ENV_RECEIPT_DB\"', timeout_seconds = 5",
+    );
+    let snapshot = snapshot(&text, worktree.path());
+    let mut lifecycle = host.lifecycle();
+    lifecycle.store.set_records_timings(false);
+    lifecycle
+        .up(&snapshot, worktree.path(), None, None, &up_options())
+        .unwrap();
+    lifecycle.park(&snapshot.env_id, "test").unwrap();
+    lifecycle
+        .up(&snapshot, worktree.path(), None, None, &up_options())
+        .unwrap();
+    let receipts = lifecycle.receipts(&snapshot.env_id).unwrap();
+    assert_eq!(receipts["db"]["metrics"]["clone"], 6.5);
+    lifecycle.down(&snapshot.env_id, None).unwrap();
+    assert!(lifecycle.store.timings("repo-park").unwrap().is_empty());
+}
+
+#[test]
+fn timings_are_off_under_ci_unless_opted_in() {
+    use super::store::timings_enabled;
+    assert!(timings_enabled(None, None));
+    assert!(timings_enabled(Some(""), None));
+    assert!(timings_enabled(Some("false"), None));
+    assert!(timings_enabled(Some("0"), None));
+    assert!(!timings_enabled(Some("true"), None));
+    assert!(!timings_enabled(Some("1"), None));
+    assert!(timings_enabled(Some("true"), Some("1")));
+    assert!(!timings_enabled(None, Some("0")));
+    assert!(!timings_enabled(Some("true"), Some("")));
 }
 
 fn identity_of(lifecycle: &Lifecycle, env_id: &str, name: &str) -> Option<ComponentIdentity> {

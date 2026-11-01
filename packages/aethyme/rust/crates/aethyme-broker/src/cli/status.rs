@@ -818,6 +818,16 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
             out!("  resolved: {}", finding.resolved);
             out!("  fix: {}", finding.fix);
         }
+        for metric in &report.environment_budgets_over {
+            out!(
+                "environment budget over: {} p50 {:.1} > budget {} {}",
+                metric.metric,
+                metric.p50.unwrap_or_default(),
+                metric.budget.unwrap_or_default(),
+                if metric.unit == "seconds" { "s" } else { "MiB" },
+            );
+            out!("  run: aethyme env budgets");
+        }
         if let Some(leftover) = &report.leftover_integration_work {
             out!(
                 "integration leftover work: {} [{}]",
