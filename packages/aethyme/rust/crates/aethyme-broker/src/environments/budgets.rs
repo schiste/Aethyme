@@ -158,6 +158,96 @@ pub fn report(
     reports
 }
 
+/// Fewest successful runs a budget change is proposed from.
+pub const MIN_PROPOSAL_VALUES: usize = 10;
+
+/// Headroom a proposed budget leaves above the measured p95.
+pub const PROPOSAL_HEADROOM: f64 = 1.5;
+
+/// A change `env calibrate` proposes to one declared budget (#1239).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BudgetProposal {
+    pub metric: String,
+    /// `seconds` or `memory_mib`.
+    pub unit: &'static str,
+    /// The key under `[budgets.seconds]` or `[budgets.memory_mib]`.
+    pub key: String,
+    pub current: u64,
+    pub proposed: u64,
+    pub count: usize,
+    pub p50: f64,
+    pub p95: f64,
+    /// `raise` (p50 over: the budget was never realistic) or `tighten` (the
+    /// measured p95 with headroom is under half of it).
+    pub reason: &'static str,
+}
+
+/// Budget changes the evidence supports: the measured p95 with
+/// [`PROPOSAL_HEADROOM`], proposed only for a declared budget with at least
+/// [`MIN_PROPOSAL_VALUES`] successful runs, and only when it is over (raise)
+/// or the proposal is under half of it (tighten). A budget the tooling
+/// meets with ordinary headroom is left alone.
+pub fn propose(reports: &[MetricReport]) -> Vec<BudgetProposal> {
+    reports
+        .iter()
+        .filter(|m| m.count >= MIN_PROPOSAL_VALUES)
+        .filter_map(|m| {
+            let (current, p50, p95) = (m.budget?, m.p50?, m.p95?);
+            let proposed = (p95 * PROPOSAL_HEADROOM).ceil().max(1.0) as u64;
+            let reason = if m.status == "over" {
+                "raise"
+            } else if proposed.saturating_mul(2) < current {
+                "tighten"
+            } else {
+                return None;
+            };
+            let key = match m.unit {
+                "memory_mib" => m.metric.strip_prefix("memory.")?.to_string(),
+                _ => m.metric.clone(),
+            };
+            Some(BudgetProposal {
+                metric: m.metric.clone(),
+                unit: m.unit,
+                key,
+                current,
+                proposed,
+                count: m.count,
+                p50,
+                p95,
+                reason,
+            })
+        })
+        .collect()
+}
+
+/// Only the metrics whose status is `over` (p50 above budget).
+pub fn over_budget(reports: Vec<MetricReport>) -> Vec<MetricReport> {
+    reports.into_iter().filter(|m| m.status == "over").collect()
+}
+
+/// The repository's over-budget metrics, for `doctor` (#1239). Empty when the
+/// repository declares no environments file, the file does not parse, or
+/// nothing was recorded on this host: doctor reports budgets, never fails on
+/// them.
+pub fn repository_over_budget(
+    repo_root: &std::path::Path,
+    repo: &crate::GitRepo,
+) -> Vec<MetricReport> {
+    let Ok(Some(loaded)) = super::load_repository_file(repo_root) else {
+        return Vec::new();
+    };
+    let Ok(file) = loaded.value else {
+        return Vec::new();
+    };
+    let Ok(Some(store)) = super::store::EnvironmentStore::open_default_read_only() else {
+        return Vec::new();
+    };
+    let repository = crate::gates::git_origin_fingerprint(repo);
+    let timings = store.timings(&repository).unwrap_or_default();
+    let footprints = store.footprints(&repository).unwrap_or_default();
+    over_budget(report(&file.budgets, &timings, &footprints))
+}
+
 /// The duration metrics a hook reported in its receipt: every numeric value
 /// of a top-level `metrics` object, in seconds. Anything else is ignored.
 pub fn hook_metrics(receipt: &serde_json::Value) -> Vec<(String, f64)> {

@@ -1468,6 +1468,11 @@ pub struct DoctorReport {
     /// never reconciled: `doctor` only names the dry run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub leftover_integration_work: Option<StatusAdvice>,
+    /// Environment metrics whose p50 is over the repository's declared budget
+    /// (#1239). Reported, never counted against [`Self::healthy`]: a slow
+    /// environment is a trend to act on, not a broken broker.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environment_budgets_over: Vec<crate::environments::budgets::MetricReport>,
     /// Milliseconds each doctor phase took (#460).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub phase_timings_ms: std::collections::BTreeMap<String, u64>,

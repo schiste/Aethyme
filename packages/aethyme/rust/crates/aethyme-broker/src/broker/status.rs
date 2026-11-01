@@ -2486,6 +2486,12 @@ impl Broker {
             None
         };
         phase("leftover_and_hooks", rest_started);
+        let environment_budgets_over = if std::time::Instant::now() < deadline {
+            crate::environments::budgets::repository_over_budget(&self.main_root, &self.repo)
+        } else {
+            budget_cut.push("environment_budgets".into());
+            Vec::new()
+        };
         phase("total", started);
 
         Ok(DoctorReport {
@@ -2501,6 +2507,7 @@ impl Broker {
             recent_command_failures,
             hooks_path,
             leftover_integration_work,
+            environment_budgets_over,
             phase_timings_ms,
             deferred_checks: budget_cut.clone(),
             budget_cut,

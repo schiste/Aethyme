@@ -327,6 +327,26 @@ pub fn default_store_path() -> Result<PathBuf, StoreError> {
 
 pub struct EnvironmentStore {
     conn: Connection,
+    /// Whether lifecycle timings are recorded (#1239): off under CI unless
+    /// opted in, so test runs never feed a repository's budget trends.
+    record_timings: bool,
+}
+
+/// Whether to record lifecycle timings, from `CI` and the
+/// `AETHYME_ENV_TIMINGS` opt-in. An explicit opt-in or opt-out wins; without
+/// one, any CI environment (`CI` set to anything but empty, `0` or `false`)
+/// turns recording off.
+pub fn timings_enabled(ci: Option<&str>, opt_in: Option<&str>) -> bool {
+    let truthy = |value: &str| !matches!(value.trim(), "" | "0" | "false" | "no" | "off");
+    match opt_in {
+        Some(value) if !value.trim().is_empty() => truthy(value),
+        _ => !ci.is_some_and(truthy),
+    }
+}
+
+fn timings_enabled_from_env() -> bool {
+    let var = |name: &str| std::env::var(name).ok();
+    timings_enabled(var("CI").as_deref(), var("AETHYME_ENV_TIMINGS").as_deref())
 }
 
 /// `env-` plus 12 lowercase hex: the only shape an id has, checked before an
@@ -387,7 +407,10 @@ impl EnvironmentStore {
              WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
             params![STORE_SCHEMA_VERSION.to_string()],
         )?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            record_timings: timings_enabled_from_env(),
+        })
     }
 
     pub fn open_default() -> Result<Self, StoreError> {
@@ -433,7 +456,10 @@ impl EnvironmentStore {
             drop(Self::open(path)?);
             return Self::open_read_only(path);
         }
-        Ok(Some(Self { conn }))
+        Ok(Some(Self {
+            conn,
+            record_timings: timings_enabled_from_env(),
+        }))
     }
 
     pub fn open_default_read_only() -> Result<Option<Self>, StoreError> {
@@ -937,6 +963,16 @@ impl EnvironmentStore {
     /// Record how long a lifecycle step took (#1239), keeping the newest
     /// [`TIMINGS_KEPT`] per (repository, metric, outcome): failures are kept
     /// apart, so a crash loop never reads as fast.
+    /// Whether lifecycle steps record their timings on this store.
+    pub fn records_timings(&self) -> bool {
+        self.record_timings
+    }
+
+    /// Override the `CI` / `AETHYME_ENV_TIMINGS` decision made at open.
+    pub fn set_records_timings(&mut self, on: bool) {
+        self.record_timings = on;
+    }
+
     pub fn record_timing(
         &mut self,
         repository: &str,

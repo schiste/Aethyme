@@ -1061,76 +1061,112 @@ pub(super) fn run_calibrate(options: &Options) -> Result<Output, Failure> {
         });
     };
     let repository = crate::gates::git_origin_fingerprint(&workspace.repo);
-    let history = match EnvironmentStore::open_default_read_only()
+    let (timings, history) = match EnvironmentStore::open_default_read_only()
         .map_err(|error| environment_failure(error.to_string()))?
     {
-        Some(store) => store
-            .footprints(&repository)
-            .map_err(|error| environment_failure(error.to_string()))?,
+        Some(store) => (
+            store
+                .timings(&repository)
+                .map_err(|error| environment_failure(error.to_string()))?,
+            store
+                .footprints(&repository)
+                .map_err(|error| environment_failure(error.to_string()))?,
+        ),
         None => Default::default(),
     };
+    // Budgets are calibrated from the same evidence `env budgets` reports
+    // (#1239), and are proposed even when memory history is still too thin
+    // for units and limits.
+    let budgets =
+        super::budgets::propose(&super::budgets::report(&file.budgets, &timings, &history));
     let host_memory = super::metrics::host_memory_bytes()
         .ok_or_else(|| environment_failure("cannot read this host's physical memory".into()))?;
-    let calibration = super::metrics::calibrate(
+    let (calibration, units_withheld) = match super::metrics::calibrate(
         file,
         &history,
         host_memory,
         super::metrics::engine_vm_bytes(),
         options.ram_fraction,
-    )
-    .map_err(|message| Failure {
-        code: "insufficient_history",
-        message,
-        next_action:
-            "keep environments running under the supervisor (it samples every 60 s), then retry"
-                .into(),
-        exit: exit_status::REFUSED,
-    })?;
+    ) {
+        Ok(calibration) => (Some(calibration), None),
+        Err(message) if !budgets.is_empty() => (None, Some(message)),
+        Err(message) => {
+            return Err(Failure {
+                code: "insufficient_history",
+                message,
+                next_action:
+                    "keep environments running under the supervisor (it samples every 60 s), then retry"
+                        .into(),
+                exit: exit_status::REFUSED,
+            });
+        }
+    };
     let original = std::fs::read_to_string(workspace.worktree_root.join(ENVIRONMENTS_FILE))
         .map_err(|error| environment_failure(error.to_string()))?;
-    let diff = super::metrics::proposal_diff(&original, &calibration);
-    let mut text = format!(
-        "host memory {} MiB, budget {} MiB ({:.0}%{}), unit {} MiB\n",
-        calibration.host_memory_bytes >> 20,
-        calibration.budget_bytes >> 20,
-        calibration.ram_fraction * 100.0,
-        calibration
-            .engine_vm
-            .as_ref()
-            .map(|(engine, bytes)| format!(" minus {engine} VM {} MiB", bytes >> 20))
-            .unwrap_or_default(),
-        calibration.unit_bytes >> 20,
-    );
-    for profile in &calibration.profiles {
+    let diff = super::metrics::proposal_diff(&original, calibration.as_ref(), &budgets);
+    let mut text = String::new();
+    if let Some(calibration) = &calibration {
         text.push_str(&format!(
-            "  {:<16} {:>4} samples  p95 {:>8}  units {}\n",
-            profile.profile,
-            profile.samples,
-            profile
-                .p95_bytes
-                .map(|b| format!("{} MiB", b >> 20))
-                .unwrap_or_else(|| "-".into()),
-            profile
-                .proposed_units
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| "-".into()),
+            "host memory {} MiB, budget {} MiB ({:.0}%{}), unit {} MiB\n",
+            calibration.host_memory_bytes >> 20,
+            calibration.budget_bytes >> 20,
+            calibration.ram_fraction * 100.0,
+            calibration
+                .engine_vm
+                .as_ref()
+                .map(|(engine, bytes)| format!(" minus {engine} VM {} MiB", bytes >> 20))
+                .unwrap_or_default(),
+            calibration.unit_bytes >> 20,
         ));
+        for profile in &calibration.profiles {
+            text.push_str(&format!(
+                "  {:<16} {:>4} samples  p95 {:>8}  units {}\n",
+                profile.profile,
+                profile.samples,
+                profile
+                    .p95_bytes
+                    .map(|b| format!("{} MiB", b >> 20))
+                    .unwrap_or_else(|| "-".into()),
+                profile
+                    .proposed_units
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| "-".into()),
+            ));
+        }
+        if !calibration.insufficient.is_empty() {
+            text.push_str(&format!(
+                "insufficient history (< {} samples): {}\n",
+                super::metrics::MIN_SAMPLES,
+                calibration.insufficient.join(", ")
+            ));
+        }
+        if let Some(withheld) = &calibration.withheld {
+            text.push_str(&format!("no units or limits proposed: {withheld}\n"));
+        }
     }
-    if !calibration.insufficient.is_empty() {
+    if let Some(message) = &units_withheld {
+        text.push_str(&format!("no units or limits proposed: {message}\n"));
+    }
+    for budget in &budgets {
         text.push_str(&format!(
-            "insufficient history (< {} samples): {}\n",
-            super::metrics::MIN_SAMPLES,
-            calibration.insufficient.join(", ")
+            "  budget {:<24} {} {} -> {} {} (p50 {:.1}, p95 {:.1}, n={})\n",
+            budget.metric,
+            budget.reason,
+            budget.current,
+            budget.proposed,
+            if budget.unit == "seconds" { "s" } else { "MiB" },
+            budget.p50,
+            budget.p95,
+            budget.count,
         ));
-    }
-    if let Some(withheld) = &calibration.withheld {
-        text.push_str(&format!("no units or limits proposed: {withheld}\n"));
     }
     text.push_str(&diff);
     Ok((
         json!({
             "schema": super::cli::CALIBRATE_SCHEMA,
             "calibration": calibration,
+            "units_withheld": units_withheld,
+            "budgets": budgets,
             "diff": diff,
         }),
         text,
