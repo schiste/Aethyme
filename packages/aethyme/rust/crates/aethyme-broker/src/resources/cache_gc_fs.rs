@@ -290,7 +290,7 @@ fn mount_identity(fd: libc::c_int, path: &Path) -> Result<MountIdentity, CacheGc
             identity.extend_from_slice(&(part.len() as u64).to_ne_bytes());
             identity.extend_from_slice(part);
         }
-        return Ok(MountIdentity(identity));
+        Ok(MountIdentity(identity))
     }
 }
 
@@ -505,7 +505,14 @@ fn open_log_file(
     }
     // SAFETY: `cache_fd` is the pinned cache directory and `name` is a single
     // NUL-terminated component. O_NOFOLLOW prevents opening a symlink target.
-    let raw = unsafe { libc::openat(cache_fd, name.as_ptr(), flags, 0o600 as libc::mode_t) };
+    let raw = unsafe {
+        libc::openat(
+            cache_fd,
+            name.as_ptr(),
+            flags,
+            0o600 as libc::mode_t as libc::c_uint,
+        )
+    };
     if raw < 0 {
         return Err(io_error("log_unreadable", path, io::Error::last_os_error()));
     }
