@@ -24,37 +24,146 @@ fn task_lease_classification_uses_normalized_actions_and_preserves_polling() {
         "the public alias normalizes to prepare status and does not renew or downgrade"
     );
     assert_eq!(
-        classify(&["leases", "plan", "src/lib.rs", "--session", "17"]),
+        classify(&[
+            "advanced",
+            "leases",
+            "plan",
+            "src/lib.rs",
+            "--session",
+            "17"
+        ]),
         ObservationOnly
     );
-    assert_eq!(classify(&["leases"]), ObservationOnly);
+    assert_eq!(classify(&["advanced", "leases"]), ObservationOnly);
     assert_eq!(
-        classify(&["note", "list", "--session", "17"]),
-        ObservationOnly
-    );
-    assert_eq!(classify(&["ownership", "list"]), ObservationOnly);
-    assert_eq!(classify(&["hooks", "status"]), ObservationOnly);
-    assert_eq!(
-        classify(&["review", "show", "--session", "17"]),
-        ObservationOnly
-    );
-    assert_eq!(
-        classify(&["representation", "status", "--session", "17"]),
+        classify(&["advanced", "note", "list", "--session", "17"]),
         ObservationOnly
     );
     assert_eq!(
-        classify(&["representation", "scan", "--session", "17"]),
+        classify(&["advanced", "ownership", "list"]),
         ObservationOnly
     );
-    assert_eq!(classify(&["operations", "list"]), ObservationOnly);
-    assert_eq!(classify(&["operations", "show", "42"]), ObservationOnly);
-    assert_eq!(classify(&["gates", "status"]), ObservationOnly);
-    assert_eq!(classify(&["gates", "manifest"]), ObservationOnly);
+    assert_eq!(classify(&["advanced", "hooks", "status"]), ObservationOnly);
     assert_eq!(
-        classify(&["gates", "scope", "--base", "HEAD~1", "--head", "HEAD"]),
+        classify(&["advanced", "review", "show", "--session", "17"]),
+        ObservationOnly
+    );
+    assert_eq!(
+        classify(&["advanced", "representation", "status", "--session", "17"]),
+        ObservationOnly
+    );
+    assert_eq!(
+        classify(&["advanced", "representation", "scan", "--session", "17"]),
+        ObservationOnly
+    );
+    assert_eq!(
+        classify(&["advanced", "operations", "list"]),
+        ObservationOnly
+    );
+    assert_eq!(
+        classify(&["advanced", "operations", "show", "42"]),
+        ObservationOnly
+    );
+    assert_eq!(
+        classify(&["advanced", "operations", "stats"]),
+        ObservationOnly
+    );
+    assert_eq!(classify(&["advanced", "gates", "status"]), ObservationOnly);
+    assert_eq!(
+        classify(&["advanced", "gates", "manifest"]),
+        ObservationOnly
+    );
+    assert_eq!(
+        classify(&[
+            "advanced", "gates", "scope", "--base", "HEAD~1", "--head", "HEAD"
+        ]),
+        ObservationOnly
+    );
+    assert_eq!(classify(&["events"]), ObservationOnly);
+    assert_eq!(classify(&["metrics"]), ObservationOnly);
+    assert_eq!(classify(&["insights"]), ObservationOnly);
+    assert_eq!(classify(&["handoff", "--session", "17"]), ObservationOnly);
+    assert_eq!(
+        classify(&["unblock"]),
+        ObservationOnly,
+        "the public no-id form resolves to the read-only blocker inventory"
+    );
+    assert_eq!(classify(&["unblock", "op:42"]), OtherWork);
+    assert_eq!(
+        classify(&["advanced", "exec-status", "--session", "17"]),
+        ObservationOnly
+    );
+    assert_eq!(classify(&["worktrees"]), ObservationOnly);
+    assert_eq!(classify(&["queue"]), ObservationOnly);
+    assert_eq!(classify(&["queue", "history"]), ObservationOnly);
+    assert_eq!(classify(&["report", "list"]), ObservationOnly);
+    assert_eq!(
+        classify(&["report", "show", "captured.json"]),
+        ObservationOnly
+    );
+    assert_eq!(
+        classify(&["report", "render", "captured.json", "--form", "form.yml"]),
+        ObservationOnly
+    );
+    assert_eq!(
+        classify(&[
+            "report",
+            "render",
+            "captured.json",
+            "--form",
+            "form.yml",
+            "--output",
+            "captured.issue.md"
+        ]),
+        OtherWork
+    );
+    assert_eq!(
+        classify(&[
+            "quality-report",
+            "plan",
+            "captured.json",
+            "--repo",
+            "acme/product",
+            "--pr",
+            "42"
+        ]),
+        ObservationOnly
+    );
+    assert_eq!(classify(&["deliveries", "list"]), ObservationOnly);
+    assert_eq!(classify(&["watch", "pr", "list"]), ObservationOnly);
+    assert_eq!(
+        classify(&["watch", "repo", "events", "--id", "42"]),
+        ObservationOnly
+    );
+    assert_eq!(
+        classify(&["watch", "pr", "monitoring", "status", "--session", "17"]),
+        ObservationOnly
+    );
+    assert_eq!(
+        classify(&["advanced", "external-events", "list"]),
         ObservationOnly
     );
     assert_eq!(classify(&["gc", "plan"]), ObservationOnly);
+    assert_eq!(
+        classify(&["events", "prune", "--keep-days", "30"]),
+        OtherWork
+    );
+    assert_eq!(
+        classify(&["gc", "reclaim", "plan", "--session", "17"]),
+        ObservationOnly
+    );
+    assert_eq!(
+        classify(&[
+            "gc",
+            "reclaim",
+            "apply",
+            "--confirm",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--session",
+            "17"
+        ]),
+        OtherWork
+    );
     assert_eq!(
         classify(&["finish", "cleanup", "42"]),
         ClosedSessionAdministration
@@ -73,11 +182,25 @@ fn task_lease_classification_uses_normalized_actions_and_preserves_polling() {
         ClosedSessionAdministration
     );
     assert_eq!(
-        classify(&["leases", "claim", "src/lib.rs", "--session", "17"]),
+        classify(&[
+            "advanced",
+            "leases",
+            "claim",
+            "src/lib.rs",
+            "--session",
+            "17"
+        ]),
         GuardedWork
     );
     assert_eq!(
-        classify(&["leases", "release", "src/lib.rs", "--session", "17"]),
+        classify(&[
+            "advanced",
+            "leases",
+            "release",
+            "src/lib.rs",
+            "--session",
+            "17"
+        ]),
         GuardedWork
     );
     assert_eq!(
@@ -85,6 +208,72 @@ fn task_lease_classification_uses_normalized_actions_and_preserves_polling() {
         OtherWork,
         "the raw-shell hook has no durable child witness and must drop finite expiry first"
     );
+}
+
+#[test]
+fn closed_session_admission_exceptions_are_narrowly_scoped() {
+    fn reaches_handler(public_args: &[&str]) -> bool {
+        let public_args = public_args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>();
+        let resolution = super::surface::resolve(&public_args);
+        assert!(resolution.refusal.is_none(), "{public_args:?}");
+        let subcommand = resolution.args.first().expect("resolved command");
+        let parsed = super::parse(&resolution.args[1..]).unwrap();
+        super::closed_session_command_reaches_handler(subcommand, &parsed)
+    }
+
+    assert!(reaches_handler(&[
+        "advanced",
+        "leases",
+        "claim",
+        "src/lib.rs",
+        "--session",
+        "17"
+    ]));
+    assert!(reaches_handler(&[
+        "advanced",
+        "review",
+        "request",
+        "--session",
+        "17"
+    ]));
+    assert!(reaches_handler(&[
+        "advanced",
+        "review",
+        "unlock",
+        "--session",
+        "17"
+    ]));
+    assert!(reaches_handler(&[
+        "advanced",
+        "review",
+        "reassign",
+        "--session",
+        "17",
+        "--to-session",
+        "18",
+        "--reason",
+        "handoff"
+    ]));
+    assert!(reaches_handler(&[
+        "gc",
+        "reclaim",
+        "apply",
+        "--confirm",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--session",
+        "17"
+    ]));
+    assert!(!reaches_handler(&["exec", "--session", "17", "--", "true"]));
+    assert!(!reaches_handler(&[
+        "submit",
+        "prepare",
+        "run",
+        "--session",
+        "17"
+    ]));
 }
 
 #[cfg(unix)]

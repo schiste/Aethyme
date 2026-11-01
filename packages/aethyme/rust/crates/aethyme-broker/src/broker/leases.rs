@@ -3997,7 +3997,7 @@ mod generic_guarded_exec_tests {
         let session = broker
             .start_worktree("active preparation witness", None)
             .unwrap();
-        let prepare_config = "schema_version = 1\n\n[[steps]]\nname = \"deps\"\ncommand = [\"sh\", \"-c\", \"true\"]\ninputs = []\noutputs = []\ncache = \"repository_shared\"\nrequired_for_hooks = false\n";
+        let prepare_config = "schema_version = 1\n\n[[steps]]\nname = \"deps\"\ncommand = [\"sh\", \"-c\", \"true\"]\ninputs = []\noutputs = [\"out/\"]\ncache = \"repository_shared\"\nrequired_for_hooks = false\n";
         std::fs::create_dir_all(Path::new(&session.worktree_path).join(".aethyme")).unwrap();
         std::fs::write(
             Path::new(&session.worktree_path).join(".aethyme/prepare.toml"),

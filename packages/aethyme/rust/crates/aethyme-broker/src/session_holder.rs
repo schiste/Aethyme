@@ -1043,10 +1043,31 @@ mod tests {
             session_id: Some(7),
             payload_json: Some(payload),
         };
-        let deadline = 1_000 + TASK_LEASE_DURATION_MS;
+        let event_timestamp_deadline = 10_000 + TASK_LEASE_DURATION_MS;
         assert_eq!(task_lease(&event), Some(TaskLease::current()));
-        assert_eq!(task_lease_expired(&event, 1_000, deadline - 1), Some(false));
-        assert_eq!(task_lease_expired(&event, 1_000, deadline), Some(true));
+        assert_eq!(
+            task_lease_expired(&event, 1_000, event_timestamp_deadline - 1),
+            Some(false),
+            "a newer holder event timestamp extends the deadline"
+        );
+        assert_eq!(
+            task_lease_expired(&event, 1_000, event_timestamp_deadline),
+            Some(true)
+        );
+        let activity_newer_event = crate::Event {
+            ts: 1_000,
+            ..event.clone()
+        };
+        let activity_deadline = 10_000 + TASK_LEASE_DURATION_MS;
+        assert_eq!(
+            task_lease_expired(&activity_newer_event, 10_000, activity_deadline - 1),
+            Some(false),
+            "newer session activity also extends the deadline"
+        );
+        assert_eq!(
+            task_lease_expired(&activity_newer_event, 10_000, activity_deadline),
+            Some(true)
+        );
         assert!(!task_lease_renewal_due(
             &event,
             event.ts + TASK_LEASE_RENEWAL_INTERVAL_MS - 1

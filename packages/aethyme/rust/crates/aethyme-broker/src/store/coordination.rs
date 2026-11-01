@@ -82,15 +82,11 @@ impl BrokerStore {
             crate::session_holder::TaskLeaseHeartbeat::Upgraded
                 | crate::session_holder::TaskLeaseHeartbeat::Renewed
         ) {
-            let payload = crate::events::session_holder_task_lease_bound_payload(
-                caller,
-                if heartbeat == crate::session_holder::TaskLeaseHeartbeat::Upgraded {
-                    "task_lease_enabled"
-                } else {
-                    "task_lease_heartbeat"
-                },
-                None,
-            );
+            let Some(payload) =
+                crate::events::session_holder_task_lease_heartbeat_payload(&payload)
+            else {
+                return Ok(crate::session_holder::TaskLeaseHeartbeat::LegacyProtected);
+            };
             insert_event(
                 &tx,
                 at_ms,
@@ -1780,6 +1776,10 @@ mod finish_lease_query_tests {
             crate::session_holder::task_lease(&upgraded),
             Some(crate::session_holder::TaskLease::current())
         );
+        let upgraded_payload: serde_json::Value =
+            serde_json::from_str(upgraded.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(upgraded_payload["reason"], "registered");
+        assert!(upgraded_payload.get("previous_pid").is_some());
         assert_eq!(
             store
                 .heartbeat_session_task_lease(session.id, &holder, now + 1_000)
@@ -1810,12 +1810,16 @@ mod finish_lease_query_tests {
             .unwrap()
             .unwrap();
         assert!(renewed.id > upgraded.id);
-        assert!(
-            renewed
-                .payload_json
-                .as_deref()
-                .unwrap()
-                .contains("task_lease_heartbeat")
+        let renewed_payload: serde_json::Value =
+            serde_json::from_str(renewed.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(renewed_payload["reason"], "registered");
+        assert_eq!(
+            renewed_payload["previous_pid"],
+            upgraded_payload["previous_pid"]
+        );
+        assert_eq!(
+            crate::session_holder::task_lease(&renewed),
+            Some(crate::session_holder::TaskLease::current())
         );
         assert_eq!(
             store

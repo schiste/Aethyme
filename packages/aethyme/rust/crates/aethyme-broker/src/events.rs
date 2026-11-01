@@ -141,6 +141,20 @@ pub(crate) fn session_holder_task_lease_bound_payload(
     session_holder_bound_payload_with_task_lease(holder, reason, previous, true)
 }
 
+/// Add or renew the task-lease extension without replacing holder-binding
+/// provenance or other additive fields from the original payload.
+pub(crate) fn session_holder_task_lease_heartbeat_payload(
+    existing: &serde_json::Value,
+) -> Option<String> {
+    let mut payload = existing.clone();
+    let object = payload.as_object_mut()?;
+    object.insert(
+        "task_lease".into(),
+        json!(crate::session_holder::TaskLease::current()),
+    );
+    Some(payload.to_string())
+}
+
 fn session_holder_bound_payload_with_task_lease(
     holder: &crate::session_holder::AgentProcess,
     reason: &str,
