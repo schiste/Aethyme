@@ -663,6 +663,12 @@ pub enum SessionRetirementDeferredReason {
     WorktreeActivityUnavailable { session_id: i64 },
     /// Another lifecycle operation held the nonblocking close claim.
     LifecycleBusy { session_id: i64 },
+    /// An admitted session command still holds the task operation guard.
+    OperationGuardBusy { session_id: i64 },
+    /// A gate, artifact producer, or other process is still using this task.
+    OperationActive { session_id: i64 },
+    /// Task operation or process-use evidence could not be established.
+    OperationEvidenceUnavailable { session_id: i64 },
     /// A concurrent SQLite writer prevented the atomic abandonment transition.
     DatabaseBusy { session_id: i64 },
     /// A concurrent SQLite writer prevented retirement cursor progress.
@@ -2692,6 +2698,30 @@ impl Broker {
                         .push(SessionRetirementDeferredReason::LifecycleBusy {
                             session_id: session.id,
                         });
+                }
+                crate::broker::AbandonedSessionCloseOutcome::OperationGuardBusy => {
+                    summary.deferred += 1;
+                    summary
+                        .reasons
+                        .push(SessionRetirementDeferredReason::OperationGuardBusy {
+                            session_id: session.id,
+                        });
+                }
+                crate::broker::AbandonedSessionCloseOutcome::OperationActive => {
+                    summary.deferred += 1;
+                    summary
+                        .reasons
+                        .push(SessionRetirementDeferredReason::OperationActive {
+                            session_id: session.id,
+                        });
+                }
+                crate::broker::AbandonedSessionCloseOutcome::OperationEvidenceUnavailable => {
+                    summary.deferred += 1;
+                    summary.reasons.push(
+                        SessionRetirementDeferredReason::OperationEvidenceUnavailable {
+                            session_id: session.id,
+                        },
+                    );
                 }
                 crate::broker::AbandonedSessionCloseOutcome::DatabaseBusy => {
                     summary.deferred += 1;

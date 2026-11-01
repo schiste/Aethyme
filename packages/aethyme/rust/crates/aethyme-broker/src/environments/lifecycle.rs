@@ -465,6 +465,9 @@ impl Lifecycle {
         started: Instant,
         ok: bool,
     ) {
+        if !self.store.records_timings() {
+            return;
+        }
         crate::warn_unrecorded(
             "record an environment timing",
             self.store.record_timing(
@@ -887,7 +890,12 @@ impl Lifecycle {
                 Ok(receipt) => {
                     if let Some(receipt) = &receipt {
                         // Durations the hook measured itself (#1239).
-                        for (metric, seconds) in super::budgets::hook_metrics(receipt) {
+                        let metrics = if self.store.records_timings() {
+                            super::budgets::hook_metrics(receipt)
+                        } else {
+                            Vec::new()
+                        };
+                        for (metric, seconds) in metrics {
                             crate::warn_unrecorded(
                                 "record a hook-reported timing",
                                 self.store.record_timing(

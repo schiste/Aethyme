@@ -196,6 +196,51 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             );
         }
         out!("Summary: {}", status.summary.message);
+        if let Some(sweep) = &status.cleanup_retention.last_artifact_sweep {
+            let completeness = if sweep.complete {
+                "complete"
+            } else {
+                "incomplete"
+            };
+            out!(
+                "Artifact cache sweep: {} at {} ({completeness}), {} directories, {} entries, {} logical file bytes observed during traversal for later-unlinked entries",
+                sweep.scope,
+                sweep.at_ms,
+                sweep.directories_reclaimed,
+                sweep.entries_reclaimed,
+                human_bytes(sweep.observed_logical_file_bytes),
+            );
+            if !sweep.bytes_accounting_complete {
+                out!("  artifact-sweep byte accounting is incomplete");
+            }
+            if sweep.blockers.total > 0 {
+                let by_reason = sweep
+                    .blockers
+                    .by_reason
+                    .iter()
+                    .map(|(reason, count)| format!("{reason}={count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out!(
+                    "  artifact-sweep blockers: {} ({by_reason}); {} examples omitted",
+                    sweep.blockers.total,
+                    sweep.blockers.omitted_examples
+                );
+                for example in sweep.blockers.examples.iter().take(3) {
+                    out!(
+                        "    {}{}",
+                        example.reason,
+                        example
+                            .path
+                            .as_deref()
+                            .map(|path| format!(": {path}"))
+                            .unwrap_or_default()
+                    );
+                }
+            }
+        } else if let Some(error) = &status.cleanup_retention.last_artifact_sweep_error {
+            out!("Artifact cache sweep report unavailable: {error}");
+        }
         out!();
         render_status_advice(&status.advice);
         let lease_waiters: Vec<_> = status
@@ -772,6 +817,16 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
             out!("git hooks: {}", finding.message());
             out!("  resolved: {}", finding.resolved);
             out!("  fix: {}", finding.fix);
+        }
+        for metric in &report.environment_budgets_over {
+            out!(
+                "environment budget over: {} p50 {:.1} > budget {} {}",
+                metric.metric,
+                metric.p50.unwrap_or_default(),
+                metric.budget.unwrap_or_default(),
+                if metric.unit == "seconds" { "s" } else { "MiB" },
+            );
+            out!("  run: aethyme env budgets");
         }
         if let Some(leftover) = &report.leftover_integration_work {
             out!(

@@ -600,6 +600,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
         "close",
         &["--session", "--abandon", "--reason", "--take-over"],
     ),
+    ("heartbeat", &["--session"]),
     (
         "cleanup",
         &[

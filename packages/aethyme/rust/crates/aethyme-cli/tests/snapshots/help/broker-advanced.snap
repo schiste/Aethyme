@@ -9,6 +9,7 @@ Verbs:
   ownership        claim, list or release a named operation such as a release
   git              run Git through the durable operation coordinator
   gh               run GitHub CLI through the same coordinator
+  heartbeat        renew the exact current holder's lease during quiet task work
   merge-chain      land pull requests in order, each verified on its merge commit
   operations       inspect or reconcile the remote-operation journal
   exec             run a command in a session worktree under the dirty-path guard

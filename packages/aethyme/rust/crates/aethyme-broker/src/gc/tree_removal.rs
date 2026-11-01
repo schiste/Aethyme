@@ -63,9 +63,11 @@ impl PinnedTreeRemoval {
     }
 
     /// Remove this pinned tree and report logical regular-file lengths observed
-    /// during successful unlinks. Symlinks and directories contribute zero;
-    /// hard links count per removed name. This is not physical space recovered.
-    /// The existing witness, identity, filesystem and deadline guards apply.
+    /// during traversal for entries whose unlink succeeded. Concurrent writes
+    /// may change the lengths before unlink. Symlinks and directories
+    /// contribute zero; hard links count per removed name. This is not physical
+    /// space recovered. Existing witness, identity, filesystem and deadline
+    /// guards apply.
     pub(crate) fn remove_with_observed_file_bytes(
         self,
         _keep_until_last: Option<&str>,
@@ -301,6 +303,44 @@ where
     }
 }
 
+/// As above, and return logical regular-file lengths observed during traversal
+/// for entries whose unlink succeeded. Concurrent writes may change those
+/// lengths before unlink; this does not estimate physical space recovered.
+/// Errors preserve the existing entry count but leave byte accounting
+/// incomplete to the caller.
+pub(crate) fn remove_condemned_tree_with_progress_and_observed_file_bytes_and_guard<M>(
+    _dir: &Path,
+    _keep_until_last: Option<&str>,
+    _deadline: Option<Instant>,
+    mut _before_mutation: M,
+) -> Result<(TreeRemoval, usize, u64), TreeRemovalError>
+where
+    M: FnMut() -> io::Result<()>,
+{
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        match unix::PinnedTreeRemoval::open_optional(_dir) {
+            Ok(Some(tree)) => tree.remove_with_progress_and_observed_file_bytes_and_guard(
+                _keep_until_last,
+                _deadline,
+                &mut _before_mutation,
+            ),
+            Ok(None) => Ok((TreeRemoval::Complete, 0, 0)),
+            Err(source) => Err(TreeRemovalError {
+                source,
+                entries_reclaimed: 0,
+            }),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(TreeRemovalError {
+            source: unsupported_platform(),
+            entries_reclaimed: 0,
+        })
+    }
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn unsupported_platform() -> io::Error {
     io::Error::new(
@@ -440,6 +480,25 @@ mod unix {
                 |_| Ok(()),
             )
             .map(|(outcome, entries, _bytes)| (outcome, entries))
+        }
+
+        pub(super) fn remove_with_progress_and_observed_file_bytes_and_guard<M>(
+            self,
+            keep_until_last: Option<&str>,
+            deadline: Option<Instant>,
+            before_mutation: &mut M,
+        ) -> Result<(TreeRemoval, usize, u64), super::TreeRemovalError>
+        where
+            M: FnMut() -> io::Result<()>,
+        {
+            self.remove_with_hooks_and_progress(
+                keep_until_last,
+                deadline,
+                &mut || Ok(()),
+                &mut || Ok(()),
+                before_mutation,
+                |_| Ok(()),
+            )
         }
 
         pub(super) fn remove_with_observed_file_bytes(
@@ -1970,7 +2029,10 @@ mod unix {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod observed_file_byte_tests {
-    use super::{PinnedTreeRemoval, TreeRemoval};
+    use super::{
+        PinnedTreeRemoval, TreeRemoval,
+        remove_condemned_tree_with_progress_and_observed_file_bytes_and_guard,
+    };
     use std::os::unix::fs::symlink;
 
     #[test]
@@ -1986,11 +2048,21 @@ mod observed_file_byte_tests {
         let outside = parent.join("outside");
         std::fs::write(&outside, b"must remain").unwrap();
         symlink(&outside, root.join("link")).unwrap();
-        let (outcome, bytes) = PinnedTreeRemoval::open(&root)
-            .unwrap()
-            .remove_with_observed_file_bytes(Some("witness"), None)
+        let mut guard_calls = 0usize;
+        let (outcome, entries, bytes) =
+            remove_condemned_tree_with_progress_and_observed_file_bytes_and_guard(
+                &root,
+                Some("witness"),
+                None,
+                || {
+                    guard_calls += 1;
+                    Ok(())
+                },
+            )
             .unwrap();
         assert_eq!(outcome, TreeRemoval::Complete);
+        assert!(entries > 0);
+        assert!(guard_calls > 0, "the pre-mutation guard must be preserved");
         assert_eq!(
             bytes, 12,
             "3 + 3 + 4 + 2 logical bytes, not physical allocation"

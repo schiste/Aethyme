@@ -187,6 +187,9 @@ pub(crate) enum AbandonedSessionCloseOutcome {
     WorktreeActivityUnavailable,
     LifecycleBusy,
     DatabaseBusy,
+    OperationGuardBusy,
+    OperationActive,
+    OperationEvidenceUnavailable,
 }
 
 fn collect_worktree_directory_entries<I>(
@@ -653,16 +656,63 @@ impl Broker {
             process_table,
             allow_process_snapshot,
         );
+        let holder_event = self.store_ref().latest_session_holder_event(session_id)?;
+        if holder_event.as_ref().map(|event| event.id) != holder.binding_event_id {
+            return Ok(AbandonedSessionCloseOutcome::Changed);
+        }
+        let task_lease_binding_present = holder_event
+            .as_ref()
+            .is_some_and(crate::session_holder::task_lease_binding_present);
+        let task_lease_expiry_enabled = crate::load_retention_policy(&self.main_root)
+            .is_ok_and(|policy| policy.expire_abandoned_task_leases);
+        let holder_task_lease_expired = holder_event.as_ref().is_some_and(|event| {
+            task_lease_expiry_enabled
+                && crate::session_holder::task_lease_expired(
+                    event,
+                    candidate.last_activity_at,
+                    decision_now_ms,
+                ) == Some(true)
+        });
+        let live_task_holder = if holder.liveness
+            == crate::session_holder::RecordedHolderLiveness::Alive
+            && holder_task_lease_expired
+        {
+            let Some(agent) = crate::session_holder::recorded_holder(self.store_ref(), session_id)?
+            else {
+                return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+            };
+            if crate::session_holder::is_shared_agent_service(&agent.command) {
+                return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+            }
+            Some(agent)
+        } else {
+            None
+        };
         match holder.liveness {
             crate::session_holder::RecordedHolderLiveness::Unknown => {
                 return Ok(AbandonedSessionCloseOutcome::HolderUnavailable);
             }
-            crate::session_holder::RecordedHolderLiveness::Alive => {
+            crate::session_holder::RecordedHolderLiveness::Alive if live_task_holder.is_none() => {
                 return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
             }
             crate::session_holder::RecordedHolderLiveness::Gone
             | crate::session_holder::RecordedHolderLiveness::Unbound => {}
+            crate::session_holder::RecordedHolderLiveness::Alive => {}
         }
+
+        // Every admitted session command holds the shared side from before
+        // Broker::open (and its maintenance pass) through completion. The
+        // exclusive side closes the startup-admission race and stays held
+        // through the final lifecycle/CAS checks.
+        let _operation_claim = match crate::file_lock::try_acquire_session_operation_guard(
+            self.main_root(),
+            session_id,
+            crate::file_lock::SessionOperationLockMode::Exclusive,
+        ) {
+            Ok(Some(guard)) => guard,
+            Ok(None) => return Ok(AbandonedSessionCloseOutcome::OperationGuardBusy),
+            Err(_) => return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable),
+        };
         if candidate.pid.is_some_and(crate::broker::session_pid_alive) {
             return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
         }
@@ -708,12 +758,115 @@ impl Broker {
         if current.pid.is_some_and(crate::broker::session_pid_alive) {
             return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
         }
-        let current_holder_event_id = self
-            .store_ref()
-            .latest_session_holder_event(session_id)?
-            .map(|event| event.id);
-        if current_holder_event_id != holder.binding_event_id {
+        let current_holder_event = self.store_ref().latest_session_holder_event(session_id)?;
+        if current_holder_event.as_ref().map(|event| event.id) != holder.binding_event_id {
             return Ok(AbandonedSessionCloseOutcome::Changed);
+        }
+        if live_task_holder.is_some()
+            && !current_holder_event.as_ref().is_some_and(|event| {
+                crate::session_holder::task_lease_expired(
+                    event,
+                    current.last_activity_at,
+                    observed_at,
+                ) == Some(true)
+            })
+        {
+            return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+        }
+
+        // A versioned task binding can outlive its broker parent: inspect the
+        // native child protocols while holding both the per-session operation
+        // claim and repository lifecycle claim. Unknown inventories never
+        // authorize closure. Legacy gone/unbound sessions keep their existing
+        // behavior and avoid a system-wide lsof scan.
+        let mut _artifact_use_reclaimer = None;
+        if task_lease_binding_present {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+            }
+            let gates = crate::gates::checked_running_session_gates_until(
+                self.main_root(),
+                session_id,
+                || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline),
+                256,
+            );
+            let Some(gates) = gates else {
+                return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+            };
+            if !gates.is_empty() {
+                return Ok(AbandonedSessionCloseOutcome::OperationActive);
+            }
+            match self
+                .store_ref()
+                .session_has_unresolved_operations(session_id)
+            {
+                Ok(true) => return Ok(AbandonedSessionCloseOutcome::OperationActive),
+                Ok(false) => {}
+                Err(_) => {
+                    return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+                }
+            }
+            match self.preparation_status(session_id) {
+                Ok(status) if status.state == crate::PreparationState::InProgress => {
+                    return Ok(AbandonedSessionCloseOutcome::OperationActive);
+                }
+                Ok(status) if status.state == crate::PreparationState::Invalid => {
+                    return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+                }
+            }
+            let worktree = std::path::Path::new(&current.worktree_path);
+            match std::fs::symlink_metadata(worktree) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                _ => return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable),
+            }
+            match crate::file_lock::artifact_use::try_artifact_use_reclaimer(
+                self.main_root(),
+                worktree,
+            ) {
+                Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Acquired(reclaimer)) => {
+                    _artifact_use_reclaimer = Some(reclaimer);
+                }
+                Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(
+                    crate::file_lock::artifact_use::ArtifactUseReclaimBlock::Contended
+                    | crate::file_lock::artifact_use::ArtifactUseReclaimBlock::UnknownProducer {
+                        ..
+                    },
+                )) => return Ok(AbandonedSessionCloseOutcome::OperationActive),
+                Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(
+                    crate::file_lock::artifact_use::ArtifactUseReclaimBlock::ProtocolUnavailable,
+                ))
+                | Err(_) => {
+                    return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+                }
+            }
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+            }
+            let Some(open_files) =
+                process_table.process_use_snapshot_for_retirement(self.main_root(), deadline)
+            else {
+                return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+            };
+            match open_files {
+                crate::reclaim::OpenFileSnapshot::Complete(_) => {
+                    if crate::reclaim::open_file_snapshot_blocker_for_session_worktree(
+                        open_files,
+                        worktree,
+                        live_task_holder.as_ref().map(|agent| agent.pid),
+                    )
+                    .is_some()
+                    {
+                        return Ok(AbandonedSessionCloseOutcome::OperationActive);
+                    }
+                }
+                crate::reclaim::OpenFileSnapshot::Incomplete { .. } => {
+                    return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+                }
+            }
         }
 
         let leases = self
@@ -760,13 +913,37 @@ impl Broker {
                     }
                 }
             }
-            let liveness = match crate::lease_liveness::assess_for_abandonment(
-                self.store_ref(),
-                &explicit_leases,
-                lease_table,
-                observed_at,
-                crate::lease_liveness::LeaseLivenessPolicy::load(self.main_root()),
-            ) {
+            let lease_policy = crate::lease_liveness::LeaseLivenessPolicy::load(self.main_root());
+            let liveness_result = match live_task_holder.as_ref().and_then(|_| {
+                current_holder_event.as_ref().and_then(|event| {
+                    crate::session_holder::task_lease(event).map(|lease| {
+                        event
+                            .ts
+                            .max(current.last_activity_at)
+                            .saturating_add(lease.duration_ms)
+                    })
+                })
+            }) {
+                Some(expired_at) => {
+                    crate::lease_liveness::assess_for_abandonment_with_task_lease_expiry(
+                        self.store_ref(),
+                        &explicit_leases,
+                        lease_table,
+                        observed_at,
+                        lease_policy,
+                        session_id,
+                        expired_at,
+                    )
+                }
+                None => crate::lease_liveness::assess_for_abandonment(
+                    self.store_ref(),
+                    &explicit_leases,
+                    lease_table,
+                    observed_at,
+                    lease_policy,
+                ),
+            };
+            let liveness = match liveness_result {
                 Ok(liveness) => liveness,
                 Err(_) => return Ok(AbandonedSessionCloseOutcome::LeaseUnavailable),
             };
@@ -781,6 +958,37 @@ impl Broker {
             != holder.binding_event_id
         {
             return Ok(AbandonedSessionCloseOutcome::Changed);
+        }
+        if task_lease_binding_present
+            && (deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                || process_table
+                    .process_use_snapshot_for_retirement(self.main_root(), deadline)
+                    .is_none())
+        {
+            return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+        }
+
+        // Retention policy can be edited while the process and filesystem
+        // witnesses are collected. Re-read it immediately before the close
+        // CAS so disabling the opt-in revokes age-expiry authority at once.
+        if live_task_holder.is_some() {
+            let policy = match crate::load_retention_policy(&self.main_root) {
+                Ok(policy) => policy,
+                Err(_) => {
+                    return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+                }
+            };
+            if !policy.expire_abandoned_task_leases
+                || !current_holder_event.as_ref().is_some_and(|event| {
+                    crate::session_holder::task_lease_expired(
+                        event,
+                        current.last_activity_at,
+                        observed_at,
+                    ) == Some(true)
+                })
+            {
+                return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+            }
         }
 
         let abandoned_payload = crate::events::session_abandoned_payload(
@@ -3577,6 +3785,355 @@ mod generic_guarded_exec_tests {
         let storage = crate::test_storage::TestStorage::new();
         let broker = storage.open(repository.path()).unwrap();
         (repository, storage, broker)
+    }
+
+    fn age_worktree_for_task_retirement(broker: &mut Broker, session: &crate::Session) -> i64 {
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(80 * 60 * 60);
+        let old_ms = old_time
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let worktree = Path::new(&session.worktree_path);
+        let git_dir = crate::git::checked_worktree_git_dir(worktree)
+            .unwrap()
+            .expect("fixture worktree has Git metadata");
+        for name in ["index", "HEAD"] {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(git_dir.join(name))
+                .unwrap();
+            file.set_modified(old_time).unwrap();
+        }
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE sessions SET created_at = ?1, updated_at = ?1, last_activity_at = ?1 WHERE id = ?2",
+                rusqlite::params![old_ms, session.id],
+            )
+            .unwrap();
+        old_ms
+    }
+
+    fn task_lease_holder(pid: i64) -> crate::session_holder::AgentProcess {
+        crate::session_holder::AgentProcess {
+            pid,
+            started: "Mon Jan 1 00:00:00 2024".into(),
+            command: "fixture-agent --task-lease".into(),
+        }
+    }
+
+    fn install_task_lease_binding(
+        broker: &mut Broker,
+        session: &crate::Session,
+        holder: &crate::session_holder::AgentProcess,
+        ts: i64,
+    ) -> i64 {
+        broker
+            .store()
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session.id),
+                Some(&crate::events::session_holder_task_lease_bound_payload(
+                    holder,
+                    "task_lease_enabled",
+                    None,
+                )),
+            )
+            .unwrap();
+        let event = broker
+            .store()
+            .latest_session_holder_event(session.id)
+            .unwrap()
+            .unwrap();
+        broker
+            .store()
+            .connection()
+            .execute(
+                "UPDATE events SET ts = ?1 WHERE id = ?2",
+                rusqlite::params![ts, event.id],
+            )
+            .unwrap();
+        event.id
+    }
+
+    fn synthetic_holder_process_table(
+        session_id: i64,
+        event_id: i64,
+        holder: &crate::session_holder::AgentProcess,
+        alive: bool,
+    ) -> crate::session_holder::RecordedHolderProcessTable {
+        let rows = if alive {
+            format!("{} 1 {} {}\n", holder.pid, holder.started, holder.command)
+        } else {
+            String::new()
+        };
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        table.install_holder_process_table_for_test(
+            session_id,
+            event_id,
+            crate::session_holder::ProcessTable::parse(&rows),
+        );
+        table
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_opted_in_live_holder_can_close_metadata_without_holder_gone() {
+        let (repository, _storage, mut broker) = fixture();
+        std::fs::write(
+            repository.path().join(".aethyme/broker.toml"),
+            "[retention]\nexpire_abandoned_task_leases = true\nsession_abandoned_after_hours = 72\n",
+        )
+        .unwrap();
+        let session = broker
+            .start_worktree("expired live task holder", None)
+            .unwrap();
+        broker
+            .store()
+            .claim_lease(session.id, "tracked.txt", None)
+            .unwrap();
+        let old = age_worktree_for_task_retirement(&mut broker, &session);
+        let holder = task_lease_holder(std::process::id() as i64);
+        let binding_id = install_task_lease_binding(&mut broker, &session, &holder, old);
+        let mut process_table =
+            synthetic_holder_process_table(session.id, binding_id, &holder, true);
+        process_table.install_process_use_snapshot_for_test(
+            crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+        );
+
+        let outcome = broker
+            .try_close_abandoned_session(
+                session.id,
+                crate::clock::epoch_ms(),
+                72 * 60 * 60 * 1_000,
+                &mut process_table,
+                true,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(outcome, AbandonedSessionCloseOutcome::Closed);
+        assert!(
+            broker
+                .store()
+                .session(session.id)
+                .unwrap()
+                .status
+                .is_closed()
+        );
+        assert!(
+            broker
+                .store()
+                .latest_session_holder_gone_event(session.id)
+                .unwrap()
+                .is_none(),
+            "task-lease expiry never fabricates holder-gone evidence"
+        );
+        assert!(
+            broker
+                .store()
+                .active_leases()
+                .unwrap()
+                .iter()
+                .all(|lease| lease.session_id != session.id),
+            "typed task-lease expiry releases the session's explicit and implicit leases"
+        );
+        assert!(Path::new(&session.worktree_path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finite_binding_with_orphan_artifact_marker_defers_close() {
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker.start_worktree("orphan task child", None).unwrap();
+        let old = age_worktree_for_task_retirement(&mut broker, &session);
+        let holder = task_lease_holder(i64::MAX);
+        let binding_id = install_task_lease_binding(&mut broker, &session, &holder, old);
+        let worktree = Path::new(&session.worktree_path);
+        let mut producer = match crate::file_lock::artifact_use::begin_artifact_use(
+            broker.main_root(),
+            worktree,
+            session.id,
+            "retirement-test-child",
+        )
+        .unwrap()
+        {
+            crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(producer) => producer,
+            crate::file_lock::artifact_use::ArtifactUseAdmission::ProtocolUnavailable => {
+                panic!("Unix task-lease closure requires artifact-use support")
+            }
+        };
+        let mut process_table =
+            synthetic_holder_process_table(session.id, binding_id, &holder, false);
+
+        let outcome = broker
+            .try_close_abandoned_session(
+                session.id,
+                crate::clock::epoch_ms(),
+                72 * 60 * 60 * 1_000,
+                &mut process_table,
+                true,
+                None,
+            )
+            .unwrap();
+        producer.finish_not_started().unwrap();
+
+        assert_eq!(outcome, AbandonedSessionCloseOutcome::OperationActive);
+        assert!(
+            !broker
+                .store()
+                .session(session.id)
+                .unwrap()
+                .status
+                .is_closed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finite_binding_with_in_progress_preparation_defers_close() {
+        let (repository, _storage, mut broker) = fixture();
+        let session = broker
+            .start_worktree("active preparation witness", None)
+            .unwrap();
+        let prepare_config = "schema_version = 1\n\n[[steps]]\nname = \"deps\"\ncommand = [\"sh\", \"-c\", \"true\"]\ninputs = []\noutputs = [\"out/\"]\ncache = \"repository_shared\"\nrequired_for_hooks = false\n";
+        std::fs::create_dir_all(Path::new(&session.worktree_path).join(".aethyme")).unwrap();
+        std::fs::write(
+            Path::new(&session.worktree_path).join(".aethyme/prepare.toml"),
+            prepare_config,
+        )
+        .unwrap();
+        let preparation_dir = repository.path().join(".aethyme/run/preparation");
+        std::fs::create_dir_all(&preparation_dir).unwrap();
+        std::fs::write(
+            preparation_dir.join(format!("session-{}.json", session.id)),
+            serde_json::json!({
+                "schema_version": 1,
+                "session_id": session.id,
+                "state": "in_progress",
+                "digest": "fixture-digest",
+                "source_digest": "fixture-source",
+                "started_at": crate::clock::epoch_ms(),
+                "completed_at": null,
+                "failed_step": null,
+                "exit_code": null,
+                "host_lease_id": null,
+                "host_lease_generation": null,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let old = age_worktree_for_task_retirement(&mut broker, &session);
+        let holder = task_lease_holder(i64::MAX);
+        install_task_lease_binding(&mut broker, &session, &holder, old);
+        let mut process_table = crate::session_holder::RecordedHolderProcessTable::default();
+        process_table.install_process_use_snapshot_for_test(
+            crate::reclaim::OpenFileSnapshot::Complete(Vec::new()),
+        );
+
+        let outcome = broker
+            .try_close_abandoned_session(
+                session.id,
+                crate::clock::epoch_ms(),
+                72 * 60 * 60 * 1_000,
+                &mut process_table,
+                true,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(outcome, AbandonedSessionCloseOutcome::OperationActive);
+        assert!(
+            !broker
+                .store()
+                .session(session.id)
+                .unwrap()
+                .status
+                .is_closed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finite_binding_with_incomplete_process_inventory_defers_close() {
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker.start_worktree("unknown process use", None).unwrap();
+        let old = age_worktree_for_task_retirement(&mut broker, &session);
+        let holder = task_lease_holder(i64::MAX);
+        let binding_id = install_task_lease_binding(&mut broker, &session, &holder, old);
+        let mut process_table =
+            synthetic_holder_process_table(session.id, binding_id, &holder, false);
+        process_table.install_process_use_snapshot_for_test(
+            crate::reclaim::OpenFileSnapshot::Incomplete {
+                reason: "fixture lsof was truncated".into(),
+                observed: Vec::new(),
+            },
+        );
+
+        let outcome = broker
+            .try_close_abandoned_session(
+                session.id,
+                crate::clock::epoch_ms(),
+                72 * 60 * 60 * 1_000,
+                &mut process_table,
+                true,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            AbandonedSessionCloseOutcome::OperationEvidenceUnavailable
+        );
+        assert!(
+            !broker
+                .store()
+                .session(session.id)
+                .unwrap()
+                .status
+                .is_closed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_operation_guard_busy_defers_abandoned_close() {
+        let (_repository, _storage, mut broker) = fixture();
+        let session = broker
+            .start_worktree("operation guard blocker", None)
+            .unwrap();
+        age_worktree_for_task_retirement(&mut broker, &session);
+        let shared = crate::file_lock::try_acquire_session_operation_guard(
+            broker.main_root(),
+            session.id,
+            crate::file_lock::SessionOperationLockMode::Shared,
+        )
+        .unwrap()
+        .expect("admitted operation holds the shared side");
+        let mut process_table = crate::session_holder::RecordedHolderProcessTable::default();
+
+        let outcome = broker
+            .try_close_abandoned_session(
+                session.id,
+                crate::clock::epoch_ms(),
+                72 * 60 * 60 * 1_000,
+                &mut process_table,
+                true,
+                None,
+            )
+            .unwrap();
+        drop(shared);
+
+        assert_eq!(outcome, AbandonedSessionCloseOutcome::OperationGuardBusy);
+        assert!(
+            !broker
+                .store()
+                .session(session.id)
+                .unwrap()
+                .status
+                .is_closed()
+        );
     }
 
     #[test]

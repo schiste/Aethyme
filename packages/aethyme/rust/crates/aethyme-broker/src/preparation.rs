@@ -144,6 +144,8 @@ pub enum PreparationError {
     LivenessIncomplete { reason: String },
     #[error("dependency preparation storage at {path} is unavailable: {reason}")]
     StorageUnavailable { path: PathBuf, reason: String },
+    #[error("shared package-cache directory {path:?} is unsafe: {reason}")]
+    SharedPackageCachePathInvalid { path: PathBuf, reason: String },
     #[error(transparent)]
     HostResource(#[from] crate::HostResourceError),
 }
@@ -228,6 +230,42 @@ pub enum PreparationCachePolicy {
     RepositoryShared,
 }
 
+/// A package-manager content or download cache that a preparation command may
+/// explicitly route into the repository-shared preparation cache.
+///
+/// These names only expose broker-owned paths through `AETHYME_PREPARE_*`
+/// variables. They do not set package-manager environment variables or rewrite
+/// commands; the repository's command remains responsible for selecting the
+/// path so caller settings keep their normal precedence.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparationPackageCache {
+    Pnpm,
+    Npm,
+    Uv,
+    Pip,
+}
+
+impl PreparationPackageCache {
+    fn directory_name(self) -> &'static str {
+        match self {
+            Self::Pnpm => "pnpm-store",
+            Self::Npm => "npm-cache",
+            Self::Uv => "uv-cache",
+            Self::Pip => "pip-cache",
+        }
+    }
+
+    fn environment_variable(self) -> &'static str {
+        match self {
+            Self::Pnpm => "AETHYME_PREPARE_PNPM_STORE_DIR",
+            Self::Npm => "AETHYME_PREPARE_NPM_CACHE_DIR",
+            Self::Uv => "AETHYME_PREPARE_UV_CACHE_DIR",
+            Self::Pip => "AETHYME_PREPARE_PIP_CACHE_DIR",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SharedCacheRoot {
@@ -287,6 +325,11 @@ pub struct PreparationStep {
     pub outputs: Vec<String>,
     #[serde(default = "default_cache_policy")]
     pub cache: PreparationCachePolicy,
+    /// Explicit package-manager cache paths made available to this step.
+    /// Commands must opt in by using the corresponding `AETHYME_PREPARE_*`
+    /// variable; package-manager environment variables are never overridden.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_package_caches: Vec<PreparationPackageCache>,
     #[serde(default)]
     pub required_for_hooks: bool,
 }
@@ -912,15 +955,6 @@ impl Broker {
             },
         )?;
 
-        let environment = cache_dir
-            .as_ref()
-            .map(|path| {
-                vec![(
-                    "AETHYME_PREPARE_CACHE_DIR".into(),
-                    path.to_string_lossy().into_owned(),
-                )]
-            })
-            .unwrap_or_default();
         let mut results = Vec::new();
         let main_root = self.main_root().to_path_buf();
         let mut heartbeat = PreparationHeartbeat::new(Instant::now());
@@ -939,6 +973,8 @@ impl Broker {
             )
             .map_err(BrokerOpError::from)
             .and_then(|()| {
+                let environment = preparation_step_environment(cache_dir.as_deref(), step)
+                    .map_err(BrokerOpError::from)?;
                 let supervisor = match next_supervisor.take() {
                     Some(supervisor) => supervisor,
                     None => self.start_preparation_exec_supervisor()?,
@@ -1155,6 +1191,9 @@ pub(crate) fn parse_config(text: &str) -> Result<PreparationConfig, PreparationE
             path: PREPARATION_CONFIG_RELPATH.into(),
             reason: error.to_string(),
         })?;
+    for step in &mut config.steps {
+        step.shared_package_caches.sort_unstable();
+    }
     if config.shared_cache.is_none()
         && config
             .steps
@@ -1206,6 +1245,23 @@ fn validate_config(config: &PreparationConfig) -> Result<(), PreparationError> {
         if !names.insert(step.name.as_str()) {
             return Err(invalid_config(format!("duplicate step {:?}", step.name)));
         }
+        if !step.shared_package_caches.is_empty()
+            && step.cache != PreparationCachePolicy::RepositoryShared
+        {
+            return Err(invalid_config(format!(
+                "step {:?} shared_package_caches requires cache = \"repository_shared\"",
+                step.name
+            )));
+        }
+        let mut package_caches = BTreeSet::new();
+        for package_cache in &step.shared_package_caches {
+            if !package_caches.insert(*package_cache) {
+                return Err(invalid_config(format!(
+                    "step {:?} declares duplicate shared package cache {:?}",
+                    step.name, package_cache
+                )));
+            }
+        }
         if step.outputs.is_empty() {
             return Err(invalid_config(format!(
                 "step {:?} must declare at least one output",
@@ -1223,6 +1279,94 @@ fn validate_config(config: &PreparationConfig) -> Result<(), PreparationError> {
         validate_managed_storage_profile(config, profile)?;
     }
     Ok(())
+}
+
+fn preparation_step_environment(
+    cache_dir: Option<&Path>,
+    step: &PreparationStep,
+) -> Result<Vec<(String, String)>, PreparationError> {
+    let Some(cache_dir) = cache_dir else {
+        return Ok(Vec::new());
+    };
+    let mut environment = vec![(
+        "AETHYME_PREPARE_CACHE_DIR".into(),
+        cache_dir.to_string_lossy().into_owned(),
+    )];
+    for package_cache in &step.shared_package_caches {
+        let path =
+            ensure_shared_package_cache_directory(cache_dir, package_cache.directory_name())?;
+        environment.push((
+            package_cache.environment_variable().into(),
+            path.to_string_lossy().into_owned(),
+        ));
+    }
+    Ok(environment)
+}
+
+fn ensure_shared_package_cache_directory(
+    cache_root: &Path,
+    directory_name: &str,
+) -> Result<PathBuf, PreparationError> {
+    let invalid = |path: &Path, reason: &str| PreparationError::SharedPackageCachePathInvalid {
+        path: path.to_path_buf(),
+        reason: reason.to_owned(),
+    };
+    let root_metadata =
+        fs::symlink_metadata(cache_root).map_err(|source| PreparationError::Io {
+            path: cache_root.to_path_buf(),
+            source,
+        })?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(invalid(
+            cache_root,
+            "the bound cache root is not a real directory",
+        ));
+    }
+    let canonical_root = fs::canonicalize(cache_root).map_err(|source| PreparationError::Io {
+        path: cache_root.to_path_buf(),
+        source,
+    })?;
+    let path = cache_root.join(directory_name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(invalid(&path, "symlinks are refused"));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(invalid(&path, "the existing path is not a directory"));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                return Err(PreparationError::Io {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        },
+        Err(source) => return Err(PreparationError::Io { path, source }),
+    }
+    let metadata = fs::symlink_metadata(&path).map_err(|source| PreparationError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(invalid(&path, "the selected path is not a real directory"));
+    }
+    let canonical_path = fs::canonicalize(&path).map_err(|source| PreparationError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    if canonical_path.parent() != Some(canonical_root.as_path())
+        || canonical_path.file_name().and_then(|name| name.to_str()) != Some(directory_name)
+    {
+        return Err(invalid(
+            &path,
+            "the selected directory resolves outside the bound cache root",
+        ));
+    }
+    Ok(path)
 }
 
 fn validate_managed_storage_profile(
@@ -4306,11 +4450,194 @@ mod tests {
                 inputs: vec!["lock.file".into()],
                 outputs: vec!["vendor/".into()],
                 cache: PreparationCachePolicy::WorktreeLocal,
+                shared_package_caches: Vec::new(),
                 required_for_hooks: true,
             }],
             shared_cache: None,
             managed_storage: None,
         }
+    }
+
+    #[test]
+    fn package_cache_paths_stay_under_the_bound_cache_and_are_opt_in() {
+        let cache_owner = tempfile::tempdir().unwrap();
+        let cache_root = cache_owner
+            .path()
+            .join("host-cache/canonical-repository/0123456789ab");
+        fs::create_dir_all(&cache_root).unwrap();
+        let mut base_config = config();
+        let mut shared_step = base_config.steps.remove(0);
+        shared_step.cache = PreparationCachePolicy::RepositoryShared;
+        shared_step.shared_package_caches = vec![
+            PreparationPackageCache::Pnpm,
+            PreparationPackageCache::Npm,
+            PreparationPackageCache::Uv,
+            PreparationPackageCache::Pip,
+        ];
+
+        let environment = preparation_step_environment(Some(&cache_root), &shared_step).unwrap();
+        assert_eq!(
+            environment,
+            vec![
+                (
+                    "AETHYME_PREPARE_CACHE_DIR".into(),
+                    cache_root.to_string_lossy().into_owned(),
+                ),
+                (
+                    "AETHYME_PREPARE_PNPM_STORE_DIR".into(),
+                    cache_root.join("pnpm-store").to_string_lossy().into_owned(),
+                ),
+                (
+                    "AETHYME_PREPARE_NPM_CACHE_DIR".into(),
+                    cache_root.join("npm-cache").to_string_lossy().into_owned(),
+                ),
+                (
+                    "AETHYME_PREPARE_UV_CACHE_DIR".into(),
+                    cache_root.join("uv-cache").to_string_lossy().into_owned(),
+                ),
+                (
+                    "AETHYME_PREPARE_PIP_CACHE_DIR".into(),
+                    cache_root.join("pip-cache").to_string_lossy().into_owned(),
+                ),
+            ]
+        );
+        assert!(environment.iter().all(|(name, _)| !matches!(
+            name.as_str(),
+            "PNPM_HOME" | "UV_CACHE_DIR" | "CARGO_HOME" | "CARGO_TARGET_DIR"
+        )));
+
+        let mut another_step = shared_step.clone();
+        another_step.name = "tools".into();
+        assert_eq!(
+            preparation_step_environment(Some(&cache_root), &another_step).unwrap(),
+            environment,
+            "steps selecting the same manager reuse its digest-specific store"
+        );
+
+        let mut local_config = config();
+        let local_step = local_config.steps.remove(0);
+        let local_environment =
+            preparation_step_environment(Some(&cache_root), &local_step).unwrap();
+        assert_eq!(local_environment.len(), 1);
+        assert_eq!(
+            local_environment[0].0, "AETHYME_PREPARE_CACHE_DIR",
+            "unlisted package caches are not exposed to the step"
+        );
+        assert!(
+            preparation_step_environment(None, &shared_step)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_cache_environment_rejects_symlink_leaf_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let owner = tempfile::tempdir().unwrap();
+        let cache_root = owner.path().join("cache");
+        let outside = owner.path().join("outside");
+        fs::create_dir(&cache_root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("preserve.txt"), b"untouched").unwrap();
+        symlink(&outside, cache_root.join("uv-cache")).unwrap();
+
+        let mut step = config().steps.remove(0);
+        step.cache = PreparationCachePolicy::RepositoryShared;
+        step.shared_package_caches = vec![PreparationPackageCache::Uv];
+        assert!(matches!(
+            preparation_step_environment(Some(&cache_root), &step),
+            Err(PreparationError::SharedPackageCachePathInvalid { .. })
+        ));
+        assert_eq!(
+            fs::read(outside.join("preserve.txt")).unwrap(),
+            b"untouched"
+        );
+        assert!(
+            fs::symlink_metadata(cache_root.join("uv-cache"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let file_leaf = cache_root.join("npm-cache");
+        fs::write(&file_leaf, b"preserve file").unwrap();
+        step.shared_package_caches = vec![PreparationPackageCache::Npm];
+        assert!(matches!(
+            preparation_step_environment(Some(&cache_root), &step),
+            Err(PreparationError::SharedPackageCachePathInvalid { .. })
+        ));
+        assert_eq!(fs::read(file_leaf).unwrap(), b"preserve file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_shared_cache_alias_reaches_child_environment_alone() {
+        let owner = tempfile::tempdir().unwrap();
+        let cache_root = owner.path().join("cache");
+        fs::create_dir(&cache_root).unwrap();
+        let mut step = config().steps.remove(0);
+        step.cache = PreparationCachePolicy::RepositoryShared;
+        step.shared_package_caches = vec![PreparationPackageCache::Uv];
+        let environment = preparation_step_environment(Some(&cache_root), &step).unwrap();
+        assert!(cache_root.join("uv-cache").is_dir());
+
+        let child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "printf '%s|%s' \"$AETHYME_PREPARE_UV_CACHE_DIR\" \"${AETHYME_PREPARE_NPM_CACHE_DIR-unset}\"",
+            ])
+            .envs(environment)
+            .env_remove("AETHYME_PREPARE_NPM_CACHE_DIR")
+            .output()
+            .unwrap();
+        assert!(child.status.success());
+        let stdout = String::from_utf8(child.stdout).unwrap();
+        assert_eq!(
+            stdout,
+            format!("{}|unset", cache_root.join("uv-cache").display())
+        );
+    }
+
+    #[test]
+    fn package_cache_opt_in_is_hashed_but_empty_defaults_keep_legacy_serialization() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("lock.file"), "locked").unwrap();
+        let mut base = config();
+        base.steps[0].cache = PreparationCachePolicy::RepositoryShared;
+        base.shared_cache = Some(SharedCacheBudget::default());
+        assert!(
+            serde_json::to_value(&base).unwrap()["steps"][0]
+                .get("shared_package_caches")
+                .is_none()
+        );
+
+        let base_digest = preparation_digest(root.path(), &base, 1).unwrap();
+        let mut uv = base.clone();
+        uv.steps[0].shared_package_caches = vec![PreparationPackageCache::Uv];
+        let uv_digest = preparation_digest(root.path(), &uv, 1).unwrap();
+        assert_ne!(base_digest, uv_digest);
+    }
+
+    #[test]
+    fn package_cache_names_require_shared_steps_and_reject_unsupported_home_caches() {
+        let base = "schema_version = 1\n\
+            [[steps]]\n\
+            name = \"deps\"\n\
+            command = [\"tool\", \"install\"]\n\
+            inputs = [\"lock.file\"]\n\
+            outputs = [\"vendor/\"]\n\
+            shared_package_caches = [\"uv\"]\n";
+        assert!(
+            parse_config(base).is_err(),
+            "worktree-local sharing is refused"
+        );
+
+        let shared = format!("{base}cache = \"repository_shared\"\n");
+        assert!(parse_config(&shared).is_ok());
+        assert!(parse_config(&shared.replace("[\"uv\"]", "[\"uv\", \"uv\"]")).is_err());
+        assert!(parse_config(&shared.replace("[\"uv\"]", "[\"cargo_home\"]")).is_err());
     }
 
     fn managed_profile_config() -> PreparationConfig {
@@ -5479,6 +5806,7 @@ mod tests {
             inputs: Vec::new(),
             outputs: vec![".venv/".into()],
             cache: PreparationCachePolicy::WorktreeLocal,
+            shared_package_caches: Vec::new(),
             required_for_hooks: false,
         });
         let profile = overflowing.managed_storage.as_mut().unwrap();

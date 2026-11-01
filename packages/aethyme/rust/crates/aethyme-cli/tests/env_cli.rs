@@ -79,7 +79,10 @@ impl Fixture {
             .env("AETHYME_ENV_SUPERVISOR_LINGER_SECONDS", "1")
             .env("AETHYME_ENV_SUPERVISOR_TICK_MS", "50")
             .env_remove("XDG_STATE_HOME")
-            .env_remove("AETHYME_WORKTREE_ROOT");
+            .env_remove("AETHYME_WORKTREE_ROOT")
+            // Timings record the same here and on CI unless a test says so.
+            .env_remove("CI")
+            .env_remove("AETHYME_ENV_TIMINGS");
         command
     }
 
@@ -712,6 +715,50 @@ backend = 350
         status(&after, "up.backend")["status"],
         "no-data",
         "no warm up yet"
+    );
+}
+
+/// #1239: under CI, lifecycle timings are not recorded unless
+/// `AETHYME_ENV_TIMINGS=1` opts in, so test runs never feed budget trends.
+#[test]
+fn budgets_record_nothing_under_ci_unless_opted_in() {
+    let environments = r#"
+schema = 1
+[[profiles]]
+name = "backend"
+[[profiles.components]]
+name = "db"
+runtime = "hooks"
+provision = "true"
+destroy = "true"
+[budgets.seconds]
+"up.cold" = 600
+"#;
+    let fixture = Fixture::new(Some(environments));
+    let cold_count = |extra: &[(&str, &str)]| {
+        let mut up = fixture.command(&["env", "up", "--wait", "5", "--json"]);
+        up.envs(extra.iter().copied());
+        let output = up.output().unwrap();
+        let up: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let env_id = up["env_id"].as_str().unwrap().to_string();
+        let mut down = fixture.command(&["env", "down", &env_id, "--json"]);
+        down.envs(extra.iter().copied());
+        assert!(down.output().unwrap().status.success());
+        let (code, report) = fixture.json(&["env", "budgets"]);
+        assert_eq!(code, 0, "{report}");
+        report["metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["metric"] == "up.cold")
+            .unwrap()["count"]
+            .as_u64()
+            .unwrap()
+    };
+    assert_eq!(cold_count(&[("CI", "true")]), 0);
+    assert_eq!(
+        cold_count(&[("CI", "true"), ("AETHYME_ENV_TIMINGS", "1")]),
+        1
     );
 }
 

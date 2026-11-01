@@ -395,7 +395,18 @@ impl Lifecycle {
             self.prepare_start(&env_id, &snapshot, &bindings, component)?;
             let ctx = self.context(&snapshot, component, &bindings, 1);
             let driver = driver_for(component.runtime);
-            let identity = match driver.start(&ctx) {
+            // A wake times each component like a cold up does (#1239), so a
+            // slow start or health wait shows under its own metric.
+            let start_started = Instant::now();
+            let start = driver.start(&ctx);
+            self.record_timing(
+                &snapshot.repository,
+                &format!("start.{}", component.name),
+                &env_id,
+                start_started,
+                start.is_ok(),
+            );
+            let identity = match start {
                 Ok(identity) => identity,
                 Err(error) => {
                     failure = Some((component.name.clone(), error));
@@ -412,7 +423,16 @@ impl Lifecycle {
                 None,
             )?;
             started.push((component.name.clone(), identity.clone()));
-            if let Err(error) = wait_healthy(driver.as_ref(), &ctx, &identity) {
+            let health_started = Instant::now();
+            let health = wait_healthy(driver.as_ref(), &ctx, &identity);
+            self.record_timing(
+                &snapshot.repository,
+                &format!("health.{}", component.name),
+                &env_id,
+                health_started,
+                health.is_ok(),
+            );
+            if let Err(error) = health {
                 failure = Some((component.name.clone(), error));
                 break;
             }

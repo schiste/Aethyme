@@ -1993,6 +1993,50 @@ pub(super) fn run_close(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+/// `broker heartbeat`.
+pub(super) fn run_heartbeat(
+    parsed: Parsed,
+    heartbeat: crate::session_holder::TaskLeaseHeartbeat,
+) -> Result<(), UsageError> {
+    let session_id = parsed.session.ok_or(UsageError::Message(
+        "heartbeat requires --session <id>".into(),
+    ))?;
+    match heartbeat {
+        crate::session_holder::TaskLeaseHeartbeat::Renewed
+        | crate::session_holder::TaskLeaseHeartbeat::Current
+        | crate::session_holder::TaskLeaseHeartbeat::Upgraded => {
+            if parsed.json {
+                out!(
+                    "{}",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "state": heartbeat.as_str(),
+                    })
+                );
+            } else {
+                match heartbeat {
+                    crate::session_holder::TaskLeaseHeartbeat::Upgraded => {
+                        out!("Enabled the guarded task lease for session {session_id}.")
+                    }
+                    crate::session_holder::TaskLeaseHeartbeat::Renewed => {
+                        out!("Renewed the guarded task lease for session {session_id}.")
+                    }
+                    _ => out!("Session {session_id}'s task lease is current."),
+                }
+            }
+            Ok(())
+        }
+        crate::session_holder::TaskLeaseHeartbeat::NotHolder => Err(UsageError::Message(format!(
+            "this process is not the recorded holder of session {session_id}"
+        ))),
+        crate::session_holder::TaskLeaseHeartbeat::LegacyProtected => {
+            Err(UsageError::Message(format!(
+                "session {session_id} has a legacy or unsupported holder binding; it remains protected from task-lease expiry"
+            )))
+        }
+    }
+}
+
 /// `broker worktrees`.
 pub(super) fn run_worktrees(parsed: Parsed) -> Result<(), UsageError> {
     let mut broker = open_broker(parsed.read_only_snapshot)?;

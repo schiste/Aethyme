@@ -1468,6 +1468,11 @@ pub struct DoctorReport {
     /// never reconciled: `doctor` only names the dry run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub leftover_integration_work: Option<StatusAdvice>,
+    /// Environment metrics whose p50 is over the repository's declared budget
+    /// (#1239). Reported, never counted against [`Self::healthy`]: a slow
+    /// environment is a trend to act on, not a broken broker.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environment_budgets_over: Vec<crate::environments::budgets::MetricReport>,
     /// Milliseconds each doctor phase took (#460).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub phase_timings_ms: std::collections::BTreeMap<String, u64>,
@@ -1841,6 +1846,14 @@ pub struct CleanupRetention {
     /// status can explain a bad file without failing before it can report it.
     #[serde(skip_serializing_if = "RetentionConfigStatus::is_healthy")]
     pub retention_config: RetentionConfigStatus,
+    /// One bounded, namespace-scoped snapshot of the last artifact sweep.
+    /// This is read from broker metadata; status does not scan the filesystem.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_artifact_sweep: Option<crate::ArtifactSweepLastReport>,
+    /// A malformed or unreadable saved report is described here without
+    /// failing the rest of status or hiding the rest of its evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_artifact_sweep_error: Option<String>,
     /// Directories under a broker worktree root that no session row claims
     /// (#176). Unsized on this path -- status runs often, and the count is
     /// the signal; `gc plan` measures the bytes.
@@ -3141,6 +3154,7 @@ fn push_auto_cleanup_advice(view: &mut StatusView, report: Option<crate::AutoCle
                 | crate::SessionRetirementDeferredReason::HolderLivenessUnavailable { .. }
                 | crate::SessionRetirementDeferredReason::WorktreeActivityUnavailable { .. }
                 | crate::SessionRetirementDeferredReason::LeaseLivenessUnavailable { .. }
+                | crate::SessionRetirementDeferredReason::OperationEvidenceUnavailable { .. }
         )
     });
     if report.removed.is_empty()
@@ -3201,6 +3215,15 @@ fn push_auto_cleanup_advice(view: &mut StatusView, report: Option<crate::AutoCle
                     session_id,
                 } => format!(
                     "session {session_id} remains open because worktree activity metadata could not be checked"
+                ),
+                crate::SessionRetirementDeferredReason::OperationGuardBusy { session_id } => format!(
+                    "session {session_id} retirement will retry after its admitted session operation finishes"
+                ),
+                crate::SessionRetirementDeferredReason::OperationActive { session_id } => format!(
+                    "session {session_id} remains open because session work or a child operation is active"
+                ),
+                crate::SessionRetirementDeferredReason::OperationEvidenceUnavailable { session_id } => format!(
+                    "session {session_id} remains open because operation or child-use evidence could not be checked"
                 ),
                 crate::SessionRetirementDeferredReason::LifecycleBusy { session_id } => format!(
                     "session {session_id} retirement will retry after the repository lifecycle operation"

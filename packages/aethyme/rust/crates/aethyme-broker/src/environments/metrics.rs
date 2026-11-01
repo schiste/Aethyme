@@ -425,12 +425,31 @@ pub fn calibrate(
 
 /// The environments file rewritten with the proposal, as a unified diff.
 /// Only `units = ` in profile tables and `limit = ` in pool tables change.
-pub fn proposal_diff(original: &str, calibration: &Calibration) -> String {
+pub fn proposal_diff(
+    original: &str,
+    calibration: Option<&Calibration>,
+    budgets: &[super::budgets::BudgetProposal],
+) -> String {
     let units: BTreeMap<&str, u32> = calibration
-        .profiles
+        .map(|c| c.profiles.as_slice())
+        .unwrap_or_default()
         .iter()
         .filter_map(|p| p.proposed_units.map(|u| (p.profile.as_str(), u)))
         .collect();
+    let pools = calibration.map(|c| &c.pools);
+    // Budget keys may be bare (`park = 15`) or quoted (`"up.backend" = 30`).
+    let budget = |section: &str, key: &str| {
+        let unit = match section {
+            "[budgets.seconds]" => "seconds",
+            "[budgets.memory_mib]" => "memory_mib",
+            _ => return None,
+        };
+        let key = key.trim_matches('"');
+        budgets
+            .iter()
+            .find(|p| p.unit == unit && p.key == key)
+            .map(|p| p.proposed)
+    };
     let mut section = String::new();
     let mut profile: Option<String> = None;
     let mut rewritten = String::with_capacity(original.len());
@@ -461,7 +480,12 @@ pub fn proposal_diff(original: &str, calibration: &Calibration) -> String {
                 .strip_prefix("[pools.")
                 .and_then(|s| s.strip_suffix(']'))
         {
-            calibration.pools.get(pool).map(|l| format!("limit = {l}"))
+            pools
+                .and_then(|pools| pools.get(pool))
+                .map(|l| format!("limit = {l}"))
+        } else if let Some(proposed) = budget(&section, key) {
+            let indent = &line[..line.len() - line.trim_start().len()];
+            Some(format!("{indent}{key} = {proposed}"))
         } else {
             None
         };
