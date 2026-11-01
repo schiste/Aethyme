@@ -675,6 +675,36 @@ serialized in per-user host state by canonical remote identity, renewed while
 the command runs, and released afterward. The cache path and ownership token
 are absent from JSON and broker journals.
 
+Steps with `cache = "repository_shared"` may declare `shared_package_caches`
+to expose package-manager-specific directories beneath that same identity- and
+digest-bound cache:
+`pnpm` provides `AETHYME_PREPARE_PNPM_STORE_DIR`, `npm` provides
+`AETHYME_PREPARE_NPM_CACHE_DIR`, `uv` provides `AETHYME_PREPARE_UV_CACHE_DIR`,
+and `pip` provides `AETHYME_PREPARE_PIP_CACHE_DIR`. The broker only supplies
+these Aethyme paths when the step declares them; its command must explicitly
+route the manager to the path. For example, this uses the shared uv download
+cache by default, while keeping `.venv/` in the worktree; if the caller already
+set a nonempty `UV_CACHE_DIR`, the command preserves that value:
+
+```toml
+[[steps]]
+name = "python-dependencies"
+command = ["sh", "-c", 'UV_CACHE_DIR="${UV_CACHE_DIR:-$AETHYME_PREPARE_UV_CACHE_DIR}" uv sync']
+offline_command = ["sh", "-c", 'UV_CACHE_DIR="${UV_CACHE_DIR:-$AETHYME_PREPARE_UV_CACHE_DIR}" uv sync --offline']
+inputs = ["pyproject.toml", "uv.lock"]
+outputs = [".venv/"]
+cache = "repository_shared"
+shared_package_caches = ["uv"]
+```
+
+Use `--store-dir "$AETHYME_PREPARE_PNPM_STORE_DIR"` for pnpm, or the
+package manager's explicit cache option for npm and pip. These aliases do not
+set `PNPM_HOME`, `UV_CACHE_DIR`, `npm_config_cache`, `PIP_CACHE_DIR`, or other
+package-manager environment variables. `CARGO_HOME` is intentionally not a
+shared-cache option because it also contains Cargo configuration, credentials,
+and installed executables; the broker leaves it untouched. Keep generated
+worktree outputs such as `node_modules/`, `.venv/`, and `target/` per worktree.
+
 By default, the broker derives the shared preparation cache from the captured
 host-resource database location. To place that cache on a separate volume, set
 `AETHYME_PREPARATION_CACHE_ROOT` to an existing, real, canonical absolute

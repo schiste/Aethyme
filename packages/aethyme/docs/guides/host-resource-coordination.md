@@ -231,12 +231,27 @@ Each step declares `inputs` (hashed into the preparation digest) and
 - `worktree_local` — each worktree installs its own copy. Correct default.
 - `repository_shared` — exports `AETHYME_PREPARE_CACHE_DIR` and serializes
   writers in host state by canonical remote identity, so N worktrees share one
-  package-manager store.
+  package-manager store. A step can opt in to typed paths with
+  `shared_package_caches = ["pnpm", "npm", "uv", "pip"]`; each exposes only
+  its corresponding `AETHYME_PREPARE_*_DIR` variable beneath the same
+  repository- and digest-specific store.
 
 Prefer `repository_shared` for a package manager with a content-addressable
-store (pnpm, uv). For a copying package manager such as npm it only shares the
-*download* cache, so each worktree still materializes a full tree on disk; the
-real saving there comes from migrating to pnpm, not from the flag.
+store (pnpm, uv). For copying package managers such as npm or pip, only their
+download cache is shared, so each worktree still materializes its own install
+tree. Aethyme does not infer how a command uses a store: add the typed name to
+`shared_package_caches` and route the manager explicitly in that step's
+command. The broker exposes only its reserved `AETHYME_PREPARE_*_DIR` path;
+it does not set or override package-manager environment variables. For
+example, a uv command can use
+`UV_CACHE_DIR="${UV_CACHE_DIR:-$AETHYME_PREPARE_UV_CACHE_DIR}" uv sync` to
+preserve a caller-provided cache location.
+
+`CARGO_HOME` is not a cache-only directory: it also holds configuration,
+credentials, and installed executables. It is deliberately not a supported
+shared cache and the broker leaves it untouched. Keep writable build outputs
+such as Cargo's `target/`, `node_modules/`, and Python virtual environments in
+each worktree.
 
 The shared store is keyed by preparation digest, so a repository whose lockfile
 differs between branches accumulates one store directory per distinct input set.
@@ -249,7 +264,9 @@ An unspecified `shared_cache.root` keeps the historical Host placement for
 existing configurations. A new pnpm draft from `aethyme init` selects the
 worktree placement filesystem and passes its broker-managed store path with
 `--store-dir`, so pnpm can hardlink package content when its import mode allows
-it. Worktree outputs such as `node_modules/` remain per-worktree. A
+it. Worktree outputs such as `node_modules/` remain per-worktree. The typed
+`pnpm` alias resolves to the same `pnpm-store` directory used by the existing
+`AETHYME_PREPARE_CACHE_DIR/pnpm-store` convention. A
 worktree-relative `store-dir` in `.npmrc` creates a private store for
 installs that do not pass an explicit store path; remove it to avoid that
 per-checkout cache:
