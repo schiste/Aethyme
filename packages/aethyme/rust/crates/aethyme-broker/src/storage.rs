@@ -366,6 +366,8 @@ pub struct StorageGitEntry {
     pub estimated_bytes: Option<u64>,
     pub estimated_inodes: Option<u64>,
     pub measured_at_ms: Option<i64>,
+    #[serde(default)]
+    pub blockers: Vec<String>,
     pub maintenance: String,
 }
 
@@ -4418,12 +4420,25 @@ fn inspect_git_storage_until(
         } else {
             records.get(&path.to_string_lossy())
         };
+        let mut blockers = Vec::new();
+        if category == "objects" && real_directory {
+            let lock_path = path.join("maintenance.lock");
+            match std::fs::symlink_metadata(&lock_path) {
+                Ok(_) => blockers.push(format!(
+                    "Git maintenance lock exists at {}; maintenance may skip without reclaiming space. Inspect its owner and use reviewed recovery; never infer success or delete it from age alone.",
+                    lock_path.display()
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => blockers.push(format!("Git maintenance lock state is unknown: {error}")),
+            }
+        }
         StorageGitEntry {
             path,
             category: category.into(),
             estimated_bytes: record.map(|record| record.bytes),
             estimated_inodes: record.and_then(|record| record.inodes),
             measured_at_ms: record.map(|record| record.measured_at_ms),
+            blockers,
             maintenance: maintenance.into(),
         }
     })
@@ -6039,6 +6054,33 @@ mod tests {
                 .unwrap()
                 .estimated_bytes,
             Some(123)
+        );
+    }
+
+    #[test]
+    fn git_maintenance_lock_is_reported_and_never_deleted_by_inventory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("objects")).unwrap();
+        let lock = tmp.path().join("objects/maintenance.lock");
+        std::fs::write(&lock, b"").unwrap();
+        let mut records = crate::measurement::SizeRecords::default();
+        let entries = inspect_git_storage(tmp.path(), crate::SizeScan::Recorded, &mut records);
+        let objects = entries
+            .iter()
+            .find(|entry| entry.category == "objects")
+            .unwrap();
+        assert_eq!(objects.blockers.len(), 1);
+        assert!(objects.blockers[0].contains("maintenance may skip"));
+        assert!(lock.is_file());
+        std::fs::remove_file(lock).unwrap();
+        let entries = inspect_git_storage(tmp.path(), crate::SizeScan::Recorded, &mut records);
+        assert!(
+            entries
+                .iter()
+                .find(|entry| entry.category == "objects")
+                .unwrap()
+                .blockers
+                .is_empty()
         );
     }
 

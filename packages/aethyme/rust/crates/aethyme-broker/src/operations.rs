@@ -2988,6 +2988,11 @@ pub fn classify_git(args: &[String]) -> Option<OperationEffect> {
                 "maintenance",
                 "run",
                 "--task=loose-objects",
+            ]) || args.iter().map(String::as_str).eq([
+                "maintenance",
+                "run",
+                "--no-quiet",
+                "--task=loose-objects",
             ]) =>
         {
             Some(OperationEffect::Write)
@@ -3476,13 +3481,29 @@ mod git_storage_maintenance_tests {
         let resolution = temporary.path().join(".git/rr-cache/fixture/postimage");
         std::fs::create_dir_all(resolution.parent().unwrap()).unwrap();
         std::fs::write(&resolution, b"saved resolution").unwrap();
+        let pack_count = || {
+            std::fs::read_dir(temporary.path().join(".git/objects/pack"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "pack")
+                })
+                .count()
+        };
+        let packs_before = pack_count();
         run(&[
             "-c",
             "pack.threads=1",
             "maintenance",
             "run",
+            "--no-quiet",
             "--task=loose-objects",
         ]);
+        assert!(
+            pack_count() > packs_before,
+            "maintenance must perform real packing, not silently skip"
+        );
         assert_eq!(run(&["rev-parse", "HEAD"]), head);
         assert_eq!(run(&["cat-file", "blob", object.trim()]), "uncommitted");
         assert_eq!(run(&["status", "--porcelain=v1"]), status);
@@ -3535,6 +3556,10 @@ mod git_storage_maintenance_tests {
     fn only_closed_non_pruning_maintenance_uses_write_authority() {
         assert_eq!(
             classify(&["maintenance", "run", "--task=loose-objects"]),
+            Some(OperationEffect::Write)
+        );
+        assert_eq!(
+            classify(&["maintenance", "run", "--no-quiet", "--task=loose-objects"]),
             Some(OperationEffect::Write)
         );
         for args in [

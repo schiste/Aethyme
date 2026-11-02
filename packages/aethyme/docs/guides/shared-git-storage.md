@@ -9,7 +9,7 @@ report is not a complete repository storage report.
 `aethyme broker gc storage plan --json` includes `primary_checkouts[].git_storage`
 even when source edits prevent deletion of primary build artifacts. Each entry
 has a category, path, logical byte estimate (null means unknown), inode estimate,
-measurement timestamp and maintenance guidance. These entries never become recursive deletion
+measurement timestamp, blockers and maintenance guidance. These entries never become recursive deletion
 candidates. Logical bytes are not APFS-exclusive physical allocation. Recorded
 estimates can be old; an explicit measured plan spends at most 250 milliseconds
 per repository on shared Git directories. Routine plans add these paths to the
@@ -22,7 +22,7 @@ categories stay unknown; measurement never follows them.
 From an existing broker session in the owning repository:
 
 ```sh
-aethyme broker advanced git --session SESSION --reason "Reviewed shared Git object maintenance" --queue-timeout 120 -- -c pack.threads=1 -c pack.windowMemory=32m -c gc.auto=0 maintenance run --task=loose-objects
+aethyme broker advanced git --session SESSION --reason "Reviewed shared Git object maintenance" --queue-timeout 120 -- -c pack.threads=1 -c pack.windowMemory=32m -c gc.auto=0 maintenance run --no-quiet --task=loose-objects
 ```
 
 Repository-routing overrides are refused for coordinated maintenance.
@@ -31,7 +31,10 @@ operation journal and coordinator. It removes loose copies already present in
 packs and packs a batch of remaining loose objects. It does not change branch
 refs, expire reflogs, prune unreachable objects, remove worktrees or expire
 conflict resolutions. Check disk headroom first: packing needs temporary space.
-Run one pass at a time; compare `git count-objects -v` before and after. A pass
+Run one pass at a time; compare `git count-objects -v` before and after.
+An existing `objects/maintenance.lock` is reported as a blocker. Git may skip
+maintenance and return success while that lock exists; exit status alone is
+not proof of reclamation. Do not remove a lock from age alone. A pass
 may leave substantial loose-object debt because Git bounds its batch. Do not
 start a concurrent standalone `git gc`; it uses different Git maintenance locks.
 Do not blindly retry an operation with unknown outcome; reconcile its receipt.

@@ -147,6 +147,9 @@ pub(super) fn render_storage_plan(plan: &crate::StoragePlan, detail: bool) {
                     .map(|bytes| bytes.to_string())
                     .unwrap_or_else(|| "unknown".into()),
             );
+            for blocker in &entry.blockers {
+                out!("      blocker: {blocker}");
+            }
             if detail {
                 out!("      {}", entry.maintenance);
             }
