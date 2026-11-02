@@ -2456,6 +2456,12 @@ mod tests {
         let primary = tempfile::tempdir().unwrap();
         let checkout = checkout(primary.path(), "checkout");
         let mut locations = ArtifactUseLocations::resolve(primary.path(), &checkout).unwrap();
+        locations.primary_volume_uuid = None;
+        locations.checkout_volume_uuid = None;
+        assert_eq!(
+            locations.new_marker_volume_evidence(),
+            (LEGACY_MARKER_SCHEMA_VERSION, None, None)
+        );
 
         locations.primary_volume_uuid = Some([0x11; 16]);
         assert_eq!(
@@ -2463,7 +2469,14 @@ mod tests {
             (LEGACY_MARKER_SCHEMA_VERSION, None, None)
         );
 
+        locations.primary_volume_uuid = None;
         locations.checkout_volume_uuid = Some([0x22; 16]);
+        assert_eq!(
+            locations.new_marker_volume_evidence(),
+            (LEGACY_MARKER_SCHEMA_VERSION, None, None)
+        );
+
+        locations.primary_volume_uuid = Some([0x11; 16]);
         assert_eq!(
             locations.new_marker_volume_evidence(),
             (
