@@ -389,3 +389,93 @@ fn automation_notes_need_no_session_and_repeat_only_once_read() {
         .to_string();
     assert!(closed.contains("is closed"), "{closed}");
 }
+
+/// Review of #1350: an automation that happens to run inside a registered
+/// session's worktree acts for itself, not for that session. Its note send
+/// must not renew the session's task lease on behalf of the agent process
+/// that holds it, nor mark that session's advisories delivered.
+#[test]
+fn automation_note_from_a_session_worktree_leaves_that_session_alone() {
+    let (fixture, holder_worktree, recipient_worktree) = fixture();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
+    let holder = broker.adopt(&holder_worktree, Some("holder")).unwrap();
+    let recipient = broker
+        .adopt(&recipient_worktree, Some("recipient"))
+        .unwrap();
+    broker
+        .persist_advisory(aethyme_broker::NewAdvisory {
+            identity: "automation-note:fixture".into(),
+            audience: aethyme_broker::AdvisoryAudience::Session,
+            producer: aethyme_broker::AdvisoryProducer::Coordination,
+            session_id: Some(holder.id),
+            severity: aethyme_broker::AdvisorySeverity::Warning,
+            queue_entry_id: None,
+            integration_sha: None,
+            paths: vec!["README.md".into()],
+            evidence: vec![aethyme_broker::AdvisoryEvidence {
+                kind: "fixture".into(),
+                summary: "an outstanding advisory".into(),
+            }],
+        })
+        .unwrap();
+    let mut agent = Command::new("sleep").arg("600").spawn().unwrap();
+    let agent_pid = agent.id().to_string();
+    let holder_id = holder.id.to_string();
+    let recipient_id = recipient.id.to_string();
+    // The agent binds itself as holder and takes a task lease.
+    let mut bind = child_command(
+        &broker,
+        &holder_worktree,
+        &["advanced", "heartbeat", "--session", &holder_id, "--json"],
+    );
+    bind.env("AETHYME_AGENT_PID", &agent_pid);
+    let mut send = child_command(
+        &broker,
+        &holder_worktree,
+        &[
+            "advanced",
+            "note",
+            "send",
+            "--from",
+            "automation:prebuild",
+            "--to-session",
+            &recipient_id,
+            "--message",
+            "prebuild failed",
+            "--json",
+        ],
+    );
+    send.env("AETHYME_AGENT_PID", &agent_pid);
+    drop(broker);
+
+    output_json(&mut bind);
+    let holder_state = |fixture: &FixtureRepository| {
+        let mut broker = open_fixture_repository_broker(fixture).unwrap();
+        let activity = broker.store().session(holder.id).unwrap().last_activity_at;
+        let bindings = broker
+            .store()
+            .events_after_filtered(0, 100, Some("session.holder_bound"))
+            .unwrap()
+            .len();
+        let shown = broker.advisory_delivery_summary().unwrap().total_shows;
+        (activity, bindings, shown)
+    };
+    let before = holder_state(&fixture);
+    assert!(before.1 > 0, "the agent never bound as holder");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let sent = output_json(&mut send);
+    assert_eq!(sent["note"]["recipient_session_id"], recipient.id);
+    let after = holder_state(&fixture);
+    let _ = agent.kill();
+    let _ = agent.wait();
+    assert_eq!(
+        after.0, before.0,
+        "the automation note renewed the holder's task lease"
+    );
+    assert_eq!(after.1, before.1, "the automation note rebound the holder");
+    assert_eq!(
+        after.2, before.2,
+        "the automation note delivered the holder's advisories"
+    );
+}
