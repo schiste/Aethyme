@@ -274,6 +274,13 @@ blocked.
    The help snapshot test derives public verbs from the surface table; keep the
    no-side-effect help coverage in sync as well.
 
+   Before hosted qualification of native filesystem changes, compare every
+   platform-specific FFI field and type with the dependency version pinned in
+   `Cargo.lock`; C headers and a passing Linux build do not establish the Rust
+   macOS layout. Inspect new production code, including inactive `cfg` branches,
+   for discarded results such as `let _ =`; fix the sites rather than raising
+   the discarded-result ratchet baseline.
+
    Before committing, stage only the intended session-owned paths explicitly
    with `git add <path>...`; never use `git add .` or `git add -A`, and
    inspect `git diff --cached`. The broker commit command does not stage files.
