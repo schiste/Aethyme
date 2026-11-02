@@ -1426,8 +1426,46 @@ mod tests {
             return;
         }
 
+        fn isolate_git_environment(command: &mut std::process::Command) {
+            command
+                .env("GIT_NO_REPLACE_OBJECTS", "1")
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env_remove("GIT_GRAFT_FILE");
+            for name in [
+                "GIT_DIR",
+                "GIT_COMMON_DIR",
+                "GIT_WORK_TREE",
+                "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_OBJECT_DIRECTORY_RELATIVE",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_NAMESPACE",
+                "GIT_REPLACE_REF_BASE",
+                "GIT_SHALLOW_FILE",
+                "GIT_CEILING_DIRECTORIES",
+                "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+                "GIT_PREFIX",
+                "GIT_CONFIG",
+                "GIT_CONFIG_SYSTEM",
+                "GIT_CONFIG_GLOBAL",
+                "GIT_CONFIG_PARAMETERS",
+                "GIT_CONFIG_COUNT",
+            ] {
+                command.env_remove(name);
+            }
+            for (name, _) in std::env::vars_os() {
+                let name = name.to_string_lossy();
+                if name.starts_with("GIT_CONFIG_KEY_") || name.starts_with("GIT_CONFIG_VALUE_") {
+                    command.env_remove(name.as_ref());
+                }
+            }
+        }
+
         fn git(root: &std::path::Path, args: &[&str]) {
-            let output = std::process::Command::new("git")
+            let mut command = std::process::Command::new("git");
+            isolate_git_environment(&mut command);
+            let output = command
                 .args(args)
                 .current_dir(root)
                 .env("GIT_AUTHOR_NAME", "ownership list test")
@@ -1479,6 +1517,7 @@ mod tests {
         assert_eq!(before.pid, Some(dead_pid));
 
         let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        isolate_git_environment(&mut child);
         child
             .arg("read_only_ownership_list_preserves_dead_spawned_session_state")
             .arg("--nocapture")
