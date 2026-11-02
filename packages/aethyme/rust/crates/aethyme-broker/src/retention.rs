@@ -796,6 +796,8 @@ pub struct GcPublicationExposureExpiry {
     pub reason: String,
 }
 
+pub(crate) const GC_ENVIRONMENT_CACHE_IDENTITY_MISSING: &str = "environment_cache_identity_missing";
+
 /// One unused entry of the host's environment build cache that belongs to
 /// this repository and a reviewed `gc apply` may evict (#1275).
 ///
@@ -806,15 +808,77 @@ pub struct GcPublicationExposureExpiry {
 /// approving the eviction of one that just became warm again.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct GcEnvironmentCacheCandidate {
+    /// Display path only. Eviction is bound by the cache-root and entry
+    /// filesystem identities plus the relative repository/component/digest.
     pub path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub repository: String,
     pub component: String,
     pub digest: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cache_root: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_root_device: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_root_inode: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub entry_device: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub entry_inode: u64,
+    /// The exact shared build key; GC retains entries that cannot prove it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<String>,
+    /// Set durably by `gc apply` before the first unlink, so a partial
+    /// descriptor-relative removal can resume without reauthorizing a changed
+    /// cache entry.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deletion_started: bool,
     pub estimated_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_inodes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at_ms: Option<i64>,
     pub reason: String,
+}
+
+impl GcEnvironmentCacheCandidate {
+    /// Old saved plans predate the fields needed to bind eviction to the
+    /// observed host cache root and relative entry identity.
+    pub(crate) fn has_identity_bound_location(&self) -> bool {
+        !self.repository.is_empty() && !self.cache_root.is_empty()
+    }
+
+    /// Return the historical build-reader lock tuple only when `.key` proves
+    /// that it names this exact cache path. GC never invents a replacement
+    /// coordination key from a path when saved metadata is missing or invalid.
+    pub(crate) fn coordinated_build_lock(&self) -> Option<(&str, &str)> {
+        let key = self.cache_key.as_deref()?;
+        let encoded = key.strip_prefix("aethyme-env-build:")?;
+        let (prefix, digest) = encoded.rsplit_once(':')?;
+        let (repository, component) = prefix.rsplit_once(':')?;
+        let repository_dir: String = repository
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+            .take(48)
+            .collect();
+        if repository.is_empty()
+            || component != self.component
+            || repository_dir != self.repository
+            || self.digest.len() != 16
+            || !self
+                .digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || !digest.starts_with(&self.digest)
+        {
+            return None;
+        }
+        Some((repository, key))
+    }
 }
 
 /// This repository's part of the host environment cache, as `gc plan` found
@@ -824,21 +888,34 @@ pub struct GcEnvironmentCacheCandidate {
 pub struct GcEnvironmentCacheInventory {
     /// `<host state>/environments/cache/builds/<repository>`.
     pub root: String,
+    /// Totals are withheld whenever the full host inventory did not complete.
+    #[serde(default)]
+    pub complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_code: Option<String>,
     /// The whole cache's budget, shared by every repository.
     pub budget_bytes: u64,
     /// Every repository's builds, which the budget is measured against.
-    pub host_total_bytes: u64,
-    pub build_entries: usize,
-    pub build_bytes: u64,
-    pub in_use_entries: usize,
-    pub in_use_bytes: u64,
-    pub reclaimable_bytes: u64,
+    pub host_total_bytes: Option<u64>,
+    pub build_entries: Option<usize>,
+    pub build_bytes: Option<u64>,
+    pub in_use_entries: Option<usize>,
+    pub in_use_bytes: Option<u64>,
+    pub reclaimable_bytes: Option<u64>,
     /// Provision templates live outside Aethyme and hold no bytes here; only
     /// `env cache prune --all` evicts them, through `template_destroy`.
-    pub template_entries: usize,
+    pub template_entries: Option<usize>,
     /// Set when nothing is proposed because live use could not be known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused: Option<String>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// An aggregate view of the protections in a GC plan.

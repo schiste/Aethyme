@@ -321,19 +321,51 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool, full_scan: bool
     }
     // The host environment build cache, this repository's part (#1275).
     if let Some(cache) = &plan.environment_cache {
-        out!(
-            "  environment cache: {} in {} {} at {}; {} in use, {} reclaimable; {} {}; budget {} for the whole cache ({} used)",
-            human_bytes(cache.build_bytes),
-            cache.build_entries,
-            crate::broker::plural_word(cache.build_entries, "build", "builds"),
-            cache.root,
-            human_bytes(cache.in_use_bytes),
-            human_bytes(cache.reclaimable_bytes),
-            cache.template_entries,
-            crate::broker::plural_word(cache.template_entries, "template", "templates"),
-            human_bytes(cache.budget_bytes),
-            human_bytes(cache.host_total_bytes),
-        );
+        if cache.complete {
+            if let (
+                Some(build_bytes),
+                Some(build_entries),
+                Some(in_use_bytes),
+                Some(reclaimable_bytes),
+                Some(template_entries),
+                Some(host_total_bytes),
+            ) = (
+                cache.build_bytes,
+                cache.build_entries,
+                cache.in_use_bytes,
+                cache.reclaimable_bytes,
+                cache.template_entries,
+                cache.host_total_bytes,
+            ) {
+                out!(
+                    "  environment cache: {} in {} {} at {}; {} in use, {} reclaimable; {} {}; budget {} for the whole cache ({} used)",
+                    human_bytes(build_bytes),
+                    build_entries,
+                    crate::broker::plural_word(build_entries, "build", "builds"),
+                    cache.root,
+                    human_bytes(in_use_bytes),
+                    human_bytes(reclaimable_bytes),
+                    template_entries,
+                    crate::broker::plural_word(template_entries, "template", "templates"),
+                    human_bytes(cache.budget_bytes),
+                    human_bytes(host_total_bytes),
+                );
+            } else {
+                out!(
+                    "  environment cache: inventory status is invalid at {}",
+                    cache.root
+                );
+            }
+        } else {
+            out!(
+                "  environment cache: incomplete inventory at {}; totals withheld (budget {})",
+                cache.root,
+                human_bytes(cache.budget_bytes),
+            );
+        }
+        if let Some(code) = &cache.refusal_code {
+            out!("    inventory refusal ({code})");
+        }
         if let Some(reason) = &cache.refused {
             out!("    nothing proposed: {reason}");
         }
@@ -974,6 +1006,41 @@ pub(super) fn run_reclaim(parsed: Parsed, action: ReclaimAction) -> Result<(), U
     Ok(())
 }
 
+#[cfg(unix)]
+fn run_shared_gc_plan(
+    parsed: &Parsed,
+    directory: &Path,
+    key: &str,
+    deadline_ms: i64,
+) -> Result<(), UsageError> {
+    crate::service::client::deadline_remaining(deadline_ms)?;
+    let client = crate::service::client::Client::connect(directory, &std::env::current_dir()?)?;
+    let (plan, json_plan) = client.gc_plan(
+        key,
+        deadline_ms,
+        parsed.include_active_gate_cache,
+        parsed.full_scan,
+    )?;
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&json_plan)?);
+    } else {
+        render_gc_plan(&plan, parsed.detail, parsed.full_scan);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn run_shared_gc_plan(
+    _parsed: &Parsed,
+    _directory: &Path,
+    _key: &str,
+    _deadline_ms: i64,
+) -> Result<(), UsageError> {
+    Err(UsageError::Message(
+        "shared planning requires Unix sockets".into(),
+    ))
+}
+
 /// `broker gc`.
 pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     let action = parsed
@@ -998,6 +1065,24 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
         return Err(UsageError::Message(
             "gc accepts one action: `plan`, `apply --confirm <sha256>`, `abandon --confirm <sha256>`, `forget-abandoned --confirm <sha256>`, `artifact-use reconcile <plan|apply> <session-id>`, or `sweep`".into(),
         ));
+    }
+    if parsed.service_directory.is_some()
+        || parsed.request_key.is_some()
+        || parsed.deadline_ms.is_some()
+    {
+        if action != "plan" || parsed.confirm.is_some() {
+            return Err(UsageError::Message(
+                "shared service options require gc plan without --confirm".into(),
+            ));
+        }
+        let (Some(directory), Some(key), Some(deadline_ms)) = (
+            parsed.service_directory.as_deref(),
+            parsed.request_key.as_deref(),
+            parsed.deadline_ms,
+        ) else {
+            return Err(UsageError::Message("shared planning requires --service-directory, --request-key and --deadline-ms together".into()));
+        };
+        return run_shared_gc_plan(&parsed, directory, key, deadline_ms);
     }
     if matches!(action, "abandon" | "forget-abandoned") && parsed.include_active_gate_cache {
         return Err(UsageError::Message(format!(
@@ -1229,17 +1314,19 @@ fn run_gc_artifact_use_reconcile(parsed: Parsed) -> Result<(), UsageError> {
         };
     let session = broker.store().session(session_id)?;
     let checkout_root = PathBuf::from(&session.worktree_path);
-    let cohort = broker
-        .closed_artifact_checkout_cohort_for_session_readonly(
-            session_id,
-            &checkout_root,
-            None,
-        )?
-        .ok_or_else(|| {
-            UsageError::Message(
-                "the selected session does not have a complete, closed checkout cohort; no markers were changed".into(),
-            )
-        })?;
+    let cohort = match broker.closed_artifact_checkout_cohort_for_session_readonly(
+        session_id,
+        &checkout_root,
+        None,
+    )? {
+        crate::auto_cleanup::ClosedArtifactCheckoutCohortResolution::Available(cohort) => cohort,
+        crate::auto_cleanup::ClosedArtifactCheckoutCohortResolution::Unavailable(reason) => {
+            return Err(UsageError::Message(format!(
+                "artifact-use reconciliation refused: {}; no markers were changed. Inspect the selected session and `aethyme broker gc plan --json` for the missing checkout proof; do not remove markers manually",
+                reason.code()
+            )));
+        }
+    };
 
     let cwd = std::env::current_dir()
         .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;

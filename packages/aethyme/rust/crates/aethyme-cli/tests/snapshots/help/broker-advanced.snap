@@ -5,6 +5,7 @@ aethyme broker advanced — the full broker surface beyond the public verbs
 Usage: aethyme broker advanced <verb> [args...]
 
 Verbs:
+  service          explicit opt-in foreground service and health requests
   leases           inspect, claim, plan, export or release path ownership
   ownership        claim, list or release a named operation such as a release
   git              run Git through the durable operation coordinator
@@ -21,6 +22,7 @@ Verbs:
   hooks            install, remove or inspect the managed git hooks
   trust            approve this repository's gate and prepare commands
   agents           list live sessions with activity-derived liveness
+  owners           name the sessions behind landed commits, with liveness
   handoff          read a finished session's persisted handoff
   queue            show the merge queue
   integration      inspect, wait on or reconcile the integration branch

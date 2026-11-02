@@ -2,6 +2,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use rusqlite::{Connection, params};
+
 use super::compile::{CompileContext, CompiledEnvironment, EnvironmentOwner, compile};
 use super::identity::{Observation, ProcessIdentity};
 use super::logs::{log_path, open_for_append, remove_environment_directory, tail};
@@ -63,6 +65,62 @@ fn store() -> (tempfile::TempDir, EnvironmentStore) {
     let directory = tempfile::tempdir().unwrap();
     let store = EnvironmentStore::open(&directory.path().join("environments.db")).unwrap();
     (directory, store)
+}
+
+#[test]
+fn cache_gc_reads_schema_v1_without_migrating_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("environments.db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO meta VALUES ('schema_version', '1');
+         CREATE TABLE environments (
+           env_id TEXT PRIMARY KEY, phase TEXT NOT NULL, spec_snapshot_json TEXT NOT NULL
+         );",
+    )
+    .unwrap();
+    let snapshot = serde_json::to_string(&snapshot("legacy-v1")).unwrap();
+    let env_id = "env-0123456789ab";
+    conn.execute(
+        "INSERT INTO environments(env_id, phase, spec_snapshot_json) VALUES (?1, ?2, ?3)",
+        params![env_id, "active", snapshot],
+    )
+    .unwrap();
+    drop(conn);
+    let before = std::fs::read(&path).unwrap();
+
+    let reader = EnvironmentStore::open_cache_gc_read_only(&path)
+        .unwrap()
+        .unwrap();
+    let records = reader.cache_gc_records(None).unwrap();
+    assert!(matches!(
+        reader.cache_gc_records(Some(std::time::Instant::now())),
+        Err(StoreError::CacheGcDeadline)
+    ));
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].env_id, env_id);
+    assert_eq!(records[0].phase, EnvironmentPhase::Active);
+    assert_eq!(records[0].snapshot.repository, "repo-0123456789abcdef");
+    drop(reader);
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let check =
+        Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let version: String = check
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, "1");
+    let has_main_root: bool = check
+        .prepare("SELECT 1 FROM pragma_table_info('environments') WHERE name='main_root'")
+        .unwrap()
+        .exists([])
+        .unwrap();
+    assert!(!has_main_root);
 }
 
 #[test]

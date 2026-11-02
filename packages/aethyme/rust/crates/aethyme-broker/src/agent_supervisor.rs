@@ -1164,12 +1164,22 @@ mod tests {
         let before = std::fs::metadata(repo.join("background-writes"))
             .unwrap()
             .len();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        assert!(
-            std::fs::metadata(repo.join("background-writes"))
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let writer_progressed = loop {
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            if std::fs::metadata(repo.join("background-writes"))
                 .unwrap()
                 .len()
-                > before,
+                > before
+            {
+                break std::time::Instant::now() < deadline;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(
+            writer_progressed,
             "test must exercise a writer after supervisor exit"
         );
         std::fs::remove_file(&hold).unwrap();

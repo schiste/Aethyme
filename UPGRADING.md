@@ -16,12 +16,28 @@ version and the target, oldest first. Each schema migration runs on first open
 and is one-way, so rollback is limited to the oldest binary that still reads
 the newest schema you have opened.
 
-Breaking releases: [v0.8.48](#v0848), [v0.8.47](#v0847), [v0.8.44](#v0844), [v0.8.43](#v0843), [v0.8.42](#v0842), [v0.8.41](#v0841), [v0.8.40](#v0840), [v0.8.38](#v0838), [v0.8.37](#v0837), [v0.8.33](#v0833), [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
+Breaking releases: [v0.8.53](#v0853), [v0.8.48](#v0848), [v0.8.47](#v0847), [v0.8.44](#v0844), [v0.8.43](#v0843), [v0.8.42](#v0842), [v0.8.41](#v0841), [v0.8.40](#v0840), [v0.8.38](#v0838), [v0.8.37](#v0837), [v0.8.33](#v0833), [v0.8.31](#v0831), [v0.8.29](#v0829), [v0.8.28](#v0828), [v0.8.27](#v0827), [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
 [v0.7.25](#v0725), [v0.7.23](#v0723), [v0.7.22](#v0722), [v0.7.19](#v0719),
 [v0.7.18](#v0718), [v0.7.16](#v0716), [v0.7.9](#v079), [v0.7.8](#v078),
 [v0.7.4](#v074), [v0.7.2](#v072),
 [v0.7.1](#v071), [v0.5.0](#v050), [v0.3.0](#v030),
 [v0.2.2](#v022), [v0.2.0](#v020).
+
+## v0.8.53
+
+### Compatibility
+
+The repository broker database advances to schema 60 with compatibility floor 60 for the per-session operation lock and renewable task-lease protocol. Older released brokers cannot open the upgraded store. An already-open older process is not revoked by this floor.
+
+### Migrate and verify
+
+Back up each affected broker database consistently before the new runtime's first normal open. Install the matching router and engine pair, drain older broker clients, and verify both executable identities before restoring automatic maintenance. Preserve repository policies, pending cleanup journals and recovery archives; do not infer deletion authority from an old plan after an upgrade.
+
+The default closed-checkout grace is five days; explicit local retention overrides remain effective. Automatic task-lease expiry, sparse checkouts, shared package-download caches and the repository service require explicit opt-in. The service is not started by installation. Its job history has no bounded-retention policy yet; keep it disabled where unbounded history is unacceptable. Environment build-cache reclamation remains outside the managed-storage ledger.
+
+### Rollback
+
+Do not run older brokers against a schema-60 store or lower its schema markers. Preserve the verified pre-upgrade backup, but never restore it over activity recorded after migration. A rollback requires an explicit recovery decision and a compatible runtime; replacing only one member of the router/engine pair is unsupported.
 
 ## v0.8.48
 

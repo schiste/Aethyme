@@ -1,6 +1,11 @@
 exit: 0
 --- stdout
   aethyme broker gc plan [--include-active-gate-cache] [--full-scan] [--json]
+  aethyme broker gc plan --service-directory <directory> --request-key <key> --deadline-ms <utc-ms> [--include-active-gate-cache] [--full-scan] [--json]
+      The explicit service form verifies this repository's owner, submits or
+      joins durable planning and prints the same plan. All three service
+      options are required together. No service startup or local fallback;
+      retain the key and exact future deadline (at most 30 minutes) for retry.
       Report exact retention-eligible rows, runtime files, represented
       worktrees/refs, finished sessions' build caches, this repository's gate
       cache, estimated bytes, blockers, and (when complete) a stable plan digest. The newest

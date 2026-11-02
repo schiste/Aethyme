@@ -79,6 +79,10 @@ pub fn public_forms() -> impl Iterator<Item = (&'static str, &'static str)> {
 /// summary `broker advanced --help` prints.
 pub const ADVANCED_VERBS: &[(&str, &str)] = &[
     (
+        "service",
+        "explicit opt-in foreground service and health requests",
+    ),
+    (
         "leases",
         "inspect, claim, plan, export or release path ownership",
     ),
@@ -123,6 +127,10 @@ pub const ADVANCED_VERBS: &[(&str, &str)] = &[
     (
         "agents",
         "list live sessions with activity-derived liveness",
+    ),
+    (
+        "owners",
+        "name the sessions behind landed commits, with liveness",
     ),
     ("handoff", "read a finished session's persisted handoff"),
     ("queue", "show the merge queue"),
@@ -475,6 +483,9 @@ fn public_verb_help(verb: &str) -> String {
 }
 
 fn internal_help(verb: &str, action: Option<&str>) -> Option<String> {
+    if verb == "service" {
+        return Some(super::service::SERVICE_USAGE.into());
+    }
     if verb == "init" || verb == "certify" {
         return Some(blocks_with_prefix(
             &format!("  aethyme {verb}"),

@@ -66,15 +66,14 @@ tar = { workspace = true }
 # Release availability and downgrade decisions use semantic versions rather
 # than string ordering.
 semver = { workspace = true }
-# The cross-process contract inventory is scanned as one literal multi-pattern
-# set so each changed line is searched once.
-regex = { workspace = true }
 
 # `tests/gate_policy.rs` asserts over the live `.aethyme/gates.toml`, so it
 # needs the monorepo root rather than this crate's. `repo_root()` discovers
 # it from the process cwd, which stays correct when a gate reuses a test
 # binary compiled in a different merge worktree.
 [dev-dependencies]
+# Independent boundary oracle for the literal contract scanner.
+regex = { workspace = true }
 aethyme-testkit = { path = "../aethyme-testkit" }
 # Seeds tempfile's generator in a test to reproduce the #430 name collision.
 fastrand = { workspace = true }

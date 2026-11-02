@@ -486,6 +486,8 @@ pub enum BrokerOpError {
     InvalidAdvisory { reason: String },
     #[error("invalid broker note: {reason}")]
     InvalidSessionNote { reason: String },
+    #[error("invalid owners request: {reason}")]
+    InvalidOwnersRequest { reason: String },
     #[error(
         "session {session_id} cannot acknowledge note {note_id}, which belongs to session {recipient_session_id}"
     )]
@@ -3545,7 +3547,9 @@ mod cleanup;
 mod finish;
 mod gates;
 mod leases;
+mod owners;
 pub(crate) use leases::{AbandonedSessionCloseOutcome, validate_session_commit_args};
+pub use owners::{CommitOwner, MAX_OWNER_COMMITS, OwnedCommit, OwnersReport};
 pub(crate) mod lifecycle;
 mod scope_capture;
 mod status;

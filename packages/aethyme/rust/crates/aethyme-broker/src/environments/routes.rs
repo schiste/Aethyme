@@ -59,7 +59,7 @@ pub struct Route {
     /// Directory served for a `static` component.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub static_dir: Option<PathBuf>,
-    /// Serve `index.html` for extensionless paths that are not files (#1291).
+    /// Serve `index.html` for missing extensionless paths (#1291).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub spa_fallback: bool,
     /// Health timeout: how long a request may be held while this wakes.
