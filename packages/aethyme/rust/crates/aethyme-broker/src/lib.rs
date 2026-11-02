@@ -178,6 +178,7 @@ pub use pr_monitoring::{
 #[cfg(any(target_os = "macos", all(test, unix)))]
 mod gc_sweep_service;
 mod outcome_issues;
+mod outcome_report;
 mod pr_projection;
 mod pr_watch;
 #[cfg(unix)]
@@ -452,8 +453,15 @@ pub use operations::{
 };
 pub use outcome_issues::{
     AUTOMATION_ISSUES_POLICY_KEY, AutomationIssuesPolicy, IssueRef, OUTCOME_ISSUE_SCHEMA,
-    OutcomeIssueAction, OutcomeIssueError, OutcomeIssueGh, OutcomeIssueRequest, OutcomeIssueResult,
-    SystemGh, outcome_marker, upsert_outcome_issue, upsert_outcome_issue_for_repository,
+    OutcomeIssueAction, OutcomeIssueError, OutcomeIssueGh, OutcomeIssueRefusal,
+    OutcomeIssueRequest, OutcomeIssueResult, OutcomeRule, SystemGh, outcome_marker,
+    recent_outcome_issue_refusals, upsert_outcome_issue, upsert_outcome_issue_for_repository,
+    valid_outcome_source,
+};
+pub use outcome_report::{
+    OUTCOME_REPORT_SCHEMA, OutcomeActionRecord, OutcomeIssueSink, OutcomeReport,
+    OutcomeReportError, OutcomeReportRequest, RepositoryIssueSink, outcome_fingerprint,
+    outcome_note_sender, report_outcome,
 };
 pub use overlap_pairs::{
     BUDGET_EXHAUSTED_REASON, OverlapPair, OverlapSeverity, overlap_state_reads,

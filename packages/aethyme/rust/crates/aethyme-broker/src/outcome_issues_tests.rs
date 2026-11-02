@@ -84,6 +84,7 @@ fn allow() -> AutomationIssuesPolicy {
         labels: vec!["ci:local".into()],
         per_day: 10,
         comment_interval_minutes: 60,
+        outcomes: Vec::new(),
     }
 }
 
@@ -387,4 +388,76 @@ fn utc_days_and_issue_urls_parse() {
         Some((42, "https://github.com/o/n/issues/42".into()))
     );
     assert_eq!(issue_number_from_url("nothing"), None);
+}
+
+/// `doctor` reads refusals back from the journal; none is kept before the
+/// first upsert.
+#[test]
+fn recent_refusals_are_read_back_for_doctor() {
+    let main = tempfile::tempdir().unwrap();
+    assert!(
+        recent_outcome_issue_refusals(main.path())
+            .unwrap()
+            .is_empty()
+    );
+    let run_dir = main.path().join(".aethyme").join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let mut gh = FakeGh::default();
+    upsert_outcome_issue(
+        &run_dir,
+        &AutomationIssuesPolicy::default(),
+        &mut gh,
+        &failing("outcome:prebuild:db"),
+        T0,
+    )
+    .unwrap();
+    let refusals = recent_outcome_issue_refusals(main.path()).unwrap();
+    assert_eq!(refusals.len(), 1);
+    assert_eq!(refusals[0].fingerprint, "outcome:prebuild:db");
+    assert_eq!(refusals[0].code, "automation_issues_denied");
+}
+
+/// `[[automation.outcomes]]` rules: defaults, and every malformed rule is an
+/// error rather than a silently ignored hook.
+#[test]
+fn outcome_rules_parse_with_defaults_and_refuse_malformed_rules() {
+    let policy = AutomationIssuesPolicy::from_config_text(
+        "[automation]\nissues = \"allow\"\n\n[[automation.outcomes]]\nsource = \"prebuild:db-template\"\nnotify_owners = true\npaths = [\"**/migrations/**\"]\nlabels = [\"migrations\"]\n\n[[automation.outcomes]]\nsource = \"gate:unit\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        policy.outcomes,
+        vec![
+            OutcomeRule {
+                source: "prebuild:db-template".into(),
+                issue: true,
+                labels: vec!["migrations".into()],
+                notify_owners: true,
+                paths: vec!["**/migrations/**".into()],
+            },
+            OutcomeRule {
+                source: "gate:unit".into(),
+                issue: true,
+                labels: Vec::new(),
+                notify_owners: false,
+                paths: Vec::new(),
+            },
+        ]
+    );
+    for bad in [
+        "[[automation.outcomes]]\nsource = \"Prebuild:x\"\n",
+        "[[automation.outcomes]]\nsource = \"prebuild\"\n",
+        &format!(
+            "[[automation.outcomes]]\nsource = \"a:{}\"\n",
+            "x".repeat(63)
+        ),
+        "[[automation.outcomes]]\nsource = \"a:b\"\n[[automation.outcomes]]\nsource = \"a:b\"\n",
+        "[[automation.outcomes]]\nsource = \"a:b\"\npaths = [\"/etc/**\"]\n",
+        "[[automation.outcomes]]\nsource = \"a:b\"\nnotify = true\n",
+    ] {
+        assert!(
+            AutomationIssuesPolicy::from_config_text(bad).is_err(),
+            "{bad}"
+        );
+    }
 }
