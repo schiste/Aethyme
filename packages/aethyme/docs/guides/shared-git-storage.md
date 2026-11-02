@@ -34,7 +34,7 @@ may leave substantial loose-object debt because Git bounds its batch. Do not
 start a concurrent standalone `git gc`; it uses different Git maintenance locks.
 Do not blindly retry an operation with unknown outcome; reconcile its receipt.
 
-Other maintenance profiles, repacking, pruning and destructive rerere actions
+Other maintenance profiles, `git gc`, repacking, pruning and destructive rerere actions
 are classified as destructive and require explicit authority. They are not an
 automatic continuation of loose-object maintenance.
 

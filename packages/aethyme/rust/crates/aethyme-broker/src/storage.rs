@@ -5940,8 +5940,14 @@ mod tests {
             vec!["config", "user.email", "fixture@example.invalid"],
             vec!["commit", "--allow-empty", "-qm", "fixture"],
         ] {
+            let mut command = std::process::Command::new("git");
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("GIT_") {
+                    command.env_remove(key);
+                }
+            }
             assert!(
-                std::process::Command::new("git")
+                command
                     .args(args)
                     .current_dir(root)
                     .status()

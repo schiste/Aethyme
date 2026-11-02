@@ -2963,7 +2963,7 @@ pub fn classify_git(args: &[String]) -> Option<OperationEffect> {
         {
             Some(OperationEffect::Write)
         }
-        "maintenance" | "prune" | "repack" => Some(OperationEffect::Destructive),
+        "maintenance" | "gc" | "prune" | "repack" => Some(OperationEffect::Destructive),
         "rerere"
             if args
                 .get(1)
@@ -2973,7 +2973,7 @@ pub fn classify_git(args: &[String]) -> Option<OperationEffect> {
         }
         "reflog" if has_any(args, &["delete", "expire"]) => Some(OperationEffect::Destructive),
         "add" | "am" | "apply" | "checkout" | "cherry-pick" | "clone" | "commit" | "fetch"
-        | "gc" | "init" | "merge" | "mv" | "notes" | "pull" | "rebase" | "replace" | "restore"
+        | "init" | "merge" | "mv" | "notes" | "pull" | "rebase" | "replace" | "restore"
         | "revert" | "rm" | "stash" | "submodule" | "switch" | "worktree" | "reset" | "clean"
         | "reflog" => Some(OperationEffect::Write),
         _ => None,
@@ -3415,7 +3415,13 @@ mod git_storage_maintenance_tests {
     fn loose_object_maintenance_preserves_unreachable_objects_and_pending_work() {
         let temporary = tempfile::tempdir().unwrap();
         let run = |args: &[&str]| {
-            let output = std::process::Command::new("git")
+            let mut command = std::process::Command::new("git");
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("GIT_") {
+                    command.env_remove(key);
+                }
+            }
+            let output = command
                 .current_dir(temporary.path())
                 .args(args)
                 .output()
@@ -3469,6 +3475,7 @@ mod git_storage_maintenance_tests {
             vec!["maintenance", "run", "--task=gc"],
             vec!["maintenance", "run", "--task=loose-objects", "--task=gc"],
             vec!["maintenance", "start"],
+            vec!["gc", "--prune=now"],
             vec!["prune", "--expire=now"],
             vec!["repack", "-ad"],
             vec!["rerere", "gc"],
