@@ -53,12 +53,12 @@ aethyme broker gc storage maintenance-lock apply --confirm REVIEWED_SHA256 --jso
 This command targets only the exact `objects/maintenance.lock` in the invoking
 repository's canonical shared Git directory. It never recurses through Git data.
 A plan is eligible only for an empty, regular, single-link file owned by the
-current user whose available timestamps all predate the current OS boot by at
-least 60 seconds. Age alone, an unavailable boot time, or uncertain file identity
+current user whose available timestamps all predate the current OS boot by strictly more
+than 60 seconds. Age alone, an unavailable boot time, or uncertain file identity
 cannot authorize recovery. Repository-routing overrides are refused.
 
 Apply revalidates the digest-bound repository, directories, file and boot proof
-under the broker's repository-wide write lane. Pending or outcome-unknown Git
+under the broker's repository-wide write lane. Running or outcome-unknown Git
 writes block recovery across every remote key. A durable intent precedes unlink;
 anchored directory operations recheck file identity, and a durable receipt follows
 directory synchronization. Branches, objects, index, source and saved resolutions
