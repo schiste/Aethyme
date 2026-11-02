@@ -2294,6 +2294,7 @@ pub(crate) fn preparation_cache_lease_name(repository: &str) -> String {
 ///
 /// `session_id` reaches the digest only through error messages, so any value
 /// produces the same key; zero is passed because no session is asking.
+#[cfg(test)]
 pub(crate) fn current_cache_key(root: &Path) -> Result<Option<String>, PreparationError> {
     current_cache_key_before(root, None)
 }
