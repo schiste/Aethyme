@@ -392,6 +392,15 @@ blocked.
    session's unmerged branch.
    Without the policy, pushing stays a separately authorized action (step 9).
 
+   A repository cleanup report must account for the primary checkout as well
+   as session worktrees. Resolve the shared Git directory and report objects,
+   conflict-resolution cache, worktree administration and recovery history
+   separately from dependencies and local broker state/logs. Removing closed
+   checkouts does not compact or expire shared Git data. Keep unmeasured sizes
+   unknown, use bounded scans, distinguish logical bytes from unique physical
+   allocation, and state which categories were retained or refused. Never
+   describe an empty checkout-deletion plan as a fully reclaimed repository.
+
    Before exact-target maintenance, account for automatic cleanup that may
    run during native startup; prefer a scoped native open when supported. If
    temporary holds are needed, preserve the existing strict/disposable policy
