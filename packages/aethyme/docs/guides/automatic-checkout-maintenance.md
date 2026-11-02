@@ -91,6 +91,19 @@ defer the attempt. Adopted and legacy rows without an original ownership
 witness require an explicit reviewed retirement plan; the broker does not
 invent a witness for an existing directory.
 
+On macOS, new spawn witnesses record stable volume UUIDs alongside paths,
+inodes and the original root-generation token. A remount may change a device
+number without changing the filesystem object; matching saved UUIDs and inodes
+permit that case in cohort checks and automatic checkout maintenance. A different
+volume, inode, path or generation still refuses. If a stable UUID cannot be
+captured, the new witness keeps the schema-2 exact-device behavior. Interrupted
+finish-cleanup recovery proofs also retain their exact device checks.
+Older witnesses have no saved volume UUID and keep their exact device checks.
+They cannot be upgraded from a current observation: use a separately reviewed
+archive resolution for an old checkout whose device identity changed. Older
+runtimes refuse schema-3 witnesses; use the new paired runtime for maintenance
+of repositories containing them.
+
 This opt-in can compact a checkout during its ordinary five-day grace period.
 Every retirement archive records a minimum retention floor of at least 15 days
 and at least the configured `closed_worktree_grace_hours`, measured from the

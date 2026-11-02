@@ -824,7 +824,10 @@ impl ClosedArtifactCheckoutCohort {
                 .find(|session| session.id == self.owner_session_id)
                 .and_then(|session| session.spawned_instance_witness.as_ref())
                 .is_some_and(|expected| {
-                    checkout.spawned_worktree_instance_witness().as_ref() == Some(expected)
+                    checkout
+                        .spawned_worktree_instance_witness()
+                        .as_ref()
+                        .is_some_and(|current| expected.matches_current_instance(current))
                 })
     }
 }
@@ -862,23 +865,16 @@ fn proves_removed_historical_instance(
             .cleanup_completed_at
             .is_some_and(|at| at >= alias.created_at && at <= handoff.recorded_at)
         && handoff.recorded_at < owner.created_at
-        && old.schema_version == 2
-        && current.schema_version == 2
+        && old.is_supported()
+        && current.is_supported()
         && old.worktree_path == current.worktree_path
         && old.worktree_path == alias.worktree_path
         && current.worktree_path == owner.worktree_path
-        && old.git_common_path == current.git_common_path
-        && old.git_common_device == current.git_common_device
-        && old.git_common_inode == current.git_common_inode
+        && old.same_git_common(current)
         && valid_generation(&old.root_generation_sha256)
         && valid_generation(&current.root_generation_sha256)
         && old.root_generation_sha256 != current.root_generation_sha256
-        && ((old.worktree_device, old.worktree_inode)
-            != (current.worktree_device, current.worktree_inode)
-            || (old.git_pointer_device, old.git_pointer_inode)
-                != (current.git_pointer_device, current.git_pointer_inode)
-            || (old.git_admin_device, old.git_admin_inode)
-                != (current.git_admin_device, current.git_admin_inode))
+        && !old.same_checkout_objects(current)
 }
 
 struct AutoCleanupGroupScan {
@@ -1861,7 +1857,9 @@ impl Broker {
             if session.origin == SessionOrigin::Spawned
                 && !spawned_instance_witness.as_ref().is_some_and(|witness| {
                     witness.worktree_path == canonical_path
-                        && current_witness.as_ref() == Some(witness)
+                        && current_witness
+                            .as_ref()
+                            .is_some_and(|current| witness.matches_current_instance(current))
                 })
             {
                 return Ok(unavailable(Reason::SpawnedWitnessMismatch));
@@ -2199,10 +2197,11 @@ impl Broker {
             {
                 continue;
             }
-            if current_witness
-                .as_ref()
-                .is_some_and(|current| witness.as_ref().is_some_and(|witness| witness == current))
-            {
+            if current_witness.as_ref().is_some_and(|current| {
+                witness
+                    .as_ref()
+                    .is_some_and(|witness| witness.matches_current_instance(current))
+            }) {
                 matched_owner = Some((session.clone(), witness));
                 break;
             }
@@ -2381,7 +2380,11 @@ impl Broker {
             .map_err(|error| keep(format!("worktree could not be re-opened: {error}")))?;
         let current_witness = checkout.spawned_worktree_instance_witness();
         match candidate.spawned_instance_witness.as_ref() {
-            Some(expected) if current_witness.as_ref() != Some(expected) => {
+            Some(expected)
+                if !current_witness
+                    .as_ref()
+                    .is_some_and(|current| expected.matches_current_instance(current)) =>
+            {
                 return Err(keep(
                     "worktree instance no longer matches its spawn record".into(),
                 ));
@@ -4219,9 +4222,13 @@ mod tests {
         bad.worktree_inode = fresh.worktree_inode;
         rejects(&alias, &current, &bad, &fresh, &handoff);
         bad.worktree_device = fresh.worktree_device + 1;
+        if bad.volume_uuids.is_some() {
+            rejects(&alias, &current, &bad, &fresh, &handoff);
+            bad.worktree_inode = fresh.worktree_inode + 1;
+        }
         assert!(
             proves_removed_historical_instance(&alias, &current, &bad, &fresh, &handoff),
-            "a device change is part of the instance identity even if inode numbers are reused"
+            "a different object is required; a saved UUID makes mount-number drift insufficient"
         );
     }
 
@@ -4358,6 +4365,127 @@ mod tests {
             .unwrap();
         assert_eq!(still_retained.session_ids(), vec![second.id]);
         assert!(still_retained.owner_witness().is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn closed_cohort_accepts_remounted_git_volume_with_spawn_time_uuid() {
+        let (_owner, _storage, mut broker, session) = retirement_fixture();
+        broker
+            .close_abandoning_unpushed(session.id, "remount fixture")
+            .unwrap();
+        let mut saved = broker
+            .store()
+            .spawned_worktree_instance_witness(session.id)
+            .unwrap()
+            .expect("macOS spawn captures a volume witness");
+        assert_eq!(saved.schema_version, 3);
+        saved.git_admin_device += 1;
+        saved.git_common_device += 1;
+        let connection = rusqlite::Connection::open(broker.store().db_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE spawned_worktree_instances SET witness_json = ?2 WHERE session_id = ?1",
+                rusqlite::params![session.id, serde_json::to_string(&saved).unwrap()],
+            )
+            .unwrap();
+        while !broker
+            .refresh_cleanup_cohort_aliases(None)
+            .unwrap()
+            .unwrap()
+            .complete
+        {}
+        let path = PathBuf::from(&session.worktree_path);
+        let cohort = broker
+            .closed_artifact_checkout_cohort_for_session(session.id, &path, None)
+            .unwrap()
+            .expect("stable saved UUID permits a changed mount device number");
+        assert_eq!(cohort.owner_session_id(), session.id);
+        let checkout = GitRepo::discover(&path).unwrap();
+        assert!(
+            cohort.matches_checkout_instance(&checkout),
+            "final mutation guard accepts the same stable instance"
+        );
+
+        std::fs::write(
+            broker.main_root().join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktree_grace_hours = 0\n",
+        )
+        .unwrap();
+        let closed = broker.store().session(session.id).unwrap();
+        let group = AutoCleanupCheckoutGroup {
+            worktree: path.clone(),
+            sessions: vec![closed],
+            complete: true,
+            cursor_session_id: session.id,
+        };
+        let candidate = match broker
+            .auto_cleanup_candidate_for_group(&group, &[], &[], None)
+            .unwrap()
+        {
+            AutoCleanupGroupInspection::Candidate(candidate) => candidate,
+            _ => panic!("same stable instance must remain a cleanup candidate"),
+        };
+        assert!(
+            candidate
+                .spawned_instance_witness
+                .as_ref()
+                .unwrap()
+                .matches_current_instance(&checkout.spawned_worktree_instance_witness().unwrap())
+        );
+        let head = checkout.head_commit().unwrap();
+        let upstream = ("main".into(), head.clone());
+        let proof = ContainmentProof {
+            head: head.clone(),
+            containing_commit: head,
+            proof: "fixture unchanged HEAD".into(),
+        };
+        let mut lease_process_table = LeaseProcessTableSnapshot::default();
+        let verdict = broker.auto_cleanup_verdict(
+            &candidate,
+            &AutoCleanupPolicy::default(),
+            &upstream,
+            AutoCleanupVerdictOptions {
+                deep: false,
+                deadline: None,
+                selected: Some(&proof),
+                lease_process_table: &mut lease_process_table,
+            },
+        );
+        assert!(
+            verdict.is_ok(),
+            "final ownership proof must accept remount: {verdict:?}"
+        );
+
+        saved.volume_uuids.as_mut().unwrap().git_common = [0x7f; 16];
+        connection
+            .execute(
+                "UPDATE spawned_worktree_instances SET witness_json = ?2 WHERE session_id = ?1",
+                rusqlite::params![session.id, serde_json::to_string(&saved).unwrap()],
+            )
+            .unwrap();
+        assert!(
+            broker
+                .closed_artifact_checkout_cohort_for_session(session.id, &path, None)
+                .unwrap()
+                .is_none(),
+            "another volume must remain protected"
+        );
+        saved.schema_version = 2;
+        saved.volume_uuids = None;
+        connection
+            .execute(
+                "UPDATE spawned_worktree_instances SET witness_json = ?2 WHERE session_id = ?1",
+                rusqlite::params![session.id, serde_json::to_string(&saved).unwrap()],
+            )
+            .unwrap();
+        assert!(
+            broker
+                .closed_artifact_checkout_cohort_for_session(session.id, &path, None)
+                .unwrap()
+                .is_none(),
+            "legacy device drift cannot be upgraded from current observations"
+        );
     }
 
     #[cfg(unix)]
