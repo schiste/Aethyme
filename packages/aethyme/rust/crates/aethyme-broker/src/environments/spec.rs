@@ -69,14 +69,17 @@ pub struct BudgetsSpec {
 }
 
 /// `[budgets.outcomes]`: a metric over budget (or failing too often) for
-/// `windows` consecutive evaluation windows opens one issue through the
-/// #1238 issue upsert; back to `ok`, the issue is resolved. A window is an
+/// `windows` consecutive evaluation windows is reported through the default
+/// branch's `[[automation.outcomes]] source = "budget:environments"` rule
+/// when one is declared, or opens one issue through the #1238 issue upsert
+/// when `issue = true`; back to `ok`, the issue is resolved. A window is an
 /// evaluation that saw new runs of that metric.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetOutcomesSpec {
-    /// Open and resolve issues. Off by default: the repository's
-    /// `automation_issues` policy must also allow it.
+    /// Open and resolve issues directly when no `budget:environments`
+    /// outcome rule is declared. Off by default: the repository's
+    /// `[automation]` policy must also allow it.
     #[serde(default)]
     pub issue: bool,
     #[serde(default = "default_outcome_windows")]
@@ -84,6 +87,7 @@ pub struct BudgetOutcomesSpec {
     /// Also a breach: more than this share of a window's runs failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_rate_pct: Option<u32>,
+    /// Labels for the direct issue; a declared rule uses its own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
 }
