@@ -15,7 +15,7 @@ fn task_lease_classification_uses_normalized_actions_and_preserves_polling() {
     }
 
     use super::TaskLeaseCommandClass::{
-        ClosedSessionAdministration, GuardedWork, ObservationOnly, OtherWork,
+        ClosedSessionAdministration, GuardedWork, NoSessionWork, ObservationOnly, OtherWork,
     };
 
     assert_eq!(
@@ -38,6 +38,31 @@ fn task_lease_classification_uses_normalized_actions_and_preserves_polling() {
     assert_eq!(
         classify(&["advanced", "note", "list", "--session", "17"]),
         ObservationOnly
+    );
+    assert_eq!(
+        classify(&[
+            "advanced",
+            "note",
+            "send",
+            "--session",
+            "17",
+            "--to-session",
+            "18"
+        ]),
+        GuardedWork
+    );
+    assert_eq!(
+        classify(&[
+            "advanced",
+            "note",
+            "send",
+            "--from",
+            "automation:prebuild",
+            "--to-session",
+            "18"
+        ]),
+        NoSessionWork,
+        "an automation note writes for the automation, not for the cwd session"
     );
     assert_eq!(
         classify(&["advanced", "ownership", "list"]),
@@ -97,6 +122,10 @@ fn task_lease_classification_uses_normalized_actions_and_preserves_polling() {
         ObservationOnly
     );
     assert_eq!(classify(&["advanced", "worktrees"]), ObservationOnly);
+    assert_eq!(
+        classify(&["advanced", "owners", "--commits", "a..b"]),
+        ObservationOnly
+    );
     assert_eq!(classify(&["advanced", "queue"]), ObservationOnly);
     assert_eq!(classify(&["advanced", "queue", "history"]), ObservationOnly);
     assert_eq!(classify(&["advanced", "report", "list"]), ObservationOnly);

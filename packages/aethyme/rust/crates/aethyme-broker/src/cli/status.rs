@@ -828,6 +828,24 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
             );
             out!("  run: aethyme env budgets");
         }
+        if let Some(latest) = report.automation_issue_refusals.last() {
+            out!(
+                "automation issues refused: {} kept, latest {} for {} ({})",
+                report.automation_issue_refusals.len(),
+                latest.code,
+                latest.fingerprint,
+                latest.repository
+            );
+            if report
+                .automation_issue_refusals
+                .iter()
+                .any(|refusal| refusal.code == "automation_issues_denied")
+            {
+                out!(
+                    "  outcomes stay local while [automation] issues is not \"allow\" on the default branch"
+                );
+            }
+        }
         if let Some(leftover) = &report.leftover_integration_work {
             out!(
                 "integration leftover work: {} [{}]",

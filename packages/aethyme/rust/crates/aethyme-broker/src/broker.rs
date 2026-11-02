@@ -1475,6 +1475,12 @@ pub struct DoctorReport {
     /// environment is a trend to act on, not a broken broker.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub environment_budgets_over: Vec<crate::environments::budgets::MetricReport>,
+    /// Automation issue writes the repository policy refused, as the local
+    /// journal keeps them (#1238): with `[automation] issues = "deny"` an
+    /// outcome reaches GitHub nowhere, so this is where it is seen. Reported,
+    /// never counted against [`Self::healthy`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub automation_issue_refusals: Vec<crate::OutcomeIssueRefusal>,
     /// Milliseconds each doctor phase took (#460).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub phase_timings_ms: std::collections::BTreeMap<String, u64>,
