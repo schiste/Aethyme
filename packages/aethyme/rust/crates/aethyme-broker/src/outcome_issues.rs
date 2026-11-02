@@ -71,6 +71,8 @@ pub struct AutomationIssuesPolicy {
     pub labels: Vec<String>,
     pub per_day: u32,
     pub comment_interval_minutes: u64,
+    /// `[[automation.outcomes]]` rules (#1238).
+    pub outcomes: Vec<OutcomeRule>,
 }
 
 impl Default for AutomationIssuesPolicy {
@@ -80,6 +82,7 @@ impl Default for AutomationIssuesPolicy {
             labels: Vec::new(),
             per_day: DEFAULT_ISSUES_PER_DAY,
             comment_interval_minutes: DEFAULT_COMMENT_INTERVAL_MINUTES,
+            outcomes: Vec::new(),
         }
     }
 }
@@ -92,6 +95,88 @@ struct AutomationTable {
     issue_labels: Vec<String>,
     issues_per_day: Option<u32>,
     issue_comment_interval_minutes: Option<u64>,
+    #[serde(default)]
+    outcomes: Vec<OutcomeRuleTable>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutcomeRuleTable {
+    source: String,
+    issue: Option<bool>,
+    #[serde(default)]
+    labels: Vec<String>,
+    notify_owners: Option<bool>,
+    #[serde(default)]
+    paths: Vec<String>,
+}
+
+/// One `[[automation.outcomes]]` rule (#1238): what an automation's failure
+/// and recovery set in motion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutcomeRule {
+    /// `<kind>:<name>`, for example `prebuild:db-template`.
+    pub source: String,
+    /// Keep one issue for the outcome (default `true`).
+    pub issue: bool,
+    pub labels: Vec<String>,
+    /// Send a note to the live sessions behind the reported commits
+    /// (default `false`).
+    pub notify_owners: bool,
+    /// Narrow the owners to commits touching these globs.
+    pub paths: Vec<String>,
+}
+
+/// `<kind>:<name>`, at most 64 characters, each part lowercase ASCII
+/// letters, digits, `.`, `_` or `-`. The bound keeps the note sender
+/// `automation:<kind>.<name>` within its own limit.
+pub fn valid_outcome_source(source: &str) -> bool {
+    let part = |text: &str| {
+        (1..=64).contains(&text.len())
+            && text.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')
+            })
+    };
+    source.len() <= 64
+        && source
+            .split_once(':')
+            .is_some_and(|(kind, name)| part(kind) && part(name))
+}
+
+fn outcome_rules(tables: Vec<OutcomeRuleTable>) -> Result<Vec<OutcomeRule>, String> {
+    let mut rules: Vec<OutcomeRule> = Vec::with_capacity(tables.len());
+    for table in tables {
+        if !valid_outcome_source(&table.source) {
+            return Err(format!(
+                "[[automation.outcomes]] source = {:?} is invalid; expected <kind>:<name> in lowercase letters, digits, '.', '_' or '-'",
+                table.source
+            ));
+        }
+        if rules.iter().any(|rule| rule.source == table.source) {
+            return Err(format!(
+                "[[automation.outcomes]] source = {:?} is declared twice",
+                table.source
+            ));
+        }
+        if let Some(path) = table
+            .paths
+            .iter()
+            .find(|path| path.trim().is_empty() || path.starts_with('/'))
+        {
+            return Err(format!(
+                "[[automation.outcomes]] {}: path {path:?} must be a non-empty repository-relative glob",
+                table.source
+            ));
+        }
+        rules.push(OutcomeRule {
+            source: table.source,
+            issue: table.issue.unwrap_or(true),
+            labels: table.labels,
+            notify_owners: table.notify_owners.unwrap_or(false),
+            paths: table.paths,
+        });
+    }
+    Ok(rules)
 }
 
 impl AutomationIssuesPolicy {
@@ -124,6 +209,7 @@ impl AutomationIssuesPolicy {
             comment_interval_minutes: table
                 .issue_comment_interval_minutes
                 .unwrap_or(DEFAULT_COMMENT_INTERVAL_MINUTES),
+            outcomes: outcome_rules(table.outcomes)?,
         })
     }
 
@@ -988,6 +1074,38 @@ impl OutcomeIssueGh for SystemGh<'_> {
         )
         .map(|(_, operation)| operation)
     }
+}
+
+/// A refusal kept in the local journal, newest last.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutcomeIssueRefusal {
+    pub at_ms: i64,
+    pub repository: String,
+    pub fingerprint: String,
+    pub code: String,
+}
+
+/// The refusals the journal under `main_root/.aethyme/run` still keeps (the
+/// most recent [`REFUSALS_KEPT`]), for `doctor`. A missing journal is none.
+pub fn recent_outcome_issue_refusals(
+    main_root: &Path,
+) -> Result<Vec<OutcomeIssueRefusal>, OutcomeIssueError> {
+    let run_dir = main_root.join(".aethyme").join("run");
+    if !run_dir.join(STATE_FILE).exists() {
+        return Ok(Vec::new());
+    }
+    let journal = Journal::load(&run_dir)?;
+    Ok(journal
+        .state
+        .refusals
+        .into_iter()
+        .map(|refusal| OutcomeIssueRefusal {
+            at_ms: refusal.at_ms,
+            repository: refusal.repository,
+            fingerprint: refusal.fingerprint,
+            code: refusal.code,
+        })
+        .collect())
 }
 
 /// [`upsert_outcome_issue`] for a repository checkout: the trusted policy

@@ -184,6 +184,10 @@ pub const ADVANCED_VERBS: &[(&str, &str)] = &[
         "one issue per automation outcome, opened, updated and closed",
     ),
     (
+        "outcomes",
+        "report an automation's failure or recovery to its declared rule",
+    ),
+    (
         "external-events",
         "ingest and reconcile normalized external events",
     ),

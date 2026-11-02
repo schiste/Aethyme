@@ -227,3 +227,255 @@ fn notes_are_local_bounded_recipient_scoped_and_redacted_from_events() {
         .to_string();
     assert!(closed.contains("recipient session") && closed.contains("is closed"));
 }
+
+fn output_json(command: &mut Command) -> serde_json::Value {
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// #1238: an automation has no session, so it sends as `automation:<name>`
+/// from the repository itself. A fingerprint keeps one unread note per
+/// recipient; the note surfaces on the recipient's next command with its own
+/// acknowledge command, lists beside session notes, and once acknowledged a
+/// repeat is queued again.
+#[test]
+fn automation_notes_need_no_session_and_repeat_only_once_read() {
+    let (fixture, _sender_worktree, recipient_worktree) = fixture();
+    let repo = fixture.path().to_path_buf();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
+    let recipient = broker
+        .adopt(&recipient_worktree, Some("recipient"))
+        .unwrap();
+    let recipient_id = recipient.id.to_string();
+    let send = |broker: &Broker, extra: &[&str]| {
+        let mut args = vec![
+            "advanced",
+            "note",
+            "send",
+            "--to-session",
+            recipient_id.as_str(),
+            "--message",
+            "prebuild of db-template failed; see #77",
+        ];
+        args.extend_from_slice(extra);
+        child_command(broker, &repo, &args)
+    };
+    let fingerprinted = [
+        "--from",
+        "automation:prebuild",
+        "--fingerprint",
+        "db-template",
+        "--json",
+    ];
+    let mut first = send(&broker, &fingerprinted);
+    let mut repeat = send(&broker, &fingerprinted);
+    let mut bad_sender = send(&broker, &["--from", "prebuild"]);
+    let mut both = send(
+        &broker,
+        &["--from", "automation:prebuild", "--session", &recipient_id],
+    );
+    let mut session_fingerprint =
+        send(&broker, &["--session", &recipient_id, "--fingerprint", "x"]);
+    let mut surfaced = child_command(
+        &broker,
+        &recipient_worktree,
+        &["advanced", "agents", "--json"],
+    );
+    let mut listed = child_command(
+        &broker,
+        &recipient_worktree,
+        &[
+            "advanced",
+            "note",
+            "list",
+            "--session",
+            &recipient_id,
+            "--json",
+        ],
+    );
+    drop(broker);
+
+    let first = output_json(&mut first);
+    assert_eq!(first["deduplicated"], false);
+    assert_eq!(first["note"]["sender"], "automation:prebuild");
+    assert_eq!(first["note"]["fingerprint"], "db-template");
+    let note_id = first["note"]["id"].as_i64().unwrap();
+    let repeat = output_json(&mut repeat);
+    assert_eq!(repeat["deduplicated"], true);
+    assert_eq!(repeat["note"]["id"], note_id);
+
+    for (command, expected) in [
+        (&mut bad_sender, "must be automation:<name>"),
+        (&mut both, "not both"),
+        (&mut session_fingerprint, "--fingerprint applies only"),
+    ] {
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{stderr}");
+    }
+
+    let surfaced = surfaced.output().unwrap();
+    let stderr = String::from_utf8_lossy(&surfaced.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "Unread note {note_id} from automation:prebuild: prebuild of db-template failed; see #77"
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "note ack --session {recipient_id} --automation-id {note_id}"
+        )),
+        "{stderr}"
+    );
+    let listed = output_json(&mut listed);
+    assert_eq!(listed["unread_count"], 1);
+    assert_eq!(listed["automation_notes"][0]["id"], note_id);
+    assert_eq!(listed["notes"].as_array().unwrap().len(), 0);
+
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
+    let event = broker
+        .store()
+        .events_after_filtered(0, 10, Some("automation.note.sent"))
+        .unwrap();
+    assert_eq!(
+        event.len(),
+        1,
+        "a deduplicated repeat records no second send"
+    );
+    assert!(
+        !event[0]
+            .payload_json
+            .as_deref()
+            .unwrap()
+            .contains("db-template failed")
+    );
+    let mut acked = child_command(
+        &broker,
+        &recipient_worktree,
+        &[
+            "advanced",
+            "note",
+            "ack",
+            "--session",
+            &recipient_id,
+            "--automation-id",
+            &note_id.to_string(),
+            "--json",
+        ],
+    );
+    let mut again = send(&broker, &fingerprinted);
+    drop(broker);
+    assert!(
+        output_json(&mut acked)["acknowledged_at"]
+            .as_i64()
+            .is_some()
+    );
+    let again = output_json(&mut again);
+    assert_eq!(again["deduplicated"], false);
+    assert_ne!(again["note"]["id"], note_id);
+
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
+    broker.close(recipient.id).unwrap();
+    let closed = broker
+        .send_automation_note("automation:prebuild", recipient.id, "too late", None)
+        .unwrap_err()
+        .to_string();
+    assert!(closed.contains("is closed"), "{closed}");
+}
+
+/// Review of #1350: an automation that happens to run inside a registered
+/// session's worktree acts for itself, not for that session. Its note send
+/// must not renew the session's task lease on behalf of the agent process
+/// that holds it, nor mark that session's advisories delivered.
+#[test]
+fn automation_note_from_a_session_worktree_leaves_that_session_alone() {
+    let (fixture, holder_worktree, recipient_worktree) = fixture();
+    let mut broker = open_fixture_repository_broker(&fixture).unwrap();
+    let holder = broker.adopt(&holder_worktree, Some("holder")).unwrap();
+    let recipient = broker
+        .adopt(&recipient_worktree, Some("recipient"))
+        .unwrap();
+    broker
+        .persist_advisory(aethyme_broker::NewAdvisory {
+            identity: "automation-note:fixture".into(),
+            audience: aethyme_broker::AdvisoryAudience::Session,
+            producer: aethyme_broker::AdvisoryProducer::Coordination,
+            session_id: Some(holder.id),
+            severity: aethyme_broker::AdvisorySeverity::Warning,
+            queue_entry_id: None,
+            integration_sha: None,
+            paths: vec!["README.md".into()],
+            evidence: vec![aethyme_broker::AdvisoryEvidence {
+                kind: "fixture".into(),
+                summary: "an outstanding advisory".into(),
+            }],
+        })
+        .unwrap();
+    let mut agent = Command::new("sleep").arg("600").spawn().unwrap();
+    let agent_pid = agent.id().to_string();
+    let holder_id = holder.id.to_string();
+    let recipient_id = recipient.id.to_string();
+    // The agent binds itself as holder and takes a task lease.
+    let mut bind = child_command(
+        &broker,
+        &holder_worktree,
+        &["advanced", "heartbeat", "--session", &holder_id, "--json"],
+    );
+    bind.env("AETHYME_AGENT_PID", &agent_pid);
+    let mut send = child_command(
+        &broker,
+        &holder_worktree,
+        &[
+            "advanced",
+            "note",
+            "send",
+            "--from",
+            "automation:prebuild",
+            "--to-session",
+            &recipient_id,
+            "--message",
+            "prebuild failed",
+            "--json",
+        ],
+    );
+    send.env("AETHYME_AGENT_PID", &agent_pid);
+    drop(broker);
+
+    output_json(&mut bind);
+    let holder_state = |fixture: &FixtureRepository| {
+        let mut broker = open_fixture_repository_broker(fixture).unwrap();
+        let activity = broker.store().session(holder.id).unwrap().last_activity_at;
+        let bindings = broker
+            .store()
+            .events_after_filtered(0, 100, Some("session.holder_bound"))
+            .unwrap()
+            .len();
+        let shown = broker.advisory_delivery_summary().unwrap().total_shows;
+        (activity, bindings, shown)
+    };
+    let before = holder_state(&fixture);
+    assert!(before.1 > 0, "the agent never bound as holder");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let sent = output_json(&mut send);
+    assert_eq!(sent["note"]["recipient_session_id"], recipient.id);
+    let after = holder_state(&fixture);
+    let _ = agent.kill();
+    let _ = agent.wait();
+    assert_eq!(
+        after.0, before.0,
+        "the automation note renewed the holder's task lease"
+    );
+    assert_eq!(after.1, before.1, "the automation note rebound the holder");
+    assert_eq!(
+        after.2, before.2,
+        "the automation note delivered the holder's advisories"
+    );
+}

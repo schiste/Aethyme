@@ -199,6 +199,15 @@ Usage:
       unlisted-label and over-budget requests write nothing and are recorded
       locally. Writes are journaled before they run; with --session they go
       through the coordinated GitHub operation layer.
+  aethyme broker outcomes report --source <kind:name> --failed --title <title> [--body-file <path>] [--key <key>] [--commits <from>..<to>] [--session <id>] [--json]
+  aethyme broker outcomes report --source <kind:name> --recovered [--body-file <path>] [--key <key>] [--session <id>] [--json]
+      Report an automation's failure or recovery to its [[automation.outcomes]]
+      rule on the default branch (#1238). A failure resolves the owners of
+      --commits (with notify_owners, narrowed to the rule's paths), keeps one
+      issue for outcome:<source>[:<key>] naming every owner's branch and pull
+      request, and notes each live owner with a link to it. A recovery
+      resolves the issue. Every action is reported with its status; exit 3
+      when one was refused or failed, after the report.
   aethyme broker external-events ingest <normalized.json> [--json]
       Ingest one adapter-verified, digest-bound normalized event. The strict
       schema rejects provider payload fields and stores only allowlisted
@@ -482,11 +491,15 @@ Usage:
       Rebuild the plan, journal a second exact remote observation, and resolve
       only contained exposures and advisories without live lease overlap.
   aethyme broker note send --session <sender> --to-session <recipient> --message <text> [--json]
+  aethyme broker note send --from automation:<name> --to-session <recipient> --message <text> [--fingerprint <key>] [--json]
   aethyme broker note list --session <recipient> [--json]
-  aethyme broker note ack --session <recipient> --id <note-id> [--json]
+  aethyme broker note ack --session <recipient> (--id <note-id> | --automation-id <note-id>) [--json]
       Send, inspect, and acknowledge bounded repository-local coordination
       notes between live sessions. Unread notes surface on the recipient's
       next broker command; event payloads never contain message text.
+      An automation, which has no session, sends with --from (#1238); with
+      --fingerprint a repeat while its last note is unread is not queued
+      again. Automation notes surface and acknowledge like session notes.
   aethyme broker gates validate [--json]
       Parse and validate .aethyme/gates.toml.
   aethyme broker gates incidents list [--json]
@@ -1609,6 +1622,10 @@ struct Parsed {
     open_pr: bool,
     session: Option<i64>,
     to_session: Option<i64>,
+    /// `note send --from automation:<name>` (#1238).
+    note_from: Option<String>,
+    /// `note ack --automation-id`.
+    automation_note_id: Option<i64>,
     cross_session: Option<i64>,
     ref_write_acknowledged: bool,
     note_id: Option<i64>,
@@ -1684,6 +1701,14 @@ struct Parsed {
     labels: Vec<String>,
     /// `issues upsert --resolve`.
     resolve: bool,
+    /// `outcomes report --source` (#1238).
+    outcome_source: Option<String>,
+    /// `outcomes report --failed`.
+    outcome_failed: bool,
+    /// `outcomes report --recovered`.
+    outcome_recovered: bool,
+    /// `outcomes report --key`.
+    outcome_key: Option<String>,
     /// `owners --commits`: the landed range to resolve (#1238).
     commits: Option<String>,
     output: Option<PathBuf>,
@@ -1785,6 +1810,8 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         open_pr: false,
         session: None,
         to_session: None,
+        note_from: None,
+        automation_note_id: None,
         cross_session: None,
         ref_write_acknowledged: false,
         note_id: None,
@@ -1844,6 +1871,10 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         body_file: None,
         labels: Vec::new(),
         resolve: false,
+        outcome_source: None,
+        outcome_failed: false,
+        outcome_recovered: false,
+        outcome_key: None,
         commits: None,
         output: None,
         grant_out: None,
@@ -2292,6 +2323,24 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
                     .clone(),
             ),
             "--resolve" => parsed.resolve = true,
+            "--failed" => parsed.outcome_failed = true,
+            "--recovered" => parsed.outcome_recovered = true,
+            "--source" => {
+                parsed.outcome_source = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message(
+                            "--source requires <kind>:<name>".into(),
+                        ))?
+                        .clone(),
+                )
+            }
+            "--key" => {
+                parsed.outcome_key = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message("--key requires a value".into()))?
+                        .clone(),
+                )
+            }
             "--title" => {
                 parsed.title = Some(
                     iter.next()
@@ -2519,6 +2568,23 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
                 ))?;
                 parsed.cross_session = Some(value.parse().map_err(|_| {
                     UsageError::Message("--cross-session must be an integer session id".into())
+                })?);
+            }
+            "--from" => {
+                parsed.note_from = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message(
+                            "--from requires automation:<name>".into(),
+                        ))?
+                        .clone(),
+                )
+            }
+            "--automation-id" => {
+                let value = iter.next().ok_or(UsageError::Message(
+                    "--automation-id requires a value".into(),
+                ))?;
+                parsed.automation_note_id = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--automation-id must be an integer note id".into())
                 })?);
             }
             "--to-session" => {
@@ -2794,6 +2860,7 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         "report" => run_report(parsed)?,
         "quality-report" => run_quality_report(parsed)?,
         "issues" => run_issues(parsed)?,
+        "outcomes" => run_outcomes(parsed)?,
         "external-events" => run_external_events(parsed)?,
         "reclaim" => {
             let action = reclaim_action.ok_or_else(|| {
@@ -3026,6 +3093,9 @@ enum TaskLeaseCommandClass {
 fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseCommandClass {
     let action = parsed.positional.first().map(String::as_str);
     let nested_action = parsed.positional.get(1).map(String::as_str);
+    if sessionless_automation_command(subcommand, parsed) {
+        return TaskLeaseCommandClass::NoSessionWork;
+    }
     match subcommand {
         "prepare" if action == Some("status") => TaskLeaseCommandClass::ObservationOnly,
         "leases" if matches!(action, None | Some("plan" | "explain" | "export")) => {
@@ -3083,9 +3153,8 @@ fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseComma
         {
             TaskLeaseCommandClass::ObservationOnly
         }
-        "handoff" | "metrics" | "insights" | "blockers" | "exec-status" | "queue" | "worktrees" => {
-            TaskLeaseCommandClass::ObservationOnly
-        }
+        "handoff" | "metrics" | "insights" | "blockers" | "exec-status" | "queue" | "worktrees"
+        | "owners" => TaskLeaseCommandClass::ObservationOnly,
         "reclaim" if action == Some("plan") => TaskLeaseCommandClass::ObservationOnly,
         "reclaim" => TaskLeaseCommandClass::OtherWork,
         "gc" if action == Some("plan") => TaskLeaseCommandClass::ObservationOnly,
@@ -3117,6 +3186,16 @@ fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseComma
         }
         _ => TaskLeaseCommandClass::NoSessionWork,
     }
+}
+
+/// Commands an automation runs for itself, without a session. The cwd may
+/// still be a registered session's worktree, so they must not renew that
+/// session's task lease or mark its advisories delivered. They still write,
+/// so they are not observation-only.
+fn sessionless_automation_command(subcommand: &str, parsed: &Parsed) -> bool {
+    subcommand == "note"
+        && parsed.positional.first().map(String::as_str) == Some("send")
+        && parsed.note_from.is_some()
 }
 
 /// These operations need to reach their domain handler for the established
@@ -3297,7 +3376,9 @@ fn surface_command_advisories(subcommand: &str, parsed: &Parsed) {
     // Internal hooks are not interactive broker commands. Pre-commit remains
     // quiet on success, while post-commit surfaces through run_post_commit
     // after its conflict radar and therefore does not print twice.
-    if matches!(subcommand, "hooks" | "readiness" | "storage") {
+    if matches!(subcommand, "hooks" | "readiness" | "storage")
+        || sessionless_automation_command(subcommand, parsed)
+    {
         return;
     }
     let Ok(cwd) = std::env::current_dir() else {
@@ -3342,17 +3423,28 @@ fn surface_command_advisories(subcommand: &str, parsed: &Parsed) {
     for line in crate::advisories::session_notice_lines(&advisories) {
         eprintln!("{line}");
     }
-    let Ok(notes) = store.unread_session_notes(session_id) else {
-        return;
-    };
-    for note in notes {
-        eprintln!(
-            "Unread broker note {} from session {}: {}",
-            note.id, note.sender_session_id, note.message
-        );
-        eprintln!(
-            "  acknowledge: aethyme broker advanced note ack --session {} --id {}",
-            session_id, note.id
-        );
+    if let Ok(notes) = store.unread_session_notes(session_id) {
+        for note in notes {
+            eprintln!(
+                "Unread broker note {} from session {}: {}",
+                note.id, note.sender_session_id, note.message
+            );
+            eprintln!(
+                "  acknowledge: aethyme broker advanced note ack --session {} --id {}",
+                session_id, note.id
+            );
+        }
+    }
+    if let Ok(notes) = store.unread_automation_notes(session_id) {
+        for note in notes {
+            eprintln!(
+                "Unread note {} from {}: {}",
+                note.id, note.sender, note.message
+            );
+            eprintln!(
+                "  acknowledge: aethyme broker advanced note ack --session {} --automation-id {}",
+                session_id, note.id
+            );
+        }
     }
 }

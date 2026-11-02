@@ -1209,6 +1209,141 @@ impl BrokerStore {
             .ok_or(BrokerError::SessionNoteNotFound(id))
     }
 
+    // ── automation notes (#1238) ────────────────────────────────────
+
+    /// Record an automation's note, or return the unread one from the same
+    /// sender with the same fingerprint (`true` when deduplicated).
+    pub fn record_automation_note(
+        &mut self,
+        sender: &str,
+        recipient_session_id: i64,
+        message: &str,
+        fingerprint: Option<&str>,
+    ) -> Result<(crate::types::AutomationNote, bool), BrokerError> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        if let Some(fingerprint) = fingerprint {
+            let existing: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM automation_notes
+                     WHERE sender = ?1 AND recipient_session_id = ?2 AND fingerprint = ?3
+                       AND acknowledged_at IS NULL
+                     ORDER BY id LIMIT 1",
+                    params![sender, recipient_session_id, fingerprint],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(id) = existing {
+                tx.commit()?;
+                let note = self
+                    .automation_note(id)?
+                    .ok_or(BrokerError::AutomationNoteNotFound(id))?;
+                return Ok((note, true));
+            }
+        }
+        tx.execute(
+            "INSERT INTO automation_notes (
+                 sender, recipient_session_id, message, fingerprint, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![sender, recipient_session_id, message, fingerprint, now],
+        )?;
+        let id = tx.last_insert_rowid();
+        let payload = serde_json::json!({
+            "note_id": id,
+            "sender": sender,
+            "recipient_session_id": recipient_session_id,
+            "message_bytes": message.len(),
+        })
+        .to_string();
+        insert_event(
+            &tx,
+            now,
+            "automation.note.sent",
+            Some(recipient_session_id),
+            Some(&payload),
+        )?;
+        tx.commit()?;
+        let note = self
+            .automation_note(id)?
+            .ok_or(BrokerError::AutomationNoteNotFound(id))?;
+        Ok((note, false))
+    }
+
+    pub fn automation_note(
+        &self,
+        id: i64,
+    ) -> Result<Option<crate::types::AutomationNote>, BrokerError> {
+        self.conn
+            .query_row(
+                &(AUTOMATION_NOTE_SELECT.to_owned() + " WHERE id = ?1"),
+                [id],
+                automation_note_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Every automation note for `recipient_session_id`, newest first.
+    pub fn automation_notes(
+        &self,
+        recipient_session_id: i64,
+    ) -> Result<Vec<crate::types::AutomationNote>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{AUTOMATION_NOTE_SELECT} WHERE recipient_session_id = ?1 ORDER BY id DESC"
+        ))?;
+        let rows = stmt.query_map([recipient_session_id], automation_note_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Unread automation notes for `recipient_session_id`, oldest first.
+    pub fn unread_automation_notes(
+        &self,
+        recipient_session_id: i64,
+    ) -> Result<Vec<crate::types::AutomationNote>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{AUTOMATION_NOTE_SELECT}
+             WHERE recipient_session_id = ?1 AND acknowledged_at IS NULL
+             ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([recipient_session_id], automation_note_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn acknowledge_automation_note(
+        &mut self,
+        id: i64,
+    ) -> Result<crate::types::AutomationNote, BrokerError> {
+        let existing = self
+            .automation_note(id)?
+            .ok_or(BrokerError::AutomationNoteNotFound(id))?;
+        if existing.acknowledged_at.is_some() {
+            return Ok(existing);
+        }
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE automation_notes SET acknowledged_at = ?2
+             WHERE id = ?1 AND acknowledged_at IS NULL",
+            params![id, now],
+        )?;
+        let payload = serde_json::json!({
+            "note_id": id,
+            "sender": existing.sender,
+            "recipient_session_id": existing.recipient_session_id,
+        })
+        .to_string();
+        insert_event(
+            &tx,
+            now,
+            "automation.note.acknowledged",
+            Some(existing.recipient_session_id),
+            Some(&payload),
+        )?;
+        tx.commit()?;
+        self.automation_note(id)?
+            .ok_or(BrokerError::AutomationNoteNotFound(id))
+    }
+
     // ── promoted entry path exposures ────────────────────────────────
 
     /// Exact durable exposure for one promoted queue entry.

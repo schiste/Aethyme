@@ -312,10 +312,34 @@ pub struct SessionNote {
     pub acknowledged_at: Option<i64>,
 }
 
+/// One bounded note an automation sent to a live session (#1238). The
+/// sender is a typed `automation:<name>` label, never a session.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AutomationNote {
+    pub id: i64,
+    pub sender: String,
+    pub recipient_session_id: i64,
+    pub message: String,
+    pub fingerprint: Option<String>,
+    pub created_at: i64,
+    pub acknowledged_at: Option<i64>,
+}
+
+/// What `note send --from automation:<name>` did: a repeat of an unread note
+/// with the same sender and fingerprint returns that note instead.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AutomationNoteSend {
+    pub note: AutomationNote,
+    pub deduplicated: bool,
+}
+
 /// Stable JSON envelope for `note list`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SessionNoteList {
     pub notes: Vec<SessionNote>,
+    /// Notes from automations (#1238), newest first.
+    pub automation_notes: Vec<AutomationNote>,
+    /// Unread session and automation notes together.
     pub unread_count: usize,
 }
 

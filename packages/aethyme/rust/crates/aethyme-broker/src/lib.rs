@@ -179,6 +179,7 @@ pub use pr_monitoring::{
 #[cfg(any(target_os = "macos", all(test, unix)))]
 mod gc_sweep_service;
 mod outcome_issues;
+mod outcome_report;
 mod pr_projection;
 mod pr_watch;
 #[cfg(unix)]
@@ -453,8 +454,15 @@ pub use operations::{
 };
 pub use outcome_issues::{
     AUTOMATION_ISSUES_POLICY_KEY, AutomationIssuesPolicy, IssueRef, OUTCOME_ISSUE_SCHEMA,
-    OutcomeIssueAction, OutcomeIssueError, OutcomeIssueGh, OutcomeIssueRequest, OutcomeIssueResult,
-    SystemGh, outcome_marker, upsert_outcome_issue, upsert_outcome_issue_for_repository,
+    OutcomeIssueAction, OutcomeIssueError, OutcomeIssueGh, OutcomeIssueRefusal,
+    OutcomeIssueRequest, OutcomeIssueResult, OutcomeRule, SystemGh, outcome_marker,
+    recent_outcome_issue_refusals, upsert_outcome_issue, upsert_outcome_issue_for_repository,
+    valid_outcome_source,
+};
+pub use outcome_report::{
+    OUTCOME_REPORT_SCHEMA, OutcomeActionRecord, OutcomeIssueSink, OutcomeReport,
+    OutcomeReportError, OutcomeReportRequest, RepositoryIssueSink, outcome_fingerprint,
+    outcome_note_sender, report_outcome,
 };
 pub use overlap_pairs::{
     BUDGET_EXHAUSTED_REASON, OverlapPair, OverlapSeverity, overlap_state_reads,
@@ -673,10 +681,10 @@ pub use store::BrokerStore;
 pub use types::{
     Advisory, AdvisoryAction, AdvisoryAudience, AdvisoryDeliveryMetric, AdvisoryDeliverySummary,
     AdvisoryDeliverySurface, AdvisoryEvidence, AdvisoryList, AdvisoryProducer,
-    AdvisoryResolutionState, AdvisorySeverity, CoordinatedOperation,
-    DEFAULT_OPERATION_HISTORY_LIMIT, EntryExposureResolutionKind, EntryExposureState,
-    EntryPathExposure, Event, GateCacheProvenance, GateDef, GateEnvironment, GateFailureClass,
-    GateResult, GateStatus, Lease, LeaseKind, MAX_OPERATION_HISTORY_LIMIT,
+    AdvisoryResolutionState, AdvisorySeverity, AutomationNote, AutomationNoteSend,
+    CoordinatedOperation, DEFAULT_OPERATION_HISTORY_LIMIT, EntryExposureResolutionKind,
+    EntryExposureState, EntryPathExposure, Event, GateCacheProvenance, GateDef, GateEnvironment,
+    GateFailureClass, GateResult, GateStatus, Lease, LeaseKind, MAX_OPERATION_HISTORY_LIMIT,
     MAX_SESSION_SHORT_NAME_CHARS, MERGE_QUEUE_HISTORY_SCHEMA_VERSION, MergeQueueEntry,
     MergeQueueHistoryPage, MergeQueueStatusCount, MergeStatus, NewAdvisory,
     NewCoordinatedOperation, NewGateResult, NewPrWatchState, NewSession, OperationEffect,
