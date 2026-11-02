@@ -40,6 +40,8 @@ const PREPARATION_ROTATION_DEBT_MAX_ENTRIES: usize = 100_000;
 const PREPARATION_LEASE_TTL_MARGIN_SECONDS: u64 = 30;
 const PREPARATION_COORDINATOR_OPEN_MAX_WAIT: Duration = Duration::from_millis(25);
 const PREPARATION_APPLY_DEADLINE: Duration = Duration::from_secs(60 * 60);
+const PREPARATION_PLAN_LIVENESS_BUDGET: Duration = Duration::from_secs(15);
+const PREPARATION_PLAN_LIVENESS_ROOT_BUDGET: Duration = Duration::from_secs(1);
 const HOST_RESOURCE_MAX_TTL_SECONDS: u64 = 86_400;
 
 #[derive(Debug, thiserror::Error)]
@@ -980,11 +982,29 @@ where
         &verified_worktree_cache_paths,
         enumerate_children,
     )?;
+    let has_preparation_cache_stores =
+        preparation_cache_root.is_some() || !worktree_volume_cache_bindings.is_empty();
+    let preparation_liveness = if has_preparation_cache_stores {
+        resolve_preparation_liveness(&live_roots)
+    } else {
+        PreparationCacheLiveness::Known(BTreeSet::new())
+    };
+    if has_preparation_cache_stores
+        && matches!(&preparation_liveness, PreparationCacheLiveness::Unknown)
+    {
+        warnings.push(
+            "checkout preparation liveness could not be verified during the bounded plan-wide check; every preparation-cache entry was retained".into(),
+        );
+    }
     let mut preparation_entries = Vec::new();
     let mut preparation_candidates = Vec::new();
     if let Some(cache_root) = preparation_cache_root {
-        let (entries, candidates) =
-            inspect_preparation_cache(cache_root, &live_roots, scan, records);
+        let (entries, candidates) = inspect_preparation_cache_with_liveness(
+            cache_root,
+            &preparation_liveness,
+            scan,
+            records,
+        );
         preparation_entries.extend(entries);
         preparation_candidates.extend(candidates);
     } else {
@@ -999,8 +1019,12 @@ where
             .map_err(|error| StorageError::Unavailable {
                 reason: format!("captured worktree-volume preparation-cache root changed: {error}"),
             })?;
-        let (entries, candidates) =
-            inspect_preparation_cache(&binding.path, &live_roots, scan, records);
+        let (entries, candidates) = inspect_preparation_cache_with_liveness(
+            &binding.path,
+            &preparation_liveness,
+            scan,
+            records,
+        );
         preparation_entries.extend(entries);
         preparation_candidates.extend(candidates);
     }
@@ -3674,6 +3698,111 @@ fn worktree_volume_cache_paths(
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreparationCacheLiveness {
+    Known(BTreeSet<String>),
+    Unknown,
+}
+
+fn resolve_preparation_liveness(live_roots: &[PathBuf]) -> PreparationCacheLiveness {
+    let deadline = Instant::now() + PREPARATION_PLAN_LIVENESS_BUDGET;
+    resolve_preparation_liveness_before(
+        live_roots,
+        deadline,
+        Instant::now,
+        |root, root_deadline| {
+            crate::preparation::current_cache_key_before(root, Some(root_deadline))
+        },
+    )
+}
+
+fn resolve_preparation_liveness_before<F, N, E>(
+    live_roots: &[PathBuf],
+    deadline: Instant,
+    mut now: N,
+    mut resolve_key: F,
+) -> PreparationCacheLiveness
+where
+    F: FnMut(&Path, Instant) -> Result<Option<String>, E>,
+    N: FnMut() -> Instant,
+{
+    let mut live_keys = BTreeSet::new();
+    for root in live_roots {
+        let started_at = now();
+        if started_at >= deadline {
+            return PreparationCacheLiveness::Unknown;
+        }
+        let root_deadline = started_at
+            .checked_add(PREPARATION_PLAN_LIVENESS_ROOT_BUDGET)
+            .map_or(deadline, |root_deadline| root_deadline.min(deadline));
+
+        let before = match std::fs::symlink_metadata(root) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
+            Ok(metadata) if metadata.file_type().is_file() => continue,
+            Ok(_) | Err(_) => return PreparationCacheLiveness::Unknown,
+        };
+        if now() >= root_deadline || now() >= deadline {
+            return PreparationCacheLiveness::Unknown;
+        }
+
+        let key = match resolve_key(root, root_deadline) {
+            Ok(key) => key,
+            Err(_) => return PreparationCacheLiveness::Unknown,
+        };
+        if now() >= root_deadline || now() >= deadline {
+            return PreparationCacheLiveness::Unknown;
+        }
+
+        let after = match std::fs::symlink_metadata(root) {
+            Ok(metadata) => metadata,
+            Err(_) => return PreparationCacheLiveness::Unknown,
+        };
+        if !same_preparation_root_version(&before, &after)
+            || now() >= root_deadline
+            || now() >= deadline
+        {
+            return PreparationCacheLiveness::Unknown;
+        }
+        if let Some(key) = key {
+            live_keys.insert(key);
+        }
+    }
+    PreparationCacheLiveness::Known(live_keys)
+}
+
+fn same_preparation_root_version(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    if !before.is_dir()
+        || !after.is_dir()
+        || before.file_type().is_symlink()
+        || after.file_type().is_symlink()
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.mtime() == after.mtime()
+            && before.mtime_nsec() == after.mtime_nsec()
+            && before.ctime() == after.ctime()
+            && before.ctime_nsec() == after.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        let created_before = before.created().ok();
+        let created_after = after.created().ok();
+        let modified_before = before.modified().ok();
+        let modified_after = after.modified().ok();
+        created_before.is_some()
+            && created_before == created_after
+            && modified_before.is_some()
+            && modified_before == modified_after
+    }
+}
+
+#[cfg(test)]
 fn inspect_preparation_cache(
     cache_root: &Path,
     live_roots: &[PathBuf],
@@ -3683,28 +3812,20 @@ fn inspect_preparation_cache(
     Vec<StoragePreparationEntry>,
     Vec<StoragePreparationCandidate>,
 ) {
-    let mut live_keys = BTreeSet::new();
-    let mut liveness_unknown = false;
-    for root in live_roots {
-        // `current_cache_key` reads config by path. Only a real directory can
-        // supply a key. A regular file cannot contain a checkout, while a
-        // symlink, special file, or missing path leaves liveness unknown.
-        match std::fs::symlink_metadata(root) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-            Ok(metadata) if metadata.file_type().is_file() => continue,
-            Ok(_) | Err(_) => {
-                liveness_unknown = true;
-                continue;
-            }
-        }
-        match crate::preparation::current_cache_key(root) {
-            Ok(Some(key)) => {
-                live_keys.insert(key);
-            }
-            Ok(None) => {}
-            Err(_) => liveness_unknown = true,
-        }
-    }
+    let liveness = resolve_preparation_liveness(live_roots);
+    inspect_preparation_cache_with_liveness(cache_root, &liveness, scan, records)
+}
+
+fn inspect_preparation_cache_with_liveness(
+    cache_root: &Path,
+    liveness: &PreparationCacheLiveness,
+    scan: crate::SizeScan,
+    records: &mut crate::measurement::SizeRecords,
+) -> (
+    Vec<StoragePreparationEntry>,
+    Vec<StoragePreparationCandidate>,
+) {
+    let liveness_unknown = matches!(liveness, PreparationCacheLiveness::Unknown);
 
     let mut entries = Vec::new();
     let Ok(repositories) = std::fs::read_dir(cache_root) else {
@@ -3726,6 +3847,15 @@ fn inspect_preparation_cache(
             continue;
         };
         if retired {
+            if liveness_unknown {
+                entries.push(retained_preparation_entry(
+                    repository_path,
+                    repository_name,
+                    String::new(),
+                    "checkout preparation liveness could not be verified; retaining cache entries",
+                ));
+                continue;
+            }
             let managed_layout = retired_preparation_store_layout(&repository_path, None);
             let estimated_bytes = managed_layout
                 .then(|| observed_size(&repository_path, scan, records))
@@ -3769,7 +3899,10 @@ fn inspect_preparation_cache(
                 ));
                 continue;
             }
-            let live = liveness_unknown || live_keys.contains(&key);
+            let live = match liveness {
+                PreparationCacheLiveness::Known(live_keys) => live_keys.contains(&key),
+                PreparationCacheLiveness::Unknown => true,
+            };
             // Measuring is the expensive half, so a live entry is counted but
             // never walked: its size cannot change the decision.
             let estimated_bytes = if !live {
@@ -7917,6 +8050,240 @@ mod tests {
         assert!(entries.iter().all(|entry| entry.estimated_inodes.is_some()));
         let summary = summarise(&[], &[], &[], &[], &entries, &candidates);
         assert_eq!(summary.preparation_reclaimable_inodes, Some(3));
+    }
+
+    fn unknown_liveness_cache_stores(root: &Path) -> [PathBuf; 2] {
+        let stores = [root.join("cache-one"), root.join("cache-two")];
+        for cache_root in &stores {
+            for key in ["aaaaaaaaaaaa", "bbbbbbbbbbbb"] {
+                std::fs::create_dir_all(cache_root.join(TEST_PREPARATION_REPOSITORY).join(key))
+                    .unwrap();
+            }
+            std::fs::create_dir_all(cache_root.join(format!(
+                "{TEST_PREPARATION_REPOSITORY}.retired-1700000000000-42"
+            )))
+            .unwrap();
+        }
+        stores
+    }
+
+    fn assert_unknown_liveness_retains_cache_store(cache_root: &Path) {
+        let mut records = crate::measurement::SizeRecords::default();
+        let (entries, candidates) = inspect_preparation_cache_with_liveness(
+            cache_root,
+            &PreparationCacheLiveness::Unknown,
+            crate::SizeScan::Recorded,
+            &mut records,
+        );
+        assert_eq!(entries.len(), 3, "all managed entries remain inventoried");
+        assert!(
+            candidates.is_empty(),
+            "unknown liveness grants no candidates"
+        );
+        assert!(
+            entries.iter().all(|entry| {
+                !entry.reclaimable && entry.reason.contains("could not be verified")
+            })
+        );
+    }
+
+    #[test]
+    fn preparation_liveness_is_resolved_once_for_roots_shared_by_two_cache_stores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = [
+            tmp.path().join("checkout-one"),
+            tmp.path().join("checkout-two"),
+        ];
+        for root in &roots {
+            std::fs::create_dir(root).unwrap();
+        }
+        let stores = [tmp.path().join("cache-one"), tmp.path().join("cache-two")];
+        for cache_root in &stores {
+            let repository_cache = cache_root.join(TEST_PREPARATION_REPOSITORY);
+            for key in ["aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"] {
+                std::fs::create_dir_all(repository_cache.join(key)).unwrap();
+            }
+        }
+
+        let started_at = Instant::now();
+        let calls = std::cell::Cell::new(0_usize);
+        let liveness = resolve_preparation_liveness_before(
+            &roots,
+            started_at + Duration::from_secs(5),
+            || started_at,
+            |root, _| {
+                calls.set(calls.get() + 1);
+                Ok::<_, ()>(Some(if root == roots[0].as_path() {
+                    "aaaaaaaaaaaa".into()
+                } else {
+                    "bbbbbbbbbbbb".into()
+                }))
+            },
+        );
+
+        assert_eq!(
+            liveness,
+            PreparationCacheLiveness::Known(
+                ["aaaaaaaaaaaa".to_string(), "bbbbbbbbbbbb".to_string()]
+                    .into_iter()
+                    .collect()
+            )
+        );
+        assert_eq!(calls.get(), roots.len());
+        for cache_root in &stores {
+            let mut records = crate::measurement::SizeRecords::default();
+            let (entries, candidates) = inspect_preparation_cache_with_liveness(
+                cache_root,
+                &liveness,
+                crate::SizeScan::Recorded,
+                &mut records,
+            );
+            assert_eq!(entries.len(), 3);
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].key, "cccccccccccc");
+        }
+        assert_eq!(
+            calls.get(),
+            roots.len(),
+            "cache stores reuse the resolved set"
+        );
+    }
+
+    #[test]
+    fn expired_plan_wide_liveness_after_partial_progress_retains_every_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stores = unknown_liveness_cache_stores(tmp.path());
+        let roots = (0..4)
+            .map(|index| {
+                let root = tmp.path().join(format!("checkout-{index}"));
+                std::fs::create_dir(&root).unwrap();
+                root
+            })
+            .collect::<Vec<_>>();
+        let started_at = Instant::now();
+        let deadline = started_at + PREPARATION_PLAN_LIVENESS_ROOT_BUDGET * 2;
+        let clock = std::cell::Cell::new(started_at);
+        let calls = std::cell::Cell::new(0_usize);
+        let liveness = resolve_preparation_liveness_before(
+            &roots,
+            deadline,
+            || clock.get(),
+            |_, _| {
+                calls.set(calls.get() + 1);
+                clock.set(clock.get() + PREPARATION_PLAN_LIVENESS_ROOT_BUDGET / 2);
+                Ok::<_, ()>(Some("aaaaaaaaaaaa".into()))
+            },
+        );
+
+        assert_eq!(liveness, PreparationCacheLiveness::Unknown);
+        assert_eq!(
+            calls.get(),
+            4,
+            "earlier keys existed before the shared deadline"
+        );
+        for cache_root in &stores {
+            assert_unknown_liveness_retains_cache_store(cache_root);
+        }
+    }
+
+    #[test]
+    fn per_root_liveness_deadline_after_partial_progress_retains_every_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stores = unknown_liveness_cache_stores(tmp.path());
+        let roots = [
+            tmp.path().join("checkout-one"),
+            tmp.path().join("checkout-two"),
+        ];
+        for root in &roots {
+            std::fs::create_dir(root).unwrap();
+        }
+        let started_at = Instant::now();
+        let clock = std::cell::Cell::new(started_at);
+        let calls = std::cell::Cell::new(0_usize);
+        let liveness = resolve_preparation_liveness_before(
+            &roots,
+            started_at + Duration::from_secs(5),
+            || clock.get(),
+            |_, root_deadline| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 2 {
+                    clock.set(root_deadline);
+                }
+                Ok::<_, ()>(Some("aaaaaaaaaaaa".into()))
+            },
+        );
+
+        assert_eq!(liveness, PreparationCacheLiveness::Unknown);
+        assert_eq!(calls.get(), 2);
+        for cache_root in &stores {
+            assert_unknown_liveness_retains_cache_store(cache_root);
+        }
+    }
+
+    #[test]
+    fn liveness_error_after_partial_progress_retains_every_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stores = unknown_liveness_cache_stores(tmp.path());
+        let roots = [
+            tmp.path().join("checkout-one"),
+            tmp.path().join("checkout-two"),
+        ];
+        for root in &roots {
+            std::fs::create_dir(root).unwrap();
+        }
+        let started_at = Instant::now();
+        let calls = std::cell::Cell::new(0_usize);
+        let liveness = resolve_preparation_liveness_before(
+            &roots,
+            started_at + Duration::from_secs(5),
+            || started_at,
+            |_, _| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    Ok(Some("aaaaaaaaaaaa".into()))
+                } else {
+                    Err(())
+                }
+            },
+        );
+
+        assert_eq!(liveness, PreparationCacheLiveness::Unknown);
+        assert_eq!(calls.get(), 2);
+        for cache_root in &stores {
+            assert_unknown_liveness_retains_cache_store(cache_root);
+        }
+    }
+
+    #[test]
+    fn changed_root_during_liveness_resolution_is_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("checkout");
+        std::fs::create_dir(&root).unwrap();
+        let previous_root = tmp.path().join("checkout-before-replacement");
+        let started_at = Instant::now();
+        let liveness = resolve_preparation_liveness_before(
+            std::slice::from_ref(&root),
+            started_at + Duration::from_secs(5),
+            || started_at,
+            |_, _| {
+                std::fs::rename(&root, &previous_root).unwrap();
+                std::fs::create_dir(&root).unwrap();
+                Ok::<_, ()>(Some("aaaaaaaaaaaa".into()))
+            },
+        );
+        assert_eq!(liveness, PreparationCacheLiveness::Unknown);
+    }
+
+    #[test]
+    fn directory_without_preparation_config_is_a_known_no_key_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("checkout-without-preparation-config");
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+
+        assert_eq!(
+            resolve_preparation_liveness(std::slice::from_ref(&root)),
+            PreparationCacheLiveness::Known(BTreeSet::new())
+        );
     }
 
     #[test]
