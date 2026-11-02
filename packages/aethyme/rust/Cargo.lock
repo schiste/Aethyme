@@ -116,7 +116,6 @@ name = "aethyme-enhance"
 version = "0.8.53"
 dependencies = [
  "aethyme-config",
- "globset",
  "libc",
  "serde",
  "serde_json",

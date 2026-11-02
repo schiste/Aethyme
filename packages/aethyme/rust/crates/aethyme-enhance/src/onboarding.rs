@@ -8,10 +8,9 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use sha2::{Digest, Sha256};
 
 use crate::pyjson::{self, py_bool, Value};
@@ -909,7 +908,7 @@ struct ManifestCandidate {
     kind: WorkspaceManifestKind,
     declares_workspace: bool,
     declared_members: Vec<String>,
-    excluded_members: Vec<String>,
+    excluded_member_paths: Vec<String>,
     parsed: bool,
 }
 
@@ -966,12 +965,23 @@ impl WorkspaceInventory {
                 continue;
             }
 
-            let excluded_members =
-                if candidate.kind == WorkspaceManifestKind::Cargo && candidate.declares_workspace {
-                    cargo_workspace_exclusion_globs(&candidate.excluded_members)?
-                } else {
-                    None
-                };
+            let explicit_member_prefixes = candidate
+                .declared_members
+                .iter()
+                .filter_map(|member| workspace_relative_member(&candidate.root, member))
+                .map(normalized_path_components)
+                .collect::<Vec<_>>();
+            let excluded_member_prefixes = candidate
+                .excluded_member_paths
+                .iter()
+                .map(|path| normalized_path_components(path))
+                .collect::<Vec<_>>();
+            let excludes_workspace_root = excluded_member_prefixes
+                .iter()
+                .any(|excluded| excluded.is_empty())
+                && !explicit_member_prefixes
+                    .iter()
+                    .any(|explicit| explicit.is_empty());
             let mut members = candidate.declared_members;
             if candidate.kind == WorkspaceManifestKind::Cargo && candidate.declares_workspace {
                 for path in &manifests {
@@ -994,12 +1004,29 @@ impl WorkspaceInventory {
                     }
                 }
             }
-            members.retain(|member| {
-                excluded_members.as_ref().map_or(true, |exclusions| {
-                    workspace_relative_member(&candidate.root, member)
-                        .map_or(true, |relative| !exclusions.is_match(relative))
-                })
-            });
+            // Cargo excludes the root before enumeration; otherwise explicit member prefixes win.
+            if excludes_workspace_root {
+                members.clear();
+            } else {
+                members.retain(|member| {
+                    if excluded_member_prefixes.is_empty() {
+                        return true;
+                    }
+                    let Some(relative) = workspace_relative_member(&candidate.root, member) else {
+                        return true;
+                    };
+                    let member_path = normalized_path_components(relative);
+                    if explicit_member_prefixes
+                        .iter()
+                        .any(|explicit| member_path.starts_with(explicit.as_slice()))
+                    {
+                        return true;
+                    }
+                    !excluded_member_prefixes
+                        .iter()
+                        .any(|excluded| member_path.starts_with(excluded.as_slice()))
+                });
+            }
             members.sort();
             members.dedup();
 
@@ -1256,7 +1283,7 @@ fn manifest_candidate(
     let root = parent_path(path);
     let mut declares_workspace = kind == WorkspaceManifestKind::Pnpm;
     let mut declared_members = Vec::new();
-    let mut excluded_members = Vec::new();
+    let mut excluded_member_paths = Vec::new();
     let mut parsed = true;
     if matches!(
         kind,
@@ -1277,7 +1304,7 @@ fn manifest_candidate(
                         .filter_map(toml::Value::as_str)
                         .map(|member| join_repo_path(&root, member))
                         .collect();
-                    excluded_members = workspace
+                    excluded_member_paths = workspace
                         .get("exclude")
                         .and_then(toml::Value::as_array)
                         .into_iter()
@@ -1297,34 +1324,27 @@ fn manifest_candidate(
         kind,
         declares_workspace,
         declared_members,
-        excluded_members,
+        excluded_member_paths,
         parsed,
     })
 }
 
-fn cargo_workspace_exclusion_globs(patterns: &[String]) -> Result<Option<GlobSet>, String> {
-    if patterns.is_empty() {
-        return Ok(None);
-    }
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
-        let glob = GlobBuilder::new(pattern)
-            .literal_separator(true)
-            .build()
-            .map_err(|error| {
-                format!("invalid Cargo workspace.exclude pattern {pattern:?}: {error}")
-            })?;
-        builder.add(glob);
-    }
-    let exclusions = builder
-        .build()
-        .map_err(|error| format!("invalid Cargo workspace.exclude patterns: {error}"))?;
-    Ok(Some(exclusions))
+/// Cargo exclusions compare literal path components, retaining parent components.
+fn normalized_path_components(path: &str) -> Vec<String> {
+    Path::new(path)
+        .components()
+        .filter_map(|component| match component {
+            Component::Prefix(prefix) => Some(prefix.as_os_str().to_string_lossy().into_owned()),
+            Component::RootDir => Some(std::path::MAIN_SEPARATOR.to_string()),
+            Component::CurDir => None,
+            Component::ParentDir => Some("..".to_string()),
+            Component::Normal(component) => Some(component.to_string_lossy().into_owned()),
+        })
+        .collect()
 }
 
 fn workspace_relative_member<'a>(workspace_root: &str, member_root: &'a str) -> Option<&'a str> {
-    if workspace_root.is_empty() {
+    if workspace_root.is_empty() || workspace_root == "." {
         Some(member_root)
     } else if member_root == workspace_root {
         Some("")
@@ -4530,14 +4550,32 @@ mod tests {
         write(
             &workspace_root.join("Cargo.toml"),
             r#"[workspace]
-members = ["crates/aethyme-config"]
-exclude = ["vendor/libsqlite3-sys-0.30.1", "vendor/ignored-*"]
+members = ["crates/keep", "vendor/explicit"]
+exclude = ["vendor/explicit", "vendor/ignored-*"]
 resolver = "2"
 "#,
         );
         write(
-            &workspace_root.join("crates/aethyme-config/Cargo.toml"),
-            "[package]\nname = \"aethyme-config\"\nversion = \"0.1.0\"\n",
+            &workspace_root.join("crates/keep/Cargo.toml"),
+            r#"[package]
+name = "keep"
+version = "0.1.0"
+
+[dependencies]
+explicit = { path = "../../vendor/explicit" }
+ignored-helper = { path = "../../vendor/ignored-helper" }
+libsqlite3-sys = { path = "../../vendor/libsqlite3-sys-0.30.1" }
+keep-sub = { path = "sub" }
+vendor-other = { path = "../../vendor-other" }
+"#,
+        );
+        write(
+            &workspace_root.join("crates/keep/sub/Cargo.toml"),
+            "[package]\nname = \"keep-sub\"\nversion = \"0.1.0\"\n",
+        );
+        write(
+            &workspace_root.join("vendor/explicit/Cargo.toml"),
+            "[package]\nname = \"explicit\"\nversion = \"0.1.0\"\n",
         );
         write(
             &workspace_root.join("vendor/libsqlite3-sys-0.30.1/Cargo.toml"),
@@ -4547,22 +4585,136 @@ resolver = "2"
             &workspace_root.join("vendor/ignored-helper/Cargo.toml"),
             "[package]\nname = \"ignored-helper\"\nversion = \"0.1.0\"\n",
         );
+        write(
+            &workspace_root.join("vendor-other/Cargo.toml"),
+            "[package]\nname = \"vendor-other\"\nversion = \"0.1.0\"\n",
+        );
         commit_all(&repo, "test: add Cargo workspace exclusions");
 
-        let snapshot = OnboardingFileSnapshot::discover(&repo).unwrap();
-        let inventory = WorkspaceInventory::discover(&repo, &snapshot).unwrap();
-        assert_eq!(inventory.workspaces.len(), 1);
-        let workspace = &inventory.workspaces[0];
+        let discover_inventory = || {
+            let snapshot = OnboardingFileSnapshot::discover(&repo).unwrap();
+            let inventory = WorkspaceInventory::discover(&repo, &snapshot).unwrap();
+            assert_eq!(inventory.workspaces.len(), 1);
+            (inventory.workspaces[0].members.clone(), inventory.manifests)
+        };
+        let (members, manifests) = discover_inventory();
         assert_eq!(
-            workspace.members,
-            vec!["packages/aethyme/rust/crates/aethyme-config"]
+            members,
+            vec![
+                "packages/aethyme/rust/crates/keep",
+                "packages/aethyme/rust/crates/keep/sub",
+                "packages/aethyme/rust/vendor-other",
+                "packages/aethyme/rust/vendor/explicit",
+                "packages/aethyme/rust/vendor/ignored-helper",
+                "packages/aethyme/rust/vendor/libsqlite3-sys-0.30.1",
+            ]
         );
-        for excluded_manifest in [
-            "packages/aethyme/rust/vendor/libsqlite3-sys-0.30.1/Cargo.toml",
+        for manifest in [
+            "packages/aethyme/rust/Cargo.toml",
+            "packages/aethyme/rust/crates/keep/Cargo.toml",
+            "packages/aethyme/rust/crates/keep/sub/Cargo.toml",
+            "packages/aethyme/rust/vendor-other/Cargo.toml",
+            "packages/aethyme/rust/vendor/explicit/Cargo.toml",
             "packages/aethyme/rust/vendor/ignored-helper/Cargo.toml",
+            "packages/aethyme/rust/vendor/libsqlite3-sys-0.30.1/Cargo.toml",
         ] {
-            assert!(inventory.manifests.contains(&excluded_manifest.to_string()));
+            assert!(manifests.contains(&manifest.to_string()));
         }
+
+        write(
+            &workspace_root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/keep"]
+exclude = ["vendor/libsqlite3-sys-0.30.1", "vendor/ignored-helper"]
+resolver = "2"
+"#,
+        );
+        let (members, manifests) = discover_inventory();
+        assert_eq!(
+            members,
+            vec![
+                "packages/aethyme/rust/crates/keep",
+                "packages/aethyme/rust/crates/keep/sub",
+                "packages/aethyme/rust/vendor-other",
+                "packages/aethyme/rust/vendor/explicit",
+            ]
+        );
+        assert!(manifests.contains(
+            &"packages/aethyme/rust/vendor/libsqlite3-sys-0.30.1/Cargo.toml".to_string()
+        ));
+        assert!(manifests
+            .contains(&"packages/aethyme/rust/vendor/ignored-helper/Cargo.toml".to_string()));
+
+        write(
+            &workspace_root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/keep"]
+exclude = ["crates"]
+resolver = "2"
+"#,
+        );
+        let (members, _) = discover_inventory();
+        assert_eq!(
+            members,
+            vec![
+                "packages/aethyme/rust/crates/keep",
+                "packages/aethyme/rust/crates/keep/sub",
+                "packages/aethyme/rust/vendor-other",
+                "packages/aethyme/rust/vendor/explicit",
+                "packages/aethyme/rust/vendor/ignored-helper",
+                "packages/aethyme/rust/vendor/libsqlite3-sys-0.30.1",
+            ]
+        );
+
+        write(
+            &workspace_root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/keep"]
+exclude = ["./vendor"]
+resolver = "2"
+"#,
+        );
+        let (members, _) = discover_inventory();
+        assert_eq!(
+            members,
+            vec![
+                "packages/aethyme/rust/crates/keep",
+                "packages/aethyme/rust/crates/keep/sub",
+                "packages/aethyme/rust/vendor-other",
+            ]
+        );
+
+        write(
+            &workspace_root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/keep"]
+exclude = ["./vendor/../vendor"]
+resolver = "2"
+"#,
+        );
+        let (members, _) = discover_inventory();
+        assert_eq!(
+            members,
+            vec![
+                "packages/aethyme/rust/crates/keep",
+                "packages/aethyme/rust/crates/keep/sub",
+                "packages/aethyme/rust/vendor-other",
+                "packages/aethyme/rust/vendor/explicit",
+                "packages/aethyme/rust/vendor/ignored-helper",
+                "packages/aethyme/rust/vendor/libsqlite3-sys-0.30.1",
+            ]
+        );
+
+        write(
+            &workspace_root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/keep"]
+exclude = ["."]
+resolver = "2"
+"#,
+        );
+        let (members, _) = discover_inventory();
+        assert!(members.is_empty());
 
         std::fs::remove_dir_all(&repo).unwrap();
     }
