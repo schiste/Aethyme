@@ -199,7 +199,19 @@ impl Broker {
         }
     }
 
-    /// Every open claim, with its holder's liveness, against `agents`.
+    /// Every open claim, with liveness derived without persisting transitions.
+    ///
+    /// Ownership listing is observational even when the broker itself was
+    /// opened with a writable store. Use this path for snapshots and commands
+    /// that only report the current claim view.
+    pub fn ownership_claims_snapshot(&self) -> Result<Vec<OwnershipClaimView>, BrokerOpError> {
+        let now = crate::clock::epoch_ms();
+        let agents = self.agents_snapshot(now)?;
+        self.ownership_claim_views(&agents, now)
+    }
+
+    /// Every open claim, with its holder's liveness, after mutable liveness
+    /// reconciliation. Claim admission uses this path before changing claims.
     pub fn ownership_claims(&mut self) -> Result<Vec<OwnershipClaimView>, BrokerOpError> {
         let now = crate::clock::epoch_ms();
         let agents = self.agents(now)?;
@@ -221,6 +233,12 @@ impl Broker {
                 None => self.store_ref().session(claim.session_id)?,
             };
             let holder_status = agent.map_or(session.status, |agent| agent.derived_status);
+            if holder_status == SessionStatus::Exited {
+                // Mutable liveness reconciliation persists this state before
+                // listing claims. A snapshot must reach the same active view
+                // without writing it back to the session row.
+                continue;
+            }
             let activity_at = agent.map_or(session.last_activity_at, |agent| agent.activity_at);
             let (last_operation_at, last_operation_reason) = self
                 .store_ref()

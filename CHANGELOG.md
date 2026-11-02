@@ -22,8 +22,11 @@ artifacts and their exact source revision are recorded in each signed
 - Storage plans bound preparation-cache liveness checks under one deadline instead of rehashing every live checkout per cache store.
 - `enhance` honours Cargo `workspace.exclude` when inventorying members (#1363).
 - `broker advanced owners` and automation `note send` no longer open mutable broker state or act for the session whose worktree they run from.
+- Spawned-session witnesses include stable volume UUID evidence so a remounted primary volume can still validate the same process identity (#1370).
+- When both UUID captures succeed, new artifact-use markers persist stable identities for the primary and checkout volumes, allowing device-number drift while retaining exact path and inode checks. Legacy markers remain strict; stale records require reviewed recovery (#1373).
+- Ownership claim listing derives liveness from a read-only snapshot and leaves session, event, lease, and claim state unchanged.
 
-The broker database advances to schema 61 (one additive table); the compatibility floor stays at 60, so 0.8.53 binaries keep working against an upgraded store and rollback is unrestricted.
+The broker database advances to schema 61 (one additive table) while the compatibility floor remains at 60, so 0.8.53 can open the store. Older readers fail closed on the new spawn-witness and artifact-use marker formats and may retain affected checkouts until reviewed recovery; rollback is database-compatible but not unrestricted.
 
 ## [0.8.53] - 2026-11-01
 
