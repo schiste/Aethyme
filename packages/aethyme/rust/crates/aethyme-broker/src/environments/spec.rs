@@ -49,6 +49,64 @@ pub struct EnvironmentsFile {
     /// recorded timings and measured footprints against.
     #[serde(default)]
     pub budgets: BudgetsSpec,
+    /// E12 (#1237): templates built ahead of need when a ref advances.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prebuild: Vec<PrebuildSpec>,
+}
+
+/// `[[prebuild]]` (#1237): keep a component's template for the tip of `ref`
+/// built before anyone asks. Aethyme keys it exactly as `env up` does (the
+/// component's `template_inputs` digest at that commit), so the next `env up`
+/// finds it instead of building it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrebuildSpec {
+    /// Names the prebuild; its outcomes report as `prebuild:<name>`.
+    pub name: String,
+    pub profile: String,
+    /// A component of `profile` that declares `template`.
+    pub component: String,
+    /// `default_branch`, `integration`, or any ref; local refs only.
+    #[serde(rename = "ref", default = "default_prebuild_ref")]
+    pub reference: String,
+    /// Pass the newest existing template as `AETHYME_PREBUILD_PREVIOUS_ID`
+    /// and `_DIGEST`, so the hook can derive the new one from it.
+    #[serde(default)]
+    pub derive_from_previous: bool,
+    /// When building may start, any of: `host_idle` (no environment on the
+    /// host active for `quiet_minutes`), `inside:HH:MM-HH:MM` or
+    /// `outside:HH:MM-HH:MM` (local time). Empty: whenever the ref moves.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub when: Vec<String>,
+    #[serde(default = "default_quiet_minutes")]
+    pub quiet_minutes: u64,
+    /// Templates of this component kept: the newest `keep`, unless a live
+    /// environment still uses an older one.
+    #[serde(default = "default_prebuild_keep")]
+    pub keep: usize,
+    /// The template hook's timeout for a prebuild.
+    #[serde(default = "default_prebuild_timeout")]
+    pub timeout_seconds: u64,
+}
+
+pub const DEFAULT_PREBUILD_QUIET_MINUTES: u64 = 15;
+pub const DEFAULT_PREBUILD_KEEP: usize = 2;
+pub const DEFAULT_PREBUILD_TIMEOUT_SECONDS: u64 = 3 * 60 * 60;
+
+fn default_prebuild_ref() -> String {
+    "default_branch".into()
+}
+
+fn default_quiet_minutes() -> u64 {
+    DEFAULT_PREBUILD_QUIET_MINUTES
+}
+
+fn default_prebuild_keep() -> usize {
+    DEFAULT_PREBUILD_KEEP
+}
+
+fn default_prebuild_timeout() -> u64 {
+    DEFAULT_PREBUILD_TIMEOUT_SECONDS
 }
 
 /// `[budgets.seconds]` per metric (`up.<profile>` for a warm up, `up.cold`

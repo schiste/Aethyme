@@ -112,6 +112,14 @@ CREATE TABLE IF NOT EXISTS budget_outcomes (
   issue_open INTEGER NOT NULL,
   PRIMARY KEY (repository, metric)
 );
+CREATE TABLE IF NOT EXISTS prebuild_state (
+  repository TEXT NOT NULL,
+  name TEXT NOT NULL,
+  main_root TEXT NOT NULL,
+  state TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (repository, name)
+);
 ";
 
 /// Timings kept per (repository, metric, outcome) (#1239).
@@ -1345,6 +1353,50 @@ impl EnvironmentStore {
                 state.consecutive as i64,
                 state.issue_open
             ],
+        )?;
+        Ok(())
+    }
+
+    fn has_prebuild_table(&self) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'prebuild_state'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Every recorded prebuild (#1237): `(repository, name, main_root,
+    /// state JSON)`. A store from before the table reads as empty.
+    pub fn prebuild_states(&self) -> Result<Vec<(String, String, String, String)>, StoreError> {
+        if !self.has_prebuild_table()? {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT repository, name, main_root, state FROM prebuild_state ORDER BY repository, name",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn set_prebuild_state(
+        &mut self,
+        repository: &str,
+        name: &str,
+        main_root: &str,
+        state: &str,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO prebuild_state (repository, name, main_root, state, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(repository, name) DO UPDATE SET main_root = excluded.main_root,
+               state = excluded.state, updated_at = excluded.updated_at",
+            params![repository, name, main_root, state, now_ms()],
         )?;
         Ok(())
     }

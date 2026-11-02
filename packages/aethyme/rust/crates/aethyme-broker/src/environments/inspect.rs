@@ -368,6 +368,8 @@ pub(super) fn run_supervise(options: &Options) -> Result<Output, Failure> {
         shared_sync: None,
         last_budget_outcomes: None,
         budget_outcomes: None,
+        last_prebuild: None,
+        prebuild: None,
     };
     let reason = supervisor::run(&config, &mut work, &|| false)
         .map_err(|error| environment_failure(format!("supervisor: {error}")))?;

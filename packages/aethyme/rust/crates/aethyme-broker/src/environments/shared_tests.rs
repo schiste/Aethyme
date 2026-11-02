@@ -797,6 +797,8 @@ fn shared_sync_never_blocks_the_tick() {
         shared_sync: None,
         last_budget_outcomes: None,
         budget_outcomes: None,
+        last_prebuild: None,
+        prebuild: None,
     };
     let (release, wait) = std::sync::mpsc::channel::<()>();
     let started = std::time::Instant::now();

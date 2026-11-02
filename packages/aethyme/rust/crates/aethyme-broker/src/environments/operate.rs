@@ -974,6 +974,137 @@ pub(super) fn run_shared(options: &Options) -> Result<Output, Failure> {
 
 /// `env budgets` (#1239): declared budgets against recorded timings and
 /// measured footprints. Read-only; a host with no store reports no data.
+/// `env prebuild [--run [--name <n>]]` (#1237).
+pub(super) fn run_prebuild(options: &Options) -> Result<Output, Failure> {
+    let workspace = workspace(options)?;
+    let main_root = workspace
+        .repo
+        .main_root()
+        .map_err(|error| environment_failure(error.to_string()))?;
+    if options.run {
+        let host = super::prebuild::host_file().map_err(environment_failure)?;
+        let (mut lifecycle, _) = open("env prebuild", false)?;
+        let mut reporter = super::prebuild::RepositoryReporter {
+            main_root: &main_root,
+        };
+        let reports = super::prebuild::run_for_repository(
+            &mut lifecycle,
+            &main_root,
+            &host,
+            true,
+            options.name.as_deref(),
+            &mut reporter,
+        )
+        .map_err(environment_failure)?;
+        let mut text = String::new();
+        if reports.is_empty() {
+            text.push_str("the default branch declares no [[prebuild]] entries\n");
+        }
+        for report in &reports {
+            text.push_str(&format!(
+                "  {:<20} {:<10} {}{}\n",
+                report.name,
+                report.result,
+                report
+                    .digest
+                    .as_deref()
+                    .map(|d| &d[..12.min(d.len())])
+                    .unwrap_or("-"),
+                report
+                    .detail
+                    .as_deref()
+                    .map(|d| format!("  {d}"))
+                    .unwrap_or_default()
+            ));
+        }
+        let failed = reports
+            .iter()
+            .any(|r| matches!(r.result, "failed" | "error"));
+        let value = json!({
+            "schema": super::prebuild::PREBUILD_SCHEMA,
+            "prebuilds": reports,
+        });
+        let exit = if failed {
+            exit_status::FAILED
+        } else {
+            exit_status::SUCCESS
+        };
+        return Ok((value, text, exit));
+    }
+    let declared = super::shared::declared_file(&main_root)
+        .map_err(environment_failure)?
+        .map(|file| file.prebuild)
+        .unwrap_or_default();
+    let repository = crate::gates::git_origin_fingerprint(&workspace.repo);
+    let states: std::collections::BTreeMap<String, super::prebuild::PrebuildState> =
+        match EnvironmentStore::open_default_read_only()
+            .map_err(|error| environment_failure(error.to_string()))?
+        {
+            Some(store) => store
+                .prebuild_states()
+                .map_err(|error| environment_failure(error.to_string()))?
+                .into_iter()
+                .filter(|(repo, ..)| *repo == repository)
+                .map(|(_, name, _, state)| (name, serde_json::from_str(&state).unwrap_or_default()))
+                .collect(),
+            None => Default::default(),
+        };
+    let mut text = String::new();
+    if declared.is_empty() {
+        text.push_str("the default branch declares no [[prebuild]] entries\n");
+    }
+    let mut entries = Vec::new();
+    for spec in &declared {
+        let state = states.get(&spec.name).cloned().unwrap_or_default();
+        let last = state.runs.last();
+        text.push_str(&format!(
+            "  {:<20} {:<8} {} @ {}{}{}\n",
+            spec.name,
+            serde_json::to_value(state.status)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default(),
+            spec.reference,
+            state
+                .commit
+                .as_deref()
+                .map(|c| &c[..12.min(c.len())])
+                .unwrap_or("-"),
+            last.map(|run| format!(
+                "  last build {} in {:.0}s{}",
+                if run.ok { "ok" } else { "failed" },
+                run.seconds,
+                run.derived_from
+                    .as_deref()
+                    .map(|id| format!(" from {id}"))
+                    .unwrap_or_default()
+            ))
+            .unwrap_or_default(),
+            state
+                .reason
+                .as_deref()
+                .map(|r| format!("  ({r})"))
+                .unwrap_or_default()
+        ));
+        entries.push(json!({
+            "name": spec.name,
+            "ref": spec.reference,
+            "profile": spec.profile,
+            "component": spec.component,
+            "when": spec.when,
+            "state": state,
+        }));
+    }
+    Ok((
+        json!({
+            "schema": super::prebuild::PREBUILD_SCHEMA,
+            "prebuilds": entries,
+        }),
+        text,
+        exit_status::SUCCESS,
+    ))
+}
+
 pub(super) fn run_budgets(options: &Options) -> Result<Output, Failure> {
     let workspace = workspace(options)?;
     let checked = check(&workspace)?;
@@ -1315,6 +1446,10 @@ pub struct LifecycleWork {
     /// it: issue writes reach GitHub, so they never run on the tick.
     pub last_budget_outcomes: Option<std::time::Instant>,
     pub budget_outcomes: Option<std::thread::JoinHandle<()>>,
+    /// When prebuilds were last looked at (#1237), and the thread building:
+    /// a template can take most of an hour.
+    pub last_prebuild: Option<std::time::Instant>,
+    pub prebuild: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LifecycleWork {
@@ -1331,6 +1466,53 @@ impl LifecycleWork {
         }
         self.shared_sync = Some(std::thread::spawn(job));
         true
+    }
+}
+
+/// Look at the prebuilds of every supervised repository (#1237). Failures
+/// are warnings: each is recorded on the prebuild and reported through its
+/// outcome rule.
+fn run_prebuilds(roots: &std::collections::BTreeSet<std::path::PathBuf>) {
+    let Ok((mut lifecycle, _)) = open("supervisor prebuild", false) else {
+        return;
+    };
+    let host = match super::prebuild::host_file() {
+        Ok(host) => host,
+        Err(error) => {
+            eprintln!(
+                "warning: aethyme env supervisor: prebuilds: host environments file: {error}"
+            );
+            return;
+        }
+    };
+    for root in roots {
+        let mut reporter = super::prebuild::RepositoryReporter { main_root: root };
+        match super::prebuild::run_for_repository(
+            &mut lifecycle,
+            root,
+            &host,
+            false,
+            None,
+            &mut reporter,
+        ) {
+            Ok(reports) => {
+                for report in reports
+                    .iter()
+                    .filter(|r| matches!(r.result, "failed" | "error"))
+                {
+                    eprintln!(
+                        "warning: aethyme env supervisor: prebuild {} for {}: {}",
+                        report.name,
+                        root.display(),
+                        report.detail.as_deref().unwrap_or(report.result)
+                    );
+                }
+            }
+            Err(error) => eprintln!(
+                "warning: aethyme env supervisor: prebuilds for {}: {error}",
+                root.display()
+            ),
+        }
     }
 }
 
@@ -1460,12 +1642,32 @@ impl super::supervisor::SupervisorWork for LifecycleWork {
                         Some(std::thread::spawn(move || run_budget_outcomes(&roots)));
                 }
             }
-            // Live environments need renewal even when nothing is moving.
+            if self
+                .last_prebuild
+                .is_none_or(|at| at.elapsed() >= super::prebuild::SUPERVISOR_INTERVAL)
+                && self.prebuild.as_ref().is_none_or(|h| h.is_finished())
+            {
+                self.last_prebuild = Some(std::time::Instant::now());
+                if let Some(finished) = self.prebuild.take()
+                    && finished.join().is_err()
+                {
+                    eprintln!("warning: aethyme env supervisor: prebuild panicked");
+                }
+                let roots = super::prebuild::supervised_roots(&lifecycle);
+                if !roots.is_empty() {
+                    self.prebuild = Some(std::thread::spawn(move || run_prebuilds(&roots)));
+                }
+            }
+            // Live environments need renewal even when nothing is moving; a
+            // prebuild that is building or waiting for its window keeps the
+            // supervisor up too, since quiet windows are when nothing is live.
             let live = lifecycle
                 .store
                 .list(None)
                 .map(|records| records.iter().any(|r| r.phase.retains_worktree()))
-                .unwrap_or(true);
+                .unwrap_or(true)
+                || self.prebuild.as_ref().is_some_and(|h| !h.is_finished())
+                || super::prebuild::any_pending(&lifecycle);
             if live {
                 return super::supervisor::TickOutcome {
                     needs_supervisor: true,

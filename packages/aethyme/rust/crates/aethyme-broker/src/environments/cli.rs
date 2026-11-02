@@ -168,6 +168,22 @@ Usage:
       `broker advanced issues upsert` under the repository's [automation]
       policy; back to ok, it is resolved. The supervisor does this every
       15 minutes. Without --act, read-only.
+  aethyme env prebuild [--run [--name <name>]] [--json]
+      [[prebuild]] entries on the default branch (#1237): keep a component's
+      template for the tip of `ref` (default_branch, integration or any
+      local ref) built before anyone asks. The supervisor checks every 5
+      minutes: when the tip's template digest (computed as `env up` does,
+      in a host-owned shared clone) has no template, it builds it once a
+      `when` condition holds (host_idle: no environment active for
+      quiet_minutes; inside:/outside:HH:MM-HH:MM, local time), passing
+      AETHYME_PREBUILD_NAME/_REF/_COMMIT/_DIGEST and, with
+      derive_from_previous, AETHYME_PREBUILD_PREVIOUS_ID/_DIGEST, then keeps
+      the newest `keep` templates. A failure keeps the previous template,
+      is not retried until the digest changes, and is reported through
+      [[automation.outcomes]] source = \"prebuild:<name>\" when declared;
+      each run is timed as prebuild.<name>. Without --run, read-only
+      status; --run builds a missing template now, ignoring the gate and an
+      earlier failure.
   aethyme env cache list|prune [--all] [--json]
       Content-addressed build outputs (build + cache_inputs, output in
       build_output or serve_dir) shared across worktrees, and database
@@ -225,6 +241,9 @@ pub(super) struct Options {
     pub(super) ram_fraction: f64,
     /// `env budgets --act` (#1239): carry out breach outcomes.
     pub(super) act: bool,
+    /// `env prebuild --run [--name <n>]` (#1237).
+    pub(super) run: bool,
+    pub(super) name: Option<String>,
 }
 
 pub fn run(args: &[String]) -> u8 {
@@ -274,6 +293,7 @@ pub fn run(args: &[String]) -> u8 {
         "shared" => super::operate::run_shared(&options),
         "calibrate" => super::operate::run_calibrate(&options),
         "budgets" => super::operate::run_budgets(&options),
+        "prebuild" => super::operate::run_prebuild(&options),
         "cache" => super::operate::run_cache(&options),
         other => Err(Failure {
             code: "unknown_subcommand",
@@ -326,6 +346,8 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
         force: false,
         ram_fraction: super::metrics::DEFAULT_RAM_FRACTION,
         act: false,
+        run: false,
+        name: None,
     };
     let number = |value: Option<&String>, flag: &str| -> Result<usize, Failure> {
         value
@@ -370,6 +392,14 @@ fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
             "--force" if command == "shared" => options.force = true,
             "--all" if command == "cache" => options.all = true,
             "--act" if command == "budgets" => options.act = true,
+            "--run" if command == "prebuild" => options.run = true,
+            "--name" if command == "prebuild" => {
+                options.name = Some(
+                    args.next()
+                        .ok_or_else(|| usage("--name needs a prebuild name".into()))?
+                        .clone(),
+                )
+            }
             "--ram-fraction" if command == "calibrate" => {
                 options.ram_fraction = args
                     .next()
