@@ -14,7 +14,8 @@ candidates. Logical bytes are not APFS-exclusive physical allocation. Recorded
 estimates can be old; an explicit measured plan spends at most 250 milliseconds
 per repository on shared Git directories. Routine plans add these paths to the
 existing bounded measurement rotation. A timeout reports unknown rather than a
-partial total. Missing directories report zero.
+partial total. Missing directories report zero. Symlinked or inaccessible Git
+categories stay unknown; measurement never follows them.
 
 ## Non-pruning object maintenance
 
@@ -24,6 +25,7 @@ From an existing broker session in the owning repository:
 aethyme broker advanced git --session SESSION --reason "Reviewed shared Git object maintenance" --queue-timeout 120 -- -c pack.threads=1 -c pack.windowMemory=32m -c gc.auto=0 maintenance run --task=loose-objects
 ```
 
+Repository-routing overrides are refused for coordinated maintenance.
 This exact task is classified as a repository-wide write and uses the durable
 operation journal and coordinator. It removes loose copies already present in
 packs and packs a batch of remaining loose objects. It does not change branch

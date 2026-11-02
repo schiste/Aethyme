@@ -2672,9 +2672,21 @@ pub(crate) fn refuse_code_executing_git_options(args: &[String]) -> Result<(), B
         })
     };
     let end = git_subcommand_index(args).unwrap_or(args.len());
+    let maintenance = args
+        .get(end)
+        .is_some_and(|command| command == "maintenance");
     let mut index = 0;
     while index < end {
         let arg = args[index].as_str();
+        if maintenance
+            && ["--git-dir", "--work-tree", "--namespace", "--super-prefix"]
+                .iter()
+                .any(|option| arg == *option || arg.starts_with(&format!("{option}=")))
+        {
+            return Err(BrokerOpError::InvalidCoordinatedOperation {
+                reason: "coordinated Git maintenance must remain bound to the owning repository; repository-routing options are refused".into(),
+            });
+        }
         let (key, consumed) = if arg == "-c" || arg == "--config-env" {
             (args.get(index + 1).map(String::as_str).unwrap_or(""), 2)
         } else if let Some(inline) = arg.strip_prefix("--config-env=") {
@@ -3465,6 +3477,32 @@ mod git_storage_maintenance_tests {
     }
 
     #[test]
+    fn maintenance_admission_stays_bound_to_its_repository() {
+        for option in ["--git-dir", "--work-tree", "--namespace", "--super-prefix"] {
+            for mut prefix in [
+                vec![format!("{option}=/other")],
+                vec![option.into(), "/other".into()],
+            ] {
+                prefix.extend(["maintenance", "run", "--task=loose-objects"].map(str::to_owned));
+                assert!(
+                    refuse_code_executing_git_options(&prefix).is_err(),
+                    "{prefix:?}"
+                );
+            }
+        }
+        let args = [
+            "-c",
+            "pack.threads=1",
+            "maintenance",
+            "run",
+            "--task=loose-objects",
+        ]
+        .map(str::to_owned);
+        assert!(refuse_code_executing_git_options(&args).is_ok());
+        assert_eq!(classify_git(&args), Some(OperationEffect::Write));
+    }
+
+    #[test]
     fn only_closed_non_pruning_maintenance_uses_write_authority() {
         assert_eq!(
             classify(&["maintenance", "run", "--task=loose-objects"]),
@@ -3475,6 +3513,8 @@ mod git_storage_maintenance_tests {
             vec!["maintenance", "run", "--task=gc"],
             vec!["maintenance", "run", "--task=loose-objects", "--task=gc"],
             vec!["maintenance", "start"],
+            vec!["gc"],
+            vec!["gc", "--auto"],
             vec!["gc", "--prune=now"],
             vec!["prune", "--expire=now"],
             vec!["repack", "-ad"],

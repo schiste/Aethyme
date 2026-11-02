@@ -4399,11 +4399,17 @@ fn inspect_git_storage_until(
     .into_iter()
     .map(|(name, category, maintenance)| {
         let path = common.join(name);
-        let missing = std::fs::symlink_metadata(&path)
+        let metadata = std::fs::symlink_metadata(&path);
+        let missing = metadata.as_ref()
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        let real_directory = metadata.as_ref().is_ok_and(|metadata| metadata.is_dir());
         let record = if missing {
             records.record_usage(&path.to_string_lossy(), 0, Some(0), now_ms());
             records.get(&path.to_string_lossy())
+        } else if !real_directory {
+            // A symlink, wrong-kind path or failed stat is unknown, never a
+            // freshly measured zero. Neither explicit nor recorded scans follow it.
+            None
         } else if scan.measures() {
             crate::disk_headroom::directory_usage_bounded(&path, deadline).and_then(|usage| {
                 records.record_usage(&path.to_string_lossy(), usage.bytes, Some(usage.inodes), now_ms());
@@ -6084,7 +6090,7 @@ mod tests {
                 .find(|entry| entry.category == "conflict_reuse")
                 .unwrap()
                 .estimated_bytes,
-            Some(0)
+            None
         );
         assert_eq!(
             std::fs::read(outside.path().join("private")).unwrap(),
