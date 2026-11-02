@@ -1481,6 +1481,12 @@ pub struct DoctorReport {
     /// never counted against [`Self::healthy`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub automation_issue_refusals: Vec<crate::OutcomeIssueRefusal>,
+    /// Shared preparation-cache rotation recoveries recorded on this host by
+    /// `submit prepare` (#1236): generation, entries unlinked across
+    /// attempts, remaining estimate, last progress, and state. Reported,
+    /// never counted against [`Self::healthy`]; omitted when none is recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preparation_rotation_recovery: Vec<crate::RotationRecoveryRecord>,
     /// Milliseconds each doctor phase took (#460).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub phase_timings_ms: std::collections::BTreeMap<String, u64>,

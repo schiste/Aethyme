@@ -46,6 +46,9 @@ pub(crate) struct Report {
     omitted_groups: usize,
     memory_observation: &'static str,
     groups: Vec<Group>,
+    /// Shared preparation-cache rotation recoveries recorded on this host
+    /// (#1236); empty when none is recorded.
+    pub(crate) preparation_rotation_recovery: Vec<crate::RotationRecoveryRecord>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -153,6 +156,7 @@ impl Report {
             omitted_groups: 0,
             memory_observation: "session_inventory_over_budget",
             groups: Vec::new(),
+            preparation_rotation_recovery: Vec::new(),
         }
     }
 
@@ -258,6 +262,7 @@ impl Report {
                 "unavailable_or_incomplete_swap_unmeasured"
             },
             groups,
+            preparation_rotation_recovery: Vec::new(),
         }
     }
 }

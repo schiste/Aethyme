@@ -2496,6 +2496,7 @@ impl Broker {
         // upsert` reports it when it next runs.
         let automation_issue_refusals =
             crate::recent_outcome_issue_refusals(&self.main_root).unwrap_or_default();
+        let preparation_rotation_recovery = self.preparation_rotation_recoveries();
         phase("total", started);
 
         Ok(DoctorReport {
@@ -2513,6 +2514,7 @@ impl Broker {
             leftover_integration_work,
             environment_budgets_over,
             automation_issue_refusals,
+            preparation_rotation_recovery,
             phase_timings_ms,
             deferred_checks: budget_cut.clone(),
             budget_cut,

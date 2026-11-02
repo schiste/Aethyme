@@ -446,6 +446,41 @@ fn doctor_healthy_accepts_successful_explicit_version_repair() {
 }
 
 #[test]
+fn doctor_reports_rotation_recovery_without_counting_it_against_health() {
+    let mut report = doctor_report(VersionDriftStatus::Current, None);
+    let healthy = report.healthy();
+    assert!(
+        serde_json::to_value(&report)
+            .unwrap()
+            .get("preparation_rotation_recovery")
+            .is_none(),
+        "the field is omitted when no recovery is recorded"
+    );
+    report
+        .preparation_rotation_recovery
+        .push(crate::RotationRecoveryRecord {
+            schema: "aethyme.preparation-rotation-recovery/v1".into(),
+            cache_root: "/cache".into(),
+            repository: "ab".repeat(32),
+            retired_generation: Some("retired".into()),
+            state: crate::RotationRecoveryState::Stalled,
+            entries_unlinked_total: 41_213,
+            attempts: 3,
+            remaining_entries: Some(100_000),
+            remaining_entries_is_lower_bound: true,
+            last_progress_at_ms: Some(5),
+            updated_at_ms: 6,
+            last_stop_reason: Some("deadline".into()),
+        });
+    assert_eq!(report.healthy(), healthy);
+    let json = serde_json::to_value(&report).unwrap();
+    let recovery = &json["preparation_rotation_recovery"][0];
+    assert_eq!(recovery["state"], "stalled");
+    assert_eq!(recovery["entries_unlinked_total"], 41_213);
+    assert_eq!(recovery["remaining_entries_is_lower_bound"], true);
+}
+
+#[test]
 fn doctor_healthy_rejects_failed_explicit_version_repair() {
     let report = doctor_report(
         VersionDriftStatus::BehindIntegration,
@@ -1129,6 +1164,7 @@ fn doctor_report(
         leftover_integration_work: None,
         environment_budgets_over: Vec::new(),
         automation_issue_refusals: Vec::new(),
+        preparation_rotation_recovery: Vec::new(),
         phase_timings_ms: Default::default(),
         deferred_checks: Vec::new(),
         budget_cut: Vec::new(),
