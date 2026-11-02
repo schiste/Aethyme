@@ -20,10 +20,10 @@
         {
           "blockers": [],
           "category": "string",
-          "estimated_bytes": "null",
-          "estimated_inodes": "null",
+          "estimated_bytes": "integer|null",
+          "estimated_inodes": "integer|null",
           "maintenance": "string",
-          "measured_at_ms": "null",
+          "measured_at_ms": "integer|null",
           "path": "string"
         }
       ],

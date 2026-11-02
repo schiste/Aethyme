@@ -252,6 +252,51 @@ fn status_shape(value: &serde_json::Value) -> String {
     )
 }
 
+/// Shared Git measurements are nullable even when this fixture has no recorded
+/// observation. Validate every entry before normalizing that stable contract.
+fn storage_shape(value: &serde_json::Value) -> String {
+    let checkouts = value["primary_checkouts"]
+        .as_array()
+        .expect("primary checkout array");
+    assert!(
+        !checkouts.is_empty(),
+        "fixture includes its primary checkout"
+    );
+    let fields = ["estimated_bytes", "estimated_inodes", "measured_at_ms"];
+    for checkout in checkouts {
+        let entries = checkout["git_storage"]
+            .as_array()
+            .expect("Git storage array");
+        assert!(
+            !entries.is_empty(),
+            "primary checkout inventories shared Git storage"
+        );
+        for entry in entries {
+            for field in fields {
+                let observed = entry.get(field).expect("Git measurement field is present");
+                let valid_integer = if field == "measured_at_ms" {
+                    observed.as_i64().is_some()
+                } else {
+                    observed.as_u64().is_some()
+                };
+                assert!(
+                    observed.is_null() || valid_integer,
+                    "invalid {field}: {observed}"
+                );
+            }
+        }
+    }
+    let mut result = json_shape(value);
+    let entry = &mut result["primary_checkouts"][0]["git_storage"][0];
+    for field in fields {
+        entry[field] = serde_json::Value::String("integer|null".into());
+    }
+    format!(
+        "{}\n",
+        serde_json::to_string_pretty(&result).expect("serialize storage shape")
+    )
+}
+
 fn fixture() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
@@ -687,7 +732,7 @@ fn other_broker_json_shapes_match_snapshots() {
     ));
     let gc_storage =
         json_with_host_state(&repo, &["broker", "gc", "storage", "--json"], &host_state);
-    entries.push(("gc-storage".to_string(), shape(&gc_storage)));
+    entries.push(("gc-storage".to_string(), storage_shape(&gc_storage)));
 
     let hooks_usage = json_with_exit(
         &repo,
