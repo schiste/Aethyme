@@ -721,13 +721,13 @@ fn stat_matches_identity(stat: &libc::stat, identity: &FileIdentity) -> bool {
     #[cfg(target_os = "macos")]
     let timestamps_match = {
         let birth_matches = identity.birth.as_ref().is_some_and(|birth| {
-            i128::from(stat.st_birthtimespec.tv_sec) == i128::from(birth.seconds)
-                && i128::from(stat.st_birthtimespec.tv_nsec) == i128::from(birth.nanoseconds)
+            i128::from(stat.st_birthtime) == i128::from(birth.seconds)
+                && i128::from(stat.st_birthtime_nsec) == i128::from(birth.nanoseconds)
         });
-        i128::from(stat.st_mtimespec.tv_sec) == i128::from(identity.modified.seconds)
-            && i128::from(stat.st_mtimespec.tv_nsec) == i128::from(identity.modified.nanoseconds)
-            && i128::from(stat.st_ctimespec.tv_sec) == i128::from(identity.changed.seconds)
-            && i128::from(stat.st_ctimespec.tv_nsec) == i128::from(identity.changed.nanoseconds)
+        i128::from(stat.st_mtime) == i128::from(identity.modified.seconds)
+            && i128::from(stat.st_mtime_nsec) == i128::from(identity.modified.nanoseconds)
+            && i128::from(stat.st_ctime) == i128::from(identity.changed.seconds)
+            && i128::from(stat.st_ctime_nsec) == i128::from(identity.changed.nanoseconds)
             && birth_matches
     };
     base && timestamps_match
