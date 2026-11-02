@@ -350,7 +350,23 @@ pub struct StoragePrimaryCheckout {
     pub clean: bool,
     pub dirty_paths: Vec<String>,
     pub artifacts: Vec<StoragePrimaryArtifact>,
+    /// Shared Git metadata is accounted even when source edits block artifact deletion.
+    /// These entries never authorize recursive deletion. Sizes are logical bytes.
+    #[serde(default)]
+    pub git_storage: Vec<StorageGitEntry>,
     pub blockers: Vec<String>,
+}
+
+/// Non-overlapping shared Git storage categories, retained by checkout cleanup.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StorageGitEntry {
+    pub path: PathBuf,
+    pub category: String,
+    /// Unknown when measurement is deferred, inaccessible or over budget.
+    pub estimated_bytes: Option<u64>,
+    pub estimated_inodes: Option<u64>,
+    pub measured_at_ms: Option<i64>,
+    pub maintenance: String,
 }
 
 /// One recognized regenerable directory beneath an enrolled primary checkout.
@@ -952,6 +968,12 @@ where
     });
     let (primary_checkouts, primary_candidates) =
         inspect_primary_checkouts(main_root, &roots, scan, records);
+    if primary_checkouts
+        .iter()
+        .any(|checkout| !checkout.git_storage.is_empty())
+    {
+        warnings.push("Shared Git storage is inventoried separately and is retained by checkout cleanup. No eligible checkout artifacts does not mean repository storage is fully reclaimed; review each Git category and its measurement completeness.".into());
+    }
 
     // Live roots come from the worktree container, but the cache itself is
     // resolved beside the host resource database by preparation.rs. These
@@ -4233,7 +4255,7 @@ fn inspect_primary_checkout(
                 clean = dirty_paths.is_empty();
                 if !clean {
                     blockers.push(format!(
-                        "checkout has uncommitted changes; refusing the whole checkout and no primary artifact is eligible ({} path(s))",
+                        "checkout has uncommitted changes; no primary artifact is eligible; shared Git storage remains inventoried ({} path(s))",
                         dirty_paths.len()
                     ));
                 }
@@ -4327,6 +4349,18 @@ fn inspect_primary_checkout(
             )),
         }
     }
+    let git_storage = repo
+        .as_ref()
+        .filter(|_| usable)
+        .map_or_else(Vec::new, |repo| match repo.git_common_dir() {
+            Ok(common) => inspect_git_storage(&common, scan, records),
+            Err(error) => {
+                blockers.push(format!(
+                    "shared Git storage could not be inventoried: {error}"
+                ));
+                Vec::new()
+            }
+        });
     artifacts.sort_by(|left, right| left.path.cmp(&right.path));
     StoragePrimaryCheckout {
         path,
@@ -4334,8 +4368,67 @@ fn inspect_primary_checkout(
         clean,
         dirty_paths,
         artifacts,
+        git_storage,
         blockers,
     }
+}
+
+/// Report categories independently of checkout cleanliness. Never classify these
+/// trees as disposable artifacts: object reachability and conflict reuse have
+/// different lifecycles from a closed worktree.
+fn inspect_git_storage(
+    common: &Path,
+    scan: crate::SizeScan,
+    records: &mut crate::measurement::SizeRecords,
+) -> Vec<StorageGitEntry> {
+    inspect_git_storage_until(
+        common,
+        scan,
+        records,
+        Instant::now() + Duration::from_millis(250),
+    )
+}
+
+fn inspect_git_storage_until(
+    common: &Path,
+    scan: crate::SizeScan,
+    records: &mut crate::measurement::SizeRecords,
+    deadline: Instant,
+) -> Vec<StorageGitEntry> {
+    // One total budget, not a fresh allowance for each large Git directory.
+    [
+        ("objects", "objects", "Use coordinated non-pruning Git loose-object maintenance; never recursively delete objects."),
+        ("rr-cache", "conflict_reuse", "Conflict-resolution history; retain active and recent records. Worktree cleanup does not expire it."),
+        ("worktrees", "worktree_administration", "Retire through broker worktree cleanup; never remove registrations of live checkouts."),
+        ("logs", "reflogs", "Recovery history; retained. Do not expire reflogs to satisfy a storage target."),
+        ("aethyme-broker", "broker_git_state", "Broker coordination state; retained."),
+    ]
+    .into_iter()
+    .map(|(name, category, maintenance)| {
+        let path = common.join(name);
+        let missing = std::fs::symlink_metadata(&path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        let record = if missing {
+            records.record_usage(&path.to_string_lossy(), 0, Some(0), now_ms());
+            records.get(&path.to_string_lossy())
+        } else if scan.measures() {
+            crate::disk_headroom::directory_usage_bounded(&path, deadline).and_then(|usage| {
+                records.record_usage(&path.to_string_lossy(), usage.bytes, Some(usage.inodes), now_ms());
+                records.get(&path.to_string_lossy())
+            })
+        } else {
+            records.get(&path.to_string_lossy())
+        };
+        StorageGitEntry {
+            path,
+            category: category.into(),
+            estimated_bytes: record.map(|record| record.bytes),
+            estimated_inodes: record.and_then(|record| record.inodes),
+            measured_at_ms: record.map(|record| record.measured_at_ms),
+            maintenance: maintenance.into(),
+        }
+    })
+    .collect()
 }
 
 fn primary_repository_key(path: &Path, repo: Option<&GitRepo>) -> String {
@@ -4545,6 +4638,9 @@ fn storage_size_paths(plan: &StoragePlan) -> Vec<String> {
         }
     }
     for checkout in &plan.primary_checkouts {
+        for entry in &checkout.git_storage {
+            paths.insert(entry.path.to_string_lossy().into_owned());
+        }
         for artifact in &checkout.artifacts {
             paths.insert(artifact.path.to_string_lossy().into_owned());
         }
@@ -5861,6 +5957,140 @@ mod tests {
             );
         }
         GitRepo::discover(root).unwrap()
+    }
+
+    #[test]
+    fn dirty_primary_checkout_still_reports_shared_git_storage_without_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = init_storage_root_test_repository(tmp.path());
+        let common = repo.git_common_dir().unwrap();
+        let resolution = common.join("rr-cache/fixture/postimage");
+        std::fs::create_dir_all(resolution.parent().unwrap()).unwrap();
+        std::fs::write(&resolution, b"valuable resolution").unwrap();
+        std::fs::write(tmp.path().join("pending.txt"), b"pending work").unwrap();
+        let mut records = crate::measurement::SizeRecords::default();
+        let checkout = inspect_primary_checkout(tmp.path(), crate::SizeScan::Measure, &mut records);
+        assert!(!checkout.clean);
+        assert!(
+            !checkout
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.reclaimable)
+        );
+        let entry = checkout
+            .git_storage
+            .iter()
+            .find(|entry| entry.category == "conflict_reuse")
+            .unwrap();
+        assert_eq!(entry.estimated_bytes, Some(19));
+        assert_eq!(std::fs::read(&resolution).unwrap(), b"valuable resolution");
+        assert_eq!(
+            std::fs::read(tmp.path().join("pending.txt")).unwrap(),
+            b"pending work"
+        );
+        assert_eq!(
+            checkout
+                .git_storage
+                .iter()
+                .filter(|entry| entry.category == "objects")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn recorded_git_storage_does_not_turn_unknown_into_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("objects")).unwrap();
+        let mut records = crate::measurement::SizeRecords::default();
+        let entries = inspect_git_storage(tmp.path(), crate::SizeScan::Recorded, &mut records);
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.category == "objects")
+                .unwrap()
+                .estimated_bytes,
+            None
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.category == "conflict_reuse")
+                .unwrap()
+                .estimated_bytes,
+            Some(0)
+        );
+        records.record_usage(
+            &tmp.path().join("objects").to_string_lossy(),
+            123,
+            Some(4),
+            now_ms(),
+        );
+        let entries = inspect_git_storage(tmp.path(), crate::SizeScan::Recorded, &mut records);
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.category == "objects")
+                .unwrap()
+                .estimated_bytes,
+            Some(123)
+        );
+    }
+
+    #[test]
+    fn expired_git_measurement_does_not_report_old_cache_as_fresh_or_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("objects")).unwrap();
+        let mut records = crate::measurement::SizeRecords::default();
+        records.record_usage(
+            &tmp.path().join("objects").to_string_lossy(),
+            123,
+            Some(4),
+            1,
+        );
+        let entries = inspect_git_storage_until(
+            tmp.path(),
+            crate::SizeScan::Measure,
+            &mut records,
+            Instant::now(),
+        );
+        let entry = entries
+            .iter()
+            .find(|entry| entry.category == "objects")
+            .unwrap();
+        assert_eq!(entry.estimated_bytes, None);
+        assert_eq!(entry.measured_at_ms, None);
+        // The last successful observation remains available to recorded-only plans.
+        assert_eq!(
+            records
+                .get(&tmp.path().join("objects").to_string_lossy())
+                .unwrap()
+                .bytes,
+            123
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_storage_measurement_does_not_follow_cache_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("private"), b"retain outside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("rr-cache")).unwrap();
+        let mut records = crate::measurement::SizeRecords::default();
+        let entries = inspect_git_storage(tmp.path(), crate::SizeScan::Measure, &mut records);
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.category == "conflict_reuse")
+                .unwrap()
+                .estimated_bytes,
+            Some(0)
+        );
+        assert_eq!(
+            std::fs::read(outside.path().join("private")).unwrap(),
+            b"retain outside"
+        );
     }
 
     fn bound_storage_context(

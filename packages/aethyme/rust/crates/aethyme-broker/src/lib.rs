@@ -664,9 +664,10 @@ pub use storage::{
     STORAGE_RECONCILIATION_SCHEMA_VERSION, StorageAppliedItem, StorageApplyFailure,
     StorageApplyReport, StorageAttribution, StorageAttributionReport, StorageCandidate,
     StorageCandidateKind, StorageDirectoryKind, StorageEntry, StorageError, StorageFilesystemKind,
-    StorageMarkerStatus, StoragePlan, StoragePrimaryArtifact, StoragePrimaryCandidate,
-    StoragePrimaryCheckout, StorageReconciliation, StorageRecoveryArchiveGroup, StorageRoot,
-    StorageSource, StorageSummary, storage_apply, storage_attribute, storage_plan,
+    StorageGitEntry, StorageMarkerStatus, StoragePlan, StoragePrimaryArtifact,
+    StoragePrimaryCandidate, StoragePrimaryCheckout, StorageReconciliation,
+    StorageRecoveryArchiveGroup, StorageRoot, StorageSource, StorageSummary, storage_apply,
+    storage_attribute, storage_plan,
 };
 pub use store::BrokerStore;
 pub use types::{

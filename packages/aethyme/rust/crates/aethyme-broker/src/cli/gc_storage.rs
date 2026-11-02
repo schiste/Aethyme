@@ -137,6 +137,20 @@ pub(super) fn render_storage_plan(plan: &crate::StoragePlan, detail: bool) {
         for blocker in &checkout.blockers {
             out!("    blocker: {blocker}");
         }
+        for entry in &checkout.git_storage {
+            out!(
+                "    Git {}: {} ({} logical bytes; retained by checkout cleanup)",
+                entry.category,
+                entry.path.display(),
+                entry
+                    .estimated_bytes
+                    .map(|bytes| bytes.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+            );
+            if detail {
+                out!("      {}", entry.maintenance);
+            }
+        }
         if detail {
             for artifact in &checkout.artifacts {
                 out!(
@@ -178,7 +192,7 @@ pub(super) fn render_storage_plan(plan: &crate::StoragePlan, detail: bool) {
         );
     });
     if plan.candidates.is_empty() && plan.primary_candidates.is_empty() {
-        out!("  apply: nothing eligible");
+        out!("  apply: no eligible checkout artifacts; shared Git storage is retained");
     } else {
         out!(
             "  apply: aethyme broker gc storage apply --confirm {}",

@@ -2952,6 +2952,25 @@ pub fn classify_git(args: &[String]) -> Option<OperationEffect> {
         {
             Some(OperationEffect::Destructive)
         }
+        // Only these closed maintenance profiles avoid reachability pruning.
+        // Keep the repository-wide coordinator lane (no narrow resource scope).
+        "maintenance"
+            if args.iter().map(String::as_str).eq([
+                "maintenance",
+                "run",
+                "--task=loose-objects",
+            ]) =>
+        {
+            Some(OperationEffect::Write)
+        }
+        "maintenance" | "prune" | "repack" => Some(OperationEffect::Destructive),
+        "rerere"
+            if args
+                .get(1)
+                .is_some_and(|action| matches!(action.as_str(), "gc" | "clear" | "forget")) =>
+        {
+            Some(OperationEffect::Destructive)
+        }
         "reflog" if has_any(args, &["delete", "expire"]) => Some(OperationEffect::Destructive),
         "add" | "am" | "apply" | "checkout" | "cherry-pick" | "clone" | "commit" | "fetch"
         | "gc" | "init" | "merge" | "mv" | "notes" | "pull" | "rebase" | "replace" | "restore"
@@ -3383,3 +3402,88 @@ mod push_and_coordinated;
 mod redaction;
 pub(crate) use push_and_coordinated::{github_command, is_within, worktree_relative_push_sources};
 use push_and_coordinated::{is_github_pull_request_merge, provider_command};
+
+#[cfg(test)]
+mod git_storage_maintenance_tests {
+    use super::*;
+
+    fn classify(args: &[&str]) -> Option<OperationEffect> {
+        classify_git(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn loose_object_maintenance_preserves_unreachable_objects_and_pending_work() {
+        let temporary = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(temporary.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.name", "Fixture"]);
+        run(&["config", "user.email", "fixture@example.invalid"]);
+        std::fs::write(temporary.path().join("tracked"), b"committed").unwrap();
+        run(&["add", "tracked"]);
+        run(&["commit", "-qm", "base"]);
+        let head = run(&["rev-parse", "HEAD"]);
+        std::fs::write(temporary.path().join("pending"), b"uncommitted").unwrap();
+        let object = run(&["hash-object", "-w", "pending"]);
+        let status = run(&["status", "--porcelain=v1"]);
+        let index = std::fs::read(temporary.path().join(".git/index")).ok();
+        let resolution = temporary.path().join(".git/rr-cache/fixture/postimage");
+        std::fs::create_dir_all(resolution.parent().unwrap()).unwrap();
+        std::fs::write(&resolution, b"saved resolution").unwrap();
+        run(&[
+            "-c",
+            "pack.threads=1",
+            "maintenance",
+            "run",
+            "--task=loose-objects",
+        ]);
+        assert_eq!(run(&["rev-parse", "HEAD"]), head);
+        assert_eq!(run(&["cat-file", "blob", object.trim()]), "uncommitted");
+        assert_eq!(run(&["status", "--porcelain=v1"]), status);
+        assert_eq!(
+            std::fs::read(temporary.path().join(".git/index")).ok(),
+            index
+        );
+        assert_eq!(std::fs::read(resolution).unwrap(), b"saved resolution");
+    }
+
+    #[test]
+    fn only_closed_non_pruning_maintenance_uses_write_authority() {
+        assert_eq!(
+            classify(&["maintenance", "run", "--task=loose-objects"]),
+            Some(OperationEffect::Write)
+        );
+        for args in [
+            vec!["maintenance", "run"],
+            vec!["maintenance", "run", "--task=gc"],
+            vec!["maintenance", "run", "--task=loose-objects", "--task=gc"],
+            vec!["maintenance", "start"],
+            vec!["prune", "--expire=now"],
+            vec!["repack", "-ad"],
+            vec!["rerere", "gc"],
+        ] {
+            assert_eq!(
+                classify(&args),
+                Some(OperationEffect::Destructive),
+                "{args:?}"
+            );
+        }
+        let args = ["maintenance", "run", "--task=loose-objects"].map(str::to_owned);
+        assert_eq!(
+            git_scopes::resource_scope(&args),
+            None,
+            "maintenance must retain the repository-wide lock"
+        );
+    }
+}
