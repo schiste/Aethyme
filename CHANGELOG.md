@@ -17,6 +17,8 @@ artifacts and their exact source revision are recorded in each signed
 
 ### Fixed
 
+- Contract checks use a memory-bounded literal index instead of a regex-set fallback that could time out on large integration diffs, preserving symbol boundaries and per-file removal accounting.
+
 - Environment cache reclamation uses bounded inventories, exact filesystem identity, coordinated use checks and resumable deletion journals. Incomplete evidence retains cache entries; cache storage is not yet charged to the managed-storage ledger.
 - Bundled resource requests receive distinct ports and cumulative same-pool capacity checks; environment pin and busy limits are validated consistently.
 - Closed-session finish remains idempotent without rebinding ownership. Cleanup writer tests and captured child output have bounded waits.
