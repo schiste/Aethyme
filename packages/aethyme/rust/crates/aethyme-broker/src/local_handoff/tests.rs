@@ -5,6 +5,13 @@ use std::io::Write;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
+/// How long a handoff that must expire mid-test stays valid. It has to
+/// outlast qualifying and dispatching it, which took over 5 s on a loaded
+/// macOS host and failed dispatch as `Stale`; the tests sleep through the
+/// rest of it.
+#[cfg(unix)]
+const EXPIRY_WINDOW_MS: i64 = 20_000;
+
 fn agent(f: &mut Fixture) -> Agent {
     appoint(&mut f.v.f.store, &f.v.owner, "controlled-agent").unwrap()
 }
@@ -786,7 +793,7 @@ fn expired_completed_leader_is_historical_but_does_not_strand_new_appointment() 
         &f.evidence,
     )
     .unwrap();
-    let expiry = now().unwrap() + 5_000;
+    let expiry = now().unwrap() + EXPIRY_WINDOW_MS;
     let r = prepare(
         &mut f.v.f.store,
         &f.v.owner,
@@ -885,7 +892,7 @@ fn expiry_while_completion_guard_is_held_cannot_commit_current_classification() 
         &f.evidence,
     )
     .unwrap();
-    let expiry = now().unwrap() + 5_000;
+    let expiry = now().unwrap() + EXPIRY_WINDOW_MS;
     let r = prepare(
         &mut f.v.f.store,
         &f.v.owner,
