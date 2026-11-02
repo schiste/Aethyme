@@ -3088,6 +3088,9 @@ enum TaskLeaseCommandClass {
 fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseCommandClass {
     let action = parsed.positional.first().map(String::as_str);
     let nested_action = parsed.positional.get(1).map(String::as_str);
+    if sessionless_automation_command(subcommand, parsed) {
+        return TaskLeaseCommandClass::NoSessionWork;
+    }
     match subcommand {
         "prepare" if action == Some("status") => TaskLeaseCommandClass::ObservationOnly,
         "leases" if matches!(action, None | Some("plan" | "explain" | "export")) => {
@@ -3179,6 +3182,16 @@ fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseComma
         }
         _ => TaskLeaseCommandClass::NoSessionWork,
     }
+}
+
+/// Commands an automation runs for itself, without a session. The cwd may
+/// still be a registered session's worktree, so they must not renew that
+/// session's task lease or mark its advisories delivered. They still write,
+/// so they are not observation-only.
+fn sessionless_automation_command(subcommand: &str, parsed: &Parsed) -> bool {
+    subcommand == "note"
+        && parsed.positional.first().map(String::as_str) == Some("send")
+        && parsed.note_from.is_some()
 }
 
 /// These operations need to reach their domain handler for the established
@@ -3359,7 +3372,9 @@ fn surface_command_advisories(subcommand: &str, parsed: &Parsed) {
     // Internal hooks are not interactive broker commands. Pre-commit remains
     // quiet on success, while post-commit surfaces through run_post_commit
     // after its conflict radar and therefore does not print twice.
-    if matches!(subcommand, "hooks" | "readiness" | "storage") {
+    if matches!(subcommand, "hooks" | "readiness" | "storage")
+        || sessionless_automation_command(subcommand, parsed)
+    {
         return;
     }
     let Ok(cwd) = std::env::current_dir() else {
