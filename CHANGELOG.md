@@ -4,6 +4,27 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.54] - 2026-11-02
+
+### Added
+
+- Repository-level keep-awake caps: `max_pin_seconds` and `max_exec_busy_seconds` in `environments.toml` tighten the host limits for that repository and take effect on the next `env up` without a reconfigure; `env pin --for` past the repository cap is refused with `pin_too_long`.
+- Template retention by count: a component's `template_keep` keeps its newest N templates, and cache pruning protects them instead of evicting the oldest first.
+- Prebuilt environment artifacts (#1237, #1366): declared prebuilds run when the default branch advances, during quiet windows, for templates or cacheable builds, with an optional host memory gate and preemption when an environment becomes active. A fetch or push queues them; `AETHYME_PREBUILD_NUDGE=0` turns that off.
+- Automation outcomes (#1238): `broker advanced owners --commits` resolves landed commits to the sessions that produced them, `note send --from automation:<name>` reaches live sessions, and `[[automation.outcomes]]` rules with `broker advanced outcomes report` file, update and resolve one issue per outcome and notify the responsible sessions. Sustained budget breaches can route through a `budget:environments` rule.
+- Reviewed recovery of a stale Git `objects/maintenance.lock`, and storage reports that include the shared object database and rerere cache.
+- `resources pressure` and `status doctor` report preparation-cache rotation recovery progress per repository.
+
+### Fixed
+
+- Preparation-cache rotation recovery converges on large caches (#1236): it works in bounded slices up to ten minutes and stops only when a slice makes no progress, instead of failing every attempt at a fixed five-second deadline.
+- An `env up` waiting on a cache key held by a long prebuild waits for that build instead of timing out after 30 minutes.
+- Storage plans bound preparation-cache liveness checks under one deadline instead of rehashing every live checkout per cache store.
+- `enhance` honours Cargo `workspace.exclude` when inventorying members (#1363).
+- `broker advanced owners` and automation `note send` no longer open mutable broker state or act for the session whose worktree they run from.
+
+The broker database advances to schema 61 (one additive table); the compatibility floor stays at 60, so 0.8.53 binaries keep working against an upgraded store and rollback is unrestricted.
+
 ## [0.8.53] - 2026-11-01
 
 **Breaking:** see [UPGRADING.md](UPGRADING.md#v0853).
