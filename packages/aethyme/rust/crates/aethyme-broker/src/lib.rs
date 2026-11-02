@@ -107,6 +107,7 @@ mod gates;
 mod gc;
 mod gh_ref_guard;
 mod git;
+mod git_maintenance_lock;
 mod github_target;
 mod graph_impact;
 mod graph_impact_envelope;
@@ -672,9 +673,10 @@ pub use storage::{
     STORAGE_RECONCILIATION_SCHEMA_VERSION, StorageAppliedItem, StorageApplyFailure,
     StorageApplyReport, StorageAttribution, StorageAttributionReport, StorageCandidate,
     StorageCandidateKind, StorageDirectoryKind, StorageEntry, StorageError, StorageFilesystemKind,
-    StorageMarkerStatus, StoragePlan, StoragePrimaryArtifact, StoragePrimaryCandidate,
-    StoragePrimaryCheckout, StorageReconciliation, StorageRecoveryArchiveGroup, StorageRoot,
-    StorageSource, StorageSummary, storage_apply, storage_attribute, storage_plan,
+    StorageGitEntry, StorageMarkerStatus, StoragePlan, StoragePrimaryArtifact,
+    StoragePrimaryCandidate, StoragePrimaryCheckout, StorageReconciliation,
+    StorageRecoveryArchiveGroup, StorageRoot, StorageSource, StorageSummary, storage_apply,
+    storage_attribute, storage_plan,
 };
 pub use store::BrokerStore;
 pub use types::{

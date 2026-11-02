@@ -2663,6 +2663,13 @@ pub(crate) fn refuse_repeated_program_name(
 
 /// Refuse global options that change what a coordinated Git command executes.
 pub(crate) fn refuse_code_executing_git_options(args: &[String]) -> Result<(), BrokerOpError> {
+    refuse_code_executing_git_options_with_env(args, |name| std::env::var_os(name).is_some())
+}
+
+fn refuse_code_executing_git_options_with_env(
+    args: &[String],
+    mut env_present: impl FnMut(&str) -> bool,
+) -> Result<(), BrokerOpError> {
     let refuse = |what: &str| {
         Err(BrokerOpError::InvalidCoordinatedOperation {
             reason: format!(
@@ -2672,9 +2679,31 @@ pub(crate) fn refuse_code_executing_git_options(args: &[String]) -> Result<(), B
         })
     };
     let end = git_subcommand_index(args).unwrap_or(args.len());
+    let maintenance = args
+        .get(end)
+        .is_some_and(|command| command == "maintenance");
+    if maintenance
+        && git_scopes::GIT_REPOSITORY_ROUTING_ENV_NAMES
+            .iter()
+            .any(|name| env_present(name))
+    {
+        return Err(BrokerOpError::InvalidCoordinatedOperation {
+            reason: "coordinated Git maintenance refuses ambient repository-routing overrides"
+                .into(),
+        });
+    }
     let mut index = 0;
     while index < end {
         let arg = args[index].as_str();
+        if maintenance
+            && ["--git-dir", "--work-tree", "--namespace", "--super-prefix"]
+                .iter()
+                .any(|option| arg == *option || arg.starts_with(&format!("{option}=")))
+        {
+            return Err(BrokerOpError::InvalidCoordinatedOperation {
+                reason: "coordinated Git maintenance must remain bound to the owning repository; repository-routing options are refused".into(),
+            });
+        }
         let (key, consumed) = if arg == "-c" || arg == "--config-env" {
             (args.get(index + 1).map(String::as_str).unwrap_or(""), 2)
         } else if let Some(inline) = arg.strip_prefix("--config-env=") {
@@ -2952,9 +2981,35 @@ pub fn classify_git(args: &[String]) -> Option<OperationEffect> {
         {
             Some(OperationEffect::Destructive)
         }
+        // Only these closed maintenance profiles avoid reachability pruning.
+        // Keep the repository-wide coordinator lane (no narrow resource scope).
+        "maintenance"
+            if args.iter().map(String::as_str).eq([
+                "maintenance",
+                "run",
+                "--task=loose-objects",
+            ]) || args.iter().map(String::as_str).eq([
+                "maintenance",
+                "run",
+                "--no-quiet",
+                "--task=loose-objects",
+            ]) =>
+        {
+            Some(OperationEffect::Write)
+        }
+        "maintenance" | "gc" | "prune" | "prune-packed" | "repack" => {
+            Some(OperationEffect::Destructive)
+        }
+        "rerere"
+            if args
+                .get(1)
+                .is_some_and(|action| matches!(action.as_str(), "gc" | "clear" | "forget")) =>
+        {
+            Some(OperationEffect::Destructive)
+        }
         "reflog" if has_any(args, &["delete", "expire"]) => Some(OperationEffect::Destructive),
         "add" | "am" | "apply" | "checkout" | "cherry-pick" | "clone" | "commit" | "fetch"
-        | "gc" | "init" | "merge" | "mv" | "notes" | "pull" | "rebase" | "replace" | "restore"
+        | "init" | "merge" | "mv" | "notes" | "pull" | "rebase" | "replace" | "restore"
         | "revert" | "rm" | "stash" | "submodule" | "switch" | "worktree" | "reset" | "clean"
         | "reflog" => Some(OperationEffect::Write),
         _ => None,
@@ -3383,3 +3438,156 @@ mod push_and_coordinated;
 mod redaction;
 pub(crate) use push_and_coordinated::{github_command, is_within, worktree_relative_push_sources};
 use push_and_coordinated::{is_github_pull_request_merge, provider_command};
+
+#[cfg(test)]
+mod git_storage_maintenance_tests {
+    use super::*;
+
+    fn classify(args: &[&str]) -> Option<OperationEffect> {
+        classify_git(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn loose_object_maintenance_preserves_unreachable_objects_and_pending_work() {
+        let temporary = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let mut command = std::process::Command::new("git");
+            for (key, _) in std::env::vars_os() {
+                if key.to_string_lossy().starts_with("GIT_") {
+                    command.env_remove(key);
+                }
+            }
+            let output = command
+                .current_dir(temporary.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.name", "Fixture"]);
+        run(&["config", "user.email", "fixture@example.invalid"]);
+        std::fs::write(temporary.path().join("tracked"), b"committed").unwrap();
+        run(&["add", "tracked"]);
+        run(&["commit", "-qm", "base"]);
+        let head = run(&["rev-parse", "HEAD"]);
+        std::fs::write(temporary.path().join("pending"), b"uncommitted").unwrap();
+        let object = run(&["hash-object", "-w", "pending"]);
+        let status = run(&["status", "--porcelain=v1"]);
+        let index = std::fs::read(temporary.path().join(".git/index")).ok();
+        let resolution = temporary.path().join(".git/rr-cache/fixture/postimage");
+        std::fs::create_dir_all(resolution.parent().unwrap()).unwrap();
+        std::fs::write(&resolution, b"saved resolution").unwrap();
+        let pack_count = || {
+            std::fs::read_dir(temporary.path().join(".git/objects/pack"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "pack")
+                })
+                .count()
+        };
+        let packs_before = pack_count();
+        run(&[
+            "-c",
+            "pack.threads=1",
+            "maintenance",
+            "run",
+            "--no-quiet",
+            "--task=loose-objects",
+        ]);
+        assert!(
+            pack_count() > packs_before,
+            "maintenance must perform real packing, not silently skip"
+        );
+        assert_eq!(run(&["rev-parse", "HEAD"]), head);
+        assert_eq!(run(&["cat-file", "blob", object.trim()]), "uncommitted");
+        assert_eq!(run(&["status", "--porcelain=v1"]), status);
+        assert_eq!(
+            std::fs::read(temporary.path().join(".git/index")).ok(),
+            index
+        );
+        assert_eq!(std::fs::read(resolution).unwrap(), b"saved resolution");
+    }
+
+    #[test]
+    fn maintenance_admission_refuses_ambient_routing_without_changing_process_environment() {
+        let args = ["maintenance", "run", "--task=loose-objects"].map(str::to_owned);
+        for name in git_scopes::GIT_REPOSITORY_ROUTING_ENV_NAMES {
+            assert!(refuse_code_executing_git_options_with_env(&args, |key| key == *name).is_err());
+        }
+        assert!(refuse_code_executing_git_options_with_env(&args, |_| false).is_ok());
+        for name in ["GIT_SSH_COMMAND", "GIT_SSH", "GIT_PROXY_COMMAND"] {
+            assert!(refuse_code_executing_git_options_with_env(&args, |key| key == name).is_ok());
+        }
+    }
+
+    #[test]
+    fn maintenance_admission_stays_bound_to_its_repository() {
+        for option in ["--git-dir", "--work-tree", "--namespace", "--super-prefix"] {
+            for mut prefix in [
+                vec![format!("{option}=/other")],
+                vec![option.into(), "/other".into()],
+            ] {
+                prefix.extend(["maintenance", "run", "--task=loose-objects"].map(str::to_owned));
+                assert!(
+                    refuse_code_executing_git_options(&prefix).is_err(),
+                    "{prefix:?}"
+                );
+            }
+        }
+        let args = [
+            "-c",
+            "pack.threads=1",
+            "maintenance",
+            "run",
+            "--task=loose-objects",
+        ]
+        .map(str::to_owned);
+        assert!(refuse_code_executing_git_options(&args).is_ok());
+        assert_eq!(classify_git(&args), Some(OperationEffect::Write));
+    }
+
+    #[test]
+    fn only_closed_non_pruning_maintenance_uses_write_authority() {
+        assert_eq!(
+            classify(&["maintenance", "run", "--task=loose-objects"]),
+            Some(OperationEffect::Write)
+        );
+        assert_eq!(
+            classify(&["maintenance", "run", "--no-quiet", "--task=loose-objects"]),
+            Some(OperationEffect::Write)
+        );
+        for args in [
+            vec!["maintenance", "run"],
+            vec!["maintenance", "run", "--task=gc"],
+            vec!["maintenance", "run", "--task=loose-objects", "--task=gc"],
+            vec!["maintenance", "start"],
+            vec!["gc"],
+            vec!["gc", "--auto"],
+            vec!["gc", "--prune=now"],
+            vec!["prune", "--expire=now"],
+            vec!["prune-packed"],
+            vec!["repack", "-ad"],
+            vec!["rerere", "gc"],
+        ] {
+            assert_eq!(
+                classify(&args),
+                Some(OperationEffect::Destructive),
+                "{args:?}"
+            );
+        }
+        let args = ["maintenance", "run", "--task=loose-objects"].map(str::to_owned);
+        assert_eq!(
+            git_scopes::resource_scope(&args),
+            None,
+            "maintenance must retain the repository-wide lock"
+        );
+    }
+}
