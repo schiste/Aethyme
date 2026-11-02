@@ -1202,7 +1202,7 @@ pub(super) fn run_ownership(parsed: Parsed) -> Result<(), UsageError> {
     };
     match parsed.positional.first().map(String::as_str) {
         None | Some("list") => {
-            let claims = broker.ownership_claims()?;
+            let claims = broker.ownership_claims_snapshot()?;
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&claims)?);
             } else if claims.is_empty() {
@@ -1351,6 +1351,207 @@ mod tests {
         assert_eq!(
             history["notes_command"],
             "aethyme broker advanced note list --session 5"
+        );
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct OwnershipListDbState {
+        origin: String,
+        status: String,
+        pid: Option<i64>,
+        updated_at: i64,
+        last_activity_at: i64,
+        event_count: i64,
+        lease_count: i64,
+        claim_count: i64,
+    }
+
+    fn ownership_list_db_state(
+        database: &std::path::Path,
+        session_id: i64,
+    ) -> OwnershipListDbState {
+        let connection = rusqlite::Connection::open(database).unwrap();
+        connection
+            .query_row(
+                "SELECT origin, status, pid, updated_at, last_activity_at,
+                        (SELECT COUNT(*) FROM events WHERE session_id = s.id),
+                        (SELECT COUNT(*) FROM leases WHERE session_id = s.id),
+                        (SELECT COUNT(*) FROM ownership_claims WHERE session_id = s.id)
+                   FROM sessions s
+                  WHERE id = ?1",
+                [session_id],
+                |row| {
+                    Ok(OwnershipListDbState {
+                        origin: row.get(0)?,
+                        status: row.get(1)?,
+                        pid: row.get(2)?,
+                        updated_at: row.get(3)?,
+                        last_activity_at: row.get(4)?,
+                        event_count: row.get(5)?,
+                        lease_count: row.get(6)?,
+                        claim_count: row.get(7)?,
+                    })
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn read_only_ownership_list_preserves_dead_spawned_session_state() {
+        const CHILD_ENV: &str = "AETHYME_OWNERSHIP_LIST_READ_ONLY_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let args = [
+                "ownership".to_owned(),
+                "list".to_owned(),
+                "--json".to_owned(),
+            ];
+            super::super::run_inner(&args, &super::super::CompatibilityMode::Normal)
+                .expect("ownership list must work against a query-only snapshot");
+
+            let repository = std::env::current_dir().unwrap();
+            let mut snapshot = crate::Broker::open_snapshot(&repository).unwrap();
+            let query_only: bool = snapshot
+                .store()
+                .connection()
+                .pragma_query_value(None, "query_only", |row| row.get(0))
+                .unwrap();
+            assert!(
+                query_only,
+                "the CLI list fixture must use a query-only database"
+            );
+            assert!(
+                snapshot.ownership_claims_snapshot().unwrap().is_empty(),
+                "the dead spawned session's claim is no longer current"
+            );
+            return;
+        }
+
+        fn isolate_git_environment(command: &mut std::process::Command) {
+            command
+                .env("GIT_NO_REPLACE_OBJECTS", "1")
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env_remove("GIT_GRAFT_FILE");
+            for name in [
+                "GIT_DIR",
+                "GIT_COMMON_DIR",
+                "GIT_WORK_TREE",
+                "GIT_INDEX_FILE",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_OBJECT_DIRECTORY_RELATIVE",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_NAMESPACE",
+                "GIT_REPLACE_REF_BASE",
+                "GIT_SHALLOW_FILE",
+                "GIT_CEILING_DIRECTORIES",
+                "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+                "GIT_PREFIX",
+                "GIT_CONFIG",
+                "GIT_CONFIG_SYSTEM",
+                "GIT_CONFIG_GLOBAL",
+                "GIT_CONFIG_PARAMETERS",
+                "GIT_CONFIG_COUNT",
+            ] {
+                command.env_remove(name);
+            }
+            for (name, _) in std::env::vars_os() {
+                let name = name.to_string_lossy();
+                if name.starts_with("GIT_CONFIG_KEY_") || name.starts_with("GIT_CONFIG_VALUE_") {
+                    command.env_remove(name.as_ref());
+                }
+            }
+        }
+
+        fn git(root: &std::path::Path, args: &[&str]) {
+            let mut command = std::process::Command::new("git");
+            isolate_git_environment(&mut command);
+            let output = command
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "ownership list test")
+                .env("GIT_AUTHOR_EMAIL", "ownership-list@example.invalid")
+                .env("GIT_COMMITTER_NAME", "ownership list test")
+                .env("GIT_COMMITTER_EMAIL", "ownership-list@example.invalid")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let repository = tempfile::tempdir().unwrap();
+        git(repository.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(repository.path().join("tracked.txt"), "fixture\n").unwrap();
+        git(repository.path(), &["add", "tracked.txt"]);
+        git(repository.path(), &["commit", "-qm", "fixture"]);
+
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(repository.path()).unwrap();
+        let session = broker
+            .start_worktree("read-only ownership list fixture", None)
+            .unwrap();
+        broker
+            .claim_ownership(
+                session.id,
+                "read-only ownership list fixture",
+                "exercise side-effect-free listing",
+            )
+            .unwrap();
+        broker.claim_lease(session.id, "tracked.txt", None).unwrap();
+
+        let database = broker.store().db_path().to_path_buf();
+        let dead_pid = i64::from(i32::MAX - 1);
+        broker
+            .store()
+            .connection_mut()
+            .execute(
+                "UPDATE sessions SET pid = ?1 WHERE id = ?2",
+                rusqlite::params![dead_pid, session.id],
+            )
+            .unwrap();
+        let before = ownership_list_db_state(&database, session.id);
+        assert_eq!(before.origin, "spawned");
+        assert_eq!(before.status, "active");
+        assert_eq!(before.pid, Some(dead_pid));
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        isolate_git_environment(&mut child);
+        child
+            .arg("read_only_ownership_list_preserves_dead_spawned_session_state")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "true")
+            .current_dir(repository.path());
+        broker
+            .configure_storage_context_for_child(&mut child)
+            .expect("bind the child CLI to fixture-owned storage");
+        drop(broker);
+
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "read-only ownership list failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            ownership_list_db_state(&database, session.id),
+            before,
+            "read-only ownership list must not rewrite session, activity, event, lease, or claim state"
+        );
+
+        let writable = storage.open(repository.path()).unwrap();
+        let before_writable_list = ownership_list_db_state(&database, session.id);
+        assert!(
+            writable.ownership_claims_snapshot().unwrap().is_empty(),
+            "the snapshot API returns the current view on a writable broker too"
+        );
+        drop(writable);
+        assert_eq!(
+            ownership_list_db_state(&database, session.id),
+            before_writable_list,
+            "ownership listing remains observational with a writable store handle"
         );
     }
 }
