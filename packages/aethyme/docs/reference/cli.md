@@ -640,8 +640,9 @@ a reason.
 - `aethyme broker advanced exposures plan [--json]`
 - `aethyme broker advanced exposures apply --session <id> --confirm <sha256> [--json]`
 - `aethyme broker advanced note send --session <sender> --to-session <recipient> --message <text> [--json]`
+- `aethyme broker advanced note send --from automation:<name> --to-session <recipient> --message <text> [--fingerprint <key>] [--json]`
 - `aethyme broker advanced note list --session <recipient> [--json]`
-- `aethyme broker advanced note ack --session <recipient> --id <note-id> [--json]`
+- `aethyme broker advanced note ack --session <recipient> (--id <note-id> | --automation-id <note-id>) [--json]`
 
 Repository-owned dependency preparation is optional and declarative. When
 `.aethyme/prepare.toml` exists, `start` and `adopt` return a structured
@@ -1088,6 +1089,18 @@ Note text remains only in the repository's broker database. The append-only
 timestamps, and the sent byte count, never message text. Notes are for terse
 handoffs such as “coordinate `src/router.rs` before editing”; they do not claim
 paths, refresh leases, alter gates, or replace task descriptions.
+
+An automation, which has no session, sends with `--from automation:<name>`
+instead of `--session` (#1238); the name is 1-64 lowercase letters, digits,
+`.`, `_` or `-`. The same message bounds apply, and the recipient must not be
+closed. With `--fingerprint <key>`, a repeat from the same sender while its
+earlier note to that recipient is unread is not queued again: the earlier note
+is returned with `deduplicated: true`. Automation notes surface on stderr with
+their own `note ack --automation-id <id>` command, reach the agent through the
+`UserPromptSubmit` and `PostToolUse` hooks without a reply line, and list under
+`automation_notes` in `note list`, whose `unread_count` counts both kinds.
+Their events, `automation.note.sent` and `automation.note.acknowledged`, carry
+the sender label, routing IDs and byte count, never message text.
 
 Every promotion also creates one authoritative path exposure owned by its
 queue entry. It contains the exact promoted SHA and repository-relative path

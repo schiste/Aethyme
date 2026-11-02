@@ -472,6 +472,8 @@ const ADVISORY_SELECT: &str = "SELECT id, identity, session_id, severity, queue_
      suppressed_at, resolved_at, resolution_evidence, audience, producer \
      FROM advisories";
 
+const AUTOMATION_NOTE_SELECT: &str = "SELECT id, sender, recipient_session_id, message, \
+     fingerprint, created_at, acknowledged_at FROM automation_notes";
 const SESSION_NOTE_SELECT: &str = "SELECT id, sender_session_id, recipient_session_id, message, \
      created_at, acknowledged_at FROM session_notes";
 
@@ -1672,6 +1674,20 @@ fn advisory_delivery_metric_from_row(
                 .transpose()?,
         })
     })())
+}
+
+fn automation_note_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<crate::types::AutomationNote, rusqlite::Error> {
+    Ok(crate::types::AutomationNote {
+        id: row.get(0)?,
+        sender: row.get(1)?,
+        recipient_session_id: row.get(2)?,
+        message: row.get(3)?,
+        fingerprint: row.get(4)?,
+        created_at: row.get(5)?,
+        acknowledged_at: row.get(6)?,
+    })
 }
 
 fn session_note_from_row(row: &rusqlite::Row<'_>) -> Result<SessionNote, rusqlite::Error> {
