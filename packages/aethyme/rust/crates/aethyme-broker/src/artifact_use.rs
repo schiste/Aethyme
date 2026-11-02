@@ -20,7 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const MARKER_SCHEMA_VERSION: u32 = 1;
+const LEGACY_MARKER_SCHEMA_VERSION: u32 = 1;
+const STABLE_MARKER_SCHEMA_VERSION: u32 = 2;
 // B1's fail-closed reclaimer allowances below stay item-scoped. The same
 // inventory bound also caps explicit marker reconciliation.
 const MAX_MARKERS_PER_CHECKOUT: usize = 256;
@@ -72,9 +73,13 @@ pub(crate) struct ArtifactUseMarker {
     pub(crate) primary_root: String,
     pub(crate) primary_device: u64,
     pub(crate) primary_inode: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) primary_volume_uuid: Option<[u8; 16]>,
     pub(crate) checkout_root: String,
     pub(crate) checkout_device: u64,
     pub(crate) checkout_inode: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) checkout_volume_uuid: Option<[u8; 16]>,
     pub(crate) checkout_key: String,
     pub(crate) session_id: i64,
     pub(crate) invocation_id: String,
@@ -236,8 +241,10 @@ pub(crate) struct ArtifactUseReconcileReport {
 struct ArtifactUseLocations {
     primary_root: PathBuf,
     primary_identity: DirectoryIdentity,
+    primary_volume_uuid: Option<[u8; 16]>,
     checkout_root: PathBuf,
     checkout_identity: DirectoryIdentity,
+    checkout_volume_uuid: Option<[u8; 16]>,
     checkout_key: String,
     runtime_dir: PathBuf,
     layout_lock_path: PathBuf,
@@ -250,7 +257,9 @@ impl ArtifactUseLocations {
         let primary_root = primary_root.canonicalize()?;
         let checkout_root = checkout_root.canonicalize()?;
         let primary_identity = directory_identity(&primary_root)?;
+        let primary_volume_uuid = capture_stable_volume_uuid(&primary_root, &primary_identity);
         let checkout_identity = directory_identity(&checkout_root)?;
+        let checkout_volume_uuid = capture_stable_volume_uuid(&checkout_root, &checkout_identity);
         let checkout_key = checkout_key(&checkout_root)?;
 
         let run_dir = super::repository_runtime_directory(&primary_root)?;
@@ -270,8 +279,10 @@ impl ArtifactUseLocations {
         Ok(Self {
             primary_root,
             primary_identity,
+            primary_volume_uuid,
             checkout_root,
             checkout_identity,
+            checkout_volume_uuid,
             layout_lock_path: runtime_dir.join(format!("{checkout_key}.init.lock")),
             lock_path: runtime_dir.join(format!("{checkout_key}.lock")),
             marker_dir: runtime_dir.join(format!("{checkout_key}.markers")),
@@ -367,25 +378,130 @@ impl ArtifactUseLocations {
     }
 
     fn marker_for(&self, marker: &ArtifactUseMarker) -> io::Result<()> {
-        if marker.schema_version != MARKER_SCHEMA_VERSION
-            || marker.primary_root != path_text(&self.primary_root)?
-            || marker.primary_device != self.primary_identity.device
-            || marker.primary_inode != self.primary_identity.inode
-            || marker.checkout_root != path_text(&self.checkout_root)?
-            || marker.checkout_device != self.checkout_identity.device
-            || marker.checkout_inode != self.checkout_identity.inode
-            || marker.checkout_key != self.checkout_key
-            || marker.nonce.is_empty()
-            || marker.session_id < 0
-            || marker.invocation_id.is_empty()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "artifact-use marker does not match its primary and checkout identities",
-            ));
+        if let Some(reason) = marker_identity_mismatch(self, marker, true) {
+            return Err(invalid_marker(reason));
         }
         Ok(())
     }
+
+    fn new_marker_volume_evidence(&self) -> (u32, Option<[u8; 16]>, Option<[u8; 16]>) {
+        match (self.primary_volume_uuid, self.checkout_volume_uuid) {
+            (Some(primary), Some(checkout))
+                if stable_volume_uuid_is_nonzero(&primary)
+                    && stable_volume_uuid_is_nonzero(&checkout) =>
+            {
+                (STABLE_MARKER_SCHEMA_VERSION, Some(primary), Some(checkout))
+            }
+            _ => (LEGACY_MARKER_SCHEMA_VERSION, None, None),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn capture_stable_volume_uuid(path: &Path, identity: &DirectoryIdentity) -> Option<[u8; 16]> {
+    let uuid = crate::worktree_registry::stable_volume_uuid_for_object(
+        path,
+        identity.device,
+        identity.inode,
+    )
+    .ok()?;
+    stable_volume_uuid_is_nonzero(&uuid).then_some(uuid)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn capture_stable_volume_uuid(_path: &Path, _identity: &DirectoryIdentity) -> Option<[u8; 16]> {
+    None
+}
+
+fn stable_volume_uuid_is_nonzero(uuid: &[u8; 16]) -> bool {
+    uuid.iter().any(|byte| *byte != 0)
+}
+
+fn marker_identity_mismatch(
+    locations: &ArtifactUseLocations,
+    marker: &ArtifactUseMarker,
+    require_legacy_primary_device_match: bool,
+) -> Option<&'static str> {
+    let schema_mismatch = match marker.schema_version {
+        LEGACY_MARKER_SCHEMA_VERSION
+            if marker.primary_volume_uuid.is_none() && marker.checkout_volume_uuid.is_none() =>
+        {
+            None
+        }
+        LEGACY_MARKER_SCHEMA_VERSION => {
+            Some("artifact-use marker schema 1 must not contain stable volume UUIDs")
+        }
+        STABLE_MARKER_SCHEMA_VERSION => {
+            match (marker.primary_volume_uuid, marker.checkout_volume_uuid) {
+                (Some(primary), Some(checkout))
+                    if stable_volume_uuid_is_nonzero(&primary)
+                        && stable_volume_uuid_is_nonzero(&checkout) =>
+                {
+                    None
+                }
+                _ => Some("artifact-use marker schema 2 requires two nonzero stable volume UUIDs"),
+            }
+        }
+        _ => Some("artifact-use marker schema version is unsupported"),
+    };
+    if let Some(reason) = schema_mismatch {
+        return Some(reason);
+    }
+
+    let Some(primary_root) = locations.primary_root.to_str() else {
+        return Some("artifact-use primary root path is not representable as UTF-8");
+    };
+    if marker.primary_root != primary_root {
+        return Some("artifact-use marker primary root path does not match");
+    }
+    if marker.primary_inode != locations.primary_identity.inode {
+        return Some("artifact-use marker primary root inode does not match");
+    }
+    let Some(checkout_root) = locations.checkout_root.to_str() else {
+        return Some("artifact-use checkout root path is not representable as UTF-8");
+    };
+    if marker.checkout_root != checkout_root {
+        return Some("artifact-use marker checkout root path does not match");
+    }
+    if marker.checkout_inode != locations.checkout_identity.inode {
+        return Some("artifact-use marker checkout root inode does not match");
+    }
+    if marker.checkout_key != locations.checkout_key {
+        return Some("artifact-use marker checkout key does not match");
+    }
+
+    match marker.schema_version {
+        LEGACY_MARKER_SCHEMA_VERSION => {
+            if require_legacy_primary_device_match
+                && marker.primary_device != locations.primary_identity.device
+            {
+                return Some("artifact-use marker primary root device does not match");
+            }
+            if marker.checkout_device != locations.checkout_identity.device {
+                return Some("artifact-use marker checkout root device does not match");
+            }
+        }
+        STABLE_MARKER_SCHEMA_VERSION => {
+            if marker.primary_volume_uuid != locations.primary_volume_uuid {
+                return Some("artifact-use marker primary stable volume UUID does not match");
+            }
+            if marker.checkout_volume_uuid != locations.checkout_volume_uuid {
+                return Some("artifact-use marker checkout stable volume UUID does not match");
+            }
+        }
+        _ => return Some("artifact-use marker schema version is unsupported"),
+    }
+
+    if marker.nonce.is_empty() {
+        return Some("artifact-use marker nonce is empty");
+    }
+    if marker.session_id < 0 {
+        return Some("artifact-use marker session ID is invalid");
+    }
+    if marker.invocation_id.is_empty() {
+        return Some("artifact-use marker invocation ID is empty");
+    }
+    None
 }
 
 /// A shared producer claim. Dropping this value releases only the advisory
@@ -641,15 +757,19 @@ fn begin_artifact_use_with_layout_wait(
 
     let nonce = next_nonce();
     let marker_path = locations.marker_dir.join(format!("{nonce}.json"));
+    let (schema_version, primary_volume_uuid, checkout_volume_uuid) =
+        locations.new_marker_volume_evidence();
     let marker = ArtifactUseMarker {
-        schema_version: MARKER_SCHEMA_VERSION,
+        schema_version,
         nonce,
         primary_root: path_text(&locations.primary_root)?,
         primary_device: locations.primary_identity.device,
         primary_inode: locations.primary_identity.inode,
+        primary_volume_uuid,
         checkout_root: path_text(&locations.checkout_root)?,
         checkout_device: locations.checkout_identity.device,
         checkout_inode: locations.checkout_identity.inode,
+        checkout_volume_uuid,
         checkout_key: locations.checkout_key.clone(),
         session_id,
         invocation_id: invocation_id.to_owned(),
@@ -1295,7 +1415,9 @@ fn resolve_existing_locations(
     let primary_root = primary_root.canonicalize()?;
     let checkout_root = checkout_root.canonicalize()?;
     let primary_identity = directory_identity(&primary_root)?;
+    let primary_volume_uuid = capture_stable_volume_uuid(&primary_root, &primary_identity);
     let checkout_identity = directory_identity(&checkout_root)?;
+    let checkout_volume_uuid = capture_stable_volume_uuid(&checkout_root, &checkout_identity);
     let checkout_key = checkout_key(&checkout_root)?;
     let state_dir = primary_root.join(".aethyme");
     let run_dir = state_dir.join("run");
@@ -1332,8 +1454,10 @@ fn resolve_existing_locations(
     Ok(ArtifactUseLocations {
         primary_root,
         primary_identity,
+        primary_volume_uuid,
         checkout_root,
         checkout_identity,
+        checkout_volume_uuid,
         runtime_dir: runtime_dir.clone(),
         layout_lock_path: runtime_dir.join(format!("{checkout_key}.init.lock")),
         lock_path: runtime_dir.join(format!("{checkout_key}.lock")),
@@ -1478,25 +1602,8 @@ fn reconciliation_disposition(
     let unknown = |reason: &str| ArtifactUseReconcileDisposition::Unknown {
         reason: reason.to_owned(),
     };
-    let primary_path = match path_text(&locations.primary_root) {
-        Ok(path) => path,
-        Err(_) => return retain("primary root path is not representable as UTF-8"),
-    };
-    let checkout_path = match path_text(&locations.checkout_root) {
-        Ok(path) => path,
-        Err(_) => return retain("checkout path is not representable as UTF-8"),
-    };
-    if marker.schema_version != MARKER_SCHEMA_VERSION
-        || marker.primary_root != primary_path
-        || marker.checkout_root != checkout_path
-        || marker.checkout_device != locations.checkout_identity.device
-        || marker.checkout_inode != locations.checkout_identity.inode
-        || marker.checkout_key != locations.checkout_key
-        || marker.session_id < 0
-        || marker.invocation_id.is_empty()
-        || marker.nonce.is_empty()
-    {
-        return retain("marker does not match the exact primary and checkout identities");
+    if let Some(reason) = marker_identity_mismatch(locations, marker, false) {
+        return retain(reason);
     }
     if record.filename != format!("{}.json", marker.nonce) {
         return retain("marker nonce does not match its filename");
@@ -1505,10 +1612,22 @@ fn reconciliation_disposition(
     if !session_ids.contains(&marker.session_id) || !session_ids.contains(&selected_session_id) {
         return retain("marker session is not in the exact closed checkout cohort");
     }
+    // Schema 1 keeps the existing registry translation for its saved
+    // primary device. Schema 2 is already bound to both current stable UUIDs
+    // above, so require the validated witness for the current primary object.
+    let (registry_device, registry_inode) = if marker.schema_version == LEGACY_MARKER_SCHEMA_VERSION
+    {
+        (marker.primary_device, marker.primary_inode)
+    } else {
+        (
+            locations.primary_identity.device,
+            locations.primary_identity.inode,
+        )
+    };
     if !registry.matches_marker_identity(
         Path::new(&marker.primary_root),
-        marker.primary_device,
-        marker.primary_inode,
+        registry_device,
+        registry_inode,
     ) {
         return retain("primary device identity has no validated registry witness");
     }
@@ -2146,20 +2265,282 @@ mod tests {
 
     fn marker(locations: &ArtifactUseLocations, nonce: String) -> ArtifactUseMarker {
         ArtifactUseMarker {
-            schema_version: MARKER_SCHEMA_VERSION,
+            schema_version: LEGACY_MARKER_SCHEMA_VERSION,
             nonce,
             primary_root: path_text(&locations.primary_root).unwrap(),
             primary_device: locations.primary_identity.device,
             primary_inode: locations.primary_identity.inode,
+            primary_volume_uuid: None,
             checkout_root: path_text(&locations.checkout_root).unwrap(),
             checkout_device: locations.checkout_identity.device,
             checkout_inode: locations.checkout_identity.inode,
+            checkout_volume_uuid: None,
             checkout_key: locations.checkout_key.clone(),
             session_id: 99,
             invocation_id: "test:99:invocation".into(),
             phase: ArtifactUsePhase::PreDispatch,
             process: None,
         }
+    }
+
+    fn stable_marker(locations: &ArtifactUseLocations, nonce: String) -> ArtifactUseMarker {
+        let mut marker = marker(locations, nonce);
+        marker.schema_version = STABLE_MARKER_SCHEMA_VERSION;
+        marker.primary_volume_uuid = Some([0x11; 16]);
+        marker.checkout_volume_uuid = Some([0x22; 16]);
+        marker
+    }
+
+    #[test]
+    fn marker_v2_accepts_device_drift_with_matching_stable_volume_uuids() {
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = checkout(primary.path(), "checkout");
+        let mut locations = ArtifactUseLocations::resolve(primary.path(), &checkout).unwrap();
+        locations.primary_volume_uuid = Some([0x11; 16]);
+        locations.checkout_volume_uuid = Some([0x22; 16]);
+        let mut marker = stable_marker(&locations, "stable-v2".into());
+        marker.primary_device += 1;
+        marker.checkout_device += 1;
+
+        assert_eq!(marker_identity_mismatch(&locations, &marker, true), None);
+        locations.marker_for(&marker).unwrap();
+    }
+
+    #[test]
+    fn marker_v2_requires_exact_paths_inodes_and_both_volume_uuids() {
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = checkout(primary.path(), "checkout");
+        let mut locations = ArtifactUseLocations::resolve(primary.path(), &checkout).unwrap();
+        locations.primary_volume_uuid = Some([0x11; 16]);
+        locations.checkout_volume_uuid = Some([0x22; 16]);
+        let marker = stable_marker(&locations, "stable-v2".into());
+
+        let mut changed = marker.clone();
+        changed.primary_device += 1;
+        changed.primary_volume_uuid = Some([0x33; 16]);
+        assert_eq!(
+            marker_identity_mismatch(&locations, &changed, true),
+            Some("artifact-use marker primary stable volume UUID does not match")
+        );
+
+        let mut changed = marker.clone();
+        changed.checkout_device += 1;
+        changed.checkout_volume_uuid = Some([0x44; 16]);
+        assert_eq!(
+            marker_identity_mismatch(&locations, &changed, true),
+            Some("artifact-use marker checkout stable volume UUID does not match")
+        );
+
+        let mut missing_current_primary_uuid = locations.clone();
+        missing_current_primary_uuid.primary_volume_uuid = None;
+        assert_eq!(
+            marker_identity_mismatch(&missing_current_primary_uuid, &marker, true),
+            Some("artifact-use marker primary stable volume UUID does not match")
+        );
+
+        let mut missing_current_checkout_uuid = locations.clone();
+        missing_current_checkout_uuid.checkout_volume_uuid = None;
+        assert_eq!(
+            marker_identity_mismatch(&missing_current_checkout_uuid, &marker, true),
+            Some("artifact-use marker checkout stable volume UUID does not match")
+        );
+
+        let mut replaced_primary = marker.clone();
+        replaced_primary.primary_inode += 1;
+        assert_eq!(
+            marker_identity_mismatch(&locations, &replaced_primary, true),
+            Some("artifact-use marker primary root inode does not match")
+        );
+
+        let mut replaced_checkout = marker.clone();
+        replaced_checkout.checkout_inode += 1;
+        assert_eq!(
+            marker_identity_mismatch(&locations, &replaced_checkout, true),
+            Some("artifact-use marker checkout root inode does not match")
+        );
+
+        let mut changed_path = marker.clone();
+        changed_path.primary_root.push_str("-alias");
+        assert_eq!(
+            marker_identity_mismatch(&locations, &changed_path, true),
+            Some("artifact-use marker primary root path does not match")
+        );
+
+        let mut changed_path = marker;
+        changed_path.checkout_root.push_str("-alias");
+        assert_eq!(
+            marker_identity_mismatch(&locations, &changed_path, true),
+            Some("artifact-use marker checkout root path does not match")
+        );
+    }
+
+    #[test]
+    fn marker_schema_and_volume_uuid_shapes_fail_closed() {
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = checkout(primary.path(), "checkout");
+        let mut locations = ArtifactUseLocations::resolve(primary.path(), &checkout).unwrap();
+        locations.primary_volume_uuid = Some([0x11; 16]);
+        locations.checkout_volume_uuid = Some([0x22; 16]);
+
+        let mut malformed = marker(&locations, "v1-with-uuid".into());
+        malformed.primary_volume_uuid = Some([0x11; 16]);
+        assert_eq!(
+            marker_identity_mismatch(&locations, &malformed, true),
+            Some("artifact-use marker schema 1 must not contain stable volume UUIDs")
+        );
+
+        let valid_v2 = stable_marker(&locations, "stable-v2".into());
+        let mut missing_primary = valid_v2.clone();
+        missing_primary.primary_volume_uuid = None;
+        assert_eq!(
+            marker_identity_mismatch(&locations, &missing_primary, true),
+            Some("artifact-use marker schema 2 requires two nonzero stable volume UUIDs")
+        );
+
+        let mut missing_checkout = valid_v2.clone();
+        missing_checkout.checkout_volume_uuid = None;
+        assert_eq!(
+            marker_identity_mismatch(&locations, &missing_checkout, true),
+            Some("artifact-use marker schema 2 requires two nonzero stable volume UUIDs")
+        );
+
+        let mut zero_primary = valid_v2.clone();
+        zero_primary.primary_volume_uuid = Some([0; 16]);
+        assert_eq!(
+            marker_identity_mismatch(&locations, &zero_primary, true),
+            Some("artifact-use marker schema 2 requires two nonzero stable volume UUIDs")
+        );
+
+        let mut zero_checkout = valid_v2;
+        zero_checkout.checkout_volume_uuid = Some([0; 16]);
+        assert_eq!(
+            marker_identity_mismatch(&locations, &zero_checkout, true),
+            Some("artifact-use marker schema 2 requires two nonzero stable volume UUIDs")
+        );
+
+        let mut unknown_schema = marker(&locations, "unknown-schema".into());
+        unknown_schema.schema_version = 3;
+        assert_eq!(
+            marker_identity_mismatch(&locations, &unknown_schema, true),
+            Some("artifact-use marker schema version is unsupported")
+        );
+    }
+
+    #[test]
+    fn marker_v1_fallback_remains_device_strict_when_uuid_capture_is_available() {
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = checkout(primary.path(), "checkout");
+        let mut locations = ArtifactUseLocations::resolve(primary.path(), &checkout).unwrap();
+        locations.primary_volume_uuid = Some([0x11; 16]);
+        locations.checkout_volume_uuid = Some([0x22; 16]);
+        let marker = marker(&locations, "legacy-v1".into());
+        locations.marker_for(&marker).unwrap();
+
+        let mut changed_primary_device = marker.clone();
+        changed_primary_device.primary_device += 1;
+        assert_eq!(
+            marker_identity_mismatch(&locations, &changed_primary_device, true),
+            Some("artifact-use marker primary root device does not match")
+        );
+
+        let mut changed_checkout_device = marker;
+        changed_checkout_device.checkout_device += 1;
+        assert_eq!(
+            marker_identity_mismatch(&locations, &changed_checkout_device, true),
+            Some("artifact-use marker checkout root device does not match")
+        );
+    }
+
+    #[test]
+    fn new_marker_uses_v2_only_with_two_nonzero_volume_uuids() {
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = checkout(primary.path(), "checkout");
+        let mut locations = ArtifactUseLocations::resolve(primary.path(), &checkout).unwrap();
+        locations.primary_volume_uuid = None;
+        locations.checkout_volume_uuid = None;
+        assert_eq!(
+            locations.new_marker_volume_evidence(),
+            (LEGACY_MARKER_SCHEMA_VERSION, None, None)
+        );
+
+        locations.primary_volume_uuid = Some([0x11; 16]);
+        assert_eq!(
+            locations.new_marker_volume_evidence(),
+            (LEGACY_MARKER_SCHEMA_VERSION, None, None)
+        );
+
+        locations.primary_volume_uuid = None;
+        locations.checkout_volume_uuid = Some([0x22; 16]);
+        assert_eq!(
+            locations.new_marker_volume_evidence(),
+            (LEGACY_MARKER_SCHEMA_VERSION, None, None)
+        );
+
+        locations.primary_volume_uuid = Some([0x11; 16]);
+        assert_eq!(
+            locations.new_marker_volume_evidence(),
+            (
+                STABLE_MARKER_SCHEMA_VERSION,
+                Some([0x11; 16]),
+                Some([0x22; 16])
+            )
+        );
+
+        locations.primary_volume_uuid = Some([0; 16]);
+        assert_eq!(
+            locations.new_marker_volume_evidence(),
+            (LEGACY_MARKER_SCHEMA_VERSION, None, None)
+        );
+    }
+
+    #[test]
+    fn marker_serialization_preserves_the_v1_and_v2_wire_shapes() {
+        let primary = tempfile::tempdir().unwrap();
+        let checkout = checkout(primary.path(), "checkout");
+        let locations = ArtifactUseLocations::resolve(primary.path(), &checkout).unwrap();
+        let v1 = marker(&locations, "legacy-v1".into());
+        let v1_json = serde_json::to_value(&v1).unwrap();
+        assert!(v1_json.get("primary_volume_uuid").is_none());
+        assert!(v1_json.get("checkout_volume_uuid").is_none());
+        assert_eq!(
+            serde_json::from_value::<ArtifactUseMarker>(v1_json).unwrap(),
+            v1
+        );
+
+        let mut v2_locations = locations;
+        v2_locations.primary_volume_uuid = Some([0x11; 16]);
+        v2_locations.checkout_volume_uuid = Some([0x22; 16]);
+        let v2 = stable_marker(&v2_locations, "stable-v2".into());
+        let v2_json = serde_json::to_value(&v2).unwrap();
+        assert_eq!(v2_json["schema_version"], STABLE_MARKER_SCHEMA_VERSION);
+        assert_eq!(
+            v2_json["primary_volume_uuid"],
+            serde_json::to_value([0x11_u8; 16]).unwrap()
+        );
+        assert_eq!(
+            v2_json["checkout_volume_uuid"],
+            serde_json::to_value([0x22_u8; 16]).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_value::<ArtifactUseMarker>(v2_json.clone()).unwrap(),
+            v2
+        );
+
+        let mut missing_uuid = v2_json.clone();
+        missing_uuid
+            .as_object_mut()
+            .unwrap()
+            .remove("primary_volume_uuid");
+        let missing_uuid_marker =
+            serde_json::from_value::<ArtifactUseMarker>(missing_uuid).unwrap();
+        assert_eq!(
+            marker_identity_mismatch(&v2_locations, &missing_uuid_marker, true),
+            Some("artifact-use marker schema 2 requires two nonzero stable volume UUIDs")
+        );
+
+        let mut malformed_uuid = v2_json;
+        malformed_uuid["primary_volume_uuid"] = serde_json::json!([1, 2]);
+        assert!(serde_json::from_value::<ArtifactUseMarker>(malformed_uuid).is_err());
     }
 
     #[test]

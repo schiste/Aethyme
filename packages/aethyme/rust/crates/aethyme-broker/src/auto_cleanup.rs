@@ -3650,6 +3650,36 @@ mod tests {
             child
         }
 
+        #[cfg(target_os = "macos")]
+        fn start_waiting_running_marker(&self, invocation_id: &str) -> std::process::Child {
+            use std::os::unix::process::CommandExt;
+
+            let admission = crate::file_lock::artifact_use::begin_artifact_use(
+                &self.primary_root,
+                &self.checkout_root,
+                self.session.id,
+                invocation_id,
+            )
+            .unwrap();
+            let crate::file_lock::artifact_use::ArtifactUseAdmission::Admitted(mut producer) =
+                admission
+            else {
+                panic!("artifact-use protocol should be available for this test");
+            };
+
+            let mut command = Command::new("sh");
+            command.args(["-c", "read -r release_marker"]);
+            command.stdin(std::process::Stdio::piped());
+            command.process_group(0);
+            let child = command.spawn().unwrap();
+            let process_group = i32::try_from(child.id()).unwrap();
+            producer
+                .mark_process_started(&child, process_group)
+                .unwrap();
+            drop(producer);
+            child
+        }
+
         fn start_predispatch_marker(&self, invocation_id: &str) {
             let admission = crate::file_lock::artifact_use::begin_artifact_use(
                 &self.primary_root,
@@ -3881,6 +3911,90 @@ mod tests {
             }
         ));
         assert!(report.stopped.is_none());
+        assert!(!marker_path.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn explicit_artifact_use_v2_reconcile_uses_current_registry_and_requires_quiescence() {
+        use std::io::Write;
+
+        let mut fixture = ArtifactUseReconcileFixture::new();
+        let invocation_id = "reconcile-v2-remounted-primary-fixture";
+        let mut child = fixture.start_waiting_running_marker(invocation_id);
+        let marker_path = fixture.marker_path(invocation_id);
+        let bytes = std::fs::read(&marker_path).unwrap();
+        let mut marker: crate::file_lock::artifact_use::ArtifactUseMarker =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(marker.schema_version, 2);
+        assert!(marker.primary_volume_uuid.is_some());
+        assert!(marker.checkout_volume_uuid.is_some());
+        assert_ne!(marker.primary_device, u64::MAX);
+        marker.primary_device = u64::MAX;
+        let live_marker = marker.clone();
+        std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+
+        let (cohort, registry) = fixture.close_and_bind();
+        let live_plan = fixture.plan(&cohort, &registry);
+        assert_eq!(live_plan.markers.len(), 1);
+        assert!(matches!(
+            &live_plan.markers[0].disposition,
+            crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::Retain { reason }
+                if reason.contains("PID and start token are still present")
+        ));
+        let live_report = fixture
+            .apply(&cohort, &registry, &live_plan.digest)
+            .unwrap();
+        assert!(matches!(
+            &live_report.outcomes[0].outcome,
+            crate::file_lock::artifact_use::ArtifactUseReconcileOutcomeKind::Retained { reason }
+                if reason.contains("PID and start token are still present")
+        ));
+        assert!(marker_path.exists());
+
+        let mut unknown_marker = live_marker.clone();
+        unknown_marker.process.as_mut().unwrap().start_time = None;
+        std::fs::write(&marker_path, serde_json::to_vec(&unknown_marker).unwrap()).unwrap();
+        let unknown_plan = fixture.plan(&cohort, &registry);
+        assert!(matches!(
+            &unknown_plan.markers[0].disposition,
+            crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::Unknown { reason }
+                if reason.contains("start token")
+        ));
+        let unknown_report = fixture
+            .apply(&cohort, &registry, &unknown_plan.digest)
+            .unwrap();
+        assert!(matches!(
+            &unknown_report.outcomes[0].outcome,
+            crate::file_lock::artifact_use::ArtifactUseReconcileOutcomeKind::Unknown { reason }
+                if reason.contains("start token")
+        ));
+        assert!(marker_path.exists());
+
+        std::fs::write(&marker_path, serde_json::to_vec(&live_marker).unwrap()).unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"release\n")
+            .unwrap();
+        child.wait().unwrap();
+
+        let quiescent_plan = fixture.plan(&cohort, &registry);
+        assert!(matches!(
+            &quiescent_plan.markers[0].disposition,
+            crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::RemoveIfConfirmed
+        ));
+        let quiescent_report = fixture
+            .apply(&cohort, &registry, &quiescent_plan.digest)
+            .unwrap();
+        assert!(matches!(
+            &quiescent_report.outcomes[0].outcome,
+            crate::file_lock::artifact_use::ArtifactUseReconcileOutcomeKind::Removed {
+                directory_sync:
+                    crate::file_lock::artifact_use::ArtifactUseReconcileDirectorySync::Synced
+            }
+        ));
         assert!(!marker_path.exists());
     }
 
