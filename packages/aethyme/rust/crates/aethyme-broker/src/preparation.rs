@@ -43,7 +43,6 @@ const PREPARATION_CACHE_HASH_BUFFER_BYTES: usize = 64 * 1024;
 const SHARED_CACHE_SCAN_MAX_ENTRIES: usize = 100_000;
 const SHARED_CACHE_SCAN_MAX_DEPTH: usize = 64;
 const SHARED_CACHE_SCAN_MAX_ELAPSED: Duration = Duration::from_secs(30);
-const SHARED_CACHE_RECOVERY_MAX_ELAPSED: Duration = Duration::from_secs(5);
 
 /// Keep the recovery reserve observable while a preparation command is running.
 /// This is cooperative pressure detection, not a byte quota: a filesystem call
@@ -2547,6 +2546,7 @@ fn shared_cache_budget_at_with_scan_limits(
         repository,
         expected_root_identity,
         root_binding,
+        &mut *progress,
     )?;
     progress(true)?;
 
@@ -2670,6 +2670,7 @@ fn shared_cache_budget_at_with_scan_limits(
             repository,
             expected_root_identity,
             root_binding,
+            &mut *progress,
         )?;
         progress(true)?;
         if !recovery.found_debt || !recovery.complete {
@@ -2847,6 +2848,17 @@ fn ensure_preparation_cache_root_identity(
     })
 }
 
+/// Recover any interrupted rotation for one repository while the caller holds
+/// its preparation-cache lease.
+///
+/// Recovery runs in bounded slices. Each slice re-enters the crash-safe
+/// recovery state machine from durable state, exactly as a separate attempt
+/// would, so a slice that runs out of time loses nothing: every entry it
+/// unlinked stays removed. Between slices the lease is renewed through
+/// `progress`, and recovery keeps going for as long as each slice makes
+/// progress, up to an overall ceiling. A fixed per-attempt deadline alone
+/// cannot drain a retired store larger than one slice's throughput, which is
+/// what left `submit prepare` failing on every attempt (#1236).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn recover_rotation_debt(
     resource_db_path: &Path,
@@ -2854,33 +2866,275 @@ fn recover_rotation_debt(
     repository: &str,
     expected_root_identity: Option<&[u8]>,
     root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
+    progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
+) -> Result<rotation_debt::RecoveryProgress, PreparationError> {
+    recover_rotation_debt_with_limits(
+        resource_db_path,
+        cache_root,
+        repository,
+        expected_root_identity,
+        root_binding,
+        progress,
+        SharedCacheRecoveryLimits::default(),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn recover_rotation_debt_with_limits(
+    resource_db_path: &Path,
+    cache_root: &Path,
+    repository: &str,
+    expected_root_identity: Option<&[u8]>,
+    root_binding: Option<&crate::broker::PreparationCacheRootBinding>,
+    progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
+    limits: SharedCacheRecoveryLimits,
 ) -> Result<rotation_debt::RecoveryProgress, PreparationError> {
     ensure_preparation_cache_root_identity(cache_root, expected_root_identity)?;
     ensure_preparation_cache_root_binding(root_binding)?;
-    let deadline = Instant::now() + SHARED_CACHE_RECOVERY_MAX_ELAPSED;
-    match rotation_debt::recover_with_journal_and_root_guard(
-        cache_root,
-        resource_db_path,
-        repository,
-        deadline,
-        || validate_preparation_cache_binding_for_recovery(root_binding),
-    ) {
-        Ok(progress) if progress.complete => Ok(progress),
-        Ok(progress) => Err(PreparationError::StorageUnavailable {
-            path: cache_root.join(repository),
-            reason: format!(
-                "shared-cache rotation recovery stopped after unlinking {} filesystem entries",
-                progress.entries_reclaimed
-            ),
-        }),
-        Err(error) => Err(PreparationError::StorageUnavailable {
-            path: cache_root.join(repository),
-            reason: format!(
-                "shared-cache rotation recovery is incomplete after unlinking {} filesystem entries: {}",
-                error.progress.entries_reclaimed, error.source
-            ),
-        }),
+    let outcome = run_rotation_recovery_slices(
+        |deadline, heartbeat| {
+            rotation_debt::recover_with_journal_and_root_guard(
+                cache_root,
+                resource_db_path,
+                repository,
+                deadline,
+                || {
+                    validate_preparation_cache_binding_for_recovery(root_binding)?;
+                    heartbeat()
+                },
+            )
+        },
+        progress,
+        limits,
+    );
+    match outcome {
+        Ok(recovered) => Ok(recovered),
+        Err(RotationRecoveryStop::Heartbeat(error)) => Err(error),
+        Err(RotationRecoveryStop::Incomplete(incomplete)) => {
+            Err(PreparationError::StorageUnavailable {
+                path: cache_root.join(repository),
+                reason: incomplete
+                    .describe(&describe_remaining_rotation_debt(cache_root, repository)),
+            })
+        }
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// How long one recovery slice may run before the lease is renewed and the
+/// slice's progress is judged.
+const SHARED_CACHE_RECOVERY_SLICE: Duration = Duration::from_secs(5);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// Ceiling on one recovery call. Recovery continues past a slice only while
+/// slices keep unlinking entries, and never beyond this.
+const SHARED_CACHE_RECOVERY_MAX_TOTAL: Duration = Duration::from_secs(600);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// Bounds on the read-only count of what remains after incomplete recovery.
+const SHARED_CACHE_RECOVERY_REMAINING_MAX_ENTRIES: usize = 100_000;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const SHARED_CACHE_RECOVERY_REMAINING_MAX_ELAPSED: Duration = Duration::from_secs(1);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy)]
+struct SharedCacheRecoveryLimits {
+    slice: Duration,
+    max_total: Duration,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Default for SharedCacheRecoveryLimits {
+    fn default() -> Self {
+        Self {
+            slice: SHARED_CACHE_RECOVERY_SLICE,
+            max_total: SHARED_CACHE_RECOVERY_MAX_TOTAL,
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+enum RotationRecoveryStop {
+    /// The lease renewal or storage check failed; reported unchanged.
+    Heartbeat(PreparationError),
+    Incomplete(RotationRecoveryIncomplete),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+struct RotationRecoveryIncomplete {
+    entries_reclaimed: usize,
+    slices: usize,
+    elapsed: Duration,
+    reason: RotationRecoveryStopReason,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+enum RotationRecoveryStopReason {
+    /// A slice ran out of time without unlinking anything.
+    NoProgress(std::io::Error),
+    /// Slices were progressing, but the call reached its overall ceiling.
+    TotalLimit(std::io::Error, Duration),
+    /// Recovery refused or failed for a reason other than time.
+    Failed(std::io::Error),
+    /// Recovery returned without error and without completing.
+    Stopped,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl RotationRecoveryIncomplete {
+    fn describe(&self, remaining: &str) -> String {
+        let reason = match &self.reason {
+            RotationRecoveryStopReason::NoProgress(source) => {
+                format!("{source}, and the last recovery slice unlinked nothing")
+            }
+            RotationRecoveryStopReason::TotalLimit(source, limit) => format!(
+                "{source}, and this attempt reached its {}s recovery limit",
+                limit.as_secs()
+            ),
+            RotationRecoveryStopReason::Failed(source) => source.to_string(),
+            RotationRecoveryStopReason::Stopped => "recovery stopped before completing".into(),
+        };
+        format!(
+            "shared-cache rotation recovery is incomplete after unlinking {} filesystem entries \
+             in {} recovery slice(s) over {:.1}s: {reason}; progress is kept between attempts \
+             (unlinked entries stay removed, so a retry resumes on what remains); {remaining}",
+            self.entries_reclaimed,
+            self.slices,
+            self.elapsed.as_secs_f64(),
+        )
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// Drive recovery slices until recovery completes, a slice makes no progress,
+/// recovery fails for a reason other than time, or the overall ceiling
+/// passes. `slice` receives its deadline and a heartbeat it must call before
+/// each recovery mutation; the heartbeat forwards to `progress(false)` so the
+/// lease stays renewed inside a slice, and `progress(true)` runs between
+/// slices.
+fn run_rotation_recovery_slices(
+    mut slice: impl FnMut(
+        Instant,
+        &mut dyn FnMut() -> std::io::Result<()>,
+    ) -> Result<rotation_debt::RecoveryProgress, rotation_debt::RecoveryError>,
+    progress: &mut dyn FnMut(bool) -> Result<(), PreparationError>,
+    limits: SharedCacheRecoveryLimits,
+) -> Result<rotation_debt::RecoveryProgress, RotationRecoveryStop> {
+    let started = Instant::now();
+    let mut entries_reclaimed = 0usize;
+    let mut found_debt = false;
+    let mut slices = 0usize;
+    loop {
+        slices += 1;
+        let mut heartbeat_error = None;
+        let result = {
+            let mut heartbeat = || match progress(false) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let source = std::io::Error::other(error.to_string());
+                    heartbeat_error = Some(error);
+                    Err(source)
+                }
+            };
+            slice(Instant::now() + limits.slice, &mut heartbeat)
+        };
+        if let Some(error) = heartbeat_error {
+            return Err(RotationRecoveryStop::Heartbeat(error));
+        }
+        let (slice_progress, failure) = match result {
+            Ok(slice_progress) => (slice_progress, None),
+            Err(error) => (error.progress, Some(error.source)),
+        };
+        entries_reclaimed = entries_reclaimed.saturating_add(slice_progress.entries_reclaimed);
+        found_debt |= slice_progress.found_debt;
+        let reason = match failure {
+            None if slice_progress.complete => {
+                return Ok(rotation_debt::RecoveryProgress {
+                    found_debt,
+                    complete: true,
+                    bytes_reclaimed: slice_progress.bytes_reclaimed,
+                    entries_reclaimed,
+                });
+            }
+            None => RotationRecoveryStopReason::Stopped,
+            Some(source) if source.kind() == std::io::ErrorKind::TimedOut => {
+                if slice_progress.entries_reclaimed == 0 {
+                    RotationRecoveryStopReason::NoProgress(source)
+                } else if started.elapsed() >= limits.max_total {
+                    RotationRecoveryStopReason::TotalLimit(source, limits.max_total)
+                } else {
+                    progress(true).map_err(RotationRecoveryStop::Heartbeat)?;
+                    continue;
+                }
+            }
+            Some(source) => RotationRecoveryStopReason::Failed(source),
+        };
+        return Err(RotationRecoveryStop::Incomplete(
+            RotationRecoveryIncomplete {
+                entries_reclaimed,
+                slices,
+                elapsed: started.elapsed(),
+                reason,
+            },
+        ));
+    }
+}
+
+/// Say how much of an interrupted rotation remains, from a bounded,
+/// read-only count of the retired store named by the durable debt record.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn describe_remaining_rotation_debt(cache_root: &Path, repository: &str) -> String {
+    let retained = match rotation_debt::read(cache_root, repository) {
+        Ok(Some(retained)) => retained,
+        Ok(None) => return "no in-cache rotation record names the remaining store".into(),
+        Err(error) => return format!("the remaining entries could not be located: {error}"),
+    };
+    let retired = cache_root.join(retained.debt.retired_component());
+    match count_tree_entries_bounded(
+        &retired,
+        SHARED_CACHE_RECOVERY_REMAINING_MAX_ENTRIES,
+        Instant::now() + SHARED_CACHE_RECOVERY_REMAINING_MAX_ELAPSED,
+    ) {
+        Ok((entries, true)) => {
+            format!("{entries} filesystem entries remain in the retired store")
+        }
+        Ok((entries, false)) => format!(
+            "at least {entries} filesystem entries remain in the retired store (the count stopped at its limit)"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            "the retired store is already removed; only rotation bookkeeping remains".into()
+        }
+        Err(error) => format!("the remaining entries could not be counted: {error}"),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// Count a tree's entries, root included, without following symlinks.
+/// Returns whether the count is complete; it stops at either bound.
+fn count_tree_entries_bounded(
+    root: &Path,
+    max_entries: usize,
+    deadline: Instant,
+) -> std::io::Result<(usize, bool)> {
+    if !fs::symlink_metadata(root)?.is_dir() {
+        return Ok((1, true));
+    }
+    let mut entries = 1usize;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)? {
+            if entries >= max_entries || Instant::now() >= deadline {
+                return Ok((entries, false));
+            }
+            let entry = entry?;
+            entries += 1;
+            if entry.file_type()?.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok((entries, true))
 }
 
 fn validate_preparation_cache_binding_for_recovery(
@@ -6043,5 +6297,361 @@ mod tests {
             missing_outputs(root.path(), &config()),
             Err(PreparationError::SymlinkOutput { .. })
         ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn timed_out_slice(entries_reclaimed: usize) -> rotation_debt::RecoveryError {
+        rotation_debt::RecoveryError {
+            source: std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "preparation-cache rotation recovery deadline elapsed",
+            ),
+            progress: rotation_debt::RecoveryProgress {
+                found_debt: true,
+                entries_reclaimed,
+                ..rotation_debt::RecoveryProgress::default()
+            },
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn rotation_recovery_slices_continue_while_each_slice_makes_progress() {
+        // Each slice can drain only a tenth of the retired store. Before
+        // #1236 one slice was the whole attempt, so no attempt could finish.
+        let mut remaining = 10_000usize;
+        let mut slices = 0usize;
+        let mut boundaries = 0usize;
+        let recovered = run_rotation_recovery_slices(
+            |_deadline, _heartbeat| {
+                slices += 1;
+                let unlinked = remaining.min(1_000);
+                remaining -= unlinked;
+                if remaining == 0 {
+                    Ok(rotation_debt::RecoveryProgress {
+                        found_debt: true,
+                        complete: true,
+                        bytes_reclaimed: 0,
+                        entries_reclaimed: unlinked,
+                    })
+                } else {
+                    Err(timed_out_slice(unlinked))
+                }
+            },
+            &mut |force| {
+                if force {
+                    boundaries += 1;
+                }
+                Ok(())
+            },
+            SharedCacheRecoveryLimits::default(),
+        )
+        .expect("recovery that progresses every slice must finish in one call");
+        assert!(recovered.complete && recovered.found_debt);
+        assert_eq!(recovered.entries_reclaimed, 10_000);
+        assert_eq!(slices, 10);
+        assert_eq!(boundaries, 9, "the lease is renewed between slices");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn rotation_recovery_slices_stop_when_a_slice_makes_no_progress() {
+        let mut slices = 0usize;
+        let stop = run_rotation_recovery_slices(
+            |_deadline, _heartbeat| {
+                slices += 1;
+                Err(timed_out_slice(if slices == 1 { 7 } else { 0 }))
+            },
+            &mut |_| Ok(()),
+            SharedCacheRecoveryLimits::default(),
+        )
+        .expect_err("a stalled slice must stop recovery");
+        let RotationRecoveryStop::Incomplete(incomplete) = stop else {
+            panic!("expected an incomplete recovery, got {stop:?}");
+        };
+        assert_eq!(slices, 2);
+        assert_eq!(incomplete.entries_reclaimed, 7);
+        assert!(matches!(
+            incomplete.reason,
+            RotationRecoveryStopReason::NoProgress(_)
+        ));
+        let message = incomplete.describe("3 filesystem entries remain in the retired store");
+        assert!(
+            message.contains("after unlinking 7 filesystem entries in 2 recovery slice(s)")
+                && message.contains("the last recovery slice unlinked nothing")
+                && message.contains("progress is kept between attempts")
+                && message.ends_with("3 filesystem entries remain in the retired store"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn rotation_recovery_slices_stop_on_failure_and_at_the_total_limit() {
+        let mut slices = 0usize;
+        let stop = run_rotation_recovery_slices(
+            |_deadline, _heartbeat| {
+                slices += 1;
+                Err(rotation_debt::RecoveryError {
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "rotation debt conflicts with current cache state",
+                    ),
+                    progress: rotation_debt::RecoveryProgress {
+                        entries_reclaimed: 4,
+                        ..rotation_debt::RecoveryProgress::default()
+                    },
+                })
+            },
+            &mut |_| Ok(()),
+            SharedCacheRecoveryLimits::default(),
+        )
+        .expect_err("a non-time failure must stop recovery");
+        assert_eq!(slices, 1, "a refusal is never retried within one call");
+        assert!(matches!(
+            stop,
+            RotationRecoveryStop::Incomplete(RotationRecoveryIncomplete {
+                reason: RotationRecoveryStopReason::Failed(_),
+                ..
+            })
+        ));
+
+        let mut slices = 0usize;
+        let stop = run_rotation_recovery_slices(
+            |_deadline, _heartbeat| {
+                slices += 1;
+                Err(timed_out_slice(100))
+            },
+            &mut |_| Ok(()),
+            SharedCacheRecoveryLimits {
+                slice: SHARED_CACHE_RECOVERY_SLICE,
+                max_total: Duration::ZERO,
+            },
+        )
+        .expect_err("progressing recovery still stops at its overall ceiling");
+        assert_eq!(slices, 1);
+        assert!(matches!(
+            stop,
+            RotationRecoveryStop::Incomplete(RotationRecoveryIncomplete {
+                reason: RotationRecoveryStopReason::TotalLimit(..),
+                ..
+            })
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn rotation_recovery_slices_report_a_failed_heartbeat_unchanged() {
+        let stop = run_rotation_recovery_slices(
+            |_deadline, heartbeat| {
+                let source = heartbeat().expect_err("the heartbeat must fail");
+                Err(rotation_debt::RecoveryError {
+                    source,
+                    progress: rotation_debt::RecoveryProgress::default(),
+                })
+            },
+            &mut |_| {
+                Err(PreparationError::LivenessIncomplete {
+                    reason: "lease renewal refused".into(),
+                })
+            },
+            SharedCacheRecoveryLimits::default(),
+        )
+        .expect_err("a failed heartbeat must stop recovery");
+        assert!(matches!(
+            stop,
+            RotationRecoveryStop::Heartbeat(PreparationError::LivenessIncomplete { .. })
+        ));
+    }
+
+    /// Publish rotation debt for a populated store, as a rotation interrupted
+    /// right after journaling its intent leaves it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn interrupted_rotation_fixture(
+        directories: usize,
+        files_per_directory: usize,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture_root = tmp.path().canonicalize().unwrap();
+        let cache_root = fixture_root.join("preparation-cache");
+        let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
+        fs::create_dir_all(&store).unwrap();
+        for directory in 0..directories {
+            let directory = store.join(format!("package-{directory}"));
+            fs::create_dir(&directory).unwrap();
+            for file in 0..files_per_directory {
+                fs::write(directory.join(format!("file-{file}")), b"cached").unwrap();
+            }
+        }
+        let resource_db = fixture_root.join("host-resources.db");
+        fs::File::create(&resource_db).unwrap();
+        let root_identity = rotation_debt::DirectoryIdentity::capture(&cache_root).unwrap();
+        let store_identity = rotation_debt::DirectoryIdentity::capture(&store).unwrap();
+        let debt = rotation_debt::RotationDebt::new(
+            SHARED_CACHE_TEST_REPOSITORY,
+            &rotation_debt::new_transaction_id(),
+            root_identity.clone(),
+            store_identity,
+        )
+        .unwrap();
+        rotation_journal::publish(
+            &resource_db,
+            &cache_root,
+            &root_identity.encode().unwrap(),
+            SHARED_CACHE_TEST_REPOSITORY,
+            &rotation_debt::encode(&debt).unwrap(),
+        )
+        .unwrap();
+        rotation_debt::publish(&cache_root, debt).unwrap();
+        (tmp, cache_root, resource_db)
+    }
+
+    /// Guard calls a slice gets before its deadline passes. It exceeds the
+    /// recovery preamble's own guard calls, so every slice unlinks something.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const SLOW_SLICE_MUTATIONS: usize = 200;
+
+    /// A heartbeat that lets each slice run out of time after a fixed number
+    /// of recovery mutations, so one slice can never drain the whole store.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn slow_slice_heartbeat(
+        slice: Duration,
+        boundaries: &mut usize,
+    ) -> impl FnMut(bool) -> Result<(), PreparationError> + '_ {
+        let mut since_boundary = 0usize;
+        move |force| {
+            if force {
+                *boundaries += 1;
+                since_boundary = 0;
+            } else {
+                since_boundary += 1;
+                if since_boundary == SLOW_SLICE_MUTATIONS {
+                    std::thread::sleep(slice + Duration::from_millis(50));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn interrupted_rotation_recovery_converges_when_one_slice_cannot_drain_the_store() {
+        let (_tmp, cache_root, resource_db) = interrupted_rotation_fixture(5, 200);
+        let slice = Duration::from_millis(200);
+        let mut boundaries = 0usize;
+        let mut progress = slow_slice_heartbeat(slice, &mut boundaries);
+        let recovered = recover_rotation_debt_with_limits(
+            &resource_db,
+            &cache_root,
+            SHARED_CACHE_TEST_REPOSITORY,
+            None,
+            None,
+            &mut progress,
+            SharedCacheRecoveryLimits {
+                slice,
+                max_total: SHARED_CACHE_RECOVERY_MAX_TOTAL,
+            },
+        )
+        .expect("recovery must finish in one call while every slice makes progress");
+        drop(progress);
+        assert!(recovered.complete && recovered.found_debt);
+        assert!(
+            boundaries >= 2,
+            "the fixture must need several slices, got {boundaries} boundaries"
+        );
+        // 1000 files, 5 package directories, the retired root and its witness.
+        assert!(recovered.entries_reclaimed >= 1005);
+        let store = cache_root.join(SHARED_CACHE_TEST_REPOSITORY);
+        assert!(store.is_dir());
+        assert_eq!(fs::read_dir(&store).unwrap().count(), 0);
+        assert!(
+            rotation_debt::read(&cache_root, SHARED_CACHE_TEST_REPOSITORY)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn incomplete_rotation_recovery_reports_what_remains_and_resumes() {
+        let (_tmp, cache_root, resource_db) = interrupted_rotation_fixture(5, 200);
+        let slice = Duration::from_millis(200);
+        let mut boundaries = 0usize;
+        let mut progress = slow_slice_heartbeat(slice, &mut boundaries);
+        let error = recover_rotation_debt_with_limits(
+            &resource_db,
+            &cache_root,
+            SHARED_CACHE_TEST_REPOSITORY,
+            None,
+            None,
+            &mut progress,
+            SharedCacheRecoveryLimits {
+                slice,
+                max_total: Duration::ZERO,
+            },
+        )
+        .expect_err("a zero ceiling stops after the first slice");
+        drop(progress);
+        let retained = rotation_debt::read(&cache_root, SHARED_CACHE_TEST_REPOSITORY)
+            .unwrap()
+            .expect("incomplete recovery keeps its durable debt");
+        let retired = cache_root.join(retained.debt.retired_component());
+        fn count(path: &Path) -> usize {
+            1 + fs::read_dir(path)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_dir() {
+                        count(&entry.path())
+                    } else {
+                        1
+                    }
+                })
+                .sum::<usize>()
+        }
+        let remaining = count(&retired);
+        assert!(remaining > 1 && remaining < 1007, "remaining: {remaining}");
+        let message = error.to_string();
+        assert!(
+            message.contains("in 1 recovery slice(s)")
+                && message.contains("recovery limit")
+                && message.contains("progress is kept between attempts")
+                && message.contains(&format!(
+                    "{remaining} filesystem entries remain in the retired store"
+                )),
+            "unexpected message: {message}"
+        );
+
+        let recovered = recover_rotation_debt(
+            &resource_db,
+            &cache_root,
+            SHARED_CACHE_TEST_REPOSITORY,
+            None,
+            None,
+            &mut |_| Ok(()),
+        )
+        .expect("the next attempt resumes on what remains");
+        assert!(recovered.complete);
+        assert_eq!(recovered.entries_reclaimed, remaining);
+        assert!(!retired.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn bounded_tree_count_reports_whether_it_is_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("tree");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("nested/file"), b"x").unwrap();
+        fs::write(root.join("file"), b"x").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(
+            count_tree_entries_bounded(&root, 100, deadline).unwrap(),
+            (4, true)
+        );
+        assert_eq!(
+            count_tree_entries_bounded(&root, 2, deadline).unwrap(),
+            (2, false)
+        );
     }
 }
