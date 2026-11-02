@@ -465,8 +465,22 @@ reported. A resolved present path goes through fresh eligibility and admission
 checks. This exclusion does not authorize
 cleanup of open worktrees and does not prove participation by older clients,
 unmanaged direct commands, or escaped descendants; an empty marker inventory
-alone is not cleanup authority. It adds no report field or schema; blocker
-reason strings remain opaque to consumers.
+alone is not cleanup authority. It adds no cleanup report field or broker
+database schema; blocker reason strings remain opaque to consumers.
+
+New producer markers use schema 2 only when a nonzero stable volume UUID was
+captured for both the primary repository and checkout roots. On macOS, capture
+uses a no-follow object check before and after reading the volume UUID. This is
+best-effort: if either capture is unavailable, the producer writes schema 1
+without either UUID and requires exact device identities during normal marker
+admission and inventory. Explicit reconciliation keeps the existing validated
+registry translation for a schema-1 primary device. Other platforms keep that
+schema 1 behavior. Schema 2 still binds both exact root paths and inodes;
+a changed device number is accepted only when both saved UUIDs match the current
+roots. Marker readers that do not support schema 2 fail closed. Reconciliation
+still requires the current validated primary-root registry witness, the exact
+closed-checkout cohort, and the existing process-start and process-group
+absence proof before removing a marker.
 
 The nine durable cache-sweep keys are scoped by a SHA-256 namespace derived
 from the complete captured broker storage context. Linked worktrees in the
