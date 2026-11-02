@@ -251,6 +251,25 @@ pub(super) fn observe_ref(
     Ok(found)
 }
 
+/// Environment selectors that can change a coordinated Git resource footprint.
+pub(super) const GIT_ROUTING_ENV_NAMES: &[&str] = &[
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_QUARANTINE_PATH",
+    "GIT_SHALLOW_FILE",
+    "GIT_GRAFT_FILE",
+    "GIT_NAMESPACE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_EXEC_PATH",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH",
+    "GIT_PROXY_COMMAND",
+];
+
 /// Reject hidden ref writers and set-expanding refmaps rather than assuming
 /// that command-line operands alone constrain an arbitrary Git configuration.
 pub(super) fn validate_repository(
@@ -260,23 +279,7 @@ pub(super) fn validate_repository(
     repository: &str,
 ) -> Result<(), BrokerOpError> {
     use std::os::unix::fs::MetadataExt;
-    for name in [
-        "GIT_DIR",
-        "GIT_COMMON_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_QUARANTINE_PATH",
-        "GIT_SHALLOW_FILE",
-        "GIT_GRAFT_FILE",
-        "GIT_NAMESPACE",
-        "GIT_REPLACE_REF_BASE",
-        "GIT_EXEC_PATH",
-        "GIT_SSH_COMMAND",
-        "GIT_SSH",
-        "GIT_PROXY_COMMAND",
-    ] {
+    for name in GIT_ROUTING_ENV_NAMES {
         if std::env::var_os(name).is_some() {
             return Err(unavailable("ambient Git routing or transport override"));
         }

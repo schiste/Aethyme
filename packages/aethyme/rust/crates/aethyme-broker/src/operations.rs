@@ -2661,6 +2661,12 @@ pub(crate) fn refuse_repeated_program_name(
     Ok(())
 }
 
+fn maintenance_routing_override_present(mut present: impl FnMut(&str) -> bool) -> bool {
+    git_scopes::GIT_ROUTING_ENV_NAMES
+        .iter()
+        .any(|name| present(name))
+}
+
 /// Refuse global options that change what a coordinated Git command executes.
 pub(crate) fn refuse_code_executing_git_options(args: &[String]) -> Result<(), BrokerOpError> {
     let refuse = |what: &str| {
@@ -2675,6 +2681,13 @@ pub(crate) fn refuse_code_executing_git_options(args: &[String]) -> Result<(), B
     let maintenance = args
         .get(end)
         .is_some_and(|command| command == "maintenance");
+    if maintenance && maintenance_routing_override_present(|name| std::env::var_os(name).is_some())
+    {
+        return Err(BrokerOpError::InvalidCoordinatedOperation {
+            reason: "coordinated Git maintenance refuses ambient repository-routing overrides"
+                .into(),
+        });
+    }
     let mut index = 0;
     while index < end {
         let arg = args[index].as_str();
@@ -3474,6 +3487,14 @@ mod git_storage_maintenance_tests {
             index
         );
         assert_eq!(std::fs::read(resolution).unwrap(), b"saved resolution");
+    }
+
+    #[test]
+    fn maintenance_admission_refuses_ambient_routing_without_changing_process_environment() {
+        for name in git_scopes::GIT_ROUTING_ENV_NAMES {
+            assert!(maintenance_routing_override_present(|key| key == *name));
+        }
+        assert!(!maintenance_routing_override_present(|_| false));
     }
 
     #[test]
