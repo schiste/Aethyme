@@ -42,10 +42,13 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::cache::{EnsuredTemplate, TemplateJob, repository_dir, template_digest};
+use super::cache::{
+    BuildJob, EnsuredTemplate, TemplateJob, build_digest, repository_dir, template_digest,
+};
+use super::compile::CompiledComponent;
 use super::compile::{CompileContext, EnvironmentOwner, compile};
 use super::lifecycle::Lifecycle;
-use super::spec::{EnvironmentsFile, HostEnvironmentsFile, PrebuildSpec};
+use super::spec::{EnvironmentsFile, HostEnvironmentsFile, PrebuildArtifact, PrebuildSpec};
 use super::{ENVIRONMENTS_FILE, parse_loaded};
 
 pub const PREBUILD_SCHEMA: &str = "aethyme.env-prebuild/v1";
@@ -201,7 +204,84 @@ pub struct PrebuildState {
 impl PrebuildState {
     /// Whether the supervisor must stay up for this prebuild.
     pub fn pending(&self) -> bool {
-        self.status == Status::Waiting
+        matches!(self.status, Status::Waiting | Status::New)
+    }
+}
+
+/// Closed while host memory in use is above `max_memory_pct`. An unknown
+/// reading does not block: no reading is a missing signal, not pressure.
+pub fn memory_gate(spec: &PrebuildSpec, used_pct: Option<u32>) -> Result<(), String> {
+    match (spec.max_memory_pct, used_pct) {
+        (Some(max), Some(used)) if used > max => Err(format!(
+            "waiting for host memory in use to fall to {max}% (now {used}%)"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Host memory in use, as a percentage: macOS `kern.memorystatus_level`
+/// (the share the kernel considers available), Linux `MemAvailable` over
+/// `MemTotal`. `None` when unreadable.
+pub fn host_memory_used_pct() -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut level: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        let name = c"kern.memorystatus_level";
+        // SAFETY: `level` and `size` outlive the call and `size` is the
+        // exact size of `level`; no new value is written (null, 0).
+        let status = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                (&mut level as *mut libc::c_int).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if status == 0 && (0..=100).contains(&level) {
+            return Some(100 - level as u32);
+        }
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let field = |name: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(name))
+                .and_then(|rest| rest.trim().split_whitespace().next())
+                .and_then(|kib| kib.parse::<u64>().ok())
+        };
+        let (total, available) = (field("MemTotal:")?, field("MemAvailable:")?);
+        (total > 0).then(|| (100 - (available.min(total) * 100 / total)) as u32)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// What a prebuild builds for its component.
+pub fn artifact_of(
+    spec: &PrebuildSpec,
+    component: &CompiledComponent,
+) -> Result<PrebuildArtifact, String> {
+    let has_template = component.commands.template.is_some();
+    let has_build = component.commands.build.is_some() && !component.cache_inputs.is_empty();
+    match spec.artifact {
+        Some(PrebuildArtifact::Template) if has_template => Ok(PrebuildArtifact::Template),
+        Some(PrebuildArtifact::Build) if has_build => Ok(PrebuildArtifact::Build),
+        None if has_template => Ok(PrebuildArtifact::Template),
+        None if has_build => Ok(PrebuildArtifact::Build),
+        _ => Err(format!(
+            "{} declares no {} to prebuild",
+            component.name,
+            match spec.artifact {
+                Some(PrebuildArtifact::Build) => "cacheable build (build + cache_inputs + output)",
+                Some(PrebuildArtifact::Template) | None => "template or cacheable build",
+            }
+        )),
     }
 }
 
@@ -558,8 +638,18 @@ fn run_one(
                 short(&tip)
             )
         })?;
-    let digest = template_digest(&checkout, component)?
-        .ok_or_else(|| format!("{} declares no template at {}", spec.component, short(&tip)))?;
+    let artifact = artifact_of(spec, component)?;
+    let digest = match artifact {
+        PrebuildArtifact::Template => template_digest(&checkout, component)?,
+        PrebuildArtifact::Build => build_digest(&checkout, component)?,
+    }
+    .ok_or_else(|| {
+        format!(
+            "{} declares nothing to prebuild at {}",
+            spec.component,
+            short(&tip)
+        )
+    })?;
     state.commit = Some(tip.clone());
     state.digest = Some(digest.clone());
     report.digest = Some(digest.clone());
@@ -577,8 +667,14 @@ fn run_one(
         last_activity_ms: host_last_activity(lifecycle),
         now_ms: now,
     };
-    let exists = lifecycle.template_exists(repository, &component.name, &digest);
-    match decide(state, &digest, exists, gate(spec, &inputs), force) {
+    let exists = match artifact {
+        PrebuildArtifact::Template => {
+            lifecycle.template_exists(repository, &component.name, &digest)
+        }
+        PrebuildArtifact::Build => lifecycle.build_exists(repository, &component.name, &digest),
+    };
+    let window = gate(spec, &inputs).and_then(|()| memory_gate(spec, host_memory_used_pct()));
+    match decide(state, &digest, exists, window, force) {
         Decision::Published => {
             state.status = Status::Ready;
             state.reason = None;
@@ -603,8 +699,7 @@ fn run_one(
             report.detail = Some(reason);
         }
         Decision::Build => {
-            let previous = spec
-                .derive_from_previous
+            let previous = (spec.derive_from_previous && artifact == PrebuildArtifact::Template)
                 .then(|| lifecycle.newest_template(repository, &component.name, Some(&digest)))
                 .flatten();
             let mut vars = component.env.clone();
@@ -625,24 +720,90 @@ fn run_one(
             let log = home(&lifecycle.root, repository, &spec.name).join("prebuild.log");
             let started_at = now;
             let clock = Instant::now();
-            let result = lifecycle.ensure_template_job(
-                TemplateJob {
-                    repository,
-                    component,
-                    worktree: &checkout,
-                    vars,
-                    log: log.clone(),
-                    timeout: Duration::from_secs(spec.timeout_seconds),
-                    env_id: None,
-                },
-                &digest,
+            // A preemptible build yields to foreground work: an environment
+            // active since it started (when it waited for host_idle), or
+            // memory past max_memory_pct. Not under --run.
+            let watcher = (spec.preemptible && !force)
+                .then(|| lifecycle.store.reopen().ok())
+                .flatten();
+            let idle_gated = spec.when.iter().any(|w| w == "host_idle");
+            let mut stop = move || -> Option<String> {
+                if let Some(store) = &watcher
+                    && idle_gated
+                    && let Some(last) = store
+                        .list(None)
+                        .ok()
+                        .and_then(|records| records.iter().filter_map(|r| r.last_activity_at).max())
+                    && last > started_at
+                {
+                    return Some("an environment became active".into());
+                }
+                if watcher.is_some()
+                    && let (Some(max), Some(used)) = (spec.max_memory_pct, host_memory_used_pct())
+                    && used > max
+                {
+                    return Some(format!("host memory in use reached {used}% (max {max}%)"));
+                }
+                None
+            };
+            let keep = Some(
+                component
+                    .template_keep
+                    .map_or(spec.keep, |k| k.max(spec.keep)),
             );
+            let timeout = Duration::from_secs(spec.timeout_seconds);
+            let result = match artifact {
+                PrebuildArtifact::Template => lifecycle.ensure_template_job(
+                    TemplateJob {
+                        repository,
+                        component,
+                        worktree: &checkout,
+                        vars,
+                        log: log.clone(),
+                        timeout,
+                        env_id: None,
+                        keep,
+                        stop: Some(&mut stop),
+                    },
+                    &digest,
+                ),
+                PrebuildArtifact::Build => lifecycle
+                    .ensure_build_job(
+                        BuildJob {
+                            repository,
+                            component,
+                            worktree: &checkout,
+                            log: log.clone(),
+                            timeout,
+                            stop: Some(&mut stop),
+                        },
+                        &digest,
+                    )
+                    .map(|built| EnsuredTemplate {
+                        id: digest[..16].to_string(),
+                        digest: digest.clone(),
+                        built,
+                        pruned: Vec::new(),
+                    }),
+            };
+            if let Err(super::exec::DriverError::Preempted { reason, .. }) = &result {
+                state.status = Status::Waiting;
+                state.reason = Some(format!(
+                    "stopped to yield: {reason}; builds again in the next window"
+                ));
+                report.result = "preempted";
+                report.detail = state.reason.clone();
+                return Ok(report);
+            }
             let seconds = clock.elapsed().as_secs_f64();
             let derived_from = previous
                 .as_ref()
                 .map(|(marker, _)| marker.template_id.clone());
             let (ok, error, template_id) = match &result {
-                Ok(EnsuredTemplate { id, .. }) => (true, None, id.clone()),
+                Ok(EnsuredTemplate { id, pruned, .. }) => {
+                    report.pruned = pruned.clone();
+                    (true, None, id.clone())
+                }
                 Err(error) => (false, Some(error.to_string()), digest[..16].to_string()),
             };
             let run = PrebuildRun {
@@ -675,9 +836,6 @@ fn run_one(
                 state.failed_digest = None;
                 state.last_ok_commit = Some(tip.clone());
                 report.result = "built";
-                report.pruned = lifecycle
-                    .prune_templates_keeping(repository, &component.name, spec.keep)
-                    .evicted;
                 if state.failure_reported {
                     report.outcome = Some(recover(state, spec, &tip, &digest, reporter));
                 }
@@ -799,4 +957,63 @@ pub fn supervised_roots(lifecycle: &Lifecycle) -> std::collections::BTreeSet<Pat
             .map(|(_, _, main_root, _)| PathBuf::from(main_root)),
     );
     roots
+}
+
+/// After a fetch or merge moved the default branch (#1366): when the
+/// default branch declares `[[prebuild]]`, record its prebuilds so the
+/// supervisor looks at this repository, and start the supervisor if none
+/// runs. Never fails the caller; `AETHYME_PREBUILD_NUDGE=0` turns it off.
+pub fn nudge_after_fetch(main_root: &Path) {
+    if std::env::var_os("AETHYME_PREBUILD_NUDGE").is_some_and(|value| value == "0") {
+        return;
+    }
+    let Ok(Some(file)) = super::shared::declared_file(main_root) else {
+        return;
+    };
+    if file.prebuild.is_empty() {
+        return;
+    }
+    let Some(root) = super::logs::environments_directory() else {
+        return;
+    };
+    if let Err(error) = register_prebuilds(main_root, &file) {
+        eprintln!("warning: prebuild: could not record this repository's prebuilds: {error}");
+        return;
+    }
+    let started =
+        std::env::current_exe().and_then(|exe| super::supervisor::ensure_running(&root, &exe));
+    if let Err(error) = started {
+        eprintln!("warning: prebuild: the environment supervisor did not start: {error}");
+    }
+}
+
+/// Give every declared prebuild a state row (status `new` when it has none),
+/// so the supervisor looks at the repository and stays up until it has.
+fn register_prebuilds(main_root: &Path, file: &EnvironmentsFile) -> Result<(), String> {
+    let repo = crate::GitRepo::discover(main_root).map_err(|e| e.to_string())?;
+    let repository = crate::gates::git_origin_fingerprint(&repo);
+    let mut store = super::store::EnvironmentStore::open_default().map_err(|e| e.to_string())?;
+    let known: std::collections::BTreeSet<String> = store
+        .prebuild_states()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|(repo, ..)| *repo == repository)
+        .map(|(_, name, ..)| name)
+        .collect();
+    let fresh = serde_json::to_string(&PrebuildState::default()).map_err(|e| e.to_string())?;
+    for spec in file
+        .prebuild
+        .iter()
+        .filter(|spec| !known.contains(&spec.name))
+    {
+        store
+            .set_prebuild_state(
+                &repository,
+                &spec.name,
+                &main_root.to_string_lossy(),
+                &fresh,
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }

@@ -1763,6 +1763,8 @@ impl Broker {
             }
         };
 
+        // The default branch just moved: a declared prebuild can start now.
+        crate::environments::prebuild::nudge_after_fetch(self.main_root());
         match self.auto_cleanup_landed_integration(&upstream_ref) {
             Ok(cleanup) => {
                 let state = match cleanup.state {

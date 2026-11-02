@@ -793,3 +793,132 @@ fn gc_withholds_inventory_when_deadline_is_already_expired() {
     assert!(inventory.reclaimable_bytes.is_none());
     assert!(candidates.is_empty());
 }
+
+fn keep_text(log: &Path, destroyed: &Path, keep: Option<usize>) -> String {
+    format!(
+        r#"
+schema = 1
+max_pin_seconds = 7200
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "db"
+runtime = "hooks"
+provision = "true"
+destroy = "true"
+template = 'echo "$AETHYME_ENV_TEMPLATE_ID" >> "{log}"'
+template_destroy = 'echo "$AETHYME_ENV_TEMPLATE_ID" >> "{destroyed}"'
+template_inputs = ["db/**"]
+{keep}
+"#,
+        log = log.display(),
+        destroyed = destroyed.display(),
+        keep = keep
+            .map(|k| format!("template_keep = {k}"))
+            .unwrap_or_default(),
+    )
+}
+
+fn ensure_for(
+    lifecycle: &mut Lifecycle,
+    text: &str,
+    schema: &str,
+) -> super::cache::EnsuredTemplate {
+    let tree = worktree(&[("db/schema.sql", schema)]);
+    let snapshot = snapshot(text, tree.path());
+    let component = &snapshot.components[0];
+    let digest = super::cache::template_digest(tree.path(), component)
+        .unwrap()
+        .unwrap();
+    lifecycle
+        .ensure_template_job(
+            super::cache::TemplateJob {
+                repository: &snapshot.repository,
+                component,
+                worktree: tree.path(),
+                vars: component.env.clone(),
+                log: tree.path().join("log"),
+                timeout: Duration::from_secs(20),
+                env_id: None,
+                keep: component.template_keep,
+                stop: None,
+            },
+            &digest,
+        )
+        .unwrap()
+}
+
+/// `template_keep`: a new template evicts all but the newest N through
+/// `template_destroy`, and `env cache prune --all` keeps those N; without it
+/// prune evicts every unused template.
+#[test]
+fn template_keep_holds_the_newest_templates() {
+    let host = tempfile::tempdir().unwrap();
+    let log = host.path().join("made.log");
+    let destroyed = host.path().join("destroyed.log");
+    let mut kept = lifecycle(host.path());
+    let text = keep_text(&log, &destroyed, Some(2));
+    let first = ensure_for(&mut kept, &text, "v1");
+    std::thread::sleep(Duration::from_millis(5));
+    let second = ensure_for(&mut kept, &text, "v2");
+    assert!(second.pruned.is_empty());
+    std::thread::sleep(Duration::from_millis(5));
+    let third = ensure_for(&mut kept, &text, "v3");
+    assert!(third.built);
+    assert_eq!(third.pruned.len(), 1, "{third:?}");
+    assert_eq!(
+        std::fs::read_to_string(&destroyed).unwrap().trim(),
+        first.id
+    );
+    let report = kept.prune_cache(true);
+    assert!(report.evicted.is_empty(), "{report:?}");
+    assert_eq!(lines(&destroyed), 1);
+
+    let unkept = keep_text(&log, &destroyed, None);
+    let other = tempfile::tempdir().unwrap();
+    let mut plain = lifecycle(other.path());
+    ensure_for(&mut plain, &unkept, "v1");
+    ensure_for(&mut plain, &unkept, "v2");
+    assert_eq!(plain.prune_cache(true).evicted.len(), 2);
+}
+
+/// Repository keep-awake caps ride on the snapshot outside its digest: a
+/// changed cap is refreshed by the next `env up` without a reconfigure, and
+/// the tighter of host and repository wins.
+#[test]
+fn repository_keep_awake_caps_refresh_without_a_reconfigure() {
+    let host = tempfile::tempdir().unwrap();
+    let mut lifecycle = lifecycle(host.path());
+    let tree = worktree(&[("db/schema.sql", "v1")]);
+    let base = "schema = 1\n[[profiles]]\nname = \"p\"\n[[profiles.components]]\nname = \"c\"\nruntime = \"hooks\"\nprovision = \"true\"\ndestroy = \"true\"\n";
+    let capped = format!("max_pin_seconds = 7200\nmax_exec_busy_seconds = 7200\n{base}");
+    let tighter = format!("max_pin_seconds = 3600\nmax_exec_busy_seconds = 600\n{base}");
+    assert_eq!(
+        snapshot(base, tree.path()).digest,
+        snapshot(&capped, tree.path()).digest
+    );
+    let env_id = up(&mut lifecycle, &capped, tree.path());
+    let record = lifecycle.store.get(&env_id).unwrap().unwrap();
+    assert_eq!(record.snapshot.max_pin_seconds, Some(7200));
+    up(&mut lifecycle, &tighter, tree.path());
+    let record = lifecycle.store.get(&env_id).unwrap().unwrap();
+    assert_eq!(record.snapshot.max_pin_seconds, Some(3600));
+    assert_eq!(record.snapshot.max_exec_busy_seconds, Some(600));
+    use super::activity::tighter as cap;
+    assert_eq!(cap(Some(86_400), Some(7200)), Some(7200));
+    assert_eq!(cap(Some(600), Some(7200)), Some(600));
+    assert_eq!(cap(None, Some(7200)), Some(7200));
+    assert_eq!(cap(Some(600), None), Some(600));
+    assert_eq!(cap(None, None), None);
+}
+
+#[test]
+fn keep_awake_caps_and_template_keep_are_validated() {
+    let text = "schema = 1\nmax_pin_seconds = 30\n[[profiles]]\nname = \"p\"\n[[profiles.components]]\nname = \"c\"\nruntime = \"hooks\"\nprovision = \"true\"\ndestroy = \"true\"\ntemplate_keep = 0\n";
+    let loaded: Loaded<EnvironmentsFile> = parse_loaded(PathBuf::from("t"), "t", text);
+    let file = loaded.value.unwrap();
+    let found = super::validate(&file, &HostEnvironmentsFile::default(), "t", "h");
+    let codes: Vec<&str> = found.iter().map(|d| d.code).collect();
+    assert!(codes.contains(&"invalid_keep_awake_cap"), "{codes:?}");
+    assert!(codes.contains(&"field_not_supported"), "{codes:?}");
+}

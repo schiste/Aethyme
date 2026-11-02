@@ -51,7 +51,7 @@ use sha2::{Digest, Sha256};
 
 use super::compile::{CompiledComponent, CompiledEnvironment};
 use super::drivers::DriverContext;
-use super::exec::{DriverError, append_log, run_hook, run_hook_in_directory_fd};
+use super::exec::{DriverError, append_log, run_hook, run_hook_in_directory_fd, run_hook_until};
 use super::lifecycle::Lifecycle;
 use super::spec::Runtime;
 use super::store::EnvironmentStore;
@@ -383,6 +383,10 @@ pub struct TemplateMarker {
     /// The exclusive key the template was made under.
     pub key: String,
     pub created_at: i64,
+    /// The component's `template_keep` (or its prebuild's `keep`) when the
+    /// template was made: prune keeps this many of the newest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<usize>,
 }
 
 /// One template to make sure of (#1237): from an environment, or from a
@@ -397,6 +401,43 @@ pub struct TemplateJob<'a> {
     pub timeout: Duration,
     /// The environment that relies on it, recorded before it does.
     pub env_id: Option<&'a str>,
+    /// Templates of this component to keep; a fresh build prunes to it.
+    pub keep: Option<usize>,
+    /// Stops the hook early with a reason (a preemptible prebuild).
+    pub stop: Option<&'a mut dyn FnMut() -> Option<String>>,
+}
+
+/// One cacheable build to make sure of without an environment (#1366): a
+/// prebuild builds in its own checkout and publishes the output.
+pub struct BuildJob<'a> {
+    pub repository: &'a str,
+    pub component: &'a CompiledComponent,
+    pub worktree: &'a Path,
+    pub log: PathBuf,
+    pub timeout: Duration,
+    pub stop: Option<&'a mut dyn FnMut() -> Option<String>>,
+}
+
+/// The build digest of a cacheable component (`build` + `cache_inputs` + an
+/// output directory), exactly as `env up` computes it; `None` otherwise.
+pub fn build_digest(
+    worktree: &Path,
+    component: &CompiledComponent,
+) -> Result<Option<String>, String> {
+    let Some(command) = component.commands.build.as_deref() else {
+        return Ok(None);
+    };
+    if component.cache_inputs.is_empty() || output_of(component).is_none() {
+        return Ok(None);
+    }
+    input_digest(
+        worktree,
+        "build",
+        component,
+        command,
+        &component.cache_inputs,
+    )
+    .map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -405,6 +446,8 @@ pub struct EnsuredTemplate {
     pub digest: String,
     /// Whether this call ran the hook.
     pub built: bool,
+    /// Older templates a fresh build evicted down to `keep`.
+    pub pruned: Vec<PathBuf>,
 }
 
 /// The template digest of a component in `worktree`, exactly as `env up`
@@ -523,23 +566,7 @@ impl Lifecycle {
                 &log,
                 ctx.hook_timeout,
             )?;
-            if !target.is_dir() {
-                return Err(DriverError::Unsupported(format!(
-                    "{}: build did not produce {output}",
-                    component.name
-                )));
-            }
-            let staging = entry.with_extension("staging");
-            if staging.exists() {
-                std::fs::remove_dir_all(&staging).map_err(io("clear build staging"))?;
-            }
-            materialize(&target, &staging.join(OUTPUT)).map_err(io("store a build"))?;
-            std::fs::write(staging.join(KEY_FILE), &key).map_err(io("record a build key"))?;
-            std::fs::write(staging.join(COMPLETE), b"").map_err(io("mark a build complete"))?;
-            if entry.exists() {
-                std::fs::remove_dir_all(&entry).map_err(io("replace an incomplete build"))?;
-            }
-            std::fs::rename(&staging, &entry).map_err(io("publish a build"))?;
+            publish_build(&target, &entry, &key, output, &component.name)?;
             append_log(
                 &log,
                 &format!(
@@ -574,10 +601,78 @@ impl Lifecycle {
                 log: ctx.log(),
                 timeout: ctx.hook_timeout,
                 env_id: Some(&ctx.environment.env_id),
+                keep: component.template_keep,
+                stop: None,
             },
             &digest,
         )?;
         Ok(Some(ensured.id))
+    }
+
+    /// The entry and exclusive key of one build digest.
+    fn build_entry(&self, repository: &str, component: &str, digest: &str) -> (PathBuf, String) {
+        let entry = self
+            .cache_root()
+            .join(BUILDS)
+            .join(repository_dir(repository))
+            .join(component)
+            .join(short(digest));
+        let key = format!("aethyme-env-build:{repository}:{component}:{digest}");
+        (entry, key)
+    }
+
+    /// Whether the build for `digest` is published.
+    pub fn build_exists(&self, repository: &str, component: &str, digest: &str) -> bool {
+        self.build_entry(repository, component, digest)
+            .0
+            .join(COMPLETE)
+            .is_file()
+    }
+
+    /// Build and publish the output for `digest` unless it is already
+    /// published, under the digest's exclusive key, so a concurrent `env up`
+    /// waits for it. Returns whether this call built it. The build runs with
+    /// the component's `env` only, as `env up`'s cached build does.
+    pub fn ensure_build_job(
+        &mut self,
+        job: BuildJob<'_>,
+        digest: &str,
+    ) -> Result<bool, DriverError> {
+        let component = job.component;
+        let (Some(command), Some(output)) =
+            (component.commands.build.clone(), output_of(component))
+        else {
+            return Err(DriverError::Unsupported(format!(
+                "{} declares no cacheable build",
+                component.name
+            )));
+        };
+        if !is_worktree_subdirectory(output) {
+            return Err(DriverError::Unsupported(format!(
+                "{}: build output {output:?} must be a subdirectory of the worktree",
+                component.name
+            )));
+        }
+        let (entry, key) = self.build_entry(job.repository, &component.name, digest);
+        let target = job.worktree.join(output);
+        self.coalesce(job.repository, &key, |_| {
+            if entry.join(COMPLETE).exists() {
+                return Ok(false);
+            }
+            let mut never = || None;
+            run_hook_until(
+                &format!("{}: build", component.name),
+                &command,
+                job.worktree,
+                &component.pass_env,
+                &component.env,
+                &job.log,
+                job.timeout,
+                job.stop.unwrap_or(&mut never),
+            )?;
+            publish_build(&target, &entry, &key, output, &component.name)?;
+            Ok(true)
+        })
     }
 
     /// The marker and exclusive key of one template digest.
@@ -659,7 +754,8 @@ impl Lifecycle {
             }
             let mut vars = job.vars;
             vars.insert(TEMPLATE_ID_VARIABLE.into(), id.clone());
-            run_hook(
+            let mut never = || None;
+            run_hook_until(
                 &format!("{}: template", component.name),
                 &command,
                 job.worktree,
@@ -667,6 +763,7 @@ impl Lifecycle {
                 &vars,
                 &job.log,
                 job.timeout,
+                job.stop.unwrap_or(&mut never),
             )?;
             if let Some(parent) = marker.parent() {
                 std::fs::create_dir_all(parent).map_err(io("create the template index"))?;
@@ -678,6 +775,7 @@ impl Lifecycle {
                 pass_env: component.pass_env.clone(),
                 key: key.clone(),
                 created_at: super::activity::now_ms(),
+                keep: job.keep,
             };
             let bytes = serde_json::to_vec(&record)
                 .map_err(std::io::Error::other)
@@ -685,10 +783,18 @@ impl Lifecycle {
             std::fs::write(&marker, bytes).map_err(io("record a template"))?;
             Ok(true)
         })?;
+        let pruned = match job.keep {
+            Some(keep) if built => {
+                self.prune_templates_keeping(job.repository, &component.name, keep)
+                    .evicted
+            }
+            _ => Vec::new(),
+        };
         Ok(EnsuredTemplate {
             id,
             digest: digest.to_string(),
             built,
+            pruned,
         })
     }
 
@@ -906,42 +1012,55 @@ impl Lifecycle {
             {
                 continue;
             }
-            // Keep-N counts templates in use too: the newest `keep` are
-            // protected whoever uses them, and the use check below still
-            // keeps any older one a live environment relies on.
-            if keep.is_none() && in_use.contains(&entry.path) {
-                continue;
-            }
             match template_prune_identity(&entry) {
                 Ok((repository, key, marker)) => {
                     valid_templates.push((entry, repository, key, marker));
                 }
+                Err(_) if in_use.contains(&entry.path) => {}
                 Err(reason) => report.kept.push((entry.path, reason)),
             }
         }
-        if let Some(keep) = &keep {
-            valid_templates.sort_by(|a, b| {
-                b.3.created_at
-                    .cmp(&a.3.created_at)
-                    .then_with(|| b.2.cmp(&a.2))
-            });
-            let newest: Vec<_> = valid_templates
-                .drain(..keep.keep.min(valid_templates.len()))
-                .collect();
-            for (entry, ..) in newest {
+        // The newest templates of each component are kept: `keep` in a
+        // keep-N prune, otherwise the largest `template_keep` its markers
+        // recorded. They count whether or not they are in use; the use check
+        // still keeps any older one a live environment relies on.
+        valid_templates.sort_by(|a, b| {
+            (&a.0.repository, &a.0.component)
+                .cmp(&(&b.0.repository, &b.0.component))
+                .then_with(|| b.3.created_at.cmp(&a.3.created_at))
+                .then_with(|| b.2.cmp(&a.2))
+        });
+        let mut protect = std::collections::BTreeMap::<(String, String), usize>::new();
+        for (entry, _, _, marker) in &valid_templates {
+            let wanted = match &keep {
+                Some(keep) => keep.keep,
+                None => marker.keep.unwrap_or(0),
+            };
+            let slot = protect
+                .entry((entry.repository.clone(), entry.component.clone()))
+                .or_default();
+            *slot = (*slot).max(wanted);
+        }
+        let mut seen = std::collections::BTreeMap::<(String, String), usize>::new();
+        valid_templates.retain(|(entry, ..)| {
+            let group = (entry.repository.clone(), entry.component.clone());
+            let rank = seen.entry(group.clone()).or_default();
+            *rank += 1;
+            let newest = protect.get(&group).copied().unwrap_or(0);
+            if *rank <= newest {
                 report
                     .kept
-                    .push((entry.path, format!("among the newest {}", keep.keep)));
-            }
-            valid_templates.retain(|(entry, ..)| {
-                if in_use.contains(&entry.path) {
+                    .push((entry.path.clone(), format!("among the newest {newest}")));
+                false
+            } else if in_use.contains(&entry.path) {
+                if keep.is_some() {
                     report.kept.push((entry.path.clone(), "in use".into()));
-                    false
-                } else {
-                    true
                 }
-            });
-        }
+                false
+            } else {
+                true
+            }
+        });
         let mut prune_log = if valid_templates.is_empty() {
             None
         } else {
@@ -1074,6 +1193,34 @@ impl Lifecycle {
         }
         report
     }
+}
+
+/// Store `target` (the build's output) as the complete entry for `key`:
+/// staged beside it, then renamed into place.
+fn publish_build(
+    target: &Path,
+    entry: &Path,
+    key: &str,
+    output: &str,
+    component: &str,
+) -> Result<(), DriverError> {
+    if !target.is_dir() {
+        return Err(DriverError::Unsupported(format!(
+            "{component}: build did not produce {output}"
+        )));
+    }
+    let staging = entry.with_extension("staging");
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging).map_err(io("clear build staging"))?;
+    }
+    materialize(target, &staging.join(OUTPUT)).map_err(io("store a build"))?;
+    std::fs::write(staging.join(KEY_FILE), key).map_err(io("record a build key"))?;
+    std::fs::write(staging.join(COMPLETE), b"").map_err(io("mark a build complete"))?;
+    if entry.exists() {
+        std::fs::remove_dir_all(entry).map_err(io("replace an incomplete build"))?;
+    }
+    std::fs::rename(&staging, entry).map_err(io("publish a build"))?;
+    Ok(())
 }
 
 fn single_path_component(value: &str) -> bool {

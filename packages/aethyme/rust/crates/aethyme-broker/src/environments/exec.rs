@@ -52,6 +52,10 @@ pub enum DriverError {
     },
     #[error("{label} did not finish within {seconds}s")]
     Timeout { label: String, seconds: u64 },
+    /// Stopped on purpose before it finished (#1366): a preemptible
+    /// prebuild that yielded to foreground work.
+    #[error("{label} was stopped: {reason}")]
+    Preempted { label: String, reason: String },
     #[error("{label} printed an invalid receipt: {reason}")]
     InvalidReceipt { label: String, reason: String },
     #[error("{component} exited right after start; last log lines:\n{tail}")]
@@ -79,6 +83,7 @@ impl DriverError {
             Self::Io { .. } => "io_error",
             Self::HookFailed { .. } => "hook_failed",
             Self::Timeout { .. } => "hook_timeout",
+            Self::Preempted { .. } => "hook_preempted",
             Self::InvalidReceipt { .. } => "invalid_receipt",
             Self::StartExited { .. } => "start_exited",
             Self::Unhealthy { .. } => "unhealthy",
@@ -317,13 +322,42 @@ pub fn run_hook(
     log: &Path,
     timeout: Duration,
 ) -> Result<HookOutcome, DriverError> {
+    run_hook_until(label, text, cwd, pass_env, vars, log, timeout, &mut || None)
+}
+
+/// [`run_hook`] that stops the hook's whole process group as soon as `stop`
+/// returns a reason (polled about once a second).
+#[allow(clippy::too_many_arguments)]
+pub fn run_hook_until(
+    label: &str,
+    text: &str,
+    cwd: &Path,
+    pass_env: &[String],
+    vars: &BTreeMap<String, String>,
+    log: &Path,
+    timeout: Duration,
+    stop: &mut dyn FnMut() -> Option<String>,
+) -> Result<HookOutcome, DriverError> {
     let mut command = command(text, cwd, pass_env, vars);
-    let outcome = crate::bounded_output::output_limited_in_owned_group(
+    let mut reason = None;
+    let outcome = crate::bounded_output::output_limited_in_owned_group_until(
         &mut command,
         timeout,
         HOOK_OUTPUT_LIMIT,
+        &mut || {
+            reason = stop();
+            reason.is_some()
+        },
     )
     .map_err(io(format!("run {label}")))?;
+    let Some(outcome) = outcome else {
+        let reason = reason.unwrap_or_else(|| "stopped".into());
+        append_log(log, &format!("[aethyme] {label}: stopped: {reason}\n"));
+        return Err(DriverError::Preempted {
+            label: label.into(),
+            reason,
+        });
+    };
     let output = match outcome {
         crate::bounded_output::LimitedOutput::Completed(output) => output,
         crate::bounded_output::LimitedOutput::Deadline => {

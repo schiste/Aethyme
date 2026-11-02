@@ -466,6 +466,25 @@ pub(super) fn run_pin(options: &Options) -> Result<Output, Failure> {
         });
     }
     let (mut lifecycle, _) = open("env pin", false)?;
+    // The repository may cap pins further; it never raises the host's cap.
+    let target = lifecycle
+        .store
+        .resolve(&id)
+        .map_err(|error| lifecycle_failure(error.into()))?;
+    if let Some(repository_cap) = target.snapshot.max_pin_seconds
+        && seconds > repository_cap
+    {
+        return Err(Failure {
+            code: "pin_too_long",
+            message: format!(
+                "env pin --for {seconds} exceeds the repository's max_pin_seconds ({repository_cap}) in {ENVIRONMENTS_FILE}"
+            ),
+            next_action: format!(
+                "pin for at most {repository_cap} seconds, or raise max_pin_seconds in {ENVIRONMENTS_FILE}"
+            ),
+            exit: exit_status::USAGE,
+        });
+    }
     let record = lifecycle
         .pin(&id, Duration::from_secs(seconds), reason)
         .map_err(lifecycle_failure)?;
