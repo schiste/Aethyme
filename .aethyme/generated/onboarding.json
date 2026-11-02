@@ -62,8 +62,7 @@
         "packages/aethyme/rust/crates/aethyme-graph-storage",
         "packages/aethyme/rust/crates/aethyme-producers",
         "packages/aethyme/rust/crates/aethyme-quality",
-        "packages/aethyme/rust/crates/aethyme-testkit",
-        "packages/aethyme/rust/vendor/libsqlite3-sys-0.30.1"
+        "packages/aethyme/rust/crates/aethyme-testkit"
       ],
       "lockfiles": [
         "packages/aethyme/rust/Cargo.lock"
@@ -90,7 +89,7 @@
         },
         {
           "kind": "workspace_members",
-          "detail": "13 tracked member roots",
+          "detail": "12 tracked member roots",
           "confidence": "high"
         },
         {
@@ -104,7 +103,7 @@
       "ranking": {
         "root_manifest": false,
         "declares_workspace": true,
-        "member_count": 13,
+        "member_count": 12,
         "ci_mentions": 64,
         "executable_entrypoints": 1,
         "source_files": 974
@@ -497,8 +496,7 @@
       "packages/aethyme/rust/crates/aethyme-graph-storage",
       "packages/aethyme/rust/crates/aethyme-producers",
       "packages/aethyme/rust/crates/aethyme-quality",
-      "packages/aethyme/rust/crates/aethyme-testkit",
-      "packages/aethyme/rust/vendor/libsqlite3-sys-0.30.1"
+      "packages/aethyme/rust/crates/aethyme-testkit"
     ],
     "lockfiles": [
       "packages/aethyme/rust/Cargo.lock"
@@ -525,7 +523,7 @@
       },
       {
         "kind": "workspace_members",
-        "detail": "13 tracked member roots",
+        "detail": "12 tracked member roots",
         "confidence": "high"
       },
       {
@@ -539,7 +537,7 @@
     "ranking": {
       "root_manifest": false,
       "declares_workspace": true,
-      "member_count": 13,
+      "member_count": 12,
       "ci_mentions": 64,
       "executable_entrypoints": 1,
       "source_files": 974
@@ -794,7 +792,7 @@
     ]
   },
   "freshness": {
-    "source_digest": "55af01b5025c34d66e88d9ed237c2fb3820fe29aaf1fe26d37b5228ecb7d7c4d",
+    "source_digest": "cd4806e3974287f437ebc04caffd720814b74a5d15a36d5e83e2393e9a728c15",
     "source_commit": null,
     "source_file_count": 3810,
     "generator": "deterministic"
@@ -807,7 +805,8 @@
     "Before a host-wide rollout, inventory router and engine binaries on agent `PATH`, repo-local selectors, and maintenance-service runtime pins. Verify both identities at every active entry point, and retain old immutable bundles until existing clients drain.",
     "Storage audits must account for the primary checkout's shared Git directory as well as linked/session worktrees. Report objects and packs, conflict-resolution cache, worktree administration, and recovery history separately from dependencies and local broker state/logs. Worktree cleanup does not compact shared Git data; keep unknown sizes unknown and distinguish logical bytes from unique physical allocation.",
     "Before hosted qualification of native filesystem changes, verify each platform-specific FFI field/type against the dependency version pinned in `Cargo.lock`. C headers and Linux builds do not establish Rust macOS declarations. Inspect production code, including inactive `cfg` branches, for discarded results such as `let _ =`; fix call sites rather than raising discard baselines.",
-    "Before repeating a Cargo command after unexpected wrapper behavior, inspect inherited `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `CARGO_BUILD_RUSTC_WRAPPER`, and `CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER` plus applicable ancestor `.cargo/config.toml` files and `$CARGO_HOME/config.toml` (commonly `~/.cargo/config.toml`). Removing `RUSTC_WRAPPER` alone does not disable `[build].rustc-wrapper` from config. Cargo documents `RUSTC_WRAPPER='' cargo ...` as a command-local override that disables that wrapper. Do not edit global Cargo config or stop shared cache servers for one task."
+    "Before repeating a Cargo command after unexpected wrapper behavior, inspect inherited `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `CARGO_BUILD_RUSTC_WRAPPER`, and `CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER` plus applicable ancestor `.cargo/config.toml` files and `$CARGO_HOME/config.toml` (commonly `~/.cargo/config.toml`). Removing `RUSTC_WRAPPER` alone does not disable `[build].rustc-wrapper` from config. Cargo documents `RUSTC_WRAPPER='' cargo ...` as a command-local override that disables that wrapper. Do not edit global Cargo config or stop shared cache servers for one task.",
+    "When documenting Cargo or another build tool, check behavior against the pinned tool's documentation/source or a metadata-only probe, and distinguish that evidence from compilation or test results."
   ],
   "telemetry": {
     "sections": [
@@ -833,7 +832,7 @@
       "generated_paths": 4,
       "dangerous_paths": 2,
       "navigation_recipes": 3,
-      "notes": 8
+      "notes": 9
     },
     "overrides_applied": true,
     "override_source": ".aethyme/overrides/onboarding.json",
