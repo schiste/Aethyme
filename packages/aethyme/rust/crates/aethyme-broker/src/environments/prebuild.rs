@@ -250,7 +250,7 @@ pub fn host_memory_used_pct() -> Option<u32> {
         let field = |name: &str| {
             text.lines()
                 .find_map(|line| line.strip_prefix(name))
-                .and_then(|rest| rest.trim().split_whitespace().next())
+                .and_then(|rest| rest.split_whitespace().next())
                 .and_then(|kib| kib.parse::<u64>().ok())
         };
         let (total, available) = (field("MemTotal:")?, field("MemAvailable:")?);
