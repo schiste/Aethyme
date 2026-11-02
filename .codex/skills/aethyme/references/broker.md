@@ -45,6 +45,20 @@ floor, so verify which executable resumed agents will use; the repo-local
 selector does not change their PATH. Preserve concurrent work and never
 automatically restore a pre-upgrade database over newer activity.
 
+Before a host-wide rollout, inventory every executable found on agent PATHs,
+repo-local runtime selectors, and installed maintenance-service runtime pins.
+Separate managed installations can serve different agents; updating one does
+not update the others. Verify both router and engine identities at every
+active entry point, and retain old immutable bundles until existing clients
+have drained.
+
+When refreshing an installed cleanup service to another immutable runtime,
+retain its installed plan, deactivate with that plan's digest, then uninstall
+with the same digest before installing the newly reviewed plan. An install
+refusal because the service file differs is not permission to overwrite it.
+Activate the new plan and verify its generation through service status and a
+matching pass receipt; preserve the prior receipts before uninstalling.
+
 For scheduled cleanup on macOS, a loaded LaunchAgent proves only scheduler
 registration. Check `broker gc service status --json` and its matching
 `last_pass` before claiming delivery; inspect the pass outcome separately
