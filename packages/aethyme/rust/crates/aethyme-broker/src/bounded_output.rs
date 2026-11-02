@@ -442,6 +442,19 @@ pub(crate) fn output_limited_in_owned_group(
     budget: Duration,
     max_stream_bytes: usize,
 ) -> io::Result<LimitedOutput> {
+    output_limited_in_owned_group_until(command, budget, max_stream_bytes, &mut || false)
+        .map(|outcome| outcome.unwrap_or(LimitedOutput::Deadline))
+}
+
+/// [`output_limited_in_owned_group`] that also stops the whole group when
+/// `stop` says so, polled about once a second. `Ok(None)` means it stopped.
+#[cfg(unix)]
+pub(crate) fn output_limited_in_owned_group_until(
+    command: &mut Command,
+    budget: Duration,
+    max_stream_bytes: usize,
+    stop: &mut dyn FnMut() -> bool,
+) -> io::Result<Option<LimitedOutput>> {
     use std::os::unix::process::CommandExt;
 
     let started = Instant::now();
@@ -452,7 +465,7 @@ pub(crate) fn output_limited_in_owned_group(
         .checked_add(1)
         .ok_or_else(|| io::Error::other("process output limit overflow"))?;
     if Instant::now() >= deadline {
-        return Ok(LimitedOutput::Deadline);
+        return Ok(Some(LimitedOutput::Deadline));
     }
 
     let child = command
@@ -479,10 +492,18 @@ pub(crate) fn output_limited_in_owned_group(
     let mut stderr = Vec::new();
     let mut stdout_closed = false;
     let mut stderr_closed = false;
+    let mut last_stop_check = Instant::now();
     loop {
         if Instant::now() >= deadline {
             child.terminate_and_reap()?;
-            return Ok(LimitedOutput::Deadline);
+            return Ok(Some(LimitedOutput::Deadline));
+        }
+        if last_stop_check.elapsed() >= Duration::from_secs(1) {
+            last_stop_check = Instant::now();
+            if stop() {
+                child.terminate_and_reap()?;
+                return Ok(None);
+            }
         }
 
         if !stdout_closed {
@@ -492,7 +513,7 @@ pub(crate) fn output_limited_in_owned_group(
             );
             if stdout.len() > max_stream_bytes {
                 child.terminate_and_reap()?;
-                return Ok(LimitedOutput::OutputLimit);
+                return Ok(Some(LimitedOutput::OutputLimit));
             }
         }
         if !stderr_closed {
@@ -502,7 +523,7 @@ pub(crate) fn output_limited_in_owned_group(
             );
             if stderr.len() > max_stream_bytes {
                 child.terminate_and_reap()?;
-                return Ok(LimitedOutput::OutputLimit);
+                return Ok(Some(LimitedOutput::OutputLimit));
             }
         }
 
@@ -536,7 +557,7 @@ pub(crate) fn output_limited_in_owned_group(
                     );
                 }
                 if stdout.len() > max_stream_bytes || stderr.len() > max_stream_bytes {
-                    return Ok(LimitedOutput::OutputLimit);
+                    return Ok(Some(LimitedOutput::OutputLimit));
                 }
                 if stdout_closed && stderr_closed {
                     break;
@@ -548,11 +569,11 @@ pub(crate) fn output_limited_in_owned_group(
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            return Ok(LimitedOutput::Completed(Output {
+            return Ok(Some(LimitedOutput::Completed(Output {
                 status,
                 stdout,
                 stderr,
-            }));
+            })));
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -778,6 +799,19 @@ pub(crate) fn output_limited_in_owned_group(
     _budget: Duration,
     _max_stream_bytes: usize,
 ) -> io::Result<LimitedOutput> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "owned process-group probes are unavailable on this platform",
+    ))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn output_limited_in_owned_group_until(
+    _command: &mut Command,
+    _budget: Duration,
+    _max_stream_bytes: usize,
+    _stop: &mut dyn FnMut() -> bool,
+) -> io::Result<Option<LimitedOutput>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "owned process-group probes are unavailable on this platform",

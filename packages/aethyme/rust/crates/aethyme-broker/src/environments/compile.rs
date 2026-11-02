@@ -103,6 +103,12 @@ pub struct CompiledEnvironment {
     /// reservation and the environment can be reconfigured in place.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reserved_port_keys: Vec<String>,
+    /// The repository's keep-awake caps, which only tighten the host's.
+    /// Omitted when unset, so existing snapshots keep their digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_pin_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_exec_busy_seconds: Option<u64>,
     pub source: SnapshotSource,
     /// Digest of everything above except `source`, so committing an unchanged
     /// file does not look like a reconfiguration.
@@ -175,6 +181,9 @@ pub struct CompiledComponent {
     pub build_output: Option<String>,
     pub cache_env: Vec<String>,
     pub template_inputs: Vec<String>,
+    /// Omitted when unset, so existing snapshots keep their digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_keep: Option<usize>,
     /// Omitted when false or empty, so a snapshot without optional
     /// components keeps the digest it had before E20.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -300,6 +309,8 @@ pub fn compile(
         uses_shared: profile.uses_shared.clone(),
         components,
         reserved_port_keys: Vec::new(),
+        max_pin_seconds: file.max_pin_seconds,
+        max_exec_busy_seconds: file.max_exec_busy_seconds,
         source: SnapshotSource {
             file: file_label.to_string(),
             file_digest: context.source_digest.clone(),
@@ -353,6 +364,7 @@ fn compile_component(file: &EnvironmentsFile, component: &ComponentSpec) -> Comp
         build_output: component.build_output.clone(),
         cache_env: component.cache_env.clone(),
         template_inputs: component.template_inputs.clone(),
+        template_keep: component.template_keep,
         optional: component.optional,
         enabled_by: component.enabled_by.clone(),
         paths: component.paths.clone(),
@@ -408,6 +420,10 @@ pub fn select_components(compiled: &mut CompiledEnvironment, selected: &BTreeSet
 fn snapshot_digest(compiled: &CompiledEnvironment) -> String {
     let mut normalized = compiled.clone();
     normalized.digest = String::new();
+    // Keep-awake caps change no component: `env up` refreshes them in place
+    // instead of asking for a reconfigure.
+    normalized.max_pin_seconds = None;
+    normalized.max_exec_busy_seconds = None;
     normalized.source = SnapshotSource {
         file: String::new(),
         file_digest: String::new(),

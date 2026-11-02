@@ -503,6 +503,17 @@ impl Lifecycle {
                 record, snapshot, worktree, main_root, session_id, options, &plan,
             );
         }
+        if (
+            record.snapshot.max_pin_seconds,
+            record.snapshot.max_exec_busy_seconds,
+        ) != (snapshot.max_pin_seconds, snapshot.max_exec_busy_seconds)
+        {
+            self.store.set_keep_awake_caps(
+                &record.env_id,
+                snapshot.max_pin_seconds,
+                snapshot.max_exec_busy_seconds,
+            )?;
+        }
         if record.phase == EnvironmentPhase::Failed
             && (record.capacity_lease_id.is_some()
                 || self

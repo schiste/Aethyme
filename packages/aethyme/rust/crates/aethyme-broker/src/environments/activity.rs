@@ -366,6 +366,15 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The tighter of a host cap and a repository cap: a repository can only
+/// lower what its host allows.
+pub fn tighter(host: Option<u64>, repository: Option<u64>) -> Option<u64> {
+    match (host, repository) {
+        (Some(host), Some(repository)) => Some(host.min(repository)),
+        (host, repository) => host.or(repository),
+    }
+}
+
 impl super::lifecycle::Lifecycle {
     /// Whether an environment is idle at `now`. Probes run only when every
     /// cheaper signal says idle, so their cost is bounded to environments
@@ -381,9 +390,11 @@ impl super::lifecycle::Lifecycle {
         {
             return Idleness::Pinned { until };
         }
-        let cap = super::host_file_beside(&self.root)
-            .max_exec_busy_seconds
-            .map(Duration::from_secs);
+        let cap = tighter(
+            super::host_file_beside(&self.root).max_exec_busy_seconds,
+            record.snapshot.max_exec_busy_seconds,
+        )
+        .map(Duration::from_secs);
         let busy = busy_state(&self.root, &record.env_id, now, cap);
         if busy == BusyState::Busy {
             return Idleness::Busy;
@@ -476,8 +487,10 @@ impl super::lifecycle::Lifecycle {
                             "exec busy cap reached",
                             "supervisor",
                             Some(&serde_json::json!({
-                                "max_exec_busy_seconds":
+                                "max_exec_busy_seconds": tighter(
                                     super::host_file_beside(&self.root).max_exec_busy_seconds,
+                                    record.snapshot.max_exec_busy_seconds,
+                                ),
                             })),
                         ),
                     );

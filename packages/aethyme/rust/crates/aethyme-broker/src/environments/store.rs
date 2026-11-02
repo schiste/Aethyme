@@ -712,6 +712,43 @@ impl EnvironmentStore {
     /// differs: replacing the commands of something that may be running is a
     /// reconfiguration, which the lifecycle layer performs explicitly. A
     /// `destroyed` record is re-planned with the new snapshot.
+    /// A second connection to the same database, for a reader that runs
+    /// while this one is borrowed (a prebuild's stop check).
+    pub fn reopen(&self) -> Result<Self, StoreError> {
+        let path = self
+            .conn
+            .path()
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| StoreError::Corrupt("the environment store has no path".into()))?;
+        Self::open(Path::new(path))
+    }
+
+    /// Refresh the repository keep-awake caps on a stored snapshot. They
+    /// are outside the snapshot digest, so changing them is no reconfigure.
+    pub fn set_keep_awake_caps(
+        &mut self,
+        env_id: &str,
+        max_pin_seconds: Option<u64>,
+        max_exec_busy_seconds: Option<u64>,
+    ) -> Result<(), StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(mut record) = load_record(&tx, env_id)? else {
+            return Ok(());
+        };
+        record.snapshot.max_pin_seconds = max_pin_seconds;
+        record.snapshot.max_exec_busy_seconds = max_exec_busy_seconds;
+        let json = serde_json::to_string(&record.snapshot)
+            .map_err(|error| StoreError::Corrupt(error.to_string()))?;
+        tx.execute(
+            "UPDATE environments SET spec_snapshot_json = ?2 WHERE env_id = ?1",
+            params![env_id, json],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn register(
         &mut self,
         snapshot: &CompiledEnvironment,
