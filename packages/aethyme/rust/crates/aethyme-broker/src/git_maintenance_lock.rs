@@ -386,17 +386,17 @@ fn canonical_directory_identity(path: &Path) -> Result<(PathBuf, DirectoryIdenti
     let canonical = fs::canonicalize(path)
         .map_err(|error| format!("cannot canonicalize {}: {error}", path.display()))?;
     let directory = open_canonical_directory(&canonical)?;
-    let metadata = directory
+    let _metadata = directory
         .metadata()
         .map_err(|error| format!("cannot fstat {}: {error}", canonical.display()))?;
-    let path_metadata = fs::metadata(&canonical)
+    let _path_metadata = fs::metadata(&canonical)
         .map_err(|error| format!("cannot stat {}: {error}", canonical.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
-        if !metadata.is_dir()
-            || metadata.dev() != path_metadata.dev()
-            || metadata.ino() != path_metadata.ino()
+        if !_metadata.is_dir()
+            || _metadata.dev() != _path_metadata.dev()
+            || _metadata.ino() != _path_metadata.ino()
         {
             return Err(format!(
                 "{} changed while resolving its directory identity",
@@ -407,34 +407,32 @@ fn canonical_directory_identity(path: &Path) -> Result<(PathBuf, DirectoryIdenti
             canonical.clone(),
             DirectoryIdentity {
                 canonical_path_hex: hex(canonical.as_os_str().as_bytes()),
-                device: metadata.dev(),
-                inode: metadata.ino(),
+                device: _metadata.dev(),
+                inode: _metadata.ino(),
             },
         ))
     }
     #[cfg(not(unix))]
     {
-        let _ = (metadata, path_metadata);
         Err("native stale-lock recovery is unsupported on this platform".into())
     }
 }
 
-fn open_canonical_directory(path: &Path) -> Result<File, String> {
+fn open_canonical_directory(_path: &Path) -> Result<File, String> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let descriptor =
-            crate::resources::managed_storage_inventory::open_absolute_directory_nofollow(path)
+            crate::resources::managed_storage_inventory::open_absolute_directory_nofollow(_path)
                 .map_err(|error| {
                     format!(
                         "cannot open directory {} without following links: {error}",
-                        path.display()
+                        _path.display()
                     )
                 })?;
         Ok(File::from(descriptor))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = path;
         Err("native no-follow directory access is unsupported on this platform".into())
     }
 }
@@ -764,10 +762,11 @@ fn valid_digest(value: &str) -> bool {
 }
 
 fn hex(bytes: &[u8]) -> String {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(output, "{byte:02x}");
+    for &byte in bytes {
+        output.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+        output.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
     }
     output
 }
