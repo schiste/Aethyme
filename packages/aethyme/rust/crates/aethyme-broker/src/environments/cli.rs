@@ -204,7 +204,10 @@ Usage:
       with --all; templates go only through their template_destroy, and a
       component's template_keep (or its prebuild's keep) newest templates
       are never evicted. A new template evicts older ones beyond
-      template_keep unless a live environment uses them.
+      template_keep unless a live environment uses them. Building one
+      digest holds its key: a concurrent `env up` waits for it, until the
+      builder's own deadline (a prebuild's timeout_seconds) when that is
+      past 30 minutes.
   aethyme env routes [--json]
       The route table the built-in proxy serves on 127.0.0.1:4180
       (AETHYME_ENV_PROXY_PORT): <component>.<namespace>.<route_domain> and

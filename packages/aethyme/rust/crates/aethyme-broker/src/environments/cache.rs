@@ -486,18 +486,28 @@ impl Lifecycle {
 
     /// Run `body` holding the cache key, failing if another holder keeps it
     /// past `COALESCE_WAIT`.
+    ///
+    /// While `body` runs, a holder record says who holds the key and until
+    /// when (`hold_for`, the hook's timeout), so a waiter outlasts a long
+    /// holder such as a prebuild instead of giving up after `COALESCE_WAIT`.
     fn coalesce<T>(
         &mut self,
         repository: &str,
         key: &str,
+        hold_for: Duration,
         body: impl FnOnce(&mut Self) -> Result<T, DriverError>,
     ) -> Result<T, DriverError> {
-        self.exclusive(repository, key, COALESCE_WAIT, body)
-            .unwrap_or_else(|| {
-                Err(DriverError::Engine(format!(
-                    "cache key {key} is held by another process"
-                )))
-            })
+        let holders = self.root.join(HOLDERS);
+        let wait = coalesce_wait(&holders, key, super::activity::now_ms());
+        self.exclusive(repository, key, wait, |this| {
+            let _holder = HolderRecord::hold(&holders, key, hold_for);
+            body(this)
+        })
+        .unwrap_or_else(|| {
+            Err(DriverError::Engine(format!(
+                "cache key {key} is held by another process"
+            )))
+        })
     }
 
     /// Build a component, reusing the cached output for its input digest.
@@ -537,7 +547,7 @@ impl Lifecycle {
         let key = format!("aethyme-env-build:{repository}:{}:{digest}", component.name);
         let log = ctx.log();
         let target = worktree.join(output);
-        self.coalesce(&repository, &key, |this| {
+        self.coalesce(&repository, &key, ctx.hook_timeout, |this| {
             this.add_cache_use(&env_id, &entry)?;
             if entry.join(COMPLETE).exists() {
                 materialize(&entry.join(OUTPUT), &target)
@@ -655,7 +665,7 @@ impl Lifecycle {
         }
         let (entry, key) = self.build_entry(job.repository, &component.name, digest);
         let target = job.worktree.join(output);
-        self.coalesce(job.repository, &key, |_| {
+        self.coalesce(job.repository, &key, job.timeout, |_| {
             if entry.join(COMPLETE).exists() {
                 return Ok(false);
             }
@@ -745,7 +755,7 @@ impl Lifecycle {
         };
         let id = short(digest).to_string();
         let (marker, key) = self.template_marker(job.repository, &component.name, digest);
-        let built = self.coalesce(job.repository, &key, |this| {
+        let built = self.coalesce(job.repository, &key, job.timeout, |this| {
             if let Some(env_id) = job.env_id {
                 this.add_cache_use(env_id, &marker)?;
             }
@@ -1192,6 +1202,82 @@ impl Lifecycle {
             }
         }
         report
+    }
+}
+
+/// Beside the cache (never inside it: cache GC refuses unknown entries
+/// there): one record per cache key being built right now.
+pub const HOLDERS: &str = "cache-holders";
+/// A waiter's margin past the holder's deadline (cleanup, publication).
+const HOLDER_MARGIN_MS: i64 = 60_000;
+
+/// Who holds a cache key and until when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HolderRecord {
+    pub pid: u32,
+    pub until_ms: i64,
+}
+
+pub(super) fn holder_path(holders: &Path, key: &str) -> PathBuf {
+    holders.join(format!("{:x}.json", Sha256::digest(key.as_bytes())))
+}
+
+/// Removes the holder record when the build ends, however it ends.
+struct HolderGuard(Option<PathBuf>);
+
+impl Drop for HolderGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            crate::warn_unrecorded("remove a cache holder record", std::fs::remove_file(path));
+        }
+    }
+}
+
+impl HolderRecord {
+    fn hold(holders: &Path, key: &str, hold_for: Duration) -> HolderGuard {
+        let path = holder_path(holders, key);
+        let record = HolderRecord {
+            pid: std::process::id(),
+            until_ms: super::activity::now_ms()
+                .saturating_add(i64::try_from(hold_for.as_millis()).unwrap_or(i64::MAX)),
+        };
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| {
+                std::fs::write(
+                    &path,
+                    serde_json::to_vec(&record).map_err(std::io::Error::other)?,
+                )
+            });
+        match written {
+            Ok(()) => HolderGuard(Some(path)),
+            Err(error) => {
+                crate::warn_unrecorded("record a cache holder", Err::<(), _>(error));
+                HolderGuard(None)
+            }
+        }
+    }
+}
+
+/// How long to wait for `key`: [`COALESCE_WAIT`], or until a live holder's
+/// recorded deadline (plus a margin) when that is later.
+pub fn coalesce_wait(holders: &Path, key: &str, now_ms: i64) -> Duration {
+    let holder = std::fs::read(holder_path(holders, key))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<HolderRecord>(&bytes).ok());
+    match holder {
+        Some(holder)
+            if holder.until_ms > now_ms
+                && crate::blockers::process_alive(i64::from(holder.pid)) =>
+        {
+            let remaining = holder
+                .until_ms
+                .saturating_sub(now_ms)
+                .saturating_add(HOLDER_MARGIN_MS);
+            COALESCE_WAIT.max(Duration::from_millis(remaining as u64))
+        }
+        _ => COALESCE_WAIT,
     }
 }
 

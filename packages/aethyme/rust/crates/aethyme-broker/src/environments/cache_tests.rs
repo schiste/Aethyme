@@ -922,3 +922,66 @@ fn keep_awake_caps_and_template_keep_are_validated() {
     assert!(codes.contains(&"invalid_keep_awake_cap"), "{codes:?}");
     assert!(codes.contains(&"field_not_supported"), "{codes:?}");
 }
+
+/// A waiter outlasts a live holder: the wait runs to the holder's recorded
+/// deadline plus a margin when that is past the usual 30 minutes, and falls
+/// back to 30 minutes for a dead or expired holder, or none.
+#[test]
+fn a_live_long_holder_extends_the_coalesce_wait() {
+    use super::cache::{HolderRecord, coalesce_wait, holder_path};
+    let holders = tempfile::tempdir().unwrap();
+    let now = super::activity::now_ms();
+    let usual = Duration::from_secs(1800);
+    assert_eq!(coalesce_wait(holders.path(), "k", now), usual);
+    let write = |pid: u32, until_ms: i64| {
+        std::fs::write(
+            holder_path(holders.path(), "k"),
+            serde_json::to_vec(&HolderRecord { pid, until_ms }).unwrap(),
+        )
+        .unwrap();
+    };
+    write(std::process::id(), now + 2 * 3600 * 1000);
+    assert_eq!(
+        coalesce_wait(holders.path(), "k", now),
+        Duration::from_millis(2 * 3600 * 1000 + 60_000)
+    );
+    assert_eq!(coalesce_wait(holders.path(), "other", now), usual);
+    write(std::process::id(), now + 60_000);
+    assert_eq!(coalesce_wait(holders.path(), "k", now), usual);
+    write(std::process::id(), now - 1);
+    assert_eq!(coalesce_wait(holders.path(), "k", now), usual);
+    let mut child = Command::new("true").spawn().unwrap();
+    let dead = child.id();
+    child.wait().unwrap();
+    write(dead, now + 2 * 3600 * 1000);
+    assert_eq!(coalesce_wait(holders.path(), "k", now), usual);
+}
+
+/// The holder record exists while the template hook runs and is gone after.
+#[test]
+fn a_build_holds_its_key_only_while_it_runs() {
+    let host = tempfile::tempdir().unwrap();
+    let holders = host.path().join("environments").join(super::cache::HOLDERS);
+    let seen = host.path().join("seen.log");
+    let text = format!(
+        r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "db"
+runtime = "hooks"
+provision = "true"
+destroy = "true"
+template = 'ls "{holders}" | wc -l | tr -d " " >> "{seen}"'
+template_destroy = "true"
+template_inputs = ["db/**"]
+"#,
+        holders = holders.display(),
+        seen = seen.display(),
+    );
+    let mut lifecycle = lifecycle(host.path());
+    ensure_for(&mut lifecycle, &text, "v1");
+    assert_eq!(std::fs::read_to_string(&seen).unwrap().trim(), "1");
+    assert_eq!(std::fs::read_dir(&holders).unwrap().count(), 0);
+}
