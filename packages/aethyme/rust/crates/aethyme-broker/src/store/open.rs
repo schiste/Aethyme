@@ -847,6 +847,21 @@ impl BrokerStore {
         self.session(id)
     }
 
+    /// Every session, cleaned ones included, that ever worked on `branch`,
+    /// newest first: owner resolution (#1238) maps a landed branch back to
+    /// the sessions that produced it long after they finished.
+    pub fn sessions_on_branch(&self, branch: &str) -> Result<Vec<Session>, BrokerError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SESSION_SELECT} WHERE branch = ?1 ORDER BY id DESC"
+        ))?;
+        let rows = stmt.query_map([branch], session_from_row)?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row??);
+        }
+        Ok(sessions)
+    }
+
     /// All sessions not yet cleaned, oldest first.
     pub fn live_sessions(&self) -> Result<Vec<Session>, BrokerError> {
         let mut stmt = self.conn.prepare(&format!(

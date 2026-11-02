@@ -1,0 +1,9 @@
+exit: 0
+--- stdout
+  aethyme broker advanced owners --commits <from>..<to> [--path <glob>]... [--json]
+      Name the sessions that produced the landed commits in a range, narrowed
+      to commits touching any --path glob (#1238). Each commit is traced to
+      the merge that landed it; its pull request and branch map to sessions,
+      finished ones included, each with liveness, branch and pull request.
+      A single commit reads as the commits it brought in. Read-only.
+--- stderr

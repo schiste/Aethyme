@@ -114,6 +114,7 @@ use most:
 - `aethyme broker advanced report render`
 - `aethyme broker advanced report file`
 - `aethyme broker advanced issues upsert`
+- `aethyme broker advanced owners`
 - `aethyme broker advanced integration status`
 - `aethyme broker advanced integration reconcile`
 - `aethyme broker advanced quick-test`
@@ -903,6 +904,7 @@ continues to expose the complete local `log_path` without embedding log data.
 - `aethyme broker advanced report render <filename> --form <form.yml> [--output <name>.issue.md] [--json]`
 - `aethyme broker advanced report file <path> --repo <owner/name> --confirm <sha256> [--json]`
 - `aethyme broker advanced issues upsert --repo <owner/name> --fingerprint <key> (--title <title> --body-file <path> [--label <label>]... | --resolve [--body-file <path>]) [--session <id>] [--json]`
+- `aethyme broker advanced owners --commits <from>..<to> [--path <glob>]... [--json]`
 - `aethyme broker advanced ship plan --entry <id> [--json]`
 - `aethyme broker advanced ship execute --entry <id> --confirm <full-integration-sha> [--sync-main] [--break-glass --reason <authorization>] [--json]`
 - `aethyme broker advanced integration status [--json]`

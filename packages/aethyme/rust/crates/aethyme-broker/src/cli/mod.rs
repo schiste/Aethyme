@@ -254,6 +254,12 @@ Usage:
   aethyme broker agents [--json]
       List live sessions with activity-derived liveness, refreshing
       diff-derived leases and warning on overlapping edits.
+  aethyme broker owners --commits <from>..<to> [--path <glob>]... [--json]
+      Name the sessions that produced the landed commits in a range, narrowed
+      to commits touching any --path glob (#1238). Each commit is traced to
+      the merge that landed it; its pull request and branch map to sessions,
+      finished ones included, each with liveness, branch and pull request.
+      A single commit reads as the commits it brought in. Read-only.
   aethyme broker leases [--json]
       Refresh and list active leases plus current overlaps.
   aethyme broker leases claim <path> --session <id> [--ttl <seconds>] [--json]
@@ -1673,6 +1679,8 @@ struct Parsed {
     labels: Vec<String>,
     /// `issues upsert --resolve`.
     resolve: bool,
+    /// `owners --commits`: the landed range to resolve (#1238).
+    commits: Option<String>,
     output: Option<PathBuf>,
     grant_out: Option<PathBuf>,
     cleanup_command: Option<String>,
@@ -1831,6 +1839,7 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         body_file: None,
         labels: Vec::new(),
         resolve: false,
+        commits: None,
         output: None,
         grant_out: None,
         cleanup_command: None,
@@ -2248,6 +2257,15 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
                         .ok_or(UsageError::Message("--worktree requires a path".into()))?
                         .clone(),
                 ))
+            }
+            "--commits" => {
+                parsed.commits = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message(
+                            "--commits requires a range such as <from>..<to>".into(),
+                        ))?
+                        .clone(),
+                )
             }
             "--fingerprint" => {
                 parsed.fingerprint = Some(
@@ -2785,6 +2803,7 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         "console" => run_console(parsed)?,
         "resources" => run_resources(parsed)?,
         "agents" => run_agents(parsed)?,
+        "owners" => run_owners(parsed)?,
         "leases" => run_leases(parsed)?,
         "ownership" => run_ownership(parsed)?,
         "exec" => run_exec(parsed)?,
