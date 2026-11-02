@@ -8,6 +8,7 @@ description = "Deployment and templating for Aethyme discoverability: enhance de
 [dependencies]
 # Shared .aethyme config loader: <stem>.toml, .yaml or .yml (#1223).
 aethyme-config = { path = "../aethyme-config" }
+globset = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
