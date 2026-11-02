@@ -99,7 +99,7 @@ description: Use when starting work in an unfamiliar repository, when the task a
 
 ## Maintainer Notes
 
-- Use `packages/aethyme/scripts/test-like-ci.sh`: it follows CI's parallel `nextest --profile ci` path. Do not run the suite serially or with `--no-capture`; a `resource_contention` or concurrency-only failure is a host-capacity signal, so rerun the failing test in isolation before changing code. Report interrupted test runs accurately.
+- `packages/aethyme/scripts/test-like-ci.sh` defaults to changed crates with the bounded local profile (one Cargo build job, two nextest workers, no retries); `--full` selects the full workspace and CI profile, including retries. Investigate contention when failures appear only under concurrency, and rerun the failing test in isolation before attributing cause; a passing isolated run does not rule out a race. Report interrupted test runs accurately.
 - `packages/aethyme` is 100% Rust; `python -m src.cli` has no shim, and `packages/aethyme-eval` remains Python by design. Do not add Python build files under `packages/aethyme`. `rust-toolchain.toml` pins local, gate, and CI builds; it wins over an action's `toolchain: stable`, so install targets and components on the pinned toolchain separately.
 - Keep gate triggers aligned with the paths they cover; stale globs can silently disable a gate, so add triggers when adding packages, manifests, or workflow directories. Treat `.aethyme/gates.toml` and `.aethyme/config.toml` as security-sensitive. Graph authority `disabled` is the intended default; a missing fragment store is healthy in that posture, though graph-dependent commands fail until local refresh.
 - Tests that parse Git output should export `CHAU7_CTO_OPTIM_ACTIVE=1` because the host wrapper can compress `git log`/`git status`. Tests touching a shared database or external namespace must use `$AETHYME_TEST_DB_SUFFIX` and `$AETHYME_GATE_WORKER_ID` where relevant.
@@ -110,7 +110,7 @@ description: Use when starting work in an unfamiliar repository, when the task a
 
 ## Freshness
 
-- Source digest: `087f8e02992f8d003b073e5f092ca1a55f2f38d690f2ffaff8e2efdc8dcf6726`
+- Source digest: `55af01b5025c34d66e88d9ed237c2fb3820fe29aaf1fe26d37b5228ecb7d7c4d`
 - Tracked source files: `3810`
 - Overrides applied: `True`
 - Sections generated: `repo, workspaces, primary_workspace, commands, areas, entrypoints, caution_zones, generated_paths, dangerous_paths, navigation_recipes, summon, freshness`
