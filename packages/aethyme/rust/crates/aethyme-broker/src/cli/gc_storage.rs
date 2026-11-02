@@ -1078,6 +1078,16 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     if action == "artifact-use" {
         return run_gc_artifact_use_reconcile(parsed);
     }
+    if action == "storage" {
+        if parsed.positional.get(1).map(String::as_str) != Some("maintenance-lock") {
+            return Err(UsageError::Message(
+                "gc storage accepts `maintenance-lock plan` or `maintenance-lock apply --confirm <sha256>`".into(),
+            ));
+        }
+        let mut storage = parsed;
+        storage.positional.remove(0);
+        return run_storage(storage);
+    }
     if parsed.positional.len() != 1 {
         return Err(UsageError::Message(
             "gc accepts one action: `plan`, `apply --confirm <sha256>`, `abandon --confirm <sha256>`, `forget-abandoned --confirm <sha256>`, `artifact-use reconcile <plan|apply> <session-id>`, or `sweep`".into(),
@@ -1824,6 +1834,9 @@ fn render_gc_sweep(report: &crate::ArtifactSweepReport) {
 
 /// `broker storage`.
 pub(super) fn run_storage(parsed: Parsed) -> Result<(), UsageError> {
+    if parsed.positional.first().map(String::as_str) == Some("maintenance-lock") {
+        return run_storage_maintenance_lock(parsed);
+    }
     if parsed.positional.first().map(String::as_str) == Some("identity") {
         return run_storage_identity(parsed);
     }
@@ -1881,6 +1894,108 @@ pub(super) fn run_storage(parsed: Parsed) -> Result<(), UsageError> {
         Some(other) => {
             return Err(UsageError::Message(format!(
                 "unknown storage action {other:?}; expected `plan`, `apply` or `attribute`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn run_storage_maintenance_lock(parsed: Parsed) -> Result<(), UsageError> {
+    if parsed.positional.len() != 2 {
+        return Err(UsageError::Message(
+            "storage maintenance-lock requires exactly one action: `plan` or `apply --confirm <sha256>`".into(),
+        ));
+    }
+    if let Some(flag) = parsed.given_flags.iter().find(|flag| {
+        !matches!(
+            flag.as_str(),
+            "--json" | "--json-output" | "--confirm" | "--no-quiet"
+        )
+    }) {
+        return Err(UsageError::Message(format!(
+            "{flag} is not supported by storage maintenance-lock"
+        )));
+    }
+    if parsed
+        .given_flags
+        .iter()
+        .filter(|flag| flag.as_str() == "--confirm")
+        .count()
+        > 1
+    {
+        return Err(UsageError::Message(
+            "storage maintenance-lock accepts --confirm at most once".into(),
+        ));
+    }
+    if parsed.apply {
+        return Err(UsageError::Message(
+            "storage maintenance-lock uses explicit `apply --confirm <sha256>`; --apply is not supported".into(),
+        ));
+    }
+    let action = parsed.positional[1].as_str();
+    let cwd = std::env::current_dir()
+        .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;
+    match action {
+        "plan" => {
+            if parsed.confirm.is_some() {
+                return Err(UsageError::Message(
+                    "maintenance-lock plan does not accept --confirm".into(),
+                ));
+            }
+            let plan = crate::git_maintenance_lock::plan(&cwd);
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                out!(
+                    "Git maintenance-lock recovery plan: {}",
+                    if plan.eligible { "eligible" } else { "refused" }
+                );
+                if let Some(target) = &plan.target {
+                    out!("  exact target: {target}");
+                }
+                if let Some(digest) = &plan.confirmation_sha256 {
+                    out!("  confirmation: {digest}");
+                }
+                for refusal in &plan.refusals {
+                    out!("  refusal [{}]: {}", refusal.code, refusal.message);
+                }
+            }
+        }
+        "apply" => {
+            let confirm = parsed.confirm.as_deref().ok_or_else(|| {
+                UsageError::Message("maintenance-lock apply requires --confirm <sha256>".into())
+            })?;
+            let report = crate::git_maintenance_lock::apply(&cwd, confirm);
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                out!("Git maintenance-lock recovery apply: {:?}", report.status);
+                if let Some(target) = &report.target {
+                    out!("  exact target: {target}");
+                }
+                out!("  target unlinked: {}", report.target_unlinked);
+                out!("  receipt written: {}", report.receipt_written);
+                for refusal in &report.refusals {
+                    out!("  refusal [{}]: {}", refusal.code, refusal.message);
+                }
+                if let Some(next_action) = &report.next_action {
+                    out!("  next action: {next_action}");
+                }
+            }
+            if !report.status.is_complete() {
+                return Err(UsageError::Message(
+                    report.next_action.clone().unwrap_or_else(|| {
+                        format!(
+                            "maintenance-lock apply did not complete: {:?}",
+                            report.status
+                        )
+                    }),
+                ));
+            }
+        }
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown maintenance-lock action {other:?}; expected `plan` or `apply`"
             )));
         }
     }

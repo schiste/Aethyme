@@ -992,6 +992,11 @@ Usage:
       inodes, owner marker, repository binding, and nonzero volume UUIDs; the
       confirmation binds the exact old and replacement payloads and owner
       marker bytes. This does not prove historical volume UUIDs.
+  aethyme broker storage maintenance-lock plan [--json]
+  aethyme broker storage maintenance-lock apply --confirm <sha256> [--json]
+      Review or remove only the exact empty, owned maintenance lock proven to
+      predate this OS boot. Apply records a durable intent before unlinking;
+      refusals retain the lock, and an existing intent requires operator review.
   aethyme broker storage attribute [--apply] [--json]
       List host worktree roots with no ownership marker and whether this
       repository can prove it owns each one: every Git worktree under it is
