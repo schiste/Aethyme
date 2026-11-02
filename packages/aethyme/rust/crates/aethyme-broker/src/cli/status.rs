@@ -828,6 +828,17 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
             );
             out!("  run: aethyme env budgets");
         }
+        for recovery in &report.preparation_rotation_recovery {
+            out!(
+                "preparation-cache rotation recovery {}",
+                crate::preparation::recovery_state::describe(recovery)
+            );
+            if recovery.state != crate::RotationRecoveryState::Complete {
+                out!(
+                    "  progress is kept between attempts; run: aethyme broker submit prepare --session <id>"
+                );
+            }
+        }
         if let Some(latest) = report.automation_issue_refusals.last() {
             out!(
                 "automation issues refused: {} kept, latest {} for {} ({})",

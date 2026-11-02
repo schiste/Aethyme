@@ -1053,7 +1053,9 @@ impl Broker {
         let sessions = self.store.live_sessions()?;
         let count = sessions.len();
         if count > crate::resource_pressure::SESSION_LIMIT {
-            return Ok(crate::resource_pressure::Report::over_budget(count));
+            let mut report = crate::resource_pressure::Report::over_budget(count);
+            report.preparation_rotation_recovery = self.preparation_rotation_recoveries();
+            return Ok(report);
         }
         let now = now_ms();
         let mut owners = Vec::new();
@@ -1071,7 +1073,9 @@ impl Broker {
                 holder: crate::session_holder::recorded_holder(&self.store, session.id)?,
             });
         }
-        Ok(crate::resource_pressure::Report::capture(owners))
+        let mut report = crate::resource_pressure::Report::capture(owners);
+        report.preparation_rotation_recovery = self.preparation_rotation_recoveries();
+        Ok(report)
     }
 
     /// Derive current liveness without persisting status transitions. This is
