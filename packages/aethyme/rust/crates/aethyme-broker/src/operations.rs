@@ -2997,7 +2997,9 @@ pub fn classify_git(args: &[String]) -> Option<OperationEffect> {
         {
             Some(OperationEffect::Write)
         }
-        "maintenance" | "gc" | "prune" | "repack" => Some(OperationEffect::Destructive),
+        "maintenance" | "gc" | "prune" | "prune-packed" | "repack" => {
+            Some(OperationEffect::Destructive)
+        }
         "rerere"
             if args
                 .get(1)
@@ -3571,6 +3573,7 @@ mod git_storage_maintenance_tests {
             vec!["gc", "--auto"],
             vec!["gc", "--prune=now"],
             vec!["prune", "--expire=now"],
+            vec!["prune-packed"],
             vec!["repack", "-ad"],
             vec!["rerere", "gc"],
         ] {

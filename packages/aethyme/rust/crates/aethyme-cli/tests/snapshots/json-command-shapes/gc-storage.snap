@@ -16,6 +16,17 @@
       "dirty_paths": [
         "string"
       ],
+      "git_storage": [
+        {
+          "blockers": [],
+          "category": "string",
+          "estimated_bytes": "null",
+          "estimated_inodes": "null",
+          "maintenance": "string",
+          "measured_at_ms": "null",
+          "path": "string"
+        }
+      ],
       "path": "string",
       "repository_key": "string"
     }

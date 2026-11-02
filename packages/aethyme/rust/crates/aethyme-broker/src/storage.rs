@@ -4250,7 +4250,7 @@ fn inspect_primary_checkout(
                 clean = dirty_paths.is_empty();
                 if !clean {
                     blockers.push(format!(
-                        "checkout has uncommitted changes; no primary artifact is eligible; shared Git storage remains inventoried ({} path(s))",
+                        "checkout has uncommitted changes; refusing the whole checkout for primary artifact cleanup; shared Git storage remains inventoried ({} path(s))",
                         dirty_paths.len()
                     ));
                 }
