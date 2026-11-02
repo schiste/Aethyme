@@ -134,6 +134,122 @@ fn validate_budgets(c: &mut Collector<'_>, file: &EnvironmentsFile) {
     }
 }
 
+/// `[[prebuild]]` (#1237): a unique name that makes a valid outcome source,
+/// a declared profile and component that has a template, and conditions,
+/// `keep` and timeout that make sense.
+fn validate_prebuild(c: &mut Collector<'_>, file: &EnvironmentsFile) {
+    let mut names = BTreeSet::new();
+    for entry in &file.prebuild {
+        let field = |name: &str| format!("prebuild.{}.{name}", entry.name);
+        if !crate::outcome_issues::valid_outcome_source(&format!("prebuild:{}", entry.name)) {
+            c.push(
+                "invalid_prebuild",
+                None,
+                None,
+                Some("prebuild.name"),
+                format!(
+                    "prebuild name {:?} must be 1-55 lowercase letters, digits, '.', '_' or '-'",
+                    entry.name
+                ),
+                "e.g. name = \"db-template\"",
+            );
+        } else if !names.insert(entry.name.as_str()) {
+            c.push(
+                "duplicate_prebuild",
+                None,
+                None,
+                Some("prebuild.name"),
+                format!("prebuild {:?} is declared twice", entry.name),
+                "give each [[prebuild]] its own name",
+            );
+        }
+        match file.profiles.iter().find(|p| p.name == entry.profile) {
+            None => c.push(
+                "unknown_profile",
+                Some(entry.profile.as_str()),
+                None,
+                Some(field("profile").as_str()),
+                format!(
+                    "prebuild {:?} names {:?}, which is not a declared profile",
+                    entry.name, entry.profile
+                ),
+                "use a profile name from [[profiles]]",
+            ),
+            Some(profile) => match profile
+                .components
+                .iter()
+                .find(|x| x.name == entry.component)
+            {
+                None => c.push(
+                    "unknown_component",
+                    Some(entry.profile.as_str()),
+                    Some(entry.component.as_str()),
+                    Some(field("component").as_str()),
+                    format!(
+                        "prebuild {:?} names component {:?}, which profile {:?} does not declare",
+                        entry.name, entry.component, entry.profile
+                    ),
+                    "use a component of the profile",
+                ),
+                Some(component) if component.template.is_none() => c.push(
+                    "prebuild_without_template",
+                    Some(entry.profile.as_str()),
+                    Some(entry.component.as_str()),
+                    Some(field("component").as_str()),
+                    format!(
+                        "prebuild {:?}: component {:?} declares no template to build",
+                        entry.name, entry.component
+                    ),
+                    "add template, template_destroy and template_inputs to the component",
+                ),
+                Some(_) => {}
+            },
+        }
+        if entry.reference.trim().is_empty() {
+            c.push(
+                "invalid_prebuild",
+                None,
+                None,
+                Some(field("ref").as_str()),
+                "ref must name a ref",
+                "e.g. ref = \"default_branch\"",
+            );
+        }
+        for condition in &entry.when {
+            if let Err(error) = super::prebuild::Condition::parse(condition) {
+                c.push(
+                    "invalid_prebuild",
+                    None,
+                    None,
+                    Some(field("when").as_str()),
+                    error,
+                    "use host_idle, inside:HH:MM-HH:MM or outside:HH:MM-HH:MM",
+                );
+            }
+        }
+        if entry.keep == 0 {
+            c.push(
+                "invalid_prebuild",
+                None,
+                None,
+                Some(field("keep").as_str()),
+                "keep must be at least 1, or the prebuilt template would be evicted",
+                "e.g. keep = 2",
+            );
+        }
+        if entry.timeout_seconds == 0 || entry.quiet_minutes == 0 {
+            c.push(
+                "invalid_prebuild",
+                None,
+                None,
+                Some(field("timeout_seconds").as_str()),
+                "timeout_seconds and quiet_minutes must be positive",
+                "e.g. timeout_seconds = 3600, quiet_minutes = 15",
+            );
+        }
+    }
+}
+
 /// `[budgets.outcomes]`: at least one window, and a failure rate that is a
 /// percentage.
 fn validate_budget_outcomes(c: &mut Collector<'_>, file: &EnvironmentsFile) {
@@ -269,6 +385,7 @@ pub fn validate(
     validate_pools(&mut c, file, host, host_label);
     validate_budgets(&mut c, file);
     validate_budget_outcomes(&mut c, file);
+    validate_prebuild(&mut c, file);
 
     let mut names = BTreeSet::new();
     let mut ranks: BTreeMap<u32, &str> = BTreeMap::new();

@@ -35,6 +35,7 @@ pub mod logs;
 pub mod metrics;
 mod operate;
 mod park;
+pub mod prebuild;
 mod preempt;
 pub mod proxy;
 pub mod routes;
@@ -62,6 +63,8 @@ mod lifecycle_tests;
 mod metrics_tests;
 #[cfg(test)]
 mod park_tests;
+#[cfg(test)]
+mod prebuild_tests;
 #[cfg(test)]
 mod preempt_tests;
 #[cfg(test)]

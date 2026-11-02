@@ -90,7 +90,7 @@ fn short(digest: &str) -> &str {
     &digest[..16.min(digest.len())]
 }
 
-fn repository_dir(repository: &str) -> String {
+pub(super) fn repository_dir(repository: &str) -> String {
     repository
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
@@ -385,6 +385,50 @@ pub struct TemplateMarker {
     pub created_at: i64,
 }
 
+/// One template to make sure of (#1237): from an environment, or from a
+/// prebuild with no environment at all.
+pub struct TemplateJob<'a> {
+    pub repository: &'a str,
+    pub component: &'a CompiledComponent,
+    /// Where the hook runs and the digest was computed.
+    pub worktree: &'a Path,
+    pub vars: BTreeMap<String, String>,
+    pub log: PathBuf,
+    pub timeout: Duration,
+    /// The environment that relies on it, recorded before it does.
+    pub env_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnsuredTemplate {
+    pub id: String,
+    pub digest: String,
+    /// Whether this call ran the hook.
+    pub built: bool,
+}
+
+/// The template digest of a component in `worktree`, exactly as `env up`
+/// computes it; `None` when the component declares no template.
+pub fn template_digest(
+    worktree: &Path,
+    component: &CompiledComponent,
+) -> Result<Option<String>, String> {
+    let (Some(command), Some(_)) = (
+        component.commands.template.as_deref(),
+        component.commands.template_destroy.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    input_digest(
+        worktree,
+        "template",
+        component,
+        command,
+        &component.template_inputs,
+    )
+    .map(Some)
+}
+
 /// Cache entries a live environment depends on, recorded under each entry's
 /// key as it is ensured.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -515,49 +559,114 @@ impl Lifecycle {
         ctx: &DriverContext<'_>,
     ) -> Result<Option<String>, DriverError> {
         let component = ctx.component;
+        let worktree = ctx.bindings.worktree.clone();
+        let Some(digest) =
+            template_digest(&worktree, component).map_err(DriverError::Unsupported)?
+        else {
+            return Ok(None);
+        };
+        let ensured = self.ensure_template_job(
+            TemplateJob {
+                repository: &ctx.environment.repository,
+                component,
+                worktree: &worktree,
+                vars: ctx.vars(),
+                log: ctx.log(),
+                timeout: ctx.hook_timeout,
+                env_id: Some(&ctx.environment.env_id),
+            },
+            &digest,
+        )?;
+        Ok(Some(ensured.id))
+    }
+
+    /// The marker and exclusive key of one template digest.
+    fn template_marker(
+        &self,
+        repository: &str,
+        component: &str,
+        digest: &str,
+    ) -> (PathBuf, String) {
+        let marker = self
+            .cache_root()
+            .join(TEMPLATES)
+            .join(repository_dir(repository))
+            .join(component)
+            .join(format!("{}.json", short(digest)));
+        let key = format!("aethyme-env-template:{repository}:{component}:{digest}");
+        (marker, key)
+    }
+
+    /// Whether the template for `digest` is published.
+    pub fn template_exists(&self, repository: &str, component: &str, digest: &str) -> bool {
+        self.template_marker(repository, component, digest)
+            .0
+            .is_file()
+    }
+
+    /// The newest published template of a component other than `except`, with
+    /// its full digest: what a prebuild can derive the next one from.
+    pub fn newest_template(
+        &self,
+        repository: &str,
+        component: &str,
+        except: Option<&str>,
+    ) -> Option<(TemplateMarker, String)> {
+        let directory = self
+            .cache_root()
+            .join(TEMPLATES)
+            .join(repository_dir(repository))
+            .join(component);
+        std::fs::read_dir(directory)
+            .ok()?
+            .flatten()
+            .filter_map(|entry| {
+                let marker: TemplateMarker =
+                    serde_json::from_slice(&std::fs::read(entry.path()).ok()?).ok()?;
+                let digest = marker.key.rsplit_once(':')?.1.to_string();
+                (digest.len() == 64 && Some(digest.as_str()) != except).then_some((marker, digest))
+            })
+            .max_by(|(a, _), (b, _)| a.created_at.cmp(&b.created_at).then(a.key.cmp(&b.key)))
+    }
+
+    /// Make sure the template for `digest` exists, building it under the
+    /// digest's exclusive key when it does not. Concurrent `env up` calls and
+    /// prebuilds of one digest build it once; a failed hook leaves no marker,
+    /// so the previous template stays the one in use.
+    pub fn ensure_template_job(
+        &mut self,
+        job: TemplateJob<'_>,
+        digest: &str,
+    ) -> Result<EnsuredTemplate, DriverError> {
+        let component = job.component;
         let (Some(command), Some(destroy)) = (
             component.commands.template.clone(),
             component.commands.template_destroy.clone(),
         ) else {
-            return Ok(None);
+            return Err(DriverError::Unsupported(format!(
+                "{} declares no template",
+                component.name
+            )));
         };
-        let worktree = ctx.bindings.worktree.clone();
-        let digest = input_digest(
-            &worktree,
-            "template",
-            component,
-            &command,
-            &component.template_inputs,
-        )
-        .map_err(DriverError::Unsupported)?;
-        let id = short(&digest).to_string();
-        let repository = ctx.environment.repository.clone();
-        let env_id = ctx.environment.env_id.clone();
-        let marker = self
-            .cache_root()
-            .join(TEMPLATES)
-            .join(repository_dir(&repository))
-            .join(&component.name)
-            .join(format!("{id}.json"));
-        let key = format!(
-            "aethyme-env-template:{repository}:{}:{digest}",
-            component.name
-        );
-        self.coalesce(&repository, &key, |this| {
-            this.add_cache_use(&env_id, &marker)?;
-            if marker.exists() {
-                return Ok(());
+        let id = short(digest).to_string();
+        let (marker, key) = self.template_marker(job.repository, &component.name, digest);
+        let built = self.coalesce(job.repository, &key, |this| {
+            if let Some(env_id) = job.env_id {
+                this.add_cache_use(env_id, &marker)?;
             }
-            let mut vars = ctx.vars();
+            if marker.exists() {
+                return Ok(false);
+            }
+            let mut vars = job.vars;
             vars.insert(TEMPLATE_ID_VARIABLE.into(), id.clone());
             run_hook(
                 &format!("{}: template", component.name),
                 &command,
-                &worktree,
+                job.worktree,
                 &component.pass_env,
                 &vars,
-                &ctx.log(),
-                ctx.hook_timeout,
+                &job.log,
+                job.timeout,
             )?;
             if let Some(parent) = marker.parent() {
                 std::fs::create_dir_all(parent).map_err(io("create the template index"))?;
@@ -574,9 +683,13 @@ impl Lifecycle {
                 .map_err(std::io::Error::other)
                 .map_err(io("encode a template marker"))?;
             std::fs::write(&marker, bytes).map_err(io("record a template"))?;
-            Ok(())
+            Ok(true)
         })?;
-        Ok(Some(id))
+        Ok(EnsuredTemplate {
+            id,
+            digest: digest.to_string(),
+            built,
+        })
     }
 
     /// Start an environment's use record empty: present means "known".
@@ -733,12 +846,35 @@ impl Lifecycle {
     /// `template_destroy` only after their marker and containing directory
     /// identities have been revalidated under the template lock.
     pub fn prune_cache(&mut self, all: bool) -> PruneReport {
+        self.prune_cache_inner(all, None)
+    }
+
+    /// Evict a component's templates beyond the newest `keep` (#1237), by
+    /// the same locks and use checks as `prune_cache`; a live environment's
+    /// template is kept whatever its age. Builds are left alone.
+    pub fn prune_templates_keeping(
+        &mut self,
+        repository: &str,
+        component: &str,
+        keep: usize,
+    ) -> PruneReport {
+        self.prune_cache_inner(
+            false,
+            Some(TemplateKeep {
+                repository_dir: repository_dir(repository),
+                component: component.to_string(),
+                keep,
+            }),
+        )
+    }
+
+    fn prune_cache_inner(&mut self, all: bool, keep: Option<TemplateKeep>) -> PruneReport {
         let mut report = PruneReport::default();
         let inventory_deadline = cache_gc_deadline(None);
         let inventory = match crate::resources::cache_gc_fs::inventory_for_prune(
             &self.root,
             inventory_deadline,
-            all,
+            all || keep.is_some(),
         ) {
             Ok(Some(inventory)) => inventory,
             Ok(None) => return report,
@@ -765,7 +901,15 @@ impl Lifecycle {
 
         let mut valid_templates = Vec::new();
         for entry in template_entries {
-            if in_use.contains(&entry.path) {
+            if let Some(keep) = &keep
+                && (entry.repository != keep.repository_dir || entry.component != keep.component)
+            {
+                continue;
+            }
+            // Keep-N counts templates in use too: the newest `keep` are
+            // protected whoever uses them, and the use check below still
+            // keeps any older one a live environment relies on.
+            if keep.is_none() && in_use.contains(&entry.path) {
                 continue;
             }
             match template_prune_identity(&entry) {
@@ -774,6 +918,29 @@ impl Lifecycle {
                 }
                 Err(reason) => report.kept.push((entry.path, reason)),
             }
+        }
+        if let Some(keep) = &keep {
+            valid_templates.sort_by(|a, b| {
+                b.3.created_at
+                    .cmp(&a.3.created_at)
+                    .then_with(|| b.2.cmp(&a.2))
+            });
+            let newest: Vec<_> = valid_templates
+                .drain(..keep.keep.min(valid_templates.len()))
+                .collect();
+            for (entry, ..) in newest {
+                report
+                    .kept
+                    .push((entry.path, format!("among the newest {}", keep.keep)));
+            }
+            valid_templates.retain(|(entry, ..)| {
+                if in_use.contains(&entry.path) {
+                    report.kept.push((entry.path.clone(), "in use".into()));
+                    false
+                } else {
+                    true
+                }
+            });
         }
         let mut prune_log = if valid_templates.is_empty() {
             None
@@ -860,6 +1027,9 @@ impl Lifecycle {
             }
         }
 
+        if keep.is_some() {
+            return report;
+        }
         let budget = budget_bytes();
         for entry in build_entries {
             if !all && total <= budget {
@@ -1487,6 +1657,13 @@ pub struct CacheEntry {
     #[serde(skip)]
     pub key: Option<String>,
     pub path: PathBuf,
+}
+
+/// Which templates a keep-N prune considers.
+struct TemplateKeep {
+    repository_dir: String,
+    component: String,
+    keep: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
