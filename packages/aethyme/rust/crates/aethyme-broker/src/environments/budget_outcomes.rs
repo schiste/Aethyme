@@ -12,6 +12,14 @@
 //! The decision is pure ([`evaluate`]); writing the issue goes through an
 //! [`OutcomeSink`], so a failed or refused write leaves the issue unmarked
 //! and the next window retries it.
+//!
+//! When the default branch declares an `[[automation.outcomes]]` rule for
+//! [`BUDGET_OUTCOME_SOURCE`], every breach and recovery is reported through
+//! that rule ([`RuleSink`], #1238's `report_outcome`): the rule's labels,
+//! its `issue` switch, the recorded `automation.outcome.reported` event and
+//! one issue per metric under `outcome:budget:environments:<metric>`.
+//! Without the rule, `[budgets.outcomes] issue = true` keeps writing the
+//! issue directly under `env-budget:<repository>:<metric>`.
 
 use std::collections::BTreeMap;
 
@@ -52,17 +60,25 @@ pub struct OutcomeAction {
     pub report: MetricReport,
 }
 
+/// The `[[automation.outcomes]]` source a budget rule declares.
+pub const BUDGET_OUTCOME_SOURCE: &str = "budget:environments";
+
 /// Writes the issue for one metric. `fingerprint` is stable per repository
 /// and metric, so one metric never has two issues.
 pub trait OutcomeSink {
+    /// The issue fingerprint for `metric`.
+    fn fingerprint(&self, repository: &str, metric: &str) -> String {
+        fingerprint(repository, metric)
+    }
     fn upsert(
         &mut self,
+        metric: &str,
         fingerprint: &str,
         title: &str,
         body: &str,
         labels: &[String],
     ) -> Result<String, String>;
-    fn resolve(&mut self, fingerprint: &str, body: &str) -> Result<String, String>;
+    fn resolve(&mut self, metric: &str, fingerprint: &str, body: &str) -> Result<String, String>;
 }
 
 /// The result of carrying out one action.
@@ -162,6 +178,28 @@ pub fn fingerprint(repository: &str, metric: &str) -> String {
     format!("env-budget:{}:{metric}", &digest[..12])
 }
 
+/// The outcome `key` for a metric: the name itself when it already is one
+/// (1-64 of `A-Z a-z 0-9 . _ -`), otherwise a sanitized prefix and a digest
+/// of the full name, so two free-text names never share an issue.
+pub fn outcome_key(metric: &str) -> String {
+    use sha2::Digest;
+    let valid = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    if (1..=64).contains(&metric.len()) && metric.chars().all(valid) {
+        return metric.to_string();
+    }
+    let digest = format!("{:x}", sha2::Sha256::digest(metric.as_bytes()));
+    let prefix: String = metric
+        .chars()
+        .map(|c| if valid(c) { c } else { '_' })
+        .take(51)
+        .collect();
+    if prefix.is_empty() {
+        digest[..12].to_string()
+    } else {
+        format!("{prefix}-{}", &digest[..12])
+    }
+}
+
 fn number(value: Option<f64>) -> String {
     value.map_or_else(|| "-".to_string(), |v| format!("{v:.1}"))
 }
@@ -227,11 +265,13 @@ pub fn apply(
 ) -> Vec<ActionOutcome> {
     let mut outcomes = Vec::new();
     for action in actions {
-        let fingerprint = fingerprint(repository, &action.metric);
+        let fingerprint = sink.fingerprint(repository, &action.metric);
         let (title, body) = render(&action);
         let result = match action.kind {
-            ActionKind::Upsert => sink.upsert(&fingerprint, &title, &body, &spec.labels),
-            ActionKind::Resolve => sink.resolve(&fingerprint, &body),
+            ActionKind::Upsert => {
+                sink.upsert(&action.metric, &fingerprint, &title, &body, &spec.labels)
+            }
+            ActionKind::Resolve => sink.resolve(&action.metric, &fingerprint, &body),
         };
         if result.is_ok()
             && let Some(state) = states.get_mut(&action.metric)
@@ -314,6 +354,7 @@ impl RepositorySink<'_> {
 impl OutcomeSink for RepositorySink<'_> {
     fn upsert(
         &mut self,
+        _metric: &str,
         fingerprint: &str,
         title: &str,
         body: &str,
@@ -321,8 +362,112 @@ impl OutcomeSink for RepositorySink<'_> {
     ) -> Result<String, String> {
         self.send(fingerprint, title, body, labels, false)
     }
-    fn resolve(&mut self, fingerprint: &str, body: &str) -> Result<String, String> {
+    fn resolve(&mut self, _metric: &str, fingerprint: &str, body: &str) -> Result<String, String> {
         self.send(fingerprint, "", body, &[], true)
+    }
+}
+
+/// Reports through the repository's [`BUDGET_OUTCOME_SOURCE`] rule. The
+/// broker is opened on the first action, so a window with nothing to write
+/// never touches broker state. `[budgets.outcomes] labels` are not used:
+/// the rule declares its own.
+pub struct RuleSink<'a> {
+    pub rules: &'a [crate::OutcomeRule],
+    pub repository: Option<String>,
+    pub issues: &'a mut dyn crate::OutcomeIssueSink,
+    pub open_broker: Box<dyn FnMut() -> Result<crate::Broker, String> + 'a>,
+    pub broker: Option<crate::Broker>,
+    pub now_ms: i64,
+}
+
+impl RuleSink<'_> {
+    fn report(
+        &mut self,
+        metric: &str,
+        failed: bool,
+        title: &str,
+        body: &str,
+    ) -> Result<String, String> {
+        use crate::outcome_issues::OutcomeIssueAction as Action;
+        if self.broker.is_none() {
+            self.broker = Some((self.open_broker)()?);
+        }
+        let broker = self.broker.as_mut().expect("broker opened above");
+        let request = crate::OutcomeReportRequest {
+            source: BUDGET_OUTCOME_SOURCE.to_string(),
+            failed,
+            key: Some(outcome_key(metric)),
+            commits: None,
+            title: failed.then(|| title.to_string()),
+            body: Some(body.to_string()),
+        };
+        let report = crate::report_outcome(
+            broker,
+            self.rules,
+            self.repository.as_deref(),
+            &request,
+            self.issues,
+            self.now_ms,
+        )
+        .map_err(|error| format!("{}: {error}", error.code()))?;
+        let rule_keeps_issue = self
+            .rules
+            .iter()
+            .any(|rule| rule.source == BUDGET_OUTCOME_SOURCE && rule.issue);
+        // The window counts as written only when the issue reached the state
+        // the action asks for (or the rule keeps no issue at all); anything
+        // else leaves it to the next window.
+        let reached = match report.issue.as_ref().map(|issue| issue.action) {
+            None => !rule_keeps_issue,
+            Some(Action::Created | Action::Commented | Action::RateLimited) => failed,
+            Some(Action::Resolved | Action::NothingToResolve) => !failed,
+            Some(Action::Refused) => false,
+        };
+        let summary = report
+            .actions
+            .iter()
+            .map(|action| {
+                format!(
+                    "{} {}{}",
+                    action.kind,
+                    action.status,
+                    action
+                        .code
+                        .as_deref()
+                        .map(|code| format!(" ({code})"))
+                        .unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let detail = match report
+            .issue
+            .as_ref()
+            .and_then(|issue| issue.issue_url.clone())
+        {
+            Some(url) => format!("{summary} {url}"),
+            None => summary,
+        };
+        if reached { Ok(detail) } else { Err(detail) }
+    }
+}
+
+impl OutcomeSink for RuleSink<'_> {
+    fn fingerprint(&self, _repository: &str, metric: &str) -> String {
+        crate::outcome_fingerprint(BUDGET_OUTCOME_SOURCE, Some(&outcome_key(metric)))
+    }
+    fn upsert(
+        &mut self,
+        metric: &str,
+        _fingerprint: &str,
+        title: &str,
+        body: &str,
+        _labels: &[String],
+    ) -> Result<String, String> {
+        self.report(metric, true, title, body)
+    }
+    fn resolve(&mut self, metric: &str, _fingerprint: &str, body: &str) -> Result<String, String> {
+        self.report(metric, false, "", body)
     }
 }
 
@@ -342,9 +487,35 @@ pub fn github_slug(url: &str) -> Option<String> {
         .then(|| format!("{owner}/{name}"))
 }
 
+/// Where a repository's budget issues go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// Through its [`BUDGET_OUTCOME_SOURCE`] outcome rule.
+    Rule,
+    /// Directly, under `[budgets.outcomes] issue = true`.
+    Direct,
+}
+
+/// A declared rule wins; otherwise `issue = true` keeps the direct path;
+/// otherwise the repository did not opt in.
+pub fn route(spec: &BudgetOutcomesSpec, rules: &[crate::OutcomeRule]) -> Option<Route> {
+    if rules
+        .iter()
+        .any(|rule| rule.source == BUDGET_OUTCOME_SOURCE)
+    {
+        Some(Route::Rule)
+    } else if spec.issue {
+        Some(Route::Direct)
+    } else {
+        None
+    }
+}
+
 /// Evaluate one repository's budgets and carry out what a sustained breach
-/// or a recovery calls for. `Ok(None)` when the repository does not opt in
-/// with `[budgets.outcomes] issue = true`.
+/// or a recovery calls for. `Ok(None)` when the repository does not opt in:
+/// `[budgets.outcomes]` must be present, with either an
+/// `[[automation.outcomes]]` rule for [`BUDGET_OUTCOME_SOURCE`] on the default
+/// branch or `issue = true`.
 pub fn act_for_repository(
     repo_root: &std::path::Path,
     store: &mut super::store::EnvironmentStore,
@@ -353,10 +524,14 @@ pub fn act_for_repository(
         return Ok(None);
     };
     let file = loaded.value.map_err(|d| d.render())?;
-    let Some(spec) = file.budgets.outcomes.clone().filter(|o| o.issue) else {
+    let Some(spec) = file.budgets.outcomes.clone() else {
         return Ok(None);
     };
     let repo = crate::GitRepo::discover(repo_root).map_err(|e| e.to_string())?;
+    let policy = crate::AutomationIssuesPolicy::load_trusted(&repo)?;
+    let Some(route) = route(&spec, &policy.outcomes) else {
+        return Ok(None);
+    };
     let repository = crate::gates::git_origin_fingerprint(&repo);
     let origin = repo.remote_url("origin").unwrap_or_default();
     let slug = github_slug(origin.trim()).ok_or_else(|| {
@@ -370,8 +545,24 @@ pub fn act_for_repository(
         .budget_outcomes(&repository)
         .map_err(|e| e.to_string())?;
     let (mut updated, actions) = evaluate(&spec, &reports, &heads, &states);
-    let mut sink = RepositorySink { repo: &repo, slug };
-    let actions = apply(&repository, &spec, actions, &mut updated, &mut sink);
+    let actions = if route == Route::Rule {
+        let mut issues = crate::RepositoryIssueSink {
+            repo: &repo,
+            session: None,
+        };
+        let mut sink = RuleSink {
+            rules: &policy.outcomes,
+            repository: Some(slug),
+            issues: &mut issues,
+            open_broker: Box::new(|| crate::Broker::open(repo_root).map_err(|e| e.to_string())),
+            broker: None,
+            now_ms: super::activity::now_ms(),
+        };
+        apply(&repository, &spec, actions, &mut updated, &mut sink)
+    } else {
+        let mut sink = RepositorySink { repo: &repo, slug };
+        apply(&repository, &spec, actions, &mut updated, &mut sink)
+    };
     for (metric, state) in &updated {
         store
             .set_budget_outcome(&repository, metric, state)

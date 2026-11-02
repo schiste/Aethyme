@@ -1178,8 +1178,8 @@ pub(super) fn run_budgets(options: &Options) -> Result<Output, Failure> {
                 .map_err(environment_failure)?
                 .ok_or_else(|| Failure {
                     code: "outcomes_not_enabled",
-                    message: format!("{ENVIRONMENTS_FILE} does not set [budgets.outcomes] issue = true"),
-                    next_action: "add [budgets.outcomes] with issue = true, and allow [automation] issues on the default branch".into(),
+                    message: format!("{ENVIRONMENTS_FILE} has no [budgets.outcomes], or the default branch declares no [[automation.outcomes]] source = \"{}\" rule and issue = true is not set", super::budget_outcomes::BUDGET_OUTCOME_SOURCE),
+                    next_action: format!("add [budgets.outcomes] here, declare [[automation.outcomes]] source = \"{}\" in .aethyme/config.toml on the default branch, and allow [automation] issues", super::budget_outcomes::BUDGET_OUTCOME_SOURCE),
                     exit: exit_status::REFUSED,
                 })?;
         text.push_str(&format!(

@@ -30,7 +30,10 @@ fn peer() -> PeerSpec {
         reader: "agent-one".into(),
         scope: Scope::Paths(vec!["src/lib.rs".into()]),
         max_attempts: 3,
-        deadline_seconds: 5,
+        // The longest a spec allows: a poll that validates and stores a full
+        // batch ran past 5 s under a loaded full-suite run on macOS and
+        // failed as `Expired`. Expiry tests use the peer's own flag.
+        deadline_seconds: 30,
     }
 }
 #[test]

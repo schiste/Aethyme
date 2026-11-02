@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 
 use super::budget_outcomes::{
-    ActionKind, OutcomeSink, OutcomeState, apply, evaluate, fingerprint, github_slug, render,
+    ActionKind, BUDGET_OUTCOME_SOURCE, OutcomeSink, OutcomeState, Route, RuleSink, apply, evaluate,
+    fingerprint, github_slug, outcome_key, render, route,
 };
 use super::budgets::MetricReport;
 use super::spec::BudgetOutcomesSpec;
@@ -145,6 +146,7 @@ struct FakeSink {
 impl OutcomeSink for FakeSink {
     fn upsert(
         &mut self,
+        _metric: &str,
         fingerprint: &str,
         _title: &str,
         _body: &str,
@@ -160,7 +162,7 @@ impl OutcomeSink for FakeSink {
             Ok("opened".into())
         }
     }
-    fn resolve(&mut self, fingerprint: &str, _body: &str) -> Result<String, String> {
+    fn resolve(&mut self, _metric: &str, fingerprint: &str, _body: &str) -> Result<String, String> {
         self.calls.push(("resolve".into(), fingerprint.into()));
         if self.fail {
             Err("denied".into())
@@ -316,4 +318,250 @@ fn fingerprints_sanitize_free_text_metric_names() {
     assert!(fp.starts_with("env-budget:"), "{fp}");
     assert!(fp.ends_with(":my_metric_1_"), "{fp}");
     assert!(fingerprint("repo", &"x".repeat(500)).len() <= 128);
+}
+
+/// Answers every issue request with a fixed action and records it.
+struct FakeIssues {
+    requests: Vec<crate::OutcomeIssueRequest>,
+    answer: crate::OutcomeIssueAction,
+}
+
+impl crate::OutcomeIssueSink for FakeIssues {
+    fn upsert(
+        &mut self,
+        _broker: &mut crate::Broker,
+        request: &crate::OutcomeIssueRequest,
+    ) -> Result<crate::OutcomeIssueResult, String> {
+        self.requests.push(request.clone());
+        let refused = self.answer == crate::OutcomeIssueAction::Refused;
+        Ok(crate::OutcomeIssueResult {
+            schema: crate::OUTCOME_ISSUE_SCHEMA,
+            repository: request.repository.clone(),
+            fingerprint: request.fingerprint.clone(),
+            action: self.answer,
+            issue_number: (!refused).then_some(9),
+            issue_url: (!refused).then(|| "https://github.com/o/n/issues/9".to_string()),
+            code: refused.then_some("automation_issues_denied"),
+            message: "ok".into(),
+            operation_ids: Vec::new(),
+        })
+    }
+}
+
+fn budget_rule() -> crate::OutcomeRule {
+    crate::OutcomeRule {
+        source: BUDGET_OUTCOME_SOURCE.into(),
+        issue: true,
+        labels: vec!["env-budget".into()],
+        notify_owners: false,
+        paths: Vec::new(),
+    }
+}
+
+/// A broker on a throwaway repository, isolated from host state.
+fn broker(temp: &std::path::Path) -> crate::Broker {
+    let repo = temp.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
+    git(&["add", ".gitignore"]);
+    git(&["commit", "-qm", "initial"]);
+    let host_state = temp.join("host-state");
+    let options = crate::BrokerOpenOptions::default()
+        .with_host_state_dir(&host_state)
+        .with_host_cache_dir(temp.join("host-cache"))
+        .with_worktree_root(temp.join("worktrees"))
+        .with_collaboration_state(host_state.clone())
+        .with_host_operation_database(host_state.join("host-operations.db"));
+    crate::Broker::open_with_options(&repo, options).unwrap()
+}
+
+fn rule_sink<'a>(
+    rules: &'a [crate::OutcomeRule],
+    issues: &'a mut FakeIssues,
+    broker: crate::Broker,
+) -> RuleSink<'a> {
+    let mut slot = Some(broker);
+    RuleSink {
+        rules,
+        repository: Some("o/n".into()),
+        issues,
+        open_broker: Box::new(move || slot.take().ok_or_else(|| "opened twice".to_string())),
+        broker: None,
+        now_ms: 1_000,
+    }
+}
+
+/// With a declared rule, a sustained breach is reported through the
+/// outcome hook: one issue per metric under the outcome fingerprint, the
+/// rule's labels rather than `[budgets.outcomes] labels`, a recorded event,
+/// and a resolve once the metric recovers.
+#[test]
+fn a_declared_rule_carries_each_breach_and_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let rules = [budget_rule()];
+    let mut issues = FakeIssues {
+        requests: Vec::new(),
+        answer: crate::OutcomeIssueAction::Created,
+    };
+    let mut resolving = FakeIssues {
+        requests: Vec::new(),
+        answer: crate::OutcomeIssueAction::Resolved,
+    };
+    let mut sink = rule_sink(&rules, &mut issues, broker(temp.path()));
+    let spec = spec(1, None);
+    let metric = "p95 provision";
+
+    let heads: BTreeMap<String, i64> = [(metric.to_string(), 1)].into();
+    let (mut states, actions) = evaluate(
+        &spec,
+        &[report(metric, "over", 10, 0)],
+        &heads,
+        &BTreeMap::new(),
+    );
+    let outcomes = apply("repo", &spec, actions, &mut states, &mut sink);
+    let expected = format!("outcome:budget:environments:{}", outcome_key(metric));
+    assert_eq!(outcomes[0].status, "done", "{}", outcomes[0].detail);
+    assert_eq!(outcomes[0].fingerprint, expected);
+    assert!(states[metric].issue_open);
+
+    let heads: BTreeMap<String, i64> = [(metric.to_string(), 2)].into();
+    let (mut recovered, actions) = evaluate(&spec, &[report(metric, "ok", 10, 0)], &heads, &states);
+    sink.issues = &mut resolving;
+    let outcomes = apply("repo", &spec, actions, &mut recovered, &mut sink);
+    assert_eq!(outcomes[0].status, "done", "{}", outcomes[0].detail);
+    assert!(!recovered[metric].issue_open);
+    let events = sink
+        .broker
+        .as_mut()
+        .unwrap()
+        .store()
+        .events_after_filtered(0, 10, Some("automation.outcome.reported"))
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    drop(sink);
+
+    let opened = &issues.requests[0];
+    assert!(!opened.resolve);
+    assert_eq!(opened.fingerprint, expected);
+    assert_eq!(opened.labels, vec!["env-budget".to_string()]);
+    assert!(opened.title.contains(metric), "{}", opened.title);
+    assert_eq!(resolving.requests.len(), 1);
+    assert!(resolving.requests[0].resolve);
+    assert_eq!(resolving.requests[0].fingerprint, expected);
+}
+
+/// A refused issue is not an open one: the window is retried.
+#[test]
+fn a_refused_rule_report_is_retried_on_the_next_window() {
+    let temp = tempfile::tempdir().unwrap();
+    let rules = [budget_rule()];
+    let mut issues = FakeIssues {
+        requests: Vec::new(),
+        answer: crate::OutcomeIssueAction::Refused,
+    };
+    let mut sink = rule_sink(&rules, &mut issues, broker(temp.path()));
+    let spec = spec(1, None);
+    let heads: BTreeMap<String, i64> = [("m".to_string(), 1)].into();
+    let (mut states, actions) = evaluate(
+        &spec,
+        &[report("m", "over", 10, 0)],
+        &heads,
+        &BTreeMap::new(),
+    );
+    let outcomes = apply("repo", &spec, actions, &mut states, &mut sink);
+    assert_eq!(outcomes[0].status, "failed");
+    assert!(
+        outcomes[0].detail.contains("automation_issues_denied"),
+        "{}",
+        outcomes[0].detail
+    );
+    assert!(!states["m"].issue_open);
+}
+
+/// A window with nothing to write never opens the broker.
+#[test]
+fn nothing_to_write_leaves_the_broker_closed() {
+    let rules = [budget_rule()];
+    let mut issues = FakeIssues {
+        requests: Vec::new(),
+        answer: crate::OutcomeIssueAction::Created,
+    };
+    let mut sink = RuleSink {
+        rules: &rules,
+        repository: Some("o/n".into()),
+        issues: &mut issues,
+        open_broker: Box::new(|| panic!("the broker must not be opened")),
+        broker: None,
+        now_ms: 1_000,
+    };
+    let spec = spec(3, None);
+    let heads: BTreeMap<String, i64> = [("m".to_string(), 1)].into();
+    let (mut states, actions) = evaluate(
+        &spec,
+        &[report("m", "over", 10, 0)],
+        &heads,
+        &BTreeMap::new(),
+    );
+    assert!(actions.is_empty());
+    assert!(apply("repo", &spec, actions, &mut states, &mut sink).is_empty());
+    assert!(sink.broker.is_none());
+}
+
+/// A declared rule wins over `issue = true`; without one, `issue = true`
+/// keeps the direct path; with neither, nothing is evaluated.
+#[test]
+fn a_declared_rule_routes_budget_issues() {
+    let direct = spec(3, None);
+    let silent = BudgetOutcomesSpec {
+        issue: false,
+        ..spec(3, None)
+    };
+    let other = crate::OutcomeRule {
+        source: "prebuild:db-template".into(),
+        ..budget_rule()
+    };
+    assert_eq!(route(&direct, &[budget_rule()]), Some(Route::Rule));
+    assert_eq!(route(&silent, &[budget_rule()]), Some(Route::Rule));
+    assert_eq!(
+        route(&direct, std::slice::from_ref(&other)),
+        Some(Route::Direct)
+    );
+    assert_eq!(route(&silent, &[other]), None);
+    assert_eq!(route(&silent, &[]), None);
+}
+
+/// A metric name that already is a key is kept; a free-text one becomes a
+/// bounded key that still tells two names apart.
+#[test]
+fn outcome_keys_are_valid_and_distinct() {
+    assert_eq!(outcome_key("provision.api"), "provision.api");
+    let spaced = outcome_key("a b");
+    assert!(spaced.starts_with("a_b-"), "{spaced}");
+    assert_ne!(spaced, outcome_key("a_b"));
+    assert_ne!(spaced, outcome_key("a/b"));
+    let long = outcome_key(&"x".repeat(200));
+    assert!(long.len() <= 64, "{long}");
+    assert_ne!(long, outcome_key(&"x".repeat(201)));
+    for key in [spaced, long, outcome_key(""), outcome_key("é")] {
+        assert!(
+            (1..=64).contains(&key.len())
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
+            "{key:?}"
+        );
+    }
 }

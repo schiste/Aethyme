@@ -26,6 +26,7 @@
       "packages/aethyme/rust/Cargo.toml",
       "packages/aethyme/rust/crates/aethyme-broker/Cargo.toml",
       "packages/aethyme/rust/crates/aethyme-cli/Cargo.toml",
+      "packages/aethyme/rust/crates/aethyme-config/Cargo.toml",
       "packages/aethyme/rust/crates/aethyme-contracts/Cargo.toml",
       "packages/aethyme/rust/crates/aethyme-engine/Cargo.toml",
       "packages/aethyme/rust/crates/aethyme-enhance/Cargo.toml",
@@ -34,7 +35,8 @@
       "packages/aethyme/rust/crates/aethyme-graph-storage/Cargo.toml",
       "packages/aethyme/rust/crates/aethyme-producers/Cargo.toml",
       "packages/aethyme/rust/crates/aethyme-quality/Cargo.toml",
-      "packages/aethyme/rust/crates/aethyme-testkit/Cargo.toml"
+      "packages/aethyme/rust/crates/aethyme-testkit/Cargo.toml",
+      "packages/aethyme/rust/vendor/libsqlite3-sys-0.30.1/Cargo.toml"
     ]
   },
   "workspaces": [
@@ -51,6 +53,7 @@
       "members": [
         "packages/aethyme/rust/crates/aethyme-broker",
         "packages/aethyme/rust/crates/aethyme-cli",
+        "packages/aethyme/rust/crates/aethyme-config",
         "packages/aethyme/rust/crates/aethyme-contracts",
         "packages/aethyme/rust/crates/aethyme-engine",
         "packages/aethyme/rust/crates/aethyme-enhance",
@@ -86,12 +89,12 @@
         },
         {
           "kind": "workspace_members",
-          "detail": "11 tracked member roots",
+          "detail": "12 tracked member roots",
           "confidence": "high"
         },
         {
           "kind": "ci_usage",
-          "detail": "workspace root mentioned 63 time(s) in CI",
+          "detail": "workspace root mentioned 64 time(s) in CI",
           "confidence": "medium"
         }
       ],
@@ -100,10 +103,10 @@
       "ranking": {
         "root_manifest": false,
         "declares_workspace": true,
-        "member_count": 11,
-        "ci_mentions": 63,
+        "member_count": 12,
+        "ci_mentions": 64,
         "executable_entrypoints": 1,
-        "source_files": 855
+        "source_files": 974
       }
     },
     {
@@ -140,7 +143,7 @@
         },
         {
           "kind": "ci_usage",
-          "detail": "workspace root mentioned 5 time(s) in CI",
+          "detail": "workspace root mentioned 9 time(s) in CI",
           "confidence": "medium"
         }
       ],
@@ -150,9 +153,9 @@
         "root_manifest": false,
         "declares_workspace": false,
         "member_count": 0,
-        "ci_mentions": 5,
+        "ci_mentions": 9,
         "executable_entrypoints": 2,
-        "source_files": 113
+        "source_files": 122
       }
     },
     {
@@ -484,6 +487,7 @@
     "members": [
       "packages/aethyme/rust/crates/aethyme-broker",
       "packages/aethyme/rust/crates/aethyme-cli",
+      "packages/aethyme/rust/crates/aethyme-config",
       "packages/aethyme/rust/crates/aethyme-contracts",
       "packages/aethyme/rust/crates/aethyme-engine",
       "packages/aethyme/rust/crates/aethyme-enhance",
@@ -519,12 +523,12 @@
       },
       {
         "kind": "workspace_members",
-        "detail": "11 tracked member roots",
+        "detail": "12 tracked member roots",
         "confidence": "high"
       },
       {
         "kind": "ci_usage",
-        "detail": "workspace root mentioned 63 time(s) in CI",
+        "detail": "workspace root mentioned 64 time(s) in CI",
         "confidence": "medium"
       }
     ],
@@ -533,10 +537,10 @@
     "ranking": {
       "root_manifest": false,
       "declares_workspace": true,
-      "member_count": 11,
-      "ci_mentions": 63,
+      "member_count": 12,
+      "ci_mentions": 64,
       "executable_entrypoints": 1,
-      "source_files": 855
+      "source_files": 974
     }
   },
   "commands": [
@@ -734,6 +738,11 @@
       "provenance": "tracked path classification"
     },
     {
+      "path": "packages/aethyme/rust/vendor",
+      "reason": "tracked generated or vendored surface; verify ownership before editing",
+      "provenance": "tracked path classification"
+    },
+    {
       "path": "target",
       "reason": "tracked generated or vendored surface; verify ownership before editing",
       "provenance": "tracked path classification"
@@ -783,21 +792,20 @@
     ]
   },
   "freshness": {
-    "source_digest": "de05b2c21b96c17478a0095608ab0157d504f9d618efae42cd461b624b81fc36",
+    "source_digest": "47fef750b72f7ed18f437ec77f835e3ef56bbf134539eaaa2ab16404ff1ff0cd",
     "source_commit": null,
-    "source_file_count": 3618,
+    "source_file_count": 3810,
     "generator": "deterministic"
   },
   "notes": [
-    "Validate a change with `packages/aethyme/scripts/test-like-ci.sh`: it runs the tests your diff affects exactly as CI does (nextest `--profile ci`, parallel, one retry, CI environment) and prints the slowest tests. CI runs the whole workspace on every pull request, so push and let it. Never run the suite with `--test-threads=1` or `--no-capture`: serially it took two hours on 2026-10-07 against eight minutes in CI. Re-run one failing test by name instead.",
-    "`packages/aethyme` is 100% Rust. `python -m src.cli` was removed with no shim and fails with `No module named src`; run `aethyme <same thing>` instead. The only Python left is `packages/aethyme-eval`, which is Python by design. Do not add Python build files under `packages/aethyme` (the `Makefile` and `package.json` there were Python-era residue, removed 2026-09-29).",
-    "Gate selection is by path trigger, and a trigger that outlives the paths it names silently disables its gate while the entry still auto-promotes. Four instances have already shipped here. `gate_policy.rs` fails on the config-only path, so a new package, manifest, or workflow directory needs its trigger added in the same change.",
-    "`.aethyme/gates.toml` and `.aethyme/config.toml` are security-sensitive paths in `.aethyme/config.toml`'s own review rules. Narrowing a `triggers` glob disables a gate for a whole class of change and reads exactly like a tidy-up.",
-    "Any gate or test that parses git output must export `CHAU7_CTO_OPTIM_ACTIVE=1`. Chau7's CTO git wrapper compresses `git log`/`git status`, and a gate that read it rejected a correctly-labelled entry on 2026-07-28.",
-    "Gate commands that touch a test database or any external namespace must suffix it with `$AETHYME_TEST_DB_SUFFIX` (and `$AETHYME_GATE_WORKER_ID` where relevant). Fixed shared names are unsafe under broker load.",
-    "Graph authority is `disabled` in `.aethyme/config.toml`, which is the intended default: `aethyme graph status` reports that posture as healthy and takes no action. A missing `.aethyme/graph` fragment store is therefore a posture, not a fault. `repo inspect`, `ingest`, and `warm` all read the graph and will fail without one; `aethyme graph refresh` materializes a local store and `aethyme deploy --repo . --with-graph` enrolls one.",
-    "A gate failing with `resource_contention`, or a test failing only under concurrent load, is a host-capacity signal rather than a product defect. Re-run the single failing test in isolation before changing code; a `quick_test` or `gate_doctor` failure that passes alone has told you about the machine, not the change.",
-    "`rust-toolchain.toml` pins the channel for local builds, gates, and CI. The pin is enforced by rustup's toolchain-file override, which wins over the `toolchain: stable` that `dtolnay/rust-toolchain` installs, so `rustc --version` inside the checkout is the pinned version even though a newer stable may be installed. Targets and components passed to that action land on `stable`, not the pinned toolchain, which is why the matrix workflows re-run `rustup target add`."
+    "`packages/aethyme/scripts/test-like-ci.sh` defaults to changed crates with the bounded local profile (one Cargo build job, two nextest workers, no retries); `--full` selects the full workspace and CI profile, including retries. Investigate contention when failures appear only under concurrency, and rerun the failing test in isolation before attributing cause; a passing isolated run does not rule out a race. Report interrupted test runs accurately.",
+    "`packages/aethyme` is 100% Rust; `python -m src.cli` has no shim, and `packages/aethyme-eval` remains Python by design. Do not add Python build files under `packages/aethyme`. `rust-toolchain.toml` pins local, gate, and CI builds; it wins over an action's `toolchain: stable`, so install targets and components on the pinned toolchain separately.",
+    "Keep gate triggers aligned with the paths they cover; stale globs can silently disable a gate, so add triggers when adding packages, manifests, or workflow directories. Treat `.aethyme/gates.toml` and `.aethyme/config.toml` as security-sensitive. Graph authority `disabled` is the intended default; a missing fragment store is healthy in that posture, though graph-dependent commands fail until local refresh.",
+    "Tests that parse Git output should export `CHAU7_CTO_OPTIM_ACTIVE=1` because the host wrapper can compress `git log`/`git status`. Tests touching a shared database or external namespace must use `$AETHYME_TEST_DB_SUFFIX` and `$AETHYME_GATE_WORKER_ID` where relevant.",
+    "Before a host-wide rollout, inventory router and engine binaries on agent `PATH`, repo-local selectors, and maintenance-service runtime pins. Verify both identities at every active entry point, and retain old immutable bundles until existing clients drain.",
+    "Storage audits must account for the primary checkout's shared Git directory as well as linked/session worktrees. Report objects and packs, conflict-resolution cache, worktree administration, and recovery history separately from dependencies and local broker state/logs. Worktree cleanup does not compact shared Git data; keep unknown sizes unknown and distinguish logical bytes from unique physical allocation.",
+    "Before hosted qualification of native filesystem changes, verify each platform-specific FFI field/type against the dependency version pinned in `Cargo.lock`. C headers and Linux builds do not establish Rust macOS declarations. Inspect production code, including inactive `cfg` branches, for discarded results such as `let _ =`; fix call sites rather than raising discard baselines.",
+    "Before repeating a Cargo command after unexpected wrapper behavior, inspect inherited `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `CARGO_BUILD_RUSTC_WRAPPER`, and `CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER` plus applicable ancestor `.cargo/config.toml` files and `$CARGO_HOME/config.toml` (commonly `~/.cargo/config.toml`). Removing `RUSTC_WRAPPER` alone does not disable `[build].rustc-wrapper` from config. Cargo documents `RUSTC_WRAPPER='' cargo ...` as a command-local override that disables that wrapper. Do not edit global Cargo config or stop shared cache servers for one task. For Cargo or other tool behavior, consult the pinned docs/source or a metadata-only probe, and distinguish that evidence from build/test results."
   ],
   "telemetry": {
     "sections": [
@@ -820,10 +828,10 @@
       "areas": 5,
       "entrypoints": 8,
       "caution_zones": 1,
-      "generated_paths": 3,
+      "generated_paths": 4,
       "dangerous_paths": 2,
       "navigation_recipes": 3,
-      "notes": 9
+      "notes": 8
     },
     "overrides_applied": true,
     "override_source": ".aethyme/overrides/onboarding.json",

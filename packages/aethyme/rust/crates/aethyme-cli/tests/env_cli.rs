@@ -823,6 +823,79 @@ clone = 1
     assert_eq!(code, 0, "{down}");
 }
 
+/// A declared `[[automation.outcomes]] source = "budget:environments"` rule
+/// on the default branch opts in without `issue = true` and carries the
+/// breach through the outcome hook: the action is keyed by the outcome
+/// fingerprint, and the default `deny` policy refuses the issue without
+/// touching GitHub, leaving it to the next window.
+#[test]
+fn budgets_act_reports_through_a_declared_outcome_rule() {
+    let fixture = Fixture::new(Some(
+        r#"
+schema = 1
+[[profiles]]
+name = "backend"
+[[profiles.components]]
+name = "db"
+runtime = "hooks"
+provision = 'echo "AETHYME_RECEIPT {\"metrics\": {\"clone\": 50}}"'
+destroy = "true"
+[budgets.seconds]
+clone = 1
+[budgets.outcomes]
+windows = 1
+"#,
+    ));
+    let repo = fixture.repo.path();
+    std::fs::write(
+        repo.join(".aethyme/config.toml"),
+        "[[automation.outcomes]]\nsource = \"budget:environments\"\n",
+    )
+    .unwrap();
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-qm", "declare the budget outcome rule"]);
+    git(
+        repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/aethyme-test/budget-fixture.git",
+        ],
+    );
+    git(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(
+        repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    let (code, up) = fixture.json(&["env", "up", "--wait", "5"]);
+    assert_eq!(code, 0, "{up}");
+    let (code, acted) = fixture.json(&["env", "budgets", "--act"]);
+    assert_eq!(code, 0, "{acted}");
+    let actions = acted["outcomes"]["actions"].as_array().unwrap();
+    assert_eq!(actions.len(), 1, "{acted}");
+    assert_eq!(actions[0]["kind"], "upsert");
+    assert_eq!(
+        actions[0]["fingerprint"],
+        "outcome:budget:environments:clone"
+    );
+    assert_eq!(actions[0]["status"], "failed");
+    assert!(
+        actions[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("issue refused (automation_issues_denied)"),
+        "{acted}"
+    );
+    let env_id = up["env_id"].as_str().unwrap().to_string();
+    let (code, down) = fixture.json(&["env", "down", &env_id]);
+    assert_eq!(code, 0, "{down}");
+}
+
 /// #1295 through the router: `--component` selects an optional component,
 /// a later plain `env up` keeps it, and an unknown name is refused.
 #[test]

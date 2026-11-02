@@ -1299,9 +1299,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let result_path = directory.path().join("pipe-result");
         let mut command = Command::new("sh");
+        // The probe write runs in its own subshell: macOS /bin/sh (bash 3.2)
+        // keeps a failed builtin `printf`'s bytes buffered and flushes them
+        // into the next redirect, which would turn "closed" into "xclosed".
         command.args([
             "-c",
-            "(trap '' PIPE; sleep 0.2; if printf x 2>/dev/null; then printf open > \"$PIPE_RESULT\"; else printf closed > \"$PIPE_RESULT\"; fi) & wait",
+            "(trap '' PIPE; sleep 0.2; if (printf x) 2>/dev/null; then printf open > \"$PIPE_RESULT\"; else printf closed > \"$PIPE_RESULT\"; fi) & wait",
         ]);
         command.env("PIPE_RESULT", &result_path);
         assert!(matches!(
