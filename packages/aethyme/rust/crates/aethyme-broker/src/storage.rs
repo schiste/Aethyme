@@ -968,13 +968,6 @@ where
     });
     let (primary_checkouts, primary_candidates) =
         inspect_primary_checkouts(main_root, &roots, scan, records);
-    if primary_checkouts
-        .iter()
-        .any(|checkout| !checkout.git_storage.is_empty())
-    {
-        warnings.push("Shared Git storage is inventoried separately and is retained by checkout cleanup. No eligible checkout artifacts does not mean repository storage is fully reclaimed; review each Git category and its measurement completeness.".into());
-    }
-
     // Live roots come from the worktree container, but the cache itself is
     // resolved beside the host resource database by preparation.rs. These
     // locations can differ when the repository overrides worktree placement.
