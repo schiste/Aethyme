@@ -122,6 +122,10 @@ fn task_lease_classification_uses_normalized_actions_and_preserves_polling() {
         ObservationOnly
     );
     assert_eq!(classify(&["advanced", "worktrees"]), ObservationOnly);
+    assert_eq!(
+        classify(&["advanced", "owners", "--commits", "a..b"]),
+        ObservationOnly
+    );
     assert_eq!(classify(&["advanced", "queue"]), ObservationOnly);
     assert_eq!(classify(&["advanced", "queue", "history"]), ObservationOnly);
     assert_eq!(classify(&["advanced", "report", "list"]), ObservationOnly);
