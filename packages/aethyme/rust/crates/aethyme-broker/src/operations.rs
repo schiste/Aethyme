@@ -2661,14 +2661,15 @@ pub(crate) fn refuse_repeated_program_name(
     Ok(())
 }
 
-fn maintenance_routing_override_present(mut present: impl FnMut(&str) -> bool) -> bool {
-    git_scopes::GIT_ROUTING_ENV_NAMES
-        .iter()
-        .any(|name| present(name))
-}
-
 /// Refuse global options that change what a coordinated Git command executes.
 pub(crate) fn refuse_code_executing_git_options(args: &[String]) -> Result<(), BrokerOpError> {
+    refuse_code_executing_git_options_with_env(args, |name| std::env::var_os(name).is_some())
+}
+
+fn refuse_code_executing_git_options_with_env(
+    args: &[String],
+    mut env_present: impl FnMut(&str) -> bool,
+) -> Result<(), BrokerOpError> {
     let refuse = |what: &str| {
         Err(BrokerOpError::InvalidCoordinatedOperation {
             reason: format!(
@@ -2681,7 +2682,10 @@ pub(crate) fn refuse_code_executing_git_options(args: &[String]) -> Result<(), B
     let maintenance = args
         .get(end)
         .is_some_and(|command| command == "maintenance");
-    if maintenance && maintenance_routing_override_present(|name| std::env::var_os(name).is_some())
+    if maintenance
+        && git_scopes::GIT_REPOSITORY_ROUTING_ENV_NAMES
+            .iter()
+            .any(|name| env_present(name))
     {
         return Err(BrokerOpError::InvalidCoordinatedOperation {
             reason: "coordinated Git maintenance refuses ambient repository-routing overrides"
@@ -3491,10 +3495,14 @@ mod git_storage_maintenance_tests {
 
     #[test]
     fn maintenance_admission_refuses_ambient_routing_without_changing_process_environment() {
-        for name in git_scopes::GIT_ROUTING_ENV_NAMES {
-            assert!(maintenance_routing_override_present(|key| key == *name));
+        let args = ["maintenance", "run", "--task=loose-objects"].map(str::to_owned);
+        for name in git_scopes::GIT_REPOSITORY_ROUTING_ENV_NAMES {
+            assert!(refuse_code_executing_git_options_with_env(&args, |key| key == *name).is_err());
         }
-        assert!(!maintenance_routing_override_present(|_| false));
+        assert!(refuse_code_executing_git_options_with_env(&args, |_| false).is_ok());
+        for name in ["GIT_SSH_COMMAND", "GIT_SSH", "GIT_PROXY_COMMAND"] {
+            assert!(refuse_code_executing_git_options_with_env(&args, |key| key == name).is_ok());
+        }
     }
 
     #[test]
