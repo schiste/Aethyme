@@ -1502,7 +1502,7 @@ mod tests {
             "read-only ownership list must not rewrite session, activity, event, lease, or claim state"
         );
 
-        let mut writable = storage.open(repository.path()).unwrap();
+        let writable = storage.open(repository.path()).unwrap();
         let before_writable_list = ownership_list_db_state(&database, session.id);
         assert!(
             writable.ownership_claims_snapshot().unwrap().is_empty(),
