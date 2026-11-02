@@ -134,6 +134,25 @@ fn validate_budgets(c: &mut Collector<'_>, file: &EnvironmentsFile) {
     }
 }
 
+/// Repository keep-awake caps: a pin cap of 0 (no new pins) or 60 s to the
+/// 24 h ceiling, the same range the host accepts.
+fn validate_keep_awake(c: &mut Collector<'_>, file: &EnvironmentsFile) {
+    let max = super::activity::MAX_PIN.as_secs();
+    if let Some(cap) = file.max_pin_seconds
+        && cap != 0
+        && !(60..=max).contains(&cap)
+    {
+        c.push(
+            "invalid_keep_awake_cap",
+            None,
+            None,
+            Some("max_pin_seconds"),
+            format!("max_pin_seconds must be 0 or between 60 and {max}, found {cap}"),
+            "e.g. max_pin_seconds = 7200",
+        );
+    }
+}
+
 /// `[[prebuild]]` (#1237): a unique name that makes a valid outcome source,
 /// a declared profile and component that has a template, and conditions,
 /// `keep` and timeout that make sense.
@@ -191,17 +210,36 @@ fn validate_prebuild(c: &mut Collector<'_>, file: &EnvironmentsFile) {
                     ),
                     "use a component of the profile",
                 ),
-                Some(component) if component.template.is_none() => c.push(
-                    "prebuild_without_template",
-                    Some(entry.profile.as_str()),
-                    Some(entry.component.as_str()),
-                    Some(field("component").as_str()),
-                    format!(
-                        "prebuild {:?}: component {:?} declares no template to build",
-                        entry.name, entry.component
-                    ),
-                    "add template, template_destroy and template_inputs to the component",
-                ),
+                Some(component)
+                    if !match entry.artifact {
+                        Some(super::spec::PrebuildArtifact::Template) => component.template.is_some(),
+                        Some(super::spec::PrebuildArtifact::Build) => {
+                            component.build.is_some() && !component.cache_inputs.is_empty()
+                        }
+                        None => {
+                            component.template.is_some()
+                                || (component.build.is_some() && !component.cache_inputs.is_empty())
+                        }
+                    } =>
+                {
+                    c.push(
+                        "prebuild_without_artifact",
+                        Some(entry.profile.as_str()),
+                        Some(entry.component.as_str()),
+                        Some(field("component").as_str()),
+                        format!(
+                            "prebuild {:?}: component {:?} declares nothing to prebuild (artifact {})",
+                            entry.name,
+                            entry.component,
+                            match entry.artifact {
+                                Some(super::spec::PrebuildArtifact::Template) => "template",
+                                Some(super::spec::PrebuildArtifact::Build) => "build",
+                                None => "template or build",
+                            }
+                        ),
+                        "add template + template_destroy + template_inputs, or build + cache_inputs + an output, to the component",
+                    )
+                }
                 Some(_) => {}
             },
         }
@@ -226,6 +264,19 @@ fn validate_prebuild(c: &mut Collector<'_>, file: &EnvironmentsFile) {
                     "use host_idle, inside:HH:MM-HH:MM or outside:HH:MM-HH:MM",
                 );
             }
+        }
+        if entry
+            .max_memory_pct
+            .is_some_and(|pct| pct == 0 || pct > 100)
+        {
+            c.push(
+                "invalid_prebuild",
+                None,
+                None,
+                Some(field("max_memory_pct").as_str()),
+                "max_memory_pct must be between 1 and 100",
+                "e.g. max_memory_pct = 70",
+            );
         }
         if entry.keep == 0 {
             c.push(
@@ -386,6 +437,7 @@ pub fn validate(
     validate_budgets(&mut c, file);
     validate_budget_outcomes(&mut c, file);
     validate_prebuild(&mut c, file);
+    validate_keep_awake(&mut c, file);
 
     let mut names = BTreeSet::new();
     let mut ranks: BTreeMap<u32, &str> = BTreeMap::new();
@@ -1356,6 +1408,27 @@ fn validate_component(
             "template_inputs without template",
             "set template or remove template_inputs",
         );
+    }
+    if let Some(keep) = component.template_keep {
+        if component.template.is_none() {
+            c.push(
+                "field_not_supported",
+                p,
+                n,
+                Some("template_keep"),
+                "template_keep without template",
+                "set template or remove template_keep",
+            );
+        } else if keep == 0 {
+            c.push(
+                "invalid_template_keep",
+                p,
+                n,
+                Some("template_keep"),
+                "template_keep must be at least 1, or every new template would be evicted",
+                "e.g. template_keep = 2",
+            );
+        }
     }
 }
 

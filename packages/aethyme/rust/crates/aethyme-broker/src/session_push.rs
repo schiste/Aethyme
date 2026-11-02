@@ -768,7 +768,10 @@ impl Broker {
             fetch_operation_wait(),
         );
         match fetch {
-            Ok(fetch) if fetch.ok() => Ok(()),
+            Ok(fetch) if fetch.ok() => {
+                crate::environments::prebuild::nudge_after_fetch(main_root);
+                Ok(())
+            }
             Ok(fetch) => Err(format!(
                 "fetching {} failed (operation {}); used the last fetched copy",
                 default.tracking_ref, fetch.operation.id

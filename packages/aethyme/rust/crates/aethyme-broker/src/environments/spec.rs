@@ -52,6 +52,16 @@ pub struct EnvironmentsFile {
     /// E12 (#1237): templates built ahead of need when a ref advances.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prebuild: Vec<PrebuildSpec>,
+    /// The repository's cap on new `env pin --for` requests (#1293
+    /// follow-up). It can only tighten the host's `max_pin_seconds`; 0
+    /// disables new pins for this repository's environments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_pin_seconds: Option<u64>,
+    /// The repository's cap on how long a proven-live `env exec` keeps an
+    /// environment busy. It can only tighten the host's
+    /// `max_exec_busy_seconds`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_exec_busy_seconds: Option<u64>,
 }
 
 /// `[[prebuild]]` (#1237): keep a component's template for the tip of `ref`
@@ -87,6 +97,26 @@ pub struct PrebuildSpec {
     /// The template hook's timeout for a prebuild.
     #[serde(default = "default_prebuild_timeout")]
     pub timeout_seconds: u64,
+    /// What to build (#1366): the component's `template`, or its cacheable
+    /// `build` output. Default: the template if declared, else the build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<PrebuildArtifact>,
+    /// Start only while host memory in use is at or below this percentage
+    /// (#1366). An unreadable reading does not block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_memory_pct: Option<u32>,
+    /// The hook is safe to stop and rerun (#1366): stop it when an
+    /// environment becomes active (with `host_idle`) or memory passes
+    /// `max_memory_pct`, and build again in the next window.
+    #[serde(default)]
+    pub preemptible: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrebuildArtifact {
+    Template,
+    Build,
 }
 
 pub const DEFAULT_PREBUILD_QUIET_MINUTES: u64 = 15;
@@ -375,6 +405,12 @@ pub struct ComponentSpec {
     pub cache_env: Vec<String>,
     #[serde(default)]
     pub template_inputs: Vec<String>,
+    /// Keep the newest this many templates of this component: older ones
+    /// are evicted (through `template_destroy`) when a new one is built,
+    /// unless a live environment uses them, and `env cache prune` never
+    /// evicts the newest this many.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_keep: Option<usize>,
     /// E20: off unless selected with `env up --component` or enabled by a
     /// changed path matching `enabled_by`.
     #[serde(default)]

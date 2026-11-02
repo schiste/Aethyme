@@ -27,6 +27,9 @@ fn spec(when: &[&str]) -> PrebuildSpec {
         quiet_minutes: 15,
         keep: 2,
         timeout_seconds: 60,
+        artifact: None,
+        max_memory_pct: None,
+        preemptible: false,
     }
 }
 
@@ -150,15 +153,9 @@ impl Fixture {
     /// template id, derived-from id and the commit's migration to `log`, and
     /// fails while `db/fail` exists.
     fn new(when: &str, keep: usize) -> Self {
-        let temp = tempfile::tempdir().unwrap();
-        let repo = temp.path().join("repo");
-        let host = temp.path().join("host");
-        std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
-        std::fs::create_dir_all(repo.join("db")).unwrap();
-        let log = temp.path().join("templates.log");
-        let destroyed = temp.path().join("destroyed.log");
-        let text = format!(
-            r#"
+        Self::custom(|log, destroyed| {
+            format!(
+                r#"
 schema = 1
 [[profiles]]
 name = "p"
@@ -179,10 +176,26 @@ derive_from_previous = true
 when = [{when}]
 keep = {keep}
 "#,
-            log = log.display(),
-            destroyed = destroyed.display(),
-        );
-        std::fs::write(repo.join(ENVIRONMENTS_FILE), text).unwrap();
+                log = log.display(),
+                destroyed = destroyed.display(),
+            )
+        })
+    }
+
+    /// A repository with the environments file `text(log, destroyed)`, a
+    /// `db/schema.sql` and a `web/app.txt`.
+    fn custom(text: impl FnOnce(&Path, &Path) -> String) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        let host = temp.path().join("host");
+        std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
+        std::fs::create_dir_all(repo.join("db")).unwrap();
+        std::fs::create_dir_all(repo.join("web")).unwrap();
+        let log = temp.path().join("templates.log");
+        let destroyed = temp.path().join("destroyed.log");
+        std::fs::write(repo.join(ENVIRONMENTS_FILE), text(&log, &destroyed)).unwrap();
+        std::fs::write(repo.join("web/app.txt"), "app v1").unwrap();
+        std::fs::write(repo.join(".gitignore"), "dist/\n").unwrap();
         std::fs::write(repo.join("db/schema.sql"), "v1").unwrap();
         std::fs::write(repo.join("README.md"), "r").unwrap();
         git(&repo, &["init", "-q", "-b", "main"]);
@@ -427,7 +440,7 @@ component = "nope"
     let found = super::validate(&file, &HostEnvironmentsFile::default(), "t", "h");
     let codes: Vec<&str> = found.iter().map(|d| d.code).collect();
     for code in [
-        "prebuild_without_template",
+        "prebuild_without_artifact",
         "invalid_prebuild",
         "duplicate_prebuild",
         "unknown_component",
@@ -439,4 +452,198 @@ component = "nope"
         2,
         "{codes:?}"
     );
+}
+
+#[test]
+fn the_memory_gate_waits_only_on_a_reading_over_the_cap() {
+    let mut capped = spec(&[]);
+    capped.max_memory_pct = Some(70);
+    assert_eq!(super::prebuild::memory_gate(&capped, Some(70)), Ok(()));
+    let closed = super::prebuild::memory_gate(&capped, Some(71)).unwrap_err();
+    assert!(closed.contains("70%") && closed.contains("71%"), "{closed}");
+    assert_eq!(super::prebuild::memory_gate(&capped, None), Ok(()));
+    assert_eq!(super::prebuild::memory_gate(&spec(&[]), Some(99)), Ok(()));
+    if let Some(used) = super::prebuild::host_memory_used_pct() {
+        assert!(used <= 100);
+    }
+}
+
+/// #1366: a cacheable build prebuilds like a template. The output published
+/// from the prebuild's checkout is the entry `env up` would restore, and a
+/// commit outside `cache_inputs` builds nothing.
+#[test]
+fn a_cacheable_build_is_prebuilt_from_the_checkout() {
+    let mut f = Fixture::custom(|log, _| {
+        format!(
+            r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "site"
+runtime = "static"
+serve_dir = "dist"
+build = 'mkdir -p dist && cp web/app.txt dist/index.html && echo built >> "{log}"'
+cache_inputs = ["web/**"]
+
+[[prebuild]]
+name = "site"
+profile = "p"
+component = "site"
+"#,
+            log = log.display()
+        )
+    });
+    let mut reports = Reports::default();
+    let first = f.run(false, &mut reports);
+    assert_eq!(first.result, "built", "{first:?}");
+    assert_eq!(f.built().len(), 1);
+    let digest = first.digest.clone().unwrap();
+    assert!(f.lifecycle.build_exists(&f.repository(), "site", &digest));
+    let text = std::fs::read_to_string(f.repo.join(ENVIRONMENTS_FILE)).unwrap();
+    let loaded: Loaded<EnvironmentsFile> = parse_loaded(PathBuf::from("t"), "t", &text);
+    let file = loaded.value.unwrap();
+    let fingerprint = crate::console::worktree_fingerprint(&f.repo);
+    let compiled = compile(
+        &file,
+        &HostEnvironmentsFile::default(),
+        "p",
+        "t",
+        &CompileContext {
+            repository: f.repository(),
+            owner: EnvironmentOwner::Worktree {
+                fingerprint: fingerprint.clone(),
+            },
+            worktree_fingerprint: fingerprint,
+            source_commit: None,
+            source_dirty: false,
+            source_digest: String::new(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        super::cache::build_digest(&f.repo, &compiled.components[0])
+            .unwrap()
+            .as_deref(),
+        Some(digest.as_str())
+    );
+    f.commit("README.md", Some("moved"));
+    assert_eq!(f.run(false, &mut reports).result, "published");
+    f.commit("web/app.txt", Some("app v2"));
+    assert_eq!(f.run(false, &mut reports).result, "built");
+    assert_eq!(f.built().len(), 2);
+}
+
+/// #1366: a preemptible prebuild that waited for host_idle stops as soon as
+/// an environment becomes active, records no failure and waits for the next
+/// window; nothing is published.
+#[test]
+fn a_preemptible_prebuild_yields_to_an_environment_becoming_active() {
+    let mut f = Fixture::custom(|log, destroyed| {
+        format!(
+            r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "db"
+runtime = "hooks"
+provision = "true"
+destroy = "true"
+template = 'echo started >> "{log}"; sleep 30'
+template_destroy = 'echo "$AETHYME_ENV_TEMPLATE_ID" >> "{destroyed}"'
+template_inputs = ["db/**"]
+
+[[prebuild]]
+name = "db"
+profile = "p"
+component = "db"
+when = ["host_idle"]
+preemptible = true
+"#,
+            log = log.display(),
+            destroyed = destroyed.display(),
+        )
+    });
+    let database = f.host.join("environments.db");
+    let log = f.log.clone();
+    let toucher = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !log.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the build never started"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut store = EnvironmentStore::open(&database).unwrap();
+        let text = "schema = 1\n[[profiles]]\nname = \"x\"\n[[profiles.components]]\nname = \"c\"\nruntime = \"hooks\"\nprovision = \"true\"\ndestroy = \"true\"\n";
+        let loaded: Loaded<EnvironmentsFile> = parse_loaded(PathBuf::from("t"), "t", text);
+        let file = loaded.value.unwrap();
+        let other = compile(
+            &file,
+            &HostEnvironmentsFile::default(),
+            "x",
+            "t",
+            &CompileContext {
+                repository: "elsewhere".into(),
+                owner: EnvironmentOwner::Worktree {
+                    fingerprint: "other".into(),
+                },
+                worktree_fingerprint: "other".into(),
+                source_commit: None,
+                source_dirty: false,
+                source_digest: String::new(),
+            },
+        )
+        .unwrap();
+        let record = store.register(&other, None, None).unwrap();
+        store
+            .record_activity(&record.env_id, super::activity::now_ms() + 1_000)
+            .unwrap();
+    });
+    let mut reports = Reports::default();
+    let clock = std::time::Instant::now();
+    let report = f.run(false, &mut reports);
+    toucher.join().unwrap();
+    assert_eq!(report.result, "preempted", "{report:?}");
+    assert!(
+        clock.elapsed() < Duration::from_secs(20),
+        "the hook was not stopped"
+    );
+    assert!(reports.0.is_empty());
+    let states = f.lifecycle.store.prebuild_states().unwrap();
+    let state: PrebuildState = serde_json::from_str(&states[0].3).unwrap();
+    assert_eq!(state.status, Status::Waiting);
+    assert_eq!(state.failed_digest, None);
+    assert!(
+        !f.lifecycle
+            .template_exists(&f.repository(), "db", report.digest.as_deref().unwrap())
+    );
+}
+
+/// `run_hook_until` stops the hook's process group when asked and says why.
+#[test]
+fn a_stopped_hook_is_preempted_not_failed() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut polls = 0;
+    let clock = std::time::Instant::now();
+    let result = super::exec::run_hook_until(
+        "t: template",
+        "sleep 30",
+        temp.path(),
+        &[],
+        &Default::default(),
+        &temp.path().join("log"),
+        Duration::from_secs(60),
+        &mut || {
+            polls += 1;
+            (polls >= 2).then(|| "yield".to_string())
+        },
+    );
+    match result {
+        Err(super::exec::DriverError::Preempted { reason, .. }) => assert_eq!(reason, "yield"),
+        other => panic!("expected a preempted hook, got {other:?}"),
+    }
+    assert!(clock.elapsed() < Duration::from_secs(10));
 }
