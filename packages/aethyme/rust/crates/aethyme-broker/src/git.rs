@@ -3014,6 +3014,18 @@ impl GitRepo {
         if (generation_device, generation_inode) != (worktree_device, worktree_inode) {
             return None;
         }
+        #[cfg(target_os = "macos")]
+        let volume_uuids = (|| {
+            use crate::worktree_registry::stable_volume_uuid_for_object as volume;
+            Some(crate::events::SpawnedWorktreeVolumeUuids {
+                worktree: volume(&root, worktree_device, worktree_inode).ok()?,
+                git_pointer: volume(&pointer_path, git_pointer_device, git_pointer_inode).ok()?,
+                git_admin: volume(&git_admin, git_admin_device, git_admin_inode).ok()?,
+                git_common: volume(&git_common, git_common_device, git_common_inode).ok()?,
+            })
+        })();
+        #[cfg(not(target_os = "macos"))]
+        let volume_uuids = None;
         let root_metadata = fs::symlink_metadata(&root).ok()?;
         if root_metadata.file_type().is_symlink()
             || !root_metadata.is_dir()
@@ -3023,7 +3035,7 @@ impl GitRepo {
         }
 
         Some(crate::events::SpawnedWorktreeInstanceWitness {
-            schema_version: 2,
+            schema_version: if volume_uuids.is_some() { 3 } else { 2 },
             worktree_path: root.to_str()?.to_string(),
             worktree_device,
             worktree_inode,
@@ -3036,6 +3048,7 @@ impl GitRepo {
             git_common_device,
             git_common_inode,
             root_generation_sha256: Some(root_generation_sha256),
+            volume_uuids,
         })
     }
 

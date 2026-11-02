@@ -468,7 +468,7 @@ impl BrokerStore {
             ));
         }
         if let Some(witness) = witness
-            && (witness.schema_version != 2
+            && (!witness.is_supported()
                 || witness.worktree_path != new.worktree_path
                 || !witness
                     .root_generation_sha256

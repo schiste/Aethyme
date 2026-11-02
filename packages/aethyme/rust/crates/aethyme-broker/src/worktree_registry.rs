@@ -194,6 +194,31 @@ fn macos_volume_uuid(path: *const libc::c_char) -> io::Result<[u8; 16]> {
     decode_volume_uuid_response(&buffer)
 }
 
+/// Capture a stable volume identity only while the exact no-follow object
+/// observed by the caller remains in place. Never mint continuity for a
+/// previously recorded witness: this helper is used at spawn/observation.
+#[cfg(target_os = "macos")]
+pub(crate) fn stable_volume_uuid_for_object(
+    path: &Path,
+    device: u64,
+    inode: u64,
+) -> io::Result<[u8; 16]> {
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+    let unchanged = || -> io::Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || (metadata.dev(), metadata.ino()) != (device, inode)
+        {
+            return Err(invalid("volume identity object changed during capture"));
+        }
+        Ok(())
+    };
+    unchanged()?;
+    let encoded = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(invalid)?;
+    let uuid = macos_volume_uuid(encoded.as_ptr())?;
+    unchanged()?;
+    Ok(uuid)
+}
+
 fn invalid(message: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_string())
 }
@@ -4466,5 +4491,26 @@ mod tests {
         );
         assert!(!registry_directory(&database).unwrap().exists());
         assert!(root.join(WORKTREE_ROOT_MARKER).is_file());
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod stable_object_volume_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    #[test]
+    fn volume_capture_refuses_symlinks_and_changed_object_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pointer");
+        fs::write(&path, "gitdir: fixture").unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let uuid = stable_volume_uuid_for_object(&path, metadata.dev(), metadata.ino()).unwrap();
+        assert!(uuid.iter().any(|byte| *byte != 0));
+        assert!(stable_volume_uuid_for_object(&path, metadata.dev() + 1, metadata.ino()).is_err());
+        assert!(stable_volume_uuid_for_object(&path, metadata.dev(), metadata.ino() + 1).is_err());
+        let alias = directory.path().join("alias");
+        symlink(&path, &alias).unwrap();
+        assert!(stable_volume_uuid_for_object(&alias, metadata.dev(), metadata.ino()).is_err());
     }
 }

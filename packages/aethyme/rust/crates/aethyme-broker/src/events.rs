@@ -259,6 +259,112 @@ pub(crate) struct SpawnedWorktreeInstanceWitness {
     /// automatic removal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) root_generation_sha256: Option<String>,
+    /// Captured only at spawn. Schema 3 can recognize the same filesystem
+    /// object after macOS assigns a new mount-scoped device number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) volume_uuids: Option<SpawnedWorktreeVolumeUuids>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SpawnedWorktreeVolumeUuids {
+    pub(crate) worktree: [u8; 16],
+    pub(crate) git_pointer: [u8; 16],
+    pub(crate) git_admin: [u8; 16],
+    pub(crate) git_common: [u8; 16],
+}
+
+impl SpawnedWorktreeInstanceWitness {
+    pub(crate) fn is_supported(&self) -> bool {
+        let shape_valid = match (self.schema_version, &self.volume_uuids) {
+            (2, None) => true,
+            (3, Some(volumes)) => [
+                volumes.worktree,
+                volumes.git_pointer,
+                volumes.git_admin,
+                volumes.git_common,
+            ]
+            .iter()
+            .all(|uuid| uuid.iter().any(|byte| *byte != 0)),
+            _ => false,
+        };
+        shape_valid
+            && self
+                .root_generation_sha256
+                .as_deref()
+                .is_some_and(crate::root_generation::valid_digest)
+    }
+
+    fn same_object(
+        saved_device: u64,
+        saved_inode: u64,
+        saved_uuid: Option<[u8; 16]>,
+        current_device: u64,
+        current_inode: u64,
+        current_uuid: Option<[u8; 16]>,
+    ) -> bool {
+        saved_inode == current_inode
+            && match (saved_uuid, current_uuid) {
+                (Some(saved), Some(current)) => saved == current,
+                (None, _) => saved_device == current_device,
+                _ => false,
+            }
+    }
+
+    pub(crate) fn same_git_common(&self, current: &Self) -> bool {
+        self.is_supported()
+            && current.is_supported()
+            && self.git_common_path == current.git_common_path
+            && Self::same_object(
+                self.git_common_device,
+                self.git_common_inode,
+                self.volume_uuids.as_ref().map(|v| v.git_common),
+                current.git_common_device,
+                current.git_common_inode,
+                current.volume_uuids.as_ref().map(|v| v.git_common),
+            )
+    }
+
+    /// Compare persisted spawn authority with a fresh observation. Legacy
+    /// witnesses retain their exact device checks; never infer a missing UUID.
+    /// Snapshot equality elsewhere intentionally remains byte-for-byte strict.
+    pub(crate) fn matches_current_instance(&self, current: &Self) -> bool {
+        self.worktree_path == current.worktree_path
+            && self.git_admin_path == current.git_admin_path
+            && self.root_generation_sha256 == current.root_generation_sha256
+            && self.same_checkout_objects(current)
+    }
+
+    /// Filesystem object identity alone, without generation equality, for
+    /// recognizing an already removed historical alias. Mount-number changes
+    /// on a saved UUID are not evidence of a different checkout object.
+    pub(crate) fn same_checkout_objects(&self, current: &Self) -> bool {
+        self.same_git_common(current)
+            && Self::same_object(
+                self.worktree_device,
+                self.worktree_inode,
+                self.volume_uuids.as_ref().map(|v| v.worktree),
+                current.worktree_device,
+                current.worktree_inode,
+                current.volume_uuids.as_ref().map(|v| v.worktree),
+            )
+            && Self::same_object(
+                self.git_pointer_device,
+                self.git_pointer_inode,
+                self.volume_uuids.as_ref().map(|v| v.git_pointer),
+                current.git_pointer_device,
+                current.git_pointer_inode,
+                current.volume_uuids.as_ref().map(|v| v.git_pointer),
+            )
+            && Self::same_object(
+                self.git_admin_device,
+                self.git_admin_inode,
+                self.volume_uuids.as_ref().map(|v| v.git_admin),
+                current.git_admin_device,
+                current.git_admin_inode,
+                current.volume_uuids.as_ref().map(|v| v.git_admin),
+            )
+    }
 }
 
 /// Immutable identity captured before `finish` begins physical cleanup. A
@@ -303,7 +409,7 @@ impl FinishCleanupRecoveryProof {
         witness: &SpawnedWorktreeInstanceWitness,
     ) -> bool {
         self.schema_version == 3
-            && witness.schema_version == 2
+            && witness.is_supported()
             && self.worktree_path == witness.worktree_path
             && self.worktree_device == witness.worktree_device
             && self.worktree_inode == witness.worktree_inode
@@ -682,4 +788,100 @@ pub fn merge_externally_landed_payload(
         })),
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod spawned_instance_volume_tests {
+    use super::{SpawnedWorktreeInstanceWitness, SpawnedWorktreeVolumeUuids};
+
+    fn witness() -> SpawnedWorktreeInstanceWitness {
+        SpawnedWorktreeInstanceWitness {
+            schema_version: 3,
+            worktree_path: "/work/task".into(),
+            worktree_device: 11,
+            worktree_inode: 101,
+            git_pointer_device: 11,
+            git_pointer_inode: 102,
+            git_admin_path: "/repo/.git/worktrees/task".into(),
+            git_admin_device: 22,
+            git_admin_inode: 201,
+            git_common_path: "/repo/.git".into(),
+            git_common_device: 22,
+            git_common_inode: 202,
+            root_generation_sha256: Some("a".repeat(64)),
+            volume_uuids: Some(SpawnedWorktreeVolumeUuids {
+                worktree: [1; 16],
+                git_pointer: [1; 16],
+                git_admin: [2; 16],
+                git_common: [2; 16],
+            }),
+        }
+    }
+
+    #[test]
+    fn remount_accepts_saved_volume_and_inode_without_relaxing_snapshot_equality() {
+        let saved = witness();
+        let mut current = saved.clone();
+        current.worktree_device += 10;
+        current.git_pointer_device += 10;
+        current.git_admin_device += 10;
+        current.git_common_device += 10;
+        assert!(saved.matches_current_instance(&current));
+        assert_ne!(
+            saved, current,
+            "apply-time snapshots must still notice changes"
+        );
+        let encoded = serde_json::to_string(&saved).unwrap();
+        let decoded = serde_json::from_str::<SpawnedWorktreeInstanceWitness>(&encoded).unwrap();
+        assert_eq!(saved, decoded);
+    }
+
+    #[test]
+    fn remount_refuses_replaced_objects_volumes_paths_and_generations() {
+        let saved = witness();
+        let mutations: &[fn(&mut SpawnedWorktreeInstanceWitness)] = &[
+            |v| v.worktree_inode += 1,
+            |v| v.git_pointer_inode += 1,
+            |v| v.git_admin_inode += 1,
+            |v| v.git_common_inode += 1,
+            |v| v.worktree_path.push('x'),
+            |v| v.git_admin_path.push('x'),
+            |v| v.git_common_path.push('x'),
+            |v| v.root_generation_sha256 = Some("b".repeat(64)),
+            |v| v.root_generation_sha256 = None,
+            |v| v.volume_uuids.as_mut().unwrap().worktree = [3; 16],
+            |v| v.volume_uuids.as_mut().unwrap().git_pointer = [3; 16],
+            |v| v.volume_uuids.as_mut().unwrap().git_admin = [3; 16],
+            |v| v.volume_uuids.as_mut().unwrap().git_common = [3; 16],
+            |v| v.volume_uuids.as_mut().unwrap().git_common = [0; 16],
+            |v| v.volume_uuids = None,
+            |v| v.schema_version = 99,
+        ];
+        for (index, mutate) in mutations.iter().enumerate() {
+            let mut current = saved.clone();
+            mutate(&mut current);
+            assert!(
+                !saved.matches_current_instance(&current),
+                "mutation {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_witness_requires_original_device_and_never_infers_a_volume() {
+        let current = witness();
+        let mut legacy = current.clone();
+        legacy.schema_version = 2;
+        legacy.volume_uuids = None;
+        assert!(legacy.matches_current_instance(&current));
+        assert!(legacy.matches_current_instance(&legacy));
+        let mut remounted = current.clone();
+        remounted.git_admin_device += 1;
+        remounted.git_common_device += 1;
+        assert!(!legacy.matches_current_instance(&remounted));
+        assert!(!current.matches_current_instance(&legacy));
+        let mut malformed = legacy.clone();
+        malformed.volume_uuids = current.volume_uuids.clone();
+        assert!(!malformed.matches_current_instance(&current));
+    }
 }
