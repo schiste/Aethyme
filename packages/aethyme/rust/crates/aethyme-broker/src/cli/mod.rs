@@ -3078,9 +3078,8 @@ fn task_lease_command_class(subcommand: &str, parsed: &Parsed) -> TaskLeaseComma
         {
             TaskLeaseCommandClass::ObservationOnly
         }
-        "handoff" | "metrics" | "insights" | "blockers" | "exec-status" | "queue" | "worktrees" => {
-            TaskLeaseCommandClass::ObservationOnly
-        }
+        "handoff" | "metrics" | "insights" | "blockers" | "exec-status" | "queue" | "worktrees"
+        | "owners" => TaskLeaseCommandClass::ObservationOnly,
         "reclaim" if action == Some("plan") => TaskLeaseCommandClass::ObservationOnly,
         "reclaim" => TaskLeaseCommandClass::OtherWork,
         "gc" if action == Some("plan") => TaskLeaseCommandClass::ObservationOnly,
