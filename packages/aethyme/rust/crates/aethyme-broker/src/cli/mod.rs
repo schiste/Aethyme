@@ -979,8 +979,8 @@ Usage:
       inodes, owner marker, repository binding, and nonzero volume UUIDs; the
       confirmation binds the exact old and replacement payloads and owner
       marker bytes. This does not prove historical volume UUIDs.
-  aethyme broker gc storage maintenance-lock plan [--json]
-  aethyme broker gc storage maintenance-lock apply --confirm <sha256> [--json]
+  aethyme broker storage maintenance-lock plan [--json]
+  aethyme broker storage maintenance-lock apply --confirm <sha256> [--json]
       Review or remove only the exact empty, owned maintenance lock proven to
       predate this OS boot. Apply records a durable intent before unlinking;
       refusals retain the lock, and an existing intent requires operator review.

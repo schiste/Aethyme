@@ -705,41 +705,30 @@ fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn stat_matches_identity(stat: &libc::stat, identity: &FileIdentity) -> bool {
-    let base = stat.st_dev as u64 == identity.device
-        && stat.st_ino as u64 == identity.inode
-        && stat.st_mode as u32 == identity.mode
-        && stat.st_uid as u32 == identity.uid
-        && stat.st_nlink as u64 == identity.links
-        && stat.st_size as u64 == identity.size;
+    let base = i128::from(stat.st_dev) == i128::from(identity.device)
+        && i128::from(stat.st_ino) == i128::from(identity.inode)
+        && i128::from(stat.st_mode) == i128::from(identity.mode)
+        && i128::from(stat.st_uid) == i128::from(identity.uid)
+        && i128::from(stat.st_nlink) == i128::from(identity.links)
+        && i128::from(stat.st_size) == i128::from(identity.size);
     #[cfg(target_os = "linux")]
     let timestamps_match = {
-        let modified = Timestamp {
-            seconds: stat.st_mtime,
-            nanoseconds: stat.st_mtime_nsec as u32,
-        };
-        let changed = Timestamp {
-            seconds: stat.st_ctime,
-            nanoseconds: stat.st_ctime_nsec as u32,
-        };
-        modified == identity.modified && changed == identity.changed
+        i128::from(stat.st_mtime) == i128::from(identity.modified.seconds)
+            && i128::from(stat.st_mtime_nsec) == i128::from(identity.modified.nanoseconds)
+            && i128::from(stat.st_ctime) == i128::from(identity.changed.seconds)
+            && i128::from(stat.st_ctime_nsec) == i128::from(identity.changed.nanoseconds)
     };
     #[cfg(target_os = "macos")]
     let timestamps_match = {
-        let modified = Timestamp {
-            seconds: stat.st_mtimespec.tv_sec as i64,
-            nanoseconds: stat.st_mtimespec.tv_nsec as u32,
-        };
-        let changed = Timestamp {
-            seconds: stat.st_ctimespec.tv_sec as i64,
-            nanoseconds: stat.st_ctimespec.tv_nsec as u32,
-        };
-        let birth = Timestamp {
-            seconds: stat.st_birthtimespec.tv_sec as i64,
-            nanoseconds: stat.st_birthtimespec.tv_nsec as u32,
-        };
-        modified == identity.modified
-            && changed == identity.changed
-            && identity.birth.as_ref() == Some(&birth)
+        let birth_matches = identity.birth.as_ref().is_some_and(|birth| {
+            i128::from(stat.st_birthtimespec.tv_sec) == i128::from(birth.seconds)
+                && i128::from(stat.st_birthtimespec.tv_nsec) == i128::from(birth.nanoseconds)
+        });
+        i128::from(stat.st_mtimespec.tv_sec) == i128::from(identity.modified.seconds)
+            && i128::from(stat.st_mtimespec.tv_nsec) == i128::from(identity.modified.nanoseconds)
+            && i128::from(stat.st_ctimespec.tv_sec) == i128::from(identity.changed.seconds)
+            && i128::from(stat.st_ctimespec.tv_nsec) == i128::from(identity.changed.nanoseconds)
+            && birth_matches
     };
     base && timestamps_match
 }
@@ -825,8 +814,7 @@ fn read_os_boot_time() -> Result<(String, Timestamp), String> {
     }
     // SAFETY: sysctl succeeded and returned the full timeval buffer.
     let value = unsafe { value.assume_init() };
-    let seconds = i64::try_from(value.tv_sec)
-        .map_err(|_| "kern.boottime seconds are outside the supported range".to_string())?;
+    let seconds: i64 = value.tv_sec;
     let micros = u32::try_from(value.tv_usec)
         .ok()
         .filter(|micros| *micros < 1_000_000)
@@ -1361,7 +1349,7 @@ mod tests {
         let boot = fake_boot(600);
         let plan = plan_with_boot(&touched.root, Some(boot.clone()));
         let digest = plan.confirmation_sha256.unwrap();
-        let mut same_file = std::fs::OpenOptions::new()
+        let same_file = std::fs::OpenOptions::new()
             .write(true)
             .open(&touched.lock)
             .unwrap();
