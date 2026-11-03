@@ -1,6 +1,6 @@
 # Git options for broker worktrees
 
-Last Updated: 2026-10-25
+Last Updated: 2026-11-03
 
 This assessment covers #901, #902, #904, #906 and #907. It does not
 enable repository settings. The bounded experiment is
@@ -49,6 +49,13 @@ python3 packages/aethyme-eval/benchmarks/performance/git_worktree_options.py \
   --fixture-parent /safe/local/scratch --output /safe/local/new-report \
   --files 10000 --samples 7 --linked
 ```
+
+For #902, add `--isolate-many-files` to run separate `index-v4` and
+`untracked-cache` variants alongside the original bundle and baseline. The
+report records the actual index header version and checks identical status
+across all variants. The fixed execution order, uncontrolled cache warmth and
+lack of broker workloads still prevent a causal or production-speedup claim.
+The flag does not change production Git settings.
 
 The caller chooses an existing scratch parent on the filesystem being measured;
 the runner creates only a new synthetic child and does not enroll that parent.

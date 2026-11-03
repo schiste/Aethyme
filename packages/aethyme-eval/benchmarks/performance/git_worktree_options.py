@@ -87,7 +87,8 @@ def distribution(rows):
                 child_cpu_ms=[row["child_cpu_ms"] for row in rows])
 
 
-def run(root, git, other, output, files=FILES, samples=SAMPLES, linked=False):
+def run(root, git, other, output, files=FILES, samples=SAMPLES, linked=False,
+        isolate_many_files=False):
     ex = Experiment(root, git, output)
     report = dict(schema="aethyme.git-worktree-options/v1", platform=platform.platform(),
                   files=files, repetitions=samples,
@@ -100,7 +101,10 @@ def run(root, git, other, output, files=FILES, samples=SAMPLES, linked=False):
     if other:
         report["other_git"] = ex.run(root, "--version", git=other)["stdout"].strip()
     variants = {}
-    for mode in ("baseline", "many-files", "fsmonitor"):
+    modes = ["baseline", "many-files", "fsmonitor"]
+    if isolate_many_files:
+        modes.extend(["index-v4", "untracked-cache"])
+    for mode in modes:
         primary = ex.init(mode)
         repo = primary
         checkout_rows = []
@@ -115,6 +119,11 @@ def run(root, git, other, output, files=FILES, samples=SAMPLES, linked=False):
             if mode == "many-files":
                 ex.run(repo, "config", "feature.manyFiles", "true")
                 ex.run(repo, "update-index", "--index-version", "4")
+            if mode == "index-v4":
+                ex.run(repo, "config", "index.version", "4")
+                ex.run(repo, "update-index", "--index-version", "4")
+            if mode == "untracked-cache":
+                ex.run(repo, "config", "core.untrackedCache", "true")
             if mode == "fsmonitor":
                 ex.run(repo, "config", "core.fsmonitor", "true")
             if linked:
@@ -167,6 +176,13 @@ def run(root, git, other, output, files=FILES, samples=SAMPLES, linked=False):
             index_path = index_path.resolve(strict=True)
             if not index_path.is_relative_to(root):
                 raise RuntimeError("index escaped the owned Playground")
+            with index_path.open("rb") as index_file:
+                index_header = index_file.read(8)
+            if len(index_header) != 8 or index_header[:4] != b"DIRC":
+                raise RuntimeError("invalid fixture index header")
+            index_version = int.from_bytes(index_header[4:], "big")
+            if mode == "index-v4" and index_version != 4:
+                raise RuntimeError("index-v4 fixture did not retain index version 4")
             primary_unchanged = None
             if linked:
                 primary_unchanged = not ex.run(
@@ -176,6 +192,7 @@ def run(root, git, other, output, files=FILES, samples=SAMPLES, linked=False):
             variants[mode] = dict(first_observation_ms=first["elapsed_ms"], states=states,
                                   index_write_ms=write["elapsed_ms"],
                                   index_bytes=index_path.stat().st_size,
+                                  index_version=index_version,
                                   linked_checkout=distribution(checkout_rows) if linked else None,
                                   primary_checkout_unchanged=primary_unchanged,
                                   untracked_cache_test_returncode=cache_probe["returncode"])
@@ -239,6 +256,8 @@ def main():
     parser.add_argument("--files", type=int, default=FILES)
     parser.add_argument("--samples", type=int, default=SAMPLES)
     parser.add_argument("--linked", action="store_true")
+    parser.add_argument("--isolate-many-files", action="store_true",
+                        help="also measure index v4 and untracked cache separately")
     args = parser.parse_args()
     if not 12 <= args.files <= 50000 or not 1 <= args.samples <= 21:
         parser.error("files must be 12..50000 and samples must be 1..21")
@@ -255,7 +274,8 @@ def main():
     try:
         report = run(root, str(args.git.resolve(strict=True)),
                      str(args.other_git.resolve(strict=True)) if args.other_git else None, output,
-                     files=args.files, samples=args.samples, linked=args.linked)
+                     files=args.files, samples=args.samples, linked=args.linked,
+                     isolate_many_files=args.isolate_many_files)
         report["harness_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         report["fixture_root"] = str(root)
         (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
