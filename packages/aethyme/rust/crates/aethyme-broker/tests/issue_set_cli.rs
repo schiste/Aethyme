@@ -137,6 +137,10 @@ depends_on = ["epic"]
         actions.iter().filter(|action| **action == "create").count(),
         2
     );
+    assert_eq!(
+        actions.iter().filter(|action| **action == "update").count(),
+        2
+    );
     assert!(actions.contains(&"ensure_sub_issue"));
     assert!(actions.contains(&"ensure_dependency"));
     let denied = run(&args);

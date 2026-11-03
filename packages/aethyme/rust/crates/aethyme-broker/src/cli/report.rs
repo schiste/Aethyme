@@ -735,9 +735,12 @@ fn run_issue_set_apply(parsed: Parsed) -> Result<(), UsageError> {
             .map_err(UsageError::Message)?;
         let mut plan = Vec::new();
         for key in &manifest.order {
-            let number = existing[key];
-            let action = if number.is_some() { "update" } else { "create" };
-            plan.push(serde_json::json!({"action": action, "key": key, "number": number}));
+            if existing[key].is_none() {
+                plan.push(serde_json::json!({"action": "create", "key": key, "number": null}));
+            }
+        }
+        for key in &manifest.order {
+            plan.push(serde_json::json!({"action": "update", "key": key, "number": existing[key]}));
         }
         for entry in &manifest.manifest.issues {
             plan.push(serde_json::json!({"action": "ensure_sub_issue", "parent": manifest.manifest.parent.key, "child": entry.key}));
