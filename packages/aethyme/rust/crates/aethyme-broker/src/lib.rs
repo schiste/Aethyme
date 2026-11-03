@@ -122,6 +122,7 @@ pub mod insights;
 pub mod install_health;
 pub mod install_replacement;
 mod issue_form;
+mod issue_set;
 mod lease_export;
 mod leases;
 pub mod local_acceptance;
