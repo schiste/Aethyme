@@ -150,5 +150,7 @@ depends_on = ["epic"]
     );
     let calls = std::fs::read_to_string(&log).unwrap();
     assert!(!calls.contains("issue create"), "{calls}");
+    assert!(!calls.contains("issue edit"), "{calls}");
     assert!(!calls.contains("-X POST"), "{calls}");
+    assert!(!calls.contains("-X DELETE"), "{calls}");
 }
