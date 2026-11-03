@@ -169,6 +169,48 @@ fn changed_paths_cover_the_whole_session_diff() {
     assert_eq!(infer(&file(), &changed).unwrap().minimum, "isolated");
 }
 
+/// A broker session is measured from its recorded start, even if integration is stale.
+#[test]
+fn broker_session_uses_its_recorded_start() {
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path().canonicalize().unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    write(&dir, ".gitignore", ".aethyme/\n");
+    write(&dir, "README", "base\n");
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "old integration"]);
+    git(&dir, &["branch", "aethyme/integration"]);
+    write(&dir, "db/schema/old.sql", "existing\n");
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "upstream"]);
+    let start = git(&dir, &["rev-parse", "HEAD"]);
+    let mut store = crate::BrokerStore::open_in_repo(&dir).unwrap();
+    store
+        .register_session(&crate::NewSession {
+            worktree_path: dir.to_string_lossy().into_owned(),
+            branch: "main".into(),
+            origin: crate::SessionOrigin::Adopted,
+            task: None,
+            diff_base: Some(start.clone()),
+            adoption_base: Some(start.clone()),
+            adopted_head: Some(start.clone()),
+            repository_contract: None,
+            pid: None,
+            command: None,
+            log_path: None,
+            agent_identity: None,
+        })
+        .unwrap();
+    drop(store);
+    write(&dir, "web/new.css", "new\n");
+    git(&dir, &["add", "web/new.css"]);
+    git(&dir, &["commit", "-qm", "session change"]);
+    let (base, changed) = changed_paths(&dir).unwrap();
+    assert_eq!(base.as_deref(), Some(start.as_str()));
+    assert_eq!(changed, paths(&["web/new.css"]));
+    assert_eq!(infer(&file(), &changed).unwrap().minimum, "static");
+}
+
 /// #1216 acceptance: replaying a 100-commit history completes in seconds
 /// and counts commits per profile.
 #[test]
@@ -256,6 +298,9 @@ fn a_range_replay_counts_what_a_merge_brought_in() {
     git(dir, &["add", "-A"]);
     git(dir, &["commit", "-qm", "migration"]);
     git(dir, &["checkout", "-q", "main"]);
+    write(dir, "server/main.py", "x\n");
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-qm", "main change"]);
     git(
         dir,
         &["merge", "-q", "--no-ff", "-m", "merge topic", "topic"],
@@ -264,6 +309,10 @@ fn a_range_replay_counts_what_a_merge_brought_in() {
     let report = infer_range(dir, &file(), "HEAD^1..HEAD").unwrap();
     assert_eq!(report.commits, 2, "{report:?}");
     assert_eq!(report.profiles.get("isolated"), Some(&2), "{report:?}");
+    assert!(
+        !report.top_rule.contains_key("backend"),
+        "second-parent changes must not enter the merge diff: {report:?}"
+    );
 }
 
 /// A raised minimum retires a cheaper environment only after the new one is

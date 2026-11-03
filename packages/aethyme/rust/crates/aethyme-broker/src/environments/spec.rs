@@ -354,6 +354,9 @@ pub struct ComponentSpec {
     pub health: Option<HealthSpec>,
     #[serde(default)]
     pub listen: bool,
+    /// Additional named ports reserved for this component.
+    #[serde(default)]
+    pub ports: Vec<String>,
     /// Defaults to true for `static`, false otherwise.
     #[serde(default)]
     pub route: Option<bool>,

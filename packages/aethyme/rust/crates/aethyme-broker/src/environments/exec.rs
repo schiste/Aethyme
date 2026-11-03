@@ -152,6 +152,47 @@ pub fn environment_variables(
             receipt.to_string(),
         );
     }
+    // Export scalar receipt fields as separate variables. Ambiguous names are
+    // omitted rather than choosing one receipt or overwriting a reserved value.
+    let mut fields: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for (name, receipt) in &bindings.receipts {
+        let Some(object) = receipt.as_object() else {
+            continue;
+        };
+        for (key, value) in object {
+            if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                continue;
+            }
+            let value = match value {
+                Value::String(value) if !value.contains('\0') => value.clone(),
+                Value::Bool(_) | Value::Number(_) => value.to_string(),
+                _ => continue,
+            };
+            let variable = format!(
+                "AETHYME_ENV_{}_{}",
+                env_suffix(name),
+                key.to_ascii_uppercase()
+            );
+            fields
+                .entry(variable)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(value));
+        }
+    }
+    for (name, value) in fields {
+        let reserved = name == "AETHYME_ENV_TEMPLATE_ID"
+            || environment.components.iter().any(|other| {
+                let suffix = env_suffix(&other.name);
+                name == format!("AETHYME_ENV_PORT_{suffix}")
+                    || name == format!("AETHYME_ENV_URL_{suffix}")
+                    || name == format!("AETHYME_ENV_RECEIPT_{suffix}")
+            });
+        if let Some(value) = value
+            && !reserved
+        {
+            vars.entry(name).or_insert(value);
+        }
+    }
     if let Some(id) = bindings.template_ids.get(&component.name) {
         vars.insert("AETHYME_ENV_TEMPLATE_ID".into(), id.clone());
     }

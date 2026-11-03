@@ -339,7 +339,8 @@ fn variables_name_the_environment_ports_urls_and_receipts() {
     harness
         .bindings
         .receipts
-        .insert("srv".into(), serde_json::json!({"k": "v"}));
+        .insert("srv_port".into(), serde_json::json!({"number": 1}));
+    harness.bindings.receipts.insert("srv".into(), serde_json::json!({"k": "v", "port": 5432, "database": "db_copy", "nested": {"x": 1}, "bad-key": "ignored", "port_number": 2}));
     let ctx = harness.ctx("srv");
     let vars = environment_variables(ctx.environment, ctx.component, ctx.bindings, 2);
     assert_eq!(vars["AETHYME_ENV_PORT_SRV"], port.to_string());
@@ -347,9 +348,40 @@ fn variables_name_the_environment_ports_urls_and_receipts() {
         vars["AETHYME_ENV_URL_SRV"],
         format!("http://127.0.0.1:{port}")
     );
-    assert_eq!(vars["AETHYME_ENV_RECEIPT_SRV"], "{\"k\":\"v\"}");
+    assert_eq!(vars["AETHYME_ENV_SRV_PORT"], "5432");
+    assert_eq!(vars["AETHYME_ENV_SRV_DATABASE"], "db_copy");
+    assert!(!vars.contains_key("AETHYME_ENV_SRV_PORT_NUMBER"));
+    assert!(!vars.contains_key("AETHYME_ENV_SRV_NESTED"));
+    assert!(!vars.contains_key("AETHYME_ENV_SRV_BAD_KEY"));
+    assert!(vars["AETHYME_ENV_RECEIPT_SRV"].contains("db_copy"));
     assert_eq!(vars["AETHYME_ENV_HOOK_ATTEMPT"], "2");
     assert_eq!(vars["AETHYME_ENV_NAMESPACE"], ctx.bindings.namespace);
+}
+
+#[test]
+fn later_hook_receives_database_receipt_fields() {
+    let text = r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "db"
+runtime = "hooks"
+provision = "true"
+destroy = "true"
+[[profiles.components]]
+name = "api"
+runtime = "hooks"
+provision = 'test "$AETHYME_ENV_DB_PORT" = 5432 && test "$AETHYME_ENV_DB_DATABASE" = copy'
+destroy = "true"
+"#;
+    let mut harness = Harness::new(text, "p");
+    harness.bindings.receipts.insert(
+        "db".into(),
+        serde_json::json!({"port": 5432, "database": "copy"}),
+    );
+    let ctx = harness.ctx("api");
+    driver_for(ctx.component.runtime).provision(&ctx).unwrap();
 }
 
 #[test]
