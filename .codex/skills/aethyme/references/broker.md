@@ -667,7 +667,11 @@ blocked.
      --repo <owner/name> --reason "<authorization>" -- <gh-args> ...
    ```
 
-   The broker classifies known commands and fails closed on ambiguity.
+   The broker classifies known commands and fails closed on ambiguity. For an
+   authorized PR merge, wait for required checks and use the exact guarded
+   form `pr merge <number> --squash --match-head-commit <full-head-sha>`
+   (or `--merge` / `--rebase` in place of `--squash`). `--auto` is not in
+   this allowlist; do not bypass the guard to enqueue an automatic merge.
 
    For an authorized PR merge, use the broker's exact supported form:
    `pr merge <number> --merge|--squash|--rebase [--match-head-commit <sha>]`.
