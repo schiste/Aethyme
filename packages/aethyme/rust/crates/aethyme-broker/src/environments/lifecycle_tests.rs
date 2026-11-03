@@ -208,6 +208,9 @@ destroy = "true"
     let host = Host::new();
     let (repo, head) = repository(&host.markers, text);
     let snapshot = snapshot(text, "isolated", repo.path(), Some(head));
+    let names = snapshot.variable_names(&snapshot.components[0]);
+    assert!(names.contains(&"AETHYME_ENV_PORT_STACK_API".to_string()));
+    assert!(names.contains(&"AETHYME_ENV_URL_STACK_API".to_string()));
     let mut lifecycle = host.lifecycle();
     let record = lifecycle
         .up(&snapshot, repo.path(), Some(repo.path()), None, &options())
