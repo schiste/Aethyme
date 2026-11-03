@@ -18,8 +18,9 @@ pub(crate) trait IssueSetBackend {
     fn has_marker(&mut self, number: u64, marker: &str) -> Result<bool, String>;
     fn create(&mut self, entry: &Entry, marker: &str) -> Result<u64, String>;
     fn update(&mut self, number: u64, entry: &Entry, body: &str) -> Result<(), String>;
-    fn ensure_sub_issue(&mut self, parent: u64, child: u64) -> Result<(), String>;
-    fn ensure_dependency(&mut self, issue: u64, blocked_by: u64) -> Result<(), String>;
+    /// Returns false only when the native endpoint is unavailable.
+    fn ensure_sub_issue(&mut self, parent: u64, child: u64) -> Result<bool, String>;
+    fn ensure_dependency(&mut self, issue: u64, blocked_by: u64) -> Result<bool, String>;
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -212,22 +213,49 @@ pub(crate) fn apply(
         journal.pending.remove(key);
         save(&journal_path, &journal)?;
     }
-    for key in &manifest.order {
-        let body = format!(
-            "{}\n\n<!-- aethyme-issue-set:{}/{key} -->\n",
-            manifest.render_body(key, &journal.numbers)?,
-            manifest.manifest.set_id
-        );
-        backend.update(journal.numbers[key], entries[key], &body)?;
-    }
     let parent = journal.numbers[&manifest.manifest.parent.key];
+    let mut fallback_children = Vec::new();
     for entry in &manifest.manifest.issues {
-        backend.ensure_sub_issue(parent, journal.numbers[&entry.key])?;
+        let child = journal.numbers[&entry.key];
+        if !backend.ensure_sub_issue(parent, child)? {
+            fallback_children.push(child);
+        }
     }
+    let mut fallback_dependencies: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     for entry in entries.values() {
         for dependency in &entry.depends_on {
-            backend.ensure_dependency(journal.numbers[&entry.key], journal.numbers[dependency])?;
+            let blocked_by = journal.numbers[dependency];
+            if !backend.ensure_dependency(journal.numbers[&entry.key], blocked_by)? {
+                fallback_dependencies
+                    .entry(entry.key.clone())
+                    .or_default()
+                    .push(blocked_by);
+            }
         }
+    }
+    for key in &manifest.order {
+        let mut content = manifest.render_body(key, &journal.numbers)?;
+        if key == &manifest.manifest.parent.key && !fallback_children.is_empty() {
+            content.push_str("\n\n### Sub-issues\n");
+            for child in &fallback_children {
+                content.push_str(&format!("- [ ] #{child}\n"));
+            }
+        }
+        if let Some(dependencies) = fallback_dependencies.get(key) {
+            content.push_str("\n\nDepends on: ");
+            content.push_str(
+                &dependencies
+                    .iter()
+                    .map(|number| format!("#{number}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        let body = format!(
+            "{}\n\n<!-- aethyme-issue-set:{}/{key} -->\n",
+            content, manifest.manifest.set_id
+        );
+        backend.update(journal.numbers[key], entries[key], &body)?;
     }
     Ok(journal.numbers)
 }
@@ -244,6 +272,7 @@ mod tests {
         create_calls: usize,
         lose_create_response: bool,
         duplicate_create_number: bool,
+        native_unavailable: bool,
     }
     impl IssueSetBackend for Fake {
         fn validate_labels(&mut self, _labels: &BTreeSet<String>) -> Result<(), String> {
@@ -282,13 +311,19 @@ mod tests {
                 .insert(number, (body.into(), entry.title.clone()));
             Ok(())
         }
-        fn ensure_sub_issue(&mut self, parent: u64, child: u64) -> Result<(), String> {
+        fn ensure_sub_issue(&mut self, parent: u64, child: u64) -> Result<bool, String> {
+            if self.native_unavailable {
+                return Ok(false);
+            }
             self.links.insert((parent, child));
-            Ok(())
+            Ok(true)
         }
-        fn ensure_dependency(&mut self, issue: u64, blocked_by: u64) -> Result<(), String> {
+        fn ensure_dependency(&mut self, issue: u64, blocked_by: u64) -> Result<bool, String> {
+            if self.native_unavailable {
+                return Ok(false);
+            }
             self.dependencies.insert((issue, blocked_by));
-            Ok(())
+            Ok(true)
         }
     }
     fn fixture() -> (tempfile::TempDir, ValidatedManifest) {
@@ -358,6 +393,29 @@ depends_on = ["epic"]
         let planned = plan(&manifest, dir.path(), "owner/repo", &mut backend).unwrap();
         assert_eq!(planned["epic"], Some(numbers["epic"]));
         assert_eq!(planned["child"], Some(numbers["child"]));
+        assert_eq!(backend.create_calls, 2);
+    }
+    #[test]
+    fn unavailable_native_relationships_fall_back_without_duplicates() {
+        let (dir, manifest) = fixture();
+        let mut backend = Fake {
+            native_unavailable: true,
+            ..Fake::default()
+        };
+        let numbers = apply(&manifest, dir.path(), "owner/repo", &mut backend).unwrap();
+        assert!(
+            backend.issues[&numbers["epic"]]
+                .0
+                .contains(&format!("- [ ] #{}", numbers["child"]))
+        );
+        assert!(
+            backend.issues[&numbers["child"]]
+                .0
+                .contains(&format!("Depends on: #{}", numbers["epic"]))
+        );
+        let original = backend.issues.clone();
+        apply(&manifest, dir.path(), "owner/repo", &mut backend).unwrap();
+        assert_eq!(backend.issues, original);
         assert_eq!(backend.create_calls, 2);
     }
     #[test]

@@ -163,6 +163,16 @@ impl ValidatedManifest {
                     .saturating_add(21);
                 rest = suffix;
             }
+            // Reserve space for task-list and dependency fallbacks before
+            // creating any issues, even when native support is unknown.
+            if entry.key == manifest.parent.key {
+                max_rendered_bytes = max_rendered_bytes
+                    .saturating_add(32)
+                    .saturating_add(manifest.issues.len().saturating_mul(28));
+            }
+            max_rendered_bytes = max_rendered_bytes
+                .saturating_add(16)
+                .saturating_add(entry.depends_on.len().saturating_mul(23));
             if max_rendered_bytes > MAX_RENDERED_BODY_BYTES {
                 return Err(format!(
                     "rendered body for {:?} exceeds the safety limit",

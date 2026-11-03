@@ -739,9 +739,6 @@ fn run_issue_set_apply(parsed: Parsed) -> Result<(), UsageError> {
                 plan.push(serde_json::json!({"action": "create", "key": key, "number": null}));
             }
         }
-        for key in &manifest.order {
-            plan.push(serde_json::json!({"action": "update", "key": key, "number": existing[key]}));
-        }
         for entry in &manifest.manifest.issues {
             plan.push(serde_json::json!({"action": "ensure_sub_issue", "parent": manifest.manifest.parent.key, "child": entry.key}));
         }
@@ -749,6 +746,9 @@ fn run_issue_set_apply(parsed: Parsed) -> Result<(), UsageError> {
             for dependency in &entry.depends_on {
                 plan.push(serde_json::json!({"action": "ensure_dependency", "issue": entry.key, "blocked_by": dependency}));
             }
+        }
+        for key in &manifest.order {
+            plan.push(serde_json::json!({"action": "update", "key": key, "number": existing[key]}));
         }
         if parsed.json {
             out!("{}", serde_json::to_string_pretty(&plan)?);

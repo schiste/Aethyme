@@ -114,6 +114,64 @@ impl GithubIssueSet<'_> {
         Err("GitHub pagination exceeded 100 pages; cannot prove the result is complete".into())
     }
 
+    /// A 404 on the relationship endpoint, after both issues have been
+    /// verified readable, means native relationships are unavailable to this
+    /// caller. Other errors and incomplete pagination must remain failures.
+    fn relationship_list(&self, path: &str) -> Result<Option<Vec<Value>>, String> {
+        let mut result = Vec::new();
+        let mut total_bytes = 0usize;
+        for page in 1..=100 {
+            let endpoint = format!("{path}?per_page=100&page={page}");
+            let output = crate::operations::github_command()
+                .args(["api", "--hostname", "github.com", "--include", &endpoint])
+                .output()
+                .map_err(|error| format!("cannot run GitHub client: {error}"))?;
+            if output.stdout.len() > 16 * 1024 * 1024 {
+                return Err("GitHub response exceeded 16 MiB".into());
+            }
+            let response =
+                std::str::from_utf8(&output.stdout).map_err(|_| "GitHub response is not UTF-8")?;
+            let status = response
+                .lines()
+                .next()
+                .and_then(|line| {
+                    let mut words = line.split_whitespace();
+                    let version = words.next()?;
+                    if !version.starts_with("HTTP/") {
+                        return None;
+                    }
+                    words.next()?.parse::<u16>().ok()
+                })
+                .ok_or("GitHub response omitted HTTP status")?;
+            if status == 404 && page == 1 {
+                return Ok(None);
+            }
+            if !output.status.success() || status != 200 {
+                return Err(format!(
+                    "GitHub relationship read failed (HTTP {status}): {}",
+                    crate::text_redaction::redact_secrets(&String::from_utf8_lossy(&output.stderr))
+                ));
+            }
+            let body = response
+                .split_once("\r\n\r\n")
+                .or_else(|| response.split_once("\n\n"))
+                .map(|(_, body)| body)
+                .ok_or("GitHub response omitted header terminator")?;
+            let values: Vec<Value> = serde_json::from_str(body)
+                .map_err(|error| format!("invalid GitHub relationship response: {error}"))?;
+            total_bytes = total_bytes.saturating_add(body.len());
+            if total_bytes > 32 * 1024 * 1024 {
+                return Err("GitHub pages exceeded the 32 MiB safety limit".into());
+            }
+            let done = values.len() < 100;
+            result.extend(values);
+            if done {
+                return Ok(Some(result));
+            }
+        }
+        Err("GitHub pagination exceeded 100 pages; cannot prove the result is complete".into())
+    }
+
     fn write(&mut self, args: Vec<String>, scope: &str) -> Result<String, String> {
         let report = self
             .broker
@@ -334,11 +392,15 @@ impl IssueSetBackend for GithubIssueSet<'_> {
         Ok(())
     }
 
-    fn ensure_sub_issue(&mut self, parent: u64, child: u64) -> Result<(), String> {
+    fn ensure_sub_issue(&mut self, parent: u64, child: u64) -> Result<bool, String> {
         let path = format!("repos/{}/issues/{parent}/sub_issues", self.repository);
+        self.issue(parent)?;
         let id = self.database_id(child)?;
-        if contains_database_id(&self.list(&path)?, id)? {
-            return Ok(());
+        let Some(relationships) = self.relationship_list(&path)? else {
+            return Ok(false);
+        };
+        if contains_database_id(&relationships, id)? {
+            return Ok(true);
         }
         self.write(
             vec![
@@ -351,17 +413,21 @@ impl IssueSetBackend for GithubIssueSet<'_> {
             ],
             "issues/sub-issues",
         )?;
-        Ok(())
+        Ok(true)
     }
 
-    fn ensure_dependency(&mut self, issue: u64, blocked_by: u64) -> Result<(), String> {
+    fn ensure_dependency(&mut self, issue: u64, blocked_by: u64) -> Result<bool, String> {
         let path = format!(
             "repos/{}/issues/{issue}/dependencies/blocked_by",
             self.repository
         );
+        self.issue(issue)?;
         let id = self.database_id(blocked_by)?;
-        if contains_database_id(&self.list(&path)?, id)? {
-            return Ok(());
+        let Some(relationships) = self.relationship_list(&path)? else {
+            return Ok(false);
+        };
+        if contains_database_id(&relationships, id)? {
+            return Ok(true);
         }
         self.write(
             vec![
@@ -374,7 +440,7 @@ impl IssueSetBackend for GithubIssueSet<'_> {
             ],
             "issues/dependencies",
         )?;
-        Ok(())
+        Ok(true)
     }
 }
 

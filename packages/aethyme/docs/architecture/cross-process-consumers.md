@@ -1346,7 +1346,9 @@ coverage lives in `aethyme-broker/tests/start_base_cli.rs`.
 set. The target default branch must opt in with `[issue_workflows]` and
 `issue_sets = "allow"` in `.aethyme/config.toml`; missing or invalid policy
 fails closed. The current implementation requires the target to match the
-session checkout's origin and requires native sub-issue and dependency support.
+session checkout's origin. If a native relationship endpoint returns 404 after
+both issues are verified readable, the managed bodies receive a task list or
+`Depends on` line; other API failures stop the operation.
 
 A manifest has a stable `set_id`, one `[parent]`, and zero or more `[[issues]]`.
 Each entry supplies a unique `key`, a `title`, a relative `body_file`, and
