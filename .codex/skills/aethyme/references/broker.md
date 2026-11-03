@@ -428,7 +428,18 @@ blocked.
    and suppress only automatic lanes; never force strict/disposable policy
    flags false or true to make an exact target eligible. Restore the exact
    original bytes or absence with compare-and-swap only after command exit and
-   detached-worker settlement are confirmed. Preserve refusal journals: changed
+   detached-worker settlement are confirmed.
+
+   Before launching a temporary hold, persist its unique run token and
+   known backup location. Capture helper or template bytes once, hash that
+   buffer, and execute or generate from those same bytes. After the child
+   is reaped, recover and validate its durable applied receipt even if
+   waiting was interrupted or stdout was truncated; compare-and-swap only
+   values proven owned by this run, and restore only after detached workers
+   settle. Keep unresolved intent fenced, report it, and do not start
+   overlapping work.
+
+   Preserve refusal journals: changed
    preconditions call for a fresh plan, not deletion of the earlier refusal.
 
 5. **Gate resources are per worker**. Broker gate runs take path-scoped owner
