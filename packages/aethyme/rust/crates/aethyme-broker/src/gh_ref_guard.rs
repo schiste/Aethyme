@@ -446,6 +446,28 @@ fn is_safe_write(tokens: &[&str], repository: &str) -> bool {
     })
 }
 
+/// The exact removal form is an issue write, not a branch deletion. The
+/// repository-specific guard still verifies the target before execution.
+pub(crate) fn is_sub_issue_removal(args: &[String]) -> bool {
+    let [api, flag, method, endpoint, field_flag, field] = args else {
+        return false;
+    };
+    if api != "api" || flag != "-X" || method != "DELETE" || field_flag != "-F" {
+        return false;
+    }
+    let parts: Vec<&str> = endpoint.split('/').collect();
+    let ["repos", owner, repo, "issues", _, "sub_issue"] = parts.as_slice() else {
+        return false;
+    };
+    if owner.is_empty() || repo.is_empty() {
+        return false;
+    }
+    is_safe_write(
+        &[flag, method, endpoint, field_flag, field],
+        &format!("{owner}/{repo}"),
+    )
+}
+
 /// The only GraphQL mutations Aethyme supports for review-thread conversations.
 /// Keep these queries exact: GraphQL can perform unrelated writes, including
 /// ref updates, in the same request.
@@ -657,6 +679,37 @@ mod tests {
 
     #[test]
     fn native_sub_issue_mutations_are_exact_and_cannot_write_refs() {
+        let classify = |parts: &[&str]| {
+            crate::classify_gh(&parts.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            classify(&[
+                "api",
+                "-X",
+                "DELETE",
+                "repos/o/n/issues/12/sub_issue",
+                "-F",
+                "sub_issue_id=345"
+            ]),
+            Some(crate::OperationEffect::Write)
+        );
+        assert_eq!(
+            classify(&["api", "-X", "DELETE", "repos/o/n/git/refs/heads/main"]),
+            Some(crate::OperationEffect::Destructive)
+        );
+        assert_eq!(
+            classify(&[
+                "api",
+                "-X",
+                "DELETE",
+                "repos/o/n/issues/12/sub_issue",
+                "-F",
+                "sub_issue_id=345",
+                "-F",
+                "replace_parent=true"
+            ]),
+            Some(crate::OperationEffect::Destructive)
+        );
         for (method, endpoint) in [
             ("POST", "repos/o/n/issues/12/sub_issues"),
             ("DELETE", "repos/o/n/issues/12/sub_issue"),

@@ -3041,6 +3041,9 @@ pub fn classify_gh(args: &[String]) -> Option<OperationEffect> {
     if command == "api" && crate::gh_ref_guard::is_review_thread_lookup(args) {
         return Some(OperationEffect::Read);
     }
+    if crate::gh_ref_guard::is_sub_issue_removal(args) {
+        return Some(OperationEffect::Write);
+    }
     // The two exact forms `gh_ref_guard` resolves to a branch delete are
     // destructive; anything else that may write a ref is refused by the
     // guard unless acknowledged (#393).
