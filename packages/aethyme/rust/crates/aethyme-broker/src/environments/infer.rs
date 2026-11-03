@@ -199,13 +199,37 @@ pub fn diff_base(worktree: &Path) -> Option<String> {
     None
 }
 
+/// The recorded checkout HEAD at session creation, when this worktree is broker-managed.
+fn session_start(worktree: &Path) -> Result<Option<String>, String> {
+    let checkout = crate::GitRepo::discover(worktree).map_err(|e| e.to_string())?;
+    let main = checkout.main_root().map_err(|e| e.to_string())?;
+    let database = crate::broker_db_path(&main).map_err(|e| e.to_string())?;
+    if !database.exists() {
+        return Ok(None);
+    }
+    let store = crate::BrokerStore::open_in_repo(&main).map_err(|e| e.to_string())?;
+    let session = store
+        .session_for_worktree(&checkout.root().to_string_lossy())
+        .map_err(|e| e.to_string())?;
+    match session {
+        Some(session) => session
+            .adopted_head
+            .map(Some)
+            .ok_or_else(|| format!("session {} has no recorded start commit", session.id)),
+        None => Ok(None),
+    }
+}
+
 /// Every path the session changed: committed and uncommitted changes
 /// against the base (both sides of renames) plus untracked files. Without a
 /// base (no integration branch or remote default branch), only uncommitted
 /// changes against `HEAD` count; the caller warns, since committed changes
 /// are then invisible.
 pub fn changed_paths(worktree: &Path) -> Result<(Option<String>, Vec<String>), String> {
-    let base = diff_base(worktree);
+    let base = match session_start(worktree)? {
+        Some(base) => Some(base),
+        None => diff_base(worktree),
+    };
     let against = match &base {
         Some(base) => Some(base.as_str()),
         None => git(worktree, &["rev-parse", "--verify", "-q", "HEAD"])
@@ -265,8 +289,7 @@ pub fn infer_range(
                 "-M",
                 // A merge is compared with its first parent, so it counts
                 // what it brought in rather than nothing.
-                "-m",
-                "--first-parent",
+                "--diff-merges=first-parent",
                 commit,
             ],
         )?);
