@@ -1,6 +1,6 @@
 # Local v3 qualification (#682)
 
-Last Updated: 2026-10-16
+Last Updated: 2026-11-03
 
 ## Scope and status
 
@@ -35,6 +35,30 @@ records separate final-head workspace, CI and schema-floor checks; the public
 T64 rehearsal remains open. These finite observations do not establish reliable
 autonomous operation. All results below name their source and profile; earlier
 operator profiles retain their original limits.
+
+## Unqualified claims (2026-11-03)
+
+#682 closes with the claims below explicitly **unqualified**. They are not
+advertised as Local capabilities, and nothing in this ledger may be cited as
+evidence for them. Each one moves to its own issue:
+
+- **T64 two-contributor public-CLI rehearsal, and the fresh reviewer
+  command-line path (#1389).** Never run. The first setup failed, and its frozen inputs
+  did not survive the 2026-11-01 host restart, so the rehearsal must be
+  re-frozen before any run. Since #671 the controller's native gates default to
+  `off`; a re-frozen policy must state its `native_gates` choice.
+- **D30, decision-brief usefulness (#1390).** Delivery is not usefulness. FX08 was
+  inconclusive, and all six FX17 model rows failed at the provider schema with
+  zero candidates. Consumed campaigns stay consumed; a new attempt needs new
+  frozen cases.
+- **Model-driven resolution quality (#1391).** #665 qualified bounded resolution
+  requests and exact candidate manifests, not the quality of what a model
+  resolves.
+
+Smaller residual gaps from the closed work packages are tracked in #1380. The
+limits stated in each section below (host and daemon storage, mid-journal
+exhaustion, power loss, the live GitHub/Mergify route, repeated drift and
+sustained load) still apply.
 
 ## Evidence inventory
 
