@@ -1,9 +1,14 @@
-//! Provisional composition fixtures FX01–FX07 and their behavior oracle.
+//! E1's original composition fixtures FX01–FX07 and their behavior oracle.
 //!
-//! These stand in for the E1 (#650) evidence until it lands, so that L4
-//! (#663–#665) can be built against something concrete. They are
-//! **provisional**: E1's frozen fixtures and requirements replace them.
-//! See `packages/aethyme/docs/architecture/local-v3-l4-provisional-fixtures.md`.
+//! First added as a provisional stand-in so that L4 (#663–#665) could be
+//! built before E1 (#650) ran, these inputs were then adopted unchanged as
+//! E1's original frozen inputs. They are hashed in
+//! `fixtures/composition-e1/frozen-input-inventory.json`, and the Q1 record is
+//! `evidence/q1-composition-profile.json`. The "provisional" label is
+//! superseded. The directory and `INPUTS_SCHEMA` keep their original names,
+//! because renaming either would change frozen paths or digests. See
+//! `packages/aethyme/docs/architecture/local-v3-e1-profile.md` and
+//! `packages/aethyme/docs/architecture/local-v3-l4-provisional-fixtures.md`.
 //!
 //! The data is split in two:
 //!

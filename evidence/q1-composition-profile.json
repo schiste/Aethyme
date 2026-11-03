@@ -1,0 +1,1431 @@
+{
+  "schema": "aethyme.local-v3.q1-composition-profile/v1",
+  "gate": "Q1",
+  "issue": 650,
+  "status": "evidence_recorded_pending_review",
+  "reconciled_on": "2026-11-03",
+  "reconciliation_note": "Assembled from evidence committed on 2026-10-12. No campaign, model call or held-out case was rerun to build this record. Every digest below is copied from, or computed over, a committed file.",
+  "selected_profile": {
+    "name": "mergiraf-html-candidate",
+    "engine": {
+      "name": "mergiraf",
+      "version": "0.19.1",
+      "binary_sha256": "cda5175440f474b4f887c8e6e39878911d15e1a4825d70b4e949a0841820cc3c",
+      "license": "GPL-3.0-only",
+      "distribution": "external opt-in executable; not linked or bundled"
+    },
+    "grammar": "HTML (.html/.htm) structural; every other path keeps the observed text profile",
+    "fallback": "text merge per file outside the structural grammar, recorded as mode=Text; parse errors, timeouts and unverified tool identity refuse rather than claim structural success",
+    "ordering": "every declared order runs twice; claimed-commutative outputs must be byte-identical",
+    "admissible_bases": "common base and recorded causal chains; unknown or unrecorded bases refuse (unknown_base)",
+    "default_profile_unchanged": "git-text-baseline remains the default"
+  },
+  "source_revisions": {
+    "original_campaign": "d1910b14150c3ca92d711e799c0f1e05439639db",
+    "browser_campaign": "f2c52f8b8f1575d0209b2daba3e58f11ea955b8e",
+    "synthesis_campaign": "97a152f13f9c38b146ba76040b6e363d80097196",
+    "sealed_campaign": "27a1b6e924b4de7f4d5fcf512337f80b61821332",
+    "frozen_inputs_prior_fixture_revision": "6a3f37414f1b8c2390db1b9725e996304c6d2797"
+  },
+  "compiled_harness_sha256": {
+    "browser_campaign": "7095bb814dfdb2dbee1d2723e7789c7454f9c620d14ecaf5753d7128df90d1e3",
+    "synthesis_campaign": "76a6cb9b54fc06db9b808e5340e665d3419c84d668bc6d7943e429425863dde9",
+    "sealed_campaign": "2d51ae3b5a5b297beafaf84640abf05a554726e302ec4bc3544f2076d3d11ba0"
+  },
+  "environment": "appointed cooperative macOS arm64 host; host OS and dynamic system/Homebrew libraries trusted, not sandboxed (see browser-runtime-profile.json deployment_contract)",
+  "commands": {
+    "note": "Exact argv lines were not retained by the campaigns. These are the committed entrypoints; each is #[ignore] and needs AETHYME_E1_ENGINE (path) and AETHYME_E1_ENGINE_SHA256 plus the named evidence directory.",
+    "original": "cargo test --locked -p aethyme-broker --test e1_composition -- --ignored compare_original_inputs_with_pinned_structural_engine  [AETHYME_E1_EVIDENCE_DIR]",
+    "browser": "cargo test --locked -p aethyme-broker --test e1_browser -- --ignored compare_browser_inputs  [AETHYME_E1_BROWSER_EVIDENCE]",
+    "synthesis": "cargo test --locked -p aethyme-broker --test e1_browser -- --ignored synthesize_and_subtract_actual_browser_candidate  [AETHYME_E1_SYNTHESIS_EVIDENCE]",
+    "sealed": "cargo test --locked -p aethyme-broker --test e1_browser -- --ignored final_sealed_structural_campaign  [AETHYME_E1_SEALED_EVIDENCE]",
+    "freeze_check": "cargo test --locked -p aethyme-broker --test e1_composition original_e1_inputs_match_the_pretrial_inventory"
+  },
+  "required_tests": [
+    "T16",
+    "T17",
+    "T18",
+    "T19",
+    "T22"
+  ],
+  "excluded_capabilities": [
+    {
+      "tests": [
+        "T20",
+        "T21"
+      ],
+      "reason": "whole-candidate verification and atomic publication claims belong to Q3 (issue #650 AC4); this record does not claim them"
+    }
+  ],
+  "test_mapping": {
+    "T16": {
+      "fixtures": [
+        "FX01",
+        "FX02",
+        "FX01-browser",
+        "FX02-browser",
+        "SH01"
+      ],
+      "result": "pass for the selected profile",
+      "evidence": "original rows FX01 s1, FX02 s1 (Structural), FX02 s2 (expected conflict); browser verdicts FX01/FX02-browser 12/12; sealed SH01 4/4"
+    },
+    "T17": {
+      "fixtures": [
+        "FX03",
+        "FX03-browser",
+        "FX03-unknown"
+      ],
+      "result": "pass",
+      "evidence": "original FX03 s1/s2 candidate, s3 unknown_base refused; browser FX03-browser 14 runs, FX03-unknown refused"
+    },
+    "T18": {
+      "fixtures": [
+        "all declared orders"
+      ],
+      "result": "pass",
+      "evidence": "every declared order ran twice; one distinct candidate snapshot per original row; browser byte_identical on every candidate verdict; sealed SH01 one candidate across both orders"
+    },
+    "T19": {
+      "fixtures": [
+        "FX05",
+        "FX05-browser"
+      ],
+      "result": "pass",
+      "evidence": "original FX05 s1 conflict for both profiles; browser FX05-browser accepted (no invented compromise) for text and structural"
+    },
+    "T22": {
+      "fixtures": [
+        "FX07",
+        "FX04-browser synthesis consumer"
+      ],
+      "result": "pass",
+      "evidence": "original FX07 s1 candidate, s2/s3 inseparable_selection; synthesis consumer 4/4, subtraction without consumer 2/2, subtraction keeping consumer refused 2/2"
+    }
+  },
+  "observed_passes": {
+    "original_structural": "16/17 scenarios",
+    "original_text_baseline": "15/17 scenarios",
+    "browser_structural": "8/9 scenarios",
+    "browser_text": "8/9 scenarios",
+    "browser_unmanaged_git": "4/9 scenarios",
+    "synthesis": "first attempt synthesized; independent browser accepted; consumer, subtraction and refusal as recorded",
+    "sealed_SH01": "4/4"
+  },
+  "observed_failures": [
+    {
+      "fixture": "FX04 (original, s1)",
+      "profiles": [
+        "git-text-baseline",
+        "mergiraf-html-candidate"
+      ],
+      "detail": "both composers returned outcome=candidate (mode Text) that failed 8 oracle checks. That candidate is unverified and is not counted as success; the cross-file rename/handler interaction is routed to semantic resolution."
+    },
+    {
+      "fixture": "FX02 (original, s1)",
+      "profiles": [
+        "git-text-baseline"
+      ],
+      "detail": "text baseline conflicted where the structural profile composed; shows why the structural profile is selected for HTML."
+    },
+    {
+      "fixture": "FX04-browser",
+      "profiles": [
+        "all composers"
+      ],
+      "detail": "no composer passes; resolved only through the bounded synthesis path recorded under synthesis"
+    }
+  ],
+  "costs": {
+    "synthesis_provider_usage": {
+      "input_tokens": 25971,
+      "output_tokens": 1212,
+      "cached_input_tokens": 11008,
+      "uncached_input_tokens": 14963,
+      "uncached_plus_output_tokens": 16175,
+      "cache_write_input_tokens": 0,
+      "retries": 0
+    },
+    "synthesis_model_process_wall_ms": 19338,
+    "invoiced_charge": "unknown (provider_charge_microunits null)",
+    "composition_campaigns": "local only; no provider cost"
+  },
+  "original_campaign": [
+    {
+      "case": "FX01",
+      "scenario": "s1",
+      "profile": "git-text-baseline",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "candidate"
+      ],
+      "modes": [
+        "Text"
+      ],
+      "runs": 12,
+      "orders": [
+        "c1>c2>c3",
+        "c1>c3>c2",
+        "c2>c1>c3",
+        "c2>c3>c1",
+        "c3>c1>c2",
+        "c3>c2>c1"
+      ],
+      "candidates": [
+        {
+          "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+          "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced",
+          "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf"
+        }
+      ]
+    },
+    {
+      "case": "FX02",
+      "scenario": "s1",
+      "profile": "git-text-baseline",
+      "accepted": false,
+      "oracle_failures": 4,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "conflict"
+      ],
+      "modes": [],
+      "runs": 4,
+      "orders": [
+        "c1>c2",
+        "c2>c1"
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX02",
+      "scenario": "s2",
+      "profile": "git-text-baseline",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "conflict"
+      ],
+      "modes": [],
+      "runs": 4,
+      "orders": [
+        "c3>c4",
+        "c4>c3"
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX03",
+      "scenario": "s1",
+      "profile": "git-text-baseline",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "candidate"
+      ],
+      "modes": [
+        "Text"
+      ],
+      "runs": 2,
+      "orders": [
+        "c1>c2"
+      ],
+      "candidates": [
+        {
+          "commit": "008d753a5460987943f8a3b38624551399c29f08",
+          "tree": "10002d7f9e944288b7a618163a82b9572a767911",
+          "snapshot": "sha256:e30f47f0db32b7d382e7c40de4a1c03be78353c1ec99598bf0ef22d756ad9f71"
+        }
+      ]
+    },
+    {
+      "case": "FX03",
+      "scenario": "s2",
+      "profile": "git-text-baseline",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "candidate"
+      ],
+      "modes": [
+        "Text"
+      ],
+      "runs": 2,
+      "orders": [
+        "c1>c1>c2>c1"
+      ],
+      "candidates": [
+        {
+          "commit": "008d753a5460987943f8a3b38624551399c29f08",
+          "tree": "10002d7f9e944288b7a618163a82b9572a767911",
+          "snapshot": "sha256:e30f47f0db32b7d382e7c40de4a1c03be78353c1ec99598bf0ef22d756ad9f71"
+        }
+      ]
+    },
+    {
+      "case": "FX03",
+      "scenario": "s3",
+      "profile": "git-text-baseline",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "unknown_base"
+      ],
+      "modes": [],
+      "runs": 2,
+      "orders": [
+        "c3"
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX04",
+      "scenario": "s1",
+      "profile": "git-text-baseline",
+      "accepted": false,
+      "oracle_failures": 8,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "candidate"
+      ],
+      "modes": [
+        "Text"
+      ],
+      "runs": 4,
+      "orders": [
+        "c1>c2",
+        "c2>c1"
+      ],
+      "candidates": [
+        {
+          "commit": "7387552d78df77f2c569498c268e79b11e9f64bd",
+          "tree": "f91a946ad93e638bcc2a04d94338e5c13cf69971",
+          "snapshot": "sha256:f0c04e1b3987a2fbaeb72904abe02f18977cbfa93b19ae88ea001e787868d2f4"
+        }
+      ]
+    },
+    {
+      "case": "FX05",
+      "scenario": "s1",
+      "profile": "git-text-baseline",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "conflict"
+      ],
+      "modes": [],
+      "runs": 4,
+      "orders": [
+        "c1>c2",
+        "c2>c1"
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX06",
+      "scenario": "s1",
+      "profile": "git-text-baseline",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "candidate"
+      ],
+      "modes": [
+        "Text"
+      ],
+      "runs": 2,
+      "orders": [
+        "c1>c3"
+      ],
+      "candidates": [
+        {
+          "commit": "e7ec22209b0e5a7dd855b0d35a08cfa603de86e6",
+          "tree": "cef2e6a0b5e50538f496c4ca1ac77a534d73c6c1",
+          "snapshot": "sha256:49507241a03f3c88398ec7ff0958584983b03d62d0e2aaaea5a092f350520f2e"
+        }
+      ]
+    },
+    {
+      "case": "FX06",
+      "scenario": "s2",
+      "profile": "git-text-baseline",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "missing_input"
+      ],
+      "modes": [],
+      "runs": 2,
+      "orders": [
+        "c3"
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX06",
+      "scenario": "s3",
+      "profile": "git-text-baseline",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "missing_input"
+      ],
+      "modes": [],
+      "runs": 2,
+      "orders": [
+        "c1"
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX06",
+      "scenario": "s4",
+      "profile": "git-text-baseline",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "dependency_cycle"
+      ],
+      "modes": [],
+      "runs": 2,
+      "orders": [
+        "c4>c5"
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX06",
+      "scenario": "s5",
+      "profile": "git-text-baseline",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "competing_revisions"
+      ],
+      "modes": [],
+      "runs": 2,
+      "orders": [
+        "c1>c2>c3"
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX06",
+      "scenario": "s6",
+      "profile": "git-text-baseline",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "competing_revisions"
+      ],
+      "modes": [],
+      "runs": 2,
+      "orders": [
+        "c2>c3"
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX07",
+      "scenario": "s1",
+      "profile": "git-text-baseline",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "candidate"
+      ],
+      "modes": [
+        "Text"
+      ],
+      "runs": 2,
+      "orders": [
+        ""
+      ],
+      "candidates": [
+        {
+          "commit": "2f6ae1a624ecc2abb4950e993394f7c3614cfae1",
+          "tree": "bdab02b408a6ad7f5c90c5b88e840b5551d833fb",
+          "snapshot": "sha256:181805ff7fbfe6602b4fe65410e63db86e65b24080179ebb53ef7a98941299b9"
+        }
+      ]
+    },
+    {
+      "case": "FX07",
+      "scenario": "s2",
+      "profile": "git-text-baseline",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "inseparable_selection"
+      ],
+      "modes": [],
+      "runs": 2,
+      "orders": [
+        ""
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX07",
+      "scenario": "s3",
+      "profile": "git-text-baseline",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "inseparable_selection"
+      ],
+      "modes": [],
+      "runs": 2,
+      "orders": [
+        ""
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX01",
+      "scenario": "s1",
+      "profile": "mergiraf-html-candidate",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "candidate"
+      ],
+      "modes": [
+        "Text"
+      ],
+      "runs": 12,
+      "orders": [
+        "c1>c2>c3",
+        "c1>c3>c2",
+        "c2>c1>c3",
+        "c2>c3>c1",
+        "c3>c1>c2",
+        "c3>c2>c1"
+      ],
+      "candidates": [
+        {
+          "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+          "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced",
+          "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf"
+        }
+      ]
+    },
+    {
+      "case": "FX02",
+      "scenario": "s1",
+      "profile": "mergiraf-html-candidate",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "candidate"
+      ],
+      "modes": [
+        "Structural"
+      ],
+      "runs": 4,
+      "orders": [
+        "c1>c2",
+        "c2>c1"
+      ],
+      "candidates": [
+        {
+          "commit": "de8cf1813786c1aa706a1befd66bfc023c024ca5",
+          "tree": "80514d56d214370948246568348da88422e7bf61",
+          "snapshot": "sha256:e45f2400c690d81956683028ff3bf990fabf1040298621ecc77b08288bf2276d"
+        }
+      ]
+    },
+    {
+      "case": "FX02",
+      "scenario": "s2",
+      "profile": "mergiraf-html-candidate",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "conflict"
+      ],
+      "modes": [],
+      "runs": 4,
+      "orders": [
+        "c3>c4",
+        "c4>c3"
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX03",
+      "scenario": "s1",
+      "profile": "mergiraf-html-candidate",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "candidate"
+      ],
+      "modes": [
+        "Text"
+      ],
+      "runs": 2,
+      "orders": [
+        "c1>c2"
+      ],
+      "candidates": [
+        {
+          "commit": "008d753a5460987943f8a3b38624551399c29f08",
+          "tree": "10002d7f9e944288b7a618163a82b9572a767911",
+          "snapshot": "sha256:e30f47f0db32b7d382e7c40de4a1c03be78353c1ec99598bf0ef22d756ad9f71"
+        }
+      ]
+    },
+    {
+      "case": "FX03",
+      "scenario": "s2",
+      "profile": "mergiraf-html-candidate",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "candidate"
+      ],
+      "modes": [
+        "Text"
+      ],
+      "runs": 2,
+      "orders": [
+        "c1>c1>c2>c1"
+      ],
+      "candidates": [
+        {
+          "commit": "008d753a5460987943f8a3b38624551399c29f08",
+          "tree": "10002d7f9e944288b7a618163a82b9572a767911",
+          "snapshot": "sha256:e30f47f0db32b7d382e7c40de4a1c03be78353c1ec99598bf0ef22d756ad9f71"
+        }
+      ]
+    },
+    {
+      "case": "FX03",
+      "scenario": "s3",
+      "profile": "mergiraf-html-candidate",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "unknown_base"
+      ],
+      "modes": [],
+      "runs": 2,
+      "orders": [
+        "c3"
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX04",
+      "scenario": "s1",
+      "profile": "mergiraf-html-candidate",
+      "accepted": false,
+      "oracle_failures": 8,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "candidate"
+      ],
+      "modes": [
+        "Text"
+      ],
+      "runs": 4,
+      "orders": [
+        "c1>c2",
+        "c2>c1"
+      ],
+      "candidates": [
+        {
+          "commit": "7387552d78df77f2c569498c268e79b11e9f64bd",
+          "tree": "f91a946ad93e638bcc2a04d94338e5c13cf69971",
+          "snapshot": "sha256:f0c04e1b3987a2fbaeb72904abe02f18977cbfa93b19ae88ea001e787868d2f4"
+        }
+      ]
+    },
+    {
+      "case": "FX05",
+      "scenario": "s1",
+      "profile": "mergiraf-html-candidate",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "conflict"
+      ],
+      "modes": [],
+      "runs": 4,
+      "orders": [
+        "c1>c2",
+        "c2>c1"
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX06",
+      "scenario": "s1",
+      "profile": "mergiraf-html-candidate",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "candidate"
+      ],
+      "modes": [
+        "Text"
+      ],
+      "runs": 2,
+      "orders": [
+        "c1>c3"
+      ],
+      "candidates": [
+        {
+          "commit": "e7ec22209b0e5a7dd855b0d35a08cfa603de86e6",
+          "tree": "cef2e6a0b5e50538f496c4ca1ac77a534d73c6c1",
+          "snapshot": "sha256:49507241a03f3c88398ec7ff0958584983b03d62d0e2aaaea5a092f350520f2e"
+        }
+      ]
+    },
+    {
+      "case": "FX06",
+      "scenario": "s2",
+      "profile": "mergiraf-html-candidate",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "missing_input"
+      ],
+      "modes": [],
+      "runs": 2,
+      "orders": [
+        "c3"
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX06",
+      "scenario": "s3",
+      "profile": "mergiraf-html-candidate",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "missing_input"
+      ],
+      "modes": [],
+      "runs": 2,
+      "orders": [
+        "c1"
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX06",
+      "scenario": "s4",
+      "profile": "mergiraf-html-candidate",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "dependency_cycle"
+      ],
+      "modes": [],
+      "runs": 2,
+      "orders": [
+        "c4>c5"
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX06",
+      "scenario": "s5",
+      "profile": "mergiraf-html-candidate",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "competing_revisions"
+      ],
+      "modes": [],
+      "runs": 2,
+      "orders": [
+        "c1>c2>c3"
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX06",
+      "scenario": "s6",
+      "profile": "mergiraf-html-candidate",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "competing_revisions"
+      ],
+      "modes": [],
+      "runs": 2,
+      "orders": [
+        "c2>c3"
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX07",
+      "scenario": "s1",
+      "profile": "mergiraf-html-candidate",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "candidate"
+      ],
+      "modes": [
+        "Text"
+      ],
+      "runs": 2,
+      "orders": [
+        ""
+      ],
+      "candidates": [
+        {
+          "commit": "2f6ae1a624ecc2abb4950e993394f7c3614cfae1",
+          "tree": "bdab02b408a6ad7f5c90c5b88e840b5551d833fb",
+          "snapshot": "sha256:181805ff7fbfe6602b4fe65410e63db86e65b24080179ebb53ef7a98941299b9"
+        }
+      ]
+    },
+    {
+      "case": "FX07",
+      "scenario": "s2",
+      "profile": "mergiraf-html-candidate",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "inseparable_selection"
+      ],
+      "modes": [],
+      "runs": 2,
+      "orders": [
+        ""
+      ],
+      "candidates": []
+    },
+    {
+      "case": "FX07",
+      "scenario": "s3",
+      "profile": "mergiraf-html-candidate",
+      "accepted": true,
+      "oracle_failures": 0,
+      "infrastructure_errors": 0,
+      "outcomes": [
+        "inseparable_selection"
+      ],
+      "modes": [],
+      "runs": 2,
+      "orders": [
+        ""
+      ],
+      "candidates": []
+    }
+  ],
+  "browser_campaign": {
+    "verdicts": [
+      {
+        "case": "FX01-browser",
+        "profile": "plain-git-unmanaged",
+        "expected": "candidate",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": true,
+        "runs": 12
+      },
+      {
+        "case": "FX02-browser",
+        "profile": "plain-git-unmanaged",
+        "expected": "candidate",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": true,
+        "runs": 12
+      },
+      {
+        "case": "FX03-browser",
+        "profile": "plain-git-unmanaged",
+        "expected": "candidate",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": true,
+        "runs": 14
+      },
+      {
+        "case": "FX04-browser",
+        "profile": "plain-git-unmanaged",
+        "expected": "synthesis_required",
+        "accepted": false,
+        "all_completed": true,
+        "byte_identical": false,
+        "runs": 4
+      },
+      {
+        "case": "FX05-browser",
+        "profile": "plain-git-unmanaged",
+        "expected": "conflict",
+        "accepted": false,
+        "all_completed": true,
+        "byte_identical": false,
+        "runs": 4
+      },
+      {
+        "case": "FX06-browser",
+        "profile": "plain-git-unmanaged",
+        "expected": "candidate",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": true,
+        "runs": 4
+      },
+      {
+        "case": "FX06-partial",
+        "profile": "plain-git-unmanaged",
+        "expected": "missing_input",
+        "accepted": false,
+        "all_completed": true,
+        "byte_identical": true,
+        "runs": 2
+      },
+      {
+        "case": "FX06-cycle",
+        "profile": "plain-git-unmanaged",
+        "expected": "dependency_cycle",
+        "accepted": false,
+        "all_completed": true,
+        "byte_identical": true,
+        "runs": 2
+      },
+      {
+        "case": "FX03-unknown",
+        "profile": "plain-git-unmanaged",
+        "expected": "unknown_base",
+        "accepted": false,
+        "all_completed": true,
+        "byte_identical": true,
+        "runs": 2
+      },
+      {
+        "case": "FX01-browser",
+        "profile": "git-text-baseline",
+        "expected": "candidate",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": true,
+        "runs": 12
+      },
+      {
+        "case": "FX02-browser",
+        "profile": "git-text-baseline",
+        "expected": "candidate",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": true,
+        "runs": 12
+      },
+      {
+        "case": "FX03-browser",
+        "profile": "git-text-baseline",
+        "expected": "candidate",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": true,
+        "runs": 14
+      },
+      {
+        "case": "FX04-browser",
+        "profile": "git-text-baseline",
+        "expected": "synthesis_required",
+        "accepted": false,
+        "all_completed": true,
+        "byte_identical": false,
+        "runs": 4
+      },
+      {
+        "case": "FX05-browser",
+        "profile": "git-text-baseline",
+        "expected": "conflict",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": false,
+        "runs": 4
+      },
+      {
+        "case": "FX06-browser",
+        "profile": "git-text-baseline",
+        "expected": "candidate",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": true,
+        "runs": 4
+      },
+      {
+        "case": "FX06-partial",
+        "profile": "git-text-baseline",
+        "expected": "missing_input",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": false,
+        "runs": 2
+      },
+      {
+        "case": "FX06-cycle",
+        "profile": "git-text-baseline",
+        "expected": "dependency_cycle",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": false,
+        "runs": 2
+      },
+      {
+        "case": "FX03-unknown",
+        "profile": "git-text-baseline",
+        "expected": "unknown_base",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": false,
+        "runs": 2
+      },
+      {
+        "case": "FX01-browser",
+        "profile": "mergiraf-html-candidate",
+        "expected": "candidate",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": true,
+        "runs": 12
+      },
+      {
+        "case": "FX02-browser",
+        "profile": "mergiraf-html-candidate",
+        "expected": "candidate",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": true,
+        "runs": 12
+      },
+      {
+        "case": "FX03-browser",
+        "profile": "mergiraf-html-candidate",
+        "expected": "candidate",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": true,
+        "runs": 14
+      },
+      {
+        "case": "FX04-browser",
+        "profile": "mergiraf-html-candidate",
+        "expected": "synthesis_required",
+        "accepted": false,
+        "all_completed": true,
+        "byte_identical": true,
+        "runs": 4
+      },
+      {
+        "case": "FX05-browser",
+        "profile": "mergiraf-html-candidate",
+        "expected": "conflict",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": false,
+        "runs": 4
+      },
+      {
+        "case": "FX06-browser",
+        "profile": "mergiraf-html-candidate",
+        "expected": "candidate",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": true,
+        "runs": 4
+      },
+      {
+        "case": "FX06-partial",
+        "profile": "mergiraf-html-candidate",
+        "expected": "missing_input",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": false,
+        "runs": 2
+      },
+      {
+        "case": "FX06-cycle",
+        "profile": "mergiraf-html-candidate",
+        "expected": "dependency_cycle",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": false,
+        "runs": 2
+      },
+      {
+        "case": "FX03-unknown",
+        "profile": "mergiraf-html-candidate",
+        "expected": "unknown_base",
+        "accepted": true,
+        "all_completed": true,
+        "byte_identical": false,
+        "runs": 2
+      }
+    ],
+    "candidate_sha256_by_case_profile": {
+      "FX01-browser|git-text-baseline": [
+        "6cc76cd1b28f65cac04e057367ab8ef231d3a600aeab2f2d351b86c260ea8afa"
+      ],
+      "FX01-browser|mergiraf-html-candidate": [
+        "6cc76cd1b28f65cac04e057367ab8ef231d3a600aeab2f2d351b86c260ea8afa"
+      ],
+      "FX01-browser|plain-git-unmanaged": [
+        "6cc76cd1b28f65cac04e057367ab8ef231d3a600aeab2f2d351b86c260ea8afa"
+      ],
+      "FX02-browser|git-text-baseline": [
+        "ca57930fe3ad65c7bf094ab2d262c924af62ddbcad629b936940282c8fab5607"
+      ],
+      "FX02-browser|mergiraf-html-candidate": [
+        "ca57930fe3ad65c7bf094ab2d262c924af62ddbcad629b936940282c8fab5607"
+      ],
+      "FX02-browser|plain-git-unmanaged": [
+        "ca57930fe3ad65c7bf094ab2d262c924af62ddbcad629b936940282c8fab5607"
+      ],
+      "FX03-browser|git-text-baseline": [
+        "6cc76cd1b28f65cac04e057367ab8ef231d3a600aeab2f2d351b86c260ea8afa"
+      ],
+      "FX03-browser|mergiraf-html-candidate": [
+        "6cc76cd1b28f65cac04e057367ab8ef231d3a600aeab2f2d351b86c260ea8afa"
+      ],
+      "FX03-browser|plain-git-unmanaged": [
+        "6cc76cd1b28f65cac04e057367ab8ef231d3a600aeab2f2d351b86c260ea8afa"
+      ],
+      "FX03-unknown|plain-git-unmanaged": [
+        "c35767471e4ddaec12b1d56b501983ce3ffe12f00ea70da0af95331cb337fa11"
+      ],
+      "FX04-browser|mergiraf-html-candidate": [
+        "91815d5c5d3b97eb6bfc7d30adb177fcb66397de55414a3168ad498f84f1f455"
+      ],
+      "FX06-browser|git-text-baseline": [
+        "a94a8f762786d903167330ef5e998d81a206a233318e9457aa4610a58d3a46da"
+      ],
+      "FX06-browser|mergiraf-html-candidate": [
+        "a94a8f762786d903167330ef5e998d81a206a233318e9457aa4610a58d3a46da"
+      ],
+      "FX06-browser|plain-git-unmanaged": [
+        "a94a8f762786d903167330ef5e998d81a206a233318e9457aa4610a58d3a46da"
+      ],
+      "FX06-cycle|plain-git-unmanaged": [
+        "ff0bde0fb6dad2424b03bfb2c2ed139abf0fbcf8378a4467e290506456024d1a"
+      ],
+      "FX06-partial|plain-git-unmanaged": [
+        "4916a70b9bcaa83cf0efb6a845cc0821a750409bbe20f4b8f931a32cbb54dd1f"
+      ]
+    },
+    "runtime_versions": {
+      "chromium": "149.0.7827.55",
+      "node": "v26.8.2",
+      "playwright": "1.64.0-alpha-1790635538000"
+    },
+    "observations": 168
+  },
+  "synthesis": {
+    "fixture": "FX04-browser",
+    "request": {
+      "decision": "4b08a5b7ab28cb4db926944098a11271126afd03cd47a3a5831906e7e9fdfc9c",
+      "id": "sha256:2fe3fd050536f1f1346602f13ad71e3e2ad1f9b5aed6ed1fb0905255055c353d"
+    },
+    "initial_independent_check": {
+      "exit": 1,
+      "passed": false
+    },
+    "attempts": [
+      {
+        "attempt": 1,
+        "state": "completed",
+        "outcome": "synthesized",
+        "browser_passed": true,
+        "candidate": {
+          "commit": "456e1e0f6aca6dfacc1f2d7a7445387a1eed6b53",
+          "tree": "7fd7fcadc22795a99e8afc77dd669e022ac2b96e",
+          "snapshot": "sha256:26bb14156bf27edb3d40bab0a3201f09abd889f59599001f3e0be0fd67237def"
+        }
+      },
+      {
+        "attempt": null,
+        "state": "unrun",
+        "outcome": null,
+        "browser_passed": null,
+        "candidate": null
+      }
+    ],
+    "consumer_runs": [
+      {
+        "order": "S>consumer-footer",
+        "repeat": 0,
+        "outcome": "candidate",
+        "browser_passed": true,
+        "candidate": "sha256:b0e0145b8f5f348e67d8b06b7e5d3180219ad982be70b9e4d7f29aa9c49d136e"
+      },
+      {
+        "order": "S>consumer-footer",
+        "repeat": 1,
+        "outcome": "candidate",
+        "browser_passed": true,
+        "candidate": "sha256:b0e0145b8f5f348e67d8b06b7e5d3180219ad982be70b9e4d7f29aa9c49d136e"
+      },
+      {
+        "order": "consumer-footer>S",
+        "repeat": 0,
+        "outcome": "candidate",
+        "browser_passed": true,
+        "candidate": "sha256:b0e0145b8f5f348e67d8b06b7e5d3180219ad982be70b9e4d7f29aa9c49d136e"
+      },
+      {
+        "order": "consumer-footer>S",
+        "repeat": 1,
+        "outcome": "candidate",
+        "browser_passed": true,
+        "candidate": "sha256:b0e0145b8f5f348e67d8b06b7e5d3180219ad982be70b9e4d7f29aa9c49d136e"
+      }
+    ],
+    "subtract_without_consumer": [
+      {
+        "repeat": 0,
+        "accepted": true,
+        "outcome": "candidate",
+        "browser_passed": true
+      },
+      {
+        "repeat": 1,
+        "accepted": true,
+        "outcome": "candidate",
+        "browser_passed": true
+      }
+    ],
+    "subtract_keeping_consumer": [
+      {
+        "repeat": 0,
+        "accepted": true,
+        "outcome": "inseparable_selection",
+        "candidate_present": false
+      },
+      {
+        "repeat": 1,
+        "accepted": true,
+        "outcome": "inseparable_selection",
+        "candidate_present": false
+      }
+    ],
+    "retained_originals_after_subtraction": 8,
+    "runtime_versions": {
+      "chromium": "149.0.7827.55",
+      "node": "v26.8.2",
+      "playwright": "1.64.0-alpha-1790635538000"
+    },
+    "provider_usage": {
+      "input_tokens": 25971,
+      "output_tokens": 1212,
+      "cached_input_tokens": 11008,
+      "uncached_input_tokens": 14963,
+      "uncached_plus_output_tokens": 16175,
+      "cache_write_input_tokens": 0,
+      "retries": 0
+    },
+    "provider_charge_microunits": null,
+    "model_process_wall_ms": 19338,
+    "second_allowance": "unrun"
+  },
+  "sealed": {
+    "case": "SH01-loan-move-edit",
+    "passed": true,
+    "engine_sha256": "cda5175440f474b4f887c8e6e39878911d15e1a4825d70b4e949a0841820cc3c",
+    "freeze_sha256": "49f0debe22731accc39c61598ceb71e09bc91ba8f1f5f8b17b4903db1694050e",
+    "runner_sha256": "fd905b0a65881a75bcdcbfdadb0479a290fd9602a42322055035400a2692e574",
+    "orders": [
+      "c1>c2",
+      "c2>c1"
+    ],
+    "runs_per_order": 2,
+    "rows": [
+      {
+        "candidate": {
+          "commit": "b6b6c21af31095f540be499e5c5c6dfc9bc7bd47",
+          "sha256": "af482f2cb4050e1a7a3e649441c93f27cdcd6227b92b6d98d8d139fd46fdbbd5",
+          "snapshot": "sha256:4feeb2015d3f72edcb85cecd7ae0347380260500963e8434ed0bd0213a735bd0",
+          "tree": "62fa4b66ecbc54259aa5fddafa635fa2509ec66b"
+        },
+        "compose_wall_ms": 1287
+      },
+      {
+        "candidate": {
+          "commit": "b6b6c21af31095f540be499e5c5c6dfc9bc7bd47",
+          "sha256": "af482f2cb4050e1a7a3e649441c93f27cdcd6227b92b6d98d8d139fd46fdbbd5",
+          "snapshot": "sha256:4feeb2015d3f72edcb85cecd7ae0347380260500963e8434ed0bd0213a735bd0",
+          "tree": "62fa4b66ecbc54259aa5fddafa635fa2509ec66b"
+        },
+        "compose_wall_ms": 353
+      },
+      {
+        "candidate": {
+          "commit": "b6b6c21af31095f540be499e5c5c6dfc9bc7bd47",
+          "sha256": "af482f2cb4050e1a7a3e649441c93f27cdcd6227b92b6d98d8d139fd46fdbbd5",
+          "snapshot": "sha256:4feeb2015d3f72edcb85cecd7ae0347380260500963e8434ed0bd0213a735bd0",
+          "tree": "62fa4b66ecbc54259aa5fddafa635fa2509ec66b"
+        },
+        "compose_wall_ms": 369
+      },
+      {
+        "candidate": {
+          "commit": "b6b6c21af31095f540be499e5c5c6dfc9bc7bd47",
+          "sha256": "af482f2cb4050e1a7a3e649441c93f27cdcd6227b92b6d98d8d139fd46fdbbd5",
+          "snapshot": "sha256:4feeb2015d3f72edcb85cecd7ae0347380260500963e8434ed0bd0213a735bd0",
+          "tree": "62fa4b66ecbc54259aa5fddafa635fa2509ec66b"
+        },
+        "compose_wall_ms": 388
+      }
+    ],
+    "retained_originals": [
+      {
+        "alias": "c1",
+        "role": "base",
+        "reconstructable": true,
+        "sha256": "0864a98f307a759ff144a2ef41e2bb7232fbdb503c49707ad4ac3bafe545ff79",
+        "snapshot": "sha256:6589f090de0402eb1b8535945d5a12380f8f4ef3fd80a5d3c14fd49d2c4effd2"
+      },
+      {
+        "alias": "c1",
+        "role": "result",
+        "reconstructable": true,
+        "sha256": "b0d8dd6f78198a2fa5795087acc8e0386294e7674e4ad567799ad771cef20fb3",
+        "snapshot": "sha256:e63346c9c50a9736dcc31f18b1341064ca67538909f4f6bb68d019ebdae0fead"
+      },
+      {
+        "alias": "c2",
+        "role": "base",
+        "reconstructable": true,
+        "sha256": "0864a98f307a759ff144a2ef41e2bb7232fbdb503c49707ad4ac3bafe545ff79",
+        "snapshot": "sha256:6589f090de0402eb1b8535945d5a12380f8f4ef3fd80a5d3c14fd49d2c4effd2"
+      },
+      {
+        "alias": "c2",
+        "role": "result",
+        "reconstructable": true,
+        "sha256": "83e41d3af49504c8e54a432e6544077bfb7052a97d7a723c4c5fdfced2c7b077",
+        "snapshot": "sha256:04ff1a46b5e162f877e1a52d00a815dfb2a8947cf363b1bf47e2cd9d3d8a5bdc"
+      }
+    ]
+  },
+  "license_inventory": "packages/aethyme-eval/e1/upstream-license-inventory.json",
+  "retained_artifacts": [
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-e1/frozen-input-inventory.json",
+      "sha256": "1cd945c0c645d65b081396f54354553bb067d7d8731fcb6489077f30a88d0295",
+      "bytes": 14795,
+      "role": "frozen FX01-FX07 public input inventory (55 inputs, frozen_before_structural_trials)"
+    },
+    {
+      "path": "packages/aethyme-eval/e1/oracle-controls-independent-freeze.json",
+      "sha256": "1f02836f345556208c5647f4ec11a815f9a9e5e2d7833e9fbf96bd8e1a4e5b9f",
+      "bytes": 1171,
+      "role": "independent browser-oracle calibration freeze"
+    },
+    {
+      "path": "packages/aethyme-eval/e1/original-observations/completed.json",
+      "sha256": "4a94c8c872720d9cdef25f061424225185d5c8f0ac32b452d74d5f46d874b0ba",
+      "bytes": 127317,
+      "role": "original FX01-FX07 campaign, 34 case/profile rows"
+    },
+    {
+      "path": "packages/aethyme-eval/e1/original-observations/admission-failure.json",
+      "sha256": "ebbed227e4295022d6644b8e60fb636a7bdf810b5344def673d6284582017983",
+      "bytes": 20561,
+      "role": "preceding executable-size admission failure (unrun schedule retained)"
+    },
+    {
+      "path": "packages/aethyme-eval/e1/browser-runtime-profile.json",
+      "sha256": "b72e16fc246cdafafaba649b9fe73502591ad1c0ac177029f0927141afdec252",
+      "bytes": 49312,
+      "role": "appointed browser runtime inventory"
+    },
+    {
+      "path": "packages/aethyme-eval/e1/browser-oracle.mjs",
+      "sha256": "7748f1da9351ce0b4485455488de07c74713323c47bcbdaac151b801794834a8",
+      "bytes": 10585,
+      "role": "independent browser observer"
+    },
+    {
+      "path": "packages/aethyme-eval/e1/browser-observations/report.json",
+      "sha256": "f1764a8d60b6697d986a27d57dd68a779c9ab8a2a1d121c30fafb0ed982b1854",
+      "bytes": 644185,
+      "role": "browser campaign, 168 observations / 27 verdicts"
+    },
+    {
+      "path": "packages/aethyme-eval/e1/synthesis-observations/completed/report.json",
+      "sha256": "61426ec8fc2f4a9770049dcba705b38db34ae97ddcb143abb9eaef7a47045abe",
+      "bytes": 92256,
+      "role": "FX04-browser genuine synthesis, consumer and subtraction"
+    },
+    {
+      "path": "packages/aethyme-eval/e1/synthesis-observations/completed/accounting.json",
+      "sha256": "057fe6e31d0d0a4730a9183356b6d3ab45dec4c9ade437eb7cf49f2f6f236506",
+      "bytes": 1104,
+      "role": "synthesis provider usage accounting"
+    },
+    {
+      "path": "packages/aethyme-eval/e1/sealed-runner.mjs",
+      "sha256": "fd905b0a65881a75bcdcbfdadb0479a290fd9602a42322055035400a2692e574",
+      "bytes": 2486,
+      "role": "sealed SH01 runner"
+    },
+    {
+      "path": "packages/aethyme-eval/e1/sealed-observations/completed/report.json",
+      "sha256": "5edc4ad7857554a5e783ccc5fb09bd7528d3555771185ae4b8616cbc3d5874f7",
+      "bytes": 68809,
+      "role": "independently sealed SH01 final variant"
+    },
+    {
+      "path": "packages/aethyme-eval/e1/upstream-license-inventory.json",
+      "sha256": "36c5e87920d6ec1ebc8c4998b4fbb4ff8248c6c10032052e2a354f9ab9ad18e6",
+      "bytes": 88200,
+      "role": "Mergiraf 0.19.1 upstream source and 202 locked package licenses"
+    }
+  ],
+  "limitations": [
+    "Structural support is qualified for the external HTML profile only; no other grammar or format is claimed.",
+    "Original FX04 (cross-file rename plus a handler still using the old id) is unsupported by composition. The composer candidate it produced is unverified and is routed to resolution, not counted as success.",
+    "The semantic positive (FX04-browser) passed through one bounded synthesized repair; it does not establish arbitrary semantic repair.",
+    "Inherited-base support is evidenced by the FX03 family only (FX03 s1/s2, FX03-browser); broader lineage such as external rebases is not claimed.",
+    "Original HX held-out variants were sealed and not rerun; SH01 is the single independently sealed final variant.",
+    "retained_playground paths inside the reports point under /private/tmp and no longer exist; this record cites commit, tree, snapshot and sha256 digests instead.",
+    "Exact campaign argv lines were not retained; committed entrypoints are listed under commands.",
+    "Invoiced provider cost and provider-side retries for the synthesis call are unknown.",
+    "Host OS and dynamic libraries were trusted, not sandboxed."
+  ],
+  "reviewer": "pending: maintainer"
+}

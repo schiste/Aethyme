@@ -1,6 +1,6 @@
 # E1 Local composition profile (#650)
 
-Last Updated: 2026-10-15
+Last Updated: 2026-11-03
 
 ## Ownership and sequencing
 
@@ -134,3 +134,95 @@ metadata with matching archive checksums. No license is unknown in that inventor
 It does not attest how the upstream release executable was built. The appointed
 GPL-3.0-only executable remains an external opt-in dependency, neither linked nor
 bundled by Aethyme.
+
+## Q1 evidence record and test mapping
+
+On 2026-11-03 the evidence above was reconciled into
+[`evidence/q1-composition-profile.json`](../../../../evidence/q1-composition-profile.json)
+([summary](../../../../evidence/q1-composition-profile.md)). That record lists
+source revisions, runtime profiles, the frozen input inventory, every report path
+with its SHA-256, per-row commit/tree/snapshot digests, entrypoints, costs,
+versions, mode and fallback, and limitations. Nothing was rerun to build it.
+Reviewer sign-off is pending the maintainer.
+
+| Test | Plan pass condition | Evidence | Result |
+|---|---|---|---|
+| T16 | FX01/FX02 through the selected engine preserve all fixture behavior | Original FX01 s1, FX02 s1 (Structural) and s2 (expected conflict); browser FX01/FX02-browser 12/12; sealed SH01 4/4 | Pass |
+| T17 | FX03: exact causal cases succeed without repeated edits; unknown bases refuse | Original FX03 s1/s2 candidates, s3 `unknown_base`; browser FX03-browser (14 runs), FX03-unknown refused | Pass |
+| T18 | Claimed-commutative permutations meet the equivalence oracle | Every declared order ran twice; one candidate snapshot per original row; browser `byte_identical` on every candidate verdict; SH01 one candidate across both orders | Pass |
+| T19 | FX05 without an authorized preference: no invented compromise | Original FX05 s1 `conflict` for both profiles; FX05-browser accepted for text and structural | Pass |
+| T22 | FX07 and a consumer of synthesis X: honest recomposition or explicit unsupported | Original FX07 s1 candidate, s2/s3 `inseparable_selection`; synthesis consumer 4/4, subtraction 2/2, keeping the consumer refused 2/2 | Pass |
+
+T20 and T21 (whole-candidate verification and atomic publication) belong to Q3
+and are not claimed here (#650 AC4).
+
+## Decision records D03–D06
+
+These follow plan §17.1. Each status is proposed by this reconciliation and takes
+effect when the maintainer signs off as reviewer.
+
+```yaml
+decision: D03
+status: accepted_with_evidence
+owner: "PO + QA"
+question: "What behavior must the concurrent fixture preserve, and who owns its independent oracle?"
+selected_option: "FX01-FX07 public inputs plus supplemental browser requirements, frozen before structural or resolver trials; independent private oracle"
+evidence:
+  - packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-e1/frozen-input-inventory.json  # status frozen_before_structural_trials
+  - packages/aethyme-eval/e1/oracle-controls-independent-freeze.json
+  - test original_e1_inputs_match_the_pretrial_inventory
+limitations:
+  - "HX held-out variants stayed sealed and were not rerun; SH01 is the single independently sealed final variant"
+reviewer: "pending: maintainer"
+reopen_on: ["fixture change", "advertised product claim change"]
+```
+
+```yaml
+decision: D04
+status: accepted_with_evidence
+owner: CO
+question: "Which composition algorithm, grammar, library mode, and license are supportable?"
+selected_option: "opt-in external Mergiraf 0.19.1 for HTML; text profile elsewhere; git-text-baseline stays default"
+evidence:
+  - evidence/q1-composition-profile.json  # original 16/17, browser 8/9, sealed SH01 4/4
+  - packages/aethyme-eval/e1/upstream-license-inventory.json  # 202 locked package licenses, none unknown
+limitations:
+  - "HTML only; no other grammar"
+  - "FX04: no composer passes. Original FX04 is routed to resolution (its text candidate is unverified); the FX04-browser positive comes from bounded synthesis (D06), not from the composer"
+  - "No separate formatting test beyond HTML parse, conflict-marker and byte-identity checks"
+  - "Does not attest how the upstream release executable was built"
+reviewer: "pending: maintainer"
+reopen_on: ["parser or Mergiraf upgrade", "new grammar or operation", "counterexample in a supported case"]
+```
+
+```yaml
+decision: D05
+status: accepted_with_evidence
+owner: CO
+question: "How are common and inherited bases normalized without replaying work or dropping edits?"
+selected_option: "common base and recorded causal chains only; fixed declared order; unknown ancestry refuses"
+evidence:
+  - "FX03 s1/s2 candidates, s3 unknown_base; FX03-browser 14 runs; FX03-unknown refused"
+  - "FX06 s4 dependency_cycle; FX06 s5/s6 competing_revisions; FX06 s2/s3 missing_input"
+  - "every declared order twice with byte-identity (T18)"
+limitations:
+  - "inherited-base evidence is the FX03 family only"
+  - "the cycle case is a prerequisite cycle (FX06 s4), not a lineage cycle"
+reviewer: "pending: maintainer"
+reopen_on: ["external rebases", "arbitrary branches", "broader lineage"]
+```
+
+```yaml
+decision: D06
+status: accepted_with_evidence
+owner: "CO + PO"
+question: "When can a contribution be excluded from a synthesized result?"
+selected_option: "recompose from retained originals; a synthesized group is indivisible while a dependent consumer remains"
+evidence:
+  - "FX07 s1 candidate; s2/s3 inseparable_selection"
+  - "FX04-browser synthesis: subtraction without consumer passed 2/2; keeping the consumer refused 2/2 (inseparable_selection); originals reconstructable"
+limitations:
+  - "one synthetic repair; arbitrary semantic repair is not established"
+reviewer: "pending: maintainer"
+reopen_on: ["cross-file extraction", "hotfix transfer", "downstream dependencies on synthesis"]
+```

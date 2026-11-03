@@ -1,10 +1,22 @@
-# Provisional composition fixtures (FX01–FX07)
+# E1 original composition fixtures (FX01–FX07)
 
-**Provisional.** These stand in for the E1 (#650) fixtures so L4 (#663–#665) can be
-built against concrete cases. E1's frozen requirements, oracle and evidence
-(`evidence/q1-composition-profile.json`) replace them. Nothing here is E1 evidence
-or a Q1 claim. Decision record:
+**Adopted as E1's original frozen inputs.** These fixtures were first added as a
+provisional stand-in so that L4 (#663–#665) could be built before E1 (#650) ran.
+E1 then froze them unchanged as its original FX01–FX07 inputs, before any
+structural trial. The inventory is
+[`../composition-e1/frozen-input-inventory.json`](../composition-e1/frozen-input-inventory.json):
+55 paths with SHA-256 digests, checked by
+`original_e1_inputs_match_the_pretrial_inventory`. The "provisional" label is
+superseded. The directory name and the `provisional-v0` schema string stay, because
+renaming either would change frozen paths or digests.
+
+The Q1 evidence record is
+[`evidence/q1-composition-profile.json`](../../../../../../../evidence/q1-composition-profile.json).
+History of the provisional profile:
 `packages/aethyme/docs/architecture/local-v3-l4-provisional-fixtures.md`.
+
+**Do not edit any input file.** A changed input breaks the freeze. Any new fixture
+belongs in its own reviewed, separately frozen set.
 
 The source is synthetic and public: tiny HTML pages and a small TypeScript surface.
 These are unit fixtures, materialized into temporary Git repositories. They are not an
