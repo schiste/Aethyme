@@ -479,6 +479,42 @@ fn sparse_gate_checkout_refuses_cached_and_uncached_cli_runs() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn gate_cli_waits_for_transient_checkout_lifecycle_claim() {
+    let tmp = fixture();
+    let runtime = tmp.path().join(".aethyme/run");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let claim = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(runtime.join("worktree-lifecycle.lock"))
+        .unwrap();
+    claim.lock().unwrap();
+    let mut child = common::broker_cli_for_fixture(
+        CLI,
+        &["advanced", "gates", "run", "--all", "--no-cache"],
+        tmp.path(),
+    )
+    .current_dir(tmp.path())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let early = child.try_wait().unwrap();
+    drop(claim);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        early.is_none(),
+        "gate exited before the claim was released: {output:?}"
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(run_count(&tmp.path().join("gate-runs.txt")), 1);
+}
+
 #[test]
 fn gate_cli_reports_tree_provenance_for_executed_and_cached_results() {
     let tmp = fixture();

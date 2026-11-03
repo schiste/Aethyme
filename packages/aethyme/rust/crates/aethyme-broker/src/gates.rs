@@ -2895,6 +2895,7 @@ fn begin_gate_artifact_use(
     main_root: &Path,
     checkout: &GitRepo,
     session_id: Option<i64>,
+    deadline: Option<Instant>,
 ) -> Result<GateArtifactUseGuard, crate::broker::BrokerOpError> {
     // Unsupported targets keep their established gate behavior. The matching
     // reclaimer returns ProtocolUnavailable there, so no automatic deletion
@@ -2937,18 +2938,38 @@ fn begin_gate_artifact_use(
         .into());
     }
 
-    let lifecycle_claim = crate::file_lock::try_acquire_repository_lifecycle_lock(&canonical_main)
-        .map_err(|source| crate::BrokerError::Io {
-            path: canonical_main.join(".aethyme/run/worktree-lifecycle.lock"),
-            source,
-        })?
-        .ok_or_else(|| crate::BrokerError::Io {
+    // Gate producers share this short claim with checkout retirement. Wait for
+    // transient producers, but never past the caller's bounded gate window.
+    let wait = deadline
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or(Duration::from_secs(10))
+        .min(Duration::from_secs(10));
+    if wait.is_zero() {
+        return Err(crate::BrokerError::Io {
             path: canonical_main.join(".aethyme/run/worktree-lifecycle.lock"),
             source: std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
-                "a checkout lifecycle operation is in progress; retry gate admission",
+                "gate admission deadline exhausted",
             ),
-        })?;
+        }
+        .into());
+    }
+    let lifecycle_claim =
+        crate::file_lock::acquire_repository_lifecycle_lock_with_wait(&canonical_main, wait)
+            .map_err(|source| crate::BrokerError::Io {
+                path: canonical_main.join(".aethyme/run/worktree-lifecycle.lock"),
+                source,
+            })?;
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(crate::BrokerError::Io {
+            path: canonical_main.join(".aethyme/run/worktree-lifecycle.lock"),
+            source: std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "gate admission deadline exhausted",
+            ),
+        }
+        .into());
+    }
     store.require_live_schema_compatible()?;
 
     let checkout_root =
@@ -3104,7 +3125,11 @@ where
     let progress = runtime.progress;
     let admission_host = runtime.admission_host;
     let mut invocation_artifact_use = Some(begin_gate_artifact_use(
-        store, main_root, checkout, session_id,
+        store,
+        main_root,
+        checkout,
+        session_id,
+        runtime.deadline,
     )?);
     invocation_artifact_use
         .as_mut()
@@ -3160,7 +3185,13 @@ where
         if gate.cache && execution_profile.is_none() {
             let mut profile_guard = match artifact_use.take() {
                 Some(profile_guard) => profile_guard,
-                None => begin_gate_artifact_use(store, main_root, checkout, session_id)?,
+                None => begin_gate_artifact_use(
+                    store,
+                    main_root,
+                    checkout,
+                    session_id,
+                    runtime.deadline,
+                )?,
             };
             // Profile capture runs repository-selected binaries before the
             // cache lookup. Retain the durable pre-dispatch marker unless the
@@ -3289,7 +3320,9 @@ where
         // admission, all before any gate-owned path is created.
         let mut artifact_use = match artifact_use {
             Some(artifact_use) => artifact_use,
-            None => begin_gate_artifact_use(store, main_root, checkout, session_id)?,
+            None => {
+                begin_gate_artifact_use(store, main_root, checkout, session_id, runtime.deadline)?
+            }
         };
 
         // Check every volume this run will write before making run/log
@@ -5494,6 +5527,77 @@ mod tests {
             assert!(error.to_string().contains("file.txt"), "{error}");
             assert!(!checkout_root.join("should-not-run").exists());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gate_artifact_admission_waits_for_a_transient_lifecycle_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        init_repo(&checkout_root);
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        let store = BrokerStore::open(&root.path().join("broker.db")).unwrap();
+        let claim = crate::file_lock::acquire_repository_lifecycle_lock(&checkout_root).unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                drop(claim);
+            });
+            let guard = begin_gate_artifact_use(&store, &checkout_root, &checkout, None, None)
+                .expect("gate admission should wait for the short claim");
+            drop(guard);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gate_artifact_admission_respects_an_expired_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        init_repo(&checkout_root);
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        let store = BrokerStore::open(&root.path().join("broker.db")).unwrap();
+        let claim = crate::file_lock::acquire_repository_lifecycle_lock(&checkout_root).unwrap();
+        let error = match begin_gate_artifact_use(
+            &store,
+            &checkout_root,
+            &checkout,
+            None,
+            Some(Instant::now()),
+        ) {
+            Ok(_) => panic!("expired deadline must not admit a gate"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("gate admission deadline exhausted"),
+            "{error}"
+        );
+        drop(claim);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gate_artifact_admission_does_not_wait_past_a_live_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        init_repo(&checkout_root);
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        let store = BrokerStore::open(&root.path().join("broker.db")).unwrap();
+        let claim = crate::file_lock::acquire_repository_lifecycle_lock(&checkout_root).unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(500));
+                drop(claim);
+            });
+            let deadline = Instant::now() + Duration::from_millis(100);
+            assert!(
+                begin_gate_artifact_use(&store, &checkout_root, &checkout, None, Some(deadline))
+                    .is_err(),
+                "a later lock release must not turn an expired admission into success"
+            );
+        });
     }
 
     #[test]
