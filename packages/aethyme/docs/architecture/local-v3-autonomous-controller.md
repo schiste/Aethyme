@@ -1,10 +1,14 @@
 # Appointed autonomous Local controller
 
-Last Updated: 2026-10-15
+Last Updated: 2026-11-03
 
 The experimental Local controller drives a finite appointment through retained
-composition, native gates, Docker build, independent artifact verification,
-private GenericGit acceptance and proof-bound completion. The actual two-wave
+composition, optional native gates, Docker build, independent artifact
+verification, private GenericGit acceptance and proof-bound completion. Native
+gates are off unless the drive policy sets `native_gates = "required"`, because
+they run candidate code with host authority; see
+"Off by default for the controller" in [native gates](local-v3-native-gates.md).
+The runs below predate that default and used `required`. The actual two-wave
 profile passed locally. Its [qualification ledger](local-v3-qualification/controller-2026-10-15/ledger.json)
 retains the successful run, the earlier failed scheduling attempt and two
 intentional guard failures. A separate controlled FX17 run accepted twenty
@@ -46,9 +50,10 @@ prepared state atomically.
 
 The driver checks cancellation, deadline, epoch and revision between stages and
 at completion. Native gate observations cannot supply independent verifier or
-provider authority. A policy with no native commands requires explicit
-`allow_empty_native_gates`; artifact verification and fresh provider acceptance
-remain mandatory.
+provider authority. With `native_gates = "off"` (the default) the frozen native job is released before
+dispatch and no native command runs. Under `required`, a policy with no native
+commands also needs explicit `allow_empty_native_gates`. In both modes, artifact
+verification and fresh provider acceptance remain mandatory.
 
 Only a fresh publication dispatch with status `Succeeded` can continue. Failed,
 prepared, running, ambiguous and reconciled historical outcomes hold for explicit

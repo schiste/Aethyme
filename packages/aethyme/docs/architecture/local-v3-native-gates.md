@@ -1,6 +1,6 @@
 # Local composed candidates at the native gate boundary
 
-Last Updated: 2026-10-15
+Last Updated: 2026-11-03
 
 `aethyme.native-local-gates/experimental-v1` prepares a durable native job for
 the current Local wave and invokes the existing broker gate executor on its
@@ -22,6 +22,38 @@ fsmonitor. Attribute-bearing trees require a separately appointed Git profile.
 Placement inside an enclosing repository or project manifest is refused. Gate
 commands run with native host authority after explicit baseline policy trust;
 this profile is not a command sandbox.
+
+## Off by default for the controller (#671)
+
+Gate commands execute candidate-controlled code: build scripts, tests and
+binaries built from the candidate tree. Under this profile that code inherits
+the operator's environment and credentials, filesystem and network. Wall-clock
+time is its only resource limit, and it is tracked by process group, so a child
+that leaves the group is not followed. That is the reason native retention
+reports `unknown_held`. The confined boundary is the
+[Docker build and independent verifier](local-v3-l6-supervisor.md), which
+withhold credentials, network and sockets.
+
+The appointed controller therefore treats native gates as opt-in. Its drive
+policy field `native_gates` is `off` unless the operator sets `required`, and a
+policy file without the field means `off`:
+
+- **`off`:** the controller still freezes the native job, so the exact base and
+  candidate are recorded, then abandons it before dispatch with the existing
+  root release. A released prepared job can never be dispatched, so this stage
+  runs no candidate code on the host. The Docker build and the verifier still
+  gate acceptance, unchanged.
+- **`required`:** the earlier behavior. Native gates run with host authority,
+  and a failure holds the wave. Choose this only when every contributor whose
+  code reaches the candidate is trusted with the operator's host authority.
+
+The change applies only to the Local controller's drive policy. The legacy
+broker submit and merge gates share the same runner and keep native host
+authority: their threat model is cooperating agents that already hold it.
+Confining native gate execution itself (environment allowlist, temporary
+`HOME`, resource limits, a macOS sandbox profile) is not part of this change.
+On macOS it could only be best-effort, so it would not support a
+"no credential access" claim.
 
 The profile admits at most 32 gates, each with a 1–60 second timeout, resource
 admission wait of at most 60 seconds, and no managed cache. A 300-second gate
