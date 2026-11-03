@@ -341,6 +341,8 @@ fn assess_pr_merge(tokens: &[&str]) -> Verdict {
 /// accepts follow. None of these can create, move or delete a git ref.
 const SAFE_WRITE_ENDPOINTS: &[(&[&str], &[&str])] = &[
     (&["issues", "N", "comments"], &["POST"]),
+    (&["issues", "N", "sub_issues"], &["POST"]),
+    (&["issues", "N", "sub_issue"], &["DELETE"]),
     (&["issues", "comments", "N"], &["PATCH", "DELETE"]),
     (&["pulls", "N", "comments"], &["POST"]),
     (&["pulls", "N", "comments", "N", "replies"], &["POST"]),
@@ -421,6 +423,14 @@ fn is_safe_write(tokens: &[&str], repository: &str) -> bool {
     if !methods.contains(&method) {
         return false;
     }
+    // Sub-issue mutations carry exactly one numeric database ID. Do not allow
+    // arbitrary request fields or replace_parent, which can move a child.
+    if *pattern == ["issues", "N", "sub_issues"] || *pattern == ["issues", "N", "sub_issue"] {
+        return matches!(fields.as_slice(), [("-F", field)]
+            if field.strip_prefix("sub_issue_id=")
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|id| id > 0));
+    }
     let issue_patch = *pattern == ["issues", "N"];
     fields.iter().all(|(flag, field)| {
         let Some((key, value)) = field.split_once('=') else {
@@ -434,6 +444,38 @@ fn is_safe_write(tokens: &[&str], repository: &str) -> bool {
         let plain_value = !(*flag == "-F" && value.starts_with('@'));
         plain_key && plain_value && (!issue_patch || ISSUE_PATCH_FIELDS.contains(&key))
     })
+}
+
+/// Only exact, issue-only sub-issue requests can use the issue relationship
+/// lock. The repository-specific guard still verifies the target before execution.
+pub(crate) fn is_sub_issue_write(args: &[String]) -> bool {
+    let [api, flag, method, endpoint, field_flag, field] = args else {
+        return false;
+    };
+    if api != "api" || flag != "-X" || field_flag != "-F" {
+        return false;
+    }
+    let parts: Vec<&str> = endpoint.split('/').collect();
+    let ["repos", owner, repo, "issues", _, resource] = parts.as_slice() else {
+        return false;
+    };
+    if owner.is_empty()
+        || repo.is_empty()
+        || !matches!(
+            (method.as_str(), *resource),
+            ("POST", "sub_issues") | ("DELETE", "sub_issue")
+        )
+    {
+        return false;
+    }
+    is_safe_write(
+        &[flag, method, endpoint, field_flag, field],
+        &format!("{owner}/{repo}"),
+    )
+}
+
+pub(crate) fn is_sub_issue_removal(args: &[String]) -> bool {
+    is_sub_issue_write(args) && args.get(2).is_some_and(|method| method == "DELETE")
 }
 
 /// The only GraphQL mutations Aethyme supports for review-thread conversations.
@@ -644,6 +686,96 @@ fn branch_ref_path(path: &str, repository: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_sub_issue_mutations_are_exact_and_cannot_write_refs() {
+        let classify = |parts: &[&str]| {
+            crate::classify_gh(&parts.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            classify(&[
+                "api",
+                "-X",
+                "DELETE",
+                "repos/o/n/issues/12/sub_issue",
+                "-F",
+                "sub_issue_id=345"
+            ]),
+            Some(crate::OperationEffect::Write)
+        );
+        assert_eq!(
+            classify(&["api", "-X", "DELETE", "repos/o/n/git/refs/heads/main"]),
+            Some(crate::OperationEffect::Destructive)
+        );
+        assert_eq!(
+            classify(&[
+                "api",
+                "-X",
+                "DELETE",
+                "repos/o/n/issues/12/sub_issue",
+                "-F",
+                "sub_issue_id=345",
+                "-F",
+                "replace_parent=true"
+            ]),
+            Some(crate::OperationEffect::Destructive)
+        );
+        for (method, endpoint) in [
+            ("POST", "repos/o/n/issues/12/sub_issues"),
+            ("DELETE", "repos/o/n/issues/12/sub_issue"),
+        ] {
+            assert_eq!(
+                assess_line(&["api", "-X", method, endpoint, "-F", "sub_issue_id=345"]),
+                Verdict::SafeWrite
+            );
+            for field in [
+                "sub_issue_id=0",
+                "sub_issue_id=-1",
+                "sub_issue_id=@file",
+                "other=345",
+            ] {
+                assert!(matches!(
+                    assess_line(&["api", "-X", method, endpoint, "-F", field]),
+                    Verdict::Unverifiable(_)
+                ));
+            }
+            assert!(matches!(
+                assess_line(&[
+                    "api",
+                    "-X",
+                    method,
+                    endpoint,
+                    "-F",
+                    "sub_issue_id=345",
+                    "-F",
+                    "replace_parent=true"
+                ]),
+                Verdict::Unverifiable(_)
+            ));
+        }
+        assert!(matches!(
+            assess_line(&[
+                "api",
+                "-X",
+                "POST",
+                "repos/other/n/issues/12/sub_issues",
+                "-F",
+                "sub_issue_id=345"
+            ]),
+            Verdict::Unverifiable(_)
+        ));
+        assert!(matches!(
+            assess_line(&[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/n/git/refs/heads/main",
+                "-F",
+                "sub_issue_id=345"
+            ]),
+            Verdict::Unverifiable(_)
+        ));
+    }
 
     fn assess_line(line: &[&str]) -> Verdict {
         assess(
