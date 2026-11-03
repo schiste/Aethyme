@@ -154,3 +154,184 @@ depends_on = ["epic"]
     assert!(!calls.contains("-X POST"), "{calls}");
     assert!(!calls.contains("-X DELETE"), "{calls}");
 }
+
+#[test]
+fn creates_and_reapplies_a_complete_set_without_duplicates() {
+    let repo = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let remote = tempfile::tempdir().unwrap();
+    let gh = bin.path().join("gh");
+    std::fs::write(&gh, r##"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$AETHYME_FAKE_GH_LOG"
+root="$AETHYME_FAKE_GH_STATE"
+issue_json() {
+    n="$1"
+    body=$(awk '{printf "%s\\n", $0}' "$root/body$n")
+    title=$(cat "$root/title$n")
+    printf '{"number":%s,"id":%s,"body":"%s","title":"%s","labels":[]}' "$n" "$((1000+n))" "$body" "$title"
+}
+case "$*" in
+  'api --hostname github.com repos/owner/repo/commits?per_page=1') printf '[{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]\n' ;;
+  'api --hostname github.com -H Accept: application/vnd.github.raw+json repos/owner/repo/contents/.aethyme/config.toml?ref=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa') printf '[issue_workflows]\nissue_sets = "allow"\n' ;;
+  'api --hostname github.com repos/owner/repo/labels?per_page=100&page=1') printf '[]\n' ;;
+  'api --hostname github.com repos/owner/repo/issues?state=all&per_page=100&page=1')
+    printf '['
+    if [ -f "$root/body1" ]; then issue_json 1; fi
+    if [ -f "$root/body2" ]; then printf ','; issue_json 2; fi
+    printf ']\n' ;;
+  'api --hostname github.com repos/owner/repo/issues/1') issue_json 1; printf '\n' ;;
+  'api --hostname github.com repos/owner/repo/issues/2') issue_json 2; printf '\n' ;;
+  'api --hostname github.com repos/owner/repo/issues/1/sub_issues?per_page=100&page=1')
+    if [ -f "$root/sub" ]; then printf '[{"id":1002}]\n'; else printf '[]\n'; fi ;;
+  'api --hostname github.com repos/owner/repo/issues/2/dependencies/blocked_by?per_page=100&page=1')
+    if [ -f "$root/dependency" ]; then printf '[{"id":1001}]\n'; else printf '[]\n'; fi ;;
+  'api -X POST repos/owner/repo/issues/1/sub_issues -F sub_issue_id=1002') : > "$root/sub"; printf '{}\n' ;;
+  'api -X POST repos/owner/repo/issues/2/dependencies/blocked_by -F issue_id=1001') : > "$root/dependency"; printf '{}\n' ;;
+  'issue create '*)
+    n=1; if [ -f "$root/body1" ]; then n=2; fi
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --title) printf '%s' "$2" > "$root/title$n"; shift 2 ;;
+        --body-file) cp "$2" "$root/body$n"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    printf 'https://github.com/owner/repo/issues/%s\n' "$n" ;;
+  'issue edit '*)
+    n="$3"
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --title) printf '%s' "$2" > "$root/title$n"; shift 2 ;;
+        --body-file) cp "$2" "$root/body$n"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    printf 'https://github.com/owner/repo/issues/%s\n' "$n" ;;
+  *) printf 'unexpected fake gh command: %s\n' "$*" >&2; exit 1 ;;
+esac
+"##).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    git(repo.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.path().join(".gitignore"), "/.aethyme/\n").unwrap();
+    std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
+    git(repo.path(), &["add", ".gitignore", "a.txt"]);
+    git(repo.path(), &["commit", "-qm", "init"]);
+    let log = repo.path().join("gh-log");
+    let run = |args: &[&str]| -> Output {
+        common::broker_cli(CLI, args)
+            .current_dir(repo.path())
+            .env("AETHYME_HOST_STATE_DIR", state.path())
+            .env("AETHYME_FAKE_GH_LOG", &log)
+            .env("AETHYME_FAKE_GH_STATE", remote.path())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .unwrap()
+    };
+    let started = run(&["start", "--task", "test issue set", "--json"]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    git(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ],
+    );
+    let session = value["session"]["id"]
+        .as_i64()
+        .or_else(|| value["id"].as_i64())
+        .unwrap()
+        .to_string();
+    std::fs::write(repo.path().join("epic.md"), "Child {{child}}").unwrap();
+    std::fs::write(repo.path().join("child.md"), "Parent {{epic}}").unwrap();
+    std::fs::write(
+        repo.path().join("set.toml"),
+        r#"set_id = "sample"
+[parent]
+key = "epic"
+title = "Epic"
+body_file = "epic.md"
+[[issues]]
+key = "child"
+title = "Child"
+body_file = "child.md"
+depends_on = ["epic"]
+"#,
+    )
+    .unwrap();
+    let args = [
+        "advanced",
+        "issues",
+        "apply",
+        "set.toml",
+        "--session",
+        &session,
+        "--repo",
+        "owner/repo",
+        "--reason",
+        "test authorized set",
+        "--json",
+    ];
+    for _ in 0..2 {
+        let result = run(&args);
+        assert!(
+            result.status.success(),
+            "stdout: {} stderr: {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(receipt["epic"], 1);
+        assert_eq!(receipt["child"], 2);
+    }
+    assert!(
+        std::fs::read_to_string(remote.path().join("body1"))
+            .unwrap()
+            .contains("Child #2")
+    );
+    assert!(
+        std::fs::read_to_string(remote.path().join("body2"))
+            .unwrap()
+            .contains("Parent #1")
+    );
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("issue create "))
+            .count(),
+        2,
+        "{calls}"
+    );
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("issue edit "))
+            .count(),
+        2,
+        "{calls}"
+    );
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("api -X POST "))
+            .count(),
+        2,
+        "{calls}"
+    );
+}
