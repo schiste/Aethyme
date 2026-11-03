@@ -253,8 +253,6 @@ impl IssueSetBackend for GithubIssueSet<'_> {
         let mut args = vec![
             "issue".into(),
             "create".into(),
-            "--repo".into(),
-            self.repository.clone(),
             "--title".into(),
             entry.title.clone(),
             "--body-file".into(),
@@ -324,8 +322,6 @@ impl IssueSetBackend for GithubIssueSet<'_> {
             "issue".into(),
             "edit".into(),
             number.to_string(),
-            "--repo".into(),
-            self.repository.clone(),
             "--title".into(),
             entry.title.clone(),
             "--body-file".into(),
