@@ -261,6 +261,7 @@ pub(super) fn inspect_with(
 
     if query.is_empty() {
         result.complete = incomplete_reason.is_none();
+        result.truncated = !result.complete;
         result.incomplete_reason = incomplete_reason;
         result.elapsed_ms = started.elapsed().as_millis() as u64;
         return result;
@@ -286,6 +287,10 @@ pub(super) fn inspect_with(
         match scan {
             Scan::Searched(file) => files.push(*file),
             Scan::Skipped => result.skipped_files += 1,
+            Scan::Unavailable => {
+                result.skipped_files += 1;
+                incomplete_reason.get_or_insert("source_unavailable");
+            }
             Scan::OutOfBudget => budget_skipped = true,
         }
     }
@@ -388,6 +393,7 @@ fn git_listing(root: &Path, deadline: Instant) -> GitListing {
     let Ok(mut child) = Command::new("git")
         .args([
             "ls-files",
+            "-t",
             "--cached",
             "--others",
             "--exclude-standard",
@@ -438,12 +444,30 @@ fn git_listing(root: &Path, deadline: Instant) -> GitListing {
     {
         return GitListing::NotARepository;
     }
-    let mut paths = bytes
+    let mut paths = Vec::new();
+    for entry in bytes
         .split(|byte| *byte == 0)
-        .filter_map(|entry| std::str::from_utf8(entry).ok())
-        .filter(|path| visible(path))
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+        .filter(|entry| !entry.is_empty())
+    {
+        if entry.len() < 3 || entry[1] != b' ' {
+            incomplete_reason.get_or_insert("listing_malformed");
+            continue;
+        }
+        let Ok(path) = std::str::from_utf8(&entry[2..]) else {
+            incomplete_reason.get_or_insert("unrepresentable_path");
+            continue;
+        };
+        if !visible(path) {
+            continue;
+        }
+        if entry[0] == b'S' {
+            // The index still lists sparse-omitted files even though their
+            // content cannot be scanned in this checkout. Preserve the cache
+            // and withdraw complete-search claims, including empty queries.
+            incomplete_reason.get_or_insert("sparse_checkout");
+        }
+        paths.push(path.to_string());
+    }
     paths.sort();
     paths.dedup();
     GitListing::Listed(paths, incomplete_reason)
@@ -493,6 +517,7 @@ fn walk(root: &Path, dir: &Path, deadline: Instant, out: &mut Vec<String>) -> bo
 enum Scan {
     Searched(Box<ScannedFile>),
     Skipped,
+    Unavailable,
     OutOfBudget,
 }
 
@@ -530,13 +555,13 @@ fn scan_file(
     let full = root.join(path);
     // symlink_metadata: a symlink is never followed out of the repository.
     let Ok(metadata) = full.symlink_metadata() else {
-        return Scan::Skipped;
+        return Scan::Unavailable;
     };
     if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
         return Scan::Skipped;
     }
     let Ok(bytes) = std::fs::read(&full) else {
-        return Scan::Skipped;
+        return Scan::Unavailable;
     };
     if bytes[..bytes.len().min(8_192)].contains(&0) {
         return Scan::Skipped;
