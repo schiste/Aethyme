@@ -1,12 +1,18 @@
 # Local v3 — L4 provisional composition fixtures (#664)
 
-Last Updated: 2026-10-15
+Last Updated: 2026-11-03
 
 > Historical checkpoint: the implementation and pending-work statements below
 > describe the original provisional profile. Current bounded E1, FX08, native-gate
 > and appointed-controller results are recorded in the
 > [Local qualification ledger](local-v3-qualification.md). Each original fixture
 > and profile keeps its own evidence and limits.
+>
+> **Superseded as "provisional" (2026-11-03).** E1 adopted these fixture inputs
+> unchanged as its original frozen inputs; see [Replacement](#replacement). The Q1
+> record is
+> [`evidence/q1-composition-profile.json`](../../../../evidence/q1-composition-profile.json)
+> and D03–D06 are recorded in [the E1 profile](local-v3-e1-profile.md).
 
 
 L4 (#663–#665) depends on E1 (#650), which selects the composition profile and freezes
@@ -175,6 +181,24 @@ fixes each finding, and the attacks are ported as must-reject unit tests:
 
 ## Replacement
 
-When E1 lands, its fixtures, requirements and evidence replace this directory. The
-public API can stay if E1's oracle fits behind it. Otherwise composer tests switch to
-E1's oracle, and this provisional set is deleted rather than kept beside it.
+The plan here was that, when E1 landed, its fixtures, requirements and evidence
+would replace this directory, and the provisional set would be deleted rather than
+kept beside it.
+
+**What happened instead (recorded 2026-11-03).** E1 did not author a separate set.
+It froze this directory's inputs unchanged as its original FX01–FX07 inputs before
+any structural trial. The inventory is
+`crates/aethyme-testkit/fixtures/composition-e1/frozen-input-inventory.json`
+(55 paths with SHA-256), checked by
+`original_e1_inputs_match_the_pretrial_inventory`. E1's supplemental browser and
+sealed fixtures sit beside it under `fixtures/composition-e1/`. Deleting or renaming
+this directory would therefore break E1's freeze, so it stays. Its "provisional"
+label and the `provisional-v0` schema string are historical names, not a status.
+The public API and oracle stayed in place.
+
+The evidence record is
+[`evidence/q1-composition-profile.json`](../../../../evidence/q1-composition-profile.json).
+D03–D06 records are in [the E1 profile](local-v3-e1-profile.md) under "Decision records D03–D06".
+The statements above that these fixtures "do not close D04–D06" and "claim none of
+T16–T23" describe the provisional checkpoint. The E1 record now maps T16–T19 and T22
+for the selected profile; T20, T21 and T23 are not claimed there.
