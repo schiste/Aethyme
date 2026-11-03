@@ -45,15 +45,18 @@ fn save(path: &Path, journal: &Journal) -> Result<(), String> {
     Ok(())
 }
 
-/// The caller must have checked the target repository's trusted policy before
-/// constructing a backend. An unknown create is never repeated without first
-/// finding its exact marker; an absent marker leaves the set blocked.
-pub(crate) fn apply(
+fn open_journal(
     manifest: &ValidatedManifest,
     run_dir: &Path,
     repository: &str,
-    backend: &mut dyn IssueSetBackend,
-) -> Result<BTreeMap<String, u64>, String> {
+) -> Result<
+    (
+        Journal,
+        std::path::PathBuf,
+        crate::file_lock::ExclusiveFileLock,
+    ),
+    String,
+> {
     let parts: Vec<_> = repository.split('/').collect();
     if parts.len() != 2
         || parts.iter().any(|part| {
@@ -81,9 +84,9 @@ pub(crate) fn apply(
         .write(true)
         .open(&lock_path)
         .map_err(|e| format!("cannot open issue-set lock: {e}"))?;
-    let _lock = crate::file_lock::ExclusiveFileLock::acquire(file)
+    let lock = crate::file_lock::ExclusiveFileLock::acquire(file)
         .map_err(|e| format!("cannot lock issue set: {e}"))?;
-    let mut journal: Journal = match std::fs::read(&journal_path) {
+    let journal: Journal = match std::fs::read(&journal_path) {
         Ok(bytes) => {
             serde_json::from_slice(&bytes).map_err(|e| format!("invalid issue-set journal: {e}"))?
         }
@@ -97,6 +100,14 @@ pub(crate) fn apply(
     if journal.repository != repository || journal.set_id != manifest.manifest.set_id {
         return Err("issue-set journal target does not match the requested set".into());
     }
+    Ok((journal, journal_path, lock))
+}
+
+fn resolve_existing(
+    manifest: &ValidatedManifest,
+    journal: &mut Journal,
+    backend: &mut dyn IssueSetBackend,
+) -> Result<(), String> {
     let entries: BTreeMap<_, _> = std::iter::once(&manifest.manifest.parent)
         .chain(&manifest.manifest.issues)
         .map(|entry| (entry.key.clone(), entry))
@@ -144,6 +155,42 @@ pub(crate) fn apply(
     {
         return Err("multiple issue-set keys refer to the same GitHub issue".into());
     }
+    Ok(())
+}
+
+/// Plan using the same locked journal and recovery checks as apply. This never
+/// writes GitHub or changes the journal, including for uncertain creates.
+pub(crate) fn plan(
+    manifest: &ValidatedManifest,
+    run_dir: &Path,
+    repository: &str,
+    backend: &mut dyn IssueSetBackend,
+) -> Result<BTreeMap<String, Option<u64>>, String> {
+    let (mut journal, _path, _lock) = open_journal(manifest, run_dir, repository)?;
+    resolve_existing(manifest, &mut journal, backend)?;
+    Ok(manifest
+        .order
+        .iter()
+        .map(|key| (key.clone(), journal.numbers.get(key).copied()))
+        .collect())
+}
+
+/// The caller must have checked the target repository's trusted policy before
+/// constructing a backend. An unknown create is never repeated without first
+/// finding its exact marker; an absent marker leaves the set blocked.
+pub(crate) fn apply(
+    manifest: &ValidatedManifest,
+    run_dir: &Path,
+    repository: &str,
+    backend: &mut dyn IssueSetBackend,
+) -> Result<BTreeMap<String, u64>, String> {
+    let (mut journal, journal_path, _lock) = open_journal(manifest, run_dir, repository)?;
+    resolve_existing(manifest, &mut journal, backend)?;
+    let entries: BTreeMap<_, _> = std::iter::once(&manifest.manifest.parent)
+        .chain(&manifest.manifest.issues)
+        .map(|entry| (entry.key.clone(), entry))
+        .collect();
+    let mut allocated: BTreeSet<u64> = journal.numbers.values().copied().collect();
     save(&journal_path, &journal)?;
     for key in &manifest.order {
         if journal.numbers.contains_key(key) {
@@ -156,8 +203,10 @@ pub(crate) fn apply(
         journal.pending.insert(key.clone());
         save(&journal_path, &journal)?;
         let number = backend.create(entries[key], &marker)?;
-        if number == 0 {
-            return Err(format!("create for {key} returned an invalid issue number"));
+        if number == 0 || !allocated.insert(number) {
+            return Err(format!(
+                "create for {key} returned an invalid or duplicate issue number"
+            ));
         }
         journal.numbers.insert(key.clone(), number);
         journal.pending.remove(key);
@@ -291,6 +340,22 @@ depends_on = ["epic"]
         assert_eq!(backend.create_calls, 2);
     }
     #[test]
+    fn plan_is_read_only_and_matches_apply_recovery_state() {
+        let (dir, manifest) = fixture();
+        let mut backend = Fake::default();
+        let planned = plan(&manifest, dir.path(), "owner/repo", &mut backend).unwrap();
+        assert_eq!(
+            planned.values().filter(|number| number.is_none()).count(),
+            2
+        );
+        assert_eq!(backend.create_calls, 0);
+        let numbers = apply(&manifest, dir.path(), "owner/repo", &mut backend).unwrap();
+        let planned = plan(&manifest, dir.path(), "owner/repo", &mut backend).unwrap();
+        assert_eq!(planned["epic"], Some(numbers["epic"]));
+        assert_eq!(planned["child"], Some(numbers["child"]));
+        assert_eq!(backend.create_calls, 2);
+    }
+    #[test]
     fn interrupted_create_is_adopted_when_marker_is_found() {
         let (dir, manifest) = fixture();
         let mut backend = Fake {
@@ -311,6 +376,8 @@ depends_on = ["epic"]
         };
         assert!(apply(&manifest, dir.path(), "owner/repo", &mut backend).is_err());
         backend.issues.clear();
+        let error = plan(&manifest, dir.path(), "owner/repo", &mut backend).unwrap_err();
+        assert!(error.contains("unknown outcome"));
         let error = apply(&manifest, dir.path(), "owner/repo", &mut backend).unwrap_err();
         assert!(error.contains("unknown outcome"));
         assert_eq!(backend.create_calls, 1);

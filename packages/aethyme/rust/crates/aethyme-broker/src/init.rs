@@ -587,6 +587,7 @@ pub const CONFIG_SCHEMA_VERSION: i64 = 1;
 const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("promote", &["mode", "branch"]),
     ("delivery", &["default", "push_session_branches"]),
+    ("issue_workflows", &["issue_sets"]),
     (
         "automation",
         &[
@@ -1263,6 +1264,7 @@ const CONFIG_TEMPLATE: &str = "\
 #   [promote] branch  integration branch name
 #   [delivery] default \"pull_request\" | \"local_main_merge\"
 #   [delivery] push_session_branches  true | false (default false; authorizes `broker push`)
+#   [issue_workflows] issue_sets  \"allow\" | \"deny\" (default deny)
 #   [broker.pr] open_as  \"draft\" | \"ready\" (default draft for new PRs)
 #   [leases]  ignore  paths never leased (trailing / = directory prefix)
 #   [leases.routing] category = [\"path/\", \"exact/file\"]
@@ -1977,6 +1979,15 @@ mod config_key_tests {
         assert_eq!(
             unknown("[delivery]\npush_everything = true\n"),
             ["delivery.push_everything"]
+        );
+    }
+
+    #[test]
+    fn issue_sets_policy_is_a_known_key() {
+        assert!(unknown("[issue_workflows]\nissue_sets = \"allow\"\n").is_empty());
+        assert_eq!(
+            unknown("[issue_workflows]\nunknown = true\n"),
+            ["issue_workflows.unknown"]
         );
     }
 

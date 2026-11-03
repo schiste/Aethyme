@@ -695,7 +695,6 @@ pub(super) fn report_main_root() -> Result<PathBuf, UsageError> {
 
 /// Apply a validated issue-set manifest through the coordinated GitHub lane.
 fn run_issue_set_apply(parsed: Parsed) -> Result<(), UsageError> {
-    use crate::issue_set_apply::IssueSetBackend;
     let usage = "issues apply <manifest.toml> --repo <owner/name> --session <id> --reason <authorization> [--dry-run]";
     if parsed.positional.len() != 2 {
         return Err(UsageError::Message(format!("expected {usage}")));
@@ -732,29 +731,12 @@ fn run_issue_set_apply(parsed: Parsed) -> Result<(), UsageError> {
             .chain(&manifest.manifest.issues)
             .map(|entry| (entry.key.clone(), entry))
             .collect();
-        let labels = entries
-            .values()
-            .flat_map(|entry| entry.labels.iter().cloned())
-            .collect();
-        github
-            .validate_labels(&labels)
+        let existing = crate::issue_set_apply::plan(&manifest, &run_dir, repository, &mut github)
             .map_err(UsageError::Message)?;
         let mut plan = Vec::new();
         for key in &manifest.order {
-            let marker = format!(
-                "<!-- aethyme-issue-set:{}/{key} -->",
-                manifest.manifest.set_id
-            );
-            let found = github.find_marker(&marker).map_err(UsageError::Message)?;
-            let (action, number) = match found.as_slice() {
-                [] => ("create", None),
-                [number] if *number > 0 => ("update", Some(*number)),
-                _ => {
-                    return Err(UsageError::Message(format!(
-                        "ambiguous issue-set marker for {key}"
-                    )));
-                }
-            };
+            let number = existing[key];
+            let action = if number.is_some() { "update" } else { "create" };
             plan.push(serde_json::json!({"action": action, "key": key, "number": number}));
         }
         for entry in &manifest.manifest.issues {
