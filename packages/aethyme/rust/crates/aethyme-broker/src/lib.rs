@@ -123,6 +123,7 @@ pub mod install_health;
 pub mod install_replacement;
 mod issue_form;
 mod issue_set;
+mod issue_set_apply;
 mod lease_export;
 mod leases;
 pub mod local_acceptance;
