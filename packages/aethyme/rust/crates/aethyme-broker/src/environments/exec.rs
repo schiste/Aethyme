@@ -381,6 +381,7 @@ pub fn run_hook_until(
 ) -> Result<HookOutcome, DriverError> {
     let mut command = command(text, cwd, pass_env, vars);
     let mut reason = None;
+    let mut partial = crate::bounded_output::PartialOutput::default();
     let outcome = crate::bounded_output::output_limited_in_owned_group_until(
         &mut command,
         timeout,
@@ -389,10 +390,22 @@ pub fn run_hook_until(
             reason = stop();
             reason.is_some()
         },
-    )
-    .map_err(io(format!("run {label}")))?;
+        &mut partial,
+    );
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // Cleanup after a deadline or stop can itself fail (a process in
+            // the hook's group outlived SIGKILL); the hook's output and the
+            // failure still belong in the log.
+            append_partial_output(log, label, &partial);
+            append_log(log, &format!("[aethyme] {label}: {error}\n"));
+            return Err(io(format!("run {label}"))(error));
+        }
+    };
     let Some(outcome) = outcome else {
         let reason = reason.unwrap_or_else(|| "stopped".into());
+        append_partial_output(log, label, &partial);
         append_log(log, &format!("[aethyme] {label}: stopped: {reason}\n"));
         return Err(DriverError::Preempted {
             label: label.into(),
@@ -402,6 +415,7 @@ pub fn run_hook_until(
     let output = match outcome {
         crate::bounded_output::LimitedOutput::Completed(output) => output,
         crate::bounded_output::LimitedOutput::Deadline => {
+            append_partial_output(log, label, &partial);
             append_log(
                 log,
                 &format!(
@@ -464,6 +478,19 @@ pub fn parse_receipt(stdout: &str) -> Result<Option<Value>, String> {
         return Err("a receipt must be a JSON object".into());
     }
     Ok(Some(value))
+}
+
+/// Log what a hook printed before it was stopped, so a timeout or
+/// preemption still leaves the hook's own output to read.
+fn append_partial_output(log: &Path, label: &str, partial: &crate::bounded_output::PartialOutput) {
+    append_log(
+        log,
+        &format!(
+            "[aethyme] {label}: output before it was stopped:\n{}{}",
+            String::from_utf8_lossy(&partial.stdout),
+            String::from_utf8_lossy(&partial.stderr),
+        ),
+    );
 }
 
 pub(crate) fn append_log(log: &Path, text: &str) {

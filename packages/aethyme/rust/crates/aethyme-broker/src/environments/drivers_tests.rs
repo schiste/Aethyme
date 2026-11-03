@@ -319,6 +319,56 @@ destroy = "true"
     assert!(started.elapsed() < Duration::from_secs(10));
 }
 
+/// A component's `hook_timeout_seconds` replaces the host default: a slow
+/// seed may run past it, and a killed hook still leaves what it printed in
+/// its log.
+#[test]
+fn a_component_hook_timeout_overrides_the_default_and_keeps_partial_output() {
+    let text = r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "slow"
+runtime = "hooks"
+provision = "sleep 1; echo seeded"
+destroy = "true"
+hook_timeout_seconds = 10
+[[profiles.components]]
+name = "stuck"
+runtime = "hooks"
+provision = "echo migrating step 1; echo stderr line >&2; sleep 30"
+destroy = "true"
+hook_timeout_seconds = 1
+"#;
+    let harness = Harness::new(text, "p");
+    let mut slow = harness.ctx("slow");
+    slow.hook_timeout = Duration::from_millis(300);
+    driver_for(slow.component.runtime).provision(&slow).unwrap();
+
+    let stuck = harness.ctx("stuck");
+    let started = std::time::Instant::now();
+    match driver_for(stuck.component.runtime).provision(&stuck) {
+        Err(DriverError::Timeout { seconds: 1, .. }) => {}
+        other => panic!("{other:?}"),
+    }
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let log = std::fs::read_to_string(stuck.log()).unwrap();
+    assert!(log.contains("migrating step 1"), "{log}");
+    assert!(log.contains("stderr line"), "{log}");
+    assert!(log.contains("timed out after 1s"), "{log}");
+}
+
+#[test]
+fn a_zero_hook_timeout_is_refused() {
+    let text = "schema = 1\n[[profiles]]\nname = \"p\"\n[[profiles.components]]\nname = \"c\"\nruntime = \"hooks\"\nprovision = \"true\"\ndestroy = \"true\"\nhook_timeout_seconds = 0\n";
+    let loaded: Loaded<EnvironmentsFile> = parse_loaded(PathBuf::from("t"), "t", text);
+    let file = loaded.value.unwrap();
+    let found = super::validate(&file, &HostEnvironmentsFile::default(), "t", "h");
+    let codes: Vec<&str> = found.iter().map(|d| d.code).collect();
+    assert!(codes.contains(&"invalid_hook_timeout"), "{codes:?}");
+}
+
 #[test]
 fn receipts_must_be_small_json_objects_and_the_last_one_wins() {
     assert_eq!(parse_receipt("hello\n").unwrap(), None);
@@ -577,4 +627,150 @@ file = "compose.yml"
     let second = driver.start(&ctx).unwrap();
     driver.destroy(&ctx, Some(&second)).unwrap();
     assert_eq!(driver.observe(&ctx, &second), Observation::Gone);
+}
+
+/// A container that carries the compose project's label but that compose
+/// did not create survives `down`; destroy removes it instead of failing
+/// with "still has 1 container(s) after down".
+#[test]
+fn compose_destroy_removes_project_containers_down_leaves_when_an_engine_is_enabled() {
+    if !engine_tests_enabled() {
+        eprintln!(
+            "SKIP compose straggler teardown: set AETHYME_ENV_ENGINE_TESTS=1 with docker or podman running"
+        );
+        return;
+    }
+    let Ok(engine) = resolve(None) else {
+        eprintln!("SKIP compose straggler teardown: no engine on PATH");
+        return;
+    };
+    if !engine.available() {
+        eprintln!(
+            "SKIP compose straggler teardown: {} is not answering",
+            engine.engine.as_str()
+        );
+        return;
+    }
+    let text = r#"
+schema = 1
+[[profiles]]
+name = "straggler"
+[[profiles.components]]
+name = "stack"
+runtime = "compose"
+file = "compose.yml"
+"#;
+    let harness = Harness::new(text, "straggler");
+    std::fs::write(
+        harness.worktree.path().join("compose.yml"),
+        "services:\n  one:\n    image: alpine:3.20\n    command: [\"sleep\", \"300\"]\n",
+    )
+    .unwrap();
+    let ctx = harness.ctx("stack");
+    let driver = driver_for(ctx.component.runtime);
+    let identity = driver.start(&ctx).unwrap();
+    let ComponentIdentity::Containers {
+        project: Some(project),
+        ..
+    } = &identity
+    else {
+        panic!("{identity:?}");
+    };
+    let label = format!("com.docker.compose.project={project}");
+    engine
+        .run(
+            &[
+                "run",
+                "-d",
+                "--label",
+                &label,
+                "alpine:3.20",
+                "sleep",
+                "300",
+            ],
+            harness.worktree.path(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    driver.destroy(&ctx, Some(&identity)).unwrap();
+    assert_eq!(driver.observe(&ctx, &identity), Observation::Gone);
+    let log = std::fs::read_to_string(ctx.log()).unwrap_or_default();
+    assert!(log.contains("that down left behind"), "{log}");
+}
+
+/// The isolated seed's shape: a hook that tees its output and runs an
+/// attached `compose run` one-off under the stack's project, stopped at its
+/// deadline. The hook must fail as a timeout with its partial output logged,
+/// and destroying the stack must still remove every project container.
+#[test]
+fn a_seed_killed_mid_compose_run_times_out_and_tears_down_when_an_engine_is_enabled() {
+    if !engine_tests_enabled() {
+        eprintln!(
+            "SKIP killed compose-run seed: set AETHYME_ENV_ENGINE_TESTS=1 with docker or podman running"
+        );
+        return;
+    }
+    let Ok(engine) = resolve(None) else {
+        eprintln!("SKIP killed compose-run seed: no engine on PATH");
+        return;
+    };
+    if !engine.available() {
+        eprintln!(
+            "SKIP killed compose-run seed: {} is not answering",
+            engine.engine.as_str()
+        );
+        return;
+    }
+    let compose = engine.compose().unwrap();
+    let mut invocation = vec![compose.program.to_string_lossy().into_owned()];
+    invocation.extend(compose.prefix.iter().cloned());
+    let text = r#"
+schema = 1
+[[profiles]]
+name = "seeded"
+[[profiles.components]]
+name = "stack"
+runtime = "compose"
+file = "sub/compose.yml"
+[[profiles.components]]
+name = "seed"
+runtime = "hooks"
+depends_on = ["stack"]
+hook_timeout_seconds = 8
+provision = "bash sub/seed.sh"
+destroy = "true"
+"#;
+    let harness = Harness::new(text, "seeded");
+    std::fs::create_dir_all(harness.worktree.path().join("sub")).unwrap();
+    std::fs::write(
+        harness.worktree.path().join("sub/compose.yml"),
+        "services:\n  one:\n    image: alpine:3.20\n    command: [\"sleep\", \"300\"]\n",
+    )
+    .unwrap();
+    // Like Mockup's backend-refresh.sh: tee everything, then migrate through
+    // an attached one-off under the stack's compose project.
+    std::fs::write(
+        harness.worktree.path().join("sub/seed.sh"),
+        format!(
+            "exec > >(tee -a seed-tee.log) 2>&1\n\
+             echo migrating\n\
+             export COMPOSE_PROJECT_NAME=\"$(printf %s \"$AETHYME_ENV_NAMESPACE\" | tr A-Z a-z | sed -e 's/[^a-z0-9_-]/-/g' -e 's/^[-_]*//')\"\n\
+             {} -f sub/compose.yml run --rm --no-deps one sleep 300\n",
+            invocation.join(" ")
+        ),
+    )
+    .unwrap();
+    let stack = harness.ctx("stack");
+    let driver = driver_for(stack.component.runtime);
+    let identity = driver.start(&stack).unwrap();
+    let seed = harness.ctx("seed");
+    let outcome = driver_for(seed.component.runtime).provision(&seed);
+    let log = std::fs::read_to_string(seed.log()).unwrap_or_default();
+    assert!(
+        matches!(outcome, Err(DriverError::Timeout { seconds: 8, .. })),
+        "{outcome:?}\n{log}"
+    );
+    assert!(log.contains("migrating"), "{log}");
+    driver.destroy(&stack, Some(&identity)).unwrap();
+    assert_eq!(driver.observe(&stack, &identity), Observation::Gone);
 }
