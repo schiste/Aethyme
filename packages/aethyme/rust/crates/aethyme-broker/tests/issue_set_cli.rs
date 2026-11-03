@@ -386,3 +386,118 @@ fn falls_back_when_native_relationships_are_unavailable() {
 fn does_not_fall_back_on_relationship_permission_errors() {
     exercise_complete_set(2);
 }
+
+#[test]
+fn separate_clones_share_unknown_create_recovery() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let log = state.path().join("gh-log");
+    let gh = bin.path().join("gh");
+    std::fs::write(&gh, r##"#!/bin/sh
+printf '%s\n' "$*" >> "$AETHYME_FAKE_GH_LOG"
+case "$*" in
+  'api --hostname github.com repos/owner/repo/commits?per_page=1') printf '[{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]\n' ;;
+  'api --hostname github.com -H Accept: application/vnd.github.raw+json repos/owner/repo/contents/.aethyme/config.toml?ref=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa') printf '[issue_workflows]\nissue_sets = "allow"\n' ;;
+  'api --hostname github.com repos/owner/repo/labels?per_page=100&page=1') printf '[]\n' ;;
+  'api --hostname github.com repos/owner/repo/issues?state=all&per_page=100&page=1') printf '[]\n' ;;
+  'issue create '*) printf 'simulated lost create response\n' >&2; exit 1 ;;
+  *) printf 'unexpected fake gh command: %s\n' "$*" >&2; exit 1 ;;
+esac
+"##).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let run = |repo: &Path, args: &[&str]| -> Output {
+        common::broker_cli(CLI, args)
+            .current_dir(repo)
+            .env("AETHYME_HOST_STATE_DIR", state.path())
+            .env("AETHYME_FAKE_GH_LOG", &log)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .unwrap()
+    };
+    let setup = |repo: &Path| -> String {
+        git(repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        git(repo, &["add", ".gitignore", "a.txt"]);
+        git(repo, &["commit", "-qm", "init"]);
+        let started = run(
+            repo,
+            &["start", "--task", "test shared issue journal", "--json"],
+        );
+        assert!(
+            started.status.success(),
+            "{}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+        git(
+            repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/owner/repo.git",
+            ],
+        );
+        std::fs::write(repo.join("epic.md"), "Epic body").unwrap();
+        std::fs::write(repo.join("set.toml"), "set_id = \"shared\"\n[parent]\nkey = \"epic\"\ntitle = \"Epic\"\nbody_file = \"epic.md\"\n").unwrap();
+        value["session"]["id"]
+            .as_i64()
+            .or_else(|| value["id"].as_i64())
+            .unwrap()
+            .to_string()
+    };
+    let session_one = setup(first.path());
+    let session_two = setup(second.path());
+    fn args(session: &str) -> Vec<&str> {
+        vec![
+            "advanced",
+            "issues",
+            "apply",
+            "set.toml",
+            "--session",
+            session,
+            "--repo",
+            "owner/repo",
+            "--reason",
+            "test recovery",
+            "--json",
+        ]
+    }
+    let initial = run(first.path(), &args(&session_one));
+    assert!(!initial.status.success());
+    let mut plan_args = args(&session_two);
+    plan_args.push("--dry-run");
+    let retry = run(second.path(), &plan_args);
+    assert!(
+        !retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stdout)
+    );
+    let error: serde_json::Value = serde_json::from_slice(&retry.stdout).unwrap();
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown outcome"),
+        "{error}"
+    );
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("issue create "))
+            .count(),
+        1,
+        "{calls}"
+    );
+}
