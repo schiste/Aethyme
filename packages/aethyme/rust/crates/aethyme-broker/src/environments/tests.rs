@@ -322,14 +322,6 @@ fn every_rule_has_a_located_diagnostic() {
             field: "health",
         },
         Case {
-            name: "duplicate rank",
-            toml: "schema = 1\n[[profiles]]\nname = \"a\"\nrank = 1\ncomponents = [{ name = \"x\", runtime = \"process\", start = \"x\" }]\n[[profiles]]\nname = \"b\"\nrank = 1\ncomponents = [{ name = \"x\", runtime = \"process\", start = \"x\" }]\n".into(),
-            code: "duplicate_rank",
-            profile: Some("b"),
-            component: None,
-            field: "rank",
-        },
-        Case {
             name: "units without pool",
             toml: "schema = 1\n[[profiles]]\nname = \"a\"\nunits = 1\ncomponents = [{ name = \"x\", runtime = \"process\", start = \"x\" }]\n".into(),
             code: "missing_pool",
@@ -806,4 +798,36 @@ fn an_entry_path_is_appended_to_the_component_url() {
     let vars = super::exec::environment_variables(&compiled, &compiled.components[0], &bindings, 1);
     assert_eq!(vars["AETHYME_ENV_URL_API"], "http://127.0.0.1:4000/o/");
     assert_eq!(vars["AETHYME_ENV_PORT_API"], "4000");
+}
+
+#[test]
+fn equal_rank_profiles_can_be_selected_without_a_reason() {
+    let text = r#"
+schema = 1
+default_profile = "static"
+[[profiles]]
+name = "static"
+rank = 1
+[[profiles]]
+name = "static-dev"
+rank = 1
+[[profiles]]
+name = "isolated"
+rank = 2
+"#;
+    assert!(diagnostics(text).is_empty());
+    let file = parse(text);
+    let inference = super::infer::infer(&file, &[]).unwrap();
+    let options = super::cli::parse_options("up", &["--profile".into(), "static-dev".into()])
+        .unwrap_or_else(|failure| panic!("{}", failure.message));
+    assert_eq!(
+        super::operate::choose_profile(&file, &inference, &options)
+            .unwrap_or_else(|failure| panic!("{}", failure.message)),
+        "static-dev"
+    );
+    let higher = super::cli::parse_options("up", &["--profile".into(), "isolated".into()])
+        .unwrap_or_else(|failure| panic!("{}", failure.message));
+    assert!(
+        matches!(super::operate::choose_profile(&file, &inference, &higher), Err(failure) if failure.code == "reason_required")
+    );
 }

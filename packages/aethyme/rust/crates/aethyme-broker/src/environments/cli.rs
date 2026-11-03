@@ -335,7 +335,7 @@ pub fn run(args: &[String]) -> u8 {
     }
 }
 
-fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
+pub(super) fn parse_options(command: &str, rest: &[String]) -> Result<Options, Failure> {
     let usage = |message: String| Failure {
         code: "usage",
         message,
