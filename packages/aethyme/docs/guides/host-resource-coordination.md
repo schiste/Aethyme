@@ -150,6 +150,18 @@ receives `AETHYME_RESOURCE_DOCKER_PROJECT`,
 `AETHYME_RESOURCE_LEASE_ID` and `AETHYME_RESOURCE_GENERATION`. The ownership
 token used to renew and release the bundle is never exposed to the child.
 
+Allocation values are recorded in lease inventory and gate provenance. Do not
+put database passwords, connection URLs containing credentials, or other
+secrets in resource keys, prefixes, or allocation values. The generic lease
+does not provide a secret-delivery mechanism or provision a PostgreSQL role,
+database, or schema.
+
+`AETHYME_TEST_DB_SUFFIX` identifies the session and gate, so retries of the
+same gate can reuse it. It is not a unique run identifier. For a per-run name,
+declare a `namespace` resource and use its allocated value; validate or quote
+that value for the database's identifier rules. A unique name alone does not
+establish database access isolation or clean up prior runs.
+
 A broker-chosen port is broker-free and OS-bindable at the moment it is
 granted, but the generic contract cannot hold the socket open while an
 arbitrary application binds it. Between the grant and the bind, a
