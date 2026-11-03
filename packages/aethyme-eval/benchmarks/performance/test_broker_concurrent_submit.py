@@ -19,6 +19,7 @@ from broker_concurrent_submit import (
     MAX_STDOUT_BYTES,
     POLICY_TEXT,
     ReceiptLog,
+    audit_patch_stream,
     command_overlap_ns,
     concurrent_pair_claim,
     deterministic_payload,
@@ -48,6 +49,23 @@ class SyntheticWorkloadTests(unittest.TestCase):
         for length in (0, BINARY_BYTES_PER_COMMIT - 1, BINARY_BYTES_PER_COMMIT + 1, True):
             with self.subTest(length=length), self.assertRaises(ValueError):
                 deterministic_payload(0, length)
+
+    def test_patch_audit_uses_current_broker_diff_profile(self):
+        runner = mock.Mock()
+        runner.run.return_value = {'stdout': 'patch', 'argv': ['recorded']}
+        commit = 'a' * 40
+        result = audit_patch_stream(runner, '/git', Path('/fixture'), 'audit', [commit])
+        args = runner.run.call_args.args[0]
+        self.assertEqual(args, [
+            '/git', 'log', '--no-walk=unsorted', '--stdin', '-p', '--no-color',
+            '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/',
+            '--full-index', '--ignore-submodules=none', '--no-renames',
+            '--diff-algorithm=myers', '--no-indent-heuristic', '--unified=3',
+            '--diff-merges=first-parent', '--format=commit %H',
+        ])
+        self.assertEqual(runner.run.call_args.kwargs['input_bytes'], (commit + '\n').encode())
+        self.assertEqual(result['profile'], 'broker-first-parent-full-index-no-binary-body')
+        self.assertEqual(result['stream_bytes'], 5)
 
     def test_positive_runner_overlap_is_required_for_concurrent_claim(self):
         self.assertEqual(command_overlap_ns([

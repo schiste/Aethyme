@@ -819,7 +819,10 @@ def audit_patch_stream(runner, git, repo, label, commits):
         raise RuntimeError('patch audit received a malformed commit id')
     stdin = ('\n'.join(commits) + '\n').encode('ascii')
     row = runner.run(
-        [git, 'log', '--no-walk=unsorted', '--stdin', '--no-color', '-p', '--binary',
+        [git, 'log', '--no-walk=unsorted', '--stdin', '-p', '--no-color',
+         '--no-ext-diff', '--no-textconv', '--src-prefix=a/', '--dst-prefix=b/',
+         '--full-index', '--ignore-submodules=none', '--no-renames',
+         '--diff-algorithm=myers', '--no-indent-heuristic', '--unified=3',
          '--diff-merges=first-parent', '--format=commit %H'],
         repo, label, input_bytes=stdin)
     data = row['stdout'].encode('utf-8')
@@ -827,6 +830,7 @@ def audit_patch_stream(runner, git, repo, label, commits):
         raise RuntimeError('common-history patch stream exceeded its audit limit')
     return {'commit_ids': commits, 'stdin_sha256': sha256_bytes(stdin),
             'stream_bytes': len(data), 'stream_sha256': sha256_bytes(data),
+            'profile': 'broker-first-parent-full-index-no-binary-body',
             'argv': row['argv']}
 
 
