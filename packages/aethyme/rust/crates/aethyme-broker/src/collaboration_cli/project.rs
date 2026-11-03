@@ -1333,6 +1333,76 @@ pub(crate) mod test_support {
                 bootstrap_snapshot,
             })
         }
+
+        /// Clones this fixture's repository (same origin URL), returns it to
+        /// the pre-descriptor anchor, and enrolls and binds it on its own.
+        /// No descriptor is shared, so it is a separate project even though
+        /// its source and origin are identical (plan T03: no implicit merge).
+        pub(crate) fn clone_and_enroll_independently(&self) -> Result<Self, FixtureError> {
+            let repo = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let host = tempfile::tempdir().map_err(|error| error.to_string())?;
+            git_clone(self.repo.path(), repo.path())?;
+            git(
+                repo.path(),
+                &["checkout", "-q", "-B", "main", self.anchor_commit.as_str()],
+            )?;
+            let root = CollaborationRoot::under_host_state(host.path());
+            let key = self.store.project().clone();
+            let mut store =
+                CollaborationStore::open(&root, &key, &[]).map_err(|error| error.to_string())?;
+            capture_anchor(
+                &mut store,
+                repo.path(),
+                &self.anchor_commit,
+                "fixture-independent-anchor",
+            )?;
+            let enroll_args = ["--commit", self.anchor_commit.as_str(), "--write"];
+            let enrolled = enroll(repo.path(), &enroll_args).map_err(|failure| {
+                format!("independent project enroll failed: {}", failure.message)
+            })?;
+            let descriptor_record_id = enrolled
+                .0
+                .get("descriptor_record_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "project enroll returned no descriptor RecordId".to_string())?
+                .to_string();
+            std::fs::write(
+                repo.path().join(".aethyme/config.toml"),
+                format!(
+                    "[collaboration]\ncapture = \"required\"\nproject = \"{}\"\ndescriptor = \"{}\"\n",
+                    key.as_str(), PROJECT_DESCRIPTOR_PATH
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+            git(repo.path(), &["add", "-A"])?;
+            git(
+                repo.path(),
+                &["commit", "-q", "-m", "independent project binding"],
+            )?;
+            let bootstrap_commit =
+                archive::pin_commit(repo.path(), "HEAD").map_err(|error| error.to_string())?;
+            let bootstrap_snapshot = archive::snapshot_of_commit(repo.path(), &bootstrap_commit)
+                .map_err(|error| error.to_string())?
+                .id();
+            let bind_args = ["--confirm", descriptor_record_id.as_str()];
+            bind_at_root(repo.path(), repo.path(), &bind_args, &root).map_err(|failure| {
+                format!("independent project bind failed: {}", failure.message)
+            })?;
+            let binding = identity_store::resolve_approved_project_binding(&store)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    "independent bind did not persist an approved binding".to_string()
+                })?;
+            Ok(Self {
+                repo,
+                host,
+                store,
+                binding,
+                anchor_commit: self.anchor_commit.clone(),
+                bootstrap_commit,
+                bootstrap_snapshot,
+            })
+        }
     }
 
     fn capture_anchor(

@@ -527,6 +527,48 @@ mod tests {
         assert_eq!(original.state(), cloned.state());
     }
 
+    /// Plan T03, negative half: a clone with the same origin URL and the same
+    /// anchor source that enrolls on its own instead of binding the approved
+    /// descriptor is a different project, and its exact FileIds do not align.
+    #[test]
+    fn same_origin_clone_enrolled_independently_gets_disjoint_file_identities() {
+        let fixture = BoundProjectFixture::new().expect("real project enrollment and bind");
+        let independent = fixture
+            .clone_and_enroll_independently()
+            .expect("independent clone enrollment");
+        assert_ne!(
+            fixture.binding.project_id(),
+            independent.binding.project_id(),
+            "a shared origin URL and identical source never merge project identity"
+        );
+        let resolve = |fixture: &BoundProjectFixture| {
+            match identity_store::resolve_project_file_identity_state(
+                fixture.store(),
+                &fixture.binding,
+                &fixture.bootstrap_snapshot,
+            )
+            .expect("bootstrap identity map")
+            {
+                IdentityStateResolution::Bootstrap(state) => state,
+                other => panic!("expected bootstrap map, got {other:?}"),
+            }
+        };
+        let original = resolve(&fixture);
+        let separate = resolve(&independent);
+        let original_id = original
+            .state()
+            .file_id(b"a.txt")
+            .expect("original enrolled a.txt");
+        let separate_id = separate
+            .state()
+            .file_id(b"a.txt")
+            .expect("independent clone enrolled a.txt");
+        assert_ne!(
+            original_id, separate_id,
+            "identical path and bytes align only under one approved descriptor"
+        );
+    }
+
     #[test]
     fn public_handler_applies_valid_rename_and_exact_dependency_updates() {
         let mut fixture = BoundProjectFixture::new().expect("real project enrollment and bind");
