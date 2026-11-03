@@ -668,7 +668,7 @@ pub(super) fn run_routes(_: &Options) -> Result<Output, Failure> {
 /// The profile `env up` brings up: the inferred minimum unless `--profile`
 /// asks for one. Lower than the minimum is refused with the firing rules;
 /// higher needs `--reason`.
-fn choose_profile(
+pub(super) fn choose_profile(
     file: &super::spec::EnvironmentsFile,
     inference: &super::infer::Inference,
     options: &Options,

@@ -440,8 +440,7 @@ pub fn validate(
     validate_keep_awake(&mut c, file);
 
     let mut names = BTreeSet::new();
-    let mut ranks: BTreeMap<u32, &str> = BTreeMap::new();
-    for (index, profile) in file.profiles.iter().enumerate() {
+    for profile in &file.profiles {
         let name = profile.name.as_str();
         if !valid_name(name) {
             c.push(
@@ -461,17 +460,6 @@ pub fn validate(
                 Some("name"),
                 "profile declared more than once",
                 "give each profile a unique name",
-            );
-        }
-        let rank = effective_rank(index, profile);
-        if let Some(other) = ranks.insert(rank, name) {
-            c.push(
-                "duplicate_rank",
-                Some(name),
-                None,
-                Some("rank"),
-                format!("rank {rank} is also used by profile {other}"),
-                "ranks form a total order for inference; give every profile a distinct rank",
             );
         }
         validate_profile(&mut c, file, host, profile);
