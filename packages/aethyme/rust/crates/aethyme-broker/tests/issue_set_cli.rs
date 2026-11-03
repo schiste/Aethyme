@@ -141,7 +141,13 @@ depends_on = ["epic"]
     assert!(actions.contains(&"ensure_dependency"));
     let denied = run(&args);
     assert!(!denied.status.success());
-    assert!(String::from_utf8_lossy(&denied.stderr).contains("issue_workflows.issue_sets"));
+    let denial: serde_json::Value = serde_json::from_slice(&denied.stdout).unwrap();
+    assert!(
+        denial["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("issue_workflows.issue_sets")
+    );
     let calls = std::fs::read_to_string(&log).unwrap();
     assert!(!calls.contains("issue create"), "{calls}");
     assert!(!calls.contains("-X POST"), "{calls}");
