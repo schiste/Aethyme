@@ -287,6 +287,7 @@ mod tests {
         lose_create_response: bool,
         duplicate_create_number: bool,
         native_unavailable: bool,
+        wrong_create_marker: bool,
     }
     impl IssueSetBackend for Fake {
         fn validate_labels(&mut self, _labels: &BTreeSet<String>) -> Result<(), String> {
@@ -313,7 +314,13 @@ mod tests {
             } else {
                 self.create_calls as u64 + 100
             };
-            self.issues.insert(id, (marker.into(), entry.title.clone()));
+            let stored_marker = if self.wrong_create_marker {
+                "unrelated"
+            } else {
+                marker
+            };
+            self.issues
+                .insert(id, (stored_marker.into(), entry.title.clone()));
             if self.lose_create_response {
                 self.lose_create_response = false;
                 return Err("lost response".into());
@@ -431,6 +438,18 @@ depends_on = ["epic"]
         apply(&manifest, dir.path(), "owner/repo", &mut backend).unwrap();
         assert_eq!(backend.issues, original);
         assert_eq!(backend.create_calls, 2);
+    }
+    #[test]
+    fn refuses_relationships_when_create_returns_an_unmarked_issue() {
+        let (dir, manifest) = fixture();
+        let mut backend = Fake {
+            wrong_create_marker: true,
+            ..Fake::default()
+        };
+        let error = apply(&manifest, dir.path(), "owner/repo", &mut backend).unwrap_err();
+        assert!(error.contains("expected marker"));
+        assert!(backend.links.is_empty());
+        assert!(backend.dependencies.is_empty());
     }
     #[test]
     fn refuses_a_duplicate_issue_number_returned_by_create() {
