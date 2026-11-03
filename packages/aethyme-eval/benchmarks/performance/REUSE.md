@@ -103,8 +103,12 @@ cleanup, source publication, notifications or provider calls are added.
 and command wall intervals. Intervals include spawn, output drain and owned-group
 settlement. `cpu.jsonl` records sequential child user/system CPU deltas, including
 failed commands; it is not host CPU telemetry. `report.json` keeps each phase's
-session/worktree identity, preparation step counts/digest, actual gate cache
-flags/provenance, and storage snapshots/deltas. Inventory time is outside command
+session/worktree identity, start/sync, preparation and gate command wall times,
+preparation step counts/digest, actual gate cache flags/provenance, and storage
+snapshots/deltas. Preparation and gate times cover their command calls, including
+spawn, output drain and owned-group settlement. Start/sync timing also includes
+session identity handling. Storage inventory and gate/preparation validation are
+outside these phase timings. Inventory time is outside command
 intervals. Storage counts logical bytes per filename, allocated blocks once per
 file inode, file names, unique file inodes, directories and symlinks. It does not
 measure APFS snapshot/cloning attribution, system-wide reclaimed space or volumes
