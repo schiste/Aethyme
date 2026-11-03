@@ -40,7 +40,8 @@ def measure(root, output, git, other, count, samples, legacy=None):
                   limitations=[
                       "sequential synthetic warm/first-observation samples, not cold-cache or p99",
                       "all synthetic branch tips share one commit; no history-transfer speedup claim",
-                      "no actual broker, IDE, hosted GitHub, network filesystem or old-client qualification",
+                      "no actual broker, IDE, hosted GitHub, or network filesystem qualification",
+                      "legacy probe, when run, tests extension refusal only, not full old-client compatibility",
                       "child CPU excludes persistent services; no production configuration changed",
                   ])
     for client in clients:

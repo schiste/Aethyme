@@ -211,6 +211,55 @@ fn broker_session_uses_its_recorded_start() {
     assert_eq!(infer(&file(), &changed).unwrap().minimum, "static");
 }
 
+/// #1400: after `broker sync` merges the default branch into a session and
+/// records the new base, only the session's own change counts.
+#[test]
+fn synced_session_is_measured_from_its_recorded_base() {
+    let repo = tempfile::tempdir().unwrap();
+    let dir = repo.path().canonicalize().unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    write(&dir, ".gitignore", ".aethyme/\n");
+    write(&dir, "README", "base\n");
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "start"]);
+    let start = git(&dir, &["rev-parse", "HEAD"]);
+    let mut store = crate::BrokerStore::open_in_repo(&dir).unwrap();
+    let session = store
+        .register_session(&crate::NewSession {
+            worktree_path: dir.to_string_lossy().into_owned(),
+            branch: "main".into(),
+            origin: crate::SessionOrigin::Adopted,
+            task: None,
+            diff_base: Some(start.clone()),
+            adoption_base: Some(start.clone()),
+            adopted_head: Some(start.clone()),
+            repository_contract: None,
+            pid: None,
+            command: None,
+            log_path: None,
+            agent_identity: None,
+        })
+        .unwrap();
+    write(&dir, "web/new.css", "new\n");
+    git(&dir, &["add", "web/new.css"]);
+    git(&dir, &["commit", "-qm", "session change"]);
+    // The default branch advances with a backend change.
+    git(&dir, &["checkout", "-q", "-b", "upstream", &start]);
+    write(&dir, "db/schema/upstream.sql", "upstream\n");
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "upstream backend change"]);
+    let upstream = git(&dir, &["rev-parse", "HEAD"]);
+    git(&dir, &["checkout", "-q", "main"]);
+    // What `broker sync` does: merge, then record the new base.
+    git(&dir, &["merge", "-q", "--no-edit", "upstream"]);
+    store.set_session_diff_base(session.id, &upstream).unwrap();
+    drop(store);
+    let (base, changed) = changed_paths(&dir).unwrap();
+    assert_eq!(base.as_deref(), Some(upstream.as_str()));
+    assert_eq!(changed, paths(&["web/new.css"]));
+    assert_eq!(infer(&file(), &changed).unwrap().minimum, "static");
+}
+
 /// #1216 acceptance: replaying a 100-commit history completes in seconds
 /// and counts commits per profile.
 #[test]
