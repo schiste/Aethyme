@@ -1,0 +1,2 @@
+cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-broker --lib -- same_origin_clone_enrolled_independently
+expect=fail

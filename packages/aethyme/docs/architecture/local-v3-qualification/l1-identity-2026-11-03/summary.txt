@@ -1,0 +1,20 @@
+01 broker-identity-pre expect=pass exit=0 passed=17 failed=0 seconds=92 log_sha256=22763692f902eac84261100f3257886c25dec96d07b0aad09d2248c54e0d0842
+02 contracts-t05-vectors-pre expect=pass exit=0 passed=9 failed=0 seconds=8 log_sha256=005d54e1033824e5d7810ad5dc820a2a7f064a3098605266edbf220f1f842594
+03 contracts-revision-pre expect=pass exit=0 passed=0 failed=0 seconds=1 log_sha256=4bfdf302a348634a36abcb04bcd6d96cf10009f530c43bee49b5c876519e682a
+04 cli-t03-association-pre expect=pass exit=0 passed=1 failed=0 seconds=140 log_sha256=7807aee0ad79e1c4de9349402a8300da9b66abc99b778bd4b2dd20c6b27848e9
+05 clippy-scoped expect=pass exit=101 passed=0 failed=0 seconds=63 log_sha256=5b3bc4a0fe5b07de847f49187b9d7aac3322ddcb61718a8455645e598c72b2b1
+06 mutation-fileid-ignores-project expect=fail exit=101 passed=0 failed=1 seconds=80 log_sha256=ed6f63a1f27ed7b3b609cc43e2ebeb9f8c7ae1e884e6c4352ac991a760ee0f76
+restored fileid-ignores-project exact
+07 mutation-fileid-ignores-project-vector expect=fail exit=101 passed=0 failed=1 seconds=1 log_sha256=c9557e1d055387b5284dd21d4aa8dfbd8f74829303777300f15eb6aefb2640b7
+restored fileid-ignores-project-vector exact
+08 mutation-uncertain-rename-claimed-explicit expect=fail exit=101 passed=0 failed=1 seconds=1 log_sha256=e15d134134a156b7c7a2524cea06a9ce841b6ad6c7aed7d0d9d05551da26046d
+restored uncertain-rename-claimed-explicit exact
+09 mutation-competing-path-unchecked expect=fail exit=101 passed=0 failed=1 seconds=2 log_sha256=21cc16abec03c289fdb536d30e4bab99cc9110596ab50ddf5ecf5a3bdcf803b4
+restored competing-path-unchecked exact
+10 broker-identity-post expect=pass exit=0 passed=17 failed=0 seconds=115 log_sha256=88e8a1b83712414f8dcfe095ca2561ddf16dc1916b1d23b03cda33ebe554dd7a
+11 contracts-t05-vectors-post expect=pass exit=0 passed=9 failed=0 seconds=1 log_sha256=0cade404de570a666471ee7105031e7132229e575f6fec0fb2de7e7bfe02961f
+12 contracts-revision-post expect=pass exit=0 passed=0 failed=0 seconds=1 log_sha256=41b89966ab8d9171bc6a61edda59b68b09c734d16a923a72b373387dc6072e22
+13 cli-t03-association-post expect=pass exit=0 passed=1 failed=0 seconds=69 log_sha256=5b9ee90b3e9095e1b650c17e00d63f98f474b48e7b1651937bfa52ec59177b92
+final source tree clean vs 2f15b81a6630cab897d29ec43e3f9af2dd66c89a
+DONE
+14 contracts-revision-integration expect=pass exit=0 passed=8 failed=0 log_sha256=6aa180f3de669cb2e5c9e87a4a39e6ba640faa85b8bd93962ada28e2b221a2d2

@@ -1,0 +1,12 @@
+diff --git a/packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/project_identity.rs b/packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/project_identity.rs
+index fb30b3ec2..5f4fb2367 100644
+--- a/packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/project_identity.rs
++++ b/packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/project_identity.rs
+@@ -102,7 +102,6 @@ impl FileId {
+ 
+     fn enrolled(project: &ProjectId, snapshot: &SourceSnapshotId, path: &[u8]) -> Self {
+         let mut input = FILE_ID_DOMAIN.to_vec();
+-        input.extend_from_slice(project.as_str().as_bytes());
+         input.push(0);
+         input.extend_from_slice(snapshot.as_str().as_bytes());
+         input.push(0);

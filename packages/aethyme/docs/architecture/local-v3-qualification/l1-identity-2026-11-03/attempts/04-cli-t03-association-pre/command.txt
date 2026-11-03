@@ -1,0 +1,2 @@
+cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --test collab_project_association -- --test-threads=1
+expect=pass

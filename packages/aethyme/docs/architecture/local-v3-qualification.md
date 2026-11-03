@@ -61,6 +61,13 @@ executions overlap; totals are executions, not unique tests.
 
 ## L1 audit findings and recorded checks
 
+The [L1 identity package](local-v3-qualification/l1-identity-2026-11-03/README.md)
+(#652) binds T03 and T05 to clean source `2f15b81a6630cab897d29ec43e3f9af2dd66c89a`.
+Its 27 focused tests (17 broker, 9 contract vectors, 1 public CLI) passed before and
+after four intended single-test mutation failures with exact restoration, and 8
+contribution-revision tests passed. Scoped strict Clippy failed only on a pre-existing
+lint outside the package and earns no credit.
+
 The [experimental scoped symbol package](local-v3-qualification/aq0-symbol-identity-2026-10-16/README.md)
 binds its results to clean source `025103777c16607639073cbf9024d2ad0c39f72d`
 and tree `5f7ef505a452b79b01faa325662102497bcb7bff`. Its 13 focused tests

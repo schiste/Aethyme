@@ -1,0 +1,2 @@
+cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-contracts --test project_identity_vectors -- exact_rename_preserves_id_but_unannotated_rename_stays_uncertain
+expect=fail

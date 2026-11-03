@@ -1,0 +1,2 @@
+cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-broker --lib -- collaboration_cli::contribution collaboration_cli::project collaboration_identity_store
+expect=pass

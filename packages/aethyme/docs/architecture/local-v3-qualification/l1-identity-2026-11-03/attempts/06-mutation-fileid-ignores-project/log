@@ -1,0 +1,35 @@
+   Compiling aethyme-engine v0.8.54 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/qualify-local-v3-l1-identities-and-align/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.54 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/qualify-local-v3-l1-identities-and-align/packages/aethyme/rust/crates/aethyme-broker)
+   Compiling aethyme-contracts v0.8.54 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/qualify-local-v3-l1-identities-and-align/packages/aethyme/rust/crates/aethyme-contracts)
+warning: unused variable: `project`
+   --> crates/aethyme-contracts/src/experimental_v0/project_identity.rs:103:17
+    |
+103 |     fn enrolled(project: &ProjectId, snapshot: &SourceSnapshotId, path: &[u8]) -> Self {
+    |                 ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_project`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aethyme-contracts` (lib) generated 1 warning (run `cargo fix --lib -p aethyme-contracts` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 15s
+     Running unittests src/lib.rs (packages/aethyme/rust/target/debug/deps/aethyme_broker-f6bdfc6b4fadfb0b)
+
+running 1 test
+test collaboration_cli::contribution::tests::same_origin_clone_enrolled_independently_gets_disjoint_file_identities ... FAILED
+
+failures:
+
+---- collaboration_cli::contribution::tests::same_origin_clone_enrolled_independently_gets_disjoint_file_identities stdout ----
+
+thread 'collaboration_cli::contribution::tests::same_origin_clone_enrolled_independently_gets_disjoint_file_identities' (1003448) panicked at crates/aethyme-broker/src/collaboration_cli/contribution.rs:566:9:
+assertion `left != right` failed: identical path and bytes align only under one approved descriptor
+  left: FileId("file:sha256:b1ab78f7b3ef164f77c8b974dd9a18e87d706b93969caa2f9791bd535f3d27ab")
+ right: FileId("file:sha256:b1ab78f7b3ef164f77c8b974dd9a18e87d706b93969caa2f9791bd535f3d27ab")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    collaboration_cli::contribution::tests::same_origin_clone_enrolled_independently_gets_disjoint_file_identities
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3690 filtered out; finished in 2.80s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

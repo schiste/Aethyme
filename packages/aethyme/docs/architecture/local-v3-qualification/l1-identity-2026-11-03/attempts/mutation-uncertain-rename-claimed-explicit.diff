@@ -1,0 +1,13 @@
+diff --git a/packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/project_identity.rs b/packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/project_identity.rs
+index fb30b3ec2..dc79fc155 100644
+--- a/packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/project_identity.rs
++++ b/packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/project_identity.rs
+@@ -967,7 +967,7 @@ pub fn advance_file_identities(
+                 relation: if possible_sources.is_empty() {
+                     IdentityRelation::New
+                 } else {
+-                    IdentityRelation::UncertainRename
++                    IdentityRelation::ExplicitRename
+                 },
+                 derived_from: Vec::new(),
+                 possible_sources,
