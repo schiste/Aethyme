@@ -265,8 +265,7 @@ pub fn infer_range(
                 "-M",
                 // A merge is compared with its first parent, so it counts
                 // what it brought in rather than nothing.
-                "-m",
-                "--first-parent",
+                "--diff-merges=first-parent",
                 commit,
             ],
         )?);

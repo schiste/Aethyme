@@ -256,6 +256,9 @@ fn a_range_replay_counts_what_a_merge_brought_in() {
     git(dir, &["add", "-A"]);
     git(dir, &["commit", "-qm", "migration"]);
     git(dir, &["checkout", "-q", "main"]);
+    write(dir, "server/main.py", "x\n");
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-qm", "main change"]);
     git(
         dir,
         &["merge", "-q", "--no-ff", "-m", "merge topic", "topic"],
@@ -264,6 +267,10 @@ fn a_range_replay_counts_what_a_merge_brought_in() {
     let report = infer_range(dir, &file(), "HEAD^1..HEAD").unwrap();
     assert_eq!(report.commits, 2, "{report:?}");
     assert_eq!(report.profiles.get("isolated"), Some(&2), "{report:?}");
+    assert!(
+        !report.top_rule.contains_key("backend"),
+        "second-parent changes must not enter the merge diff: {report:?}"
+    );
 }
 
 /// A raised minimum retires a cheaper environment only after the new one is
