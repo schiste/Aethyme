@@ -596,6 +596,13 @@ destroy = "true"
             .iter()
             .any(|d| d.code == "port_env_collision")
     );
+    let non_listening = text.replace("ports = [\"api\", \"api\"]", "ports = [\"api\"]")
+        + "\n[[profiles.components]]\nname = \"stack_api\"\nruntime = \"hooks\"\nprovision = \"true\"\ndestroy = \"true\"\n";
+    assert!(
+        diagnostics(&non_listening)
+            .iter()
+            .any(|d| d.code == "port_env_collision")
+    );
 }
 
 #[test]

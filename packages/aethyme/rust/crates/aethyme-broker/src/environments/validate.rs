@@ -816,7 +816,6 @@ fn validate_profile(
     let mut port_names: BTreeSet<String> = profile
         .components
         .iter()
-        .filter(|component| component.listen)
         .map(|component| env_suffix(&component.name))
         .collect();
     for component in &profile.components {
