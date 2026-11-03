@@ -807,3 +807,23 @@ fn an_entry_path_is_appended_to_the_component_url() {
     assert_eq!(vars["AETHYME_ENV_URL_API"], "http://127.0.0.1:4000/o/");
     assert_eq!(vars["AETHYME_ENV_PORT_API"], "4000");
 }
+
+#[test]
+fn named_component_ports_cannot_collide() {
+    let text = r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "stack"
+runtime = "hooks"
+ports = ["api", "api"]
+provision = "true"
+destroy = "true"
+"#;
+    assert!(
+        diagnostics(text)
+            .iter()
+            .any(|d| d.code == "port_env_collision")
+    );
+}

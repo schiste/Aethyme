@@ -813,6 +813,12 @@ fn validate_profile(
     let mut names = BTreeSet::new();
     let mut suffixes: BTreeMap<String, &str> = BTreeMap::new();
     let mut listening = 0usize;
+    let mut port_names: BTreeSet<String> = profile
+        .components
+        .iter()
+        .filter(|component| component.listen)
+        .map(|component| env_suffix(&component.name))
+        .collect();
     for component in &profile.components {
         let name = component.name.as_str();
         if !valid_name(name) {
@@ -853,6 +859,30 @@ fn validate_profile(
         if component.listen {
             listening += 1;
         }
+        for port in &component.ports {
+            listening += 1;
+            if !valid_name(port) {
+                c.push(
+                    "invalid_name",
+                    p,
+                    Some(name),
+                    Some("ports"),
+                    format!("invalid port name {port:?}"),
+                    "use [a-z][a-z0-9_-]{0,31}",
+                );
+            }
+            let suffix = env_suffix(&format!("{name}_{port}"));
+            if !port_names.insert(suffix.clone()) {
+                c.push(
+                    "port_env_collision",
+                    p,
+                    Some(name),
+                    Some("ports"),
+                    format!("port variable AETHYME_ENV_PORT_{suffix} is declared more than once"),
+                    "rename the component or port to make port variables unique",
+                );
+            }
+        }
         validate_component(c, file, profile, component);
     }
     let range = usize::from(file.ports.end.saturating_sub(file.ports.start)) + 1;
@@ -862,7 +892,7 @@ fn validate_profile(
             p,
             None,
             Some("ports"),
-            format!("{listening} listening components but the port range holds {range}"),
+            format!("{listening} requested ports but the port range holds {range}"),
             "widen [ports]",
         );
     }

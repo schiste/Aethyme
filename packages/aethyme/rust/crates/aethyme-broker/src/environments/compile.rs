@@ -153,6 +153,9 @@ pub struct CompiledComponent {
     /// Resource key of this component's port in the reservation lease.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port_key: Option<String>,
+    /// Reservation keys for additional named ports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_port_keys: Vec<String>,
     pub routed: bool,
     pub env: BTreeMap<String, String>,
     pub pass_env: Vec<String>,
@@ -344,6 +347,11 @@ fn compile_component(file: &EnvironmentsFile, component: &ComponentSpec) -> Comp
         },
         health: component.health.clone(),
         port_key: component.listen.then(|| port_key(&component.name)),
+        extra_port_keys: component
+            .ports
+            .iter()
+            .map(|name| port_key(&format!("{}_{name}", component.name)))
+            .collect(),
         routed: component.routed(),
         env: component.env.clone(),
         pass_env: component.pass_env.clone(),
@@ -413,7 +421,10 @@ pub fn select_components(compiled: &mut CompiledEnvironment, selected: &BTreeSet
         .into_iter()
         .partition(|c| keep.contains(&c.name));
     compiled.components = kept;
-    compiled.reserved_port_keys = dropped.into_iter().filter_map(|c| c.port_key).collect();
+    compiled.reserved_port_keys = dropped
+        .into_iter()
+        .flat_map(|c| c.port_key.into_iter().chain(c.extra_port_keys))
+        .collect();
     compiled.digest = snapshot_digest(compiled);
 }
 
@@ -455,7 +466,7 @@ impl CompiledEnvironment {
         let keys = self
             .components
             .iter()
-            .filter_map(|c| c.port_key.as_ref())
+            .flat_map(|c| c.port_key.iter().chain(&c.extra_port_keys))
             .chain(&self.reserved_port_keys);
         for key in keys {
             resources.push(HostResourceRequirement {
@@ -519,6 +530,11 @@ impl CompiledEnvironment {
             if other.port_key.is_some() {
                 names.push(format!("AETHYME_ENV_PORT_{}", env_suffix(&other.name)));
                 names.push(format!("AETHYME_ENV_URL_{}", env_suffix(&other.name)));
+            }
+            for key in &other.extra_port_keys {
+                if let Some(name) = key.strip_prefix("port_") {
+                    names.push(format!("AETHYME_ENV_PORT_{}", env_suffix(name)));
+                }
             }
             names.push(format!("AETHYME_ENV_RECEIPT_{}", env_suffix(&other.name)));
         }
