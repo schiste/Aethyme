@@ -92,7 +92,7 @@ impl DriverContext<'_> {
             &self.component.pass_env,
             &self.vars(),
             &self.log(),
-            self.hook_timeout,
+            self.component.hook_timeout(self.hook_timeout),
         )
         .map(|outcome| outcome.receipt)
     }
@@ -655,11 +655,28 @@ impl Driver for ComposeDriver {
         let (engine, compose) = Self::engine(ctx)?;
         // `down` by project name works without the compose file, so a
         // missing worktree does not strand the project.
-        compose.run(
-            &["-p", &project, "down", "-v", "--remove-orphans"],
-            ctx.cwd(),
-            &ctx.vars(),
-        )?;
+        let down = ["-p", project.as_str(), "down", "-v", "--remove-orphans"];
+        compose.run(&down, ctx.cwd(), &ctx.vars())?;
+        // `down` leaves containers it did not create from a service, such
+        // as a still-running `compose run` one-off a killed hook started
+        // under this project. They carry this project's exact label, so
+        // they are ours: remove them, then `down` again so the network and
+        // volumes they held go too.
+        let stragglers = Self::project_ids(&engine, ctx, &project)?;
+        if !stragglers.is_empty() {
+            for id in &stragglers {
+                engine.run(&engine.remove_args(id), ctx.cwd(), &BTreeMap::new())?;
+            }
+            append_log(
+                &ctx.log(),
+                &format!(
+                    "[aethyme] {}: removed {} container(s) of compose project {project} that down left behind\n",
+                    ctx.component.name,
+                    stragglers.len()
+                ),
+            );
+            compose.run(&down, ctx.cwd(), &ctx.vars())?;
+        }
         let left = Self::project_ids(&engine, ctx, &project)?;
         if !left.is_empty() {
             return Err(DriverError::Engine(format!(

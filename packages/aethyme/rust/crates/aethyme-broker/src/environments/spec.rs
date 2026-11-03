@@ -366,6 +366,11 @@ pub struct ComponentSpec {
     pub pass_env: Vec<String>,
     #[serde(default)]
     pub stop_grace_seconds: Option<u64>,
+    /// How long each of this component's hooks (`provision`, `build`,
+    /// `template`, `stop`, `destroy`, ...) may run before its process group
+    /// is stopped. Defaults to the host's 600 s.
+    #[serde(default)]
+    pub hook_timeout_seconds: Option<u64>,
     // Driver-specific fields.
     /// `compose`: the compose file, relative to the worktree root.
     #[serde(default)]
