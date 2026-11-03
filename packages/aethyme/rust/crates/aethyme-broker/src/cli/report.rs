@@ -700,49 +700,6 @@ fn sub_issue_database_id(value: &serde_json::Value, number: u64) -> Option<u64> 
     value.get("id")?.as_u64().filter(|id| *id > 0)
 }
 
-#[cfg(test)]
-mod sub_issue_tests {
-    use super::sub_issue_database_id;
-
-    #[test]
-    fn rejects_invalid_child_lists_before_github_access() {
-        let args = [
-            "sub-issue",
-            "add",
-            "42",
-            "42",
-            "--repo",
-            "owner/repo",
-            "--session",
-            "7",
-            "--reason",
-            "user requested issue links",
-        ]
-        .map(str::to_owned);
-        let parsed = super::super::parse(&args).expect("arguments parse");
-        assert!(super::super::validate_flags("issues", &parsed).is_ok());
-        assert!(super::run_sub_issue(parsed).is_err());
-    }
-
-    #[test]
-    fn accepts_only_matching_issue_database_ids() {
-        let issue = serde_json::json!({"number": 42, "id": 9001});
-        assert_eq!(sub_issue_database_id(&issue, 42), Some(9001));
-        assert_eq!(sub_issue_database_id(&issue, 43), None);
-        assert_eq!(
-            sub_issue_database_id(&serde_json::json!({"number": 42, "id": 0}), 42),
-            None
-        );
-        assert_eq!(
-            sub_issue_database_id(
-                &serde_json::json!({"number": 42, "id": 9001, "pull_request": {}}),
-                42
-            ),
-            None
-        );
-    }
-}
-
 /// Resolve issue numbers before sending narrowly scoped, journaled mutations.
 fn run_sub_issue(parsed: Parsed) -> Result<(), UsageError> {
     let usage = "issues sub-issue add|remove <parent> <child>... --repo <owner/name> --session <id> --reason <authorization>";
@@ -1115,4 +1072,47 @@ pub(super) fn run_outcomes(parsed: Parsed) -> Result<(), UsageError> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod sub_issue_tests {
+    use super::sub_issue_database_id;
+
+    #[test]
+    fn rejects_invalid_child_lists_before_github_access() {
+        let args = [
+            "sub-issue",
+            "add",
+            "42",
+            "42",
+            "--repo",
+            "owner/repo",
+            "--session",
+            "7",
+            "--reason",
+            "user requested issue links",
+        ]
+        .map(str::to_owned);
+        let parsed = super::super::parse(&args).expect("arguments parse");
+        assert!(super::super::validate_flags("issues", &parsed).is_ok());
+        assert!(super::run_sub_issue(parsed).is_err());
+    }
+
+    #[test]
+    fn accepts_only_matching_issue_database_ids() {
+        let issue = serde_json::json!({"number": 42, "id": 9001});
+        assert_eq!(sub_issue_database_id(&issue, 42), Some(9001));
+        assert_eq!(sub_issue_database_id(&issue, 43), None);
+        assert_eq!(
+            sub_issue_database_id(&serde_json::json!({"number": 42, "id": 0}), 42),
+            None
+        );
+        assert_eq!(
+            sub_issue_database_id(
+                &serde_json::json!({"number": 42, "id": 9001, "pull_request": {}}),
+                42
+            ),
+            None
+        );
+    }
 }
