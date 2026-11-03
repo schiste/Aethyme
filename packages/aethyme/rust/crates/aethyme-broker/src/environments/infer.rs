@@ -199,8 +199,12 @@ pub fn diff_base(worktree: &Path) -> Option<String> {
     None
 }
 
-/// The recorded checkout HEAD at session creation, when this worktree is broker-managed.
-fn session_start(worktree: &Path) -> Result<Option<String>, String> {
+/// The base a broker-managed session is measured from: its recorded
+/// `diff_base`, which `broker sync`, repair rebases and `start --reuse` move
+/// forward, else the immutable checkout HEAD recorded at creation. Reading
+/// only the creation HEAD would count every default-branch commit a sync
+/// merged in as the session's own change (#1400).
+fn session_base(worktree: &Path) -> Result<Option<String>, String> {
     let checkout = crate::GitRepo::discover(worktree).map_err(|e| e.to_string())?;
     let main = checkout.main_root().map_err(|e| e.to_string())?;
     let database = crate::broker_db_path(&main).map_err(|e| e.to_string())?;
@@ -213,9 +217,10 @@ fn session_start(worktree: &Path) -> Result<Option<String>, String> {
         .map_err(|e| e.to_string())?;
     match session {
         Some(session) => session
-            .adopted_head
+            .diff_base
+            .or(session.adopted_head)
             .map(Some)
-            .ok_or_else(|| format!("session {} has no recorded start commit", session.id)),
+            .ok_or_else(|| format!("session {} has no recorded base commit", session.id)),
         None => Ok(None),
     }
 }
@@ -226,7 +231,7 @@ fn session_start(worktree: &Path) -> Result<Option<String>, String> {
 /// changes against `HEAD` count; the caller warns, since committed changes
 /// are then invisible.
 pub fn changed_paths(worktree: &Path) -> Result<(Option<String>, Vec<String>), String> {
-    let base = match session_start(worktree)? {
+    let base = match session_base(worktree)? {
         Some(base) => Some(base),
         None => diff_base(worktree),
     };
