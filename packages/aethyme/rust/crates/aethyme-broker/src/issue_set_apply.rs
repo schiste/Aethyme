@@ -54,6 +54,19 @@ pub(crate) fn apply(
     repository: &str,
     backend: &mut dyn IssueSetBackend,
 ) -> Result<BTreeMap<String, u64>, String> {
+    let parts: Vec<_> = repository.split('/').collect();
+    if parts.len() != 2
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || matches!(*part, "." | "..")
+                || !part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        })
+    {
+        return Err("invalid repository; expected owner/name".into());
+    }
+    let repository = repository.to_ascii_lowercase();
     std::fs::create_dir_all(run_dir)
         .map_err(|e| format!("cannot create journal directory: {e}"))?;
     let digest = format!(
@@ -75,7 +88,7 @@ pub(crate) fn apply(
             serde_json::from_slice(&bytes).map_err(|e| format!("invalid issue-set journal: {e}"))?
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Journal {
-            repository: repository.to_owned(),
+            repository: repository.clone(),
             set_id: manifest.manifest.set_id.clone(),
             ..Journal::default()
         },
@@ -268,6 +281,11 @@ depends_on = ["epic"]
         );
         assert_eq!(
             apply(&manifest, dir.path(), "owner/repo", &mut backend).unwrap(),
+            numbers
+        );
+        assert_eq!(backend.create_calls, 2);
+        assert_eq!(
+            apply(&manifest, dir.path(), "Owner/Repo", &mut backend).unwrap(),
             numbers
         );
         assert_eq!(backend.create_calls, 2);
