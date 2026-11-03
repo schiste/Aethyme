@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from git_worktree_config import Experiment, case
+from git_ref_backends import probe_legacy_client
 
 
 class MissingFormatWrite(Experiment):
@@ -73,6 +74,33 @@ class WorktreeConfigControls(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "750-command budget"):
             ex.run(self.playground, "--version")
         self.assertFalse((self.output / "commands.jsonl").exists())
+
+
+class LegacyReftableRefusalControls(unittest.TestCase):
+    def test_requires_working_control_and_extension_refusal(self):
+        class FakeExperiment:
+            def __init__(self, files_result, reftable_result):
+                self.files_result = files_result
+                self.reftable_result = reftable_result
+
+            def run(self, repo, *args, git=None, required=True):
+                if git is None:
+                    return {"returncode": 0, "stdout": "refs/heads/main abc\n", "stderr": ""}
+                return self.files_result if repo == "files" else self.reftable_result
+
+        good = {"returncode": 0, "stdout": "refs/heads/main abc\n", "stderr": ""}
+        refusal = {"returncode": 128, "stdout": "", "stderr": "unknown repository extension: refStorage"}
+        self.assertEqual(probe_legacy_client(FakeExperiment(good, refusal), "files", "reftable", "old-git"),
+                         {"files_control": "matched", "reftable": "refused_refstorage_extension"})
+        for bad in ({"returncode": 1, "stdout": "", "stderr": "files failed"},
+                    {"returncode": 0, "stdout": "wrong refs\n", "stderr": ""}):
+            with self.subTest(bad=bad), self.assertRaisesRegex(RuntimeError, "files-backed control"):
+                probe_legacy_client(FakeExperiment(bad, refusal), "files", "reftable", "old-git")
+        for bad in ({"returncode": 0, "stdout": "abc\n", "stderr": ""},
+                    {"returncode": 1, "stdout": "", "stderr": "permission denied"},
+                    {"returncode": 1, "stdout": "", "stderr": "unknown extension: other"}):
+            with self.subTest(bad=bad), self.assertRaisesRegex(RuntimeError, "refStorage extension"):
+                probe_legacy_client(FakeExperiment(good, bad), "files", "reftable", "old-git")
 
 
 if __name__ == "__main__":
