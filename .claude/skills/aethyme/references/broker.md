@@ -254,6 +254,15 @@ blocked.
    directories bottom-up; after publishing the final archive, sync its
    directory, parent and storage anchor. Keep the source if any sync fails.
 
+   Before launching a temporary hold, persist its unique run token and
+   known backup location. Capture helper or template bytes once, hash that
+   buffer, and execute or generate from those same bytes. After the child
+   is reaped, recover and validate its durable applied receipt even if
+   waiting was interrupted or stdout was truncated; compare-and-swap only
+   values proven owned by this run, and restore only after detached workers
+   settle. Keep unresolved intent fenced, report it, and do not start
+   overlapping work.
+
    Compound filesystem guards should name the failed predicate (file type,
    owner, zero/multiple links, group/world write, or identity change) without
    logging raw metadata values; keep a refusal regression for each category.
