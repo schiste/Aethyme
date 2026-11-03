@@ -1,0 +1,2 @@
+cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-contracts --test project_identity_vectors -- competing_new_files_at_the_same_path_conflict_even_with_equal_bytes
+expect=fail

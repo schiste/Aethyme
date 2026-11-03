@@ -1,0 +1,217 @@
+{
+  "schema": "aethyme.local-qualification-artifact-ledger.v1",
+  "package": "L1 identities (#652): T03 two-clone binding and T05 FileId transitions",
+  "recorded_at": "2026-11-03",
+  "scope": [
+    "T03 explicit descriptor binding aligns FileIds; independent same-origin enrollment does not",
+    "T03 public CLI independent enrollment, association propose/confirm/reopen/revoke",
+    "T05 rename/copy/split/competing-path FileId transitions",
+    "ContributionRevision immutability"
+  ],
+  "qualification_boundary": "Experimental v0 formats; host-local macOS run; no authority, verification, acceptance or publication decision.",
+  "qualified_source": {
+    "commit": "2f15b81a6630cab897d29ec43e3f9af2dd66c89a",
+    "tree": "01f756d43ab0fcf86fbd47877dc3a9d604682d2e",
+    "clean_at_runtime": true,
+    "note": "Source tree under packages/aethyme/rust was clean at the commit for every run; only docs were uncommitted."
+  },
+  "host": {
+    "os": "macOS (Darwin 27.2.0, arm64)",
+    "toolchain": "rustc/cargo 1.96.0",
+    "jobs": 4
+  },
+  "test_totals": {
+    "positive_pre": {
+      "passed": 27,
+      "failed": 0
+    },
+    "positive_post": {
+      "passed": 27,
+      "failed": 0
+    },
+    "contribution_revision_integration": {
+      "passed": 8,
+      "failed": 0
+    },
+    "mutation_controls": {
+      "intended_failures": 4,
+      "each_failed_exactly_one_named_test": true,
+      "exact_restoration": true
+    }
+  },
+  "runs": [
+    {
+      "run_id": "01-broker-identity-pre",
+      "command": "cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-broker --lib -- collaboration_cli::contribution collaboration_cli::project collaboration_identity_store",
+      "expect": "pass",
+      "exit": 0,
+      "passed": 17,
+      "failed": 0,
+      "log": "attempts/01-broker-identity-pre/log",
+      "log_sha256": "22763692f902eac84261100f3257886c25dec96d07b0aad09d2248c54e0d0842",
+      "result_matches_expectation": true
+    },
+    {
+      "run_id": "02-contracts-t05-vectors-pre",
+      "command": "cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-contracts --test project_identity_vectors",
+      "expect": "pass",
+      "exit": 0,
+      "passed": 9,
+      "failed": 0,
+      "log": "attempts/02-contracts-t05-vectors-pre/log",
+      "log_sha256": "005d54e1033824e5d7810ad5dc820a2a7f064a3098605266edbf220f1f842594",
+      "result_matches_expectation": true
+    },
+    {
+      "run_id": "03-contracts-revision-pre",
+      "command": "cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-contracts --lib -- contribution_revision",
+      "expect": "pass",
+      "exit": 0,
+      "passed": 0,
+      "failed": 0,
+      "log": "attempts/03-contracts-revision-pre/log",
+      "log_sha256": "4bfdf302a348634a36abcb04bcd6d96cf10009f530c43bee49b5c876519e682a",
+      "result_matches_expectation": true,
+      "credit": "none: filter matched 0 tests (revision tests are the integration target, see run 14)"
+    },
+    {
+      "run_id": "04-cli-t03-association-pre",
+      "command": "cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --test collab_project_association -- --test-threads=1",
+      "expect": "pass",
+      "exit": 0,
+      "passed": 1,
+      "failed": 0,
+      "log": "attempts/04-cli-t03-association-pre/log",
+      "log_sha256": "7807aee0ad79e1c4de9349402a8300da9b66abc99b778bd4b2dd20c6b27848e9",
+      "result_matches_expectation": true
+    },
+    {
+      "run_id": "05-clippy-scoped",
+      "command": "cargo clippy --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-broker -p aethyme-contracts --all-targets -- -D warnings",
+      "expect": "pass",
+      "exit": 101,
+      "passed": 0,
+      "failed": 0,
+      "log": "attempts/05-clippy-scoped/log",
+      "log_sha256": "5b3bc4a0fe5b07de847f49187b9d7aac3322ddcb61718a8455645e598c72b2b1",
+      "result_matches_expectation": false,
+      "credit": "none: fails only on a pre-existing collapsible_if lint in crates/aethyme-broker/src/cli/gc_storage.rs:1260 (local clippy 1.96 newer than CI); no lint in files this package changes"
+    },
+    {
+      "run_id": "06-mutation-fileid-ignores-project",
+      "command": "cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-broker --lib -- same_origin_clone_enrolled_independently",
+      "expect": "fail",
+      "exit": 101,
+      "passed": 0,
+      "failed": 1,
+      "log": "attempts/06-mutation-fileid-ignores-project/log",
+      "log_sha256": "ed6f63a1f27ed7b3b609cc43e2ebeb9f8c7ae1e884e6c4352ac991a760ee0f76",
+      "result_matches_expectation": true,
+      "mutation_diff": "attempts/mutation-fileid-ignores-project.diff",
+      "failed_tests": [
+        "collaboration_cli::contribution::tests::same_origin_clone_enrolled_independently_gets_disjoint_file_identities"
+      ]
+    },
+    {
+      "run_id": "07-mutation-fileid-ignores-project-vector",
+      "command": "cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-contracts --test project_identity_vectors -- file_ids_are_project_scoped",
+      "expect": "fail",
+      "exit": 101,
+      "passed": 0,
+      "failed": 1,
+      "log": "attempts/07-mutation-fileid-ignores-project-vector/log",
+      "log_sha256": "c9557e1d055387b5284dd21d4aa8dfbd8f74829303777300f15eb6aefb2640b7",
+      "result_matches_expectation": true,
+      "mutation_diff": "attempts/mutation-fileid-ignores-project-vector.diff",
+      "failed_tests": [
+        "file_ids_are_project_scoped_and_repeatable_for_the_same_project_id"
+      ]
+    },
+    {
+      "run_id": "08-mutation-uncertain-rename-claimed-explicit",
+      "command": "cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-contracts --test project_identity_vectors -- exact_rename_preserves_id_but_unannotated_rename_stays_uncertain",
+      "expect": "fail",
+      "exit": 101,
+      "passed": 0,
+      "failed": 1,
+      "log": "attempts/08-mutation-uncertain-rename-claimed-explicit/log",
+      "log_sha256": "e15d134134a156b7c7a2524cea06a9ce841b6ad6c7aed7d0d9d05551da26046d",
+      "result_matches_expectation": true,
+      "mutation_diff": "attempts/mutation-uncertain-rename-claimed-explicit.diff",
+      "failed_tests": [
+        "exact_rename_preserves_id_but_unannotated_rename_stays_uncertain"
+      ]
+    },
+    {
+      "run_id": "09-mutation-competing-path-unchecked",
+      "command": "cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-contracts --test project_identity_vectors -- competing_new_files_at_the_same_path_conflict_even_with_equal_bytes",
+      "expect": "fail",
+      "exit": 101,
+      "passed": 0,
+      "failed": 1,
+      "log": "attempts/09-mutation-competing-path-unchecked/log",
+      "log_sha256": "21cc16abec03c289fdb536d30e4bab99cc9110596ab50ddf5ecf5a3bdcf803b4",
+      "result_matches_expectation": true,
+      "mutation_diff": "attempts/mutation-competing-path-unchecked.diff",
+      "failed_tests": [
+        "competing_new_files_at_the_same_path_conflict_even_with_equal_bytes"
+      ]
+    },
+    {
+      "run_id": "10-broker-identity-post",
+      "command": "cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-broker --lib -- collaboration_cli::contribution collaboration_cli::project collaboration_identity_store",
+      "expect": "pass",
+      "exit": 0,
+      "passed": 17,
+      "failed": 0,
+      "log": "attempts/10-broker-identity-post/log",
+      "log_sha256": "88e8a1b83712414f8dcfe095ca2561ddf16dc1916b1d23b03cda33ebe554dd7a",
+      "result_matches_expectation": true
+    },
+    {
+      "run_id": "11-contracts-t05-vectors-post",
+      "command": "cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-contracts --test project_identity_vectors",
+      "expect": "pass",
+      "exit": 0,
+      "passed": 9,
+      "failed": 0,
+      "log": "attempts/11-contracts-t05-vectors-post/log",
+      "log_sha256": "0cade404de570a666471ee7105031e7132229e575f6fec0fb2de7e7bfe02961f",
+      "result_matches_expectation": true
+    },
+    {
+      "run_id": "12-contracts-revision-post",
+      "command": "cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-contracts --lib -- contribution_revision",
+      "expect": "pass",
+      "exit": 0,
+      "passed": 0,
+      "failed": 0,
+      "log": "attempts/12-contracts-revision-post/log",
+      "log_sha256": "41b89966ab8d9171bc6a61edda59b68b09c734d16a923a72b373387dc6072e22",
+      "result_matches_expectation": true,
+      "credit": "none: filter matched 0 tests (revision tests are the integration target, see run 14)"
+    },
+    {
+      "run_id": "13-cli-t03-association-post",
+      "command": "cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --test collab_project_association -- --test-threads=1",
+      "expect": "pass",
+      "exit": 0,
+      "passed": 1,
+      "failed": 0,
+      "log": "attempts/13-cli-t03-association-post/log",
+      "log_sha256": "5b9ee90b3e9095e1b650c17e00d63f98f474b48e7b1651937bfa52ec59177b92",
+      "result_matches_expectation": true
+    },
+    {
+      "run_id": "14-contracts-revision-integration",
+      "command": "cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-contracts --test contribution_revision",
+      "expect": "pass",
+      "exit": 0,
+      "passed": 8,
+      "failed": 0,
+      "log": "attempts/14-contracts-revision-integration/log",
+      "log_sha256": "6aa180f3de669cb2e5c9e87a4a39e6ba640faa85b8bd93962ada28e2b221a2d2",
+      "result_matches_expectation": true
+    }
+  ]
+}

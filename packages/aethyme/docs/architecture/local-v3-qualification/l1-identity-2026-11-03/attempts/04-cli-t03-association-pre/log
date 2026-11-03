@@ -1,0 +1,51 @@
+   Compiling serde v1.0.229
+   Compiling zerocopy v0.8.42
+   Compiling zerocopy-derive v0.8.42
+   Compiling aethyme-engine v0.8.54 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/qualify-local-v3-l1-identities-and-align/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling ciborium-io v0.2.2
+   Compiling aethyme-broker v0.8.54 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/qualify-local-v3-l1-identities-and-align/packages/aethyme/rust/crates/aethyme-broker)
+   Compiling itertools v0.10.5
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling oxc_index v4.1.0
+   Compiling toml_edit v0.22.27
+   Compiling oxc_syntax v0.125.0
+   Compiling aethyme-graph-schema v0.8.54 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/qualify-local-v3-l1-identities-and-align/packages/aethyme/rust/crates/aethyme-graph-schema)
+   Compiling oxc_ast v0.125.0
+   Compiling toml v0.8.23
+   Compiling bincode v1.3.3
+   Compiling aethyme-config v0.8.54 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/qualify-local-v3-l1-identities-and-align/packages/aethyme/rust/crates/aethyme-config)
+   Compiling aethyme-cli v0.8.54 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/qualify-local-v3-l1-identities-and-align/packages/aethyme/rust/crates/aethyme-cli)
+   Compiling aethyme-graph-storage v0.8.54 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/qualify-local-v3-l1-identities-and-align/packages/aethyme/rust/crates/aethyme-graph-storage)
+   Compiling aethyme-enhance v0.8.54 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/qualify-local-v3-l1-identities-and-align/packages/aethyme/rust/crates/aethyme-enhance)
+   Compiling ahash v0.8.12
+   Compiling hashbrown v0.14.5
+   Compiling rowan v0.15.18
+   Compiling aethyme-producers v0.8.54 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/qualify-local-v3-l1-identities-and-align/packages/aethyme/rust/crates/aethyme-producers)
+   Compiling ra_ap_syntax v0.0.331
+   Compiling hashlink v0.9.1
+   Compiling half v2.7.1
+   Compiling rusqlite v0.32.1
+   Compiling ciborium-ll v0.2.2
+   Compiling cast v0.3.0
+   Compiling criterion-plot v0.5.0
+   Compiling ciborium v0.2.2
+   Compiling aethyme-quality v0.8.54 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/qualify-local-v3-l1-identities-and-align/packages/aethyme/rust/crates/aethyme-quality)
+   Compiling oxc_ecmascript v0.125.0
+   Compiling oxc_ast_visit v0.125.0
+   Compiling tinytemplate v1.2.1
+   Compiling oxc_parser v0.125.0
+   Compiling is-terminal v0.4.17
+   Compiling anes v0.1.6
+   Compiling oorandom v11.1.5
+   Compiling aethyme-testkit v0.1.0 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/qualify-local-v3-l1-identities-and-align/packages/aethyme/rust/crates/aethyme-testkit)
+   Compiling criterion v0.5.1
+   Compiling aethyme-graph-indexer v0.8.54 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/qualify-local-v3-l1-identities-and-align/packages/aethyme/rust/crates/aethyme-graph-indexer)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 00s
+     Running tests/collab_project_association.rs (packages/aethyme/rust/target/debug/deps/collab_project_association-e288599c8548ff71)
+
+running 1 test
+test independently_enrolled_playground_clones_confirm_persist_and_revoke_one_local_association ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 79.77s
+

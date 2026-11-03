@@ -1,0 +1,11 @@
+   Compiling aethyme-engine v0.8.54 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/qualify-local-v3-l1-identities-and-align/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-cli v0.8.54 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/qualify-local-v3-l1-identities-and-align/packages/aethyme/rust/crates/aethyme-cli)
+   Compiling aethyme-broker v0.8.54 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/qualify-local-v3-l1-identities-and-align/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.32s
+     Running tests/collab_project_association.rs (packages/aethyme/rust/target/debug/deps/collab_project_association-e288599c8548ff71)
+
+running 1 test
+test independently_enrolled_playground_clones_confirm_persist_and_revoke_one_local_association ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 53.37s
+

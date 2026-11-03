@@ -1,0 +1,2 @@
+cargo clippy --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-broker -p aethyme-contracts --all-targets -- -D warnings
+expect=pass

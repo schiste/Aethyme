@@ -1,0 +1,4 @@
+# Frozen evidence keeps captured bytes unchanged across checkouts.
+attempts/** -text
+summary.txt -text
+source.txt -text

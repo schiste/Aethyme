@@ -1,6 +1,6 @@
 # Local v3 — L1 identity decision record (#652)
 
-Last Updated: 2026-10-16
+Last Updated: 2026-11-03
 
 This record is input to decision **D10** (how identities and exact revision references are
 minted and encoded) and the identity part of **D39** (how existing NodeIds relate to
@@ -8,8 +8,10 @@ portable references). It is a **proposal**, except where "Decided" below says ot
 At the original L1 proposal freeze, E1 (#650) had not yet run. The later bounded E1
 campaign (#755), described in the [E1 profile](local-v3-e1-profile.md), qualifies a
 retained HTML move/edit profile and specific synthesis, consumer and subtraction paths.
-It does not establish generic ProjectId enrollment, FileId transitions or contribution
-lineage. D10 remains open pending the remaining plan evidence.
+That campaign did not itself establish generic ProjectId enrollment, FileId transitions
+or contribution lineage. Those are implemented separately as experimental v0 (commit
+`324a49320`) and qualified in the [L1 identity evidence](local-v3-qualification/l1-identity-2026-11-03/README.md).
+D10 is closed below.
 
 Baseline facts come from the L0 audit (`local-v3-l0/`, slice D): NodeId hashes
 (repo, path, name, kind) and nothing else; there is no FileId; the engine also mints
@@ -29,11 +31,11 @@ renames change them. These are existing semantics and remain unchanged.
 |---|---|---|
 | `SourceSnapshotId` | **Implemented, experimental v0.** Golden vectors from an independent implementation. | `aethyme-contracts::experimental_v0::source_snapshot` |
 | `NodeId` (existing) | **Unchanged.** Body and signature independence now pinned by a test (T65 baseline, #700). | `aethyme-graph-indexer/tests/rust_indexer.rs` |
-| `ProjectId` | Experimental v0 enrollment and approved descriptor binding are implemented; T03 association qualification remains pending. | `aethyme-contracts::experimental_v0::project_identity`; `aethyme-broker::collaboration_cli::project` |
-| `ProjectAssociation` | Experimental v0 exact-record proposal, local confirmation, revocation and fail-closed mapping resolution are implemented; T03 host-lane qualification remains pending. | `aethyme-contracts::experimental_v0::project_association`; `aethyme-broker::collaboration_cli::project_association`; `aethyme-broker::experimental_symbol_mapping` |
-| `FileId` | Proposed below; generic enrollment and rename/copy/split rules remain unqualified after bounded E1. | — |
-| `ContributionId` / `ContributionRevisionId` | Proposed below; generic lineage remains unqualified after the specific bounded E1 inheritance and subtraction cases. | — |
-| `BrokerId` / `SessionRef` | Proposed below; no code. | — |
+| `ProjectId` | **Implemented, experimental v0.** Enrollment and approved descriptor binding; T03 qualified. | `aethyme-contracts::experimental_v0::project_identity`; `aethyme-broker::collaboration_cli::project` |
+| `ProjectAssociation` | **Implemented, experimental v0.** Exact-record proposal, local confirmation, revocation and fail-closed mapping resolution; T03 qualified. | `aethyme-contracts::experimental_v0::project_association`; `aethyme-broker::collaboration_cli::project_association`; `aethyme-broker::experimental_symbol_mapping` |
+| `FileId` | **Implemented, experimental v0.** Enrollment, explicit/uncertain rename, copy, split and competing-path rules; T05 qualified. | `aethyme-contracts::experimental_v0::project_identity`; `aethyme-broker::collaboration_identity_store` |
+| `ContributionId` / `ContributionRevisionId` | **Implemented, experimental v0.** Immutable revisions with exact base/result, file changes, brief and dependencies. | `aethyme-contracts::experimental_v0::contribution_revision`; `aethyme-broker::collaboration_cli::contribution` |
+| `BrokerId` / `SessionRef` | **Deferred.** No portable record consumes them yet; see below. | — |
 | `SymbolRef` | Experimental scoped records and a finite advisory mapping resolver are implemented. No producer emits these records automatically. | `aethyme-contracts::experimental_v0::symbol_identity`; `aethyme-broker::experimental_symbol_mapping` |
 
 ## Common rules
@@ -63,7 +65,7 @@ renames change them. These are existing semantics and remain unchanged.
 | Case and composition | **Faithful (decided 2026-10-09).** Paths differing only by letter case or Unicode composition are distinct, valid entries, as in Git. Materialization (#670) must refuse such collisions explicitly on a case-insensitive or normalizing filesystem. |
 | Not | A Git object id, the graph manifest digest, or execution identity (#670). |
 
-### ProjectId: experimental v0; T03 association qualification pending
+### ProjectId: experimental v0
 
 - **Minted** once, at random, in an explicit enrollment descriptor (`proj:<random 128-bit,
   base32>`). Not derived from URL, path or tree; the current repository key is path-derived
@@ -73,7 +75,7 @@ renames change them. These are existing semantics and remain unchanged.
   independently approved local bindings, never by a matching URL or tree.
 - **Lifecycle:** a rebind is an explicit new descriptor revision, never an edit in place.
 
-### ProjectAssociation: experimental v0; T03 qualification pending
+### ProjectAssociation: experimental v0
 
 - `aethyme collab project association propose --peer-repo <path> [--write]` names the
   exact local and peer ProjectKeys, ProjectIds, committed descriptor RecordIds and anchor
@@ -93,38 +95,51 @@ renames change them. These are existing semantics and remain unchanged.
   explicitly confirm its new RecordId; the old RecordId remains revoked.
 - Associations grant no source permission, execution, acceptance or transitive authority.
 
-### FileId: proposed; generic transition rules remain unqualified
+### FileId: experimental v0
 
-- **Existing files at enrollment:** derived from (ProjectId, enrollment SourceSnapshotId,
-  raw path bytes). The same enrollment always yields the same FileIds.
-- **New files:** minted at random in the proposal that creates them. Two proposals creating
-  the same path is a namespace **conflict**, never resolved by timestamp.
-- **Rename:** an explicit, validated rename keeps the FileId. An inferred rename is
-  recorded as `uncertain` until confirmed. Copy and split create new FileIds linked by
-  `derived_from`.
-- **Unresolved evidence:** E1 #755's retained HTML move/edit case does not decide generic
-  FileId correspondence. T05 still needs explicit enrollment and rename/copy/split/
-  competing-path behavior, including the boundary between inferred and author-confirmed
-  changes.
+- **Existing files at enrollment:** `file:sha256:` over a domain header, ProjectId,
+  enrollment SourceSnapshotId and length-prefixed raw path bytes (`FileId::enrolled`).
+  The same enrollment always yields the same FileIds; a different ProjectId never does.
+  Clones that explicitly bind one approved descriptor therefore share FileIds, and a clone
+  that enrolls on its own does not, even with the same origin URL and bytes (T03).
+- **New files:** derived deterministically from (ProjectId, proposal id, result
+  SourceSnapshotId, ordinal, path) under a separate domain (`FileId::proposed`). The
+  proposal id is unique per proposal, so IDs never collide across proposals, and an exact
+  retry reproduces the same IDs instead of minting new ones. (An earlier draft of this record
+  said "at random"; determinism was chosen so replay is idempotent.) Two proposals creating
+  the same path are a namespace **conflict** (`CompetingPath`), never resolved by timestamp,
+  even with equal bytes.
+- **Rename:** an explicit, validated, unedited rename keeps the FileId (`ExplicitRename`).
+  An unannotated delete/add pair is never treated as a rename; an exact-content match is
+  recorded as `UncertainRename` until confirmed, and an edited rename is not claimed as
+  validated. Copy and split create new FileIds linked by `derived_from`.
+- **Replay:** foreign-project state and a wrong base snapshot are refused; competing
+  histories resolve as unknown (`collaboration_identity_store`).
+- **Out of scope:** cross-project FileId correspondence. Two separate projects are related
+  only through a `ProjectAssociation` and explicit symbol mapping records, never by path.
 
-### ContributionId and ContributionRevisionId: proposed; generic lineage remains unqualified
+### ContributionId and ContributionRevisionId: experimental v0
 
-- **ContributionId:** minted at random for one logical submitted intent under an
+- **ContributionId:** `contrib:<random 128-bit base32>`, minted at random for one logical submitted intent under an
   authorized objective. Not a task ID, and not a promise that the contribution can later be
   removed from a synthesized descendant.
 - **ContributionRevisionId:** a digest over the canonical record of one immutable revision:
   exact base and result `SourceSnapshotId`s, declared dependencies (as revision IDs),
   brief, and metadata. A metadata- or brief-only change is a new revision. Consumers pin a
   revision, never "latest". The record layout is #653's.
-- **Unresolved evidence:** E1 #755 validates selected inherited-base, consumer and
-  subtraction cases. It does not define generic lineage or arbitrary subtraction; the
-  broader FX03/FX07 evidence remains open.
+- **Scope:** identity and immutability are qualified here. Arbitrary subtraction from a
+  synthesized descendant is not promised; composition lineage is E1's (#650).
 
-### BrokerId and SessionRef: proposed
+### BrokerId and SessionRef: deferred
 
-- **BrokerId** is minted at random per broker installation. **SessionRef** is
-  (BrokerId, local integer session id). The integer alone is neither unique nor a
-  permission, and broker session ids are already per repository.
+- **Design, unchanged:** BrokerId is minted at random per broker installation;
+  SessionRef is (BrokerId, local integer session id). The integer alone is neither unique
+  nor a permission, and broker session ids are already per repository.
+- **Why deferred:** no portable record refers to a broker or session today, and the
+  Coordination service that would need one is out of Local scope. Minting an identity no
+  reader consumes would freeze a format without a consumer (D32). The per-repository UUID
+  marker in `aethyme-broker::store::repository_identity` stays a local storage key. Reopen
+  when the first cross-broker record needs to name its origin.
 
 ### SymbolRef: experimental v0; producer integration remains out of scope
 
@@ -174,16 +189,31 @@ renames change them. These are existing semantics and remain unchanged.
 - **Common encoding rules (2026-10-09): accepted as the D10 direction.** Self-describing
   `<scheme>:` identities, algorithm-tagged SHA-256 digests, canonical-only parsing, and
   locators kept separate from identities. #653 (records) and #655 (analysis envelope)
-  build on them. D10 remains open until the remaining plan evidence, including project
-  authority binding and generic FileId/contribution transitions, is qualified.
+  build on them.
+
+## D10 closure (confirmed 2026-11-03)
+
+**Status: `accepted_with_evidence`**, confirmed by the maintainer on 2026-11-03 together with
+the deterministic new-file FileId rule and the BrokerId/SessionRef deferral. Project authority binding, generic FileId
+transitions and contribution revisions are implemented and qualified in the
+[L1 identity evidence](local-v3-qualification/l1-identity-2026-11-03/README.md).
+
+- **Evidence substitution:** the plan asks for canonical Rust/TypeScript fixtures. TypeScript
+  parity stays deferred until a real TypeScript consumer exists (see T01). The Rust vectors
+  plus the independent Python oracle (`aethyme-contracts/fixtures/experimental-v0/d10-independent/`)
+  are the second implementation instead.
+- **Limits:** experimental v0 formats, not frozen (D32). BrokerId/SessionRef deferred as
+  above. Cross-project FileId correspondence is out of scope.
+- **Reopen triggers:** a real TypeScript or Worker consumer; the first cross-broker record;
+  a change to any identity preimage.
 
 ## Tests
 
 | Plan test | State |
 |---|---|
 | T01 (canonical golden vectors) | Rust canonical vectors for source snapshots, records and analysis are present and independently checked. TypeScript parity is deferred until a real TS consumer exists; it is not evidence for unimplemented TS behavior. |
-| T03 (two clones) | Implementation and process-level CLI coverage added; qualification pending the focused host-lane run. The test starts from two clones of one origin commit/tree, then uses the real CLI enrollment, binding, proposal, confirmation, reopen and revocation routes. |
-| T05 (rename, copy, split, competing paths) | Pending: needs generic FileId enrollment and explicit rename/copy/split/competing-path behavior. The bounded E1 move/edit profile does not qualify identity transitions. |
+| T03 (two clones) | **Qualified.** Clones that explicitly bind one approved descriptor resolve identical FileId maps; a same-origin clone that enrolls on its own gets a different ProjectId and disjoint FileIds; the public CLI test covers independent enrollment, binding, association proposal, confirmation, reopen and revocation. See [L1 identity evidence](local-v3-qualification/l1-identity-2026-11-03/README.md). |
+| T05 (rename, copy, split, competing paths) | **Qualified.** Contract vectors cover exact versus uncertain rename, edited rename, copy/split derivation, competing new files and renames, and foreign or wrong-base state. See [L1 identity evidence](local-v3-qualification/l1-identity-2026-11-03/README.md). |
 | T65 (body edit keeps NodeId, revision changes) | Baseline done (#700). The "revision binds the exact input" half is #655's envelope. |
 | T66 (scoped symbols, clone mapping) | The bounded AQ0 fixture is source-qualified: 4/4 actual-clone tests, including NodeId preservation, plus 3/3 symbol-vector tests. The adapter remains advisory and no producer integration is claimed. See [AQ0 evidence](local-v3-qualification/aq0-symbol-identity-2026-10-16/README.md). |
 | T78 (conservative baseline degradation) | Timeout, omitted-language, truncation, unavailable-producer and stale-view cases retain explicit conservative outcomes in the independent analysis vectors; the final vector target passed 6/6. See [AQ0 evidence](local-v3-qualification/aq0-symbol-identity-2026-10-16/README.md). |
