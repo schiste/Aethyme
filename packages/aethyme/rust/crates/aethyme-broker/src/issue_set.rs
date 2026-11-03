@@ -9,6 +9,8 @@ use std::path::Path;
 use serde::Deserialize;
 
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
+// Leave a conservative margin for the generated marker and references.
+const MAX_RENDERED_BODY_BYTES: usize = 60_000;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -146,6 +148,7 @@ impl ValidatedManifest {
                 ));
             }
             let mut rest = body.as_str();
+            let mut max_rendered_bytes = body.len();
             while let Some((_, after)) = rest.split_once("{{") {
                 let (key, suffix) = after
                     .split_once("}}")
@@ -153,7 +156,17 @@ impl ValidatedManifest {
                 if !keys.contains(key) {
                     return Err(format!("unknown reference {key:?} in {:?}", entry.key));
                 }
+                // A u64 issue number plus '#' needs at most 21 bytes.
+                max_rendered_bytes = max_rendered_bytes
+                    .saturating_sub(key.len() + 4)
+                    .saturating_add(21);
                 rest = suffix;
+            }
+            if max_rendered_bytes > MAX_RENDERED_BODY_BYTES {
+                return Err(format!(
+                    "rendered body for {:?} exceeds the safety limit",
+                    entry.key
+                ));
             }
             let mut dependencies = BTreeSet::new();
             for dependency in &entry.depends_on {
@@ -273,6 +286,17 @@ depends_on = ["epic"]
             ValidatedManifest::load(&path)
                 .unwrap_err()
                 .contains("reserved")
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_rendered_bodies_before_creation() {
+        let (dir, path) = fixture(VALID);
+        std::fs::write(dir.path().join("child.md"), "{{epic}}".repeat(4000)).unwrap();
+        assert!(
+            ValidatedManifest::load(&path)
+                .unwrap_err()
+                .contains("safety limit")
         );
     }
 
