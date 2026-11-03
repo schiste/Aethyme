@@ -198,7 +198,7 @@ The public API and oracle stayed in place.
 
 The evidence record is
 [`evidence/q1-composition-profile.json`](../../../../evidence/q1-composition-profile.json).
-D03–D06 records are in [the E1 profile](local-v3-e1-profile.md#decision-records-d03d06).
+D03–D06 records are in [the E1 profile](local-v3-e1-profile.md) under "Decision records D03–D06".
 The statements above that these fixtures "do not close D04–D06" and "claim none of
 T16–T23" describe the provisional checkpoint. The E1 record now maps T16–T19 and T22
 for the selected profile; T20, T21 and T23 are not claimed there.
