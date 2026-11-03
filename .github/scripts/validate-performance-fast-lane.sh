@@ -15,6 +15,7 @@ for path in \
   "$benchmark_dir/test_broker_latency.py" \
   "$benchmark_dir/test_broker_concurrent_submit.py" \
   "$benchmark_dir/git_worktree_config.py" \
+  "$benchmark_dir/git_ref_backends.py" \
   "$benchmark_dir/test_git_worktree_config.py" \
   "$benchmark_dir/git_worktree_options.py" \
   "$repo_root/packages/aethyme/docs/architecture/git-worktree-config-assessment.md" \
@@ -45,7 +46,8 @@ sources = {
     "test_broker_latency.py": {"broker_latency", "broker_action_matrix"},
     "test_broker_concurrent_submit.py": {"broker_concurrent_submit"},
     "git_worktree_config.py": {"git_worktree_options"},
-    "test_git_worktree_config.py": {"git_worktree_config"},
+    "test_git_worktree_config.py": {"git_worktree_config", "git_ref_backends"},
+    "git_ref_backends.py": {"git_worktree_options"},
     "git_worktree_options.py": set(),
 }
 required_tests = {
@@ -66,6 +68,7 @@ required_tests = {
     "test_missing_format_write_is_not_accepted",
     "test_supported_client_is_not_misreported_as_legacy",
     "test_exhausted_command_budget_dispatches_nothing",
+    "test_requires_working_control_and_extension_refusal",
 }
 for filename, allowed_local in sources.items():
     path = benchmark_dir / filename

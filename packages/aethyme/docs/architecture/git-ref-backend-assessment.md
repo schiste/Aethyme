@@ -1,6 +1,6 @@
 # Ref-heavy Git backend assessment
 
-Last Updated: 2026-10-25
+Last Updated: 2026-11-03
 
 For #904, keep the files backend for existing Aethyme repositories. Reftable
 substantially reduced enumeration versus loose files refs, while packed files
@@ -16,6 +16,13 @@ stdout/stderr, wall time, child CPU, and stdin length/digest for seeded refs.
 It creates only its own temporary synthetic Playground under an existing
 caller-selected scratch parent. Successful fixtures are removed; failures
 retain their exact path and receipts. Each command has a twenty-second timeout.
+
+The optional `--legacy-git /path/to/git` adds an older-client probe: it must
+read the files-backed fixture with the same refs, then refuse reftable with an
+explicit `refStorage` repository-extension error. The report records the client
+path and version, per-case result, and command receipts. A failed files control,
+a successful reftable read, or an unrelated error refuses the claimed legacy
+result. This does not establish the supported-version floor or IDE/CI behavior.
 
 Two sequential macOS 27.2 runs used an internal APFS/Apple Fabric volume and
 an external APFS/USB volume. Each case had 2,000 synthetic agent branch refs

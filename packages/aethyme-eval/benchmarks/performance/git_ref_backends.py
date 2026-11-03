@@ -17,7 +17,22 @@ def refs(ex, repo, git=None):
                   "refs/heads/", git=git)["stdout"].splitlines()
 
 
-def measure(root, output, git, other, count, samples):
+def probe_legacy_client(ex, files_repo, reftable_repo, legacy):
+    """Require a working files read before attributing reftable refusal to format."""
+    expected = refs(ex, files_repo)
+    observed = ex.run(files_repo, "for-each-ref", "--format=%(refname) %(objectname)",
+                      "refs/heads/", git=legacy, required=False)
+    if observed["returncode"] != 0 or observed["stdout"].splitlines() != expected:
+        raise RuntimeError("legacy client could not correctly read the files-backed control")
+    refused = ex.run(reftable_repo, "rev-parse", "--verify", "HEAD",
+                     git=legacy, required=False)
+    diagnostic = refused["stderr"].lower()
+    if refused["returncode"] == 0 or "extension" not in diagnostic or "refstorage" not in diagnostic:
+        raise RuntimeError("legacy client did not clearly refuse the refStorage extension")
+    return {"files_control": "matched", "reftable": "refused_refstorage_extension"}
+
+
+def measure(root, output, git, other, count, samples, legacy=None):
     ex = Experiment(root, git, output)
     clients = list(dict.fromkeys([git] + ([other] if other else [])))
     report = dict(schema="aethyme.git-ref-backends/v1", platform=platform.platform(),
@@ -30,7 +45,11 @@ def measure(root, output, git, other, count, samples):
                   ])
     for client in clients:
         report["clients"].append(dict(path=client, version=ex.run(root, "--version", git=client)["stdout"].strip()))
+    if legacy:
+        report["legacy_client"] = {"path": legacy,
+            "version": ex.run(root, "--version", git=legacy)["stdout"].strip()}
     for client_index, client in enumerate(clients):
+        files_control = None
         for variant in ["files-loose", "files-packed", "reftable"]:
             backend = "reftable" if variant == "reftable" else "files"
             name = f"client-{client_index}-{variant}"
@@ -84,6 +103,13 @@ def measure(root, output, git, other, count, samples):
             ex.run(restored, "-c", "maintenance.auto=false", "fetch", str(bundle), "+refs/heads/*:refs/heads/*", git=client)
             assert refs(ex, restored, client) == expected
             ex.run(restored, "fsck", "--full", git=client)
+            legacy_result = None
+            if variant == "files-loose":
+                files_control = primary
+            elif variant == "reftable" and legacy:
+                if files_control is None:
+                    raise RuntimeError("missing files-backed legacy control")
+                legacy_result = probe_legacy_client(ex, files_control, primary, legacy)
             # Exercise conversion and rollback only in this owned fixture,
             # after removing every linked checkout. This is not crash recovery.
             other_backend = "files" if backend == "reftable" else "reftable"
@@ -96,7 +122,8 @@ def measure(root, output, git, other, count, samples):
                 initial_fetch_ms=initial_fetch["elapsed_ms"],
                 timings={key: distribution(rows) for key, rows in timings.items()},
                 exact_ref_controls=True, alternate_clients=len(clients),
-                bundle_restored_to_files=True, migration_round_trip=True))
+                bundle_restored_to_files=True, migration_round_trip=True,
+                legacy_client_control=legacy_result))
     report["commands"] = ex.commands
     return report
 
@@ -107,6 +134,8 @@ def main():
     parser.add_argument("--fixture-parent", type=Path, required=True)
     parser.add_argument("--git", type=Path, default=Path("/opt/homebrew/bin/git"))
     parser.add_argument("--other-git", type=Path)
+    parser.add_argument("--legacy-git", type=Path,
+                        help="older client expected to refuse the reftable extension")
     parser.add_argument("--refs", type=int, default=2000)
     parser.add_argument("--samples", type=int, default=7)
     args = parser.parse_args()
@@ -121,11 +150,12 @@ def main():
         parser.error("fixture parent must exist")
     git = str(args.git.resolve(strict=True))
     other = str(args.other_git.resolve(strict=True)) if args.other_git else None
+    legacy = str(args.legacy_git.resolve(strict=True)) if args.legacy_git else None
     output.mkdir(mode=0o700)
     root = Path(tempfile.mkdtemp(prefix="aethyme-playground-ref-backends-", dir=parent)).resolve()
     report = None
     try:
-        report = measure(root, output, git, other, args.refs, args.samples)
+        report = measure(root, output, git, other, args.refs, args.samples, legacy=legacy)
         report["harness_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         report["command_runner_sha256"] = hashlib.sha256(Path(__file__).with_name("git_worktree_options.py").read_bytes()).hexdigest()
         report["fixture_root"] = str(root)
