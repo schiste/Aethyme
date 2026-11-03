@@ -213,6 +213,20 @@ pub(crate) fn apply(
         journal.pending.remove(key);
         save(&journal_path, &journal)?;
     }
+    // Recheck every marker after creation and before making any links. A
+    // malformed create result must never link an unrelated existing issue.
+    for key in &manifest.order {
+        let marker = format!(
+            "<!-- aethyme-issue-set:{}/{key} -->",
+            manifest.manifest.set_id
+        );
+        let number = journal.numbers[key];
+        if !backend.has_marker(number, &marker)? {
+            return Err(format!(
+                "issue #{number} no longer carries the expected marker for {key}"
+            ));
+        }
+    }
     let parent = journal.numbers[&manifest.manifest.parent.key];
     let mut fallback_children = Vec::new();
     for entry in &manifest.manifest.issues {

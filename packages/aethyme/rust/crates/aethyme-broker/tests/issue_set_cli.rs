@@ -159,7 +159,7 @@ depends_on = ["epic"]
     assert!(!calls.contains("-X DELETE"), "{calls}");
 }
 
-fn exercise_complete_set(native_available: bool) {
+fn exercise_complete_set(mode: u8) {
     let repo = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let bin = tempfile::tempdir().unwrap();
@@ -187,11 +187,13 @@ case "$*" in
   'api --hostname github.com repos/owner/repo/issues/1') issue_json 1; printf '\n' ;;
   'api --hostname github.com repos/owner/repo/issues/2') issue_json 2; printf '\n' ;;
   'api --hostname github.com --include repos/owner/repo/issues/1/sub_issues?per_page=100&page=1')
-    if [ "$AETHYME_FAKE_NO_NATIVE" = 1 ]; then printf 'HTTP/2.0 404 Not Found\r\n\r\n{}'; exit 1; fi
+    if [ "$AETHYME_FAKE_NATIVE_MODE" = 1 ]; then printf 'HTTP/2.0 404 Not Found\r\n\r\n{}'; exit 1; fi
+    if [ "$AETHYME_FAKE_NATIVE_MODE" = 2 ]; then printf 'HTTP/2.0 403 Forbidden\r\n\r\n{}'; exit 1; fi
     printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n'
     if [ -f "$root/sub" ]; then printf '[{"id":1002}]\n'; else printf '[]\n'; fi ;;
   'api --hostname github.com --include repos/owner/repo/issues/2/dependencies/blocked_by?per_page=100&page=1')
-    if [ "$AETHYME_FAKE_NO_NATIVE" = 1 ]; then printf 'HTTP/2.0 404 Not Found\r\n\r\n{}'; exit 1; fi
+    if [ "$AETHYME_FAKE_NATIVE_MODE" = 1 ]; then printf 'HTTP/2.0 404 Not Found\r\n\r\n{}'; exit 1; fi
+    if [ "$AETHYME_FAKE_NATIVE_MODE" = 2 ]; then printf 'HTTP/2.0 403 Forbidden\r\n\r\n{}'; exit 1; fi
     printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n'
     if [ -f "$root/dependency" ]; then printf '[{"id":1001}]\n'; else printf '[]\n'; fi ;;
   'api -X POST repos/owner/repo/issues/1/sub_issues -F sub_issue_id=1002') : > "$root/sub"; printf '{}\n' ;;
@@ -232,10 +234,7 @@ esac
             .env("AETHYME_HOST_STATE_DIR", state.path())
             .env("AETHYME_FAKE_GH_LOG", &log)
             .env("AETHYME_FAKE_GH_STATE", remote.path())
-            .env(
-                "AETHYME_FAKE_NO_NATIVE",
-                if native_available { "0" } else { "1" },
-            )
+            .env("AETHYME_FAKE_NATIVE_MODE", mode.to_string())
             .env(
                 "PATH",
                 format!(
@@ -300,6 +299,20 @@ depends_on = ["epic"]
     ];
     for _ in 0..2 {
         let result = run(&args);
+        if mode == 2 {
+            assert!(!result.status.success());
+            let error: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("HTTP 403")
+            );
+            let calls = std::fs::read_to_string(&log).unwrap();
+            assert!(!calls.contains("issue edit"), "{calls}");
+            assert!(!calls.contains("api -X POST"), "{calls}");
+            return;
+        }
         assert!(
             result.status.success(),
             "stdout: {} stderr: {}",
@@ -342,10 +355,10 @@ depends_on = ["epic"]
             .lines()
             .filter(|line| line.starts_with("api -X POST "))
             .count(),
-        if native_available { 2 } else { 0 },
+        if mode == 0 { 2 } else { 0 },
         "{calls}"
     );
-    if !native_available {
+    if mode == 1 {
         assert!(
             std::fs::read_to_string(remote.path().join("body1"))
                 .unwrap()
@@ -361,10 +374,15 @@ depends_on = ["epic"]
 
 #[test]
 fn creates_and_reapplies_a_complete_set_without_duplicates() {
-    exercise_complete_set(true);
+    exercise_complete_set(0);
 }
 
 #[test]
 fn falls_back_when_native_relationships_are_unavailable() {
-    exercise_complete_set(false);
+    exercise_complete_set(1);
+}
+
+#[test]
+fn does_not_fall_back_on_relationship_permission_errors() {
+    exercise_complete_set(2);
 }
