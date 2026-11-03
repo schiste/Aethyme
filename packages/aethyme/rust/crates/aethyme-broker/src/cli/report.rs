@@ -805,7 +805,7 @@ fn run_sub_issue(parsed: Parsed) -> Result<(), UsageError> {
     let mut children = Vec::new();
     for child in &numbers[1..] {
         let endpoint = format!("repos/{repository}/issues/{child}");
-        let output = std::process::Command::new("gh")
+        let output = crate::operations::github_command()
             .args(["api", &endpoint])
             .output()
             .map_err(|error| UsageError::Message(format!("cannot run gh: {error}")))?;
@@ -853,6 +853,12 @@ fn run_sub_issue(parsed: Parsed) -> Result<(), UsageError> {
                     results.len()
                 ))
             })?;
+        if let Some(recovery) = report.unknown_outcome_recovery() {
+            return Err(UsageError::Message(format!(
+                "sub-issue #{child} has an unknown outcome after {} completed: {recovery}",
+                results.len()
+            )));
+        }
         if !report.command_success {
             return Err(UsageError::Message(format!(
                 "sub-issue #{child} failed after {} completed (operation {}): {}",

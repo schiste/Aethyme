@@ -35,7 +35,7 @@ fn resolves_all_children_before_coordinated_mutations() {
     std::fs::write(
         &gh,
         r##"#!/bin/sh
-printf '%s\n' "$*" >> "$FAKE_GH_LOG"
+printf '%s\n' "$*" >> "$AETHYME_FAKE_GH_LOG"
 case "$*" in
   'api repos/owner/repo/issues/2') printf '{"number":2,"id":1002}\n' ;;
   'api repos/owner/repo/issues/3') printf '{"number":3,"id":1003}\n' ;;
@@ -57,7 +57,7 @@ esac
         common::broker_cli(CLI, args)
             .current_dir(repo.path())
             .env("AETHYME_HOST_STATE_DIR", state.path())
-            .env("FAKE_GH_LOG", &log)
+            .env("AETHYME_FAKE_GH_LOG", &log)
             .env(
                 "PATH",
                 format!(
@@ -76,6 +76,16 @@ esac
         String::from_utf8_lossy(&started.stderr)
     );
     let value: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    // Bind the coordinated target to this fixture's origin without fetching it.
+    git(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ],
+    );
     let session = value["session"]["id"]
         .as_i64()
         .or_else(|| value["id"].as_i64())
@@ -107,7 +117,8 @@ esac
     let result = run(&arguments("3"));
     assert!(
         result.status.success(),
-        "{}",
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
     let receipt: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
