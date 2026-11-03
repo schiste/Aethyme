@@ -110,6 +110,13 @@ ownership history and explicit takeover requirements when liveness is unknown;
 never clear leases or force removal merely because a holder is ambiguous. Use
 native reclamation plans, which independently protect recent work and open files.
 
+Interrupting a broker submit can leave its gate process group running after
+the submit PID exits. Before reconciling its quarantined cache lease or
+finishing the session, identify the exact gate process group and verify all
+its processes have exited; a missing lease-holder PID alone is insufficient.
+Stop only a verified group owned by the interrupted work, then recheck the
+whole group before reconciling the lease generation.
+
 Before starting or delegating a fix for shared CI failures or generated
 files, use `aethyme broker status --compact --json` and open PRs on affected
 paths. Read the matching task, claimed paths and PR diff even when the graph
