@@ -4484,6 +4484,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn closed_cohort_accepts_remounted_git_volume_with_spawn_time_uuid() {
+        use super::{
+            AutoCleanupCheckoutGroup, AutoCleanupVerdictOptions, LeaseProcessTableSnapshot,
+        };
+
         let (_owner, _storage, mut broker, session) = retirement_fixture();
         broker
             .close_abandoning_unpushed(session.id, "remount fixture")
