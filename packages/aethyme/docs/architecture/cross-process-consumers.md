@@ -1337,3 +1337,26 @@ retain their existing local-base behavior. Startup still reads committed
 policy and checks root identity, storage and path leases.
 Adopt/reuse behavior and explicit session sync remain unchanged. Regression
 coverage lives in `aethyme-broker/tests/start_base_cli.rs`.
+
+
+### Issue-set manifests (draft workflow)
+
+`broker advanced issues apply <manifest.toml> --repo owner/name --session ID
+--reason AUTHORIZATION` reads a manifest and creates or updates its GitHub issue
+set. The target default branch must opt in with `[issue_workflows]` and
+`issue_sets = "allow"` in `.aethyme/config.toml`; missing or invalid policy
+fails closed. The current implementation requires the target to match the
+session checkout's origin and requires native sub-issue and dependency support.
+
+A manifest has a stable `set_id`, one `[parent]`, and zero or more `[[issues]]`.
+Each entry supplies a unique `key`, a `title`, a relative `body_file`, and
+optional `labels` and `depends_on` arrays. Body references such as `{{epic}}`
+resolve to issue numbers. Body files must remain within the manifest directory.
+Labels and dependencies are validated before GitHub writes.
+
+`--dry-run --json` prints create/update and relationship actions without
+writing to GitHub. The broker holds a per-set local lock and checks its create
+journal before planning or applying. If a create's outcome is unknown and its
+marker cannot be found, it refuses a blind retry; inspect GitHub and reconcile
+the operation. The journal is local to this broker host and does not coordinate
+concurrent applications from independent hosts.
