@@ -5529,6 +5529,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn gate_artifact_admission_waits_for_a_transient_lifecycle_claim() {
         let root = tempfile::tempdir().unwrap();
@@ -5548,6 +5549,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn gate_artifact_admission_respects_an_expired_deadline() {
         let root = tempfile::tempdir().unwrap();
@@ -5575,6 +5577,7 @@ mod tests {
         drop(claim);
     }
 
+    #[cfg(unix)]
     #[test]
     fn gate_artifact_admission_does_not_wait_past_a_live_deadline() {
         let root = tempfile::tempdir().unwrap();
