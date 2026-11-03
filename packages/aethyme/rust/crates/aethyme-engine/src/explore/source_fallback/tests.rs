@@ -91,6 +91,78 @@ fn fixture() -> tempfile::TempDir {
 }
 
 #[test]
+fn sparse_checkout_reports_incomplete_and_preserves_symbol_cache() {
+    let repo = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    write(root, "src/included.rs", "pub fn sentinel_included() {}\n");
+    write(root, "other/omitted.rs", "pub fn sentinel_omitted() {}\n");
+    git(root, &["add", "--all"]);
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    );
+    let cached = SourceSearchOptions {
+        symbol_cache: SymbolCache::Under(cache.path().to_path_buf()),
+        ..SourceSearchOptions::default()
+    };
+    let full = inspect_with(root, "sentinel", &cached);
+    assert!(full.complete, "{:?}", full.incomplete_reason);
+    assert_eq!(full.symbol_index.cached_files, 2);
+
+    git(root, &["sparse-checkout", "set", "--cone", "src"]);
+    assert!(!root.join("other/omitted.rs").exists());
+    let sparse = inspect_with(root, "sentinel", &cached);
+    assert!(!sparse.complete);
+    assert_eq!(sparse.incomplete_reason, Some("sparse_checkout"));
+    assert!(!sparse.answer_safety.safe);
+    assert_eq!(
+        sparse.symbol_index.cached_files, 2,
+        "omitted entries must not be pruned"
+    );
+    assert_eq!(sparse.observability()["reason"], "sparse_checkout");
+    let empty = inspect_with(root, "", &cached);
+    assert!(!empty.complete);
+    assert!(empty.truncated);
+    assert_eq!(empty.incomplete_reason, Some("sparse_checkout"));
+
+    let envelope = super::super::graph_unavailable_response_with(
+        root,
+        "sentinel",
+        "task_localization_query",
+        "test",
+        "missing",
+        "fixture".into(),
+        &cached,
+    );
+    assert!(!envelope.safe_to_use_as_answer);
+    assert!(
+        envelope.trust_policy.reason.contains("search_incomplete"),
+        "{}",
+        envelope.trust_policy.reason
+    );
+}
+
+#[test]
+fn missing_tracked_source_is_not_reported_as_a_complete_search() {
+    let repo = fixture();
+    std::fs::remove_file(repo.path().join("src/net/backoff.py")).unwrap();
+    let result = inspect_with(repo.path(), "retry delay", &options());
+    assert!(!result.complete);
+    assert_eq!(result.incomplete_reason, Some("source_unavailable"));
+    assert!(!result.answer_safety.safe);
+}
+
+#[test]
 fn behavior_request_ranks_the_defining_source_first() {
     let repo = fixture();
     let result = inspect_with(repo.path(), "How is the retry delay computed?", &options());
