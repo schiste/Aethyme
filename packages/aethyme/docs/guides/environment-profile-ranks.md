@@ -1,5 +1,7 @@
 # Environment profile ranks
 
+Last Updated: 2026-11-03
+
 Profiles may share a rank when they represent equivalent minimum environment
 levels. Selecting another profile at the inferred rank does not require a
 reason; selecting a higher rank still does. Inference keeps the default
