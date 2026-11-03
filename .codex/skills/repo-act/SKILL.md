@@ -830,5 +830,6 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 - `packages/aethyme/rust/crates/aethyme-engine/src/bin/aethyme-engine-cli.rs` (tracked Rust binary entrypoint in `packages/aethyme/rust`)
 - `packages/aethyme/rust/crates/aethyme-graph-indexer/src/bin/aethyme-graph-index.rs` (tracked Rust binary entrypoint in `packages/aethyme/rust`)
 
+## Caution Zones
 
 - `target` (likely generated, vendored, fixture, or migration-heavy area)

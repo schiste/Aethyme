@@ -792,9 +792,9 @@
     ]
   },
   "freshness": {
-    "source_digest": "438bd9445c64b9c8e6083f615dd7f2e1056e00547d1398638677b3c8e20f4450",
+    "source_digest": "c3bb96b149489ef1bfa650b64506b14b5c78105663d29eb14a48b5532a7be89a",
     "source_commit": null,
-    "source_file_count": 3813,
+    "source_file_count": 3869,
     "generator": "deterministic"
   },
   "notes": [

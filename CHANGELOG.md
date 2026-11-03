@@ -4,6 +4,25 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.55] - 2026-11-03
+
+### Added
+
+- Named ports per environment component (#1385): `ports = ["api", "db", "web"]` reserves each port with the environment, exposes it as `AETHYME_ENV_PORT_<COMPONENT>_<NAME>` and lists its URL variable in plans. The `listen = true` primary port is unchanged.
+- Scalar hook-receipt fields as variables (#1383): later components receive top-level string, number and boolean receipt fields as `AETHYME_ENV_<COMPONENT>_<FIELD>`, alongside the full JSON in `AETHYME_ENV_RECEIPT_<COMPONENT>`. Colliding or reserved names are skipped.
+- Profiles may share a rank (#1384). Choosing an equivalent profile at the inferred rank needs no reason, and the `duplicate_rank` validation diagnostic is no longer emitted.
+
+### Changed
+
+- The Local controller's native gates default to off (#671). It records the frozen native job and abandons it before dispatch, so candidate code does not run with host authority; the confined Docker build and independent verifier still decide acceptance. Setting the policy's `native_gates` to `required` restores the earlier behaviour. The broker's submit and merge gates are unchanged.
+
+### Fixed
+
+- Environment profile inference uses the broker session's recorded start commit, so a stale integration branch no longer inflates a session's changes (#1381).
+- Merge commits count only their first-parent diff during range inference (#1379).
+
+There is no broker database schema change; rollback to 0.8.54 is unrestricted.
+
 ## [0.8.54] - 2026-11-02
 
 ### Added
