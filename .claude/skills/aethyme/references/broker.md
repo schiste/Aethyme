@@ -669,6 +669,11 @@ blocked.
 
    The broker classifies known commands and fails closed on ambiguity.
 
+   For an authorized PR merge, use the broker's exact supported form:
+   `pr merge <number> --merge|--squash|--rebase [--match-head-commit <sha>]`.
+   The coordinator rejects `--auto`; wait for required checks and reviews,
+   then merge the reviewed head. Do not bypass the ref-write guard.
+
    For a cross-session PR merge, if the broker reports that the head branch
    belongs to another session, inspect that session's task and worktree status,
    including changed paths, then compare those paths and behavior with the PR's
