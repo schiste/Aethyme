@@ -3041,6 +3041,9 @@ pub fn classify_gh(args: &[String]) -> Option<OperationEffect> {
     if command == "api" && crate::gh_ref_guard::is_review_thread_lookup(args) {
         return Some(OperationEffect::Read);
     }
+    if crate::gh_ref_guard::is_sub_issue_removal(args) {
+        return Some(OperationEffect::Write);
+    }
     // The two exact forms `gh_ref_guard` resolves to a branch delete are
     // destructive; anything else that may write a ref is refused by the
     // guard unless acknowledged (#393).
@@ -3168,6 +3171,11 @@ fn first_positional(args: &[String]) -> Option<&str> {
 fn resource_lock_scope(provider: OperationProvider, args: &[String]) -> Option<String> {
     if provider == OperationProvider::Git {
         return git_scopes::resource_scope(args);
+    }
+    // Serialize all sub-issue changes together: a child can only have one
+    // parent, including when different parent issue numbers are involved.
+    if crate::gh_ref_guard::is_sub_issue_write(args) {
+        return Some("issues/sub-issues".into());
     }
     match args.first()?.as_str() {
         command @ ("pr" | "issue") => {
