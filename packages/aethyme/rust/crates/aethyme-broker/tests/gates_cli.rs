@@ -454,6 +454,32 @@ fn submit_distinguishes_missing_unmatched_and_passing_gate_evidence() {
 }
 
 #[test]
+fn sparse_gate_checkout_refuses_cached_and_uncached_cli_runs() {
+    let tmp = fixture();
+    let marker = tmp.path().join("gate-runs.txt");
+    stdout(run(tmp.path(), &["advanced", "gates", "run", "--all"]));
+    assert_eq!(run_count(&marker), 1);
+    std::fs::remove_file(&marker).unwrap();
+    git(
+        tmp.path(),
+        &["update-index", "--skip-worktree", "tracked.txt"],
+    );
+    std::fs::remove_file(tmp.path().join("tracked.txt")).unwrap();
+
+    for args in [
+        vec!["advanced", "gates", "run", "--all"],
+        vec!["advanced", "gates", "run", "--all", "--no-cache"],
+    ] {
+        let output = run(tmp.path(), &args);
+        assert!(!output.status.success(), "{output:?}");
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(diagnostic.contains("tracked.txt"), "{output:?}");
+        assert!(diagnostic.contains("complete checkout"), "{output:?}");
+        assert!(!marker.exists(), "gate ran for an incomplete checkout");
+    }
+}
+
+#[test]
 fn gate_cli_reports_tree_provenance_for_executed_and_cached_results() {
     let tmp = fixture();
     let first_tree = tree_hash(tmp.path());
