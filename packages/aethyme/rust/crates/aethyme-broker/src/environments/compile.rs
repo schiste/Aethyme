@@ -534,6 +534,7 @@ impl CompiledEnvironment {
             for key in &other.extra_port_keys {
                 if let Some(name) = key.strip_prefix("port_") {
                     names.push(format!("AETHYME_ENV_PORT_{}", env_suffix(name)));
+                    names.push(format!("AETHYME_ENV_URL_{}", env_suffix(name)));
                 }
             }
             names.push(format!("AETHYME_ENV_RECEIPT_{}", env_suffix(&other.name)));
