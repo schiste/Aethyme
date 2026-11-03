@@ -323,6 +323,9 @@ jobs:
           python3 -m unittest discover \
             -s packages/aethyme-eval/benchmarks/performance \
             -p 'test_git_worktree_config.py' -v
+          python3 -m unittest discover \
+            -s packages/aethyme-eval/benchmarks/performance \
+            -p 'test_git_worktree_options.py' -v
 
       - name: Install cargo-nextest
         if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}
