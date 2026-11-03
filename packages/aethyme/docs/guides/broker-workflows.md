@@ -237,7 +237,11 @@ Explicit `broker start --path` leases add their directory to the new checkout
 (the parent directory for a file lease), so the claimed source is present.
 Include any other directories needed by your task, context tools, dependency
 preparation and gates. Sparse checkout does not infer those inputs or prepare
-dependencies. An absent or empty `sparse_paths` keeps full checkouts, and
+dependencies. Gates cannot reliably infer every input used by arbitrary commands,
+so gate execution and cached verification refuse a checkout with skipped
+tracked paths. Run gates from a complete checkout; use the normal Git sparse
+checkout commands only after reviewing their effects on local files. An absent
+or empty `sparse_paths` keeps full checkouts, and
 `--reuse` or `--adopt` never changes an existing worktree's sparsity.
 
 When continuing the same task, reuse its broker session/worktree instead of

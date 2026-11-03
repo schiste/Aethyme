@@ -2803,6 +2803,9 @@ fn run_selections(
     cache_policy: CachePolicy,
     runtime: GateRuntimeContext<'_>,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    // This must precede cache lookup as well as execution: cached success
+    // cannot certify a checkout with potentially missing gate inputs.
+    checkout.require_complete_gate_checkout()?;
     let storage = runtime.storage.clone();
     run_selections_with_admission(
         store,
@@ -5463,6 +5466,35 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn incomplete_checkout_refuses_gate_before_execution_or_cache_lookup() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        init_repo(&checkout_root);
+        git_in(
+            &checkout_root,
+            &["update-index", "--skip-worktree", "file.txt"],
+        );
+        std::fs::remove_file(checkout_root.join("file.txt")).unwrap();
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        let mut store = BrokerStore::open(&root.path().join("broker.db")).unwrap();
+        let gate = synthetic_gate("sentinel", true, "touch should-not-run");
+        for policy in [CachePolicy::Use, CachePolicy::Bypass] {
+            let error = run_all_in(
+                &mut store,
+                &checkout_root,
+                &checkout,
+                std::slice::from_ref(&gate),
+                None,
+                policy,
+                GateStorageLocations::default(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("file.txt"), "{error}");
+            assert!(!checkout_root.join("should-not-run").exists());
+        }
+    }
 
     #[test]
     fn managed_cache_shortfall_refuses_admission_on_its_own_volume() {
