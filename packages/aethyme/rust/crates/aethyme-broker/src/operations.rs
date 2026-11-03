@@ -3172,6 +3172,11 @@ fn resource_lock_scope(provider: OperationProvider, args: &[String]) -> Option<S
     if provider == OperationProvider::Git {
         return git_scopes::resource_scope(args);
     }
+    // Serialize all sub-issue changes together: a child can only have one
+    // parent, including when different parent issue numbers are involved.
+    if crate::gh_ref_guard::is_sub_issue_write(args) {
+        return Some("issues/sub-issues".into());
+    }
     match args.first()?.as_str() {
         command @ ("pr" | "issue") => {
             let resource = match (command, args.get(1)?.as_str()) {

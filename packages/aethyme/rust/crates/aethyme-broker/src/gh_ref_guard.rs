@@ -446,26 +446,36 @@ fn is_safe_write(tokens: &[&str], repository: &str) -> bool {
     })
 }
 
-/// The exact removal form is an issue write, not a branch deletion. The
-/// repository-specific guard still verifies the target before execution.
-pub(crate) fn is_sub_issue_removal(args: &[String]) -> bool {
+/// Only exact, issue-only sub-issue requests can use the issue relationship
+/// lock. The repository-specific guard still verifies the target before execution.
+pub(crate) fn is_sub_issue_write(args: &[String]) -> bool {
     let [api, flag, method, endpoint, field_flag, field] = args else {
         return false;
     };
-    if api != "api" || flag != "-X" || method != "DELETE" || field_flag != "-F" {
+    if api != "api" || flag != "-X" || field_flag != "-F" {
         return false;
     }
     let parts: Vec<&str> = endpoint.split('/').collect();
-    let ["repos", owner, repo, "issues", _, "sub_issue"] = parts.as_slice() else {
+    let ["repos", owner, repo, "issues", _, resource] = parts.as_slice() else {
         return false;
     };
-    if owner.is_empty() || repo.is_empty() {
+    if owner.is_empty()
+        || repo.is_empty()
+        || !matches!(
+            (method.as_str(), *resource),
+            ("POST", "sub_issues") | ("DELETE", "sub_issue")
+        )
+    {
         return false;
     }
     is_safe_write(
         &[flag, method, endpoint, field_flag, field],
         &format!("{owner}/{repo}"),
     )
+}
+
+pub(crate) fn is_sub_issue_removal(args: &[String]) -> bool {
+    is_sub_issue_write(args) && args.get(2).is_some_and(|method| method == "DELETE")
 }
 
 /// The only GraphQL mutations Aethyme supports for review-thread conversations.

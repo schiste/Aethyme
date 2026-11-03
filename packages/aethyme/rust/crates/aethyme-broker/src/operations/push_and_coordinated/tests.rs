@@ -576,6 +576,51 @@ fn comment_and_review_writes_resolve_to_a_per_resource_scope() {
     );
 }
 
+#[test]
+fn exact_sub_issue_changes_share_one_issue_lock() {
+    assert_eq!(
+        scope(&[
+            "api",
+            "-X",
+            "POST",
+            "repos/o/r/issues/7/sub_issues",
+            "-F",
+            "sub_issue_id=9"
+        ])
+        .as_deref(),
+        Some("issues/sub-issues")
+    );
+    assert_eq!(
+        scope(&[
+            "api",
+            "-X",
+            "DELETE",
+            "repos/o/r/issues/8/sub_issue",
+            "-F",
+            "sub_issue_id=9"
+        ])
+        .as_deref(),
+        Some("issues/sub-issues")
+    );
+    assert_eq!(
+        scope(&[
+            "api",
+            "-X",
+            "POST",
+            "repos/o/r/issues/7/sub_issues",
+            "-F",
+            "sub_issue_id=9",
+            "-F",
+            "replace_parent=true"
+        ]),
+        None
+    );
+    assert_eq!(
+        scope(&["api", "-X", "DELETE", "repos/o/r/git/refs/heads/main"]),
+        None
+    );
+}
+
 /// A flag's value is not an operand. `--method POST` in front of the path
 /// must not make `POST` the resource.
 #[test]
