@@ -693,8 +693,162 @@ pub(super) fn report_main_root() -> Result<PathBuf, UsageError> {
     Ok(repo.main_root()?)
 }
 
+fn sub_issue_database_id(value: &serde_json::Value, number: u64) -> Option<u64> {
+    if value.get("pull_request").is_some() || value.get("number")?.as_u64()? != number {
+        return None;
+    }
+    value.get("id")?.as_u64().filter(|id| *id > 0)
+}
+
+/// Resolve issue numbers before sending narrowly scoped, journaled mutations.
+fn run_sub_issue(parsed: Parsed) -> Result<(), UsageError> {
+    let usage = "issues sub-issue add|remove <parent> <child>... --repo <owner/name> --session <id> --reason <authorization>";
+    let action = parsed.positional.get(1).map(String::as_str);
+    let (method, resource) = match action {
+        Some("add") => ("POST", "sub_issues"),
+        Some("remove") => ("DELETE", "sub_issue"),
+        _ => return Err(UsageError::Message(format!("expected {usage}"))),
+    };
+    if parsed.positional.len() < 4 {
+        return Err(UsageError::Message(format!("expected {usage}")));
+    }
+    let repository = parsed
+        .repository
+        .as_deref()
+        .ok_or_else(|| UsageError::Message(format!("expected {usage}")))?;
+    let valid_part = |part: &str| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+    let parts: Vec<_> = repository.split('/').collect();
+    if parts.len() != 2 || !parts.iter().all(|part| valid_part(part)) {
+        return Err(UsageError::Message(
+            "--repo must be an owner/name pair".into(),
+        ));
+    }
+    let session_id = parsed
+        .session
+        .ok_or_else(|| UsageError::Message(format!("expected {usage}")))?;
+    let reason = parsed
+        .reason
+        .as_ref()
+        .filter(|reason| !reason.trim().is_empty())
+        .ok_or_else(|| UsageError::Message(format!("expected {usage}")))?;
+    let numbers: Vec<u64> = parsed.positional[2..]
+        .iter()
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|number| *number > 0)
+                .ok_or_else(|| UsageError::Message(format!("invalid issue number {value:?}")))
+        })
+        .collect::<Result<_, _>>()?;
+    let parent = numbers[0];
+    let mut seen = std::collections::BTreeSet::new();
+    if numbers[1..]
+        .iter()
+        .any(|child| *child == parent || !seen.insert(*child))
+    {
+        return Err(UsageError::Message(
+            "children must be distinct and different from the parent".into(),
+        ));
+    }
+    // Resolve every child before any write so an invalid later number cannot
+    // leave a partially applied request. GitHub expects a database ID, not
+    // the user-facing issue number.
+    let mut children = Vec::new();
+    for child in &numbers[1..] {
+        let endpoint = format!("repos/{repository}/issues/{child}");
+        let output = crate::operations::github_command()
+            .args(["api", &endpoint])
+            .output()
+            .map_err(|error| UsageError::Message(format!("cannot run gh: {error}")))?;
+        if !output.status.success() {
+            return Err(UsageError::Message(format!(
+                "cannot resolve issue #{child}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+            UsageError::Message(format!("invalid issue response for #{child}: {error}"))
+        })?;
+        let id = sub_issue_database_id(&value, *child).ok_or_else(|| {
+            UsageError::Message(format!("#{child} is not an issue with a valid database ID"))
+        })?;
+        children.push((*child, id));
+    }
+    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let mut results = Vec::new();
+    for (child, id) in children {
+        let report = broker
+            .run_coordinated_operation(crate::CoordinatedCommand {
+                session_id,
+                provider: crate::OperationProvider::Github,
+                repository: Some(repository.to_owned()),
+                resolved_target: None,
+                scope: Some("issues/sub-issues".into()),
+                declared_effect: Some(crate::OperationEffect::Write),
+                destructive_confirmed: false,
+                cross_session: None,
+                ref_write_acknowledged: false,
+                authorization_reason: Some(reason.clone()),
+                args: vec![
+                    "api".into(),
+                    "-X".into(),
+                    method.into(),
+                    format!("repos/{repository}/issues/{parent}/{resource}"),
+                    "-F".into(),
+                    format!("sub_issue_id={id}"),
+                ],
+            })
+            .map_err(|error| {
+                UsageError::Message(format!(
+                    "sub-issue #{child} failed after {} completed: {error}",
+                    results.len()
+                ))
+            })?;
+        if let Some(recovery) = report.unknown_outcome_recovery() {
+            return Err(UsageError::Message(format!(
+                "sub-issue #{child} has an unknown outcome after {} completed: {recovery}",
+                results.len()
+            )));
+        }
+        if !report.command_success {
+            return Err(UsageError::Message(format!(
+                "sub-issue #{child} failed after {} completed (operation {}): {}",
+                results.len(),
+                report.operation.id,
+                report.stderr.trim()
+            )));
+        }
+        results.push(
+            serde_json::json!({"parent": parent, "child": child, "operation": report.operation.id}),
+        );
+    }
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&results)?);
+    } else {
+        for result in results {
+            out!(
+                "Sub-issue #{} {} parent #{} (operation {})",
+                result["child"],
+                action.unwrap_or_default(),
+                parent,
+                result["operation"]
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `broker issues upsert`: one issue per automation outcome (#1238).
 pub(super) fn run_issues(parsed: Parsed) -> Result<(), UsageError> {
+    if parsed.positional.first().map(String::as_str) == Some("sub-issue") {
+        return run_sub_issue(parsed);
+    }
     match parsed.positional.first().map(String::as_str) {
         Some("upsert") if parsed.positional.len() == 1 => {}
         Some(other) if other != "upsert" => {
@@ -918,4 +1072,47 @@ pub(super) fn run_outcomes(parsed: Parsed) -> Result<(), UsageError> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod sub_issue_tests {
+    use super::sub_issue_database_id;
+
+    #[test]
+    fn rejects_invalid_child_lists_before_github_access() {
+        let args = [
+            "sub-issue",
+            "add",
+            "42",
+            "42",
+            "--repo",
+            "owner/repo",
+            "--session",
+            "7",
+            "--reason",
+            "user requested issue links",
+        ]
+        .map(str::to_owned);
+        let parsed = super::super::parse(&args).expect("arguments parse");
+        assert!(super::super::validate_flags("issues", &parsed).is_ok());
+        assert!(super::run_sub_issue(parsed).is_err());
+    }
+
+    #[test]
+    fn accepts_only_matching_issue_database_ids() {
+        let issue = serde_json::json!({"number": 42, "id": 9001});
+        assert_eq!(sub_issue_database_id(&issue, 42), Some(9001));
+        assert_eq!(sub_issue_database_id(&issue, 43), None);
+        assert_eq!(
+            sub_issue_database_id(&serde_json::json!({"number": 42, "id": 0}), 42),
+            None
+        );
+        assert_eq!(
+            sub_issue_database_id(
+                &serde_json::json!({"number": 42, "id": 9001, "pull_request": {}}),
+                42
+            ),
+            None
+        );
+    }
 }
