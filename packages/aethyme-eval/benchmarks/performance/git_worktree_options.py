@@ -161,12 +161,15 @@ def run(root, git, other, output, files=FILES, samples=SAMPLES, linked=False,
                     if "untracked-199.txt" not in rows[0]["stdout"] or "target/" in rows[0]["stdout"]:
                         raise RuntimeError("untracked/ignored status was incorrect")
             write = ex.run(repo, "add", "package-0/file-0.txt")
+            alternate_client = None
             if other:
                 before = ex.run(repo, "status", "--porcelain=v1")["stdout"]
                 compatibility = ex.run(repo, "status", "--porcelain=v1", git=other)
                 if compatibility["stdout"] != before:
                     raise RuntimeError("alternate client status disagreed")
-                ex.run(repo, "update-index", "--refresh", git=other)
+                refresh = ex.run(repo, "update-index", "--refresh", git=other)
+                alternate_client = dict(status_stderr=compatibility["stderr"],
+                                        index_refresh_stderr=refresh["stderr"])
                 if ex.run(repo, "status", "--porcelain=v1")["stdout"] != before:
                     raise RuntimeError("alternate client index write changed status")
             cache_probe = ex.run(repo, "update-index", "--test-untracked-cache", required=False)
@@ -193,6 +196,7 @@ def run(root, git, other, output, files=FILES, samples=SAMPLES, linked=False,
                                   index_write_ms=write["elapsed_ms"],
                                   index_bytes=index_path.stat().st_size,
                                   index_version=index_version,
+                                  alternate_client=alternate_client,
                                   linked_checkout=distribution(checkout_rows) if linked else None,
                                   primary_checkout_unchanged=primary_unchanged,
                                   untracked_cache_test_returncode=cache_probe["returncode"])

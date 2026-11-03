@@ -19,9 +19,19 @@ class GitOptionsIsolationTest(unittest.TestCase):
                                    capture_output=True, check=False)
             if probe.returncode:
                 self.skipTest("installed Git lacks reftable fixture support")
+            alternate = root / "warning-git"
+            alternate.write_text(
+                f"#!{sys.executable}\n"
+                "import subprocess, sys\n"
+                f"result = subprocess.run([{git!r}, *sys.argv[1:]])\n"
+                "if 'status' in sys.argv: print('synthetic client warning', file=sys.stderr)\n"
+                "sys.exit(result.returncode)\n"
+            )
+            alternate.chmod(0o755)
             output = root / "result"
             script = Path(__file__).with_name("git_worktree_options.py")
             result = subprocess.run([sys.executable, str(script), "--git", git,
+                                     "--other-git", str(alternate),
                                      "--output", str(output), "--fixture-parent", str(root),
                                      "--files", "12", "--samples", "1", "--linked",
                                      "--isolate-many-files"], capture_output=True, text=True,
@@ -32,6 +42,9 @@ class GitOptionsIsolationTest(unittest.TestCase):
             self.assertEqual(set(variants), {"baseline", "many-files", "fsmonitor",
                                              "index-v4", "untracked-cache"})
             self.assertEqual(variants["index-v4"]["index_version"], 4)
+            for variant in variants.values():
+                self.assertIn("synthetic client warning", variant["alternate_client"]["status_stderr"])
+                self.assertEqual(variant["alternate_client"]["index_refresh_stderr"], "")
             for state in ("clean", "dirty", "untracked-and-ignored"):
                 self.assertEqual(len({v["states"][state]["status_sha256"]
                                       for v in variants.values()}), 1)
