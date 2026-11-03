@@ -7,7 +7,7 @@ composition, optional native gates, Docker build, independent artifact
 verification, private GenericGit acceptance and proof-bound completion. Native
 gates are off unless the drive policy sets `native_gates = "required"`, because
 they run candidate code with host authority; see
-[native gates](local-v3-native-gates.md#off-by-default-for-the-controller-671).
+"Off by default for the controller" in [native gates](local-v3-native-gates.md).
 The runs below predate that default and used `required`. The actual two-wave
 profile passed locally. Its [qualification ledger](local-v3-qualification/controller-2026-10-15/ledger.json)
 retains the successful run, the earlier failed scheduling attempt and two
