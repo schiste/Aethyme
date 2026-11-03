@@ -343,6 +343,11 @@ const SAFE_WRITE_ENDPOINTS: &[(&[&str], &[&str])] = &[
     (&["issues", "N", "comments"], &["POST"]),
     (&["issues", "N", "sub_issues"], &["POST"]),
     (&["issues", "N", "sub_issue"], &["DELETE"]),
+    (&["issues", "N", "dependencies", "blocked_by"], &["POST"]),
+    (
+        &["issues", "N", "dependencies", "blocked_by", "N"],
+        &["DELETE"],
+    ),
     (&["issues", "comments", "N"], &["PATCH", "DELETE"]),
     (&["pulls", "N", "comments"], &["POST"]),
     (&["pulls", "N", "comments", "N", "replies"], &["POST"]),
@@ -431,6 +436,30 @@ fn is_safe_write(tokens: &[&str], repository: &str) -> bool {
                 .and_then(|value| value.parse::<u64>().ok())
                 .is_some_and(|id| id > 0));
     }
+    if (*pattern == ["issues", "N", "dependencies", "blocked_by"]
+        || *pattern == ["issues", "N", "dependencies", "blocked_by", "N"])
+        && !endpoint
+            .split('/')
+            .nth(4)
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|number| number > 0)
+    {
+        return false;
+    }
+    if *pattern == ["issues", "N", "dependencies", "blocked_by"] {
+        return matches!(fields.as_slice(), [("-F", field)]
+            if field.strip_prefix("issue_id=")
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|id| id > 0));
+    }
+    if *pattern == ["issues", "N", "dependencies", "blocked_by", "N"] {
+        return fields.is_empty()
+            && endpoint
+                .rsplit('/')
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|id| id > 0);
+    }
     let issue_patch = *pattern == ["issues", "N"];
     fields.iter().all(|(flag, field)| {
         let Some((key, value)) = field.split_once('=') else {
@@ -476,6 +505,53 @@ pub(crate) fn is_sub_issue_write(args: &[String]) -> bool {
 
 pub(crate) fn is_sub_issue_removal(args: &[String]) -> bool {
     is_sub_issue_write(args) && args.get(2).is_some_and(|method| method == "DELETE")
+}
+
+/// Exact native dependency requests can share the issue-only lock; all other
+/// forms remain subject to the general reference-write guard.
+pub(crate) fn is_issue_dependency_write(args: &[String]) -> bool {
+    let (method, endpoint, tokens): (&str, &str, Vec<&str>) = match args {
+        [api, flag, method, endpoint, field_flag, field]
+            if api == "api" && flag == "-X" && method == "POST" && field_flag == "-F" =>
+        {
+            (
+                method,
+                endpoint,
+                vec![flag, method, endpoint, field_flag, field],
+            )
+        }
+        [api, flag, method, endpoint] if api == "api" && flag == "-X" && method == "DELETE" => {
+            (method, endpoint, vec![flag, method, endpoint])
+        }
+        _ => return false,
+    };
+    let parts: Vec<&str> = endpoint.split('/').collect();
+    let (owner, repo, issue) = match parts.as_slice() {
+        [
+            "repos",
+            owner,
+            repo,
+            "issues",
+            issue,
+            "dependencies",
+            "blocked_by",
+        ] if method == "POST" => (*owner, *repo, *issue),
+        [
+            "repos",
+            owner,
+            repo,
+            "issues",
+            issue,
+            "dependencies",
+            "blocked_by",
+            _,
+        ] if method == "DELETE" => (*owner, *repo, *issue),
+        _ => return false,
+    };
+    if owner.is_empty() || repo.is_empty() || !issue.parse::<u64>().is_ok_and(|id| id > 0) {
+        return false;
+    }
+    is_safe_write(&tokens, &format!("{owner}/{repo}"))
 }
 
 /// The only GraphQL mutations Aethyme supports for review-thread conversations.
@@ -686,6 +762,77 @@ fn branch_ref_path(path: &str, repository: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_dependency_writes_are_exact_and_never_authorize_ref_deletion() {
+        let classify = |parts: &[&str]| {
+            crate::classify_gh(&parts.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        let add = [
+            "api",
+            "-X",
+            "POST",
+            "repos/o/n/issues/12/dependencies/blocked_by",
+            "-F",
+            "issue_id=345",
+        ];
+        let remove = [
+            "api",
+            "-X",
+            "DELETE",
+            "repos/o/n/issues/12/dependencies/blocked_by/345",
+        ];
+        assert_eq!(assess_line(&add), Verdict::SafeWrite);
+        assert_eq!(assess_line(&remove), Verdict::SafeWrite);
+        assert!(matches!(
+            assess_line(&[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/n/issues/0/dependencies/blocked_by",
+                "-F",
+                "issue_id=345"
+            ]),
+            Verdict::Unverifiable(_)
+        ));
+        assert_eq!(classify(&remove), Some(crate::OperationEffect::Write));
+        for field in ["issue_id=0", "issue_id=-1", "issue_id=@file", "other=345"] {
+            assert!(matches!(
+                assess_line(&[
+                    "api",
+                    "-X",
+                    "POST",
+                    "repos/o/n/issues/12/dependencies/blocked_by",
+                    "-F",
+                    field
+                ]),
+                Verdict::Unverifiable(_)
+            ));
+        }
+        for path in [
+            "repos/o/n/issues/12/dependencies/blocked_by/0",
+            "repos/other/n/issues/12/dependencies/blocked_by/345",
+            "repos/o/n/git/refs/heads/main",
+        ] {
+            assert!(!matches!(
+                assess_line(&["api", "-X", "DELETE", path]),
+                Verdict::SafeWrite
+            ));
+        }
+        assert!(matches!(
+            assess_line(&[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/n/issues/12/dependencies/blocked_by",
+                "-F",
+                "issue_id=345",
+                "-F",
+                "extra=true"
+            ]),
+            Verdict::Unverifiable(_)
+        ));
+    }
 
     #[test]
     fn native_sub_issue_mutations_are_exact_and_cannot_write_refs() {

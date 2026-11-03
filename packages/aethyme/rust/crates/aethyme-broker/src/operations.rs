@@ -3041,6 +3041,11 @@ pub fn classify_gh(args: &[String]) -> Option<OperationEffect> {
     if command == "api" && crate::gh_ref_guard::is_review_thread_lookup(args) {
         return Some(OperationEffect::Read);
     }
+    if crate::gh_ref_guard::is_issue_dependency_write(args)
+        && args.get(2).is_some_and(|method| method == "DELETE")
+    {
+        return Some(OperationEffect::Write);
+    }
     if crate::gh_ref_guard::is_sub_issue_removal(args) {
         return Some(OperationEffect::Write);
     }
@@ -3174,6 +3179,9 @@ fn resource_lock_scope(provider: OperationProvider, args: &[String]) -> Option<S
     }
     // Serialize all sub-issue changes together: a child can only have one
     // parent, including when different parent issue numbers are involved.
+    if crate::gh_ref_guard::is_issue_dependency_write(args) {
+        return Some("issues/dependencies".into());
+    }
     if crate::gh_ref_guard::is_sub_issue_write(args) {
         return Some("issues/sub-issues".into());
     }
@@ -3450,6 +3458,43 @@ use push_and_coordinated::{is_github_pull_request_merge, provider_command};
 #[cfg(test)]
 mod git_storage_maintenance_tests {
     use super::*;
+
+    #[test]
+    fn native_dependency_scope_is_issue_only_and_serialized() {
+        let args = |items: &[&str]| {
+            items
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let add = args(&[
+            "api",
+            "-X",
+            "POST",
+            "repos/o/n/issues/12/dependencies/blocked_by",
+            "-F",
+            "issue_id=345",
+        ]);
+        let remove = args(&[
+            "api",
+            "-X",
+            "DELETE",
+            "repos/o/n/issues/12/dependencies/blocked_by/345",
+        ]);
+        assert_eq!(
+            resource_lock_scope(OperationProvider::Github, &add).as_deref(),
+            Some("issues/dependencies")
+        );
+        assert_eq!(
+            resource_lock_scope(OperationProvider::Github, &remove).as_deref(),
+            Some("issues/dependencies")
+        );
+        let invalid = args(&["api", "-X", "DELETE", "repos/o/n/git/refs/heads/main"]);
+        assert_ne!(
+            resource_lock_scope(OperationProvider::Github, &invalid).as_deref(),
+            Some("issues/dependencies")
+        );
+    }
 
     fn classify(args: &[&str]) -> Option<OperationEffect> {
         classify_git(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
