@@ -1427,5 +1427,5 @@
     "Invoiced provider cost and provider-side retries for the synthesis call are unknown.",
     "Host OS and dynamic libraries were trusted, not sandboxed."
   ],
-  "reviewer": "pending: maintainer"
+  "reviewer": "status confirmed by maintainer 2026-11-03; independent evidence review not performed"
 }

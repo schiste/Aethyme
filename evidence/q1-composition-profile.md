@@ -45,5 +45,6 @@ T20 and T21 are excluded: they belong to Q3 (#650 AC4).
 
 ## Review
 
-`reviewer: pending: maintainer`. D03–D06 closure records, also pending the
-maintainer, are in the profile doc.
+The maintainer confirmed the Q1 record and the D03–D06 statuses on 2026-11-03, including
+D04 as `accepted_with_evidence` with its FX04 limitation stated. No independent review of
+the evidence itself has been performed. The decision records are in the profile doc.

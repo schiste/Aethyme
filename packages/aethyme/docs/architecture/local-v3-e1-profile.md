@@ -173,7 +173,7 @@ evidence:
   - test original_e1_inputs_match_the_pretrial_inventory
 limitations:
   - "HX held-out variants stayed sealed and were not rerun; SH01 is the single independently sealed final variant"
-reviewer: "pending: maintainer"
+reviewer: "status confirmed by maintainer 2026-11-03; independent evidence review not performed"
 reopen_on: ["fixture change", "advertised product claim change"]
 ```
 
@@ -191,7 +191,7 @@ limitations:
   - "FX04: no composer passes. Original FX04 is routed to resolution (its text candidate is unverified); the FX04-browser positive comes from bounded synthesis (D06), not from the composer"
   - "No separate formatting test beyond HTML parse, conflict-marker and byte-identity checks"
   - "Does not attest how the upstream release executable was built"
-reviewer: "pending: maintainer"
+reviewer: "status confirmed by maintainer 2026-11-03; independent evidence review not performed"
 reopen_on: ["parser or Mergiraf upgrade", "new grammar or operation", "counterexample in a supported case"]
 ```
 
@@ -208,7 +208,7 @@ evidence:
 limitations:
   - "inherited-base evidence is the FX03 family only"
   - "the cycle case is a prerequisite cycle (FX06 s4), not a lineage cycle"
-reviewer: "pending: maintainer"
+reviewer: "status confirmed by maintainer 2026-11-03; independent evidence review not performed"
 reopen_on: ["external rebases", "arbitrary branches", "broader lineage"]
 ```
 
@@ -223,6 +223,6 @@ evidence:
   - "FX04-browser synthesis: subtraction without consumer passed 2/2; keeping the consumer refused 2/2 (inseparable_selection); originals reconstructable"
 limitations:
   - "one synthetic repair; arbitrary semantic repair is not established"
-reviewer: "pending: maintainer"
+reviewer: "status confirmed by maintainer 2026-11-03; independent evidence review not performed"
 reopen_on: ["cross-file extraction", "hotfix transfer", "downstream dependencies on synthesis"]
 ```
