@@ -1,5 +1,7 @@
 # Environment hook receipts
 
+Last Updated: 2026-11-03
+
 A hook can print `AETHYME_RECEIPT {"port":5432,"database":"copy"}` on a
 single line. Later component commands receive the complete JSON object in
 `AETHYME_ENV_RECEIPT_DB` when the producing component is named `db`. They
