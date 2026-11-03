@@ -2880,6 +2880,28 @@ impl GitRepo {
         })
     }
 
+    /// Gates cannot infer all tracked inputs from a command, so refuse to
+    /// certify a checkout whose index omits any tracked paths.
+    pub(crate) fn require_complete_gate_checkout(&self) -> Result<(), GitError> {
+        let output = run_git_bytes(&self.root, &["ls-files", "-t", "-z"])?;
+        for entry in nul_terminated_paths(&output, "ls-files -t")? {
+            if entry.len() < 3 || entry[1] != b' ' {
+                return Err(GitError::UntrustedOutput {
+                    detail: "git ls-files -t returned a malformed index entry".into(),
+                });
+            }
+            if entry[0] == b'S' {
+                return Err(GitError::UntrustedOutput {
+                    detail: format!(
+                        "gates cannot verify a sparse checkout with omitted tracked paths (for example {:?}); use a complete checkout for verification",
+                        String::from_utf8_lossy(&entry[2..])
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -11526,6 +11548,13 @@ mod sparse_worktree_tests {
         assert!(worktree_path.join("README.md").is_file());
         assert!(worktree_path.join("included/source.rs").is_file());
         assert!(!worktree_path.join("omitted/deep/data.txt").exists());
+        assert!(repo.require_complete_gate_checkout().is_ok());
+        let error = worktree
+            .require_complete_gate_checkout()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("omitted/deep/data.txt"), "{error}");
+        assert!(error.contains("complete checkout"), "{error}");
         assert!(worktree.dirty_paths().unwrap().is_empty());
         assert!(
             root.join("omitted/deep/data.txt").is_file(),
