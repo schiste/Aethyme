@@ -160,6 +160,10 @@ pub struct CompiledComponent {
     pub env: BTreeMap<String, String>,
     pub pass_env: Vec<String>,
     pub stop_grace_seconds: u64,
+    /// Per-component hook deadline; omitted when unset, so existing
+    /// snapshots keep their digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_timeout_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine: Option<Engine>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -358,6 +362,7 @@ fn compile_component(file: &EnvironmentsFile, component: &ComponentSpec) -> Comp
         stop_grace_seconds: component
             .stop_grace_seconds
             .unwrap_or(DEFAULT_STOP_GRACE_SECONDS),
+        hook_timeout_seconds: component.hook_timeout_seconds,
         engine,
         compose_file: component.file.clone(),
         services: component.services.clone(),
@@ -376,6 +381,15 @@ fn compile_component(file: &EnvironmentsFile, component: &ComponentSpec) -> Comp
         optional: component.optional,
         enabled_by: component.enabled_by.clone(),
         paths: component.paths.clone(),
+    }
+}
+
+impl CompiledComponent {
+    /// The deadline for one of this component's hooks: its own
+    /// `hook_timeout_seconds`, else `default`.
+    pub fn hook_timeout(&self, default: std::time::Duration) -> std::time::Duration {
+        self.hook_timeout_seconds
+            .map_or(default, std::time::Duration::from_secs)
     }
 }
 

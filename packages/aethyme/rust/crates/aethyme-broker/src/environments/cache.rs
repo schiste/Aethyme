@@ -547,7 +547,8 @@ impl Lifecycle {
         let key = format!("aethyme-env-build:{repository}:{}:{digest}", component.name);
         let log = ctx.log();
         let target = worktree.join(output);
-        self.coalesce(&repository, &key, ctx.hook_timeout, |this| {
+        let timeout = component.hook_timeout(ctx.hook_timeout);
+        self.coalesce(&repository, &key, timeout, |this| {
             this.add_cache_use(&env_id, &entry)?;
             if entry.join(COMPLETE).exists() {
                 materialize(&entry.join(OUTPUT), &target)
@@ -574,7 +575,7 @@ impl Lifecycle {
                 &component.pass_env,
                 &component.env,
                 &log,
-                ctx.hook_timeout,
+                timeout,
             )?;
             publish_build(&target, &entry, &key, output, &component.name)?;
             append_log(
@@ -609,7 +610,7 @@ impl Lifecycle {
                 worktree: &worktree,
                 vars: ctx.vars(),
                 log: ctx.log(),
-                timeout: ctx.hook_timeout,
+                timeout: component.hook_timeout(ctx.hook_timeout),
                 env_id: Some(&ctx.environment.env_id),
                 keep: component.template_keep,
                 stop: None,

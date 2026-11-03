@@ -442,18 +442,34 @@ pub(crate) fn output_limited_in_owned_group(
     budget: Duration,
     max_stream_bytes: usize,
 ) -> io::Result<LimitedOutput> {
-    output_limited_in_owned_group_until(command, budget, max_stream_bytes, &mut || false)
-        .map(|outcome| outcome.unwrap_or(LimitedOutput::Deadline))
+    output_limited_in_owned_group_until(
+        command,
+        budget,
+        max_stream_bytes,
+        &mut || false,
+        &mut PartialOutput::default(),
+    )
+    .map(|outcome| outcome.unwrap_or(LimitedOutput::Deadline))
+}
+
+/// What a stopped child had printed before it was stopped.
+#[derive(Debug, Default)]
+pub(crate) struct PartialOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 /// [`output_limited_in_owned_group`] that also stops the whole group when
 /// `stop` says so, polled about once a second. `Ok(None)` means it stopped.
+/// When the deadline or `stop` ends the child, whatever it had printed is
+/// left in `partial`, so a killed run still leaves its output to read.
 #[cfg(unix)]
 pub(crate) fn output_limited_in_owned_group_until(
     command: &mut Command,
     budget: Duration,
     max_stream_bytes: usize,
     stop: &mut dyn FnMut() -> bool,
+    partial: &mut PartialOutput,
 ) -> io::Result<Option<LimitedOutput>> {
     use std::os::unix::process::CommandExt;
 
@@ -495,12 +511,16 @@ pub(crate) fn output_limited_in_owned_group_until(
     let mut last_stop_check = Instant::now();
     loop {
         if Instant::now() >= deadline {
+            partial.stdout = std::mem::take(&mut stdout);
+            partial.stderr = std::mem::take(&mut stderr);
             child.terminate_and_reap()?;
             return Ok(Some(LimitedOutput::Deadline));
         }
         if last_stop_check.elapsed() >= Duration::from_secs(1) {
             last_stop_check = Instant::now();
             if stop() {
+                partial.stdout = std::mem::take(&mut stdout);
+                partial.stderr = std::mem::take(&mut stderr);
                 child.terminate_and_reap()?;
                 return Ok(None);
             }
@@ -811,6 +831,7 @@ pub(crate) fn output_limited_in_owned_group_until(
     _budget: Duration,
     _max_stream_bytes: usize,
     _stop: &mut dyn FnMut() -> bool,
+    _partial: &mut PartialOutput,
 ) -> io::Result<Option<LimitedOutput>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,

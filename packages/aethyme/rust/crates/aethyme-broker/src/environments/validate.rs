@@ -1426,6 +1426,16 @@ fn validate_component(
             "set template or remove template_inputs",
         );
     }
+    if component.hook_timeout_seconds == Some(0) {
+        c.push(
+            "invalid_hook_timeout",
+            p,
+            n,
+            Some("hook_timeout_seconds"),
+            "hook_timeout_seconds must be positive",
+            "e.g. hook_timeout_seconds = 1800",
+        );
+    }
     if let Some(keep) = component.template_keep {
         if component.template.is_none() {
             c.push(
