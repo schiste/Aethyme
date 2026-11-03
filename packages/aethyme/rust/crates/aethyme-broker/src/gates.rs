@@ -5576,6 +5576,28 @@ mod tests {
     }
 
     #[test]
+    fn gate_artifact_admission_does_not_wait_past_a_live_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        init_repo(&checkout_root);
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        let store = BrokerStore::open(&root.path().join("broker.db")).unwrap();
+        let claim = crate::file_lock::acquire_repository_lifecycle_lock(&checkout_root).unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(500));
+                drop(claim);
+            });
+            let deadline = Instant::now() + Duration::from_millis(100);
+            assert!(
+                begin_gate_artifact_use(&store, &checkout_root, &checkout, None, Some(deadline))
+                    .is_err(),
+                "a later lock release must not turn an expired admission into success"
+            );
+        });
+    }
+
+    #[test]
     fn managed_cache_shortfall_refuses_admission_on_its_own_volume() {
         let probes = vec![
             GateStorageProbe {
