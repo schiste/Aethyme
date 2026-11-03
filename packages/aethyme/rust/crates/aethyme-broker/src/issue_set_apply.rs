@@ -243,6 +243,7 @@ mod tests {
         dependencies: BTreeSet<(u64, u64)>,
         create_calls: usize,
         lose_create_response: bool,
+        duplicate_create_number: bool,
     }
     impl IssueSetBackend for Fake {
         fn validate_labels(&mut self, _labels: &BTreeSet<String>) -> Result<(), String> {
@@ -264,7 +265,11 @@ mod tests {
         }
         fn create(&mut self, entry: &Entry, marker: &str) -> Result<u64, String> {
             self.create_calls += 1;
-            let id = self.create_calls as u64 + 100;
+            let id = if self.duplicate_create_number {
+                101
+            } else {
+                self.create_calls as u64 + 100
+            };
             self.issues.insert(id, (marker.into(), entry.title.clone()));
             if self.lose_create_response {
                 self.lose_create_response = false;
@@ -354,6 +359,18 @@ depends_on = ["epic"]
         assert_eq!(planned["epic"], Some(numbers["epic"]));
         assert_eq!(planned["child"], Some(numbers["child"]));
         assert_eq!(backend.create_calls, 2);
+    }
+    #[test]
+    fn refuses_a_duplicate_issue_number_returned_by_create() {
+        let (dir, manifest) = fixture();
+        let mut backend = Fake {
+            duplicate_create_number: true,
+            ..Fake::default()
+        };
+        let error = apply(&manifest, dir.path(), "owner/repo", &mut backend).unwrap_err();
+        assert!(error.contains("duplicate issue number"));
+        assert!(backend.links.is_empty());
+        assert!(backend.dependencies.is_empty());
     }
     #[test]
     fn interrupted_create_is_adopted_when_marker_is_found() {
