@@ -341,6 +341,8 @@ fn assess_pr_merge(tokens: &[&str]) -> Verdict {
 /// accepts follow. None of these can create, move or delete a git ref.
 const SAFE_WRITE_ENDPOINTS: &[(&[&str], &[&str])] = &[
     (&["issues", "N", "comments"], &["POST"]),
+    (&["issues", "N", "sub_issues"], &["POST"]),
+    (&["issues", "N", "sub_issue"], &["DELETE"]),
     (&["issues", "comments", "N"], &["PATCH", "DELETE"]),
     (&["pulls", "N", "comments"], &["POST"]),
     (&["pulls", "N", "comments", "N", "replies"], &["POST"]),
@@ -420,6 +422,14 @@ fn is_safe_write(tokens: &[&str], repository: &str) -> bool {
     };
     if !methods.contains(&method) {
         return false;
+    }
+    // Sub-issue mutations carry exactly one numeric database ID. Do not allow
+    // arbitrary request fields or replace_parent, which can move a child.
+    if *pattern == ["issues", "N", "sub_issues"] || *pattern == ["issues", "N", "sub_issue"] {
+        return matches!(fields.as_slice(), [("-F", field)]
+            if field.strip_prefix("sub_issue_id=")
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|id| id > 0));
     }
     let issue_patch = *pattern == ["issues", "N"];
     fields.iter().all(|(flag, field)| {
@@ -644,6 +654,65 @@ fn branch_ref_path(path: &str, repository: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_sub_issue_mutations_are_exact_and_cannot_write_refs() {
+        for (method, endpoint) in [
+            ("POST", "repos/o/n/issues/12/sub_issues"),
+            ("DELETE", "repos/o/n/issues/12/sub_issue"),
+        ] {
+            assert_eq!(
+                assess_line(&["api", "-X", method, endpoint, "-F", "sub_issue_id=345"]),
+                Verdict::SafeWrite
+            );
+            for field in [
+                "sub_issue_id=0",
+                "sub_issue_id=-1",
+                "sub_issue_id=@file",
+                "other=345",
+            ] {
+                assert!(matches!(
+                    assess_line(&["api", "-X", method, endpoint, "-F", field]),
+                    Verdict::Unverifiable(_)
+                ));
+            }
+            assert!(matches!(
+                assess_line(&[
+                    "api",
+                    "-X",
+                    method,
+                    endpoint,
+                    "-F",
+                    "sub_issue_id=345",
+                    "-F",
+                    "replace_parent=true"
+                ]),
+                Verdict::Unverifiable(_)
+            ));
+        }
+        assert!(matches!(
+            assess_line(&[
+                "api",
+                "-X",
+                "POST",
+                "repos/other/n/issues/12/sub_issues",
+                "-F",
+                "sub_issue_id=345"
+            ]),
+            Verdict::Unverifiable(_)
+        ));
+        assert!(matches!(
+            assess_line(&[
+                "api",
+                "-X",
+                "POST",
+                "repos/o/n/git/refs/heads/main",
+                "-F",
+                "sub_issue_id=345"
+            ]),
+            Verdict::Unverifiable(_)
+        ));
+    }
 
     fn assess_line(line: &[&str]) -> Verdict {
         assess(
