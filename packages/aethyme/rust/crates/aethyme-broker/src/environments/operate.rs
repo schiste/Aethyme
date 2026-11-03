@@ -102,11 +102,10 @@ fn describe(lifecycle: &Lifecycle, record: &EnvironmentRecord) -> (Value, String
         // Only components the environment runs: an optional component left
         // out keeps its port reserved but is not reported (E20).
         let runs = |key: &str| {
-            record
-                .snapshot
-                .components
-                .iter()
-                .any(|c| c.port_key.as_deref() == Some(key))
+            record.snapshot.components.iter().any(|c| {
+                c.port_key.as_deref() == Some(key)
+                    || c.extra_port_keys.iter().any(|extra| extra == key)
+            })
         };
         for allocation in grant.lease.allocations.iter().filter(|a| runs(&a.key)) {
             if let Some(component) = allocation.key.strip_prefix("port_") {

@@ -193,6 +193,35 @@ health = { command = "true", timeout_seconds = 5, interval_ms = 50 }
 "#;
 
 #[test]
+fn one_component_reserves_and_releases_multiple_named_ports() {
+    let text = r#"
+schema = 1
+[[profiles]]
+name = "isolated"
+[[profiles.components]]
+name = "stack"
+runtime = "hooks"
+ports = ["api", "db", "web"]
+provision = 'test -n "$AETHYME_ENV_PORT_STACK_API" && test -n "$AETHYME_ENV_PORT_STACK_DB" && test -n "$AETHYME_ENV_PORT_STACK_WEB" && test "$AETHYME_ENV_PORT_STACK_API" != "$AETHYME_ENV_PORT_STACK_DB" && test "$AETHYME_ENV_PORT_STACK_API" != "$AETHYME_ENV_PORT_STACK_WEB" && test "$AETHYME_ENV_PORT_STACK_DB" != "$AETHYME_ENV_PORT_STACK_WEB"'
+destroy = "true"
+"#;
+    let host = Host::new();
+    let (repo, head) = repository(&host.markers, text);
+    let snapshot = snapshot(text, "isolated", repo.path(), Some(head));
+    let names = snapshot.variable_names(&snapshot.components[0]);
+    assert!(names.contains(&"AETHYME_ENV_PORT_STACK_API".to_string()));
+    assert!(names.contains(&"AETHYME_ENV_URL_STACK_API".to_string()));
+    let mut lifecycle = host.lifecycle();
+    let record = lifecycle
+        .up(&snapshot, repo.path(), Some(repo.path()), None, &options())
+        .unwrap();
+    assert_eq!(record.phase, EnvironmentPhase::Active);
+    assert_eq!(host.active_leases(&record.env_id), 1);
+    lifecycle.down(&record.env_id, None).unwrap();
+    assert_eq!(host.active_leases(&record.env_id), 0);
+}
+
+#[test]
 fn up_reserves_provisions_and_starts_and_a_second_up_is_the_same_environment() {
     let host = Host::new();
     let (repo, head) = repository(&host.markers, STACK);

@@ -571,6 +571,33 @@ fn unknown_keys_and_syntax_errors_carry_line_and_column() {
 }
 
 #[test]
+fn named_component_ports_cannot_collide() {
+    let text = r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "stack"
+runtime = "hooks"
+ports = ["api", "api"]
+provision = "true"
+destroy = "true"
+"#;
+    assert!(
+        diagnostics(text)
+            .iter()
+            .any(|d| d.code == "port_env_collision")
+    );
+    let non_listening = text.replace("ports = [\"api\", \"api\"]", "ports = [\"api\"]")
+        + "\n[[profiles.components]]\nname = \"stack_api\"\nruntime = \"hooks\"\nprovision = \"true\"\ndestroy = \"true\"\n";
+    assert!(
+        diagnostics(&non_listening)
+            .iter()
+            .any(|d| d.code == "port_env_collision")
+    );
+}
+
+#[test]
 fn components_compile_in_dependency_order_and_ties_keep_declaration_order() {
     let file = parse(NODE_COMPOSE);
     let isolated = file.profiles.iter().find(|p| p.name == "isolated").unwrap();

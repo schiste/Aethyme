@@ -778,6 +778,7 @@ fn render_plan(compiled: &CompiledEnvironment, plans: AdvisoryPlans) -> Output {
                 "runtime": component.runtime,
                 "depends_on": component.depends_on,
                 "port_key": component.port_key,
+                "extra_port_keys": component.extra_port_keys,
                 "routed": component.routed,
                 "variables": compiled.variable_names(component),
             })
