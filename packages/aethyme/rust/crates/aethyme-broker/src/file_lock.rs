@@ -286,7 +286,7 @@ pub(crate) fn try_acquire_session_commit_lock(
     Ok(lock)
 }
 
-fn acquire_repository_lifecycle_lock_with_wait(
+pub(crate) fn acquire_repository_lifecycle_lock_with_wait(
     main_root: &Path,
     wait: Duration,
 ) -> io::Result<ExclusiveFileLock> {
