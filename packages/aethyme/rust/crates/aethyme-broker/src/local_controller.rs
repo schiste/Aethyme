@@ -17,7 +17,7 @@ use crate::local_target::{self as target, ControllerOwner, Phase};
 use crate::local_wave::{self as wave, WavePhase};
 
 pub mod drive;
-pub use drive::{DrivePolicy, DriveResult, drive};
+pub use drive::{DrivePolicy, DriveResult, NativeGateMode, drive};
 pub mod bare_destination;
 pub mod service;
 pub use service::{ServiceOutcome, ServicePolicy, ServiceReport, serve};

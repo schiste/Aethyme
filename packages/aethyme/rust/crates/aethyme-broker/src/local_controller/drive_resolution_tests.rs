@@ -97,6 +97,7 @@ fn minimal_policy() -> DrivePolicy {
         wave_policy: wave::WavePolicy::default(),
         max_wall_ms: 1000,
         allow_empty_native_gates: true,
+        native_gates: NativeGateMode::Required,
     }
 }
 

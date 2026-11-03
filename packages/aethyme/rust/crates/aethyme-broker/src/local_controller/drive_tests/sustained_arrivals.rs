@@ -15,7 +15,7 @@ use crate::execution_snapshot::{
 use crate::execution_supervisor::DockerExecutor;
 use crate::execution_verifier::{AssertionCase, AssertionInventory, VerifierPolicy};
 use crate::local_budget::{self as budget, ProjectPolicy, Units};
-use crate::local_controller::{DrivePolicy, ServiceOutcome, ServicePolicy, serve};
+use crate::local_controller::{DrivePolicy, NativeGateMode, ServiceOutcome, ServicePolicy, serve};
 use crate::local_source_transport::GitCarrier;
 use crate::local_target::{self as target, Phase, RequestedContribution, TargetSpec};
 use crate::local_wave::{self as wave, WavePhase, WavePolicy};
@@ -2734,6 +2734,7 @@ fn run_fx10(context: Fx10RunContext<'_>) -> Result<(), String> {
         wave_policy,
         max_wall_ms: 120_000,
         allow_empty_native_gates: false,
+        native_gates: NativeGateMode::Required,
     };
     for id in ["A", "B", "C"] {
         wave::available(&mut store, &owner, id, now_ms()?).map_err(|error| error.to_string())?;

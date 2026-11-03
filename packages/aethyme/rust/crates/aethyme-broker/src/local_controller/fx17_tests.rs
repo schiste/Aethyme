@@ -8,7 +8,7 @@ use crate::execution_snapshot::{
 use crate::execution_supervisor::DockerExecutor;
 use crate::execution_verifier::{AssertionCase, AssertionInventory, VerifierPolicy};
 use crate::local_budget::{self as budget, ProjectPolicy, Units};
-use crate::local_controller::DrivePolicy;
+use crate::local_controller::{DrivePolicy, NativeGateMode};
 use crate::local_source_transport::GitCarrier;
 use crate::local_target::{self as target, Phase, RequestedContribution, TargetSpec};
 use crate::local_wave::{self as wave, WavePolicy};
@@ -944,6 +944,7 @@ fn run_fx17(
             },
             max_wall_ms: 900_000,
             allow_empty_native_gates: false,
+            native_gates: NativeGateMode::Required,
         };
         let appointment = crate::local_controller::ServicePolicy {
             nonce: format!("fx17-stage-{ordinal:02}"),

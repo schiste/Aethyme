@@ -34,7 +34,29 @@ pub struct DrivePolicy {
     pub wave_policy: wave::WavePolicy,
     pub max_wall_ms: i64,
     /// Explicit permission for the repository's no-command native policy.
+    /// Only consulted when `native_gates` is `required`.
     pub allow_empty_native_gates: bool,
+    /// Whether candidate code also runs through the repository's native gate
+    /// commands before the Docker build. Absent means `off`.
+    #[serde(default)]
+    pub native_gates: NativeGateMode,
+}
+
+/// Native gate commands execute candidate-controlled code (build scripts,
+/// tests, binaries built from the candidate tree) with the operator's full
+/// host authority: inherited environment and credentials, the operator's
+/// filesystem, and the network. They are not a sandbox. Local acceptance
+/// always rests on the confined Docker build and the independent verifier,
+/// so native gates stay off unless an operator explicitly opts in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeGateMode {
+    /// Freeze the native job for the record, abandon it before dispatch, and
+    /// run no native command. The Docker build and verifier still gate.
+    #[default]
+    Off,
+    /// Run native gates with host authority; a failure holds the wave.
+    Required,
 }
 impl DrivePolicy {
     pub(super) fn validate(&self) -> Result<(), ControllerError> {
@@ -480,6 +502,52 @@ fn raise_failed_check_request(
     Ok(None)
 }
 
+/// What the native-gate stage did for one dispatch.
+pub(super) enum NativeStage {
+    /// `off`: the job was frozen for the record and abandoned before dispatch.
+    /// No native command ran.
+    Skipped(native_gates::Job),
+    /// `required`: native commands ran with host authority. The completed
+    /// job carries the same frozen spec as the prepared one.
+    Ran(native_gates::Job),
+}
+
+/// Freeze the native job, then either abandon it before dispatch (`off`) or
+/// run it once (`required`). A released prepared job can never be dispatched,
+/// so `off` guarantees no candidate code runs on the host in this stage.
+pub(super) fn native_stage(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    broker: &mut Broker,
+    policy: &DrivePolicy,
+    wave_id: &RecordId,
+) -> Result<NativeStage, ControllerError> {
+    let prepared = native_gates::prepare(store, owner, broker, wave_id)?;
+    require_fresh_native(&prepared)?;
+    match policy.native_gates {
+        NativeGateMode::Off => {
+            let release = native_gates::release_roots(store, owner, &prepared.id)?;
+            if release.status != native_gates::RootReleaseStatus::Released {
+                return Err(ControllerError::Mismatch);
+            }
+            Ok(NativeStage::Skipped(prepared))
+        }
+        NativeGateMode::Required => {
+            // Graph regeneration does not have this profile's process deadline.
+            // Refuse that optional configuration before dispatching the job.
+            if prepared.spec.graph_config_sha256.is_some() {
+                return Err(ControllerError::Mismatch);
+            }
+            Ok(NativeStage::Ran(native_gates::run_fresh(
+                store,
+                owner,
+                broker,
+                &prepared.id,
+            )?))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     store: &mut CollaborationStore,
@@ -540,14 +608,7 @@ fn run(
         target::resume(store, owner, held.version)?;
     }
     check(store, owner, spec, cancel)?;
-    let native = native_gates::prepare(store, owner, broker, wave_id)?;
-    require_fresh_native(&native)?;
-    // Graph regeneration does not have this profile's process deadline.
-    // Refuse that optional configuration before dispatching the native job.
-    if native.spec.graph_config_sha256.is_some() {
-        return Err(ControllerError::Mismatch);
-    }
-    let native = native_gates::run_fresh(store, owner, broker, &native.id)?;
+    let stage = native_stage(store, owner, broker, &spec.policy, wave_id)?;
     budget::settle(
         store,
         owner,
@@ -556,36 +617,45 @@ fn run(
         &canonical(spec)?.id(),
     )?;
     close(store, owner, &control)?;
-    let observation = native.observation.ok_or(ControllerError::Mismatch)?;
-    let status = observation["status"]
-        .as_str()
-        .ok_or(ControllerError::Mismatch)?;
-    if observation["current_authority"] != true
-        || !(status == "passed"
-            || (spec.policy.allow_empty_native_gates
-                && matches!(status, "no_configuration" | "no_gates_triggered")))
-    {
-        let failed_checks = trusted_native_failed_checks(&observation);
-        let resolution_hold = raise_failed_check_request(
-            store,
-            FailedCheckRequestContext {
-                owner,
-                repo: broker.repo_handle().root(),
-                spec,
-                wave_id,
-                cancel,
-                source: source.as_ref(),
-            },
-            failed_checks,
-        )?;
-        return Ok(DriveResult::Held {
-            wave: wave_id.clone(),
-            detail: resolution_hold.map_or_else(
-                || format!("native gates {status}"),
-                |reason| format!("native gates {status}; resolution held: {reason}"),
-            ),
-        });
-    }
+    let native = match stage {
+        NativeStage::Skipped(prepared) => prepared,
+        NativeStage::Ran(completed) => {
+            let observation = completed
+                .observation
+                .clone()
+                .ok_or(ControllerError::Mismatch)?;
+            let status = observation["status"]
+                .as_str()
+                .ok_or(ControllerError::Mismatch)?;
+            let passed = observation["current_authority"] == true
+                && (status == "passed"
+                    || (spec.policy.allow_empty_native_gates
+                        && matches!(status, "no_configuration" | "no_gates_triggered")));
+            if !passed {
+                let failed_checks = trusted_native_failed_checks(&observation);
+                let resolution_hold = raise_failed_check_request(
+                    store,
+                    FailedCheckRequestContext {
+                        owner,
+                        repo: broker.repo_handle().root(),
+                        spec,
+                        wave_id,
+                        cancel,
+                        source: source.as_ref(),
+                    },
+                    failed_checks,
+                )?;
+                return Ok(DriveResult::Held {
+                    wave: wave_id.clone(),
+                    detail: resolution_hold.map_or_else(
+                        || format!("native gates {status}"),
+                        |reason| format!("native gates {status}; resolution held: {reason}"),
+                    ),
+                });
+            }
+            completed
+        }
+    };
     check(store, owner, spec, cancel)?;
     let mut execution_spec = spec.policy.execution.clone();
     execution_spec.candidate_source = active

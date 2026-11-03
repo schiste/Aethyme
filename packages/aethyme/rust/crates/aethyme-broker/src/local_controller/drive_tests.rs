@@ -20,7 +20,7 @@ pub(crate) fn policy() -> DrivePolicy {
         output_bytes: 1024 * 1024,
         pids: 32,
     };
-    DrivePolicy {execution:ExecutionSpec {candidate_source:digest(b"placeholder"),preparation:None,dependencies:None,configuration:None,harness:digest(b"harness"),dataset:None,assertion_inventory:digest(b"inventory"),materialization_profile:snapshot::MATERIALIZATION_PROFILE.into(),profile:LinuxProfile {build_image:digest(b"image"),verifier_image:digest(b"image"),architecture:"aarch64".into(),runtime_profile:digest(b"runtime"),build_limits:limits,verifier_limits:limits},build:CommandSpec {program:"/bin/sh".into(),arguments:vec!["-c".into(),"set -eu; cp /source/one.txt /outputs/value; printf 'set -eu\\ntest ! -e /harness\\ntest ! -e /dataset\\ntest ! -e /var/run/docker.sock\\ncat /artifact/value\\n' > /outputs/app.sh".into()],environment:Default::default()},verify:command},wave_policy:wave::WavePolicy {debounce_ms:0,..Default::default()},max_wall_ms:300000,allow_empty_native_gates:true}
+    DrivePolicy {execution:ExecutionSpec {candidate_source:digest(b"placeholder"),preparation:None,dependencies:None,configuration:None,harness:digest(b"harness"),dataset:None,assertion_inventory:digest(b"inventory"),materialization_profile:snapshot::MATERIALIZATION_PROFILE.into(),profile:LinuxProfile {build_image:digest(b"image"),verifier_image:digest(b"image"),architecture:"aarch64".into(),runtime_profile:digest(b"runtime"),build_limits:limits,verifier_limits:limits},build:CommandSpec {program:"/bin/sh".into(),arguments:vec!["-c".into(),"set -eu; cp /source/one.txt /outputs/value; printf 'set -eu\\ntest ! -e /harness\\ntest ! -e /dataset\\ntest ! -e /var/run/docker.sock\\ncat /artifact/value\\n' > /outputs/app.sh".into()],environment:Default::default()},verify:command},wave_policy:wave::WavePolicy {debounce_ms:0,..Default::default()},max_wall_ms:300000,allow_empty_native_gates:true,native_gates:NativeGateMode::Required}
 }
 fn spec() -> RunSpec {
     RunSpec {
@@ -458,6 +458,9 @@ fn dispatch_record_binds_every_operator_choice() {
     v.policy.allow_empty_native_gates = false;
     changes.push(v);
     let mut v = s.clone();
+    v.policy.native_gates = NativeGateMode::Off;
+    changes.push(v);
+    let mut v = s.clone();
     v.policy.execution.build.arguments.push("changed".into());
     changes.push(v);
     let mut v = s.clone();
@@ -845,6 +848,94 @@ fn completed_native_job_is_history_and_cannot_approve_controller_dispatch() {
     assert!(
         require_fresh_native(&restarted).is_err(),
         "ambiguous native dispatch cannot be retried"
+    );
+}
+
+/// Frozen wave plus broker for exercising the native stage directly.
+fn native_stage_fixture(name: &str) -> (Fixture, ControllerOwner, Broker, RecordId) {
+    let mut f = Fixture::new();
+    let owner = target::acquire_controller(&mut f.store, name, "operator").unwrap();
+    let selected = f.spec();
+    let revision = target::propose_revision(&mut f.store, &owner, selected).unwrap();
+    target::select_revision(&mut f.store, &owner, &revision.id).unwrap();
+    wave::available(&mut f.store, &owner, "A", 0).unwrap();
+    let wave::Admission::Frozen(w) =
+        wave::admit(&mut f.store, &owner, policy().wave_policy, 0).unwrap()
+    else {
+        panic!("missing wave")
+    };
+    wave::compose(&mut f.store, &owner, f._repo.path(), &w.id).unwrap();
+    let broker = Broker::open(f._repo.path())
+        .unwrap()
+        .with_host_operation_database(f._host.path().join("operations.db"))
+        .with_worktree_root(f._host.path().join("worktrees"));
+    (f, owner, broker, w.id)
+}
+
+#[test]
+fn native_gates_off_abandons_the_frozen_job_before_any_dispatch() {
+    if crate::native_gates::run_in_clean_git_child(
+        "local_controller::drive::tests::native_gates_off_abandons_the_frozen_job_before_any_dispatch",
+    ) {
+        return;
+    }
+    let (mut f, owner, mut broker, wave_id) = native_stage_fixture("native-off");
+    let mut off = policy();
+    off.native_gates = NativeGateMode::Off;
+    let NativeStage::Skipped(prepared) =
+        native_stage(&mut f.store, &owner, &mut broker, &off, &wave_id).unwrap()
+    else {
+        panic!("off must not run native gates")
+    };
+    let job = native_gates::load(&f.store, &prepared.id).unwrap();
+    assert_eq!(job.state, "prepared", "never dispatched");
+    assert!(job.observation.is_none(), "no native observation exists");
+    assert!(job.roots_released_ms.is_some(), "abandoned before dispatch");
+    assert!(
+        native_gates::run_fresh(&mut f.store, &owner, &mut broker, &prepared.id).is_err(),
+        "an abandoned prepared job can never be dispatched later"
+    );
+    assert_eq!(
+        native_gates::load(&f.store, &prepared.id).unwrap().state,
+        "prepared",
+        "the refused dispatch left no trace of execution"
+    );
+}
+
+#[test]
+fn native_gates_required_runs_the_frozen_job_once() {
+    if crate::native_gates::run_in_clean_git_child(
+        "local_controller::drive::tests::native_gates_required_runs_the_frozen_job_once",
+    ) {
+        return;
+    }
+    let (mut f, owner, mut broker, wave_id) = native_stage_fixture("native-required");
+    let required = policy();
+    assert_eq!(required.native_gates, NativeGateMode::Required);
+    let NativeStage::Ran(completed) =
+        native_stage(&mut f.store, &owner, &mut broker, &required, &wave_id).unwrap()
+    else {
+        panic!("required must run native gates")
+    };
+    assert_eq!(completed.state, "completed");
+    assert!(completed.roots_released_ms.is_none());
+    assert_eq!(
+        completed.observation.as_ref().unwrap()["current_authority"],
+        true
+    );
+}
+
+#[test]
+fn policy_files_without_a_native_gate_choice_default_to_off() {
+    let mut value = serde_json::to_value(policy()).unwrap();
+    assert_eq!(value["native_gates"], "required");
+    value.as_object_mut().unwrap().remove("native_gates");
+    let parsed: DrivePolicy = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(parsed.native_gates, NativeGateMode::Off);
+    value["native_gates"] = "advisory".into();
+    assert!(
+        serde_json::from_value::<DrivePolicy>(value).is_err(),
+        "an unknown native gate mode is refused, never guessed"
     );
 }
 
