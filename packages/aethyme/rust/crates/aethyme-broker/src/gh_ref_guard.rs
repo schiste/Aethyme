@@ -438,11 +438,11 @@ fn is_safe_write(tokens: &[&str], repository: &str) -> bool {
     }
     if (*pattern == ["issues", "N", "dependencies", "blocked_by"]
         || *pattern == ["issues", "N", "dependencies", "blocked_by", "N"])
-        && !endpoint
+        && endpoint
             .split('/')
             .nth(4)
             .and_then(|value| value.parse::<u64>().ok())
-            .is_some_and(|number| number > 0)
+            .is_none_or(|number| number == 0)
     {
         return false;
     }
@@ -548,7 +548,12 @@ pub(crate) fn is_issue_dependency_write(args: &[String]) -> bool {
         ] if method == "DELETE" => (*owner, *repo, *issue),
         _ => return false,
     };
-    if owner.is_empty() || repo.is_empty() || !issue.parse::<u64>().is_ok_and(|id| id > 0) {
+    if !is_plain_label(owner)
+        || !is_plain_label(repo)
+        || matches!(owner, "." | "..")
+        || matches!(repo, "." | "..")
+        || issue.parse::<u64>().ok().is_none_or(|id| id == 0)
+    {
         return false;
     }
     is_safe_write(&tokens, &format!("{owner}/{repo}"))
