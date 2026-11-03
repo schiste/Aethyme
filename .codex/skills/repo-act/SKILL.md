@@ -760,6 +760,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   newline or tab only when it is intentional display structure, not in data
   fields. Apply byte caps after escaping and label raw-source hashes separately
   from the transformed preview.
+- For fake GitHub coordinator fixtures, give the checkout an origin matching the
+  requested target, and prefix fixture environment variables with `AETHYME_`:
+  the hardened GitHub command drops other unallowlisted variables. Check
+  recorded calls and broker receipts as well as the exit status.
 - For CLI JSON stream tests, parse complete stdout as one JSON value and
   check child output on the intended stream separately. Include both stdout
   and stderr in subprocess failure assertions: a structured refusal can be
