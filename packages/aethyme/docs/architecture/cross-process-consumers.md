@@ -1357,8 +1357,9 @@ resolve to issue numbers. Body files must remain within the manifest directory.
 Labels and dependencies are validated before GitHub writes.
 
 `--dry-run --json` prints create/update and relationship actions without
-writing to GitHub. The broker holds a per-set local lock and checks its create
-journal before planning or applying. If a create's outcome is unknown and its
+writing to GitHub. The broker holds a per-set lock in its host-state directory and checks its
+create journal before planning or applying. Clones using the same host-state
+directory share this coordination. If a create's outcome is unknown and its
 marker cannot be found, it refuses a blind retry; inspect GitHub and reconcile
-the operation. The journal is local to this broker host and does not coordinate
-concurrent applications from independent hosts.
+the operation. Independent host-state directories do not coordinate concurrent applications
+or share uncertain-create recovery state.

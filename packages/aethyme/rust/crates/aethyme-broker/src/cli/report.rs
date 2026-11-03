@@ -719,7 +719,11 @@ fn run_issue_set_apply(parsed: Parsed) -> Result<(), UsageError> {
         crate::issue_set::ValidatedManifest::load(std::path::Path::new(&parsed.positional[1]))
             .map_err(UsageError::Message)?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
-    let run_dir = broker.main_root().join(".aethyme").join("run");
+    let run_dir = crate::host_state::default_host_state_dir()
+        .ok_or_else(|| {
+            UsageError::Message("cannot resolve host state for issue-set coordination".into())
+        })?
+        .join("issue-sets");
     let mut github = crate::issue_set_github::GithubIssueSet {
         broker: &mut broker,
         session_id,
