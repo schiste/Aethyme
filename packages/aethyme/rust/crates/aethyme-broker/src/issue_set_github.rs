@@ -9,6 +9,25 @@ use serde_json::Value;
 use crate::issue_set::Entry;
 use crate::issue_set_apply::IssueSetBackend;
 
+const ISSUE_SETS_POLICY_KEY: &str = "issue_workflows.issue_sets";
+
+fn policy_allows_issue_sets(config: &str) -> Result<bool, String> {
+    let value: toml::Value = config
+        .parse()
+        .map_err(|error| format!("target issue policy is invalid: {error}"))?;
+    match value
+        .get("issue_workflows")
+        .and_then(|table| table.get("issue_sets"))
+    {
+        None => Ok(false),
+        Some(value) if value.as_str() == Some("allow") => Ok(true),
+        Some(value) if value.as_str() == Some("deny") => Ok(false),
+        Some(_) => Err(format!(
+            "{ISSUE_SETS_POLICY_KEY} must be \"allow\" or \"deny\""
+        )),
+    }
+}
+
 fn marker_matches(issues: &[Value], marker: &str) -> Result<Vec<u64>, String> {
     let mut matches = Vec::new();
     for issue in issues {
@@ -55,7 +74,7 @@ pub(crate) struct GithubIssueSet<'a> {
 impl GithubIssueSet<'_> {
     fn read(&self, path: &str) -> Result<Value, String> {
         let output = crate::operations::github_command()
-            .args(["api", path])
+            .args(["api", "--hostname", "github.com", path])
             .output()
             .map_err(|error| format!("cannot run GitHub client: {error}"))?;
         if !output.status.success() {
@@ -123,6 +142,53 @@ impl GithubIssueSet<'_> {
             ));
         }
         Ok(report.stdout)
+    }
+
+    /// Read policy from the target's current default-branch commit, pinned by
+    /// SHA so a worktree or a branch name supplied by the caller cannot grant
+    /// permission. A missing or unreadable config denies.
+    pub fn require_issue_sets_policy(&self) -> Result<(), String> {
+        let commits = self.read(&format!("repos/{}/commits?per_page=1", self.repository))?;
+        let sha = commits
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("sha"))
+            .and_then(Value::as_str)
+            .filter(|sha| {
+                matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+            .ok_or("cannot resolve the target repository default-branch commit")?;
+        let path = format!(
+            "repos/{}/contents/.aethyme/config.toml?ref={sha}",
+            self.repository
+        );
+        let output = crate::operations::github_command()
+            .args([
+                "api",
+                "--hostname",
+                "github.com",
+                "-H",
+                "Accept: application/vnd.github.raw+json",
+                &path,
+            ])
+            .output()
+            .map_err(|error| format!("cannot read target issue policy: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "{ISSUE_SETS_POLICY_KEY} denied: target policy is absent or unreadable"
+            ));
+        }
+        if output.stdout.len() > 1024 * 1024 {
+            return Err("target issue policy exceeds 1 MiB".into());
+        }
+        let text =
+            std::str::from_utf8(&output.stdout).map_err(|_| "target issue policy is not UTF-8")?;
+        if !policy_allows_issue_sets(text)? {
+            return Err(format!(
+                "{ISSUE_SETS_POLICY_KEY} denied: set issue_sets = \"allow\" under [issue_workflows] on the target default branch"
+            ));
+        }
+        Ok(())
     }
 
     fn issue(&self, number: u64) -> Result<Value, String> {
@@ -320,6 +386,14 @@ impl IssueSetBackend for GithubIssueSet<'_> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn issue_set_policy_defaults_to_deny_and_requires_an_explicit_allow() {
+        assert!(!policy_allows_issue_sets("").unwrap());
+        assert!(!policy_allows_issue_sets("[issue_workflows]\nissue_sets = \"deny\"").unwrap());
+        assert!(policy_allows_issue_sets("[issue_workflows]\nissue_sets = \"allow\"").unwrap());
+        assert!(policy_allows_issue_sets("[issue_workflows]\nissue_sets = true").is_err());
+    }
 
     #[test]
     fn marker_search_fails_closed_on_incomplete_issue_data() {
