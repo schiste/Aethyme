@@ -195,6 +195,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("report render", &["--form", "--output"]),
     ("report file", &["--repo", "--confirm"]),
     ("quality-report", &["--repo", "--pr", "--session"]),
+    ("issues sub-issue", &["--repo", "--session", "--reason"]),
     (
         "issues apply",
         &["--repo", "--session", "--reason", "--dry-run"],

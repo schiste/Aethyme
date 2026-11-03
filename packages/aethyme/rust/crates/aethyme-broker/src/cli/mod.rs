@@ -190,6 +190,7 @@ Usage:
       opt-in and uses the coordinated GitHub operation lane; it never changes
       gate selection or CI certification.
   aethyme broker issues apply <manifest.toml> --repo <owner/name> --session <id> --reason <authorization> [--dry-run] [--json]
+  aethyme broker issues sub-issue add|remove <parent> <child>... --repo <owner/name> --session <id> --reason <authorization> [--json]
   aethyme broker issues upsert --repo <owner/name> --fingerprint <key> --title <title> --body-file <path> [--label <label>]... [--session <id>] [--json]
   aethyme broker issues upsert --repo <owner/name> --fingerprint <key> --resolve [--body-file <path>] [--session <id>] [--json]
       Keep one issue per automation outcome (#1238). The first failure opens
