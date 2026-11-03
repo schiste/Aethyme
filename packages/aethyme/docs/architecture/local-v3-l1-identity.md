@@ -11,7 +11,7 @@ retained HTML move/edit profile and specific synthesis, consumer and subtraction
 That campaign did not itself establish generic ProjectId enrollment, FileId transitions
 or contribution lineage. Those are implemented separately as experimental v0 (commit
 `324a49320`) and qualified in the [L1 identity evidence](local-v3-qualification/l1-identity-2026-11-03/README.md).
-D10 is proposed for closure below, pending maintainer confirmation.
+D10 is closed below.
 
 Baseline facts come from the L0 audit (`local-v3-l0/`, slice D): NodeId hashes
 (repo, path, name, kind) and nothing else; there is no FileId; the engine also mints
@@ -191,9 +191,10 @@ renames change them. These are existing semantics and remain unchanged.
   locators kept separate from identities. #653 (records) and #655 (analysis envelope)
   build on them.
 
-## Proposed D10 closure (pending maintainer confirmation)
+## D10 closure (confirmed 2026-11-03)
 
-**Status proposed: `accepted_with_evidence`.** Project authority binding, generic FileId
+**Status: `accepted_with_evidence`**, confirmed by the maintainer on 2026-11-03 together with
+the deterministic new-file FileId rule and the BrokerId/SessionRef deferral. Project authority binding, generic FileId
 transitions and contribution revisions are implemented and qualified in the
 [L1 identity evidence](local-v3-qualification/l1-identity-2026-11-03/README.md).
 
