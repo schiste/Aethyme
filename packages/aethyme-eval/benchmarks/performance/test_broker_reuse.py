@@ -98,8 +98,14 @@ class ReuseProtocolTests(unittest.TestCase):
                              'tree_hash': 'tree', 'definition_hash': 'definition'}]
                 return {}
             verified = []
-            rows = matrix(command, '/fake/aethyme', root, {'gate': 'verify', 'tree': 'tree'},
-                          lambda cwd, label: verified.append((cwd, label)))
+            with mock.patch('broker_reuse.time.perf_counter_ns',
+                            side_effect=range(0, 24_000_000, 1_000_000)):
+                rows = matrix(command, '/fake/aethyme', root, {'gate': 'verify', 'tree': 'tree'},
+                              lambda cwd, label: verified.append((cwd, label)))
+            for row in rows:
+                self.assertEqual(row['start_or_sync_wall_ms'], 1.0)
+                self.assertEqual(row['preparation_wall_ms'], 1.0)
+                self.assertEqual(row['gate_wall_ms'], 1.0)
             self.assertEqual(len(verified), 8)
             self.assertEqual([row['phase'] for row in rows], list(PHASES))
             self.assertEqual([row['session_id'] for row in rows], [1, 2, 2, 2])

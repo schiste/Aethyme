@@ -170,18 +170,23 @@ def matrix(command, binary, root, spec, verify_checkout):
         checkout_ms = (time.perf_counter_ns() - start) / 1_000_000
         cwd = Path(session[1])
         verify_checkout(cwd, phase + ':before')
+        preparation_start = time.perf_counter_ns()
         preparation = command([binary, 'broker', 'submit', 'prepare', '--session',
                                str(session[0]), '--json'], cwd, f'{phase}:prepare')
+        preparation_ms = (time.perf_counter_ns() - preparation_start) / 1_000_000
         preparation = validate_preparation(preparation, session[0])
+        gate_start = time.perf_counter_ns()
         gate = command([binary, 'broker', 'advanced', 'gates', 'run', '--session',
                         str(session[0]), '--only', spec['gate'], '--json'], cwd, f'{phase}:gate')
+        gate_ms = (time.perf_counter_ns() - gate_start) / 1_000_000
         gate = validate_gate(gate, spec['gate'])
         if gate['tree_hash'] != spec['tree']:
             raise RuntimeError('gate evidence is for a different source tree')
         verify_checkout(cwd, phase + ':after')
         after = storage(root)
         rows.append({'phase': phase, 'session_id': session[0], 'worktree': session[1],
-                     'start_or_sync_wall_ms': checkout_ms, 'preparation': preparation,
+                     'start_or_sync_wall_ms': checkout_ms, 'preparation_wall_ms': preparation_ms,
+                     'gate_wall_ms': gate_ms, 'preparation': preparation,
                      'gate': gate, 'storage_before': before, 'storage_after': after,
                      'storage_delta': {key: after[key] - before[key] for key in after}})
     return rows
