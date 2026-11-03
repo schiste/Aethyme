@@ -100,7 +100,6 @@ explicit planned paths. Do not use this to take over another task's checkout
 or to bypass the requirement to keep an unmerged PR session live unless the
 user has authorized that exception. Re-adoption invalidates old cleanup plans;
 never apply a retirement plan made for the previous owner of that path.
-
 When investigating retained worktrees, distinguish task identity from shared
 service uptime. A shared agent daemon can outlive many tasks; its PID alone
 proves neither that each task is active nor that its checkout is disposable.
@@ -165,6 +164,11 @@ blocked.
    `cd` into the reported worktree before editing. If you are already in a
    dedicated worktree, use
    `aethyme broker start --adopt --task "<your task>" --short-name "<short name>" --path <planned-path>` instead.
+   Before running repository tools or audits, inspect the session's preparation
+   status and follow its `next_action` when dependencies are required:
+   `aethyme broker submit prepare status --session <your-session-id> --json`.
+   Worktrees do not inherit ignored dependencies such as `node_modules/` or
+   `.venv/` from the main checkout; preparation is explicit.
    For patch tools without a per-call worktree setting, use the reported
    worktree's absolute path and verify the target path there before editing;
    relative paths can resolve against the shared checkout.
@@ -189,6 +193,10 @@ blocked.
    checkout. A sibling session's PR or branch is not automatically your
    upstream. Sync against the configured upstream when required; do not import
    or restack onto another session's branch without separate authorization.
+   When you edit a file another live session is changing, the broker tells you
+   in context who, where and whether Git would conflict, never blocking the
+   edit; `aethyme broker advanced note send --to-session <id>` reaches that
+   agent, and its notes reach you at your next turn.
 
 2. **Lease additional shared files before the diff exists**. Prefer the
    atomic `start --path` / `start --adopt --path` declaration above for initial intent. If the
@@ -224,6 +232,11 @@ blocked.
    Do not repeat the same expensive claim without a changed runtime or
    dependency state; use the read-only lease plan to recheck scope before a
    later retry.
+
+   A claim is refused only by another explicit lease whose holder is actively
+   working, and never in a `verify-only` repository; every other overlap comes
+   back as a warning naming the holder, with the `note send` command to
+   coordinate.
 
    Cleanup and archive inventories are deletion proofs: path enumeration must
    preserve every path or fail closed. Do not use a parser that silently drops
@@ -565,6 +578,19 @@ blocked.
    each native cleanup, preserve other aliases' branch refs, and stop an exact
    sweep on an ambiguous result. Save per-target results and verify path absence;
    do not count a successful close as a removed checkout.
+   Filesystem birth time, descendant modification time, broker activity, and
+   source edits are different observations; label the date used. Walk without
+   following symlinks and distinguish summed file bytes from unique physical
+   space, since hardlinks and clones can share storage. Never authorize deletion
+   from age, a stale-session label, or a missing size estimate alone.
+
+   For a storage audit, reconcile broker session paths, `git worktree list
+   --porcelain`, and directories under current and historical roots on every
+   relevant volume. Include temporary and merge-simulation checkouts; report
+   shared cache containers separately to avoid counting nested worktrees twice.
+   A closed or `cleaned` session is not proof of physical removal. Report each
+   path's cleanup result or blocker, keeping uninspected and unsupported scopes
+   unknown. Preserve complete audit output and disclose incomplete scans.
    Filesystem birth time, descendant modification time, broker activity, and
    source edits are different observations; label the date used. Walk without
    following symlinks and distinguish summed file bytes from unique physical
