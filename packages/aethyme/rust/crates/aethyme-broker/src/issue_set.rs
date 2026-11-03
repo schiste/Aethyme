@@ -64,6 +64,37 @@ fn read_bounded(path: &Path) -> Result<String, String> {
 }
 
 impl ValidatedManifest {
+    /// Render references only after all issue numbers are known. A missing
+    /// number is an error, never a partially substituted body.
+    pub fn render_body(
+        &self,
+        key: &str,
+        numbers: &BTreeMap<String, u64>,
+    ) -> Result<String, String> {
+        let body = self
+            .bodies
+            .get(key)
+            .ok_or_else(|| format!("unknown issue key {key:?}"))?;
+        let mut rendered = String::with_capacity(body.len());
+        let mut rest = body.as_str();
+        while let Some((prefix, after)) = rest.split_once("{{") {
+            let (reference, suffix) = after
+                .split_once("}}")
+                .ok_or_else(|| format!("unclosed reference in {key:?}"))?;
+            let number = numbers
+                .get(reference)
+                .copied()
+                .filter(|number| *number > 0)
+                .ok_or_else(|| format!("missing issue number for {reference:?}"))?;
+            rendered.push_str(prefix);
+            rendered.push('#');
+            rendered.push_str(&number.to_string());
+            rest = suffix;
+        }
+        rendered.push_str(rest);
+        Ok(rendered)
+    }
+
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = read_bounded(path)?;
         let manifest: Manifest =
@@ -108,6 +139,12 @@ impl ValidatedManifest {
                 ));
             }
             let body = read_bounded(&path)?;
+            if body.contains("<!-- aethyme-issue-set:") {
+                return Err(format!(
+                    "body for {:?} contains a reserved issue-set marker",
+                    entry.key
+                ));
+            }
             let mut rest = body.as_str();
             while let Some((_, after)) = rest.split_once("{{") {
                 let (key, suffix) = after
@@ -187,6 +224,16 @@ depends_on = ["epic"]
         assert_eq!(manifest.order, ["epic", "E1"]);
         assert_eq!(manifest.manifest.set_id, "environments");
         assert!(manifest.bodies["epic"].contains("{{E1}}"));
+        let numbers = BTreeMap::from([("epic".into(), 10), ("E1".into(), 11)]);
+        assert_eq!(
+            manifest.render_body("epic", &numbers).unwrap(),
+            "Child #11\n"
+        );
+        assert_eq!(
+            manifest.render_body("E1", &numbers).unwrap(),
+            "Parent #10\n"
+        );
+        assert!(manifest.render_body("epic", &BTreeMap::new()).is_err());
     }
 
     #[test]
@@ -211,6 +258,21 @@ depends_on = ["epic"]
             ValidatedManifest::load(&path)
                 .unwrap_err()
                 .contains("cycle")
+        );
+    }
+
+    #[test]
+    fn refuses_reserved_issue_set_markers_in_user_bodies() {
+        let (dir, path) = fixture(VALID);
+        std::fs::write(
+            dir.path().join("child.md"),
+            "<!-- aethyme-issue-set:other/key -->",
+        )
+        .unwrap();
+        assert!(
+            ValidatedManifest::load(&path)
+                .unwrap_err()
+                .contains("reserved")
         );
     }
 
