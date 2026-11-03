@@ -98,14 +98,14 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
             .iter()
             .filter(|line| line.trim() == "-s packages/aethyme-eval/benchmarks/performance \\")
             .count(),
-        3
+        4
     );
     assert_eq!(
         controls
             .iter()
             .filter(|line| line.trim().starts_with("python3 -m unittest discover"))
             .count(),
-        3
+        4
     );
     assert_eq!(
         controls
@@ -116,6 +116,7 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
             "'test_broker_latency.py' -v",
             "'test_broker_concurrent_submit.py' -v",
             "'test_git_worktree_config.py' -v",
+            "'test_git_worktree_options.py' -v",
         ]
     );
     assert!(
