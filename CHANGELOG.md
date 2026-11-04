@@ -4,6 +4,24 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.56] - 2026-11-04
+
+### Added
+
+- A coordinated `broker advanced issues sub-issue add|remove` helper resolves issue numbers to GitHub IDs and records each mutation. Native sub-issue and dependency API writes are recognized as issue operations without Git ref-write acknowledgement (#1408, #1411, #1414).
+- Environment components can set `hook_timeout_seconds`; timed-out or preempted hooks retain their partial output and failure reason in component logs (#1407).
+- Opt-in Git performance diagnostics can isolate many-files settings, probe older Git clients' reftable refusal, and report preparation and gate timing for reuse (#1395, #1396, #1397).
+
+### Fixed
+
+- Environment inference measures synced broker sessions from their recorded current base, so incoming upstream changes do not inflate the session's profile (#1402).
+- Compose teardown removes remaining containers bearing the exact project label after `down` and retries cleanup (#1407).
+- Gates refuse to verify sparse checkouts with omitted tracked inputs; graph-free Explore reports incomplete source coverage without discarding cached entries (#1398, #1401).
+- Gate admission briefly waits for a concurrent checkout lifecycle claim instead of immediately failing on transient contention (#1399).
+- Git performance diagnostics measure the current submit patch profile and surface alternate-client warnings (#1393, #1405).
+
+There is no broker database schema change in this release.
+
 ## [0.8.55] - 2026-11-03
 
 ### Added
