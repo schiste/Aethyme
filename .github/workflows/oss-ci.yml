@@ -381,8 +381,16 @@ jobs:
           name: rust-tests-archive
           path: ${{ runner.temp }}/rust-tests-archive
 
+      # Most of this suite's I/O is temporary Git repositories and SQLite
+      # databases that nothing keeps, so put them in memory.
       - name: Run workspace tests
+        env:
+          TMPDIR: /dev/shm
         run: ../scripts/test-like-ci.sh --from-archive "$RUNNER_TEMP/rust-tests-archive/rust-tests.tar.zst" --partition "hash:${{ matrix.shard }}/6"
+
+      - name: Report temporary storage use
+        if: ${{ always() }}
+        run: df -h /dev/shm
 
       - name: Upload the shard report
         if: ${{ always() }}
