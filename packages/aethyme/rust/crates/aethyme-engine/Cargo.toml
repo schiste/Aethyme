@@ -4,6 +4,8 @@ version.workspace = true
 edition = "2024"
 description = "Deterministic engine components for Aethyme Core"
 license = "Apache-2.0"
+# Integration tests are listed below; see tests/it.rs.
+autotests = false
 
 [lib]
 name = "aethyme_engine"
@@ -39,3 +41,8 @@ dhat-heap = ["dep:dhat"]
 
 [lints]
 workspace = true
+
+# One binary for most integration suites; see tests/it.rs.
+[[test]]
+name = "it"
+path = "tests/it.rs"

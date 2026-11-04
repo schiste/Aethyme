@@ -4,6 +4,8 @@ version.workspace = true
 edition = "2024"
 description = "OverlayProducer trait + determinism harness for Phase 4.7. Producers synthesize non-per-file payloads (structure, configs, docs, risks) and persist through the fragment-store overlay surface."
 license = "Apache-2.0"
+# Integration tests are listed below; see tests/it.rs.
+autotests = false
 
 [lib]
 name = "aethyme_producers"
@@ -32,3 +34,8 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+# One binary for most integration suites; see tests/it.rs.
+[[test]]
+name = "it"
+path = "tests/it.rs"

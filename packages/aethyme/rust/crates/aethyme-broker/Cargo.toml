@@ -4,6 +4,8 @@ version.workspace = true
 edition = "2024"
 description = "Local agent broker: operational state (sessions, worktrees, leases, gates, merge queue, events) for high-concurrency AI development. Library-first — the CLI is a thin client of this crate's typed API. Broker state lives in SQLite (.aethyme/broker.db); the graph engine's redb/fragment storage is a separate, read-only advisory concern."
 license = "Apache-2.0"
+# Integration tests are listed below; see tests/it.rs.
+autotests = false
 
 [lib]
 name = "aethyme_broker"
@@ -87,3 +89,80 @@ fastrand = { workspace = true }
 # visible in one place.
 [lints]
 workspace = true
+
+# One binary for most integration suites; see tests/it.rs.
+[[test]]
+name = "it"
+path = "tests/it.rs"
+
+# Separate binaries: each re-runs its own binary with `--exact <test name>`
+# to get a child process with a poisoned environment. Inside `it` the test
+# name gains a module prefix, so `--exact` would match nothing.
+[[test]]
+name = "broker"
+path = "tests/broker.rs"
+
+[[test]]
+name = "collaboration_state_cleanup"
+path = "tests/collaboration_state_cleanup.rs"
+
+[[test]]
+name = "fixture_host_state_isolation_cli"
+path = "tests/fixture_host_state_isolation_cli.rs"
+
+[[test]]
+name = "fixture_isolation"
+path = "tests/fixture_isolation.rs"
+
+[[test]]
+name = "gate_database_isolation"
+path = "tests/gate_database_isolation.rs"
+
+[[test]]
+name = "gc"
+path = "tests/gc.rs"
+
+[[test]]
+name = "integration_drift"
+path = "tests/integration_drift.rs"
+
+[[test]]
+name = "operations_e2e"
+path = "tests/operations_e2e.rs"
+
+[[test]]
+name = "pr_overlap_cli"
+path = "tests/pr_overlap_cli.rs"
+
+[[test]]
+name = "promote_mode"
+path = "tests/promote_mode.rs"
+
+[[test]]
+name = "service_jobs"
+path = "tests/service_jobs.rs"
+
+# Separate binaries: each changes process-wide environment variables
+# (`set_var`/`remove_var`), which would race the other suites when
+# `cargo test` runs `it` in one process.
+[[test]]
+name = "candidate_boundary_grandfather"
+path = "tests/candidate_boundary_grandfather.rs"
+
+[[test]]
+name = "candidate_boundary_trust"
+path = "tests/candidate_boundary_trust.rs"
+
+[[test]]
+name = "gates_e2e"
+path = "tests/gates_e2e.rs"
+
+# Separate binaries: a gate in `.aethyme/gates.toml` or a release workflow
+# selects each by name (`--test <suite>`) and builds only that suite.
+[[test]]
+name = "gate_policy"
+path = "tests/gate_policy.rs"
+
+[[test]]
+name = "host_operations_e2e"
+path = "tests/host_operations_e2e.rs"

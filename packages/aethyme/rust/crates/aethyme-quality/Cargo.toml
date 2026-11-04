@@ -4,6 +4,8 @@ version.workspace = true
 license = "Apache-2.0"
 edition = "2024"
 description = "Optional repository-quality analysis (quality inspect), plus the frozen legacy ai-ready scorecard and autofix fixers ported from the retired Python implementation."
+# Integration tests are listed below; see tests/it.rs.
+autotests = false
 
 [dependencies]
 # localtime_r: the autofix branch name is `datetime.now().strftime(...)`
@@ -18,3 +20,8 @@ toml = { workspace = true }
 
 [lints]
 workspace = true
+
+# One binary for most integration suites; see tests/it.rs.
+[[test]]
+name = "it"
+path = "tests/it.rs"

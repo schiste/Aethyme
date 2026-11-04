@@ -10,6 +10,10 @@
 #     packages/aethyme/scripts/test-like-ci.sh --package aethyme-broker --lib
 #         # one crate's library unit tests, without a workspace-bin prebuild
 #     packages/aethyme/scripts/test-like-ci.sh --base origin/main -- -E 'test(lease)'
+#     packages/aethyme/scripts/test-like-ci.sh --archive "$RUNNER_TEMP/tests.tar.zst"
+#         # CI build job: compile the full workspace suite once into an archive
+#     packages/aethyme/scripts/test-like-ci.sh --from-archive FILE --partition hash:1/6
+#         # CI shard job: run one partition of that archive, with the CI profile
 #
 # --changed (the default) selects affected crates and their reverse
 # dependencies. Repository-wide inputs that affect every suite fall back to
@@ -22,6 +26,13 @@
 # profile, including CI retries and full-suite behavior. The local job count
 # can be overridden with CARGO_BUILD_JOBS; nextest options after -- can
 # explicitly override worker/retry settings.
+#
+# --archive and --from-archive split --full across machines: one job compiles
+# every test binary (and, through Cargo's integration-test rule, every product
+# binary the tests run) into a nextest archive, and each shard job extracts it
+# over its own checkout of the same tree and runs one --partition of the suite.
+# Extraction targets the workspace root, so the binaries land at the
+# target/debug paths `env!("CARGO_BIN_EXE_*")` and aethyme-testkit expect.
 set -euo pipefail
 
 coverage=changed
@@ -30,6 +41,9 @@ base=origin/main
 base_explicit=0
 package=""
 library=0
+archive_out=""
+archive_in=""
+partition=""
 extra=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -56,6 +70,15 @@ while [ $# -gt 0 ]; do
         --lib)
             library=1
             shift ;;
+        --archive)
+            archive_out="${2:?--archive needs a file}"
+            shift 2 ;;
+        --from-archive)
+            archive_in="${2:?--from-archive needs a file}"
+            shift 2 ;;
+        --partition)
+            partition="${2:?--partition needs a spec such as hash:1/6}"
+            shift 2 ;;
         -h|--help)
             awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
             exit 0 ;;
@@ -69,7 +92,24 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-if [ -n "$package" ] || [ "$library" -eq 1 ]; then
+if [ -n "$archive_out" ] || [ -n "$archive_in" ]; then
+    if [ -n "$archive_out" ] && [ -n "$archive_in" ]; then
+        echo "error: --archive and --from-archive cannot be combined" >&2
+        exit 2
+    fi
+    if [ "$coverage_explicit" -eq 1 ] || [ "$base_explicit" -eq 1 ] || [ -n "$package" ] || [ "$library" -eq 1 ]; then
+        echo "error: archive modes always cover the full workspace; drop --full, --changed, --base, --package and --lib" >&2
+        exit 2
+    fi
+    if [ -n "$archive_out" ] && { [ -n "$partition" ] || [ "${#extra[@]}" -gt 0 ]; }; then
+        echo "error: --archive only builds; pass --partition and nextest options to --from-archive" >&2
+        exit 2
+    fi
+    if [ -n "$archive_out" ]; then coverage=archive; else coverage=from-archive; fi
+elif [ -n "$partition" ]; then
+    echo "error: --partition only applies to --from-archive" >&2
+    exit 2
+elif [ -n "$package" ] || [ "$library" -eq 1 ]; then
     if [ -z "$package" ] || [ "$library" -ne 1 ]; then
         echo "error: focused runs require both --package NAME and --lib" >&2
         exit 2
@@ -195,11 +235,29 @@ cd "$rust"
 started=$(date +%s)
 selection=()
 test_command=()
-if [ "$coverage" = full ]; then
+if [ "$coverage" = archive ]; then
+    # `--timings` records where the compile time goes (target/cargo-timings).
+    status=0
+    cargo nextest archive --locked --workspace --archive-file "$archive_out" --timings || status=$?
+    elapsed=$(( $(date +%s) - started ))
+    printf '\nWall time: %dm%02ds (archive build)\n' $((elapsed / 60)) $((elapsed % 60))
+    exit "$status"
+elif [ "$coverage" = full ] || [ "$coverage" = from-archive ]; then
+    # Product binaries come from the same build as the tests: Cargo builds a
+    # package's binaries whenever one of its integration tests is selected,
+    # and every package with a binary has integration tests. A separate
+    # `cargo build --bins` resolved features without dev-dependencies, so the
+    # test build compiled every workspace library a second time.
     export AETHYME_TESTKIT_PREBUILT_BINS=1
-    cargo build --locked --workspace --bins
-    selection=(--workspace)
-    test_command=(cargo nextest run --locked "${selection[@]}" --profile ci --no-tests fail)
+    if [ "$coverage" = full ]; then
+        test_command=(cargo nextest run --locked --workspace --profile ci --no-tests fail)
+    else
+        # An archive run resolves and builds nothing, so nextest refuses --locked.
+        test_command=(cargo nextest run --archive-file "$archive_in" --extract-to "$rust" --extract-overwrite --workspace-remap "$rust" --profile ci --no-tests fail)
+        if [ -n "$partition" ]; then
+            test_command+=(--partition "$partition")
+        fi
+    fi
 else
     local_build_jobs="${CARGO_BUILD_JOBS:-1}"
     if ! [[ "$local_build_jobs" =~ ^[1-9][0-9]*$ ]]; then
@@ -225,7 +283,7 @@ test_command+=("${filter[@]+"${filter[@]}"}" "${extra[@]+"${extra[@]}"}")
 "${test_command[@]}" || status=$?
 elapsed=$(( $(date +%s) - started ))
 
-if [ "$coverage" = full ] && [ "$status" -eq 0 ]; then
+if { [ "$coverage" = full ] || [ "$coverage" = from-archive ]; } && [ "$status" -eq 0 ]; then
     junit="$rust/target/nextest/ci/junit.xml"
     if [ -f "$junit" ]; then
         echo

@@ -46,6 +46,7 @@ jobs:
           bash .github/scripts/test-docs-fast-lane.sh
           bash .github/scripts/test-performance-fast-lane.sh
           bash .github/scripts/test-oss-ci-rustfmt-preflight.sh
+          bash .github/scripts/test-rust-test-telemetry.sh
 
       - name: Classify changed paths
         id: classify
@@ -253,15 +254,105 @@ jobs:
   # --workspace` is the whole Rust test story for packages/aethyme. The normal
   # product lane remains Python-free; `packages/aethyme-eval` keeps its Python
   # tooling by design and has a narrow reporting-only fast lane below.
-  rust-tests:
-    name: Rust workspace tests
+  # The workspace suite is compiled once and run in shards. On one 4-core
+  # runner it was 22-23 minutes: the 6,955 tests took about 3,200 seconds of
+  # test time with the runner saturated, and the build ran twice because a
+  # separate `cargo build --bins` resolved features without dev-dependencies.
+  # `rust-tests-build` compiles every test and product binary once into a
+  # nextest archive; each `rust-tests-shard` extracts it over a checkout of the
+  # same tree and runs one hash partition with the CI profile. `rust-tests`
+  # keeps the required check name: it passes only when the build, every shard
+  # and the broker performance controls passed, and it publishes the run's
+  # telemetry (job phases, shard balance, slowest and flaky tests).
+  rust-tests-build:
+    name: Rust workspace tests (build)
     needs: classify_changes
-    # Main receives the same full workspace coverage through Aethyme Gates;
-    # `warm-rust-cache` below compiles main's tests so this job starts warm.
-    # Mirrored Markdown-only PRs run the exact skill parity tests with rustc
-    # directly. Exact performance-reporting PRs also run parity plus bounded
-    # Python/workflow checks; all uncertain diffs run the full Rust suite.
-    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && (needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/aethyme/rust
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Same history as the shards, so build scripts see the same tree.
+          fetch-depth: 0
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+
+      - name: Check formatting before Rust work
+        run: cargo fmt --all -- --check
+
+      # Restores the cache `warm-rust-cache` saves from main. Pull requests do
+      # not save: a cache written by a pull request is visible only to that
+      # pull request, and would evict main's.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: packages/aethyme/rust
+          shared-key: rust-tests
+          save-if: false
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-nextest@0.9.146
+
+      # Workspace crates build without debug info here: panics still report
+      # file and line, and the archive every shard downloads is much smaller.
+      # Third-party crates already build without it (.cargo/config.toml), so
+      # the restored dependency cache stays valid. Set on this step only:
+      # rust-cache keys on CARGO_* variables present when it restores.
+      - name: Build the test archive
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: ../scripts/test-like-ci.sh --archive "$RUNNER_TEMP/rust-tests.tar.zst"
+
+      - name: Record the build facts
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/rust-tests.tar.zst"
+          bytes=$(stat -c %s "$archive")
+          binaries=$(tar --zstd -tf "$archive" | grep -c '^target/debug/deps/')
+          mkdir -p "$RUNNER_TEMP/rust-tests-build"
+          printf '{"archive_bytes": %s, "test_binaries": %s}\n' "$bytes" "$binaries" \
+            > "$RUNNER_TEMP/rust-tests-build/build.json"
+          cp target/cargo-timings/cargo-timing.html "$RUNNER_TEMP/rust-tests-build/"
+          echo "Archive: $((bytes / 1048576)) MiB, $binaries test binaries"
+
+      - name: Upload the test archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rust-tests-archive
+          path: ${{ runner.temp }}/rust-tests.tar.zst
+          # Already zstd-compressed; the shards need it for this run only.
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+      # `cargo-timing.html` shows where the compile time goes.
+      - name: Upload the build telemetry
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rust-tests-build
+          path: ${{ runner.temp }}/rust-tests-build/
+          if-no-files-found: error
+          retention-days: 14
+
+  rust-tests-shard:
+    name: Rust workspace tests (shard ${{ matrix.shard }}/6)
+    needs: [classify_changes, rust-tests-build]
+    if: ${{ !cancelled() && needs.rust-tests-build.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -274,43 +365,46 @@ jobs:
           # The plugin hook version guard compares this PR with its base.
           fetch-depth: 0
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      # A few tests run cargo themselves; install the pinned toolchain in its
+      # own step so its cost shows in the job's timings.
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
-          toolchain: stable
+          tool: cargo-nextest@0.9.146
 
-      - name: Check formatting before Rust work
-        if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}
-        run: cargo fmt --all -- --check
-
-      # Restores the cache `warm-rust-cache` saves from main. Pull requests do
-      # not save: a cache written by a pull request is visible only to that
-      # pull request, and would evict main's.
-      - name: Cache Rust build
-        if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Download the test archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          workspaces: packages/aethyme/rust
-          shared-key: rust-tests
-          save-if: false
+          name: rust-tests-archive
+          path: ${{ runner.temp }}/rust-tests-archive
 
-      - name: Run mirrored skill parity tests without Cargo
-        if: ${{ needs.classify_changes.result == 'success' && (needs.classify_changes.outputs.docs_fast == 'true' || needs.classify_changes.outputs.performance_fast == 'true') }}
-        working-directory: ${{ github.workspace }}
-        run: |
-          set -euo pipefail
-          rustc --edition=2021 --test .github/scripts/skill-parity-harness.rs \
-            -o "$RUNNER_TEMP/skill-parity-tests"
-          "$RUNNER_TEMP/skill-parity-tests" --test-threads=1
+      - name: Run workspace tests
+        run: ../scripts/test-like-ci.sh --from-archive "$RUNNER_TEMP/rust-tests-archive/rust-tests.tar.zst" --partition "hash:${{ matrix.shard }}/6"
 
-      - name: Validate non-Rust performance reporting
-        if: ${{ needs.classify_changes.result == 'success' && needs.classify_changes.outputs.performance_fast == 'true' }}
-        working-directory: ${{ github.workspace }}
-        run: bash .github/scripts/validate-performance-fast-lane.sh
+      - name: Upload the shard report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rust-tests-junit-shard-${{ matrix.shard }}
+          path: packages/aethyme/rust/target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+  broker-performance-controls:
+    name: Broker performance controls
+    needs: classify_changes
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && (needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Run broker performance controls in the full lane
-        if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}
-        working-directory: ${{ github.workspace }}
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
@@ -327,46 +421,106 @@ jobs:
             -s packages/aethyme-eval/benchmarks/performance \
             -p 'test_git_worktree_options.py' -v
 
-      - name: Install cargo-nextest
-        if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+  rust-tests:
+    name: Rust workspace tests
+    needs: [classify_changes, rust-tests-build, rust-tests-shard, broker-performance-controls]
+    # Main receives the same full workspace coverage through Aethyme Gates;
+    # `warm-rust-cache` below compiles main's tests so the build starts warm.
+    # Mirrored Markdown-only PRs run the exact skill parity tests with rustc
+    # directly. Exact performance-reporting PRs also run parity plus bounded
+    # Python/workflow checks; all uncertain diffs run the full Rust suite.
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Reads this run's job and step timings for the telemetry summary.
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          tool: cargo-nextest@0.9.146
+          persist-credentials: false
+          fetch-depth: 0
 
-      # Test helpers would run `cargo build --bin <name>` once per test process
-      # to find the product binaries (aethyme-testkit/src/bins.rs). nextest
-      # runs each test in its own process, so those builds queued on cargo's
-      # lock for minutes each. Build once here; the test step sets
-      # AETHYME_TESTKIT_PREBUILT_BINS=1 to use these binaries directly.
-      - name: Build the product binaries
-        if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}
-        run: cargo build --locked --workspace --bins
+      - name: Set up Rust
+        if: ${{ needs.classify_changes.result == 'success' && (needs.classify_changes.outputs.docs_fast == 'true' || needs.classify_changes.outputs.performance_fast == 'true') }}
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
 
-      # Compiling and running are separate steps so the job's log shows which
-      # one is slow, and `--timings` records where the compile time goes:
-      # download the `cargo-timings` artifact for the HTML report. nextest then
-      # reuses these test binaries instead of building them.
-      - name: Compile the workspace tests
-        if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}
-        run: cargo test --locked --workspace --no-run --timings
+      - name: Run mirrored skill parity tests without Cargo
+        if: ${{ needs.classify_changes.result == 'success' && (needs.classify_changes.outputs.docs_fast == 'true' || needs.classify_changes.outputs.performance_fast == 'true') }}
+        run: |
+          set -euo pipefail
+          rustc --edition=2021 --test .github/scripts/skill-parity-harness.rs \
+            -o "$RUNNER_TEMP/skill-parity-tests"
+          "$RUNNER_TEMP/skill-parity-tests" --test-threads=1
 
-      - name: Upload the compile timings
+      - name: Validate non-Rust performance reporting
+        if: ${{ needs.classify_changes.result == 'success' && needs.classify_changes.outputs.performance_fast == 'true' }}
+        run: bash .github/scripts/validate-performance-fast-lane.sh
+
+      # Unknown classifier results select the full suite, so a failed or
+      # skipped build, shard or control job fails this required check.
+      - name: Require the full suite
         if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}
+        env:
+          BUILD: ${{ needs.rust-tests-build.result }}
+          SHARDS: ${{ needs.rust-tests-shard.result }}
+          CONTROLS: ${{ needs.broker-performance-controls.result }}
+        run: |
+          set -euo pipefail
+          echo "build=$BUILD shards=$SHARDS controls=$CONTROLS"
+          [[ "$BUILD" == success && "$SHARDS" == success && "$CONTROLS" == success ]]
+
+      - name: Download the shard reports
+        if: ${{ always() && needs.rust-tests-build.result == 'success' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: rust-tests-junit-shard-*
+          path: ${{ runner.temp }}/rust-tests-junit
+
+      - name: Download the build telemetry
+        if: ${{ always() && needs.rust-tests-build.result == 'success' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rust-tests-build
+          path: ${{ runner.temp }}/rust-tests-build
+
+      # Job timings are best effort: an unreadable API leaves the summary
+      # saying so, and never fails the check that the tests already decided.
+      - name: Summarize the run
+        if: ${{ always() && needs.rust-tests-build.result == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/rust-test-telemetry"
+          mkdir -p "$out"
+          if ! gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100" \
+            > "$out/jobs.json"; then
+            echo "::warning::Job timings are unavailable; the summary reports them as such."
+            rm -f "$out/jobs.json"
+          fi
+          python3 .github/scripts/rust-test-telemetry.py \
+            --junit-dir "$RUNNER_TEMP/rust-tests-junit" \
+            --build-json "$RUNNER_TEMP/rust-tests-build/build.json" \
+            --jobs-json "$out/jobs.json" \
+            --markdown "$out/summary.md" \
+            --json "$out/rust-test-telemetry.json"
+          cat "$out/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the run telemetry
+        if: ${{ always() && needs.rust-tests-build.result == 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: cargo-timings
-          path: packages/aethyme/rust/target/cargo-timings/cargo-timing.html
-          if-no-files-found: ignore
-          retention-days: 14
-
-      # Library, binary and integration tests. `cargo test --workspace
-      # --examples` stood in for this step until now, but a target flag
-      # narrows cargo's selection to examples only: it ran three binaries.
-      # The same command a workstation runs (#598): it sets the CI
-      # environment, uses `--profile ci`, and prints the slowest tests.
-      - name: Run workspace tests
-        if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}
-        run: ../scripts/test-like-ci.sh --full
+          name: rust-test-telemetry
+          path: ${{ runner.temp }}/rust-test-telemetry/
+          if-no-files-found: warn
+          retention-days: 90
 
   # nextest runs neither example targets nor doctests. The release-manifest
   # assertions live in examples (#435) and must keep running. A job of their

@@ -582,7 +582,7 @@ V2 correctness and performance gates:
   `AETHYME_REDB_PERF_MAX_QUERY_OVERVIEW_MS`, and
   `AETHYME_REDB_PERF_MAX_SYMBOL_MS`.
 - MediaWiki-scale verification is an explicit ignored Rust test:
-  `cargo test -p aethyme-engine --test redb_cli mediawiki_scale_redb_smoke_for_v2_paths -- --ignored --nocapture`
+  `cargo test -p aethyme-engine --test it redb_cli::mediawiki_scale_redb_smoke_for_v2_paths -- --ignored --nocapture`
   with `AETHYME_MEDIAWIKI_REPO=/path/to/mediawiki`. Run it when broadening
   redb-backed graph paths beyond the query surfaces listed above. Thresholds
   are configurable with
@@ -600,7 +600,7 @@ V2 correctness and performance gates:
   `AETHYME_REDB_MEDIAWIKI_MAX_CONTEXT_PACK_MS`, and
   `AETHYME_REDB_MEDIAWIKI_MAX_EXPLORE_MS` for the Phase 6 navigation smoke.
 - Playground eval/token verification is also an explicit ignored Rust test:
-  `cargo test -p aethyme-engine --test redb_cli playground_context_pack_token_regression_gate_never_self_eval -- --ignored --nocapture`
+  `cargo test -p aethyme-engine --test it redb_cli::playground_context_pack_token_regression_gate_never_self_eval -- --ignored --nocapture`
   with `AETHYME_PLAYGROUND_REPO=/path/to/playground`. The test canonicalizes
   the supplied repo and fails if it points inside the Aethyme checkout. It
   compares redb context-pack and task-pack budget metrics against the
