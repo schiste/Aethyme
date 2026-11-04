@@ -324,7 +324,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   checkbox (for example, `- [x] **none**`) so the decision is explicit and
   matches the template. The current parser also recognizes a plain
   `Contract decision: <label>` line in PR bodies and commit messages; the key
-  must start the line after whitespace. If CI reports an undeclared decision,
+  must start the line after whitespace. Broker submission preflight reads
+  pending session commit messages, not the PR body: record the decision in a
+  session commit as `Contract decision: <label>` before submitting. A `none`
+  decision for a tracked removal also needs a `Contract justification:` of at
+  least 24 characters. If CI reports an undeclared decision,
   inspect its exact captured body and `Looked in` output before diagnosing a
   formatting problem.
   Prepare the exact body file. When local validation is allowed, run the pinned
