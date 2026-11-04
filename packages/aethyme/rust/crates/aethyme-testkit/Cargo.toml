@@ -5,6 +5,8 @@ license = "Apache-2.0"
 edition = "2024"
 publish = false
 description = "Dev-only test harness for the Aethyme workspace: builds and drives the product binaries as subprocesses, and builds fixture repositories. Successor to the retired pytest `tests/support/` package (python-retirement Phase 7). Consumed only as a dev-dependency, so it never enters `cargo install`."
+# Integration tests are listed below; see tests/it.rs.
+autotests = false
 
 [lib]
 name = "aethyme_testkit"
@@ -25,3 +27,50 @@ toml = { workspace = true }
 
 [lints]
 workspace = true
+
+# One binary for most integration suites; see tests/it.rs.
+[[test]]
+name = "it"
+path = "tests/it.rs"
+
+# Separate binaries: a gate in `.aethyme/gates.toml` or a release workflow
+# selects each by name (`--test <suite>`) and builds only that suite.
+[[test]]
+name = "broker_discarded_results"
+path = "tests/broker_discarded_results.rs"
+
+[[test]]
+name = "ci_validation"
+path = "tests/ci_validation.rs"
+
+[[test]]
+name = "deprecated_spelling_callers"
+path = "tests/deprecated_spelling_callers.rs"
+
+[[test]]
+name = "docs_hygiene"
+path = "tests/docs_hygiene.rs"
+
+[[test]]
+name = "grammar_provenance"
+path = "tests/grammar_provenance.rs"
+
+[[test]]
+name = "no_eval_tuning"
+path = "tests/no_eval_tuning.rs"
+
+[[test]]
+name = "pilot_report"
+path = "tests/pilot_report.rs"
+
+[[test]]
+name = "pr_template"
+path = "tests/pr_template.rs"
+
+[[test]]
+name = "release_contract"
+path = "tests/release_contract.rs"
+
+[[test]]
+name = "release_installer"
+path = "tests/release_installer.rs"

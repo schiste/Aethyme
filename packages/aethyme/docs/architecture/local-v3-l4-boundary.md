@@ -214,7 +214,7 @@ checks.
 
 ## Tests
 
-- `cargo test -p aethyme-broker --test candidate_boundary`: every case above except the
+- `cargo test -p aethyme-broker --test it candidate_boundary::`: every case above except the
   two trust cases, plus the stability of every reason code.
 - `cargo test -p aethyme-broker --test candidate_boundary_trust`: the untrusted policy.
 - `cargo test -p aethyme-broker --test candidate_boundary_grandfather`: grandfathering.

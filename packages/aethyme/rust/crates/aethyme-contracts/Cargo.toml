@@ -4,6 +4,8 @@ version.workspace = true
 edition = "2024"
 description = "Portable records, identities and canonical encodings for Aethyme Local v3. Pure functions only: no I/O, no storage, no CLI. Everything here is experimental until the plan's qualification gates pass."
 license = "Apache-2.0"
+# Integration tests are listed below; see tests/it.rs.
+autotests = false
 
 [lib]
 name = "aethyme_contracts"
@@ -29,3 +31,8 @@ serde_json = { workspace = true }
 
 [lints]
 workspace = true
+
+# One binary for most integration suites; see tests/it.rs.
+[[test]]
+name = "it"
+path = "tests/it.rs"

@@ -4,6 +4,8 @@ version.workspace = true
 edition = "2024"
 description = "Indexers that walk source repos and produce aethyme-graph-schema nodes + edges. Phase 3 of the graph rewrite: turns real source files into typed graph payloads suitable for committed per-file fragments."
 license = "Apache-2.0"
+# Integration tests are listed below; see tests/it.rs.
+autotests = false
 
 [lib]
 name = "aethyme_graph_indexer"
@@ -138,3 +140,8 @@ serde_json = { workspace = true }
 
 [lints]
 workspace = true
+
+# One binary for most integration suites; see tests/it.rs.
+[[test]]
+name = "it"
+path = "tests/it.rs"

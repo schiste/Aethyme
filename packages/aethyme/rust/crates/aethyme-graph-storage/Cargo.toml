@@ -4,6 +4,8 @@ version.workspace = true
 edition = "2024"
 description = "Storage layer for Aethyme graph fragments: per-file binary fragments (bincode) and per-module NDJSON index shards. Built on top of aethyme-graph-schema's pure types."
 license = "Apache-2.0"
+# Integration tests are listed below; see tests/it.rs.
+autotests = false
 
 [lib]
 name = "aethyme_graph_storage"
@@ -46,3 +48,8 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+# One binary for most integration suites; see tests/it.rs.
+[[test]]
+name = "it"
+path = "tests/it.rs"

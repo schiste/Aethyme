@@ -4,6 +4,8 @@ version.workspace = true
 license = "Apache-2.0"
 edition = "2024"
 description = "The aethyme router binary — single entrypoint for agents. Owns the app shell (native dispatch to engine/broker/enhance, Python delegation for unflipped groups); moved out of aethyme-engine (retirement plan Phase 1 item 1) so the engine lib no longer carries broker/enhance deps for the bin's sake."
+# Integration tests are listed below; see tests/it.rs.
+autotests = false
 
 [[bin]]
 name = "aethyme"
@@ -40,3 +42,26 @@ workspace = true
 [[bench]]
 name = "product_latency"
 harness = false
+
+# One binary for most integration suites; see tests/it.rs.
+[[test]]
+name = "it"
+path = "tests/it.rs"
+
+# Separate binaries: a gate in `.aethyme/gates.toml` or a release workflow
+# selects each by name (`--test <suite>`) and builds only that suite.
+[[test]]
+name = "help_everywhere"
+path = "tests/help_everywhere.rs"
+
+[[test]]
+name = "help_snapshots"
+path = "tests/help_snapshots.rs"
+
+[[test]]
+name = "help_surface"
+path = "tests/help_surface.rs"
+
+[[test]]
+name = "repository_deploy_cli"
+path = "tests/repository_deploy_cli.rs"

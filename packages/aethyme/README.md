@@ -133,7 +133,7 @@ at [`docs/architecture/eval-mining-notes.md`](docs/architecture/eval-mining-note
 
 ### Local workflow test lane
 
-- `cargo test -p aethyme-cli --test local_workflow` indexes a fixture repo
+- `cargo test -p aethyme-cli --test it local_workflow::` indexes a fixture repo
   the same way `scripts/eval/setup-playground.sh` does and drives the
   router over it.
 - There is no skip path and no `AETHYME_REQUIRE_LOCAL_ENGINE` opt-in any
