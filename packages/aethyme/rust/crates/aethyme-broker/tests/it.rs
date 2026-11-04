@@ -121,6 +121,8 @@ mod inspection_budget_cli;
 mod install_replacement_cli;
 #[path = "integration_verify_base.rs"]
 mod integration_verify_base;
+#[path = "issue_set_cli.rs"]
+mod issue_set_cli;
 #[path = "lease_claim_policy_e2e.rs"]
 mod lease_claim_policy_e2e;
 #[path = "lease_liveness_cli.rs"]

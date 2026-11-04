@@ -693,6 +693,91 @@ pub(super) fn report_main_root() -> Result<PathBuf, UsageError> {
     Ok(repo.main_root()?)
 }
 
+/// Apply a validated issue-set manifest through the coordinated GitHub lane.
+fn run_issue_set_apply(parsed: Parsed) -> Result<(), UsageError> {
+    let usage = "issues apply <manifest.toml> --repo <owner/name> --session <id> --reason <authorization> [--dry-run]";
+    if parsed.positional.len() != 2 {
+        return Err(UsageError::Message(format!("expected {usage}")));
+    }
+    let repository = parsed
+        .repository
+        .as_deref()
+        .ok_or_else(|| UsageError::Message(format!("expected {usage}")))?;
+    let session_id = parsed
+        .session
+        .ok_or_else(|| UsageError::Message(format!("expected {usage}")))?;
+    let reason = parsed
+        .reason
+        .as_deref()
+        .filter(|reason| !reason.trim().is_empty())
+        .ok_or_else(|| UsageError::Message(format!("expected {usage}")))?;
+    let cwd = std::env::current_dir().map_err(|error| UsageError::Message(error.to_string()))?;
+    let repo = crate::GitRepo::discover(&cwd)?;
+    repo.resolve_remote_target("origin", Some(repository))
+        .map_err(|error| UsageError::Message(error.to_string()))?;
+    let manifest =
+        crate::issue_set::ValidatedManifest::load(std::path::Path::new(&parsed.positional[1]))
+            .map_err(UsageError::Message)?;
+    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let run_dir = crate::host_state::default_host_state_dir()
+        .ok_or_else(|| {
+            UsageError::Message("cannot resolve host state for issue-set coordination".into())
+        })?
+        .join("issue-sets");
+    let mut github = crate::issue_set_github::GithubIssueSet {
+        broker: &mut broker,
+        session_id,
+        repository: repository.to_owned(),
+        reason: reason.to_owned(),
+    };
+    if parsed.dry_run {
+        let entries: std::collections::BTreeMap<_, _> = std::iter::once(&manifest.manifest.parent)
+            .chain(&manifest.manifest.issues)
+            .map(|entry| (entry.key.clone(), entry))
+            .collect();
+        let existing = crate::issue_set_apply::plan(&manifest, &run_dir, repository, &mut github)
+            .map_err(UsageError::Message)?;
+        let mut plan = Vec::new();
+        for key in &manifest.order {
+            if existing[key].is_none() {
+                plan.push(serde_json::json!({"action": "create", "key": key, "number": null}));
+            }
+        }
+        for entry in &manifest.manifest.issues {
+            plan.push(serde_json::json!({"action": "ensure_sub_issue", "parent": manifest.manifest.parent.key, "child": entry.key}));
+        }
+        for entry in entries.values() {
+            for dependency in &entry.depends_on {
+                plan.push(serde_json::json!({"action": "ensure_dependency", "issue": entry.key, "blocked_by": dependency}));
+            }
+        }
+        for key in &manifest.order {
+            plan.push(serde_json::json!({"action": "update", "key": key, "number": existing[key]}));
+        }
+        if parsed.json {
+            out!("{}", serde_json::to_string_pretty(&plan)?);
+        } else {
+            for item in &plan {
+                out!("{}", item);
+            }
+        }
+        return Ok(());
+    }
+    github
+        .require_issue_sets_policy()
+        .map_err(UsageError::Message)?;
+    let result = crate::issue_set_apply::apply(&manifest, &run_dir, repository, &mut github)
+        .map_err(UsageError::Message)?;
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        for (key, number) in result {
+            out!("{key}: #{number}");
+        }
+    }
+    Ok(())
+}
+
 fn sub_issue_database_id(value: &serde_json::Value, number: u64) -> Option<u64> {
     if value.get("pull_request").is_some() || value.get("number")?.as_u64()? != number {
         return None;
@@ -846,6 +931,9 @@ fn run_sub_issue(parsed: Parsed) -> Result<(), UsageError> {
 
 /// `broker issues upsert`: one issue per automation outcome (#1238).
 pub(super) fn run_issues(parsed: Parsed) -> Result<(), UsageError> {
+    if parsed.positional.first().map(String::as_str) == Some("apply") {
+        return run_issue_set_apply(parsed);
+    }
     if parsed.positional.first().map(String::as_str) == Some("sub-issue") {
         return run_sub_issue(parsed);
     }
