@@ -4,6 +4,26 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.57] - 2026-11-04
+
+### Added
+
+- Preview an unmerged shared environment declaration in an isolated worktree-owned environment without changing the shared serving alias (#1420).
+- Plan and apply opt-in issue-set manifests with validation and same-host recovery journaling. Independent-host concurrency and sessionless coordination remain unsupported; do not run concurrent applies for the same set from independent hosts (#1424).
+- Scope garbage-collection plans to exclude unprovable orphan roots while retaining conservative storage-budget verdicts (#1418).
+
+### Fixed
+
+- Roll back every dispatched provisioning attempt, including timed-out hooks, and retry transient container removal while retaining capacity when cleanup cannot be proven (#1417).
+- Keep resource supervision running when a caller disconnects from progress output; killed supervisors and externally managed resource operations still require safe reconciliation (#1423).
+- Search larger landing histories within a separate total work budget while retaining per-batch limits and fail-closed deadlines (#1425).
+
+### Changed
+
+- Reduce CI test-binary linking and run the Rust workspace suite in ten shards (#1416, #1419, #1422, #1426).
+
+There is no broker database schema change in this release.
+
 ## [0.8.56] - 2026-11-04
 
 ### Added
