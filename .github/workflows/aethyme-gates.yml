@@ -116,7 +116,7 @@ jobs:
         env:
           CHAU7_CTO_OPTIM_ACTIVE: "1"
           CARGO_INCREMENTAL: "0"
-          CARGO_BUILD_JOBS: "1"
+          CARGO_BUILD_JOBS: "4"
           CARGO_PROFILE_DEV_DEBUG: "1"
           CARGO_TARGET_DIR: ${{ env.GATE_CACHE_DIR }}
         run: cargo build --locked --manifest-path packages/aethyme/rust/Cargo.toml --bin aethyme
@@ -159,8 +159,8 @@ jobs:
           # (cargo-test), the examples and their guard tests (fast-guards),
           # and the testkit contract tests (workflow-contract, gate-policy).
           COVERED_BY_PR_SUITE: "cargo-test fast-guards workflow-contract gate-policy"
-          # This runner is dedicated to these gates, so the cargo-test gate may
-          # use all four cores instead of its bounds for shared workstations.
+          # This runner is dedicated to these gates, so the Rust gates may use
+          # all four cores instead of their bounds for shared workstations.
           AETHYME_GATE_BUILD_JOBS: "4"
           AETHYME_GATE_TEST_THREADS: "4"
         run: |

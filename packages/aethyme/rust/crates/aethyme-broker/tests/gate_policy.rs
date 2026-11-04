@@ -324,13 +324,11 @@ esac
     }
 }
 
-/// A host dedicated to the gates raises the cargo-test gate's bounds, and those of
-/// fast-guards, which shares its build environment, through their own settings.
-/// Those settings reach no other gate, and generic Cargo and nextest variables
-/// still cannot raise any gate's bounds.
+/// A host dedicated to the gates raises every Rust gate's bounds through their own
+/// settings. Generic Cargo and nextest variables still cannot raise them.
 #[test]
 #[cfg(unix)]
-fn only_the_gate_settings_raise_only_the_workspace_suite_workers() {
+fn only_the_gate_settings_raise_the_rust_gate_workers() {
     use std::os::unix::fs::PermissionsExt;
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
@@ -385,22 +383,28 @@ fn only_the_gate_settings_raise_only_the_workspace_suite_workers() {
     ];
 
     let raised = run("cargo-test", &dedicated);
-    assert!(raised.lines().all(|line| line.starts_with("4\t4\t4\t")));
     assert!(raised.contains("--build-jobs 4"));
-
     let bounded = run("cargo-test", &[]);
-    assert!(bounded.lines().all(|line| line.starts_with("1\t2\t2\t")));
     assert!(bounded.contains("--build-jobs 1"));
 
-    let guards = run("fast-guards", &dedicated);
-    assert!(guards.lines().all(|line| line.starts_with("4\t4\t4\t")));
-
-    for name in ["workflow-contract", "gate-policy"] {
-        let log = run(name, &dedicated);
-        assert!(!log.is_empty(), "{name} must execute Cargo");
+    for name in [
+        "fast-guards",
+        "cargo-test",
+        "script-contract",
+        "workflow-contract",
+        "gate-policy",
+        "cross-process-contract",
+    ] {
+        let raised = run(name, &dedicated);
+        assert!(!raised.is_empty(), "{name} must execute Cargo");
         assert!(
-            log.lines().all(|line| line.starts_with("1\t2\t2\t")),
-            "{name} took the workspace suite's settings: {log}"
+            raised.lines().all(|line| line.starts_with("4\t4\t4\t")),
+            "{name} ignored the gate settings: {raised}"
+        );
+        let bounded = run(name, &[]);
+        assert!(
+            bounded.lines().all(|line| line.starts_with("1\t2\t2\t")),
+            "{name} inherited unbounded workers: {bounded}"
         );
     }
 }

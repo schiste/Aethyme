@@ -226,7 +226,7 @@ fn main_gate_router_prebuild_reuses_the_managed_debug_target() {
     for setting in [
         "CHAU7_CTO_OPTIM_ACTIVE: \"1\"",
         "CARGO_INCREMENTAL: \"0\"",
-        "CARGO_BUILD_JOBS: \"1\"",
+        "CARGO_BUILD_JOBS: \"4\"",
         "CARGO_PROFILE_DEV_DEBUG: \"1\"",
         "CARGO_TARGET_DIR: ${{ env.GATE_CACHE_DIR }}",
         "run: cargo build --locked --manifest-path packages/aethyme/rust/Cargo.toml --bin aethyme",
