@@ -12,8 +12,8 @@ fn write_resource_run_event(
     request_id: &str,
     message: &str,
 ) {
-    if json {
-        let _ = writeln!(
+    let result = if json {
+        writeln!(
             writer,
             "{}",
             serde_json::json!({
@@ -21,10 +21,12 @@ fn write_resource_run_event(
                 "request_id": request_id,
                 "message": message,
             })
-        );
+        )
     } else {
-        let _ = writeln!(writer, "resource run: {message}");
-    }
+        writeln!(writer, "resource run: {message}")
+    };
+    // Progress is best-effort; the supervisor must keep protecting its child.
+    result.unwrap_or(());
 }
 
 fn record_resource_run_phase(
