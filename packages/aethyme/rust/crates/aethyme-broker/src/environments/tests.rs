@@ -788,6 +788,7 @@ fn variables_name_every_port_and_receipt_and_nothing_inherited() {
     for expected in [
         "AETHYME_ENV_ID",
         "AETHYME_ENV_NAMESPACE",
+        "AETHYME_ENV_COMPOSE_PROJECT",
         "AETHYME_ENV_PORT_API",
         "AETHYME_ENV_URL_API",
         "AETHYME_ENV_RECEIPT_DB",
