@@ -37,7 +37,7 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
         ]
     );
     // `rust-tests` keeps the required check name. The suite itself is built
-    // once into a nextest archive and run in six hash partitions; the verdict
+    // once into a nextest archive and run in ten hash partitions; the verdict
     // job requires the build, every shard and the performance controls.
     let rust = block(&oss, "  rust-tests:");
     assert!(rust.contains(&"    if: ${{ !cancelled() && github.event_name == 'pull_request' }}"));
@@ -64,8 +64,8 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
             .contains(&"    if: ${{ !cancelled() && needs.rust-tests-build.result == 'success' }}")
     );
     assert!(shard.contains(&"      fail-fast: false"));
-    assert!(shard.contains(&"        shard: [1, 2, 3, 4, 5, 6]"));
-    assert!(shard.contains(&"        run: ../scripts/test-like-ci.sh --from-archive \"$RUNNER_TEMP/rust-tests-archive/rust-tests.tar.zst\" --partition \"hash:${{ matrix.shard }}/6\""));
+    assert!(shard.contains(&"        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]"));
+    assert!(shard.contains(&"        run: ../scripts/test-like-ci.sh --from-archive \"$RUNNER_TEMP/rust-tests-archive/rust-tests.tar.zst\" --partition \"hash:${{ matrix.shard }}/10\""));
     assert!(shard.contains(&"          path: packages/aethyme/rust/target/nextest/ci/junit.xml"));
     // nextest runs neither example targets nor doctests, and the
     // release-manifest assertions in
