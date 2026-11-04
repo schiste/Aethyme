@@ -1383,3 +1383,7 @@ or share uncertain-create recovery state.
 ### Environment Compose project variable
 
 Environment component commands and environment status expose `AETHYME_ENV_COMPOSE_PROJECT`, the normalized Compose project name derived from the environment namespace. Provision and other hooks can use this value to address the same project as the Compose driver. The compiled plan lists the variable among the names available to commands.
+
+### Environment activity probes
+
+An `activity_probe` reports active with exit status 0 and idle with exit status 1 and empty stderr. An exit status of 1 with stderr, any other nonzero status, a signal, an execution failure, or a timeout keeps the environment awake. Nonzero completed failures are logged by the supervisor. A probe that fails silently with exit status 1 is indistinguishable from idle and should emit a diagnostic or use another exit status.
