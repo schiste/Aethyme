@@ -40,6 +40,20 @@ jobs:
     name: Run all gates
     runs-on: ubuntu-latest
     steps:
+      # A gate refuses to start below its storage reserve, which turned main
+      # red without running the suite (run 41851732511: 7.5 GiB free, 8.0 GiB
+      # required). This job never uses these toolchains. Runners with room skip
+      # the removal; the free space is logged either way.
+      - name: Free runner disk when it is low
+        run: |
+          set -euo pipefail
+          free="$(df --output=avail -BG "$GITHUB_WORKSPACE" | tail -n 1 | tr -dc '0-9')"
+          echo "Free disk: ${free} GiB"
+          if [ "$free" -lt 30 ]; then
+            sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL
+            df -h "$GITHUB_WORKSPACE"
+          fi
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -145,6 +159,10 @@ jobs:
           # (cargo-test), the examples and their guard tests (fast-guards),
           # and the testkit contract tests (workflow-contract, gate-policy).
           COVERED_BY_PR_SUITE: "cargo-test fast-guards workflow-contract gate-policy"
+          # This runner is dedicated to these gates, so the cargo-test gate may
+          # use all four cores instead of its bounds for shared workstations.
+          AETHYME_GATE_BUILD_JOBS: "4"
+          AETHYME_GATE_TEST_THREADS: "4"
         run: |
           set -euo pipefail
           aethyme="$GATE_CACHE_DIR/debug/aethyme"

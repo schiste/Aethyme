@@ -324,6 +324,84 @@ esac
     }
 }
 
+/// A host dedicated to the gates raises the cargo-test gate's bounds, and those of
+/// fast-guards, which shares its build environment, through their own settings.
+/// Those settings reach no other gate, and generic Cargo and nextest variables
+/// still cannot raise any gate's bounds.
+#[test]
+#[cfg(unix)]
+fn only_the_gate_settings_raise_only_the_workspace_suite_workers() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    fs::write(
+        &cargo,
+        "#!/bin/sh\nprintf '%s\\t%s\\t%s\\t%s\\n' \"$CARGO_BUILD_JOBS\" \"$RUST_TEST_THREADS\" \"$NEXTEST_TEST_THREADS\" \"$*\" >> \"$MOCK_EVENTS\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o700)).unwrap();
+    let git = bin.join("git");
+    fs::write(
+        &git,
+        "#!/bin/sh\nprintf '0000000000000000000000000000000000000000\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
+    let events = root.join("events");
+    let gates = load_gates(&repo_root()).unwrap();
+    let run = |name: &str, settings: &[(&str, &str)]| {
+        fs::write(&events, "").unwrap();
+        let gate = gates.iter().find(|gate| gate.name == name).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", &gate.command])
+            .current_dir(root)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("AETHYME_GATE_CACHE_DIR", root.join("cache"))
+            .env("CARGO_BUILD_JOBS", "99")
+            .env("RUST_TEST_THREADS", "99")
+            .env("NEXTEST_TEST_THREADS", "99")
+            .env("MOCK_EVENTS", &events);
+        for (name, value) in settings {
+            command.env(name, value);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::read_to_string(&events).unwrap()
+    };
+    let dedicated = [
+        ("AETHYME_GATE_BUILD_JOBS", "4"),
+        ("AETHYME_GATE_TEST_THREADS", "4"),
+    ];
+
+    let raised = run("cargo-test", &dedicated);
+    assert!(raised.lines().all(|line| line.starts_with("4\t4\t4\t")));
+    assert!(raised.contains("--build-jobs 4"));
+
+    let bounded = run("cargo-test", &[]);
+    assert!(bounded.lines().all(|line| line.starts_with("1\t2\t2\t")));
+    assert!(bounded.contains("--build-jobs 1"));
+
+    let guards = run("fast-guards", &dedicated);
+    assert!(guards.lines().all(|line| line.starts_with("4\t4\t4\t")));
+
+    for name in ["workflow-contract", "gate-policy"] {
+        let log = run(name, &dedicated);
+        assert!(!log.is_empty(), "{name} must execute Cargo");
+        assert!(
+            log.lines().all(|line| line.starts_with("1\t2\t2\t")),
+            "{name} took the workspace suite's settings: {log}"
+        );
+    }
+}
+
 /// Run the shipped shell commands against recording tools. A hostile inherited
 /// environment must not undo local resource bounds; no real build runs here.
 #[test]

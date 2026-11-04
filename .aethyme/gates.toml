@@ -93,7 +93,7 @@ triggers = ["packages/aethyme-eval/**"]
 # Local Rust gates bound compilation and test execution separately. Keep
 # these defaults explicit so an inherited environment cannot fan out workers.
 name = "fast-guards"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=2 NEXTEST_TEST_THREADS=2 CARGO_PROFILE_DEV_DEBUG=1 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --workspace --examples --quiet --manifest-path packages/aethyme/rust/Cargo.toml --test help_snapshots --test help_surface --test help_everywhere --test broker_discarded_results --test deprecated_spelling_callers --test docs_hygiene --test no_eval_tuning --test pr_template --test grammar_provenance --test gate_policy'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-1}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" CARGO_PROFILE_DEV_DEBUG=1 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --workspace --examples --quiet --manifest-path packages/aethyme/rust/Cargo.toml --test help_snapshots --test help_surface --test help_everywhere --test broker_discarded_results --test deprecated_spelling_callers --test docs_hygiene --test no_eval_tuning --test pr_template --test grammar_provenance --test gate_policy'
 cost = 2
 timeout_seconds = 2400
 resource_wait_seconds = 900
@@ -137,7 +137,15 @@ name = "cargo-test"
 # retries. Compilation is independently limited to one job.
 # CARGO_PROFILE_DEV_DEBUG matches the test profile so the binaries and the
 # tests share one set of compiled dependencies.
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=2 NEXTEST_TEST_THREADS=2 CARGO_PROFILE_DEV_DEBUG=1 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && m=packages/aethyme/rust/Cargo.toml; if cargo nextest --version >/dev/null 2>&1; then cargo build --locked --workspace --bins --quiet --manifest-path "$m" && AETHYME_TESTKIT_PREBUILT_BINS=1 cargo nextest run --locked --workspace --profile local --build-jobs 1 --no-fail-fast --cargo-quiet --manifest-path "$m"; suite=$?; cargo test --locked --workspace --doc --quiet --no-fail-fast --manifest-path "$m"; doc=$?; else cargo test --locked --workspace --quiet --no-fail-fast --manifest-path "$m"; suite=$?; doc=0; fi; cargo test --locked --workspace --examples --quiet --no-fail-fast --manifest-path "$m"; examples=$?; [ "$suite" -eq 0 ] && [ "$doc" -eq 0 ] && [ "$examples" -eq 0 ]'
+# 2026-11-04: AETHYME_GATE_BUILD_JOBS and AETHYME_GATE_TEST_THREADS raise the
+# bounds of this gate and fast-guards, which must share its build environment,
+# where a host is known to be dedicated to them; only aethyme-gates.yml sets
+# them. Without them the bounds stay at one build job and
+# two test workers, and inherited CARGO_BUILD_JOBS or NEXTEST_TEST_THREADS still
+# cannot change them. The bounds protect a shared workstation, but they left
+# GitHub's 4-core runner at a load of about 1 while this gate used 2292-2400 s
+# of its 2400 s limit, and timed out on main three times that day.
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-1}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" CARGO_PROFILE_DEV_DEBUG=1 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && m=packages/aethyme/rust/Cargo.toml; if cargo nextest --version >/dev/null 2>&1; then cargo build --locked --workspace --bins --quiet --manifest-path "$m" && AETHYME_TESTKIT_PREBUILT_BINS=1 cargo nextest run --locked --workspace --profile local --build-jobs "$CARGO_BUILD_JOBS" --no-fail-fast --cargo-quiet --manifest-path "$m"; suite=$?; cargo test --locked --workspace --doc --quiet --no-fail-fast --manifest-path "$m"; doc=$?; else cargo test --locked --workspace --quiet --no-fail-fast --manifest-path "$m"; suite=$?; doc=0; fi; cargo test --locked --workspace --examples --quiet --no-fail-fast --manifest-path "$m"; examples=$?; [ "$suite" -eq 0 ] && [ "$doc" -eq 0 ] && [ "$examples" -eq 0 ]'
 cost = 3
 # 2026-09-26: raised from 1200. A full workspace run took 1056 s on a passing
 # gate that day and hit 1200 four times (sessions 677, 684, 621) while other

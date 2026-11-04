@@ -181,6 +181,23 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
     );
 }
 
+/// The cargo-test gate timed out on main with the runner almost idle, and a gate
+/// refused to start on a runner short of disk. The workflow owns both answers.
+#[test]
+fn main_gates_use_the_whole_runner_and_keep_their_storage_reserve() {
+    let gates = workflow("aethyme-gates.yml");
+    let run = block(&gates, "      - name: Run all gates");
+    assert!(run.contains(&"          AETHYME_GATE_BUILD_JOBS: \"4\""));
+    assert!(run.contains(&"          AETHYME_GATE_TEST_THREADS: \"4\""));
+
+    let free = gates
+        .find("      - name: Free runner disk when it is low")
+        .unwrap();
+    assert!(free < gates.find("      - name: Checkout").unwrap());
+    let step = block(&gates, "      - name: Free runner disk when it is low");
+    assert!(step.contains(&"          if [ \"$free\" -lt 30 ]; then"));
+}
+
 #[test]
 fn main_gate_router_prebuild_reuses_the_managed_debug_target() {
     let gates = workflow("aethyme-gates.yml");
