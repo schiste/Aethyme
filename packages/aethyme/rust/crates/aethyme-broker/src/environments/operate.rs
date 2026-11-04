@@ -907,7 +907,7 @@ fn attach_shared(
 pub(super) fn run_shared(options: &Options) -> Result<Output, Failure> {
     let usage = || Failure {
         code: "usage",
-        message: "env shared needs up|redeploy|destroy <name>, or list".into(),
+        message: "env shared needs up|redeploy|destroy|preview <name>, or list".into(),
         next_action: "run `aethyme env --help`".into(),
         exit: exit_status::USAGE,
     };
@@ -925,7 +925,10 @@ pub(super) fn run_shared(options: &Options) -> Result<Output, Failure> {
     let (_, host) =
         super::load_host_file().map_err(|error| environment_failure(error.to_string()))?;
     let host = host.value.map_err(|d| environment_failure(d.render()))?;
-    let (mut lifecycle, warning) = open("env shared", action == "up" || action == "redeploy")?;
+    let (mut lifecycle, warning) = open(
+        "env shared",
+        matches!(action, "up" | "redeploy" | "preview"),
+    )?;
     let wait = Duration::from_secs(options.wait_seconds);
     let (value, text) = match (action, options.positional.get(1)) {
         ("list", None) => {
@@ -958,6 +961,44 @@ pub(super) fn run_shared(options: &Options) -> Result<Output, Failure> {
                 })
                 .collect();
             (json!({ "shared": shared }), text)
+        }
+        ("preview", Some(name)) => {
+            let checked = check(&workspace)?;
+            let file = match (&checked.file, checked.diagnostics.is_empty()) {
+                (Some(file), true) => file,
+                _ => {
+                    return Err(Failure {
+                        code: "invalid_environments_file",
+                        message: format!(
+                            "{ENVIRONMENTS_FILE} has {} validation problem(s)",
+                            checked.diagnostics.len()
+                        ),
+                        next_action: "run `aethyme env validate` and fix every problem".into(),
+                        exit: exit_status::VERIFICATION_FAILED,
+                    });
+                }
+            };
+            let context = compile_context(&workspace, &checked.digest);
+            let snapshot = super::shared::preview_snapshot(file, &checked.host, name, &context)
+                .map_err(lifecycle_failure)?;
+            let record = lifecycle
+                .up(
+                    &snapshot,
+                    &workspace.worktree_root,
+                    Some(&main_root),
+                    None,
+                    &UpOptions {
+                        wait,
+                        reconfigure: false,
+                        recreate: Vec::new(),
+                    },
+                )
+                .map_err(lifecycle_failure)?;
+            let (mut value, mut text) = describe(&lifecycle, &record);
+            value["preview"] = json!(true);
+            value["shared_name"] = json!(name);
+            text.push_str("  isolated preview; serving shared alias is unchanged; use `env down <id>` to remove it\n");
+            (value, text)
         }
         ("up", Some(name)) => {
             let record = lifecycle

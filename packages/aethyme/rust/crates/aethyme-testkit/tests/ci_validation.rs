@@ -36,13 +36,37 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
             "    branches: [\"main\", \"master\"]"
         ]
     );
+    // `rust-tests` keeps the required check name. The suite itself is built
+    // once into a nextest archive and run in six hash partitions; the verdict
+    // job requires the build, every shard and the performance controls.
     let rust = block(&oss, "  rust-tests:");
     assert!(rust.contains(&"    if: ${{ !cancelled() && github.event_name == 'pull_request' }}"));
-    assert!(rust.contains(&"    needs: classify_changes"));
+    assert!(rust.contains(&"    needs: [classify_changes, rust-tests-build, rust-tests-shard, broker-performance-controls]"));
+    let build = block(&oss, "  rust-tests-build:");
+    assert!(build.contains(&"    needs: classify_changes"));
+    assert!(build.contains(&"    if: ${{ !cancelled() && github.event_name == 'pull_request' && (needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}"));
     // The workspace suite runs under nextest. `cargo test --workspace
     // --examples` once stood in for it, but a target flag narrows cargo's
     // selection to examples only, so it ran three binaries.
-    assert!(rust.contains(&"        run: ../scripts/test-like-ci.sh --full"));
+    assert!(build.contains(
+        &"        run: ../scripts/test-like-ci.sh --archive \"$RUNNER_TEMP/rust-tests.tar.zst\""
+    ));
+    assert!(
+        !build
+            .iter()
+            .any(|line| line.contains("cargo build --locked --workspace --bins")),
+        "the test build already produces the product binaries"
+    );
+    let shard = block(&oss, "  rust-tests-shard:");
+    assert!(shard.contains(&"    needs: [classify_changes, rust-tests-build]"));
+    assert!(
+        shard
+            .contains(&"    if: ${{ !cancelled() && needs.rust-tests-build.result == 'success' }}")
+    );
+    assert!(shard.contains(&"      fail-fast: false"));
+    assert!(shard.contains(&"        shard: [1, 2, 3, 4, 5, 6]"));
+    assert!(shard.contains(&"        run: ../scripts/test-like-ci.sh --from-archive \"$RUNNER_TEMP/rust-tests-archive/rust-tests.tar.zst\" --partition \"hash:${{ matrix.shard }}/6\""));
+    assert!(shard.contains(&"          path: packages/aethyme/rust/target/nextest/ci/junit.xml"));
     // nextest runs neither example targets nor doctests, and the
     // release-manifest assertions in
     // `crates/aethyme-broker/examples/release_manifest.rs` live in an example.
@@ -61,38 +85,32 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
         .map(|line| line.trim())
         .collect::<Vec<_>>();
     assert_eq!(
-        rust_conditions.len(),
-        11,
-        "the Rust job has one PR guard, eight full-lane guards, one shared parity guard and one performance validation guard"
+        rust_conditions,
+        [
+            "if: ${{ !cancelled() && github.event_name == 'pull_request' }}",
+            "if: ${{ needs.classify_changes.result == 'success' && (needs.classify_changes.outputs.docs_fast == 'true' || needs.classify_changes.outputs.performance_fast == 'true') }}",
+            "if: ${{ needs.classify_changes.result == 'success' && (needs.classify_changes.outputs.docs_fast == 'true' || needs.classify_changes.outputs.performance_fast == 'true') }}",
+            "if: ${{ needs.classify_changes.result == 'success' && needs.classify_changes.outputs.performance_fast == 'true' }}",
+            "if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}",
+            "if: ${{ always() && needs.rust-tests-build.result == 'success' }}",
+            "if: ${{ always() && needs.rust-tests-build.result == 'success' }}",
+            "if: ${{ always() && needs.rust-tests-build.result == 'success' }}",
+            "if: ${{ always() && needs.rust-tests-build.result == 'success' }}",
+        ],
+        "PR guard; parity toolchain and parity on either fast path; performance validation; the full-suite verdict; four telemetry steps"
     );
-    assert_eq!(
-        rust_conditions
-            .iter()
-            .filter(|line| **line == "if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}")
-            .count(),
-        8,
-        "seven Rust steps and the Python controls must run when classification fails or selects the full suite"
-    );
-    assert_eq!(
-        rust_conditions
-            .iter()
-            .filter(|line| **line == "if: ${{ needs.classify_changes.result == 'success' && (needs.classify_changes.outputs.docs_fast == 'true' || needs.classify_changes.outputs.performance_fast == 'true') }}")
-            .count(),
-        1,
-        "the parity step must run on either fast path"
-    );
-
-    assert!(rust_conditions.contains(&"if: ${{ needs.classify_changes.result == 'success' && needs.classify_changes.outputs.performance_fast == 'true' }}"));
     assert!(rust.contains(&"        run: bash .github/scripts/validate-performance-fast-lane.sh"));
+    // A skipped or failed build, shard or control job fails the verdict.
+    assert!(rust.contains(&"          [[ \"$BUILD\" == success && \"$SHARDS\" == success && \"$CONTROLS\" == success ]]"));
+    assert!(rust.contains(&"          BUILD: ${{ needs.rust-tests-build.result }}"));
+    assert!(rust.contains(&"          SHARDS: ${{ needs.rust-tests-shard.result }}"));
+    assert!(rust.contains(&"          CONTROLS: ${{ needs.broker-performance-controls.result }}"));
 
-    // The added lightweight coverage belongs to the full lane too. Pin its
-    // condition and exact suites, rather than only accepting another guard.
-    let rust_body = rust.join("\n");
-    let controls = block(
-        &rust_body,
-        "      - name: Run broker performance controls in the full lane",
-    );
-    assert_eq!(controls.iter().filter(|line| line.trim() == "if: ${{ needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true') }}").count(), 1);
+    // The lightweight Python coverage belongs to the full lane too, in a job
+    // of its own beside the build. Pin its condition and exact suites.
+    let controls = block(&oss, "  broker-performance-controls:");
+    assert!(controls.contains(&"    needs: classify_changes"));
+    assert!(controls.contains(&"    if: ${{ !cancelled() && github.event_name == 'pull_request' && (needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}"));
     assert_eq!(
         controls
             .iter()
@@ -498,8 +516,8 @@ fn docs_fast_lane_is_fail_closed_and_never_records_full_suite_coverage() {
     assert!(rust.iter().any(|line| {
         line.contains("rustc --edition=2021 --test .github/scripts/skill-parity-harness.rs")
     }));
-    assert!(rust.contains(&"      - name: Run workspace tests"));
-    assert!(rust.contains(&"        run: ../scripts/test-like-ci.sh --full"));
+    let shard = block(&oss, "  rust-tests-shard:");
+    assert!(shard.contains(&"      - name: Run workspace tests"));
 
     let examples = block(&oss, "  rust-examples-doctests:");
     assert!(examples.contains(&"      - name: Run example tests"));
@@ -662,6 +680,18 @@ fn ci_and_local_runs_share_one_test_command() {
     assert!(script.contains("coverage=focused"));
     assert!(script.contains("AETHYME_TESTKIT_PREBUILT_BINS=1"));
     assert!(script.contains("unset AETHYME_TESTKIT_PREBUILT_BINS"));
+    // CI splits --full across jobs: one archive build, then partitions of it
+    // extracted over the same tree, so baked binary paths stay valid.
+    assert!(script.contains(
+        "cargo nextest archive --locked --workspace --archive-file \"$archive_out\" --timings"
+    ));
+    assert!(script.contains(
+        "--archive-file \"$archive_in\" --extract-to \"$rust\" --extract-overwrite --workspace-remap \"$rust\" --profile ci --no-tests fail"
+    ));
+    assert!(script.contains("test_command+=(--partition \"$partition\")"));
+    // The full-coverage paths take product binaries from the test build; only
+    // the bounded local profile still warms them separately.
+    assert!(!script.contains("    cargo build --locked --workspace --bins\n"));
     assert!(!script.contains("--test-threads=1|--nocapture|--no-capture|-j1"));
     assert!(script.contains("|| status=$?"));
     assert!(script.contains("exit \"$status\""));

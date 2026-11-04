@@ -83,15 +83,18 @@ assert_contains 'classifier controls' "$controls_step" 'bash .github/scripts/tes
 
 rust_tests=$(job_section rust-tests)
 assert_contains 'Rust workspace job' "$rust_tests" 'name: Rust workspace tests'
-assert_contains 'Rust workspace job' "$rust_tests" 'needs: classify_changes'
+assert_contains 'Rust workspace job' "$rust_tests" 'needs: [classify_changes, rust-tests-build, rust-tests-shard, broker-performance-controls]'
 assert_contains 'Rust workspace job' "$rust_tests" "if: $rust_tests_condition"
-assert_contains 'Rust workspace job' "$rust_tests" 'working-directory: packages/aethyme/rust'
-assert_preflight rust-tests "$full_path_condition"
-assert_before 'Rust workspace preflight' "$rust_tests" 'name: Check formatting before Rust work' 'name: Cache Rust build'
-assert_before 'Rust workspace preflight' "$rust_tests" 'name: Check formatting before Rust work' 'name: Install cargo-nextest'
-assert_before 'Rust workspace preflight' "$rust_tests" 'name: Check formatting before Rust work' 'name: Build the product binaries'
-assert_before 'Rust workspace preflight' "$rust_tests" 'name: Check formatting before Rust work' 'name: Compile the workspace tests'
-assert_before 'Rust workspace preflight' "$rust_tests" 'name: Check formatting before Rust work' 'name: Run workspace tests'
+
+build=$(job_section rust-tests-build)
+assert_contains 'Rust workspace build job' "$build" 'name: Rust workspace tests (build)'
+assert_contains 'Rust workspace build job' "$build" 'needs: classify_changes'
+assert_contains 'Rust workspace build job' "$build" "if: $examples_condition"
+assert_contains 'Rust workspace build job' "$build" 'working-directory: packages/aethyme/rust'
+assert_preflight rust-tests-build
+assert_before 'Rust workspace preflight' "$build" 'name: Check formatting before Rust work' 'name: Cache Rust build'
+assert_before 'Rust workspace preflight' "$build" 'name: Check formatting before Rust work' 'name: Install cargo-nextest'
+assert_before 'Rust workspace preflight' "$build" 'name: Check formatting before Rust work' 'name: Build the test archive'
 
 examples=$(job_section rust-examples-doctests)
 assert_contains 'examples job' "$examples" 'name: Rust examples and doctests'
