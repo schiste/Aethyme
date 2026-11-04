@@ -1,6 +1,6 @@
 # Testing Guide
 
-Last Updated: 2026-10-17
+Last Updated: 2026-11-04
 
 The suite is Rust. There is no database, no services, and no Python —
 `src/` was deleted on 2026-08-01 (python-retirement Phase 6) and the dev
@@ -152,6 +152,36 @@ pinned upstream ref:
 ```bash
 cargo test -p aethyme-testkit --test grammar_provenance -- --ignored
 ```
+
+### Integration-test binaries — one per crate
+
+Cargo builds every file under a crate's `tests/` as a binary of its own,
+and each of those binaries links the crate and all of its dependencies
+again. With about 250 suite files, linking was most of the workspace's
+test compile time. Most crates therefore set `autotests = false` and
+gather their suites as modules of one binary, `it`, whose root is
+`tests/it.rs`. A suite keeps its file and its test names, which gain the
+suite as a prefix:
+
+```bash
+cargo test -p aethyme-broker --test it merge_e2e::
+cargo nextest run -p aethyme-broker -E 'binary(it) & test(/^merge_e2e::/)'
+```
+
+A suite stays a binary of its own, listed as a `[[test]]` target in its
+crate's `Cargo.toml` with the reason, when it:
+
+- re-runs its own binary with `--exact <test name>` to get a child process
+  (inside `it` the name would gain a module prefix);
+- changes process-wide environment variables, which would race the other
+  suites when `cargo test` runs `it` in one process; or
+- is selected by name (`--test <suite>`) by a gate in `.aethyme/gates.toml`
+  or by a release workflow, which then builds only that suite.
+
+A new suite needs a `#[path = "<suite>.rs"] mod <suite>;` line in
+`tests/it.rs`, or its own `[[test]]` target. `aethyme-testkit`'s
+`test_targets.rs` fails until it has one, because with `autotests = false`
+Cargo would otherwise never build it.
 
 ### Product path (no Python at all)
 
