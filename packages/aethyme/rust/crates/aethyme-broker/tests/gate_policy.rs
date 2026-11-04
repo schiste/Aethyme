@@ -362,6 +362,7 @@ fn only_the_gate_settings_raise_the_rust_gate_workers() {
             // The main-branch gate job sets these for its own run.
             .env_remove("AETHYME_GATE_BUILD_JOBS")
             .env_remove("AETHYME_GATE_TEST_THREADS")
+            .env_remove("AETHYME_GATE_PHASES")
             .env("CARGO_BUILD_JOBS", "99")
             .env("RUST_TEST_THREADS", "99")
             .env("NEXTEST_TEST_THREADS", "99")
@@ -381,6 +382,48 @@ fn only_the_gate_settings_raise_the_rust_gate_workers() {
         ("AETHYME_GATE_BUILD_JOBS", "4"),
         ("AETHYME_GATE_TEST_THREADS", "4"),
     ];
+
+    // Phases are recorded only on request, in order, with their exit status; the
+    // same request adds Cargo's timing report to the test build alone.
+    let phases = root.join("phases.tsv");
+    let recorded = run(
+        "cargo-test",
+        &[("AETHYME_GATE_PHASES", phases.to_str().unwrap())],
+    );
+    assert_eq!(recorded.matches("--timings").count(), 1, "{recorded}");
+    assert!(recorded.contains("--no-run --timings"), "{recorded}");
+    // nextest refuses --no-fail-fast together with --no-run.
+    assert!(
+        recorded
+            .lines()
+            .filter(|line| line.contains("--no-run"))
+            .all(|line| !line.contains("--no-fail-fast")),
+        "{recorded}"
+    );
+    let written = fs::read_to_string(&phases).unwrap();
+    let names = written
+        .lines()
+        .map(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 3, "{line}");
+            assert!(fields[1].parse::<u64>().is_ok(), "{line}");
+            assert_eq!(fields[2], "0", "{line}");
+            fields[0]
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            "product-binaries",
+            "test-build",
+            "test-run",
+            "doctests",
+            "examples"
+        ]
+    );
+    let unrecorded = run("cargo-test", &[]);
+    assert!(!unrecorded.contains("--timings"), "{unrecorded}");
+    assert_eq!(fs::read_to_string(&phases).unwrap(), written);
 
     let raised = run("cargo-test", &dedicated);
     assert!(raised.contains("--build-jobs 4"));
@@ -472,6 +515,7 @@ esac
                     // The main-branch gate job sets these for its own run.
                     .env_remove("AETHYME_GATE_BUILD_JOBS")
                     .env_remove("AETHYME_GATE_TEST_THREADS")
+                    .env_remove("AETHYME_GATE_PHASES")
                     .env("CARGO_BUILD_JOBS", "99")
                     .env("RUST_TEST_THREADS", "99")
                     .env("NEXTEST_TEST_THREADS", "99")
@@ -501,7 +545,12 @@ esac
                         if *failure == "build " {
                             assert!(!log.contains("nextest run"));
                         } else {
-                            assert!(log.contains("nextest run --locked --workspace --profile local --build-jobs 1 --no-fail-fast"));
+                            assert!(log.contains(
+                                "nextest run --locked --workspace --profile local --build-jobs 1"
+                            ));
+                            if *failure != "nextest run" {
+                                assert!(log.contains("nextest run --locked --workspace --profile local --build-jobs 1 --no-fail-fast"));
+                            }
                         }
                         assert!(log.contains("--doc"));
                     } else {

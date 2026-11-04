@@ -163,8 +163,12 @@ jobs:
           # all four cores instead of their bounds for shared workstations.
           AETHYME_GATE_BUILD_JOBS: "4"
           AETHYME_GATE_TEST_THREADS: "4"
+          # The cargo-test gate records its phases here for the summary below.
+          AETHYME_GATE_PHASES: ${{ runner.temp }}/gate-telemetry/phases.tsv
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gate-telemetry"
+          exec > >(tee "$RUNNER_TEMP/gate-telemetry/gates.log") 2>&1
           aethyme="$GATE_CACHE_DIR/debug/aethyme"
           if [ -z "${TESTED_BY_RUN:-}" ]; then
             exec "$aethyme" broker advanced gates run --all
@@ -206,6 +210,39 @@ jobs:
               cat -- "$log"
             done
 
+      # Best effort: the gates above already decided this job's verdict, so a
+      # summary problem warns instead of failing it. A tree a pull-request run
+      # tested runs no cargo-test gate, and the summary says so.
+      - name: Summarize the gates
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/gate-telemetry"
+          mkdir -p "$out"
+          report="$GATE_CACHE_DIR/nextest/local/junit.xml"
+          timings="$GATE_CACHE_DIR/cargo-timings/cargo-timing.html"
+          [ ! -f "$report" ] || cp "$report" "$out/"
+          [ ! -f "$timings" ] || cp "$timings" "$out/"
+          if python3 .github/scripts/gate-telemetry.py \
+            --gate-log "$out/gates.log" \
+            --phases "$out/phases.tsv" \
+            --junit "$report" \
+            --markdown "$out/summary.md" \
+            --json "$out/gate-telemetry.json"; then
+            cat "$out/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::The gate telemetry could not be summarized."
+          fi
+
+      - name: Upload the gate telemetry
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: gate-telemetry
+          path: ${{ runner.temp }}/gate-telemetry/
+          if-no-files-found: warn
+          retention-days: 90
+
       # Runs after the gates, before the cache post-step saves. Keep
       # third-party artifacts only: the workspace's own crates, test binaries
       # and incremental state are rebuilt on every run anyway, and dropping
@@ -215,7 +252,7 @@ jobs:
           set -euo pipefail
           dir="$GATE_CACHE_DIR/debug"
           [ -d "$dir" ] || exit 0
-          rm -rf "$dir/incremental" "$dir/examples"
+          rm -rf "$dir/incremental" "$dir/examples" "$GATE_CACHE_DIR/nextest" "$GATE_CACHE_DIR/cargo-timings"
           rm -rf "$dir"/deps/aethyme* "$dir"/deps/libaethyme* "$dir"/.fingerprint/aethyme* "$dir"/build/aethyme*
           # Test and binary executables (no extension) are workspace outputs.
           find "$dir" -maxdepth 1 -type f -perm -u+x -delete
