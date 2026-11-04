@@ -426,38 +426,57 @@ fn remote_movement_after_review_refuses_before_preservation() {
     );
 }
 
+// One test per phase boundary: each builds its own fixture, so they run in
+// parallel instead of one test holding four sequential deploys.
 #[test]
-fn persisted_phase_boundaries_resume_without_duplicate_publication() {
-    for phase in ["preserved", "outputs_applied", "promoted", "published"] {
-        let fixture = fixture();
-        let planned = plan(&fixture.clone);
-        let digest = planned["plan_digest"].as_str().unwrap();
-        let interrupted = run_with_env(
-            &fixture.clone,
-            &["deploy", "execute", "--confirm", digest],
-            Some(("AETHYME_TEST_ENROLLMENT_STOP_AFTER_PHASE", phase)),
-        );
-        assert!(!interrupted.status.success(), "phase {phase}");
-        assert!(
-            String::from_utf8_lossy(&interrupted.stderr).contains("test interruption"),
-            "phase {phase}: {}",
-            String::from_utf8_lossy(&interrupted.stderr)
-        );
+fn persisted_phase_boundary_after_preserved_resumes_without_duplicate_publication() {
+    resume_after_persisted_phase_without_duplicate_publication("preserved");
+}
 
-        let resumed = run(
-            &fixture.clone,
-            &["deploy", "execute", "--confirm", digest, "--json"],
-        );
-        assert!(
-            resumed.status.success(),
-            "phase {phase}: {}",
-            failure_context(&fixture.clone, &resumed)
-        );
-        let report: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
-        assert_eq!(report["completed"], true, "phase {phase}");
-        assert_eq!(
-            report["publication_sha"], report["verified_remote_sha"],
-            "phase {phase}"
-        );
-    }
+#[test]
+fn persisted_phase_boundary_after_outputs_applied_resumes_without_duplicate_publication() {
+    resume_after_persisted_phase_without_duplicate_publication("outputs_applied");
+}
+
+#[test]
+fn persisted_phase_boundary_after_promoted_resumes_without_duplicate_publication() {
+    resume_after_persisted_phase_without_duplicate_publication("promoted");
+}
+
+#[test]
+fn persisted_phase_boundary_after_published_resumes_without_duplicate_publication() {
+    resume_after_persisted_phase_without_duplicate_publication("published");
+}
+
+fn resume_after_persisted_phase_without_duplicate_publication(phase: &str) {
+    let fixture = fixture();
+    let planned = plan(&fixture.clone);
+    let digest = planned["plan_digest"].as_str().unwrap();
+    let interrupted = run_with_env(
+        &fixture.clone,
+        &["deploy", "execute", "--confirm", digest],
+        Some(("AETHYME_TEST_ENROLLMENT_STOP_AFTER_PHASE", phase)),
+    );
+    assert!(!interrupted.status.success(), "phase {phase}");
+    assert!(
+        String::from_utf8_lossy(&interrupted.stderr).contains("test interruption"),
+        "phase {phase}: {}",
+        String::from_utf8_lossy(&interrupted.stderr)
+    );
+
+    let resumed = run(
+        &fixture.clone,
+        &["deploy", "execute", "--confirm", digest, "--json"],
+    );
+    assert!(
+        resumed.status.success(),
+        "phase {phase}: {}",
+        failure_context(&fixture.clone, &resumed)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(report["completed"], true, "phase {phase}");
+    assert_eq!(
+        report["publication_sha"], report["verified_remote_sha"],
+        "phase {phase}"
+    );
 }

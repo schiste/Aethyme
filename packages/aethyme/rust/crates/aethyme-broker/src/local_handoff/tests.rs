@@ -5,12 +5,43 @@ use std::io::Write;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
-/// How long a handoff that must expire mid-test stays valid. It has to
-/// outlast qualifying and dispatching it, which took over 5 s on a loaded
-/// macOS host and failed dispatch as `Stale`; the tests sleep through the
-/// rest of it.
+/// How long a handoff that must expire mid-test stays valid, tried in order.
+/// The window has to outlast qualifying and dispatching the handoff, which
+/// took over 5 s on a loaded macOS host and failed dispatch as `Stale`; the
+/// tests then sleep through the rest of it. A fixed 20 s window made each such
+/// test take over 20 s everywhere, so a short window is tried first and an
+/// attempt whose setup outlasted its window is discarded and repeated, with a
+/// fresh fixture, under the next one. The last window is the old fixed one.
 #[cfg(unix)]
-const EXPIRY_WINDOW_MS: i64 = 20_000;
+const EXPIRY_WINDOWS_MS: [i64; 3] = [1_500, 5_000, 20_000];
+
+/// An attempt's setup did not finish inside its expiry window, so it could not
+/// exercise expiry at the intended point.
+#[cfg(unix)]
+struct WindowElapsed;
+
+/// Run `attempt` under each expiry window until one finishes its setup in
+/// time. Anything other than an elapsed window fails the test immediately.
+#[cfg(unix)]
+fn with_expiry_window<T>(mut attempt: impl FnMut(i64) -> Result<T, WindowElapsed>) -> T {
+    for window in EXPIRY_WINDOWS_MS {
+        if let Ok(value) = attempt(window) {
+            return value;
+        }
+    }
+    panic!("setup outlasted every expiry window {EXPIRY_WINDOWS_MS:?}");
+}
+
+/// Classify a setup failure: retryable only if the window has already elapsed,
+/// which is how expiry surfaces (`Stale` or `Deadline`) before dispatch ends.
+#[cfg(unix)]
+fn window_elapsed<T>(expiry: i64, error: HandoffError) -> Result<T, WindowElapsed> {
+    if now().unwrap() >= expiry {
+        Err(WindowElapsed)
+    } else {
+        panic!("handoff setup failed before its expiry window elapsed: {error:?}")
+    }
+}
 
 fn agent(f: &mut Fixture) -> Agent {
     appoint(&mut f.v.f.store, &f.v.owner, "controlled-agent").unwrap()
@@ -778,35 +809,42 @@ fn ready_or_adopted_target_stop_drift_and_resume_aba_never_send_go() {
 #[cfg(unix)]
 #[test]
 fn expired_completed_leader_is_historical_but_does_not_strand_new_appointment() {
-    let mut f = Fixture::new();
-    let g = f.prepare("source").unwrap();
-    let a = agent(&mut f);
-    let grant = acceptance::qualify(
-        &mut f.v.f.store,
-        &f.v.owner,
-        &mut f.broker,
-        &f.carrier,
-        &f.binding,
-        &f.v.execution,
-        &f.v.artifact,
-        &f.v.permit,
-        &f.evidence,
-    )
-    .unwrap();
-    let expiry = now().unwrap() + EXPIRY_WINDOW_MS;
-    let r = prepare(
-        &mut f.v.f.store,
-        &f.v.owner,
-        &a,
-        &mut f.broker,
-        &f.carrier,
-        &grant,
-        g.id(),
-        "expires",
-        expiry,
-    )
-    .unwrap();
-    let mut old = launch(&mut f, &a, &r, shell("true")).unwrap();
+    let (mut f, g, a, mut old, expiry) = with_expiry_window(|window| {
+        let mut f = Fixture::new();
+        let g = f.prepare("source").unwrap();
+        let a = agent(&mut f);
+        let grant = acceptance::qualify(
+            &mut f.v.f.store,
+            &f.v.owner,
+            &mut f.broker,
+            &f.carrier,
+            &f.binding,
+            &f.v.execution,
+            &f.v.artifact,
+            &f.v.permit,
+            &f.evidence,
+        )
+        .unwrap();
+        let expiry = now().unwrap() + window;
+        let r = match prepare(
+            &mut f.v.f.store,
+            &f.v.owner,
+            &a,
+            &mut f.broker,
+            &f.carrier,
+            &grant,
+            g.id(),
+            "expires",
+            expiry,
+        ) {
+            Ok(r) => r,
+            Err(error) => return window_elapsed(expiry, error),
+        };
+        match launch(&mut f, &a, &r, shell("true")) {
+            Ok(old) => Ok((f, g, a, old, expiry)),
+            Err(error) => window_elapsed(expiry, error),
+        }
+    });
     let delay = expiry - now().unwrap() + 1;
     if delay > 0 {
         std::thread::sleep(Duration::from_millis(delay as u64));
@@ -877,53 +915,68 @@ fn completed_leader_rechecks_real_target_stop_at_classification() {
 #[cfg(unix)]
 #[test]
 fn expiry_while_completion_guard_is_held_cannot_commit_current_classification() {
-    let mut f = Fixture::new();
-    let g = f.prepare("source").unwrap();
-    let a = agent(&mut f);
-    let grant = acceptance::qualify(
-        &mut f.v.f.store,
-        &f.v.owner,
-        &mut f.broker,
-        &f.carrier,
-        &f.binding,
-        &f.v.execution,
-        &f.v.artifact,
-        &f.v.permit,
-        &f.evidence,
-    )
-    .unwrap();
-    let expiry = now().unwrap() + EXPIRY_WINDOW_MS;
-    let r = prepare(
-        &mut f.v.f.store,
-        &f.v.owner,
-        &a,
-        &mut f.broker,
-        &f.carrier,
-        &grant,
-        g.id(),
-        "expires-inside-completion",
-        expiry,
-    )
-    .unwrap();
-    let mut c = launch(&mut f, &a, &r, shell("true")).unwrap();
-    c.child.wait().unwrap();
-    let mut held = false;
-    let result = poll_command_with(
-        &mut f.v.f.store,
-        &f.v.owner,
-        &a,
-        &mut c,
-        &mut |_| Ok(()),
-        &mut || {
-            held = true;
-            let delay = expiry - now()? + 1;
-            if delay > 0 {
-                std::thread::sleep(Duration::from_millis(delay as u64));
-            }
-            Ok(())
-        },
-    )
-    .unwrap();
+    let (mut f, g, a, c, held, result) = with_expiry_window(|window| {
+        let mut f = Fixture::new();
+        let g = f.prepare("source").unwrap();
+        let a = agent(&mut f);
+        let grant = acceptance::qualify(
+            &mut f.v.f.store,
+            &f.v.owner,
+            &mut f.broker,
+            &f.carrier,
+            &f.binding,
+            &f.v.execution,
+            &f.v.artifact,
+            &f.v.permit,
+            &f.evidence,
+        )
+        .unwrap();
+        let expiry = now().unwrap() + window;
+        let r = match prepare(
+            &mut f.v.f.store,
+            &f.v.owner,
+            &a,
+            &mut f.broker,
+            &f.carrier,
+            &grant,
+            g.id(),
+            "expires-inside-completion",
+            expiry,
+        ) {
+            Ok(r) => r,
+            Err(error) => return window_elapsed(expiry, error),
+        };
+        let mut c = match launch(&mut f, &a, &r, shell("true")) {
+            Ok(c) => c,
+            Err(error) => return window_elapsed(expiry, error),
+        };
+        c.child.wait().unwrap();
+        let mut held = false;
+        // Expiry must fall while the guard is held; if the window had already
+        // elapsed when it was acquired, this attempt tests something else.
+        let mut expired_before_guard = false;
+        let result = poll_command_with(
+            &mut f.v.f.store,
+            &f.v.owner,
+            &a,
+            &mut c,
+            &mut |_| Ok(()),
+            &mut || {
+                held = true;
+                let delay = expiry - now()? + 1;
+                if delay > 0 {
+                    std::thread::sleep(Duration::from_millis(delay as u64));
+                } else {
+                    expired_before_guard = true;
+                }
+                Ok(())
+            },
+        );
+        if expired_before_guard {
+            return Err(WindowElapsed);
+        }
+        Ok((f, g, a, c, held, result.unwrap()))
+    });
     assert!(held, "must acquire current guard before the injected delay");
     assert_eq!(result, Completion::Historical(0));
     assert_eq!(

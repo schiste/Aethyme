@@ -449,27 +449,32 @@ fn snapshot_page_rejects_aggregate_revision_bytes_over_the_page_cap() {
         incarnation: "incarnation-1".into(),
         remote_authority_epoch: "authority-1".into(),
     };
-    let first_event = Event {
-        stream: stream.clone(),
-        sequence: 1,
-        packet: large_packet_with_scope(&revision, scope.clone(), format!("sha256:{:064x}", 0)),
-    };
-    let first_event_bytes = first_event.record().unwrap().canonical_bytes().len();
-    let item_count = MAX_SNAPSHOT_PAGE_BYTES / first_event_bytes + 1;
-    assert!(item_count <= MAX_BATCH_ITEMS);
-    let items = (0..item_count)
-        .map(|index| Event {
+    // Build the large packet once; items differ only in their receipt id. Each
+    // canonical encoding of a ~1 MiB item is expensive in a debug build, so
+    // every item is encoded once here and once by the page check under test.
+    let template = large_packet_with_scope(&revision, scope, format!("sha256:{:064x}", 0));
+    let event = |index: usize| {
+        let mut packet = template.clone();
+        let Metadata::RevisionContribution {
+            capture_receipt_record_id,
+            ..
+        } = &mut packet
+        else {
+            panic!("large page fixture must contain revision packets");
+        };
+        // Each packet needs its own record identity so the aggregate byte
+        // limit, rather than duplicate-event validation, is the first guard.
+        *capture_receipt_record_id = format!("sha256:{index:064x}");
+        Event {
             stream: stream.clone(),
             sequence: index as u64 + 1,
-            // Each packet needs its own record identity so the aggregate byte
-            // limit, rather than duplicate-event validation, is the first guard.
-            packet: large_packet_with_scope(
-                &revision,
-                scope.clone(),
-                format!("sha256:{:064x}", index),
-            ),
-        })
-        .collect::<Vec<_>>();
+            packet,
+        }
+    };
+    let first_event_bytes = event(0).record().unwrap().canonical_bytes().len();
+    let item_count = MAX_SNAPSHOT_PAGE_BYTES / first_event_bytes + 1;
+    assert!(item_count <= MAX_BATCH_ITEMS);
+    let items = (0..item_count).map(event).collect::<Vec<_>>();
     assert!(items.len() > 1);
     let receipt_ids = items
         .iter()
@@ -482,19 +487,16 @@ fn snapshot_page_rejects_aggregate_revision_bytes_over_the_page_cap() {
         })
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(receipt_ids.len(), items.len());
+    let item_bytes = items
+        .iter()
+        .map(|event| event.record().unwrap().canonical_bytes().len())
+        .collect::<Vec<_>>();
     assert!(
-        items
+        item_bytes
             .iter()
-            .all(|event| event.record().unwrap().canonical_bytes().len()
-                <= MAX_REVISION_PACKET_BYTES)
+            .all(|&bytes| bytes <= MAX_REVISION_PACKET_BYTES)
     );
-    assert!(
-        items
-            .iter()
-            .map(|event| event.record().unwrap().canonical_bytes().len())
-            .sum::<usize>()
-            > MAX_SNAPSHOT_PAGE_BYTES
-    );
+    assert!(item_bytes.iter().sum::<usize>() > MAX_SNAPSHOT_PAGE_BYTES);
     let page = SnapshotPage {
         snapshot: SnapshotDescriptor {
             stream: stream.clone(),
