@@ -1379,3 +1379,7 @@ directory share this coordination. If a create's outcome is unknown and its
 marker cannot be found, it refuses a blind retry; inspect GitHub and reconcile
 the operation. Independent host-state directories do not coordinate concurrent applications
 or share uncertain-create recovery state.
+
+### Environment Compose project variable
+
+Environment component commands and environment status expose `AETHYME_ENV_COMPOSE_PROJECT`, the normalized Compose project name derived from the environment namespace. Provision and other hooks can use this value to address the same project as the Compose driver. The compiled plan lists the variable among the names available to commands.
