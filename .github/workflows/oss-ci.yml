@@ -346,13 +346,13 @@ jobs:
           retention-days: 14
 
   rust-tests-shard:
-    name: Rust workspace tests (shard ${{ matrix.shard }}/6)
+    name: Rust workspace tests (shard ${{ matrix.shard }}/10)
     needs: [classify_changes, rust-tests-build]
     if: ${{ !cancelled() && needs.rust-tests-build.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -381,16 +381,8 @@ jobs:
           name: rust-tests-archive
           path: ${{ runner.temp }}/rust-tests-archive
 
-      # Most of this suite's I/O is temporary Git repositories and SQLite
-      # databases that nothing keeps, so put them in memory.
       - name: Run workspace tests
-        env:
-          TMPDIR: /dev/shm
-        run: ../scripts/test-like-ci.sh --from-archive "$RUNNER_TEMP/rust-tests-archive/rust-tests.tar.zst" --partition "hash:${{ matrix.shard }}/6"
-
-      - name: Report temporary storage use
-        if: ${{ always() }}
-        run: df -h /dev/shm
+        run: ../scripts/test-like-ci.sh --from-archive "$RUNNER_TEMP/rust-tests-archive/rust-tests.tar.zst" --partition "hash:${{ matrix.shard }}/10"
 
       - name: Upload the shard report
         if: ${{ always() }}
