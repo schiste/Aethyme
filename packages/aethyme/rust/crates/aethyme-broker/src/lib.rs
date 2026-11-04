@@ -829,3 +829,4 @@ mod broker_db_path_tests {
 
 #[cfg(test)]
 mod local_compatibility;
+// measurement only: forces aethyme-broker to recompile; reverted before merge.
