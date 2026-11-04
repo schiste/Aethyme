@@ -47,6 +47,7 @@ jobs:
           bash .github/scripts/test-performance-fast-lane.sh
           bash .github/scripts/test-oss-ci-rustfmt-preflight.sh
           bash .github/scripts/test-rust-test-telemetry.sh
+          bash .github/scripts/test-gate-telemetry.sh
 
       - name: Classify changed paths
         id: classify

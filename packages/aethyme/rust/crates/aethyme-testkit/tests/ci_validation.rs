@@ -176,7 +176,9 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
             .collect::<Vec<_>>(),
         [
             "        if: github.event_name == 'push'",
-            "        if: failure()"
+            "        if: failure()",
+            "        if: ${{ !cancelled() }}",
+            "        if: ${{ !cancelled() }}"
         ]
     );
 }
@@ -189,6 +191,34 @@ fn main_gates_use_the_whole_runner_and_keep_their_storage_reserve() {
     let run = block(&gates, "      - name: Run all gates");
     assert!(run.contains(&"          AETHYME_GATE_BUILD_JOBS: \"4\""));
     assert!(run.contains(&"          AETHYME_GATE_TEST_THREADS: \"4\""));
+
+    // Passing gates print no detail, so the workflow records it. A summary
+    // problem must not change the verdict the gates reached.
+    assert!(
+        run.contains(
+            &"          AETHYME_GATE_PHASES: ${{ runner.temp }}/gate-telemetry/phases.tsv"
+        )
+    );
+    let summary = block(&gates, "      - name: Summarize the gates");
+    assert!(summary.contains(&"          set -uo pipefail"));
+    assert!(
+        summary.contains(
+            &"            echo \"::warning::The gate telemetry could not be summarized.\""
+        )
+    );
+    assert!(
+        summary.contains(&"          report=packages/aethyme/rust/target/nextest/local/junit.xml")
+    );
+    assert!(gates.contains("      - name: Upload the gate telemetry"));
+    let nextest = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .unwrap()
+            .join(".config/nextest.toml"),
+    )
+    .unwrap();
+    assert!(nextest.contains("[profile.local.junit]"));
 
     let free = gates
         .find("      - name: Free runner disk when it is low")
