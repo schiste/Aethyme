@@ -219,7 +219,8 @@ jobs:
           set -uo pipefail
           out="$RUNNER_TEMP/gate-telemetry"
           mkdir -p "$out"
-          report="$GATE_CACHE_DIR/nextest/local/junit.xml"
+          # nextest keeps its store under the workspace, not CARGO_TARGET_DIR.
+          report=packages/aethyme/rust/target/nextest/local/junit.xml
           timings="$GATE_CACHE_DIR/cargo-timings/cargo-timing.html"
           [ ! -f "$report" ] || cp "$report" "$out/"
           [ ! -f "$timings" ] || cp "$timings" "$out/"
@@ -252,7 +253,7 @@ jobs:
           set -euo pipefail
           dir="$GATE_CACHE_DIR/debug"
           [ -d "$dir" ] || exit 0
-          rm -rf "$dir/incremental" "$dir/examples" "$GATE_CACHE_DIR/nextest" "$GATE_CACHE_DIR/cargo-timings"
+          rm -rf "$dir/incremental" "$dir/examples" "$GATE_CACHE_DIR/cargo-timings"
           rm -rf "$dir"/deps/aethyme* "$dir"/deps/libaethyme* "$dir"/.fingerprint/aethyme* "$dir"/build/aethyme*
           # Test and binary executables (no extension) are workspace outputs.
           find "$dir" -maxdepth 1 -type f -perm -u+x -delete

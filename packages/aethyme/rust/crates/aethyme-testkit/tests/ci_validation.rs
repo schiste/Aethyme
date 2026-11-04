@@ -206,6 +206,9 @@ fn main_gates_use_the_whole_runner_and_keep_their_storage_reserve() {
             &"            echo \"::warning::The gate telemetry could not be summarized.\""
         )
     );
+    assert!(
+        summary.contains(&"          report=packages/aethyme/rust/target/nextest/local/junit.xml")
+    );
     assert!(gates.contains("      - name: Upload the gate telemetry"));
     let nextest = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))
