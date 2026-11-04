@@ -1087,6 +1087,51 @@ impl EnvironmentStore {
         Ok(())
     }
 
+    /// Update only activity probes in an active or parked snapshot. The
+    /// immediate transaction rechecks the full snapshot before changing it so
+    /// this path cannot silently apply other runtime configuration changes.
+    pub fn replace_activity_probes(
+        &mut self,
+        env_id: &str,
+        snapshot: &CompiledEnvironment,
+    ) -> Result<Option<EnvironmentRecord>, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record =
+            load_record(&tx, env_id)?.ok_or_else(|| StoreError::NotFound(env_id.into()))?;
+        if !matches!(
+            record.phase,
+            EnvironmentPhase::Active | EnvironmentPhase::Parked
+        ) || record.snapshot.components.len() != snapshot.components.len()
+        {
+            return Ok(None);
+        }
+        let mut normalized = snapshot.clone();
+        normalized.digest = record.snapshot.digest.clone();
+        normalized.source = record.snapshot.source.clone();
+        for (new, old) in normalized
+            .components
+            .iter_mut()
+            .zip(&record.snapshot.components)
+        {
+            new.commands.activity_probe = old.commands.activity_probe.clone();
+        }
+        if normalized != record.snapshot {
+            return Ok(None);
+        }
+        let snapshot_json = serde_json::to_string(snapshot)
+            .map_err(|error| StoreError::Corrupt(error.to_string()))?;
+        tx.execute(
+            "UPDATE environments SET profile_digest = ?2, spec_snapshot_json = ?3, updated_at = ?4 WHERE env_id = ?1",
+            params![env_id, snapshot.digest, snapshot_json, now_ms()],
+        )?;
+        let updated =
+            load_record(&tx, env_id)?.ok_or_else(|| StoreError::NotFound(env_id.into()))?;
+        tx.commit()?;
+        Ok(Some(updated))
+    }
+
     /// Swap the recorded snapshot and source of a stopped environment, keeping
     /// its id, reservation, namespace and ports (#1217 hold-and-swap). Only a
     /// `parked` or `planned` environment can be swapped: nothing may be
