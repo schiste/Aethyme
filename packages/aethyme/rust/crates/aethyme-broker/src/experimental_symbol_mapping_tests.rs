@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
-const SEED: &str = "tests/fixtures/synthetic-playground-symbol-identity/seed";
+const SEED: &str = "../aethyme-broker-cli/tests/fixtures/synthetic-playground-symbol-identity/seed";
 const PROJECT: &str = "proj:aaaaaaaaaaaaaaaaaaaaaaaaaa";
 const PEER_PROJECT: &str = "proj:bbbbbbbbbbbbbbbbbbbbbbbbba";
 const OTHER_PROJECT: &str = "proj:ccccccccccccccccccccccccca";
