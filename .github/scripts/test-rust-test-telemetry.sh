@@ -14,8 +14,8 @@ fail() {
   exit 1
 }
 
-mkdir -p "$work/junit/shard-1" "$work/junit/shard-2"
-cat > "$work/junit/shard-1/junit.xml" <<'XML'
+mkdir -p "$work/junit/rust-tests-junit-shard-1" "$work/junit/rust-tests-junit-shard-2"
+cat > "$work/junit/rust-tests-junit-shard-1/junit.xml" <<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites name="nextest-run" tests="3" failures="0" errors="0" time="120.0">
   <testsuite name="aethyme-broker" tests="3">
@@ -27,7 +27,7 @@ cat > "$work/junit/shard-1/junit.xml" <<'XML'
   </testsuite>
 </testsuites>
 XML
-cat > "$work/junit/shard-2/junit.xml" <<'XML'
+cat > "$work/junit/rust-tests-junit-shard-2/junit.xml" <<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <testsuites name="nextest-run" tests="2" failures="1" errors="0" time="60.0">
   <testsuite name="aethyme-cli::it" tests="2">
@@ -49,7 +49,9 @@ cat > "$work/jobs.json" <<'JSON'
      {"name": "Skipped step", "conclusion": "skipped", "started_at": "2026-11-04T07:03:10Z", "completed_at": "2026-11-04T07:03:10Z"}
    ]},
   {"name": "Rust workspace tests (shard 1/2)", "conclusion": "success",
-   "created_at": "2026-11-04T07:03:30Z", "started_at": "2026-11-04T07:03:40Z", "completed_at": "2026-11-04T07:06:00Z", "steps": []}
+   "created_at": "2026-11-04T07:03:30Z", "started_at": "2026-11-04T07:03:40Z", "completed_at": "2026-11-04T07:06:00Z", "steps": []},
+  {"name": "Rust workspace tests", "conclusion": null,
+   "created_at": "2026-11-04T07:06:00Z", "started_at": "2026-11-04T07:06:05Z", "completed_at": null, "steps": []}
 ]}
 JSON
 
@@ -69,7 +71,9 @@ assert s["slowest"][0]["name"] == "slow" and s["slowest"][0]["shard"] == "shard-
 assert [x["name"] for x in s["flaky"]] == ["wobbly"], s["flaky"]
 assert [x["name"] for x in s["failed"]] == ["broken"], s["failed"]
 jobs = {j["job"]: j for j in s["jobs"]}
-assert set(jobs) == {"Rust workspace tests (build)", "Rust workspace tests (shard 1/2)"}, jobs
+assert set(jobs) == {"Rust workspace tests (build)", "Rust workspace tests (shard 1/2)", "Rust workspace tests"}, jobs
+assert jobs["Rust workspace tests"]["running"] and jobs["Rust workspace tests"]["seconds"] is None, jobs
+assert not jobs["Rust workspace tests (build)"]["running"], jobs
 build = jobs["Rust workspace tests (build)"]
 assert build["queued_seconds"] == 10.0 and build["seconds"] == 180.0, build
 assert build["steps"] == [{"name": "Build the test archive", "seconds": 150.0}], build["steps"]
@@ -77,6 +81,8 @@ assert s["jobs_first_start_to_last_end_seconds"] == 330.0, s["jobs_first_start_t
 PY
 grep -Fq '| Rust workspace tests (build) | 10.0s | 3m00.0s | Build the test archive 2m30.0s |' "$work/summary.md" \
   || fail 'job table row is missing from the Markdown summary'
+grep -Fq '| Rust workspace tests | 5.0s | running |' "$work/summary.md" \
+  || fail 'the running summarizer job must read running, not unavailable'
 grep -Fq '`aethyme-broker wobbly` (shard-1)' "$work/summary.md" || fail 'flaky test is not listed'
 grep -Fq '`aethyme-cli::it broken` (shard-2)' "$work/summary.md" || fail 'failed test is not listed'
 

@@ -65,8 +65,9 @@ def read_shard(path: Path) -> dict:
                     "status": status,
                 }
             )
+    # Artifacts are named rust-tests-junit-shard-<n>; report the shard only.
     return {
-        "shard": path.parent.name,
+        "shard": path.parent.name.removeprefix("rust-tests-junit-"),
         "wall_seconds": round(float(root.get("time") or 0.0), 1),
         "tests": tests,
     }
@@ -90,6 +91,8 @@ def job_phases(jobs: list[dict]) -> list[dict]:
                 "conclusion": job.get("conclusion"),
                 "queued_seconds": seconds(job.get("created_at"), job.get("started_at")),
                 "seconds": seconds(job.get("started_at"), job.get("completed_at")),
+                # The summarizing job reads the API while it is still running.
+                "running": bool(job.get("started_at")) and not job.get("completed_at"),
                 "started_at": job.get("started_at"),
                 "completed_at": job.get("completed_at"),
                 "steps": steps,
@@ -171,7 +174,8 @@ def markdown(summary: dict) -> str:
                 (s for s in job["steps"] if s["seconds"] is not None), key=lambda s: -s["seconds"]
             )[:3]
             steps = "; ".join(f"{s['name']} {fmt(s['seconds'])}" for s in longest)
-            lines.append(f"| {job['job']} | {fmt(job['queued_seconds'])} | {fmt(job['seconds'])} | {steps} |")
+            total = "running" if job["running"] else fmt(job["seconds"])
+            lines.append(f"| {job['job']} | {fmt(job['queued_seconds'])} | {total} | {steps} |")
     lines += ["", "### Shards", "", "| Shard | Tests | Wall | Test time |", "|---|---|---|---|"]
     for s in summary["shards"]:
         lines.append(f"| {s['shard']} | {s['tests']} | {fmt(s['wall_seconds'])} | {fmt(s['test_seconds'])} |")
