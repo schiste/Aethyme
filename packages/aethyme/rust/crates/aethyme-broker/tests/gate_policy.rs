@@ -361,6 +361,9 @@ fn only_the_gate_settings_raise_only_the_workspace_suite_workers() {
             .current_dir(root)
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .env("AETHYME_GATE_CACHE_DIR", root.join("cache"))
+            // The main-branch gate job sets these for its own run.
+            .env_remove("AETHYME_GATE_BUILD_JOBS")
+            .env_remove("AETHYME_GATE_TEST_THREADS")
             .env("CARGO_BUILD_JOBS", "99")
             .env("RUST_TEST_THREADS", "99")
             .env("NEXTEST_TEST_THREADS", "99")
@@ -462,6 +465,9 @@ esac
                     .current_dir(root)
                     .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
                     .env("AETHYME_GATE_CACHE_DIR", root.join("cache"))
+                    // The main-branch gate job sets these for its own run.
+                    .env_remove("AETHYME_GATE_BUILD_JOBS")
+                    .env_remove("AETHYME_GATE_TEST_THREADS")
                     .env("CARGO_BUILD_JOBS", "99")
                     .env("RUST_TEST_THREADS", "99")
                     .env("NEXTEST_TEST_THREADS", "99")
