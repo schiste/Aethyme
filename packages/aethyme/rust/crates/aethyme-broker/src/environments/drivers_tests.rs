@@ -774,3 +774,54 @@ destroy = "true"
     driver.destroy(&stack, Some(&identity)).unwrap();
     assert_eq!(driver.observe(&stack, &identity), Observation::Gone);
 }
+
+#[test]
+fn project_container_removal_recovers_from_races_and_transient_failures() {
+    use super::drivers::remove_project_container_with_retry;
+    use std::cell::Cell;
+
+    let attempts = Cell::new(0);
+    remove_project_container_with_retry(
+        "owned-id",
+        |_| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                Err(DriverError::Engine("busy".into()))
+            } else {
+                Ok(())
+            }
+        },
+        || Ok(vec!["owned-id".into()]),
+    )
+    .unwrap();
+    assert_eq!(attempts.get(), 2);
+
+    remove_project_container_with_retry(
+        "already-gone",
+        |_| Err(DriverError::Engine("no such container".into())),
+        || Ok(vec![]),
+    )
+    .unwrap();
+
+    let attempts = Cell::new(0);
+    let error = remove_project_container_with_retry(
+        "still-owned",
+        |_| {
+            attempts.set(attempts.get() + 1);
+            Err(DriverError::Engine("daemon failure".into()))
+        },
+        || Ok(vec!["still-owned".into()]),
+    )
+    .unwrap_err();
+    assert_eq!(attempts.get(), 3);
+    assert!(error.to_string().contains("daemon failure"));
+
+    assert!(
+        remove_project_container_with_retry(
+            "unproven",
+            |_| Err(DriverError::Engine("remove failed".into())),
+            || Err(DriverError::Engine("inspection failed".into())),
+        )
+        .is_err()
+    );
+}
