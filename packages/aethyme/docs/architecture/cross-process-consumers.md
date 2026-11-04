@@ -86,6 +86,14 @@ path. Ambiguous outcomes
 never trigger a local fallback or an automatic retry; recovery and deadline
 semantics are specified in [broker-service.md](broker-service.md).
 
+`aethyme env shared preview <name> [--wait <seconds>] [--json]` starts the
+checkout's `[[shared]]` profile as a separately owned worktree environment.
+Its `aethyme.env-shared/v1` output adds `preview: true` and `shared_name`,
+alongside the environment ID and URLs. It does not change the host's serving
+shared alias; remove the preview with `aethyme env down <id>`. Preview uses
+checkout contents, including uncommitted edits, and refuses profiles that
+themselves require shared environments.
+
 `broker gc plan --exclude-orphans` and the matching `gc apply --exclude-orphans`
 omit orphan worktree roots from the reviewed candidate set. The plan carries an
 `orphans_excluded` blocker, its digest binds that scope, and apply recomputes the

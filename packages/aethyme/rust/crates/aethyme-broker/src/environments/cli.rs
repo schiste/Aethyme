@@ -137,6 +137,10 @@ Usage:
       in the environment's history.
   aethyme env shared up|redeploy|destroy <name> [--force] [--json]
   aethyme env shared list [--json]
+  aethyme env shared preview <name> [--wait <seconds>] [--json]
+      Preview the checkout's shared profile in a separate worktree-owned
+      environment, without switching the serving alias. The result prints
+      its own URLs and can be removed with `env down <id>`.
       Host-scoped [[shared]] environments, owned by a ref instead of a
       session: never removed by session or worktree cleanup. `up` creates or
       wakes one at its ref's commit (an export, not a worktree); `redeploy`
@@ -382,7 +386,7 @@ pub(super) fn parse_options(command: &str, rest: &[String]) -> Result<Options, F
                         .ok_or_else(|| usage("--repo needs a path".into()))?,
                 ))
             }
-            "--wait" if matches!(command, "up" | "wake") => {
+            "--wait" if matches!(command, "up" | "wake" | "shared") => {
                 options.wait_seconds = number(args.next(), "--wait")? as u64
             }
             "--reconfigure" if command == "up" => options.reconfigure = true,
