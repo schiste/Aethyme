@@ -39,8 +39,8 @@ on:
       - .github/workflows/homebrew-tap.yml
       - .github/workflows/release.yml
       - scripts/publish-homebrew-tap.sh
-      - packages/aethyme/rust/crates/aethyme-broker/src/homebrew.rs
-      - packages/aethyme/rust/crates/aethyme-broker/examples/homebrew_formula.rs
+      - packages/aethyme/rust/crates/aethyme-broker-cli/src/homebrew.rs
+      - packages/aethyme/rust/crates/aethyme-broker-cli/examples/homebrew_formula.rs
 
 permissions:
   contents: read
@@ -126,7 +126,7 @@ jobs:
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "$dir/release-manifest.json"
           cargo run --locked --manifest-path packages/aethyme/rust/Cargo.toml \
-            -p aethyme-broker --example homebrew_formula -- \
+            -p aethyme-broker-cli --example homebrew_formula -- \
             --manifest "$dir/release-manifest.json" \
             --tag "$TAG" \
             --source-sha "$(git rev-parse "refs/tags/${TAG}^{commit}")" \

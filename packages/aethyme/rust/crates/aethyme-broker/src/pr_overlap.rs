@@ -140,11 +140,11 @@ pub struct PrOverlapCheck {
 /// Cached changed paths that intersect a session's explicit planned leases.
 /// This is intentionally path-only; it does not estimate line conflicts.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct PlannedPathPrOverlap {
-    pub(crate) pr: i64,
-    pub(crate) url: String,
+pub struct PlannedPathPrOverlap {
+    pub pr: i64,
+    pub url: String,
     /// Changed PR paths that equal or fall under an explicit planned path.
-    pub(crate) files: Vec<String>,
+    pub files: Vec<String>,
 }
 
 /// Availability and path-only overlap results for explicit `start --path`

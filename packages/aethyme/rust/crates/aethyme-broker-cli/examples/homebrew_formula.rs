@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use aethyme_broker::{ReleaseManifest, render_homebrew_formula};
+use aethyme_broker_cli::{ReleaseManifest, render_homebrew_formula};
 
 fn main() {
     if let Err(error) = run(std::env::args().skip(1)) {

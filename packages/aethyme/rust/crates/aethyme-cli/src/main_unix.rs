@@ -227,7 +227,7 @@ fn eligible_pinned_session_contract(
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    aethyme_broker::cli::with_status_read_context(&args, || main_with_args(&args))
+    aethyme_broker_cli::cli::with_status_read_context(&args, || main_with_args(&args))
 }
 
 fn main_with_args(args: &[String]) -> ExitCode {
@@ -260,7 +260,7 @@ fn main_with_args(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
 
-    let mut broker_compatibility_mode = aethyme_broker::cli::CompatibilityMode::Normal;
+    let mut broker_compatibility_mode = aethyme_broker_cli::cli::CompatibilityMode::Normal;
     if let Some(capability) = command.compatibility_capability
         && let Ok(cwd) = env::current_dir()
     {
@@ -304,8 +304,8 @@ fn main_with_args(args: &[String]) -> ExitCode {
         if let Some(decision) = decision {
             if let Some(message) = decision.refusal_message() {
                 if let Some(hook_message) = decision.managed_pre_commit_refusal_message() {
-                    if aethyme_broker::cli::json_requested(&invocation_args) {
-                        let code = aethyme_broker::cli::report_dispatch_error(
+                    if aethyme_broker_cli::cli::json_requested(&invocation_args) {
+                        let code = aethyme_broker_cli::cli::report_dispatch_error(
                             &invocation_args,
                             1,
                             &hook_message,
@@ -316,12 +316,12 @@ fn main_with_args(args: &[String]) -> ExitCode {
                     return ExitCode::from(1);
                 }
                 let code =
-                    aethyme_broker::cli::report_dispatch_error(&invocation_args, 1, &message);
+                    aethyme_broker_cli::cli::report_dispatch_error(&invocation_args, 1, &message);
                 return ExitCode::from(code);
             }
             if decision.execution == repository_upgrade::CompatibilityExecution::ReadOnlySnapshot {
                 broker_compatibility_mode =
-                    aethyme_broker::cli::CompatibilityMode::ReadOnlySnapshot(
+                    aethyme_broker_cli::cli::CompatibilityMode::ReadOnlySnapshot(
                         decision.read_only_compatibility(),
                     );
             }
@@ -412,7 +412,7 @@ fn main_with_args(args: &[String]) -> ExitCode {
         // match an installed CLI version.
         "hook" => {
             let running_build_banner = build_banner();
-            ExitCode::from(aethyme_broker::agent_hook::run_with_build_banner(
+            ExitCode::from(aethyme_broker_cli::agent_hook::run_with_build_banner(
                 &args[1..],
                 &running_build_banner,
             ))
@@ -421,10 +421,10 @@ fn main_with_args(args: &[String]) -> ExitCode {
         // `hook` is the one that registers the hooks, so a plugin
         // installed this way cannot be paired with a CLI too old to
         // serve it.
-        "plugin" => ExitCode::from(aethyme_broker::plugin_cli::run(&args[1..])),
+        "plugin" => ExitCode::from(aethyme_broker_cli::plugin_cli::run(&args[1..])),
         // Opt-in Local collaboration (#680). Disabled unless the repository's
         // [collaboration] policy enables it; nothing runs in the background.
-        "collab" => ExitCode::from(aethyme_broker::collaboration_cli::run(&args[1..])),
+        "collab" => ExitCode::from(aethyme_broker_cli::collaboration_cli::run(&args[1..])),
         // Declared runnable environments per worktree (#1208). Profiles,
         // validation and plans are read-only (#1209).
         "env" => ExitCode::from(aethyme_broker::environments::cli::run(&args[1..])),
@@ -432,7 +432,7 @@ fn main_with_args(args: &[String]) -> ExitCode {
         "broker" if readiness_remediation::is_command(command.args) => {
             ExitCode::from(readiness_remediation::run(&command.args[1..]))
         }
-        "broker" => ExitCode::from(aethyme_broker::cli::run_resolved_with_mode(
+        "broker" => ExitCode::from(aethyme_broker_cli::cli::run_resolved_with_mode(
             command.args,
             broker_compatibility_mode,
         )),
@@ -445,11 +445,11 @@ fn main_with_args(args: &[String]) -> ExitCode {
         // Certification — top-level by design (the "airport certification"
         // inspection). Strictly read-only; adaptive setup lives in
         // `broker scaffold`.
-        "certify" => ExitCode::from(aethyme_broker::cli::run_resolved(&args)),
+        "certify" => ExitCode::from(aethyme_broker_cli::cli::run_resolved(&args)),
         // Guided setup — certify + scaffold + gates draft in sequence,
         // idempotent. Top-level like certify: it is the first command a
         // new repo runs.
-        "init" => ExitCode::from(aethyme_broker::cli::run_resolved(&args)),
+        "init" => ExitCode::from(aethyme_broker_cli::cli::run_resolved(&args)),
         "deploy" => ExitCode::from(repository_deploy::run(&args[1..])),
         // Repository enrollment lives under deploy. Its --generated-only
         // mode exposes the embedded discoverability renderer without broker
@@ -763,9 +763,9 @@ fn answer_help(route: help::HelpRoute, args: &[String]) -> ExitCode {
         }
         help::HelpRoute::Broker => {
             if args[0] == "broker" {
-                ExitCode::from(aethyme_broker::cli::run(&args[1..]))
+                ExitCode::from(aethyme_broker_cli::cli::run(&args[1..]))
             } else {
-                ExitCode::from(aethyme_broker::cli::run_resolved(args))
+                ExitCode::from(aethyme_broker_cli::cli::run_resolved(args))
             }
         }
         help::HelpRoute::Native(native) => {
@@ -780,13 +780,13 @@ fn answer_help(route: help::HelpRoute, args: &[String]) -> ExitCode {
                 },
                 "update" => aethyme_broker::run_update_cli(rest),
                 "self-update" => aethyme_broker::run_update_cli(&self_update_args(rest)),
-                "plugin" => aethyme_broker::plugin_cli::run(rest),
+                "plugin" => aethyme_broker_cli::plugin_cli::run(rest),
                 "ai-ready" => aethyme_quality::ai_ready_cli::run(rest),
                 "quality" => aethyme_quality::quality_cli::run(rest),
                 "autofix" => aethyme_quality::autofix_cli::run(rest),
                 "deploy" => repository_deploy::run(rest),
                 "upgrade" => repository_upgrade::run(rest),
-                "collab" => aethyme_broker::collaboration_cli::run(rest),
+                "collab" => aethyme_broker_cli::collaboration_cli::run(rest),
                 "env" => aethyme_broker::environments::cli::run(rest),
                 other => {
                     eprintln!("Error: no help route for {other}");
@@ -807,9 +807,9 @@ fn answer_help(route: help::HelpRoute, args: &[String]) -> ExitCode {
 fn resolve_spelling(args: Vec<String>) -> Result<Vec<String>, ExitCode> {
     match args[0].as_str() {
         "broker" => {
-            let resolved = aethyme_broker::cli::resolve(&args[1..]);
+            let resolved = aethyme_broker_cli::cli::resolve(&args[1..]);
             if let Some(refusal) = &resolved.refusal {
-                let code = aethyme_broker::cli::report_dispatch_error(&args, 2, refusal);
+                let code = aethyme_broker_cli::cli::report_dispatch_error(&args, 2, refusal);
                 return Err(ExitCode::from(code));
             }
             if resolved.args.is_empty() {
@@ -820,28 +820,28 @@ fn resolve_spelling(args: Vec<String>) -> Result<Vec<String>, ExitCode> {
                 .collect())
         }
         "readiness" => {
-            let message = aethyme_broker::cli::removed_spelling_message(
+            let message = aethyme_broker_cli::cli::removed_spelling_message(
                 "aethyme readiness",
                 "aethyme broker status readiness",
             );
-            let code = aethyme_broker::cli::report_dispatch_error(&args, 2, &message);
+            let code = aethyme_broker_cli::cli::report_dispatch_error(&args, 2, &message);
             Err(ExitCode::from(code))
         }
         "enhance" => match args.get(1).map(String::as_str) {
             Some("deploy") => {
-                let message = aethyme_broker::cli::removed_spelling_message(
+                let message = aethyme_broker_cli::cli::removed_spelling_message(
                     "aethyme enhance deploy",
                     "aethyme deploy --generated-only",
                 );
-                let code = aethyme_broker::cli::report_dispatch_error(&args, 2, &message);
+                let code = aethyme_broker_cli::cli::report_dispatch_error(&args, 2, &message);
                 Err(ExitCode::from(code))
             }
             Some("verify") => {
-                let message = aethyme_broker::cli::removed_spelling_message(
+                let message = aethyme_broker_cli::cli::removed_spelling_message(
                     "aethyme enhance verify",
                     "aethyme deploy verify --generated-only",
                 );
-                let code = aethyme_broker::cli::report_dispatch_error(&args, 2, &message);
+                let code = aethyme_broker_cli::cli::report_dispatch_error(&args, 2, &message);
                 Err(ExitCode::from(code))
             }
             _ => Ok(args),

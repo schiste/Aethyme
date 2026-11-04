@@ -171,7 +171,7 @@ fn independently_enrolled_playground_clones_confirm_persist_and_revoke_one_local
     let seed = tempfile::tempdir().unwrap();
     git(seed.path(), &["init", "-q", "-b", "main"]);
     let playground = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../aethyme-broker/tests/fixtures/synthetic-playground-symbol-identity/seed");
+        .join("../aethyme-broker-cli/tests/fixtures/synthetic-playground-symbol-identity/seed");
     std::fs::create_dir_all(seed.path().join("src")).unwrap();
     for relative in ["src/lib.ts", "src/other.ts"] {
         std::fs::copy(playground.join(relative), seed.path().join(relative)).unwrap();

@@ -302,7 +302,7 @@ pub fn status(store: &CollaborationStore) -> Result<Witness, AuthorityError> {
 
 /// Historical status only. Serialized observation cannot acquire a guard.
 #[derive(Debug, Serialize)]
-pub(crate) struct AuthorityObservation {
+pub struct AuthorityObservation {
     pub state: &'static str,
     pub witness: Option<Witness>,
     pub bound_epoch: Option<String>,

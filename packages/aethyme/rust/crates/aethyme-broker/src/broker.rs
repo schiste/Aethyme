@@ -40,7 +40,7 @@ pub(crate) const GATES_AFFECTED_PHASE_BUDGET_MS: u64 = 5_000;
 
 /// Millisecond timings for each phase of `gates affected`.
 #[derive(Debug, Clone, Default, serde::Serialize)]
-pub(crate) struct AffectedGatePhaseTimings {
+pub struct AffectedGatePhaseTimings {
     pub graph_read: u64,
     pub manifest: u64,
     pub selection: u64,
@@ -66,7 +66,7 @@ impl AffectedGatePhaseTimings {
 }
 
 #[derive(Debug)]
-pub(crate) struct AffectedGatesReport {
+pub struct AffectedGatesReport {
     pub selected_gates: Vec<(String, Option<String>)>,
     pub phase_timings_ms: AffectedGatePhaseTimings,
     pub phase_budget_ms: u64,

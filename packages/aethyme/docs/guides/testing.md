@@ -164,8 +164,8 @@ gather their suites as modules of one binary, `it`, whose root is
 suite as a prefix:
 
 ```bash
-cargo test -p aethyme-broker --test it merge_e2e::
-cargo nextest run -p aethyme-broker -E 'binary(it) & test(/^merge_e2e::/)'
+cargo test -p aethyme-broker-cli --test it merge_e2e::
+cargo nextest run -p aethyme-broker-cli -E 'binary(it) & test(/^merge_e2e::/)'
 ```
 
 A suite stays a binary of its own, listed as a `[[test]]` target in its

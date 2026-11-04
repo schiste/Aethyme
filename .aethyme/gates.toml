@@ -245,7 +245,7 @@ max_bytes = 12884901888
 # COUPLING: the suite also runs under `cargo-test`, so nothing here is lost
 # when Rust changes; this gate only adds the config-only path.
 name = "gate-policy"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=2 NEXTEST_TEST_THREADS=2 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-broker --test gate_policy'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=2 NEXTEST_TEST_THREADS=2 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-broker-cli --test gate_policy'
 cost = 1
 timeout_seconds = 600
 resource_wait_seconds = 900

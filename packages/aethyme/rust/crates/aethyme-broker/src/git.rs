@@ -93,7 +93,7 @@ pub(crate) fn without_git_deadline<T>(operation: impl FnOnce() -> T) -> T {
 /// scope (`limit_git_until`) nest by taking the earlier instant, and either
 /// way of lifting it (`without_git_deadline`, `suspend_git_deadline`) lifts
 /// both, so a mutation is never cut off by whichever scope it did not lift.
-pub(crate) struct GitDeadlineGuard {
+pub struct GitDeadlineGuard {
     _restore: RestoreGitDeadline,
 }
 

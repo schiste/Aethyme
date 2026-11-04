@@ -265,7 +265,7 @@ fn status_context_is_scoped_to_one_invocation_even_in_one_process() {
         .collect();
     let f = fixture();
     let observed = || {
-        aethyme_broker::cli::with_status_read_context(&args, || {
+        aethyme_broker_cli::cli::with_status_read_context(&args, || {
             let repo = aethyme_broker::GitRepo::discover(f.path()).unwrap();
             repo.git_common_dir().unwrap()
         })

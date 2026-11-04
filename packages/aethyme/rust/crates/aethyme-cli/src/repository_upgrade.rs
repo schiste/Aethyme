@@ -384,7 +384,7 @@ impl CompatibilityDecision {
     /// What a broker command running as a read-only snapshot quotes when it
     /// refuses a writing flag: the repository's compatibility state relative
     /// to this binary, and the action that restores normal operation.
-    pub fn read_only_compatibility(&self) -> aethyme_broker::cli::ReadOnlyCompatibility {
+    pub fn read_only_compatibility(&self) -> aethyme_broker_cli::cli::ReadOnlyCompatibility {
         let state = match self.repository {
             RepositoryCompatibility::Current => "current",
             RepositoryCompatibility::UpgradeRequired => "upgrade required",
@@ -396,7 +396,7 @@ impl CompatibilityDecision {
             Some(schema) => format!("repository deployment schema {schema}, "),
             None => String::new(),
         };
-        aethyme_broker::cli::ReadOnlyCompatibility {
+        aethyme_broker_cli::cli::ReadOnlyCompatibility {
             cause: format!(
                 "{} ({state}: {schemas}aethyme {} uses schema {REPOSITORY_SCHEMA_VERSION})",
                 self.reason,

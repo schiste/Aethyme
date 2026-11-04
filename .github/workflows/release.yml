@@ -103,7 +103,7 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           cargo build --release --locked --target "${{ matrix.target }}" \
-            -p aethyme-broker --example release_manifest --example homebrew_formula
+            -p aethyme-broker-cli --example release_manifest --example homebrew_formula
           helper_stage_dir="$RUNNER_TEMP/aethyme-release-helpers"
           mkdir -p "$helper_stage_dir"
           cp "target/${{ matrix.target }}/release/examples/release_manifest" "$helper_stage_dir/"

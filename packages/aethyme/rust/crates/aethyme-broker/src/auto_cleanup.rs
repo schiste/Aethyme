@@ -732,7 +732,7 @@ struct ClosedArtifactSessionSnapshot {
 /// Equality pins the closed canonical cohort and spawn-time owner across the
 /// discovery-to-removal window.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct ClosedArtifactCheckoutCohort {
+pub struct ClosedArtifactCheckoutCohort {
     worktree: PathBuf,
     sessions: Vec<ClosedArtifactSessionSnapshot>,
     owner_session_id: i64,
@@ -740,7 +740,7 @@ pub(crate) struct ClosedArtifactCheckoutCohort {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClosedArtifactCheckoutCohortUnavailableReason {
+pub enum ClosedArtifactCheckoutCohortUnavailableReason {
     IndexMissing,
     IndexIncomplete,
     DeadlineExceeded,
@@ -805,7 +805,7 @@ impl ClosedArtifactCheckoutCohort {
         &self.worktree
     }
 
-    pub(crate) fn session_ids(&self) -> Vec<i64> {
+    pub fn session_ids(&self) -> Vec<i64> {
         self.sessions.iter().map(|session| session.id).collect()
     }
 

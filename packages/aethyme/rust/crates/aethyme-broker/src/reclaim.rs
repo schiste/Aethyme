@@ -886,7 +886,7 @@ pub const RECENT_WORK_WINDOW_MS: i64 = 3 * 3_600_000;
 
 /// Process attribution for one named file from a complete `lsof` snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OpenFileUse {
+pub struct OpenFileUse {
     pub pid: u32,
     pub command: String,
     pub descriptor: String,

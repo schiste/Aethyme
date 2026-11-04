@@ -69,7 +69,7 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
     assert!(shard.contains(&"          path: packages/aethyme/rust/target/nextest/ci/junit.xml"));
     // nextest runs neither example targets nor doctests, and the
     // release-manifest assertions in
-    // `crates/aethyme-broker/examples/release_manifest.rs` live in an example.
+    // `crates/aethyme-broker-cli/examples/release_manifest.rs` live in an example.
     // They run in a job of their own, beside the workspace suite, on every
     // full-validation pull request. Docs-fast pull requests run only parity.
     let examples = block(&oss, "  rust-examples-doctests:");

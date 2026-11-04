@@ -1257,7 +1257,7 @@ fn lifecycle_target_changes_use_actual_ownership_versions_and_exact_epoch_stop()
 #[cfg(unix)]
 #[test]
 fn lifecycle_export_is_exclusive_and_verified_as_historical_source_only() {
-    use aethyme_broker::{collaboration_archive as archive, local_restore as restore};
+    use aethyme_broker_cli::{collaboration_archive as archive, local_restore as restore};
     let input = LifecycleInput::new();
     let f = &input.fixture;
     input.propose_select();

@@ -88,7 +88,7 @@ pub struct ApprovedProjectBinding {
 #[derive(Debug, Clone)]
 // Reserved for the explicit experimental mapping resolver; T03 does not activate it.
 #[allow(dead_code)]
-pub(crate) struct PersistedProjectAssociation {
+pub struct PersistedProjectAssociation {
     descriptor: ProjectAssociationDescriptor,
     confirmed: bool,
 }

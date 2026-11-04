@@ -619,7 +619,7 @@ fn covers(reference: &[u8], path: &[u8]) -> bool {
 }
 
 /// Rank, budget and explain. Pure: the vectors in
-/// `aethyme-broker/tests/fixtures/context_selection.json` pin it.
+/// `aethyme-broker-cli/tests/fixtures/context_selection.json` pin it.
 pub fn select(query: &SelectionQuery, candidates: &[Candidate]) -> Selection {
     let scope: BTreeSet<&[u8]> = query.scope.iter().map(Vec::as_slice).collect();
     let directories: BTreeSet<&[u8]> = scope

@@ -31,7 +31,7 @@ pub struct GuardedExecReceipt {
 /// Observation of the directly supervised child only. This never completes
 /// the caller's ownership audit or proves that descendants were cleaned up.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct HelperObservation {
+pub struct HelperObservation {
     pub direct_child_outcome: String,
     pub exit_code: Option<i32>,
     pub observed_at_ms: i64,

@@ -348,7 +348,7 @@ impl ArchiveError {
 /// supplied by the production caller so legacy archive reads keep their existing
 /// contract. Byte totals count every manifest entry, including repeated CAS IDs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ReconstructionLimits {
+pub struct ReconstructionLimits {
     pub(crate) max_manifest_bytes: usize,
     pub(crate) max_file_bytes: usize,
     pub(crate) max_output_bytes: usize,
@@ -368,7 +368,7 @@ impl ReconstructionLimits {
 /// A manifest and its checked logical output size. Validation reads one bounded
 /// object at a time and retains no file bodies.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ValidatedSnapshot {
+pub struct ValidatedSnapshot {
     snapshot: SourceSnapshot,
     output_bytes: u64,
 }

@@ -342,14 +342,14 @@ struct GuardedExecOptions {
     record_receipt: bool,
 }
 
-pub(crate) struct GuardedExecCliReport {
+pub struct GuardedExecCliReport {
     pub report: GuardedExecReport,
     pub receipt_id: String,
     pub command_ran: Option<bool>,
 }
 
 #[derive(Debug, serde::Serialize)]
-pub(crate) struct GuardedCommitCliReport {
+pub struct GuardedCommitCliReport {
     pub execution: GuardedExecReport,
     pub execution_receipt_id: String,
     pub head_before: String,

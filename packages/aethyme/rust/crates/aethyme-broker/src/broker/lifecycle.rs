@@ -2012,24 +2012,24 @@ enum FreshRootPublicationCheckpoint {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct FreshRootRecoveryPlan {
+pub struct FreshRootRecoveryPlan {
     pub(crate) schema_version: u32,
     pub(crate) binding: crate::store::repository_binding::RepositoryWorktreeBinding,
-    pub(crate) repository_root: PathBuf,
+    pub repository_root: PathBuf,
     pub(crate) repository_key: String,
     pub(crate) broker_database: PathBuf,
     pub(crate) host_operation_database: PathBuf,
-    pub(crate) worktree_root: PathBuf,
-    pub(crate) layout: crate::store::repository_binding::RepositoryWorktreeRootLayout,
-    pub(crate) source: WorktreeRootSource,
+    pub worktree_root: PathBuf,
+    pub layout: crate::store::repository_binding::RepositoryWorktreeRootLayout,
+    pub source: WorktreeRootSource,
     pub(crate) parent_identity: BoundDirectoryIdentity,
     root_inventory: FreshRootRecoveryInventory,
-    pub(crate) registry: crate::worktree_registry::FreshRootRegistryObservation,
+    pub registry: crate::worktree_registry::FreshRootRegistryObservation,
     pub(crate) expected_marker_bytes_sha256: String,
     pub(crate) binding_record_sha256: String,
-    pub(crate) can_apply: bool,
-    pub(crate) refusal: Option<String>,
-    pub(crate) digest: String,
+    pub can_apply: bool,
+    pub refusal: Option<String>,
+    pub digest: String,
 }
 
 #[derive(serde::Serialize)]
@@ -4259,18 +4259,18 @@ mod fresh_root_recovery_inventory_tests {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct LegacyWorktreeRootBindingPlan {
+pub struct LegacyWorktreeRootBindingPlan {
     pub(crate) schema_version: u32,
-    pub(crate) repository_root: PathBuf,
+    pub repository_root: PathBuf,
     pub(crate) git_common_dir: PathBuf,
     pub(crate) repository_key: String,
     pub(crate) broker_db_path: PathBuf,
-    pub(crate) worktree_root: PathBuf,
-    pub(crate) layout: String,
-    pub(crate) source: WorktreeRootSource,
+    pub worktree_root: PathBuf,
+    pub layout: String,
+    pub source: WorktreeRootSource,
     pub(crate) parent_identity: BoundDirectoryIdentity,
     pub(crate) worktree_identity: BoundDirectoryIdentity,
-    pub(crate) digest: String,
+    pub digest: String,
 }
 
 fn fresh_root_identity(
@@ -10950,7 +10950,7 @@ mod unbound_preparation_cache_open_tests {
         std::fs::create_dir_all(database.parent().unwrap()).unwrap();
         rusqlite::Connection::open(&database)
             .unwrap()
-            .execute_batch(include_str!("../../tests/fixtures/v028-schema52.sql"))
+            .execute_batch(include_str!("../../../aethyme-broker-cli/tests/fixtures/v028-schema52.sql"))
             .unwrap();
         let storage = crate::test_storage::TestStorage::new();
         let cache_root = storage.root().join("preparation-cache");

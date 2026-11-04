@@ -449,7 +449,7 @@ pub enum CaptureSubmit {
 }
 
 /// The capture side of a submit that ran.
-pub(crate) enum CaptureStep {
+pub enum CaptureStep {
     /// Required: captured before the submit.
     Done(SubmitCaptureReport),
     /// Advisory: to run after the legacy verdict is shown.

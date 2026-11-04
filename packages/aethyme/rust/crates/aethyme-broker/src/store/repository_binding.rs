@@ -74,7 +74,7 @@ impl RepositoryWorktreeRootLayout {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct RepositoryWorktreeBinding {
+pub struct RepositoryWorktreeBinding {
     #[serde(skip)]
     pub binding_id: i64,
     #[serde(skip)]

@@ -83,7 +83,7 @@ pub fn run(args: &[String]) -> u8 {
     }
 
     let scaffold = in_repo(&repo, || {
-        aethyme_broker::cli::run_resolved(&["scaffold".to_string()])
+        aethyme_broker_cli::cli::run_resolved(&["scaffold".to_string()])
     });
     if scaffold != 0 {
         return scaffold;
@@ -102,7 +102,7 @@ pub fn run(args: &[String]) -> u8 {
         }
     }
     let gates = in_repo(&repo, || {
-        aethyme_broker::cli::run_resolved(&["gates".to_string(), "draft".to_string()])
+        aethyme_broker_cli::cli::run_resolved(&["gates".to_string(), "draft".to_string()])
     });
     if gates != 0 {
         return gates;
@@ -165,7 +165,7 @@ fn verify_repository(repo: &Path) -> u8 {
         return verified;
     }
     in_repo(repo, || {
-        aethyme_broker::cli::run_resolved(&["certify".to_string()])
+        aethyme_broker_cli::cli::run_resolved(&["certify".to_string()])
     })
 }
 
@@ -393,7 +393,7 @@ fn verify_local_repository(repo: &Path) -> u8 {
         }
     }
     in_repo(repo, || {
-        aethyme_broker::cli::run_resolved(&["certify".to_string()])
+        aethyme_broker_cli::cli::run_resolved(&["certify".to_string()])
     })
 }
 

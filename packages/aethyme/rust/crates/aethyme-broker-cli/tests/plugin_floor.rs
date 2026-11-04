@@ -9,7 +9,7 @@
 //! CLI's own warning would be the only thing telling the truth -- after
 //! the fact, which is where this problem always lands.
 
-use aethyme_broker::plugin_cli::{
+use aethyme_broker_cli::plugin_cli::{
     DEFAULT_MARKETPLACE_SOURCE, MARKETPLACE_NAME, MIN_HOOK_CLI_VERSION, PLUGIN_ID,
     compare_versions, parse_version, plan_install,
 };
@@ -210,7 +210,7 @@ fn the_plugin_version_guard_rejects_an_unchanged_or_lower_version_for_hook_chang
 /// `~/.codex` and `~/.claude`, so the blast radius is worth pinning.
 #[test]
 fn install_only_ever_runs_plugin_subcommands() {
-    for surface in aethyme_broker::plugin_cli::Surface::ALL {
+    for surface in aethyme_broker_cli::plugin_cli::Surface::ALL {
         for step in plan_install(surface, DEFAULT_MARKETPLACE_SOURCE) {
             assert_eq!(step.argv[0], surface.binary(), "{}", step.rendered());
             assert_eq!(step.argv[1], "plugin", "{}", step.rendered());

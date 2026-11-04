@@ -15,7 +15,7 @@ use support::snapshots::assert_snapshots;
 // Broker verbs come from the tables `broker --help` and `broker advanced
 // --help` print, not from a copy: a copied list missed `broker push` when it
 // became a public verb, and its snapshot went unverified.
-use aethyme_broker::cli::{ADVANCED_VERBS, PUBLIC_VERBS, public_forms};
+use aethyme_broker_cli::cli::{ADVANCED_VERBS, PUBLIC_VERBS, public_forms};
 
 const TOP_LEVEL: &[&str] = &[
     "explore",

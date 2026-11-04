@@ -1,7 +1,7 @@
 //! Keeps every caller on the six-verb broker surface.
 //!
 //! v0.8.4 moved the broker to six public verbs plus `advanced`, and
-//! `aethyme-broker/src/cli/surface.rs` keeps the older spellings working
+//! `aethyme-broker-cli/src/cli/surface.rs` keeps the older spellings working
 //! with a warning until `DEPRECATED_SPELLING_REMOVAL_RELEASE`. v0.8.7
 //! migrated every caller that ships from this repository: generated agent
 //! guidance and skills, broker-emitted next actions, adapter and hook
@@ -127,7 +127,7 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("docs/dogfood-friction.md", "frozen historical friction log"),
     ("packages/aethyme/docs/reports/", "dated historical reports"),
     (
-        "packages/aethyme/rust/crates/aethyme-broker/src/cli/surface.rs",
+        "packages/aethyme/rust/crates/aethyme-broker-cli/src/cli/surface.rs",
         "the alias table itself",
     ),
 ];

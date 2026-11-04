@@ -901,7 +901,7 @@ impl BrokerStore {
 
     /// The connection, for broker modules that own their own tables
     /// (repository watches, #606) rather than growing this file further.
-    pub(crate) fn connection(&self) -> &Connection {
+    pub fn connection(&self) -> &Connection {
         &self.conn
     }
 

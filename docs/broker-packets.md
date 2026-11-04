@@ -826,7 +826,7 @@ State:
 
 Changed files:
 - packages/aethyme/rust/crates/aethyme-broker/src/gates.rs
-- packages/aethyme/rust/crates/aethyme-broker/tests/gates_e2e.rs
+- packages/aethyme/rust/crates/aethyme-broker-cli/tests/gates_e2e.rs
 
 Latest result:
 - submit rejected by cargo-test/test_failure

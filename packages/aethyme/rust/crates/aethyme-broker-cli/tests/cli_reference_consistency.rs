@@ -60,7 +60,7 @@ fn every_documented_broker_flag_appears_in_the_usage_text() {
     let reference = std::fs::read_to_string(root.join("packages/aethyme/docs/reference/cli.md"))
         .expect("cli reference");
     let usage_source = std::fs::read_to_string(
-        root.join("packages/aethyme/rust/crates/aethyme-broker/src/cli/mod.rs"),
+        root.join("packages/aethyme/rust/crates/aethyme-broker-cli/src/cli/mod.rs"),
     )
     .expect("cli source");
 
@@ -107,7 +107,7 @@ fn every_documented_broker_flag_appears_in_the_usage_text() {
             .map(|word| if word == "[--json]" { "--json" } else { word })
             .map(str::to_string)
             .collect();
-        let mut args = aethyme_broker::cli::resolve(&words).args;
+        let mut args = aethyme_broker_cli::cli::resolve(&words).args;
         // `start` merges by flag, as the dispatcher does; `--adopt` only
         // selects the form, so the adopt usage line does not list it.
         if args.first().map(String::as_str) == Some("start") {

@@ -2070,16 +2070,16 @@ fn gc_journal_age_reference_ms(journal: &GcJournal) -> Result<i64, BrokerOpError
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct GcJournalAbandonReport {
-    pub(crate) digest: String,
-    pub(crate) archive_path: String,
-    pub(crate) bytes_archived: u64,
+pub struct GcJournalAbandonReport {
+    pub digest: String,
+    pub archive_path: String,
+    pub bytes_archived: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct GcJournalForgetReport {
-    pub(crate) digest: String,
-    pub(crate) bytes_forgotten: u64,
+pub struct GcJournalForgetReport {
+    pub digest: String,
+    pub bytes_forgotten: u64,
 }
 
 fn gc_recovery_action(journal: &GcJournal, complete: bool) -> Option<String> {

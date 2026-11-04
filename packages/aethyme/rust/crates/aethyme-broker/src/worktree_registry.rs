@@ -296,7 +296,7 @@ const RECOVERY_LOCK_NAME: &str = "registry.lock";
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum FreshRootRegistryState {
+pub enum FreshRootRegistryState {
     MissingDatabase,
     ExistingNoTargetRow,
     ExactTargetRow,
@@ -313,7 +313,7 @@ pub(crate) struct RecoveryArtifactIdentity {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub(crate) struct FreshRootRegistryObservation {
+pub struct FreshRootRegistryObservation {
     pub(crate) host_operation_database: PathBuf,
     pub(crate) registry_directory: PathBuf,
     pub(crate) database_path: PathBuf,
@@ -322,7 +322,7 @@ pub(crate) struct FreshRootRegistryObservation {
     pub(crate) database_identity: Option<RecoveryArtifactIdentity>,
     pub(crate) lock_identity: Option<RecoveryArtifactIdentity>,
     pub(crate) directory_entries: Vec<String>,
-    pub(crate) state: FreshRootRegistryState,
+    pub state: FreshRootRegistryState,
     pub(crate) schema_version: Option<u32>,
     pub(crate) journal_mode: Option<String>,
     pub(crate) integrity_check: Option<String>,
@@ -2449,7 +2449,7 @@ struct ArtifactUseRootRowWitness {
     origin_identity: DirectoryIdentity,
 }
 
-pub(crate) struct ArtifactUsePrimaryRootWitnessGuard {
+pub struct ArtifactUsePrimaryRootWitnessGuard {
     host_database: PathBuf,
     _registry_lock: crate::file_lock::ExclusiveFileLock,
     witness: ArtifactUsePrimaryRootWitness,

@@ -17,5 +17,5 @@ fn main() -> ExitCode {
         Some("broker") => &args[1..],
         _ => &args[..],
     };
-    ExitCode::from(aethyme_broker::cli::run(rest))
+    ExitCode::from(aethyme_broker_cli::cli::run(rest))
 }

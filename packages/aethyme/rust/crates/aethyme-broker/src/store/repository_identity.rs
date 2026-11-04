@@ -16,7 +16,7 @@ const MARKER_HEADER: &str = "AETHYME-REPO-UUID-V1\n";
 const MAX_MARKER_BYTES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RepositoryBindingScope {
+pub struct RepositoryBindingScope {
     pub repository_root: PathBuf,
     pub git_common_dir: PathBuf,
     pub repository_key: String,

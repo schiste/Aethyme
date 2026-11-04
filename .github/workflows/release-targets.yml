@@ -15,8 +15,8 @@ on:
       - packages/aethyme/rust/crates/aethyme-broker/src/update*.rs
       - packages/aethyme/rust/crates/aethyme-broker/src/release_*.rs
       - packages/aethyme/rust/crates/aethyme-broker/src/install_*.rs
-      - packages/aethyme/rust/crates/aethyme-broker/tests/broker.rs
-      - packages/aethyme/rust/crates/aethyme-broker/tests/host_operations_e2e.rs
+      - packages/aethyme/rust/crates/aethyme-broker-cli/tests/broker.rs
+      - packages/aethyme/rust/crates/aethyme-broker-cli/tests/host_operations_e2e.rs
       - packages/aethyme/rust/crates/aethyme-testkit/tests/release_installer.rs
       - packages/aethyme/rust/crates/aethyme-testkit/tests/release_contract.rs
 
@@ -81,8 +81,8 @@ jobs:
           cargo test --locked -p aethyme-testkit --test release_installer
           cargo test --locked -p aethyme-broker --lib bootstrap_switches_the_pair_once_and_retains_one_rollback_bundle
           cargo test --locked -p aethyme-broker --lib failed_staged_quick_test_never_moves_the_active_pair
-          cargo test --locked -p aethyme-broker --test broker two_session_worktrees_are_distinct_and_registered
-          cargo test --locked -p aethyme-broker --test host_operations_e2e
+          cargo test --locked -p aethyme-broker-cli --test broker two_session_worktrees_are_distinct_and_registered
+          cargo test --locked -p aethyme-broker-cli --test host_operations_e2e
 
       - name: Smoke native Linux arm64 release archive
         if: matrix.target == 'aarch64-unknown-linux-gnu'

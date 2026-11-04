@@ -428,8 +428,8 @@ fn release_targets_exercises_native_linux_arm64_runtime_contract() {
         "cargo test --locked -p aethyme-testkit --test release_installer",
         "cargo test --locked -p aethyme-broker --lib bootstrap_switches_the_pair_once_and_retains_one_rollback_bundle",
         "cargo test --locked -p aethyme-broker --lib failed_staged_quick_test_never_moves_the_active_pair",
-        "cargo test --locked -p aethyme-broker --test broker two_session_worktrees_are_distinct_and_registered",
-        "cargo test --locked -p aethyme-broker --test host_operations_e2e",
+        "cargo test --locked -p aethyme-broker-cli --test broker two_session_worktrees_are_distinct_and_registered",
+        "cargo test --locked -p aethyme-broker-cli --test host_operations_e2e",
         "broker quick-test",
         "graph refresh plan",
         "graph refresh execute",
@@ -518,7 +518,7 @@ fn release_workflow_renders_the_homebrew_formula_from_the_manifest() {
     );
     assert!(
         helper_build
-            .contains("-p aethyme-broker --example release_manifest --example homebrew_formula")
+            .contains("-p aethyme-broker-cli --example release_manifest --example homebrew_formula")
     );
     assert!(
         helper_build.contains("printf '%s\\n' \"$GITHUB_SHA\" > \"$helper_stage_dir/source.sha\"")

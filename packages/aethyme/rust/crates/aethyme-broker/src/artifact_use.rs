@@ -137,14 +137,14 @@ struct DirectoryIdentity {
 
 /// One exact marker entry in an explicit, checkout-scoped reconciliation plan.
 #[derive(Clone, Debug, Serialize)]
-pub(crate) struct ArtifactUseReconcileMarker {
-    pub(crate) filename: String,
-    pub(crate) session_id: i64,
+pub struct ArtifactUseReconcileMarker {
+    pub filename: String,
+    pub session_id: i64,
     pub(crate) invocation_id: String,
-    pub(crate) bytes_sha256: String,
+    pub bytes_sha256: String,
     pub(crate) file_device: u64,
     pub(crate) file_inode: u64,
-    pub(crate) disposition: ArtifactUseReconcileDisposition,
+    pub disposition: ArtifactUseReconcileDisposition,
 }
 
 /// A marker is removable only when both its PID identity and its recorded
@@ -178,10 +178,10 @@ pub struct ArtifactUseReconcilePlan {
 /// Per-marker result from a digest-confirmed apply. An unconfirmed directory
 /// sync means the unlink returned success but its crash durability is unknown.
 #[derive(Clone, Debug, Serialize)]
-pub(crate) struct ArtifactUseReconcileMarkerOutcome {
-    pub(crate) filename: String,
+pub struct ArtifactUseReconcileMarkerOutcome {
+    pub filename: String,
     pub(crate) bytes_sha256: String,
-    pub(crate) outcome: ArtifactUseReconcileOutcomeKind,
+    pub outcome: ArtifactUseReconcileOutcomeKind,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -209,15 +209,15 @@ pub enum ArtifactUseReconcileDirectorySync {
 /// why later candidates were retained as unknown and whether an unlink had
 /// already succeeded before the failure.
 #[derive(Clone, Debug, Serialize)]
-pub(crate) struct ArtifactUseReconcileApplyStop {
-    pub(crate) kind: ArtifactUseReconcileApplyStopKind,
-    pub(crate) marker_filename: String,
-    pub(crate) reason: String,
+pub struct ArtifactUseReconcileApplyStop {
+    pub kind: ArtifactUseReconcileApplyStopKind,
+    pub marker_filename: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ArtifactUseReconcileApplyStopKind {
+pub enum ArtifactUseReconcileApplyStopKind {
     InventoryChanged,
     MarkerChanged,
     ProducerStillActive,

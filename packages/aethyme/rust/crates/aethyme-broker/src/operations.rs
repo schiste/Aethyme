@@ -594,11 +594,11 @@ impl OutputCaptureState {
 }
 
 #[derive(Debug)]
-pub(crate) struct CapturedOutput {
+pub struct CapturedOutput {
     pub(crate) status: std::process::ExitStatus,
-    pub(crate) stdout: Vec<u8>,
+    pub stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
-    pub(crate) stdout_truncated: bool,
+    pub stdout_truncated: bool,
     pub(crate) stderr_truncated: bool,
 }
 
@@ -1324,7 +1324,7 @@ impl OperationShowReport {
 const OPERATION_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const OPERATION_LOCK_PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
 
-pub(crate) struct RepositoryWriteLock {
+pub struct RepositoryWriteLock {
     file: File,
     acquired_at: Instant,
     acquired_at_ms: i64,

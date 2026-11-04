@@ -4,7 +4,7 @@ Version: schema_version **1** — **FROZEN** (2026-07-17; per-row field, see
 rules below)
 Source of truth: `rust/crates/aethyme-broker/src/events.rs` (kinds and
 payload constructors) — this document describes what that module defines.
-Enforcement: `rust/crates/aethyme-broker/tests/contract_v1.rs` locks the
+Enforcement: `rust/crates/aethyme-broker-cli/tests/contract_v1.rs` locks the
 v1 kind list and per-kind payload field names against golden expectations;
 any unversioned change fails CI.
 Stable `--json` command outputs are a separate surface, documented in

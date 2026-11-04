@@ -3,7 +3,7 @@
 Version: schema_version **1**
 Source of truth: `rust/crates/aethyme-broker/src/insights.rs` (types and
 semantics) and `src/cli/insights.rs` (the `--json` and text surfaces).
-Enforcement: `rust/crates/aethyme-broker/tests/insights.rs`.
+Enforcement: `rust/crates/aethyme-broker-cli/tests/insights.rs`.
 
 This is a separate contract from
 [`events-contract.md`](events-contract.md). The event contract freezes what the

@@ -336,7 +336,7 @@ pub fn test_escape_enabled_for_a_repository(main_root: &Path) -> bool {
 
 /// How an enforcement check was satisfied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TrustDecision {
+pub enum TrustDecision {
     NoCommands,
     Trusted,
     Grandfathered,
