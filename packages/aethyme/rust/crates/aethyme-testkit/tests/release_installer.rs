@@ -66,13 +66,23 @@ fn stable_installer_fetches_verifies_and_updates_the_binary_pair() {
     let archive_path = exact.join(&archive);
     let installer_path = repo_root().join("install.sh");
     let installer_digest = format!("{:x}", Sha256::digest(fs::read(&installer_path).unwrap()));
-    let tar = Command::new("tar")
-        .args(["-C", payload.to_str().unwrap(), "-czf"])
-        .arg(&archive_path)
+    // The payload is two unstripped debug binaries (hundreds of MiB). Default
+    // gzip compression of them dominated this test; the installer only needs a
+    // valid gzip stream, so compress at the fastest level.
+    let mut tar = Command::new("tar")
+        .args(["-C", payload.to_str().unwrap(), "-cf", "-"])
         .args(["aethyme", "aethyme-engine-cli"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let gzip = Command::new("gzip")
+        .arg("-1")
+        .stdin(tar.stdout.take().unwrap())
+        .stdout(fs::File::create(&archive_path).unwrap())
         .status()
         .unwrap();
-    assert!(tar.success());
+    assert!(tar.wait().unwrap().success());
+    assert!(gzip.success());
 
     let bytes = fs::read(&archive_path).unwrap();
     let digest = format!("{:x}", Sha256::digest(bytes));
