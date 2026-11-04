@@ -313,7 +313,7 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
           CARGO_PROFILE_TEST_DEBUG: "0"
           RUSTC_WORKSPACE_WRAPPER: ${{ github.workspace }}/.github/scripts/broker-rustc-wrapper.sh
-          BROKER_RUSTC_FLAGS: -Ztime-passes
+          BROKER_RUSTC_FLAGS: -Zthreads=4 -Ztime-passes
         run: ../scripts/test-like-ci.sh --archive "$RUNNER_TEMP/rust-tests.tar.zst"
 
       - name: Record the build facts
