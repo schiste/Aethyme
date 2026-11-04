@@ -886,7 +886,12 @@ impl Lifecycle {
                     let ctx = self.context(snapshot, component, &current, attempt);
                     match self.cached_build(&ctx) {
                         Err(error) => Err(error),
-                        Ok(()) => driver.provision(&ctx),
+                        Ok(()) => {
+                            // Provision hooks can create external resources before failing or
+                            // timing out. Include the attempted component in rollback.
+                            provisioned.push(component.name.clone());
+                            driver.provision(&ctx)
+                        }
                     }
                 }
             };
@@ -927,7 +932,6 @@ impl Lifecycle {
                         None,
                         receipt.as_ref(),
                     )?;
-                    provisioned.push(component.name.clone());
                 }
                 Err(error) => return Ok(Err(error)),
             }
@@ -1037,7 +1041,11 @@ impl Lifecycle {
                 ),
             }
         }
-        self.release_capacity(env_id)?;
+        // A failed destroy may leave resources running; retain capacity until
+        // a later down operation proves cleanup succeeded.
+        if rollback_errors.is_empty() {
+            self.release_capacity(env_id)?;
+        }
         let detail = json!({
             "code": error.code(),
             "message": error.to_string(),

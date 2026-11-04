@@ -665,7 +665,15 @@ impl Driver for ComposeDriver {
         let stragglers = Self::project_ids(&engine, ctx, &project)?;
         if !stragglers.is_empty() {
             for id in &stragglers {
-                engine.run(&engine.remove_args(id), ctx.cwd(), &BTreeMap::new())?;
+                remove_project_container_with_retry(
+                    id,
+                    |id| {
+                        engine
+                            .run(&engine.remove_args(id), ctx.cwd(), &BTreeMap::new())
+                            .map(|_| ())
+                    },
+                    || Self::project_ids(&engine, ctx, &project),
+                )?;
             }
             append_log(
                 &ctx.log(),
@@ -709,6 +717,31 @@ impl Driver for ComposeDriver {
             Err(_) => Observation::Unproven,
         }
     }
+}
+
+/// Retry a failed exact-ID removal only while that ID is still in this project.
+/// An absent ID also covers the race where another cleanup already removed it.
+pub(super) fn remove_project_container_with_retry(
+    id: &str,
+    mut remove: impl FnMut(&str) -> Result<(), DriverError>,
+    mut project_ids: impl FnMut() -> Result<Vec<String>, DriverError>,
+) -> Result<(), DriverError> {
+    const ATTEMPTS: usize = 3;
+    for attempt in 0..ATTEMPTS {
+        match remove(id) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if !project_ids()?.iter().any(|candidate| candidate == id) {
+                    return Ok(());
+                }
+                if attempt + 1 == ATTEMPTS {
+                    return Err(error);
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+    unreachable!()
 }
 
 // ---------------------------------------------------------------- container
