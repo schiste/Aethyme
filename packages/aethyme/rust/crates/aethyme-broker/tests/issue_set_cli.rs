@@ -1,0 +1,503 @@
+//! Exercise issue-set planning and authorization without contacting GitHub.
+#![cfg(unix)]
+
+mod common;
+
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::process::{Command, Output};
+
+const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
+
+fn git(repo: &Path, args: &[&str]) {
+    let result = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
+fn plans_without_writes_and_denies_unapproved_target_policy() {
+    let repo = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let gh = bin.path().join("gh");
+    std::fs::write(&gh, r##"#!/bin/sh
+printf '%s\n' "$*" >> "$AETHYME_FAKE_GH_LOG"
+case "$*" in
+  'api --hostname github.com repos/owner/repo/labels?per_page=100&page=1') printf '[{"name":"feature"}]\n' ;;
+  'api --hostname github.com repos/owner/repo/issues?state=all&per_page=100&page=1') printf '[]\n' ;;
+  'api --hostname github.com repos/owner/repo/commits?per_page=1') printf '[{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]\n' ;;
+  'api --hostname github.com -H Accept: application/vnd.github.raw+json repos/owner/repo/contents/.aethyme/config.toml?ref=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa') printf '[issue_workflows]\nissue_sets = "deny"\n' ;;
+  *) printf 'unexpected fake gh command: %s\n' "$*" >&2; exit 1 ;;
+esac
+"##).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    git(repo.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.path().join(".gitignore"), "/.aethyme/\n").unwrap();
+    std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
+    git(repo.path(), &["add", ".gitignore", "a.txt"]);
+    git(repo.path(), &["commit", "-qm", "init"]);
+    let log = repo.path().join("gh-log");
+    let run = |args: &[&str]| -> Output {
+        common::broker_cli(CLI, args)
+            .current_dir(repo.path())
+            .env("AETHYME_HOST_STATE_DIR", state.path())
+            .env("AETHYME_FAKE_GH_LOG", &log)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .unwrap()
+    };
+    let started = run(&["start", "--task", "test issue set", "--json"]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    git(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ],
+    );
+    let session = value["session"]["id"]
+        .as_i64()
+        .or_else(|| value["id"].as_i64())
+        .unwrap()
+        .to_string();
+    std::fs::write(repo.path().join("epic.md"), "See {{child}}").unwrap();
+    std::fs::write(repo.path().join("child.md"), "See {{epic}}").unwrap();
+    std::fs::write(
+        repo.path().join("set.toml"),
+        r#"set_id = "sample"
+[parent]
+key = "epic"
+title = "Epic"
+body_file = "epic.md"
+labels = ["feature"]
+[[issues]]
+key = "child"
+title = "Child"
+body_file = "child.md"
+depends_on = ["epic"]
+"#,
+    )
+    .unwrap();
+    let args = [
+        "advanced",
+        "issues",
+        "apply",
+        "set.toml",
+        "--session",
+        &session,
+        "--repo",
+        "owner/repo",
+        "--reason",
+        "test authorized set",
+        "--json",
+    ];
+    let mut dry_args = args.to_vec();
+    dry_args.push("--dry-run");
+    let dry = run(&dry_args);
+    assert!(
+        dry.status.success(),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&dry.stdout),
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&dry.stdout).unwrap();
+    let actions: Vec<_> = plan
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        actions.iter().filter(|action| **action == "create").count(),
+        2
+    );
+    assert_eq!(
+        actions.iter().filter(|action| **action == "update").count(),
+        2
+    );
+    assert!(actions.contains(&"ensure_sub_issue"));
+    assert!(actions.contains(&"ensure_dependency"));
+    let denied = run(&args);
+    assert!(!denied.status.success());
+    let denial: serde_json::Value = serde_json::from_slice(&denied.stdout).unwrap();
+    assert!(
+        denial["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("issue_workflows.issue_sets")
+    );
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(!calls.contains("issue create"), "{calls}");
+    assert!(!calls.contains("issue edit"), "{calls}");
+    assert!(!calls.contains("-X POST"), "{calls}");
+    assert!(!calls.contains("-X DELETE"), "{calls}");
+}
+
+fn exercise_complete_set(mode: u8) {
+    let repo = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let remote = tempfile::tempdir().unwrap();
+    let gh = bin.path().join("gh");
+    std::fs::write(&gh, r##"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$AETHYME_FAKE_GH_LOG"
+root="$AETHYME_FAKE_GH_STATE"
+issue_json() {
+    n="$1"
+    body=$(awk '{printf "%s\\n", $0}' "$root/body$n")
+    title=$(cat "$root/title$n")
+    printf '{"number":%s,"id":%s,"body":"%s","title":"%s","labels":[]}' "$n" "$((1000+n))" "$body" "$title"
+}
+case "$*" in
+  'api --hostname github.com repos/owner/repo/commits?per_page=1') printf '[{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]\n' ;;
+  'api --hostname github.com -H Accept: application/vnd.github.raw+json repos/owner/repo/contents/.aethyme/config.toml?ref=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa') printf '[issue_workflows]\nissue_sets = "allow"\n' ;;
+  'api --hostname github.com repos/owner/repo/labels?per_page=100&page=1') printf '[]\n' ;;
+  'api --hostname github.com repos/owner/repo/issues?state=all&per_page=100&page=1')
+    printf '['
+    if [ -f "$root/body1" ]; then issue_json 1; fi
+    if [ -f "$root/body2" ]; then printf ','; issue_json 2; fi
+    printf ']\n' ;;
+  'api --hostname github.com repos/owner/repo/issues/1') issue_json 1; printf '\n' ;;
+  'api --hostname github.com repos/owner/repo/issues/2') issue_json 2; printf '\n' ;;
+  'api --hostname github.com --include repos/owner/repo/issues/1/sub_issues?per_page=100&page=1')
+    if [ "$AETHYME_FAKE_NATIVE_MODE" = 1 ]; then printf 'HTTP/2.0 404 Not Found\r\n\r\n{}'; exit 1; fi
+    if [ "$AETHYME_FAKE_NATIVE_MODE" = 2 ]; then printf 'HTTP/2.0 403 Forbidden\r\n\r\n{}'; exit 1; fi
+    printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n'
+    if [ -f "$root/sub" ]; then printf '[{"id":1002}]\n'; else printf '[]\n'; fi ;;
+  'api --hostname github.com --include repos/owner/repo/issues/2/dependencies/blocked_by?per_page=100&page=1')
+    if [ "$AETHYME_FAKE_NATIVE_MODE" = 1 ]; then printf 'HTTP/2.0 404 Not Found\r\n\r\n{}'; exit 1; fi
+    if [ "$AETHYME_FAKE_NATIVE_MODE" = 2 ]; then printf 'HTTP/2.0 403 Forbidden\r\n\r\n{}'; exit 1; fi
+    printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n'
+    if [ -f "$root/dependency" ]; then printf '[{"id":1001}]\n'; else printf '[]\n'; fi ;;
+  'api -X POST repos/owner/repo/issues/1/sub_issues -F sub_issue_id=1002') : > "$root/sub"; printf '{}\n' ;;
+  'api -X POST repos/owner/repo/issues/2/dependencies/blocked_by -F issue_id=1001') : > "$root/dependency"; printf '{}\n' ;;
+  'issue create '*)
+    n=1; if [ -f "$root/body1" ]; then n=2; fi
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --title) printf '%s' "$2" > "$root/title$n"; shift 2 ;;
+        --body-file) cp "$2" "$root/body$n"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    printf 'https://github.com/owner/repo/issues/%s\n' "$n" ;;
+  'issue edit '*)
+    n="$3"
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --title) printf '%s' "$2" > "$root/title$n"; shift 2 ;;
+        --body-file) cp "$2" "$root/body$n"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    printf 'https://github.com/owner/repo/issues/%s\n' "$n" ;;
+  *) printf 'unexpected fake gh command: %s\n' "$*" >&2; exit 1 ;;
+esac
+"##).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    git(repo.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.path().join(".gitignore"), "/.aethyme/\n").unwrap();
+    std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
+    git(repo.path(), &["add", ".gitignore", "a.txt"]);
+    git(repo.path(), &["commit", "-qm", "init"]);
+    let log = repo.path().join("gh-log");
+    let run = |args: &[&str]| -> Output {
+        common::broker_cli(CLI, args)
+            .current_dir(repo.path())
+            .env("AETHYME_HOST_STATE_DIR", state.path())
+            .env("AETHYME_FAKE_GH_LOG", &log)
+            .env("AETHYME_FAKE_GH_STATE", remote.path())
+            .env("AETHYME_FAKE_NATIVE_MODE", mode.to_string())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .unwrap()
+    };
+    let started = run(&["start", "--task", "test issue set", "--json"]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    git(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ],
+    );
+    let session = value["session"]["id"]
+        .as_i64()
+        .or_else(|| value["id"].as_i64())
+        .unwrap()
+        .to_string();
+    std::fs::write(repo.path().join("epic.md"), "Child {{child}}").unwrap();
+    std::fs::write(repo.path().join("child.md"), "Parent {{epic}}").unwrap();
+    std::fs::write(
+        repo.path().join("set.toml"),
+        r#"set_id = "sample"
+[parent]
+key = "epic"
+title = "Epic"
+body_file = "epic.md"
+[[issues]]
+key = "child"
+title = "Child"
+body_file = "child.md"
+depends_on = ["epic"]
+"#,
+    )
+    .unwrap();
+    let args = [
+        "advanced",
+        "issues",
+        "apply",
+        "set.toml",
+        "--session",
+        &session,
+        "--repo",
+        "owner/repo",
+        "--reason",
+        "test authorized set",
+        "--json",
+    ];
+    for _ in 0..2 {
+        let result = run(&args);
+        if mode == 2 {
+            assert!(!result.status.success());
+            let error: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("HTTP 403")
+            );
+            let calls = std::fs::read_to_string(&log).unwrap();
+            assert!(!calls.contains("issue edit"), "{calls}");
+            assert!(!calls.contains("api -X POST"), "{calls}");
+            return;
+        }
+        assert!(
+            result.status.success(),
+            "stdout: {} stderr: {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(receipt["epic"], 1);
+        assert_eq!(receipt["child"], 2);
+    }
+    assert!(
+        std::fs::read_to_string(remote.path().join("body1"))
+            .unwrap()
+            .contains("Child #2")
+    );
+    assert!(
+        std::fs::read_to_string(remote.path().join("body2"))
+            .unwrap()
+            .contains("Parent #1")
+    );
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("issue create "))
+            .count(),
+        2,
+        "{calls}"
+    );
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("issue edit "))
+            .count(),
+        2,
+        "{calls}"
+    );
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("api -X POST "))
+            .count(),
+        if mode == 0 { 2 } else { 0 },
+        "{calls}"
+    );
+    if mode == 1 {
+        assert!(
+            std::fs::read_to_string(remote.path().join("body1"))
+                .unwrap()
+                .contains("- [ ] #2")
+        );
+        assert!(
+            std::fs::read_to_string(remote.path().join("body2"))
+                .unwrap()
+                .contains("Depends on: #1")
+        );
+    }
+}
+
+#[test]
+fn creates_and_reapplies_a_complete_set_without_duplicates() {
+    exercise_complete_set(0);
+}
+
+#[test]
+fn falls_back_when_native_relationships_are_unavailable() {
+    exercise_complete_set(1);
+}
+
+#[test]
+fn does_not_fall_back_on_relationship_permission_errors() {
+    exercise_complete_set(2);
+}
+
+#[test]
+fn separate_clones_share_unknown_create_recovery() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let log = state.path().join("gh-log");
+    let gh = bin.path().join("gh");
+    std::fs::write(&gh, r##"#!/bin/sh
+printf '%s\n' "$*" >> "$AETHYME_FAKE_GH_LOG"
+case "$*" in
+  'api --hostname github.com repos/owner/repo/commits?per_page=1') printf '[{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]\n' ;;
+  'api --hostname github.com -H Accept: application/vnd.github.raw+json repos/owner/repo/contents/.aethyme/config.toml?ref=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa') printf '[issue_workflows]\nissue_sets = "allow"\n' ;;
+  'api --hostname github.com repos/owner/repo/labels?per_page=100&page=1') printf '[]\n' ;;
+  'api --hostname github.com repos/owner/repo/issues?state=all&per_page=100&page=1') printf '[]\n' ;;
+  'issue create '*) printf 'simulated lost create response\n' >&2; exit 1 ;;
+  *) printf 'unexpected fake gh command: %s\n' "$*" >&2; exit 1 ;;
+esac
+"##).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let run = |repo: &Path, args: &[&str]| -> Output {
+        common::broker_cli(CLI, args)
+            .current_dir(repo)
+            .env("AETHYME_HOST_STATE_DIR", state.path())
+            .env("AETHYME_FAKE_GH_LOG", &log)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .unwrap()
+    };
+    let setup = |repo: &Path| -> String {
+        git(repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        git(repo, &["add", ".gitignore", "a.txt"]);
+        git(repo, &["commit", "-qm", "init"]);
+        let started = run(
+            repo,
+            &["start", "--task", "test shared issue journal", "--json"],
+        );
+        assert!(
+            started.status.success(),
+            "{}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+        git(
+            repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/owner/repo.git",
+            ],
+        );
+        std::fs::write(repo.join("epic.md"), "Epic body").unwrap();
+        std::fs::write(repo.join("set.toml"), "set_id = \"shared\"\n[parent]\nkey = \"epic\"\ntitle = \"Epic\"\nbody_file = \"epic.md\"\n").unwrap();
+        value["session"]["id"]
+            .as_i64()
+            .or_else(|| value["id"].as_i64())
+            .unwrap()
+            .to_string()
+    };
+    let session_one = setup(first.path());
+    let session_two = setup(second.path());
+    fn args(session: &str) -> Vec<&str> {
+        vec![
+            "advanced",
+            "issues",
+            "apply",
+            "set.toml",
+            "--session",
+            session,
+            "--repo",
+            "owner/repo",
+            "--reason",
+            "test recovery",
+            "--json",
+        ]
+    }
+    let initial = run(first.path(), &args(&session_one));
+    assert!(!initial.status.success());
+    let mut plan_args = args(&session_two);
+    plan_args.push("--dry-run");
+    let retry = run(second.path(), &plan_args);
+    assert!(
+        !retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stdout)
+    );
+    let error: serde_json::Value = serde_json::from_slice(&retry.stdout).unwrap();
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown outcome"),
+        "{error}"
+    );
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("issue create "))
+            .count(),
+        1,
+        "{calls}"
+    );
+}
