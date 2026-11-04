@@ -488,20 +488,27 @@ impl Lifecycle {
         session_id: Option<i64>,
         options: &UpOptions,
     ) -> Result<EnvironmentRecord, LifecycleError> {
-        let record = self.store.register(snapshot, Some(worktree), session_id)?;
+        let mut record = self.store.register(snapshot, Some(worktree), session_id)?;
         if let Some(main_root) = main_root {
             self.store.set_main_root(&record.env_id, main_root)?;
         }
         if record.profile_digest != snapshot.digest {
-            let plan = Reconfigure::new(&record.snapshot, snapshot);
-            if !options.reconfigure && !plan.only_adds() {
-                return Err(LifecycleError::ReconfigureRequired {
-                    env_id: record.env_id,
-                });
+            if let Some(updated) = self
+                .store
+                .replace_activity_probes(&record.env_id, snapshot)?
+            {
+                record = updated;
+            } else {
+                let plan = Reconfigure::new(&record.snapshot, snapshot);
+                if !options.reconfigure && !plan.only_adds() {
+                    return Err(LifecycleError::ReconfigureRequired {
+                        env_id: record.env_id,
+                    });
+                }
+                return self.reconfigure_locked(
+                    record, snapshot, worktree, main_root, session_id, options, &plan,
+                );
             }
-            return self.reconfigure_locked(
-                record, snapshot, worktree, main_root, session_id, options, &plan,
-            );
         }
         if (
             record.snapshot.max_pin_seconds,

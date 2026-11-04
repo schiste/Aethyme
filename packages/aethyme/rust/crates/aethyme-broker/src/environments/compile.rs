@@ -536,6 +536,7 @@ impl CompiledEnvironment {
         let mut names = vec![
             "AETHYME_ENV_ID".to_string(),
             "AETHYME_ENV_NAMESPACE".into(),
+            "AETHYME_ENV_COMPOSE_PROJECT".into(),
             "AETHYME_ENV_PROFILE".into(),
             "AETHYME_ENV_WORKTREE".into(),
             "AETHYME_ENV_HOOK_ATTEMPT".into(),
