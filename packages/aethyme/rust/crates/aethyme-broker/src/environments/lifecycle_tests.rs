@@ -376,6 +376,85 @@ destroy = "true"
 }
 
 #[test]
+fn timed_out_provision_rolls_back_the_attempted_component() {
+    let host = Host::new();
+    let text = format!(
+        r#"
+schema = 1
+[pools.envs]
+limit = 2
+[[profiles]]
+name = "p"
+units = 1
+[[profiles.components]]
+name = "worker"
+runtime = "hooks"
+hook_timeout_seconds = 1
+provision = 'touch "{m}/started"; sleep 30'
+destroy = 'rm -f "{m}/started"; touch "{m}/destroyed"'
+"#,
+        m = host.markers.display()
+    );
+    let worktree = tempfile::tempdir().unwrap();
+    let snapshot = snapshot(&text, "p", worktree.path(), None);
+    let mut lifecycle = host.lifecycle();
+    assert!(matches!(
+        lifecycle.up(&snapshot, worktree.path(), None, None, &options()),
+        Err(LifecycleError::Driver(_))
+    ));
+    let record = lifecycle.store.get(&snapshot.env_id).unwrap().unwrap();
+    assert_eq!(record.phase, EnvironmentPhase::Failed);
+    assert!(host.markers.join("destroyed").exists());
+    assert!(!host.markers.join("started").exists());
+    assert_eq!(
+        record.last_error.unwrap()["rollback_errors"],
+        serde_json::json!([])
+    );
+    assert_eq!(host.active_leases(&record.env_id), 1);
+    lifecycle.down(&record.env_id, None).unwrap();
+}
+
+#[test]
+fn failed_provision_rollback_retains_capacity_until_down_succeeds() {
+    let host = Host::new();
+    let text = format!(
+        r#"
+schema = 1
+[pools.envs]
+limit = 2
+[[profiles]]
+name = "p"
+units = 1
+[[profiles.components]]
+name = "worker"
+runtime = "hooks"
+provision = 'touch "{m}/started"; exit 9'
+destroy = 'test -f "{m}/allow_destroy" && rm -f "{m}/started"'
+"#,
+        m = host.markers.display()
+    );
+    let worktree = tempfile::tempdir().unwrap();
+    let snapshot = snapshot(&text, "p", worktree.path(), None);
+    let mut lifecycle = host.lifecycle();
+    assert!(matches!(
+        lifecycle.up(&snapshot, worktree.path(), None, None, &options()),
+        Err(LifecycleError::Driver(_))
+    ));
+    let record = lifecycle.store.get(&snapshot.env_id).unwrap().unwrap();
+    assert_eq!(record.phase, EnvironmentPhase::Failed);
+    assert_eq!(
+        record.last_error.as_ref().unwrap()["rollback_errors"][0]["component"],
+        "worker"
+    );
+    assert!(host.markers.join("started").exists());
+    assert_eq!(host.active_leases(&record.env_id), 2);
+    std::fs::write(host.markers.join("allow_destroy"), "").unwrap();
+    lifecycle.down(&record.env_id, None).unwrap();
+    assert!(!host.markers.join("started").exists());
+    assert_eq!(host.active_leases(&record.env_id), 0);
+}
+
+#[test]
 fn an_unhealthy_start_stops_what_started_and_keeps_provisioned_data() {
     let host = Host::new();
     let text = format!(

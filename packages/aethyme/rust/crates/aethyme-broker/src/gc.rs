@@ -4281,16 +4281,15 @@ impl Broker {
         &mut self,
         include_active_gate_cache: bool,
         full_scan: bool,
+        exclude_orphans: bool,
     ) -> Result<GcPlan, BrokerOpError> {
-        if full_scan {
-            self.gc_plan_scanned(crate::SizeScan::Measure, include_active_gate_cache)
-        } else {
-            self.gc_plan_scanned_until(
-                crate::SizeScan::Measure,
-                include_active_gate_cache,
-                Some(Instant::now() + MANUAL_GC_PLAN_BUDGET),
-            )
-        }
+        let deadline = (!full_scan).then(|| Instant::now() + MANUAL_GC_PLAN_BUDGET);
+        self.gc_plan_scanned_until_scope(
+            crate::SizeScan::Measure,
+            include_active_gate_cache,
+            deadline,
+            exclude_orphans,
+        )
     }
 
     pub(crate) fn gc_plan_for_service(
@@ -4578,6 +4577,16 @@ impl Broker {
         scan: crate::SizeScan,
         include_active_gate_cache: bool,
         deadline: Option<std::time::Instant>,
+    ) -> Result<GcPlan, BrokerOpError> {
+        self.gc_plan_scanned_until_scope(scan, include_active_gate_cache, deadline, false)
+    }
+
+    fn gc_plan_scanned_until_scope(
+        &mut self,
+        scan: crate::SizeScan,
+        include_active_gate_cache: bool,
+        deadline: Option<std::time::Instant>,
+        exclude_orphans: bool,
     ) -> Result<GcPlan, BrokerOpError> {
         let _git_deadline = deadline.map(crate::git::limit_git_until);
         // The budget is cooperative: loops and stage boundaries check it, but
@@ -5004,8 +5013,17 @@ impl Broker {
         if artifact_worktrees_not_scanned > 0 {
             deferred_checks.push("artifact_scan".into());
         }
-        let (mut orphans, orphans_complete) =
-            self.orphan_candidates(age_anchor_ms, &policy, &mut blockers, scan, deadline)?;
+        let (mut orphans, orphans_complete) = if exclude_orphans {
+            blockers.push(GcBlocker {
+                kind: "orphans_excluded".into(),
+                id: None,
+                reason: "orphan worktree roots are outside this plan and will not be removed"
+                    .into(),
+            });
+            (Vec::new(), true)
+        } else {
+            self.orphan_candidates(age_anchor_ms, &policy, &mut blockers, scan, deadline)?
+        };
         if !orphans_complete {
             deferred_checks.push("orphan_scan".into());
         }
@@ -5420,7 +5438,9 @@ impl Broker {
         }
         // A partial inventory can only establish that the recorded floor is
         // over budget. It cannot turn an under-budget floor into a pass.
-        if !deferred_checks.is_empty() && budget_verdict == crate::BudgetVerdict::Within {
+        if (exclude_orphans || !deferred_checks.is_empty())
+            && budget_verdict == crate::BudgetVerdict::Within
+        {
             budget_verdict = crate::BudgetVerdict::Unknown;
         }
         deferred_checks.sort();
@@ -5430,7 +5450,8 @@ impl Broker {
             deferred_checks.sort();
             deferred_checks.dedup();
         }
-        let clears_retained_bytes_budget = deferred_checks.is_empty()
+        let clears_retained_bytes_budget = !exclude_orphans
+            && deferred_checks.is_empty()
             && crate::reclaim_order::clears_budget(
                 estimated_retained_bytes,
                 policy_budget,
@@ -5533,9 +5554,16 @@ impl Broker {
         confirm: &str,
         include_active_gate_cache: bool,
         full_scan: bool,
+        exclude_orphans: bool,
     ) -> Result<GcApplyReport, BrokerOpError> {
         let planning_deadline = (!full_scan).then(|| Instant::now() + MANUAL_GC_PLAN_BUDGET);
-        self.gc_apply_with(confirm, None, include_active_gate_cache, planning_deadline)
+        self.gc_apply_with_scope(
+            confirm,
+            None,
+            include_active_gate_cache,
+            planning_deadline,
+            exclude_orphans,
+        )
     }
 
     /// The retention summary `doctor`, `certify` and the verify loop report.
@@ -9632,6 +9660,23 @@ impl Broker {
         include_active_gate_cache: bool,
         planning_deadline: Option<Instant>,
     ) -> Result<GcApplyReport, BrokerOpError> {
+        self.gc_apply_with_scope(
+            confirm,
+            budget_ms,
+            include_active_gate_cache,
+            planning_deadline,
+            false,
+        )
+    }
+
+    fn gc_apply_with_scope(
+        &mut self,
+        confirm: &str,
+        budget_ms: Option<u64>,
+        include_active_gate_cache: bool,
+        planning_deadline: Option<Instant>,
+        exclude_orphans: bool,
+    ) -> Result<GcApplyReport, BrokerOpError> {
         if confirm.len() != 64 || !confirm.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BrokerOpError::GcConfirmationNotSha256);
         }
@@ -9665,16 +9710,12 @@ impl Broker {
                 journal
             }
             None => {
-                let plan = match planning_deadline {
-                    Some(deadline) => self.gc_plan_scanned_until(
-                        crate::SizeScan::Measure,
-                        include_active_gate_cache,
-                        Some(deadline),
-                    )?,
-                    None => {
-                        self.gc_plan_scanned(crate::SizeScan::Measure, include_active_gate_cache)?
-                    }
-                };
+                let plan = self.gc_plan_scanned_until_scope(
+                    crate::SizeScan::Measure,
+                    include_active_gate_cache,
+                    planning_deadline,
+                    exclude_orphans,
+                )?;
                 if !plan.digest.eq_ignore_ascii_case(confirm) {
                     return Err(BrokerOpError::GcConfirmationMismatch {
                         actual: confirm.to_owned(),
@@ -16884,6 +16925,31 @@ mod tests {
         )
         .unwrap();
         (fixture, broker, root.canonicalize().unwrap(), digest)
+    }
+
+    #[test]
+    fn excluding_orphan_roots_keeps_them_out_of_reviewed_cleanup() {
+        let (_fixture, mut broker, root, _) = registered_orphan_fixture();
+        std::fs::remove_file(broker.main_root().join(".aethyme/gc-journal.json")).unwrap();
+        let scoped = broker.gc_plan_for_cli(false, true, true).unwrap();
+        assert!(scoped.orphans.is_empty());
+        assert!(
+            scoped
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == "orphans_excluded")
+        );
+        assert!(!scoped.digest.is_empty(), "{:?}", scoped.deferred_checks);
+        assert!(
+            broker
+                .gc_apply_for_cli(&scoped.digest, false, true, false)
+                .is_err()
+        );
+        let report = broker
+            .gc_apply_for_cli(&scoped.digest, false, true, true)
+            .unwrap();
+        assert!(report.complete);
+        assert!(root.exists(), "excluded orphan must be retained");
     }
 
     #[test]

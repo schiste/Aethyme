@@ -94,6 +94,14 @@ shared alias; remove the preview with `aethyme env down <id>`. Preview uses
 checkout contents, including uncommitted edits, and refuses profiles that
 themselves require shared environments.
 
+`broker gc plan --exclude-orphans` and the matching `gc apply --exclude-orphans`
+omit orphan worktree roots from the reviewed candidate set. The plan carries an
+`orphans_excluded` blocker, its digest binds that scope, and apply recomputes the
+same scope before acting. Overall retained-storage budget verdicts remain
+unknown when they cannot be proved without the omitted roots. The same option
+must be passed to plan and apply. This option is local-only and is refused with shared-service planning. Default GC remains
+unchanged and refuses incomplete orphan inventory.
+
 The dependent discovery phase adds `service directory <private-service-root>
 --jobs-for <repository> [--json]`. Both output modes emit one object:
 `schema_version: 1`, `directory`, and the full `repository` identity (`key`,

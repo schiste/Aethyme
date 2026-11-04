@@ -688,7 +688,7 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool, full_scan: bool
         out!("  apply: nothing eligible");
     } else {
         out!(
-            "  apply: aethyme broker gc apply --confirm {}{}{}",
+            "  apply: aethyme broker gc apply --confirm {}{}{}{}",
             plan.digest,
             if plan
                 .gate_cache
@@ -699,7 +699,16 @@ pub(super) fn render_gc_plan(plan: &crate::GcPlan, detail: bool, full_scan: bool
             } else {
                 ""
             },
-            if full_scan { " --full-scan" } else { "" }
+            if full_scan { " --full-scan" } else { "" },
+            if plan
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == "orphans_excluded")
+            {
+                " --exclude-orphans"
+            } else {
+                ""
+            }
         );
     }
 }
@@ -1097,6 +1106,11 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
         || parsed.request_key.is_some()
         || parsed.deadline_ms.is_some()
     {
+        if parsed.exclude_orphans {
+            return Err(UsageError::Message(
+                "--exclude-orphans is not supported by shared planning".into(),
+            ));
+        }
         if action != "plan" || parsed.confirm.is_some() {
             return Err(UsageError::Message(
                 "shared service options require gc plan without --confirm".into(),
@@ -1187,8 +1201,11 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
                     "gc plan does not accept --confirm; review its emitted digest".into(),
                 ));
             }
-            let plan =
-                broker.gc_plan_for_cli(parsed.include_active_gate_cache, parsed.full_scan)?;
+            let plan = broker.gc_plan_for_cli(
+                parsed.include_active_gate_cache,
+                parsed.full_scan,
+                parsed.exclude_orphans,
+            )?;
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&plan)?);
             } else {
@@ -1203,6 +1220,7 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
                 confirm,
                 parsed.include_active_gate_cache,
                 parsed.full_scan,
+                parsed.exclude_orphans,
             )?;
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&report)?);
