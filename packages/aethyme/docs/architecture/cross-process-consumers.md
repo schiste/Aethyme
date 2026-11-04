@@ -1387,3 +1387,4 @@ Environment component commands and environment status expose `AETHYME_ENV_COMPOS
 ### Environment activity probes
 
 An `activity_probe` reports active with exit status 0 and idle with exit status 1 and empty stderr. An exit status of 1 with stderr, any other nonzero status, a signal, an execution failure, or a timeout keeps the environment awake. Nonzero completed failures are logged by the supervisor. A probe that fails silently with exit status 1 is indistinguishable from idle and should emit a diagnostic or use another exit status.
+When `env up` finds that only activity probes changed, it updates the recorded snapshot without stopping or recreating components. Other configuration changes retain their normal reconfiguration requirements.
