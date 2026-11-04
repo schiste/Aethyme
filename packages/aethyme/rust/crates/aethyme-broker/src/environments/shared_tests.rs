@@ -135,6 +135,86 @@ fn python_available() -> bool {
 const REPOSITORY: &str = "repo-shared";
 
 #[test]
+fn unmerged_shared_preview_is_worktree_owned_and_preserves_serving_baseline() {
+    if !python_available() {
+        eprintln!("SKIP shared preview: python3 not available");
+        return;
+    }
+    let host = Host::new();
+    let repo = repository(45000);
+    let mut lifecycle = host.lifecycle();
+    let host_config = HostEnvironmentsFile::default();
+    let serving = lifecycle
+        .shared_up(
+            repo.path(),
+            REPOSITORY,
+            "baseline",
+            &host_config,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    let mut text = std::fs::read_to_string(repo.path().join(".aethyme/environments.toml")).unwrap();
+    text.push_str(
+        "\n[[shared]]\nname = \"candidate\"\nprofile = \"backend\"\nref = \"default_branch\"\n",
+    );
+    let loaded: super::Loaded<super::spec::EnvironmentsFile> = super::parse_loaded(
+        PathBuf::from(".aethyme/environments.toml"),
+        ".aethyme/environments.toml",
+        &text,
+    );
+    let file = loaded.value.unwrap();
+    let fingerprint = crate::console::worktree_fingerprint(repo.path());
+    let context = super::compile::CompileContext {
+        repository: REPOSITORY.into(),
+        owner: EnvironmentOwner::Worktree {
+            fingerprint: fingerprint.clone(),
+        },
+        worktree_fingerprint: fingerprint,
+        source_commit: None,
+        source_dirty: true,
+        source_digest: "unmerged".into(),
+    };
+    let snapshot =
+        super::shared::preview_snapshot(&file, &host_config, "candidate", &context).unwrap();
+    assert_ne!(snapshot.env_id, serving.env_id);
+    assert!(matches!(snapshot.owner, EnvironmentOwner::Worktree { .. }));
+    let preview = lifecycle
+        .up(
+            &snapshot,
+            repo.path(),
+            Some(repo.path()),
+            None,
+            &super::lifecycle::UpOptions {
+                wait: Duration::from_secs(5),
+                reconfigure: false,
+                recreate: vec![],
+            },
+        )
+        .unwrap();
+    assert_eq!(preview.phase, EnvironmentPhase::Active);
+    assert_eq!(
+        lifecycle
+            .shared_record(repo.path(), REPOSITORY, "baseline")
+            .unwrap()
+            .unwrap()
+            .env_id,
+        serving.env_id
+    );
+    lifecycle.down(&preview.env_id, None).unwrap();
+    assert_eq!(
+        lifecycle
+            .shared_record(repo.path(), REPOSITORY, "baseline")
+            .unwrap()
+            .unwrap()
+            .phase,
+        EnvironmentPhase::Active
+    );
+    lifecycle
+        .shared_destroy(repo.path(), REPOSITORY, "baseline")
+        .unwrap();
+}
+
+#[test]
 fn a_shared_environment_is_ref_owned_and_survives_worktree_cleanup() {
     if !python_available() {
         eprintln!("SKIP shared ownership: python3 not available");

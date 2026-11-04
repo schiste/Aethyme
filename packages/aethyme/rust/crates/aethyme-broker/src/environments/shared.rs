@@ -472,6 +472,40 @@ pub enum Redeploy {
     InProgress,
 }
 
+/// Compile the caller's checked-out declaration as a worktree-owned preview.
+/// Its distinct owner keeps its namespace and lifecycle separate from both the
+/// serving shared environment and the worktree's ordinary profile.
+pub(super) fn preview_snapshot(
+    file: &EnvironmentsFile,
+    host: &HostEnvironmentsFile,
+    name: &str,
+    context: &CompileContext,
+) -> Result<CompiledEnvironment, LifecycleError> {
+    let spec = Lifecycle::shared_spec(file, name)?;
+    let mut preview_context = context.clone();
+    preview_context.owner = EnvironmentOwner::Worktree {
+        fingerprint: format!("{}:shared-preview:{}", context.worktree_fingerprint, name),
+    };
+    let mut snapshot = compile(
+        file,
+        host,
+        &spec.profile,
+        ENVIRONMENTS_FILE,
+        &preview_context,
+    )
+    .map_err(io)?;
+    if !snapshot.uses_shared.is_empty() {
+        return Err(io(
+            "a shared preview cannot itself depend on shared environments",
+        ));
+    }
+    super::compile::select_components(&mut snapshot, &Default::default());
+    if let Some(idle) = spec.idle_seconds {
+        snapshot.idle_seconds = idle;
+    }
+    Ok(snapshot)
+}
+
 impl Lifecycle {
     fn shared_spec(file: &EnvironmentsFile, name: &str) -> Result<SharedSpec, LifecycleError> {
         file.shared

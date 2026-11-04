@@ -86,6 +86,14 @@ path. Ambiguous outcomes
 never trigger a local fallback or an automatic retry; recovery and deadline
 semantics are specified in [broker-service.md](broker-service.md).
 
+`aethyme env shared preview <name> [--wait <seconds>] [--json]` starts the
+checkout's `[[shared]]` profile as a separately owned worktree environment.
+Its `aethyme.env-shared/v1` output adds `preview: true` and `shared_name`,
+alongside the environment ID and URLs. It does not change the host's serving
+shared alias; remove the preview with `aethyme env down <id>`. Preview uses
+checkout contents, including uncommitted edits, and refuses profiles that
+themselves require shared environments.
+
 The dependent discovery phase adds `service directory <private-service-root>
 --jobs-for <repository> [--json]`. Both output modes emit one object:
 `schema_version: 1`, `directory`, and the full `repository` identity (`key`,
