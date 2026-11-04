@@ -75,5 +75,6 @@ pub use report_filing::{
 // Test fixtures the core gates behind its own `cfg(test)`, so they are compiled
 // into this crate's test binary from the same file instead of shipping.
 #[cfg(test)]
+#[allow(dead_code)]
 #[path = "../../aethyme-broker/src/test_storage.rs"]
 mod test_storage;

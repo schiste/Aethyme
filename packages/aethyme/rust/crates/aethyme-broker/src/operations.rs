@@ -3453,8 +3453,8 @@ mod git_scopes;
 mod push_and_coordinated;
 mod redaction;
 pub use push_and_coordinated::github_command;
-pub use push_and_coordinated::{is_within, worktree_relative_push_sources};
 use push_and_coordinated::{is_github_pull_request_merge, provider_command};
+pub use push_and_coordinated::{is_within, worktree_relative_push_sources};
 
 #[cfg(test)]
 mod git_storage_maintenance_tests {

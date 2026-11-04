@@ -21,7 +21,6 @@
 //!   sessions, stress-tested at 20 (see `tests/stress.rs`).
 
 #[doc(hidden)]
-
 pub mod advisories;
 pub mod analysis_view;
 mod archive_cleanup;
@@ -171,14 +170,6 @@ pub mod waiters;
 pub use waiters::{CurrentWaiter, WaitRecord};
 pub mod lease_liveness;
 pub mod lease_requests;
-pub mod session_holder;
-mod test_storage;
-#[doc(hidden)]
-pub mod text_redaction;
-#[doc(hidden)]
-pub mod unpushed;
-pub mod worktree_location;
-mod worktree_report;
 mod outcome_issues;
 mod outcome_report;
 mod pr_projection;
@@ -198,6 +189,14 @@ mod remote_target;
 mod removal;
 pub mod renamed_targets;
 mod repo_watch;
+pub mod session_holder;
+mod test_storage;
+#[doc(hidden)]
+pub mod text_redaction;
+#[doc(hidden)]
+pub mod unpushed;
+pub mod worktree_location;
+mod worktree_report;
 pub use chau7_tabs::{
     Chau7DispatchAction, Chau7Resolution, Chau7ResolutionRefusal, Chau7Tab, Chau7TabReadiness,
     dispatch_action, resolve_session_tab, workspace_tab_ids,
@@ -691,10 +690,9 @@ pub use worktree_report::{
     build_with as build_worktree_report_with,
 };
 
-#[doc(hidden)]
-
-pub mod resource_pressure;
 mod gate_cache_gc;
+#[doc(hidden)]
+pub mod resource_pressure;
 mod storage;
 pub use storage::{
     STORAGE_ATTRIBUTION_SCHEMA_VERSION, STORAGE_PLAN_SCHEMA_VERSION,

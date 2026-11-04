@@ -42,11 +42,7 @@ pub(crate) fn directory_size_without_following_links(path: &Path) -> std::io::Re
 /// outlives the walk that produced it, and there is no way to tell it apart
 /// from a real one afterwards. A routine check that cannot finish a
 /// measurement learns nothing, which is the honest outcome.
-pub fn plural_word(
-    count: usize,
-    singular: &'static str,
-    plural: &'static str,
-) -> &'static str {
+pub fn plural_word(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
     if count == 1 { singular } else { plural }
 }
 

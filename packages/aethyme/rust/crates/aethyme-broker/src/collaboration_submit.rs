@@ -471,7 +471,7 @@ type OpenStore<'a> =
 
 /// An advisory capture of the commit a submit pinned, against the base it
 /// verified against.
-pub(crate) struct AdvisoryCapture {
+pub struct AdvisoryCapture {
     capture: SubmitCapture,
     base: String,
     head: String,

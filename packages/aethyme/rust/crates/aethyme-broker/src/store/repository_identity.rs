@@ -89,9 +89,7 @@ impl RepositoryBindingScope {
 }
 
 /// Read the UUID without repairing, creating, or removing any marker entry.
-pub fn read_repository_uuid_marker(
-    git_common_dir: &Path,
-) -> Result<Option<String>, BrokerError> {
+pub fn read_repository_uuid_marker(git_common_dir: &Path) -> Result<Option<String>, BrokerError> {
     #[cfg(unix)]
     {
         let (directory, identity) = open_verified_directory(git_common_dir)?;

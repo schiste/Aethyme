@@ -10950,7 +10950,9 @@ mod unbound_preparation_cache_open_tests {
         std::fs::create_dir_all(database.parent().unwrap()).unwrap();
         rusqlite::Connection::open(&database)
             .unwrap()
-            .execute_batch(include_str!("../../../aethyme-broker-cli/tests/fixtures/v028-schema52.sql"))
+            .execute_batch(include_str!(
+                "../../../aethyme-broker-cli/tests/fixtures/v028-schema52.sql"
+            ))
             .unwrap();
         let storage = crate::test_storage::TestStorage::new();
         let cache_root = storage.root().join("preparation-cache");

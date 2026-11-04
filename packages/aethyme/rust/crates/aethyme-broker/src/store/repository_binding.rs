@@ -18,7 +18,7 @@ const BOOTSTRAP_NONCE_HEX_BYTES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum RepositoryWorktreeBindingState {
+pub enum RepositoryWorktreeBindingState {
     LegacyUnbound,
     FreshUnbound,
     FreshReserved,
@@ -97,7 +97,7 @@ pub struct RepositoryWorktreeBinding {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum RepositoryWorktreeBindingOrigin {
+pub enum RepositoryWorktreeBindingOrigin {
     Legacy,
     Fresh,
 }
@@ -202,9 +202,7 @@ impl BrokerStore {
     /// Read the binding record selected by this store's captured repository scope.
     /// Missing or malformed evidence is a recovery condition; callers must not
     /// infer a root from current configuration.
-    pub fn repository_worktree_binding(
-        &self,
-    ) -> Result<RepositoryWorktreeBinding, BrokerError> {
+    pub fn repository_worktree_binding(&self) -> Result<RepositoryWorktreeBinding, BrokerError> {
         read_repository_worktree_binding(&self.conn, self.binding_scope.as_ref())
     }
 

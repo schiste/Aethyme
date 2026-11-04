@@ -328,9 +328,7 @@ pub fn response_use(store: &CollaborationStore) -> Result<ResponseUse, Sensitive
 /// Hold the existing response barrier without creating or modifying files.
 /// Peer-project verification uses this so a read never initializes that
 /// project's state as a side effect.
-pub fn response_use_read_only(
-    store: &CollaborationStore,
-) -> Result<ResponseUse, SensitiveError> {
+pub fn response_use_read_only(store: &CollaborationStore) -> Result<ResponseUse, SensitiveError> {
     let path = lock_path(store);
     if let Some(state) = RESPONSE_READERS.with(|readers| readers.borrow().get(&path).cloned()) {
         state.count.set(state.count.get().saturating_add(1));
@@ -398,9 +396,7 @@ pub(crate) fn response_use_for_view_hold_release(
 /// Hold the same barrier when a long-lived reader has only retained its
 /// immutable project directory. This is used by analysis readers, which cannot
 /// own a CollaborationStore or retain a !Send guard between calls.
-pub fn response_use_for_project_dir(
-    project_dir: &Path,
-) -> Result<ResponseUse, SensitiveError> {
+pub fn response_use_for_project_dir(project_dir: &Path) -> Result<ResponseUse, SensitiveError> {
     let project_key = project_dir
         .file_name()
         .and_then(|name| name.to_str())

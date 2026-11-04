@@ -122,7 +122,7 @@ pub enum SessionOperationGuard {
 }
 
 #[derive(Debug)]
-pub(crate) struct SharedSessionOperationLock {
+pub struct SharedSessionOperationLock {
     _file: File,
 }
 

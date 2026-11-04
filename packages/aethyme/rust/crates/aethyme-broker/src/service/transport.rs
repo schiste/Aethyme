@@ -193,11 +193,7 @@ impl Server {
         self.serve_requests_until(stop, None, None)
     }
 
-    pub fn serve_jobs_until(
-        &self,
-        stop: &AtomicBool,
-        jobs: Arc<JobRuntime>,
-    ) -> io::Result<()> {
+    pub fn serve_jobs_until(&self, stop: &AtomicBool, jobs: Arc<JobRuntime>) -> io::Result<()> {
         let worker_stop = AtomicBool::new(false);
         struct StopOnDrop<'a>(&'a AtomicBool);
         impl Drop for StopOnDrop<'_> {

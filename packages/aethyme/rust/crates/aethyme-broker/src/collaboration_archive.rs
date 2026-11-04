@@ -518,10 +518,7 @@ fn new_temporary(store: &CollaborationStore) -> Result<tempfile::NamedTempFile, 
 }
 
 /// Store `bytes` and return their name.
-pub fn put_object(
-    store: &CollaborationStore,
-    bytes: &[u8],
-) -> Result<ObjectDigest, ArchiveError> {
+pub fn put_object(store: &CollaborationStore, bytes: &[u8]) -> Result<ObjectDigest, ArchiveError> {
     let _response = crate::collaboration_sensitive::response_use(store)?;
     let mut temporary = new_temporary(store)?;
     let path = temporary.path().to_path_buf();

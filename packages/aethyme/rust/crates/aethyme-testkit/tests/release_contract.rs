@@ -518,8 +518,9 @@ fn release_workflow_renders_the_homebrew_formula_from_the_manifest() {
             .contains("if: matrix.target == 'x86_64-unknown-linux-gnu'")
     );
     assert!(
-        helper_build
-            .contains("-p aethyme-broker-cli --example release_manifest --example homebrew_formula")
+        helper_build.contains(
+            "-p aethyme-broker-cli --example release_manifest --example homebrew_formula"
+        )
     );
     assert!(
         helper_build.contains("printf '%s\\n' \"$GITHUB_SHA\" > \"$helper_stage_dir/source.sha\"")

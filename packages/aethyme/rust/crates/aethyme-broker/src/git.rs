@@ -9627,11 +9627,7 @@ impl GitRepo {
     /// Zero-context patch of `path` from `base` to the working tree, so
     /// uncommitted edits count. Read by the agent hook to describe where
     /// another session is changing a file; only the `@@` headers are used.
-    pub fn working_zero_context_diff(
-        &self,
-        base: &str,
-        path: &str,
-    ) -> Result<String, GitError> {
+    pub fn working_zero_context_diff(&self, base: &str, path: &str) -> Result<String, GitError> {
         run_git(
             &self.root,
             &[
