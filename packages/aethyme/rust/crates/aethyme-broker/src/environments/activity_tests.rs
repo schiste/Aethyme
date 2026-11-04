@@ -303,7 +303,7 @@ fn a_non_directory_busy_path_is_not_reported_as_idle() {
 #[test]
 fn probes_keep_it_awake_and_a_hung_probe_counts_as_active() {
     let host = Host::new();
-    for (probe, active) in [("true", true), ("false", false), ("sleep 30", true)] {
+    for (probe, active) in [("true", true), ("false", false), ("exit 2", true), ("sleep 30", true)] {
         let (mut lifecycle, id, _w) = up(&host, &profile(Some(probe)));
         let record = lifecycle.store.get(&id).unwrap().unwrap();
         let state = lifecycle.idleness(&record, now_ms() + LATER, true);

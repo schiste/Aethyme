@@ -13,8 +13,8 @@
 //!   life of its command. An environment with a live marker is never idle,
 //!   however old its last touch.
 //! - **activity probes**: a component's `activity_probe` command exits 0
-//!   when there is activity. A probe that fails to run or times out counts as
-//!   active: failing toward staying up.
+//!   when there is activity, and exits 1 when idle. Other exit codes, signals,
+//!   timeouts and execution failures count as active: failing toward staying up.
 //!
 //! The supervisor parks an `active`, unpinned environment with no live busy
 //! marker whose last activity is older than its `idle_seconds`.
@@ -439,7 +439,7 @@ impl super::lifecycle::Lifecycle {
     }
 
     /// Run each component's `activity_probe`. Exit 0 means active; a probe
-    /// that cannot run, times out or overflows counts as active too.
+    /// exiting 1 means idle. Other failures keep the environment awake.
     fn probe_active(&self, record: &super::store::EnvironmentRecord) -> bool {
         let Ok(bindings) = self.bindings_for(record) else {
             return true;
@@ -458,7 +458,15 @@ impl super::lifecycle::Lifecycle {
                 64 * 1024,
             ) {
                 Ok(crate::bounded_output::LimitedOutput::Completed(output))
-                    if !output.status.success() => {}
+                    if output.status.code() == Some(1) => {}
+                Ok(crate::bounded_output::LimitedOutput::Completed(output))
+                    if !output.status.success() => {
+                        eprintln!(
+                            "warning: activity probe for {} failed ({})",
+                            component.name, output.status
+                        );
+                        return true;
+                    }
                 _ => return true,
             }
         }
