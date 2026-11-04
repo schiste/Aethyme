@@ -1,6 +1,6 @@
 exit: 0
 --- stdout
-  aethyme broker gc plan [--include-active-gate-cache] [--full-scan] [--json]
+  aethyme broker gc plan [--include-active-gate-cache] [--exclude-orphans] [--full-scan] [--json]
   aethyme broker gc plan --service-directory <directory> --request-key <key> --deadline-ms <utc-ms> [--include-active-gate-cache] [--full-scan] [--json]
       The explicit service form verifies this repository's owner, submits or
       joins durable planning and prints the same plan. All three service
@@ -17,8 +17,9 @@ exit: 0
       inventory is deferred by default because verifying its bundles can be
       expensive. --full-scan removes the default 10-second time budget and
       artifact-discovery entry cap; discovery still stops at six directory
-      levels.
-  aethyme broker gc apply --confirm <sha256> [--include-active-gate-cache] [--full-scan] [--json]
+      levels. --exclude-orphans omits orphan roots entirely, allowing other
+      cleanup when root ownership cannot be established.
+  aethyme broker gc apply --confirm <sha256> [--include-active-gate-cache] [--exclude-orphans] [--full-scan] [--json]
       Apply or resume the exact reviewed plan under an exclusive lock. A
       recovery journal makes interrupted row, file, and worktree cleanup safe.
       Pass the same --include-active-gate-cache and --full-scan options used

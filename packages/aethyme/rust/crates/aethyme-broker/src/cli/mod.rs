@@ -922,7 +922,7 @@ Usage:
       later plan. --session scopes both to one session's worktree. Nothing
       here is recreated for you: a reclaimed worktree pays a cold build next
       time.
-  aethyme broker gc plan [--include-active-gate-cache] [--full-scan] [--json]
+  aethyme broker gc plan [--include-active-gate-cache] [--exclude-orphans] [--full-scan] [--json]
   aethyme broker gc plan --service-directory <directory> --request-key <key> --deadline-ms <utc-ms> [--include-active-gate-cache] [--full-scan] [--json]
       The explicit service form verifies this repository's owner, submits or
       joins durable planning and prints the same plan. All three service
@@ -939,8 +939,9 @@ Usage:
       inventory is deferred by default because verifying its bundles can be
       expensive. --full-scan removes the default 10-second time budget and
       artifact-discovery entry cap; discovery still stops at six directory
-      levels.
-  aethyme broker gc apply --confirm <sha256> [--include-active-gate-cache] [--full-scan] [--json]
+      levels. --exclude-orphans omits orphan roots entirely, allowing other
+      cleanup when root ownership cannot be established.
+  aethyme broker gc apply --confirm <sha256> [--include-active-gate-cache] [--exclude-orphans] [--full-scan] [--json]
       Apply or resume the exact reviewed plan under an exclusive lock. A
       recovery journal makes interrupted row, file, and worktree cleanup safe.
       Pass the same --include-active-gate-cache and --full-scan options used
@@ -1741,6 +1742,7 @@ struct Parsed {
     apply: bool,
     dry_run: bool,
     include_active_gate_cache: bool,
+    exclude_orphans: bool,
     /// `gc plan`/`gc apply`: request exhaustive inventory instead of the
     /// default deadline-bound operator scan.
     full_scan: bool,
@@ -1904,6 +1906,7 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         apply: false,
         dry_run: false,
         include_active_gate_cache: false,
+        exclude_orphans: false,
         full_scan: false,
         service_directory: None,
         request_key: None,
@@ -1996,6 +1999,7 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
             "--apply" => parsed.apply = true,
             "--dry-run" => parsed.dry_run = true,
             "--include-active-gate-cache" => parsed.include_active_gate_cache = true,
+            "--exclude-orphans" => parsed.exclude_orphans = true,
             "--full-scan" => parsed.full_scan = true,
             "--service-directory" | "--request-key" | "--deadline-ms" => {
                 if parsed
