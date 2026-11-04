@@ -4,6 +4,29 @@ use super::*;
 
 pub(super) const HOST_RESOURCE_INPUT_MAX_BYTES: u64 = 1024 * 1024;
 
+// Progress is advisory: a disconnected caller must not terminate the
+// supervisor while its child still owns resources.
+fn write_resource_run_event(
+    mut writer: impl std::io::Write,
+    json: bool,
+    request_id: &str,
+    message: &str,
+) {
+    if json {
+        let _ = writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "type": "resource_run_event",
+                "request_id": request_id,
+                "message": message,
+            })
+        );
+    } else {
+        let _ = writeln!(writer, "resource run: {message}");
+    }
+}
+
 fn record_resource_run_phase(
     phase_timings_ms: &mut std::collections::BTreeMap<String, u128>,
     phase: &'static str,
@@ -1244,18 +1267,12 @@ pub(super) fn run_resources(parsed: Parsed) -> Result<(), UsageError> {
                 &cwd,
                 |_grant| Ok(std::collections::BTreeMap::new()),
                 |message| {
-                    if json {
-                        eprintln!(
-                            "{}",
-                            serde_json::json!({
-                                "type": "resource_run_event",
-                                "request_id": request.request_id,
-                                "message": message,
-                            })
-                        );
-                    } else {
-                        eprintln!("resource run: {message}");
-                    }
+                    write_resource_run_event(
+                        std::io::stderr().lock(),
+                        json,
+                        &request.request_id,
+                        message,
+                    );
                 },
                 |phase, duration_ms| {
                     record_resource_run_phase(&mut phase_timings_ms, phase, duration_ms)
@@ -1480,6 +1497,21 @@ mod tests {
             "{error:?}"
         );
         assert!(super::read_resource_json::<serde_json::Value>(dir.path()).is_err());
+    }
+
+    #[test]
+    fn disconnected_progress_reader_does_not_abort_supervision() {
+        struct Disconnected;
+        impl std::io::Write for Disconnected {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        super::write_resource_run_event(Disconnected, false, "request", "running");
+        super::write_resource_run_event(Disconnected, true, "request", "running");
     }
 
     #[test]
