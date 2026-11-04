@@ -306,6 +306,7 @@ fn probes_keep_it_awake_and_a_hung_probe_counts_as_active() {
     for (probe, active) in [
         ("true", true),
         ("false", false),
+        ("echo broken >&2; exit 1", true),
         ("exit 2", true),
         ("sleep 30", true),
     ] {
