@@ -764,7 +764,7 @@ fn observe_fresh_root_registry_locked(
         )
         .map_err(invalid)?;
         connection
-            .busy_timeout(Duration::from_millis(25))
+            .busy_timeout(REGISTRY_BUSY_TIMEOUT)
             .map_err(invalid)?;
         let version: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -1393,18 +1393,27 @@ fn registration_lock(
     }
 }
 
+/// How long a registry connection waits for another process's write. The
+/// registry is host-wide and writes with `synchronous=FULL` under DELETE
+/// journaling, so a reader is locked out across a whole fsync. A 25 ms wait
+/// turned that into "cannot verify worktree-root registration: database is
+/// locked", refusing broker commands and failing tests on main. This matches
+/// `store.rs`; a caller with its own time budget passes less, as `inventory` does.
+const REGISTRY_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn open_registry(host_database: &Path, create: bool) -> io::Result<Connection> {
-    open_registry_with_mode(host_database, create, create)
+    open_registry_with_mode(host_database, create, create, REGISTRY_BUSY_TIMEOUT)
 }
 
 fn open_existing_registry_for_write(host_database: &Path) -> io::Result<Connection> {
-    open_registry_with_mode(host_database, false, true)
+    open_registry_with_mode(host_database, false, true, REGISTRY_BUSY_TIMEOUT)
 }
 
 fn open_registry_with_mode(
     host_database: &Path,
     create: bool,
     writable: bool,
+    busy_timeout: Duration,
 ) -> io::Result<Connection> {
     let path = registry_path(host_database)?;
     if create {
@@ -1449,9 +1458,7 @@ fn open_registry_with_mode(
         OpenFlags::SQLITE_OPEN_READ_ONLY
     } | OpenFlags::SQLITE_OPEN_NOFOLLOW;
     let connection = Connection::open_with_flags(&path, flags).map_err(invalid)?;
-    connection
-        .busy_timeout(Duration::from_millis(25))
-        .map_err(invalid)?;
+    connection.busy_timeout(busy_timeout).map_err(invalid)?;
     if create {
         // The registry itself must not become another unbounded artifact.
         // DELETE journaling avoids WAL growth pinned by a slow inventory reader.
@@ -2340,7 +2347,14 @@ pub(crate) fn inventory(host_database: &Path, deadline: Option<Instant>) -> Inve
         ..Inventory::default()
     };
     let inspected = (|| -> io::Result<()> {
-        let connection = open_registry(host_database, false)?;
+        // Chosen before opening: the open itself reads the schema version, so
+        // narrowing the wait afterwards would already have spent it.
+        let busy_timeout = deadline.map_or(REGISTRY_BUSY_TIMEOUT, |deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(REGISTRY_BUSY_TIMEOUT)
+        });
+        let connection = open_registry_with_mode(host_database, false, false, busy_timeout)?;
         let mut cursor = String::new();
         let mut bytes = 0;
         let mut count = 0;
@@ -2892,6 +2906,52 @@ mod tests {
                     .expect("contention observer must remain alive");
             }
         });
+    }
+
+    #[test]
+    fn a_brief_registry_write_does_not_fail_a_registration_check() {
+        let fixture = Fixture::new();
+        let planned = fixture._owned.path().join("held");
+        let admission = admit_with_limit(&fixture.database, &planned, 1).unwrap();
+        let (root, owner) = fixture.root("held");
+        admission
+            .record(&root, &owner, WorktreeRootSource::LibraryOverride)
+            .unwrap();
+
+        // Another process's FULL-synchronous write holds this lock across an
+        // fsync, which on a CI disk outlasted the old 25 ms wait.
+        let holder = open_existing_registry_for_write(&fixture.database).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            holder.execute_batch("COMMIT;").unwrap();
+        });
+        let source = registered_source(&fixture.database, &root, &owner);
+        writer.join().unwrap();
+        assert!(
+            matches!(source, Ok(WorktreeRootSource::LibraryOverride)),
+            "{source:?}"
+        );
+    }
+
+    #[test]
+    fn a_budgeted_inventory_does_not_wait_past_its_deadline_for_the_lock() {
+        let fixture = Fixture::new();
+        let planned = fixture._owned.path().join("held");
+        let admission = admit_with_limit(&fixture.database, &planned, 1).unwrap();
+        let (root, owner) = fixture.root("held");
+        admission
+            .record(&root, &owner, WorktreeRootSource::LibraryOverride)
+            .unwrap();
+
+        let holder = open_existing_registry_for_write(&fixture.database).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let started = Instant::now();
+        let result = inventory(&fixture.database, Some(started + Duration::from_millis(50)));
+        let waited = started.elapsed();
+        holder.execute_batch("COMMIT;").unwrap();
+        assert!(!result.complete, "the held lock must leave it incomplete");
+        assert!(waited < Duration::from_secs(2), "waited {waited:?}");
     }
 
     struct Fixture {
