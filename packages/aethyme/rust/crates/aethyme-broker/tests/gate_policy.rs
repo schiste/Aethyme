@@ -324,6 +324,91 @@ esac
     }
 }
 
+/// A host dedicated to the gates raises every Rust gate's bounds through their own
+/// settings. Generic Cargo and nextest variables still cannot raise them.
+#[test]
+#[cfg(unix)]
+fn only_the_gate_settings_raise_the_rust_gate_workers() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    fs::write(
+        &cargo,
+        "#!/bin/sh\nprintf '%s\\t%s\\t%s\\t%s\\n' \"$CARGO_BUILD_JOBS\" \"$RUST_TEST_THREADS\" \"$NEXTEST_TEST_THREADS\" \"$*\" >> \"$MOCK_EVENTS\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o700)).unwrap();
+    let git = bin.join("git");
+    fs::write(
+        &git,
+        "#!/bin/sh\nprintf '0000000000000000000000000000000000000000\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
+    let events = root.join("events");
+    let gates = load_gates(&repo_root()).unwrap();
+    let run = |name: &str, settings: &[(&str, &str)]| {
+        fs::write(&events, "").unwrap();
+        let gate = gates.iter().find(|gate| gate.name == name).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", &gate.command])
+            .current_dir(root)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("AETHYME_GATE_CACHE_DIR", root.join("cache"))
+            // The main-branch gate job sets these for its own run.
+            .env_remove("AETHYME_GATE_BUILD_JOBS")
+            .env_remove("AETHYME_GATE_TEST_THREADS")
+            .env("CARGO_BUILD_JOBS", "99")
+            .env("RUST_TEST_THREADS", "99")
+            .env("NEXTEST_TEST_THREADS", "99")
+            .env("MOCK_EVENTS", &events);
+        for (name, value) in settings {
+            command.env(name, value);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::read_to_string(&events).unwrap()
+    };
+    let dedicated = [
+        ("AETHYME_GATE_BUILD_JOBS", "4"),
+        ("AETHYME_GATE_TEST_THREADS", "4"),
+    ];
+
+    let raised = run("cargo-test", &dedicated);
+    assert!(raised.contains("--build-jobs 4"));
+    let bounded = run("cargo-test", &[]);
+    assert!(bounded.contains("--build-jobs 1"));
+
+    for name in [
+        "fast-guards",
+        "cargo-test",
+        "script-contract",
+        "workflow-contract",
+        "gate-policy",
+        "cross-process-contract",
+    ] {
+        let raised = run(name, &dedicated);
+        assert!(!raised.is_empty(), "{name} must execute Cargo");
+        assert!(
+            raised.lines().all(|line| line.starts_with("4\t4\t4\t")),
+            "{name} ignored the gate settings: {raised}"
+        );
+        let bounded = run(name, &[]);
+        assert!(
+            bounded.lines().all(|line| line.starts_with("1\t2\t2\t")),
+            "{name} inherited unbounded workers: {bounded}"
+        );
+    }
+}
+
 /// Run the shipped shell commands against recording tools. A hostile inherited
 /// environment must not undo local resource bounds; no real build runs here.
 #[test]
@@ -384,6 +469,9 @@ esac
                     .current_dir(root)
                     .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
                     .env("AETHYME_GATE_CACHE_DIR", root.join("cache"))
+                    // The main-branch gate job sets these for its own run.
+                    .env_remove("AETHYME_GATE_BUILD_JOBS")
+                    .env_remove("AETHYME_GATE_TEST_THREADS")
                     .env("CARGO_BUILD_JOBS", "99")
                     .env("RUST_TEST_THREADS", "99")
                     .env("NEXTEST_TEST_THREADS", "99")
