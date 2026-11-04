@@ -17,6 +17,10 @@
 //! fails when a `tests/*.rs` file is neither listed here nor its own target,
 //! because `autotests = false` would otherwise skip it silently.
 
+// Suites load shared helper files with their own `mod` declarations, as they
+// did when each was a crate root, so each suite keeps a private copy.
+#![allow(clippy::duplicate_mod)]
+
 #[path = "adopt_cli.rs"]
 mod adopt_cli;
 #[path = "advisories_cli.rs"]
