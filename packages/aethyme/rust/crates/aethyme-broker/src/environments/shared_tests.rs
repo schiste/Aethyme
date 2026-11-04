@@ -1064,7 +1064,7 @@ fn route_snapshot_rebuilds_when_new_serving_owner_appears_after_initial_list() {
         return;
     }
     let host = Host::new();
-    let repo = repository(43901);
+    let repo = repository(44050);
     let none = HostEnvironmentsFile::default();
     let mut lifecycle = host.lifecycle();
     let blue = up_baseline(&mut lifecycle, repo.path());
@@ -1149,7 +1149,7 @@ fn blue_green_publishes_current_owner_before_starting_second_slot() {
         return;
     }
     let host = Host::new();
-    let repo = repository(43902);
+    let repo = repository(44100);
     let none = HostEnvironmentsFile::default();
     let mut lifecycle = host.lifecycle();
     let blue = up_baseline(&mut lifecycle, repo.path());
@@ -1203,7 +1203,7 @@ fn shared_ref_change_replaces_stale_serving_owner_before_sync_cleanup() {
         return;
     }
     let host = Host::new();
-    let repo = repository(43903);
+    let repo = repository(44150);
     let none = HostEnvironmentsFile::default();
     let mut lifecycle = host.lifecycle();
     let blue = up_baseline(&mut lifecycle, repo.path());
@@ -1491,5 +1491,57 @@ fn a_shared_environment_on_inputs_ignores_unrelated_commits() {
                 .unwrap();
             break;
         }
+    }
+}
+
+/// Tests in these files bind real loopback ports from fixed ranges, and each
+/// test has its own host database, so only disjoint ranges keep parallel tests
+/// apart. Three ranges here once started inside the 43900 test's range, and
+/// `route_snapshot_rebuilds_when_new_serving_owner_appears_after_initial_list`
+/// failed in CI with "Address already in use" when it ran beside that test.
+/// The same start in the same file is one range (one test may reuse its own).
+#[test]
+fn fixed_port_ranges_of_parallel_environment_tests_are_disjoint() {
+    let sources = [
+        (
+            "shared_tests.rs",
+            include_str!("shared_tests.rs"),
+            "repository(",
+            50,
+        ),
+        ("proxy_tests.rs", include_str!("proxy_tests.rs"), "web(", 50),
+        (
+            "park_tests.rs",
+            include_str!("park_tests.rs"),
+            "one_unit(",
+            20,
+        ),
+    ];
+    let mut ranges = std::collections::BTreeSet::new();
+    for (file, text, call, width) in sources {
+        assert!(
+            text.contains(&format!("end = port_start + {}", width - 1)),
+            "{file}: its port helper no longer spans {width} ports; update this guard"
+        );
+        for (index, _) in text.match_indices(call) {
+            let rest = &text[index + call.len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if !digits.is_empty() && rest[digits.len()..].starts_with(')') {
+                let start: u32 = digits.parse().unwrap();
+                ranges.insert((start, start + width - 1, file));
+            }
+        }
+    }
+    let ranges: Vec<_> = ranges.into_iter().collect();
+    assert!(
+        ranges.len() > 20,
+        "the guard found too few ranges: {ranges:?}"
+    );
+    for pair in ranges.windows(2) {
+        let ((start, end, file), (next_start, next_end, next_file)) = (pair[0], pair[1]);
+        assert!(
+            end < next_start,
+            "{file} range {start}..={end} overlaps {next_file} range {next_start}..={next_end}"
+        );
     }
 }
