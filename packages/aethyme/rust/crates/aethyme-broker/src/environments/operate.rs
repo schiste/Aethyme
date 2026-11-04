@@ -124,6 +124,10 @@ fn describe(lifecycle: &Lifecycle, record: &EnvironmentRecord) -> (Value, String
     variables.insert("AETHYME_ENV_ID".into(), json!(record.env_id));
     if let Some(namespace) = &record.namespace {
         variables.insert("AETHYME_ENV_NAMESPACE".into(), json!(namespace));
+        variables.insert(
+            "AETHYME_ENV_COMPOSE_PROJECT".into(),
+            json!(super::drivers::project_name(namespace)),
+        );
     }
     let mut text = format!(
         "environment {} ({}) is {}\n",
