@@ -460,13 +460,14 @@ impl super::lifecycle::Lifecycle {
                 Ok(crate::bounded_output::LimitedOutput::Completed(output))
                     if output.status.code() == Some(1) => {}
                 Ok(crate::bounded_output::LimitedOutput::Completed(output))
-                    if !output.status.success() => {
-                        eprintln!(
-                            "warning: activity probe for {} failed ({})",
-                            component.name, output.status
-                        );
-                        return true;
-                    }
+                    if !output.status.success() =>
+                {
+                    eprintln!(
+                        "warning: activity probe for {} failed ({})",
+                        component.name, output.status
+                    );
+                    return true;
+                }
                 _ => return true,
             }
         }
