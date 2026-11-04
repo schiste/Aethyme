@@ -197,6 +197,10 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("quality-report", &["--repo", "--pr", "--session"]),
     ("issues sub-issue", &["--repo", "--session", "--reason"]),
     (
+        "issues apply",
+        &["--repo", "--session", "--reason", "--dry-run"],
+    ),
+    (
         "issues upsert",
         &[
             "--repo",
