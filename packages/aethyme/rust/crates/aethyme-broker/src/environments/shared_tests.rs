@@ -135,6 +135,20 @@ fn python_available() -> bool {
 const REPOSITORY: &str = "repo-shared";
 
 #[test]
+fn shared_preview_accepts_a_wait_timeout() {
+    let options = super::cli::parse_options(
+        "shared",
+        &[
+            "preview".into(),
+            "baseline".into(),
+            "--wait".into(),
+            "42".into(),
+        ],
+    );
+    assert_eq!(options.ok().unwrap().wait_seconds, 42);
+}
+
+#[test]
 fn unmerged_shared_preview_is_worktree_owned_and_preserves_serving_baseline() {
     if !python_available() {
         eprintln!("SKIP shared preview: python3 not available");

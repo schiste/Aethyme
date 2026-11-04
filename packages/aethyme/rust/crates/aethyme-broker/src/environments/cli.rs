@@ -386,7 +386,7 @@ pub(super) fn parse_options(command: &str, rest: &[String]) -> Result<Options, F
                         .ok_or_else(|| usage("--repo needs a path".into()))?,
                 ))
             }
-            "--wait" if matches!(command, "up" | "wake") => {
+            "--wait" if matches!(command, "up" | "wake" | "shared") => {
                 options.wait_seconds = number(args.next(), "--wait")? as u64
             }
             "--reconfigure" if command == "up" => options.reconfigure = true,
