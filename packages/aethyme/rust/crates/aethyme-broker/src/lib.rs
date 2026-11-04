@@ -84,7 +84,8 @@ mod external_events;
 #[doc(hidden)]
 pub mod file_lock;
 mod gate_admission;
-mod gate_database;
+#[doc(hidden)]
+pub mod gate_database;
 #[doc(hidden)]
 pub mod outbox;
 pub use gate_database::GateBrokerDatabase;
@@ -705,6 +706,18 @@ pub use storage::{
     StorageRecoveryArchiveGroup, StorageRoot, StorageSource, StorageSummary, storage_apply,
     storage_attribute, storage_plan,
 };
+
+mod graph_impact_envelope;
+pub mod local_exchange;
+pub mod local_generation;
+pub mod local_handoff;
+pub mod local_restore;
+pub use graph_impact_envelope::{UnbindableImpactReport, impact_analysis_envelope};
+
+pub mod collaboration_cli;
+
+#[allow(dead_code)]
+pub mod experimental_symbol_mapping;
 
 /// Repo-relative location of the broker database.
 pub const BROKER_DB_RELPATH: &str = ".aethyme/broker.db";

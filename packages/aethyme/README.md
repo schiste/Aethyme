@@ -21,7 +21,7 @@ It owns:
 4. scorecard analysis
 5. controlled autofix tooling from the CLI
 6. deterministic navigation primitives for AI agents
-7. agent broker + certification (`rust/crates/aethyme-broker`)
+7. agent broker + certification (`rust/crates/aethyme-broker`, `rust/crates/aethyme-broker-cli`)
 
 ## Public Product Model
 

@@ -905,7 +905,7 @@ impl BrokerStore {
         &self.conn
     }
 
-    pub(crate) fn connection_mut(&mut self) -> &mut Connection {
+    pub fn connection_mut(&mut self) -> &mut Connection {
         &mut self.conn
     }
 

@@ -1132,12 +1132,12 @@ pub struct WorktreeRootPlan {
 /// broker, but cannot affect work already done during open.
 #[derive(Debug, Clone, Default)]
 pub struct BrokerOpenOptions {
-    pub(crate) host_state_dir: Option<PathBuf>,
-    pub(crate) host_cache_dir: Option<PathBuf>,
-    pub(crate) preparation_cache_root: Option<PathBuf>,
-    pub(crate) host_operation_db_path: Option<PathBuf>,
-    pub(crate) worktree_root: Option<PathBuf>,
-    pub(crate) collaboration_state_dir: Option<PathBuf>,
+    pub host_state_dir: Option<PathBuf>,
+    pub host_cache_dir: Option<PathBuf>,
+    pub preparation_cache_root: Option<PathBuf>,
+    pub host_operation_db_path: Option<PathBuf>,
+    pub worktree_root: Option<PathBuf>,
+    pub collaboration_state_dir: Option<PathBuf>,
 }
 
 impl BrokerOpenOptions {

@@ -424,7 +424,7 @@ fn main_with_args(args: &[String]) -> ExitCode {
         "plugin" => ExitCode::from(aethyme_broker_cli::plugin_cli::run(&args[1..])),
         // Opt-in Local collaboration (#680). Disabled unless the repository's
         // [collaboration] policy enables it; nothing runs in the background.
-        "collab" => ExitCode::from(aethyme_broker_cli::collaboration_cli::run(&args[1..])),
+        "collab" => ExitCode::from(aethyme_broker::collaboration_cli::run(&args[1..])),
         // Declared runnable environments per worktree (#1208). Profiles,
         // validation and plans are read-only (#1209).
         "env" => ExitCode::from(aethyme_broker::environments::cli::run(&args[1..])),
@@ -786,7 +786,7 @@ fn answer_help(route: help::HelpRoute, args: &[String]) -> ExitCode {
                 "autofix" => aethyme_quality::autofix_cli::run(rest),
                 "deploy" => repository_deploy::run(rest),
                 "upgrade" => repository_upgrade::run(rest),
-                "collab" => aethyme_broker_cli::collaboration_cli::run(rest),
+                "collab" => aethyme_broker::collaboration_cli::run(rest),
                 "env" => aethyme_broker::environments::cli::run(rest),
                 other => {
                     eprintln!("Error: no help route for {other}");

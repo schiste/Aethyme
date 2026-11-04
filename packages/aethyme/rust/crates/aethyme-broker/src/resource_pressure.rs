@@ -148,7 +148,7 @@ impl MemorySnapshot {
 }
 
 impl Report {
-    pub(crate) fn over_budget(session_count: usize) -> Self {
+    pub fn over_budget(session_count: usize) -> Self {
         Self {
             schema: "aethyme.resource-pressure/v1",
             observation: "read_only_not_cleanup_authority",

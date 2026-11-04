@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use aethyme_testkit::rust_workspace_root;
 
-/// `let _ =` sites in aethyme-broker production code (outside `#[cfg(test)]`
+/// `let _ =` sites in broker production code, across `aethyme-broker` and
+/// `aethyme-broker-cli` (outside `#[cfg(test)]`
 /// items) after the P2.13 audit. Each remaining site is either infallible
 /// (`write!` into a `String`), best-effort cleanup (temporary files, killing a
 /// finished child, closing), or documented at the site as intentional.
@@ -122,9 +123,11 @@ fn is_test_module_file(path: &Path, test_modules: &[PathBuf]) -> bool {
 #[test]
 fn broker_production_code_does_not_discard_more_results() {
     let workspace = rust_workspace_root();
-    let source = workspace.join("crates/aethyme-broker/src");
     let mut files = Vec::new();
-    rust_files_under(&source, &mut files);
+    for crate_name in ["aethyme-broker", "aethyme-broker-cli"] {
+        let source = workspace.join("crates").join(crate_name).join("src");
+        rust_files_under(&source, &mut files);
+    }
     files.sort();
     assert!(
         files.len() > 50,
@@ -160,7 +163,7 @@ fn broker_production_code_does_not_discard_more_results() {
 
     assert!(
         sites.len() <= BASELINE,
-        "aethyme-broker production code has {} `let _ =` sites, above the baseline of \
+        "broker production code has {} `let _ =` sites, above the baseline of \
          {BASELINE}. A discarded Result can silently lose broker state: propagate the \
          error with `?`, or report it with `crate::warn_unrecorded`. Only infallible or \
          best-effort cleanup may be discarded, with a comment where the reason is not \

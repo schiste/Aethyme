@@ -26,9 +26,6 @@ thiserror = { workspace = true }
 # serializable types, so Serialize lives on the types themselves.
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Repository issue forms are YAML 1.2. Noyalib is a pure-Rust, safe-code
-# parser with native Serde support; the renderer only uses typed decoding.
-noyalib = { workspace = true }
 # .aethyme/config.toml ([leases] ignore, later [gates]/[promote]).
 toml = { workspace = true }
 # Gate trigger globs (gates.toml). Same matcher family ripgrep uses.

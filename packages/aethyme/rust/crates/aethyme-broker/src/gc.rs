@@ -6833,7 +6833,7 @@ impl Broker {
     /// Build the continuation command without changing which database it opens.
     /// The private worker rejects test database overrides, so omit the pin only
     /// after the child's real no-override resolver proves the same database.
-    pub(crate) fn artifact_sweep_worker_command(
+    pub fn artifact_sweep_worker_command(
         &mut self,
         router: &Path,
         canonical_root: &Path,

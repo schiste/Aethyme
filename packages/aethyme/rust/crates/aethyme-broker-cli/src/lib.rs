@@ -16,23 +16,15 @@ pub use aethyme_broker::*;
 pub mod agent_hook;
 mod artifact_claim;
 mod chau7_mcp;
-pub mod collaboration_cli;
-#[allow(dead_code)]
-pub mod experimental_symbol_mapping;
 pub mod cli;
 mod cli_output;
 mod gate_doctor;
 mod git_maintenance_lock;
-mod graph_impact_envelope;
 mod homebrew;
 mod issue_form;
 mod issue_set;
 mod issue_set_apply;
 mod issue_set_github;
-pub mod local_exchange;
-pub mod local_generation;
-pub mod local_handoff;
-pub mod local_restore;
 mod merge_chain;
 pub mod plugin_cli;
 mod pr_monitoring;
@@ -58,7 +50,6 @@ pub use gate_doctor::{
     GateProbeReport, GateProbeWorktree, inspect_gate_quality, probe_gate_quality,
     static_gate_diagnostics,
 };
-pub use graph_impact_envelope::{UnbindableImpactReport, impact_analysis_envelope};
 pub use homebrew::render_homebrew_formula;
 pub use issue_form::{
     ISSUE_FORM_RENDER_SCHEMA_VERSION, ISSUE_REVIEW_ARTIFACT_SCHEMA_VERSION, IssueFormFieldKind,
@@ -80,3 +71,9 @@ pub use report_filing::{
     REPORT_FILE_SCHEMA_VERSION, ReportFileError, ReportFileResult, ReportFileState,
     file_reviewed_report,
 };
+
+// Test fixtures the core gates behind its own `cfg(test)`, so they are compiled
+// into this crate's test binary from the same file instead of shipping.
+#[cfg(test)]
+#[path = "../../aethyme-broker/src/test_storage.rs"]
+mod test_storage;

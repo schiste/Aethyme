@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const SCOPE_ENV: &str = "AETHYME_GATE_BROKER_DATABASES";
+pub const SCOPE_ENV: &str = "AETHYME_GATE_BROKER_DATABASES";
 
 #[derive(Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -32,7 +32,7 @@ fn parse(value: &OsStr) -> Option<Scope> {
 
 /// Preserve ancestor gate bindings so an inner gate cannot expose an outer
 /// gate's primary checkout. Failure to identify the repository refuses launch.
-pub(crate) fn for_child(
+pub fn for_child(
     cwd: &Path,
     database: &Path,
     inherited: Option<&OsStr>,
@@ -83,7 +83,7 @@ pub(crate) fn for_child(
 /// Independent fixture repositories keep their own `<repo>/.aethyme/broker.db`,
 /// and an explicit override that names some other file still wins, so a test
 /// harness nested in a gate can pin a database it owns.
-pub(crate) fn resolve(
+pub fn resolve(
     repo_root: &Path,
     override_value: Option<&OsStr>,
     scope_value: Option<&OsStr>,

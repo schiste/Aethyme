@@ -26,7 +26,7 @@
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Verdict {
+pub enum Verdict {
     NoRefWrite,
     PrMerge {
         number: String,
@@ -133,7 +133,7 @@ fn unverifiable(why: impl Into<String>) -> Verdict {
 
 /// Assess `gh <args>` run against `repository` (`owner/name`, the exact
 /// `--repo` the broker hands gh).
-pub(crate) fn assess(args: &[String], repository: &str) -> Verdict {
+pub fn assess(args: &[String], repository: &str) -> Verdict {
     let tokens: Vec<&str> = args.iter().map(String::as_str).collect();
     let Some((&command, rest)) = tokens.split_first() else {
         return unverifiable("no gh command");

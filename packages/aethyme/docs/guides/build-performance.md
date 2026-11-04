@@ -7,6 +7,18 @@ a repository setting, dev debug-info trimming, which applies to everyone. The
 second is sccache, which each developer opts into on their own machine. CI uses
 neither sccache nor any machine-level setting.
 
+## Why the broker is two crates
+
+`aethyme-broker` is the core: sessions, the store, gates, merges and every
+`impl Broker`. `aethyme-broker-cli` sits on top of it with the `aethyme broker`
+command tree, the diagnostic reports, the services the CLI installs, and every
+broker integration suite. The core's unit-test binary is the slowest compile in
+the workspace, and code in the upper crate is not part of it.
+
+The upper crate re-exports the core at its root, so a module can move up without
+rewriting its `crate::...` paths. A module can move up when no core production
+code uses it; a core `#[cfg(test)]` item is not visible from there.
+
 ## 1. Dev debug info (repository, everyone)
 
 The repository-root `.cargo/config.toml` sets:

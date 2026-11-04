@@ -50,7 +50,7 @@ mod lifecycle;
 #[path = "collaboration_cli/project.rs"]
 mod project;
 #[path = "collaboration_cli/project_association.rs"]
-pub(crate) mod project_association;
+pub mod project_association;
 #[path = "collaboration_cli/resolution.rs"]
 mod resolution;
 #[cfg(test)]
