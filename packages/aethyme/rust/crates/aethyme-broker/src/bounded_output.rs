@@ -21,7 +21,7 @@ const POLL: Duration = Duration::from_millis(50);
 
 /// A finite process observation. Limits apply independently to both streams.
 #[derive(Debug)]
-pub(crate) enum LimitedOutput {
+pub enum LimitedOutput {
     Completed(Output),
     Deadline,
     OutputLimit,
@@ -43,7 +43,7 @@ pub(crate) enum LimitedStreamOutput {
 
 /// Bound memory and elapsed time even if a descendant holds a pipe open.
 /// Only this invocation's direct child is killed; no process-name matching.
-pub(crate) fn output_limited(
+pub fn output_limited(
     command: &mut Command,
     budget: Duration,
     max_stream_bytes: usize,

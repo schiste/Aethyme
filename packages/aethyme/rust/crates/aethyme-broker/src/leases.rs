@@ -152,7 +152,7 @@ pub struct Overlap {
 
 /// Whether two lease-style paths overlap. Shared with the post-commit
 /// conflict radar, which compares commit paths against lease paths.
-pub(crate) fn paths_overlap(a: &str, b: &str) -> bool {
+pub fn paths_overlap(a: &str, b: &str) -> bool {
     if a == b {
         return true;
     }
@@ -247,7 +247,7 @@ pub fn plan_lease_coverage(
     }
 }
 
-pub(crate) fn exact_directory_claim_warning(path: &str, is_directory: bool) -> Option<String> {
+pub fn exact_directory_claim_warning(path: &str, is_directory: bool) -> Option<String> {
     (is_directory && !path.ends_with('/')).then(|| {
         format!(
             "{path} is an existing directory, but this lease is exact; append / to claim its subtree"

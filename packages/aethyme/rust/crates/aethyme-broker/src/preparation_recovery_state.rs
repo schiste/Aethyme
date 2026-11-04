@@ -324,7 +324,7 @@ pub(crate) fn read_records(resource_db_path: &Path, now_ms: i64) -> Vec<Rotation
 }
 
 /// One human line per record, for `doctor`.
-pub(crate) fn describe(record: &RotationRecoveryRecord) -> String {
+pub fn describe(record: &RotationRecoveryRecord) -> String {
     let state = match record.state {
         RotationRecoveryState::InProgress => "in progress",
         RotationRecoveryState::Stalled => "stalled",

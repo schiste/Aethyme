@@ -12,7 +12,7 @@ const MAX_RECEIPT_LIST_LIMIT: u32 = 100;
 const RETAIN_TERMINAL_RECEIPTS_PER_SESSION: i64 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct GuardedExecReceipt {
+pub struct GuardedExecReceipt {
     pub helper_observation: Option<HelperObservation>,
     pub receipt_id: String,
     pub session_id: i64,
@@ -351,7 +351,7 @@ impl super::BrokerStore {
         prune_terminal_guarded_exec_receipts(&self.conn, session_id)
     }
 
-    pub(crate) fn guarded_exec_receipt(
+    pub fn guarded_exec_receipt(
         &self,
         session_id: i64,
         receipt_id: &str,
@@ -374,7 +374,7 @@ impl super::BrokerStore {
         Ok(receipt)
     }
 
-    pub(crate) fn guarded_exec_receipts(
+    pub fn guarded_exec_receipts(
         &self,
         session_id: i64,
         limit: u32,

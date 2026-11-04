@@ -16,7 +16,7 @@ const LIFECYCLE_LOCK_WAIT: Duration = Duration::from_secs(10);
 const LIFECYCLE_LOCK_POLL: Duration = Duration::from_millis(50);
 
 /// Open (creating if needed) a lock file without truncating it.
-pub(crate) fn open_lock_file(path: &Path) -> io::Result<File> {
+pub fn open_lock_file(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .create(true)
         .read(true)
@@ -106,7 +106,7 @@ pub(crate) fn repository_run_directory(main_root: &Path) -> io::Result<std::path
 
 /// Which side of the per-session command/retirement fence to acquire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SessionOperationLockMode {
+pub enum SessionOperationLockMode {
     Shared,
     Exclusive,
 }
@@ -116,7 +116,7 @@ pub(crate) enum SessionOperationLockMode {
 /// coordinated-operation witnesses protect children after the broker parent
 /// exits; retirement refuses when those inventories are unknown.
 #[derive(Debug)]
-pub(crate) enum SessionOperationGuard {
+pub enum SessionOperationGuard {
     Shared { _lock: SharedSessionOperationLock },
     Exclusive { _lock: ExclusiveFileLock },
 }
@@ -131,7 +131,7 @@ pub(crate) struct SharedSessionOperationLock {
 /// may remove. A busy lock is an ordinary retryable refusal; path or lock
 /// protocol errors remain errors and must not be interpreted as an idle
 /// session.
-pub(crate) fn try_acquire_session_operation_guard(
+pub fn try_acquire_session_operation_guard(
     main_root: &Path,
     session_id: i64,
     mode: SessionOperationLockMode,
@@ -182,7 +182,7 @@ pub(crate) fn try_acquire_session_operation_guard(
 /// Whether this host supports the nonblocking per-session advisory lock used
 /// by the guarded expiry protocol. Descendants are protected separately by
 /// durable producer/process witnesses rather than inheriting this descriptor.
-pub(crate) const fn session_operation_guard_supported() -> bool {
+pub const fn session_operation_guard_supported() -> bool {
     cfg!(unix)
 }
 
@@ -208,7 +208,7 @@ fn repository_runtime_directory(main_root: &Path) -> io::Result<std::path::PathB
 
 /// Claim one complete CLI scheduling pass, including repository watches.
 /// The file remains persistent so a second inode cannot split ownership.
-pub(crate) fn acquire_pr_watch_tick_lock(main_root: &Path) -> io::Result<ExclusiveFileLock> {
+pub fn acquire_pr_watch_tick_lock(main_root: &Path) -> io::Result<ExclusiveFileLock> {
     let path = repository_runtime_lock_path(main_root, "pr-watch-tick.lock")?;
     let file = open_lock_file_nofollow(&path)?;
     let lock = ExclusiveFileLock::try_acquire(file)?.ok_or_else(|| {
@@ -409,13 +409,13 @@ fn verify_named_lock_file(path: &Path, opened: &File) -> io::Result<()> {
 
 /// An exclusive lock held on an open file until the guard drops.
 #[derive(Debug)]
-pub(crate) struct ExclusiveFileLock {
+pub struct ExclusiveFileLock {
     file: File,
 }
 
 impl ExclusiveFileLock {
     /// Block until `file` is locked exclusively.
-    pub(crate) fn acquire(file: File) -> io::Result<Self> {
+    pub fn acquire(file: File) -> io::Result<Self> {
         file.lock()?;
         Ok(Self { file })
     }
@@ -429,7 +429,7 @@ impl ExclusiveFileLock {
     }
 
     /// Lock `file` exclusively if nobody holds it; `None` when it is held.
-    pub(crate) fn try_acquire(file: File) -> io::Result<Option<Self>> {
+    pub fn try_acquire(file: File) -> io::Result<Option<Self>> {
         match file.try_lock() {
             Ok(()) => Ok(Some(Self { file })),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
@@ -470,7 +470,7 @@ impl Drop for SharedFileLock {
 }
 
 #[path = "artifact_use.rs"]
-pub(crate) mod artifact_use;
+pub mod artifact_use;
 
 #[cfg(test)]
 mod tests {

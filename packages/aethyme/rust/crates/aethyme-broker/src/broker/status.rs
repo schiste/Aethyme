@@ -351,7 +351,7 @@ impl Broker {
 
     /// Read coordination records for compact presentation without inspecting
     /// retained checkouts, Git history, or submission recovery remedies.
-    pub(crate) fn routine_status_context(
+    pub fn routine_status_context(
         &self,
         now_ms: i64,
     ) -> Result<RoutineStatusContext, BrokerOpError> {

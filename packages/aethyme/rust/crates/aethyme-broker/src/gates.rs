@@ -1957,7 +1957,7 @@ pub(crate) fn run_all_in(
 }
 
 /// Run every gate using the default storage paths and an injectable progress sink.
-pub(crate) fn run_all_with_progress(
+pub fn run_all_with_progress(
     store: &mut BrokerStore,
     main_root: &Path,
     checkout: &GitRepo,
@@ -2018,7 +2018,7 @@ pub(crate) fn run_all_with_progress_in(
 /// Run one explicitly selected gate. Unlike affected selection, an exact
 /// name is authoritative even when its path triggers do not match the diff.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_named(
+pub fn run_named(
     store: &mut BrokerStore,
     main_root: &Path,
     checkout: &GitRepo,
@@ -2439,7 +2439,7 @@ fn acquire_gate_resources(
 /// same repository from any clone on any machine, while the fallback names
 /// one checkout on one machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RepositoryKeySource {
+pub enum RepositoryKeySource {
     Origin,
     MainCheckoutPath,
 }
@@ -2458,7 +2458,7 @@ pub(crate) enum RepositoryKeySource {
 ///   worktrees share the config but not the root, so they disagree for the
 ///   same reason. An absolute or network `origin` was always worktree-
 ///   independent and is unaffected.
-pub(crate) fn repository_key(repo: &GitRepo) -> (String, RepositoryKeySource) {
+pub fn repository_key(repo: &GitRepo) -> (String, RepositoryKeySource) {
     // Degrades to the calling checkout rather than failing: a key an
     // operator can still coordinate under beats a gate that cannot run. The
     // repository has to have become unreadable between discovery and here
@@ -2487,7 +2487,7 @@ pub(crate) fn repository_key(repo: &GitRepo) -> (String, RepositoryKeySource) {
     }
 }
 
-pub(crate) fn git_origin_fingerprint(repo: &GitRepo) -> String {
+pub fn git_origin_fingerprint(repo: &GitRepo) -> String {
     repository_key(repo).0
 }
 

@@ -198,12 +198,12 @@ pub(crate) fn operation_liveness_view(operation: &CoordinatedOperation) -> Opera
     }
 }
 
-pub(crate) fn operation_liveness_summary(operation: &CoordinatedOperation) -> String {
+pub fn operation_liveness_summary(operation: &CoordinatedOperation) -> String {
     let view = operation_liveness_view(operation);
     operation_liveness_view_summary(&view)
 }
 
-pub(crate) fn operation_liveness_view_summary(view: &OperationLivenessView) -> String {
+pub fn operation_liveness_view_summary(view: &OperationLivenessView) -> String {
     if view.state == "not_running" {
         return view.state.clone();
     }
@@ -1591,7 +1591,7 @@ pub(crate) fn local_git_coordination_lock_key(cwd: &Path) -> Result<String, Brok
 
 /// Acquire both the common-directory lane and canonical remote compatibility
 /// lane used by coordinated writers before reusing a submission plan.
-pub(crate) fn try_acquire_local_repository_write_lock(
+pub fn try_acquire_local_repository_write_lock(
     main_root: &Path,
     checkout: &crate::GitRepo,
 ) -> Result<Option<(String, RepositoryWriteLock)>, BrokerOpError> {
@@ -1919,7 +1919,7 @@ pub(crate) fn humanize_ms(milliseconds: u64) -> String {
     }
 }
 
-pub(crate) fn humanize_duration(seconds: u64) -> String {
+pub fn humanize_duration(seconds: u64) -> String {
     match seconds {
         0..=59 => format!("{seconds}s"),
         _ => format!("{}m {}s", seconds / 60, seconds % 60),
@@ -3265,7 +3265,7 @@ pub(crate) const REMOTE_GIT_REPO_REQUIRED: &str = "remote Git operation requires
 /// The flags a refused coordinated operation was missing, when the refusal is
 /// one a re-run with those flags would get past.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MissingOperationFlags {
+pub struct MissingOperationFlags {
     pub destructive: bool,
     /// `Some` when `--repo` is missing: the repository inferred from the
     /// remote the command targets, or `None` inside when it cannot be.
@@ -3277,7 +3277,7 @@ pub(crate) struct MissingOperationFlags {
 /// Which flags `reason` says were missing. The destructive check runs before
 /// the repository check, so a refusal for `--destructive` also reports a
 /// `--repo` the same command would be refused for next.
-pub(crate) fn missing_operation_flags(
+pub fn missing_operation_flags(
     reason: &str,
     provider: OperationProvider,
     args: &[String],
@@ -3396,7 +3396,7 @@ fn local_repository_coordination_key(
 /// unrelated repository. Any configured remote counts, so a fork whose
 /// `upstream` names the target still passes. A worktree whose remotes cannot
 /// be resolved at all gives no evidence either way and is left alone.
-pub(crate) fn refuse_session_repository_mismatch(
+pub fn refuse_session_repository_mismatch(
     session_id: i64,
     worktree: &Path,
     requested: &str,
@@ -3452,7 +3452,8 @@ fn journal_details(
 mod git_scopes;
 mod push_and_coordinated;
 mod redaction;
-pub(crate) use push_and_coordinated::{github_command, is_within, worktree_relative_push_sources};
+pub use push_and_coordinated::github_command;
+pub use push_and_coordinated::{is_within, worktree_relative_push_sources};
 use push_and_coordinated::{is_github_pull_request_merge, provider_command};
 
 #[cfg(test)]

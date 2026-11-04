@@ -17,7 +17,7 @@ use aethyme_graph_storage::{
     read_engine_version, write_graph_authority_manifest,
 };
 
-pub(crate) fn load_graph_policy_at_commit(
+pub fn load_graph_policy_at_commit(
     repository: &crate::GitRepo,
     commit: &str,
 ) -> Result<GraphIntegrityPolicy, crate::BrokerOpError> {

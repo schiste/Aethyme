@@ -103,7 +103,7 @@ pub fn inspect_version(main_root: &Path) -> VersionDriftReport {
 /// enrolled checkout's `main`, and must not treat unrelated source drift as a
 /// correctness risk. A missing local `main`, an unresolvable build revision,
 /// or unrelated history is inconclusive and therefore silent.
-pub(crate) fn broker_start_warning(main_root: &Path) -> Option<String> {
+pub fn broker_start_warning(main_root: &Path) -> Option<String> {
     broker_start_warning_with_binary(main_root, current_binary_build())
 }
 

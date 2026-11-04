@@ -78,7 +78,7 @@ pub struct GitCarrier {
     pub(crate) repo: GitRepo,
     pub(crate) remote: String,
     pub(crate) destination: String,
-    pub(crate) identity: crate::ResolvedRemoteTarget,
+    pub identity: crate::ResolvedRemoteTarget,
     repository_binding: String,
     pub(crate) timeout: u64,
     reason: String,

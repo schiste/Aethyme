@@ -29,7 +29,7 @@ const REDACTED: &str = "[redacted]";
 
 /// Remove credentials from `text`: URL user-info is replaced in place, and
 /// the text is cut at the earliest remaining secret marker.
-pub(crate) fn redact_secrets(text: &str) -> String {
+pub fn redact_secrets(text: &str) -> String {
     let mut redacted = redact_url_userinfo(text);
     if let Some(index) = earliest_secret(&redacted) {
         redacted.truncate(index);
@@ -40,7 +40,7 @@ pub(crate) fn redact_secrets(text: &str) -> String {
 
 /// A failure message fit for durable local storage: secrets removed, then
 /// capped at `max_chars` characters on a character boundary.
-pub(crate) fn failure_message(text: &str, max_chars: usize) -> Option<String> {
+pub fn failure_message(text: &str, max_chars: usize) -> Option<String> {
     let redacted = redact_secrets(text.trim());
     if redacted.is_empty() {
         return None;

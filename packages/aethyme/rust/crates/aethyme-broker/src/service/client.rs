@@ -8,7 +8,7 @@ use super::job_protocol::{self as wire, Method, Reply, Status};
 use super::jobs::{JobOperation, JobState};
 use super::{job_runtime, transport};
 
-pub(crate) struct Client {
+pub struct Client {
     directory: PathBuf,
     repository_key: String,
 }
@@ -27,7 +27,7 @@ fn accepted(response: wire::Response) -> io::Result<Reply> {
 }
 
 impl Client {
-    pub(crate) fn connect(directory: &Path, repository: &Path) -> io::Result<Self> {
+    pub fn connect(directory: &Path, repository: &Path) -> io::Result<Self> {
         // Reuse the worker's snapshot-only owner validation. A remote key by
         // itself cannot establish ownership of the independently selected repo.
         let expected = job_runtime::selected_repository_identity(repository)?;
@@ -59,7 +59,7 @@ impl Client {
         )?)
     }
 
-    pub(crate) fn gc_plan(
+    pub fn gc_plan(
         &self,
         request_key: &str,
         deadline_ms: i64,
@@ -133,7 +133,7 @@ impl Client {
     }
 }
 
-pub(crate) fn deadline_remaining(deadline_ms: i64) -> io::Result<Duration> {
+pub fn deadline_remaining(deadline_ms: i64) -> io::Result<Duration> {
     let now = i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -174,7 +174,7 @@ fn validate_status(
 }
 
 /// Shared by the legacy manual result command and the repository-pinned client.
-pub(crate) fn read_result(
+pub fn read_result(
     mut request: impl FnMut(Method) -> io::Result<Reply>,
     job_id: i64,
 ) -> io::Result<serde_json::Value> {

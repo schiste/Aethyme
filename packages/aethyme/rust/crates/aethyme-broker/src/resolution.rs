@@ -2465,7 +2465,7 @@ pub fn attempt_status(
 
 /// Read an attempt from a lifecycle snapshot without opening a writer,
 /// applying migrations, or creating collaboration state.
-pub(crate) fn attempt_status_from_connection(
+pub fn attempt_status_from_connection(
     connection: &rusqlite::Connection,
     token: &str,
     session_label: &str,

@@ -99,7 +99,7 @@ pub(crate) fn integration_severity(age_ms: i64) -> StatusAdviceSeverity {
 }
 
 /// Human-readable age for advice text, coarse on purpose.
-pub(crate) fn describe_age(age_ms: i64) -> String {
+pub fn describe_age(age_ms: i64) -> String {
     let hours = age_ms.max(0) / 3_600_000;
     match hours {
         0 => format!("{} minute(s)", age_ms.max(0) / 60_000),

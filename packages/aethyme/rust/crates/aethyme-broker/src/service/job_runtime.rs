@@ -144,7 +144,7 @@ pub(crate) fn selected_repository_identity(path: &Path) -> io::Result<wire::Repo
 type Planner =
     dyn Fn(&Repository, &JobOperation, Instant) -> Result<serde_json::Value, String> + Send + Sync;
 
-pub(crate) struct JobRuntime {
+pub struct JobRuntime {
     directory: RuntimeDirectory,
     database: FileIdentity,
     repository: Repository,
@@ -155,7 +155,7 @@ pub(crate) struct JobRuntime {
 }
 
 impl JobRuntime {
-    pub(crate) fn open(server: &Server, repository: &Path) -> io::Result<Arc<Self>> {
+    pub fn open(server: &Server, repository: &Path) -> io::Result<Arc<Self>> {
         Self::open_with_planner(server, repository, Arc::new(plan))
     }
 

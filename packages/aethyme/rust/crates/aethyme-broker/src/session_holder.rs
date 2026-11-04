@@ -46,7 +46,7 @@ pub(crate) struct TaskLease {
 /// Outcome of an explicit same-holder task-lease heartbeat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum TaskLeaseHeartbeat {
+pub enum TaskLeaseHeartbeat {
     /// The five-minute renewal interval elapsed and a new holder event landed.
     Renewed,
     /// The current binding is still fresh; only session activity was touched.
@@ -60,7 +60,7 @@ pub(crate) enum TaskLeaseHeartbeat {
 }
 
 impl TaskLeaseHeartbeat {
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Renewed => "renewed",
             Self::Current => "current",
@@ -74,7 +74,7 @@ impl TaskLeaseHeartbeat {
 /// Whether an unsupported command safely removed age-expiry authority before
 /// it was allowed to act for the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TaskLeaseDowngrade {
+pub enum TaskLeaseDowngrade {
     NotFinite,
     Downgraded,
     NotHolder,
@@ -687,7 +687,7 @@ pub(crate) fn task_lease_from_payload(payload: &str) -> Option<TaskLease> {
 /// including malformed and future-version values. Unsupported values never
 /// grant age-expiry authority, but still require child-use witnesses before a
 /// gone holder can be retired.
-pub(crate) fn task_lease_binding_present(event: &crate::Event) -> bool {
+pub fn task_lease_binding_present(event: &crate::Event) -> bool {
     event
         .payload_json
         .as_deref()

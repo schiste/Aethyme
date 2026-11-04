@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub(crate) mod cache_gc_fs;
-pub(crate) mod managed_storage_inventory;
+pub mod managed_storage_inventory;
 pub(crate) use managed_storage_inventory::{ManagedStorageOwner, ManagedStorageRootSetBinding};
 
 pub const HOST_RESOURCE_SCHEMA_VERSION: u32 = 1;
@@ -3295,7 +3295,7 @@ impl HostResourceCoordinator {
     /// CLI-facing execution path that reports completed wall-clock phases
     /// without changing the public `HostResourceRunReport` Rust API.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn run_supervised_with_environment_observed<F, P, O>(
+    pub fn run_supervised_with_environment_observed<F, P, O>(
         &mut self,
         request: &HostResourceRequest,
         wait: std::time::Duration,

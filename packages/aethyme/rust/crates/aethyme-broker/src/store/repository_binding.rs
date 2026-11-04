@@ -51,7 +51,7 @@ impl RepositoryWorktreeBindingState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum RepositoryWorktreeRootLayout {
+pub enum RepositoryWorktreeRootLayout {
     KeyedContainer,
     DirectRoot,
 }
@@ -202,7 +202,7 @@ impl BrokerStore {
     /// Read the binding record selected by this store's captured repository scope.
     /// Missing or malformed evidence is a recovery condition; callers must not
     /// infer a root from current configuration.
-    pub(crate) fn repository_worktree_binding(
+    pub fn repository_worktree_binding(
         &self,
     ) -> Result<RepositoryWorktreeBinding, BrokerError> {
         read_repository_worktree_binding(&self.conn, self.binding_scope.as_ref())

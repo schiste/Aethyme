@@ -21,7 +21,7 @@ use crate::clock::epoch_ms;
 /// What a waiter is blocked on.
 pub(crate) const WAIT_COORDINATED_WRITE_LOCK: &str = "coordinated_write_lock";
 pub(crate) const WAIT_GATE_OWNER_LOCK: &str = "gate_owner_lock";
-pub(crate) const WAIT_LEASE: &str = "lease";
+pub const WAIT_LEASE: &str = "lease";
 
 fn waits_dir(main_root: &Path) -> PathBuf {
     main_root.join(".aethyme/run/waits")
@@ -90,7 +90,7 @@ fn current_with(main_root: &Path, now_ms: i64, alive: impl Fn(i64) -> bool) -> V
 }
 
 /// `waiting for the coordinated write lock on schiste/aethyme: held by …`.
-pub(crate) fn describe(waiter: &CurrentWaiter) -> String {
+pub fn describe(waiter: &CurrentWaiter) -> String {
     let who = match waiter.session_id {
         Some(session) => format!("session {session}"),
         None => format!("process {}", waiter.pid),
@@ -119,7 +119,7 @@ fn kind_label(kind: &str) -> &str {
 
 /// The record of one wait in this process. Dropping it removes the record,
 /// so only a killed waiter leaves one behind.
-pub(crate) struct WaitRegistration {
+pub struct WaitRegistration {
     path: PathBuf,
     record: WaitRecord,
 }
@@ -129,7 +129,7 @@ static NEXT_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 impl WaitRegistration {
     /// Record that this process has started waiting. Recording is advisory:
     /// a failure to write warns and the wait goes on unrecorded.
-    pub(crate) fn start(
+    pub fn start(
         main_root: &Path,
         session_id: Option<i64>,
         kind: &str,
@@ -155,7 +155,7 @@ impl WaitRegistration {
     }
 
     /// The holder changed or aged; keep the record current.
-    pub(crate) fn update_holder(&mut self, holder: &str) {
+    pub fn update_holder(&mut self, holder: &str) {
         if self.record.holder != holder {
             self.record.holder = holder.to_string();
             self.persist();

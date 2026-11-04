@@ -762,7 +762,7 @@ pub(crate) enum ClosedArtifactCheckoutCohortUnavailableReason {
 }
 
 impl ClosedArtifactCheckoutCohortUnavailableReason {
-    pub(crate) const fn code(self) -> &'static str {
+    pub const fn code(self) -> &'static str {
         match self {
             Self::IndexMissing => "index_missing",
             Self::IndexIncomplete => "index_incomplete",
@@ -787,7 +787,7 @@ impl ClosedArtifactCheckoutCohortUnavailableReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ClosedArtifactCheckoutCohortResolution {
+pub enum ClosedArtifactCheckoutCohortResolution {
     Available(ClosedArtifactCheckoutCohort),
     Unavailable(ClosedArtifactCheckoutCohortUnavailableReason),
 }
@@ -1653,7 +1653,7 @@ impl Broker {
     /// Read-only variant for explicit artifact-use marker review. An
     /// incomplete path index is a refusal here: planning must not advance or
     /// otherwise mutate the cleanup cohort index.
-    pub(crate) fn closed_artifact_checkout_cohort_for_session_readonly(
+    pub fn closed_artifact_checkout_cohort_for_session_readonly(
         &mut self,
         session_id: i64,
         worktree: &Path,

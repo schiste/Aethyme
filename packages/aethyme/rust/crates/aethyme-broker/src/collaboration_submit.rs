@@ -53,7 +53,7 @@ pub(crate) const KNOWN_SETTINGS: &[&str] = &["capture", "project", "descriptor"]
 
 /// What `[collaboration] capture` asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Setting {
+pub enum Setting {
     Off,
     On {
         policy: CapturePolicy,
@@ -70,7 +70,7 @@ pub(crate) enum Setting {
 }
 
 /// The setting and where the config came from (`None` without a config).
-pub(crate) fn setting(main_root: &Path) -> (Setting, Option<&'static str>) {
+pub fn setting(main_root: &Path) -> (Setting, Option<&'static str>) {
     match crate::merge::repository_config_checked(main_root) {
         Ok(Some((text, source))) => (setting_from_text(Some(&text)), Some(source)),
         Ok(None) => (Setting::Off, None),
@@ -87,7 +87,7 @@ pub(crate) fn setting(main_root: &Path) -> (Setting, Option<&'static str>) {
 
 /// Whether the raw text visibly opts in, read without parsing it: a
 /// `[collaboration...]` header or a `collaboration` key.
-pub(crate) fn mentions_collaboration(text: &str) -> bool {
+pub fn mentions_collaboration(text: &str) -> bool {
     text.lines().map(str::trim_start).any(|line| {
         line.strip_prefix('[')
             .map(|rest| rest.trim_start().starts_with("collaboration"))
@@ -423,14 +423,14 @@ fn path_free(detail: &str, known: &[(PathBuf, &str)]) -> String {
 /// `submit --json` with capture enabled: the legacy outcome's fields,
 /// unchanged and in order, then `collaboration_capture`.
 #[derive(Serialize)]
-pub(crate) struct WithCapture<'a, T: Serialize> {
+pub struct WithCapture<'a, T: Serialize> {
     #[serde(flatten)]
     pub outcome: &'a T,
     pub collaboration_capture: &'a SubmitCaptureReport,
 }
 
 /// What a submit with collaboration enabled produced.
-pub(crate) enum CaptureSubmit {
+pub enum CaptureSubmit {
     /// Required capture was not acknowledged; nothing was submitted.
     Refused(SubmitCaptureReport),
     /// Required capture was acknowledged, then the session moved, so the
@@ -458,7 +458,7 @@ pub(crate) enum CaptureStep {
 
 impl CaptureStep {
     /// The report, running a pending advisory capture now.
-    pub(crate) fn finish(self, broker: &crate::Broker) -> SubmitCaptureReport {
+    pub fn finish(self, broker: &crate::Broker) -> SubmitCaptureReport {
         match self {
             Self::Done(report) => report,
             Self::Pending(advisory) => advisory.run(broker),
@@ -514,7 +514,7 @@ impl AdvisoryCapture {
 /// - **Advisory:** nothing runs before the submit. The returned
 ///   [`CaptureStep::Pending`] captures the head the submit pinned against the
 ///   base it verified against.
-pub(crate) fn submit(
+pub fn submit(
     broker: &mut crate::Broker,
     session: i64,
     cache: crate::CachePolicy,

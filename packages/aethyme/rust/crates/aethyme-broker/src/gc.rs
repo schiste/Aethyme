@@ -206,7 +206,7 @@ const ARTIFACT_SWEEP_META_PREFIX: &str = "gc.artifact_sweep.";
 const ARTIFACT_SWEEP_LEGACY_SCALAR_MAX_BYTES: usize = 4 * 1024;
 /// Internal marker which keeps Broker::open from starting a second inline GC
 /// pass before the continuation worker takes its scoped recovery path.
-pub(crate) const ARTIFACT_SWEEP_WORKER_ENV: &str = "AETHYME_GC_ARTIFACT_SWEEP_WORKER";
+pub const ARTIFACT_SWEEP_WORKER_ENV: &str = "AETHYME_GC_ARTIFACT_SWEEP_WORKER";
 const ARTIFACT_SWEEP_WORKER_NO_PROGRESS_PASSES: usize = 3;
 /// Positive partial deletion is progress, but must not let one detached worker
 /// run indefinitely while another process keeps replenishing the cache.
@@ -2438,7 +2438,7 @@ fn worker_binary_version(binary: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-pub(crate) fn artifact_worker_runtime_is_aligned() -> bool {
+pub fn artifact_worker_runtime_is_aligned() -> bool {
     let Some((router, engine)) = artifact_worker_binaries() else {
         return false;
     };
@@ -2509,7 +2509,7 @@ fn artifact_sweep_worker_lock_file(main_root: &Path) -> Result<std::fs::File, Br
 }
 
 /// Try to become the one process allowed to schedule or run continuation.
-pub(crate) fn try_artifact_sweep_worker_lock(
+pub fn try_artifact_sweep_worker_lock(
     main_root: &Path,
 ) -> Result<Option<crate::file_lock::ExclusiveFileLock>, BrokerOpError> {
     let file = artifact_sweep_worker_lock_file(main_root)?;
@@ -4277,7 +4277,7 @@ impl Broker {
 
     /// The default operator-facing plan is cooperative and deadline-bound.
     /// `full_scan` selects the exhaustive compatibility path explicitly.
-    pub(crate) fn gc_plan_for_cli(
+    pub fn gc_plan_for_cli(
         &mut self,
         include_active_gate_cache: bool,
         full_scan: bool,
@@ -4313,7 +4313,7 @@ impl Broker {
     /// Retire an ineligible frozen journal after the operator confirms its
     /// exact digest. This archives only the journal bytes: it never resumes,
     /// replans, or removes any retained row, file, worktree, or artifact.
-    pub(crate) fn gc_abandon_pending(
+    pub fn gc_abandon_pending(
         &mut self,
         confirm: &str,
     ) -> Result<GcJournalAbandonReport, BrokerOpError> {
@@ -4405,7 +4405,7 @@ impl Broker {
     /// Remove only a previously abandoned journal or its known atomic-write
     /// temporary files after the operator confirms its plan digest. This
     /// never touches GC candidates or changes an active journal.
-    pub(crate) fn gc_forget_abandoned(
+    pub fn gc_forget_abandoned(
         &mut self,
         confirm: &str,
     ) -> Result<GcJournalForgetReport, BrokerOpError> {
@@ -5549,7 +5549,7 @@ impl Broker {
     /// CLI apply uses the same scan mode as the plan command. An existing
     /// journal is still resumed directly; this deadline only covers the fresh
     /// plan needed when no journal exists.
-    pub(crate) fn gc_apply_for_cli(
+    pub fn gc_apply_for_cli(
         &mut self,
         confirm: &str,
         include_active_gate_cache: bool,
@@ -7024,7 +7024,7 @@ impl Broker {
     /// scans the full cohort before checking the pass deadline, so the reserved
     /// tranche is cooperative and can overrun on a large cohort; the durable
     /// cursor bounds proof progress after discovery, not discovery time.
-    pub(crate) fn run_artifact_sweep_recovery_worker(&mut self) -> Result<(), BrokerOpError> {
+    pub fn run_artifact_sweep_recovery_worker(&mut self) -> Result<(), BrokerOpError> {
         if !matches!(std::env::var(ARTIFACT_SWEEP_WORKER_ENV).as_deref(), Ok("1")) {
             self.write_artifact_sweep_worker_status("refused_environment")?;
             return Ok(());

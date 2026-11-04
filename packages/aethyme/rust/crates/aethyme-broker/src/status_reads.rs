@@ -24,7 +24,7 @@ impl Drop for Scope {
     }
 }
 
-pub(crate) fn with_context<T>(operation: impl FnOnce() -> T) -> T {
+pub fn with_context<T>(operation: impl FnOnce() -> T) -> T {
     let owner = CONTEXT.with(|context| {
         let mut context = context.borrow_mut();
         if context.is_some() {

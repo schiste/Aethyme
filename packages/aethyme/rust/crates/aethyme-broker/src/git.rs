@@ -66,7 +66,7 @@ impl Drop for RestoreGitDeadline {
 
 /// Apply one wall-clock deadline to all Git subprocesses run synchronously by
 /// `operation`, preserving and restoring an outer deadline when nested.
-pub(crate) fn with_git_deadline<T>(timeout: Duration, operation: impl FnOnce() -> T) -> T {
+pub fn with_git_deadline<T>(timeout: Duration, operation: impl FnOnce() -> T) -> T {
     let requested = Instant::now() + timeout;
     let previous = GIT_DEADLINE.with(|deadline| {
         let previous = deadline.get();
@@ -99,7 +99,7 @@ pub(crate) struct GitDeadlineGuard {
 
 /// Cap Git commands on the current thread at `deadline`, keeping an earlier
 /// outer deadline, until the guard is dropped.
-pub(crate) fn limit_git_until(deadline: Instant) -> GitDeadlineGuard {
+pub fn limit_git_until(deadline: Instant) -> GitDeadlineGuard {
     let previous = GIT_DEADLINE.with(|slot| {
         let previous = slot.get();
         slot.set(Some(previous.map_or(deadline, |outer| outer.min(deadline))));
@@ -726,7 +726,7 @@ pub fn git_output_trust() -> &'static GitOutputTrust {
 /// resolved an honest binary, and one of them authorized discarding work.
 /// The probe already answers "which binary"; the cheap invariant is that no
 /// call site answers it again.
-pub(crate) fn git_command() -> Command {
+pub fn git_command() -> Command {
     let mut command = Command::new(&git_program().program);
     if graph_verification_git_enabled() {
         configure_isolated_graph_git_command(&mut command);
@@ -1413,7 +1413,7 @@ fn unsafe_session_commit_git_environment_key(key: &std::ffi::OsStr) -> bool {
 /// Refuse commit commands when inherited Git environment can redirect
 /// repository discovery, history, the index, or Git configuration. This is
 /// checked before CLI broker discovery as well as immediately before commit.
-pub(crate) fn session_commit_git_environment_refusal() -> Option<&'static str> {
+pub fn session_commit_git_environment_refusal() -> Option<&'static str> {
     std::env::vars_os()
         .any(|(key, _)| unsafe_session_commit_git_environment_key(&key))
         .then_some(
@@ -9585,7 +9585,7 @@ impl GitRepo {
     /// session worktree the broker created. Skips the `rev-parse` that
     /// [`GitRepo::discover`] spends, which matters on the agent hook's
     /// per-edit path; a wrong root only makes later Git calls fail.
-    pub(crate) fn at_known_root(root: &Path) -> Self {
+    pub fn at_known_root(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
         }
@@ -9593,7 +9593,7 @@ impl GitRepo {
 
     /// Whether `path` exists in the working tree as an untracked,
     /// non-ignored file: a new file no diff against a commit reports.
-    pub(crate) fn path_is_untracked(&self, path: &str) -> Result<bool, GitError> {
+    pub fn path_is_untracked(&self, path: &str) -> Result<bool, GitError> {
         let listed = run_git(
             &self.root,
             &["ls-files", "--others", "--exclude-standard", "--", path],
@@ -9627,7 +9627,7 @@ impl GitRepo {
     /// Zero-context patch of `path` from `base` to the working tree, so
     /// uncommitted edits count. Read by the agent hook to describe where
     /// another session is changing a file; only the `@@` headers are used.
-    pub(crate) fn working_zero_context_diff(
+    pub fn working_zero_context_diff(
         &self,
         base: &str,
         path: &str,

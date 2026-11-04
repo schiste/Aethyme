@@ -1741,7 +1741,7 @@ impl Broker {
     /// Try to claim repository-wide checkout lifecycle mutation without
     /// waiting. Bounded maintenance uses this to skip a checkout rather than
     /// exceed its deadline while another creation, adoption, or removal runs.
-    pub(crate) fn try_claim_worktree_lifecycle(
+    pub fn try_claim_worktree_lifecycle(
         &self,
     ) -> Result<Option<crate::file_lock::ExclusiveFileLock>, BrokerOpError> {
         self.store.require_live_schema_compatible()?;

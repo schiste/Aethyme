@@ -1764,13 +1764,13 @@ impl CollaborationStore {
     }
 
     /// The database, read-only use.
-    pub(crate) fn read_connection(&self) -> &Connection {
+    pub fn read_connection(&self) -> &Connection {
         &self.connection
     }
 
     /// The database, for the capture and archive slices built on this one.
     #[allow(dead_code)]
-    pub(crate) fn connection(&mut self) -> &mut Connection {
+    pub fn connection(&mut self) -> &mut Connection {
         &mut self.connection
     }
 }
@@ -1815,12 +1815,12 @@ pub struct CollaborationSnapshot {
 }
 
 impl CollaborationSnapshot {
-    pub(crate) fn connection(&self) -> &Connection {
+    pub fn connection(&self) -> &Connection {
         &self.connection
     }
 
     /// Whether the stored schema has `table` (an older store may not).
-    pub(crate) fn has_table(&self, table: &str) -> bool {
+    pub fn has_table(&self, table: &str) -> bool {
         self.connection
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -1852,7 +1852,7 @@ pub fn inspect_for_repository(
 /// Unlike [`open_for_repository`], this never creates, configures or migrates
 /// state; it is used when an operation must verify a peer binding without
 /// writing to that project's database.
-pub(crate) fn inspect_store_for_repository(
+pub fn inspect_store_for_repository(
     main_root: &Path,
     project: &ProjectKey,
 ) -> Result<Option<CollaborationStore>, CollaborationStateError> {
@@ -2250,7 +2250,7 @@ fn create_private_file(_path: &Path) -> Result<(), CollaborationStateError> {
 
 /// Make a directory's entries durable. On macOS `sync_all` issues
 /// `F_FULLFSYNC`, which also flushes the device cache.
-pub(crate) fn sync_directory(path: &Path) -> Result<(), CollaborationStateError> {
+pub fn sync_directory(path: &Path) -> Result<(), CollaborationStateError> {
     std::fs::File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|source| io(path, source))

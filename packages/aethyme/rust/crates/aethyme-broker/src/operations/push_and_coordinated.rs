@@ -32,7 +32,7 @@ fn with_push_planning(mut extra: serde_json::Value, planning: &PushPlanning) -> 
 /// *session* worktree rather than the caller's, so a `HEAD:` refspec sent from
 /// somewhere else silently publishes the session's commit under the caller's
 /// chosen branch name, and the push reports success (#269).
-pub(crate) fn worktree_relative_push_sources(args: &[String]) -> Vec<String> {
+pub fn worktree_relative_push_sources(args: &[String]) -> Vec<String> {
     let Some(args) = git_subcommand_args(args) else {
         return Vec::new();
     };
@@ -57,7 +57,7 @@ pub(crate) fn worktree_relative_push_sources(args: &[String]) -> Vec<String> {
 /// Compared after canonicalization so a symlinked temporary directory -- the
 /// normal shape of a scratch checkout on macOS -- is not mistaken for a
 /// different tree.
-pub(crate) fn is_within(candidate: &Path, root: &Path) -> bool {
+pub fn is_within(candidate: &Path, root: &Path) -> bool {
     let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     canonical(candidate).starts_with(canonical(root))
 }
@@ -1348,7 +1348,7 @@ fn passwd_home() -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
 }
 
-pub(crate) fn github_command() -> Command {
+pub fn github_command() -> Command {
     let program = gh_program()
         .cloned()
         .unwrap_or_else(|| PathBuf::from("/nonexistent/gh"));
@@ -2201,7 +2201,7 @@ impl Broker {
     /// Execute through the normal coordinated-operation state machine while
     /// allowing a caller to revalidate local state under the repository lock,
     /// then durably journal structured successful stdout before success.
-    pub(crate) fn run_coordinated_operation_at_with_hooks<P, F>(
+    pub fn run_coordinated_operation_at_with_hooks<P, F>(
         &mut self,
         mut request: CoordinatedCommand,
         cwd: &Path,

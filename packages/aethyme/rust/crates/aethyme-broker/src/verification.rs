@@ -23,28 +23,28 @@ use crate::{BrokerError, BrokerOpError, GitRepo};
 
 /// Where a slot was placed, and what it had to settle for.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SlotPlacement {
-    pub(crate) directory: PathBuf,
+pub struct SlotPlacement {
+    pub directory: PathBuf,
     /// True when nothing outside the repository could be written.
-    pub(crate) inside_repository: bool,
+    pub inside_repository: bool,
     /// The location that was wanted, when it is not the one in use.
-    pub(crate) preferred: Option<PathBuf>,
+    pub preferred: Option<PathBuf>,
     /// Why each location outside the repository was rejected, in order.
-    pub(crate) refusals: Vec<String>,
+    pub refusals: Vec<String>,
     /// Explicit environment/library roots are strict. If their storage is not
     /// safe, acquisition must fail rather than silently switching volumes.
-    pub(crate) blocking_refusal: Option<String>,
+    pub blocking_refusal: Option<String>,
 }
 
 /// Choose the directory this repository's slot will occupy.
-pub(crate) fn plan_slot_placement(main_root: &Path, namespace: &str) -> SlotPlacement {
+pub fn plan_slot_placement(main_root: &Path, namespace: &str) -> SlotPlacement {
     let root_plan = default_worktree_root_plan(main_root);
     plan_slot_placement_with_worktree_root_plan(main_root, namespace, &root_plan)
 }
 
 /// Build the default worktree-root choice when no broker instance has an
 /// accepted library override to supply.
-pub(crate) fn default_worktree_root_plan(main_root: &Path) -> crate::WorktreeRootPlan {
+pub fn default_worktree_root_plan(main_root: &Path) -> crate::WorktreeRootPlan {
     let repository = GitRepo::discover(main_root).ok();
     let git_common_dir = repository
         .as_ref()
@@ -491,7 +491,7 @@ fn path_is_inside(root: &Path, candidate: &Path) -> bool {
 /// Callers choose a distinct namespace when their verification lifetimes must
 /// not contend with one another.
 /// The file lock covers checkout materialization, gate execution, and cleanup.
-pub(crate) struct ExactTreeVerificationSlot {
+pub struct ExactTreeVerificationSlot {
     repository_root: PathBuf,
     path: PathBuf,
     _lock: ExclusiveFileLock,
@@ -504,7 +504,7 @@ impl ExactTreeVerificationSlot {
         Self::acquire_with_worktree_root_plan(main_root, namespace, &root_plan)
     }
 
-    pub(crate) fn acquire_with_worktree_root_plan(
+    pub fn acquire_with_worktree_root_plan(
         main_root: &Path,
         namespace: &str,
         root_plan: &crate::WorktreeRootPlan,
@@ -678,7 +678,7 @@ impl ExactTreeVerificationSlot {
         })
     }
 
-    pub(crate) fn materialize(
+    pub fn materialize(
         &mut self,
         repository: &GitRepo,
         commit: &str,

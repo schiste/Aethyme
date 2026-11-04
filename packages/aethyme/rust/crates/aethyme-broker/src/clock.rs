@@ -3,7 +3,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Milliseconds since the Unix epoch, or 0 if the clock reads before it.
-pub(crate) fn epoch_ms() -> i64 {
+pub fn epoch_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)

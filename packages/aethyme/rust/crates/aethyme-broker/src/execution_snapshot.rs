@@ -28,7 +28,7 @@ const MAX_MATERIALIZED_FILES: usize = 8192;
 const MAX_MATERIALIZED_NODES: usize = 16_384;
 const MAX_MATERIALIZED_PATH_DEPTH: usize = 64;
 const MAX_MATERIALIZED_COMPONENT_BYTES: usize = 255;
-pub(crate) const RECONSTRUCTION_LIMITS: archive::ReconstructionLimits =
+pub const RECONSTRUCTION_LIMITS: archive::ReconstructionLimits =
     archive::ReconstructionLimits {
         max_manifest_bytes: MAX_FILE_BYTES as usize,
         max_file_bytes: MAX_FILE_BYTES as usize,
@@ -488,7 +488,7 @@ fn inspect(
     }
     Ok(snapshot)
 }
-pub(crate) fn portable(snapshot: &SourceSnapshot) -> Result<(), SnapshotError> {
+pub fn portable(snapshot: &SourceSnapshot) -> Result<(), SnapshotError> {
     // This is the common boundary for execution inputs, local generations,
     // and parsed artifacts. Bound logical nodes and path sizes before building
     // prefix keys; `inspect_roles` separately enforces the all-role total.

@@ -374,7 +374,7 @@ pub(crate) struct ValidatedSnapshot {
 }
 
 impl ValidatedSnapshot {
-    pub(crate) fn snapshot(&self) -> &SourceSnapshot {
+    pub fn snapshot(&self) -> &SourceSnapshot {
         &self.snapshot
     }
 
@@ -518,7 +518,7 @@ fn new_temporary(store: &CollaborationStore) -> Result<tempfile::NamedTempFile, 
 }
 
 /// Store `bytes` and return their name.
-pub(crate) fn put_object(
+pub fn put_object(
     store: &CollaborationStore,
     bytes: &[u8],
 ) -> Result<ObjectDigest, ArchiveError> {
@@ -542,7 +542,7 @@ pub fn read_object(
 }
 
 /// Read an object through the response barrier with a caller-specific budget.
-pub(crate) fn read_object_bounded(
+pub fn read_object_bounded(
     store: &CollaborationStore,
     digest: &ObjectDigest,
     max_bytes: usize,
@@ -656,7 +656,7 @@ pub fn has_object(store: &CollaborationStore, digest: &ObjectDigest) -> Result<b
 
 // -------------------------------------------------------------------- git
 
-pub(crate) fn git(repo: &Path) -> Command {
+pub fn git(repo: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .arg("--no-replace-objects")
@@ -1311,7 +1311,7 @@ pub(crate) fn raw_commit_tree(repo: &Path, commit: &CommitOid) -> Result<String,
 /// and hashes every blob: O(bytes of the tree) per call, with no cache.
 /// Read a bounded ordinary policy blob from verified raw Git objects. No
 /// replacement refs, grafts, alternate object paths, or lazy fetch can alter it.
-pub(crate) fn raw_file_at_commit(
+pub fn raw_file_at_commit(
     repo: &Path,
     commit: &CommitOid,
     path: &[u8],
@@ -1405,7 +1405,7 @@ pub(crate) fn retain_snapshot_with(
 /// Retain one committed snapshot while the caller holds the shared archive
 /// barrier. Project binding uses this for its explicit enrollment bootstrap;
 /// the lock must cover validation through the transaction that roots the map.
-pub(crate) fn retain_snapshot_for_binding(
+pub fn retain_snapshot_for_binding(
     store: &mut CollaborationStore,
     repo: &Path,
     commit: &CommitOid,
@@ -1954,7 +1954,7 @@ pub fn retained_contribution(
     }))
 }
 
-pub(crate) fn parse_digest(hex: &str) -> Option<ObjectDigest> {
+pub fn parse_digest(hex: &str) -> Option<ObjectDigest> {
     if !is_lower_hex(hex, &[64]) {
         return None;
     }
@@ -1969,7 +1969,7 @@ pub(crate) fn parse_digest(hex: &str) -> Option<ObjectDigest> {
 
 /// Parse a #652 manifest back into a snapshot. The caller has already
 /// checked that the bytes hash to the snapshot ID.
-pub(crate) fn parse_manifest(bytes: &[u8]) -> Option<SourceSnapshot> {
+pub fn parse_manifest(bytes: &[u8]) -> Option<SourceSnapshot> {
     use aethyme_contracts::experimental_v0::source_snapshot::MANIFEST_HEADER;
 
     let mut rest = bytes.strip_prefix(MANIFEST_HEADER)?;
@@ -2095,7 +2095,7 @@ fn check_manifest_entry_count(
 /// the parsed entry vector, and file bodies are read one at a time through the
 /// no-follow, digest-verifying bounded reader. Output bytes are counted per
 /// entry, even where multiple entries share one CAS object.
-pub(crate) fn validate_snapshot_bounded(
+pub fn validate_snapshot_bounded(
     store: &CollaborationStore,
     id: &SourceSnapshotId,
     limits: ReconstructionLimits,
@@ -2262,7 +2262,7 @@ pub fn reconstruct(
 
 /// Internal raw manifest materialization. The caller must establish retention
 /// authority (a retained snapshot or a sealed artifact's exact target root).
-pub(crate) fn reconstruct_manifest(
+pub fn reconstruct_manifest(
     store: &CollaborationStore,
     id: &SourceSnapshotId,
     dest: &Path,
@@ -2329,7 +2329,7 @@ fn prepare_empty_destination(dest: &Path) -> Result<(), ArchiveError> {
 /// body are checked before the destination is created. A later archive read or
 /// filesystem write failure may leave a partial destination; callers must treat
 /// it as incomplete and must not use or merge it.
-pub(crate) fn reconstruct_bounded(
+pub fn reconstruct_bounded(
     store: &CollaborationStore,
     id: &SourceSnapshotId,
     dest: &Path,

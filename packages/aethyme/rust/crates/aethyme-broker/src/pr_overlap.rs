@@ -151,19 +151,19 @@ pub(crate) struct PlannedPathPrOverlap {
 /// declarations. Missing or stale data is represented as a warning rather
 /// than an empty result.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct PlannedPathPrOverlapCheck {
+pub struct PlannedPathPrOverlapCheck {
     /// Whether the cached PR listing is fresh and matches the local default.
-    pub(crate) cache_available: bool,
-    pub(crate) overlaps: Vec<PlannedPathPrOverlap>,
+    pub cache_available: bool,
+    pub overlaps: Vec<PlannedPathPrOverlap>,
     /// PRs in a usable listing whose current changed paths could not be read.
-    pub(crate) unknown_prs: Vec<i64>,
+    pub unknown_prs: Vec<i64>,
     pub(crate) listed_at_ms: Option<i64>,
     /// The listing is capped at this many PRs when it is refreshed by push.
-    pub(crate) checked_open_pr_limit: usize,
+    pub checked_open_pr_limit: usize,
     /// True when the cached listing reached its cap and more PRs may exist.
-    pub(crate) listing_may_be_truncated: bool,
+    pub listing_may_be_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) warning: Option<String>,
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -490,7 +490,7 @@ impl Broker {
 
     /// Compare explicit planned paths with cached open-PR changed paths.
     /// Reads only the broker cache; it never inspects Git history or calls GitHub.
-    pub(crate) fn cached_planned_path_pr_overlaps(
+    pub fn cached_planned_path_pr_overlaps(
         &self,
         session: &crate::Session,
         planned_leases: &[crate::Lease],
@@ -988,7 +988,7 @@ impl Broker {
     /// The one-line heads-up `start` and `adopt` print when a session already
     /// has committed work that overlaps an open PR. A fresh session has no
     /// change yet, so this is silent for it.
-    pub(crate) fn pr_overlap_heads_up(&self, session: &crate::Session) -> Option<String> {
+    pub fn pr_overlap_heads_up(&self, session: &crate::Session) -> Option<String> {
         heads_up(&self.cached_pr_overlaps(session, crate::clock::epoch_ms())?)
     }
 }

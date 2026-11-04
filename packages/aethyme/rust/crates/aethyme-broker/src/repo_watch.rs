@@ -286,7 +286,7 @@ impl RepositoryWatchProvider for GithubCliRepositoryWatchProvider {
 }
 
 impl GithubCliRepositoryWatchProvider {
-    pub(crate) fn list_with_deadline(
+    pub fn list_with_deadline(
         repository: &str,
         limit: usize,
         deadline: std::time::Duration,

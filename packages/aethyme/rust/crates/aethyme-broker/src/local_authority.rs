@@ -72,7 +72,7 @@ pub enum AuthorityError {
 /// Lifetime guard shared by all controller mutations. Freeze waits for admitted
 /// library operations to finish, then closes ingress before changing the DB.
 #[derive(Debug)]
-pub(crate) struct Guard {
+pub struct Guard {
     project_dir: PathBuf,
     epoch: Option<Epoch>,
     active: bool,
@@ -192,7 +192,7 @@ fn matching(conn: &Connection, w: &Witness, epoch: &Epoch) -> Result<(), Authori
 
 /// Initialize only an unbound store with no witness. An interrupted initial
 /// installation stays frozen and needs explicit trusted-operator recovery.
-pub(crate) fn acquire(store: &mut CollaborationStore) -> Result<(Epoch, Guard), AuthorityError> {
+pub fn acquire(store: &mut CollaborationStore) -> Result<(Epoch, Guard), AuthorityError> {
     let path = directory(store)?;
     prepare(&path)?;
     let exclusive = ExclusiveFileLock::acquire(open_lock_file(&path.join("ingress.lock"))?)?;
@@ -236,7 +236,7 @@ pub(crate) fn acquire(store: &mut CollaborationStore) -> Result<(Epoch, Guard), 
     let guard = guard(store, &epoch)?;
     Ok((epoch, guard))
 }
-pub(crate) fn guard(store: &CollaborationStore, epoch: &Epoch) -> Result<Guard, AuthorityError> {
+pub fn guard(store: &CollaborationStore, epoch: &Epoch) -> Result<Guard, AuthorityError> {
     let path = directory(store)?;
     let file = open_lock_file(&path.join("ingress.lock"))?;
     file.lock_shared()?;
@@ -311,7 +311,7 @@ pub(crate) struct AuthorityObservation {
 /// Inspect a checked read-only snapshot without initializing authority, opening
 /// an ingress lock, changing pragmas, or creating files. Concurrent changes can
 /// make this observation stale; the mutation APIs still require their guards.
-pub(crate) fn inspect(
+pub fn inspect(
     snapshot: &crate::collaboration_state::CollaborationSnapshot,
 ) -> Result<AuthorityObservation, AuthorityError> {
     let binding = if snapshot.has_table("local_authority_state") {

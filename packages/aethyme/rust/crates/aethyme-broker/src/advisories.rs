@@ -27,7 +27,7 @@ fn quoted(value: &str) -> String {
 /// Concise, deterministic command/hook boundary notices for one session.
 /// Producer-controlled strings stay JSON quoted so terminal control text or
 /// arbitrary Markdown cannot be mistaken for broker instructions.
-pub(crate) fn session_notice_lines(advisories: &[Advisory]) -> Vec<String> {
+pub fn session_notice_lines(advisories: &[Advisory]) -> Vec<String> {
     let mut lines = Vec::new();
     for advisory in advisories {
         lines.push(format!(

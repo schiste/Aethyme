@@ -562,9 +562,9 @@ pub(crate) fn is_issue_dependency_write(args: &[String]) -> bool {
 /// The only GraphQL mutations Aethyme supports for review-thread conversations.
 /// Keep these queries exact: GraphQL can perform unrelated writes, including
 /// ref updates, in the same request.
-pub(crate) const REVIEW_THREAD_REPLY_QUERY: &str = "mutation($threadId: ID!, $body: String!) { addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $threadId, body: $body}) { comment { id } } }";
-pub(crate) const REVIEW_THREAD_RESOLVE_QUERY: &str = "mutation($threadId: ID!) { resolveReviewThread(input: {threadId: $threadId}) { thread { id isResolved } } }";
-pub(crate) const REVIEW_THREAD_LOOKUP_QUERY: &str = "query($threadId: ID!) { node(id: $threadId) { ... on PullRequestReviewThread { id pullRequest { number repository { nameWithOwner } } } } }";
+pub const REVIEW_THREAD_REPLY_QUERY: &str = "mutation($threadId: ID!, $body: String!) { addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $threadId, body: $body}) { comment { id } } }";
+pub const REVIEW_THREAD_RESOLVE_QUERY: &str = "mutation($threadId: ID!) { resolveReviewThread(input: {threadId: $threadId}) { thread { id isResolved } } }";
+pub const REVIEW_THREAD_LOOKUP_QUERY: &str = "query($threadId: ID!) { node(id: $threadId) { ... on PullRequestReviewThread { id pullRequest { number repository { nameWithOwner } } } } }";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReviewThreadRequestKind {
@@ -583,7 +583,7 @@ struct ReviewThreadRequest<'a> {
 
 /// IDs are used as GraphQL variables and are retained as opaque, single-token
 /// values for lock-scope recovery.
-pub(crate) fn is_review_thread_node_id(value: &str) -> bool {
+pub fn is_review_thread_node_id(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 

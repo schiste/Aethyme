@@ -1132,7 +1132,7 @@ fn scan_complete(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub(crate) fn open_absolute_directory_nofollow(
+pub fn open_absolute_directory_nofollow(
     path: &Path,
 ) -> Result<std::os::fd::OwnedFd, HostResourceError> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -1210,7 +1210,7 @@ pub(crate) fn openat_directory(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub(crate) fn openat_regular(
+pub fn openat_regular(
     parent: libc::c_int,
     name: &std::ffi::CStr,
     path: &Path,
@@ -1233,7 +1233,7 @@ pub(crate) fn openat_regular(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub(crate) fn stat_at(
+pub fn stat_at(
     parent: libc::c_int,
     name: &std::ffi::CStr,
     flags: libc::c_int,
@@ -1270,7 +1270,7 @@ pub(crate) fn cstring_from_os(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub(crate) fn file_type(stat: &libc::stat) -> libc::mode_t {
+pub fn file_type(stat: &libc::stat) -> libc::mode_t {
     stat.st_mode & libc::S_IFMT
 }
 

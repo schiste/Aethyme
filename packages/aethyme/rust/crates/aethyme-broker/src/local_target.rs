@@ -256,7 +256,7 @@ impl ControllerOwner {
     pub fn authority_epoch(&self) -> &crate::local_authority::Epoch {
         &self.epoch
     }
-    pub(crate) fn target(&self) -> &str {
+    pub fn target(&self) -> &str {
         &self.target
     }
     pub(crate) fn issuer(&self) -> &str {
@@ -365,7 +365,7 @@ pub fn acquire_controller(
     })
 }
 
-pub(crate) fn authorize(
+pub fn authorize(
     store: &CollaborationStore,
     owner: &ControllerOwner,
 ) -> Result<crate::local_authority::Guard, TargetError> {
@@ -496,7 +496,7 @@ fn require_snapshot_with_limits(
 
 /// Validate operator input and retained subjects before a new appointment.
 /// This is a bounded preflight observation; publication rechecks under guards.
-pub(crate) fn validate_proposal(
+pub fn validate_proposal(
     store: &CollaborationStore,
     spec: TargetSpec,
 ) -> Result<TargetSpec, TargetError> {

@@ -67,7 +67,7 @@ pub(crate) fn now_ms() -> i64 {
 // ------------------------------------------------------------ archive lock
 
 /// The lock every archive user shares and reclamation takes exclusively.
-pub(crate) fn lock_path(store: &CollaborationStore) -> PathBuf {
+pub fn lock_path(store: &CollaborationStore) -> PathBuf {
     store.project_dir().join("spool/gc.lock")
 }
 
@@ -207,7 +207,7 @@ pub fn archive_use(store: &CollaborationStore) -> std::io::Result<ArchiveUse> {
 /// Hold an existing archive barrier shared without creating or modifying
 /// peer state. This blocks exclusive reclamation while held; other shared
 /// archive users may still proceed.
-pub(crate) fn archive_use_read_only(store: &CollaborationStore) -> std::io::Result<ArchiveUse> {
+pub fn archive_use_read_only(store: &CollaborationStore) -> std::io::Result<ArchiveUse> {
     let file = open_existing_archive_lock_read_only(store)?;
     file.lock_shared()?;
     Ok(ArchiveUse {

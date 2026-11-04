@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 /// common directory means Git could not be asked, and the checkout path
 /// stands in -- worse as an identity, but still stable for the caller that
 /// has nothing better.
-pub(crate) fn repository_key(main_root: &Path, git_common_dir: Option<&Path>) -> String {
+pub fn repository_key(main_root: &Path, git_common_dir: Option<&Path>) -> String {
     let identity = git_common_dir.unwrap_or(main_root);
     let identity = identity
         .canonicalize()
@@ -34,7 +34,7 @@ pub(crate) fn repository_key(main_root: &Path, git_common_dir: Option<&Path>) ->
     format!("{name}-{}", &digest[..16])
 }
 
-pub(crate) fn default_host_state_dir() -> Option<PathBuf> {
+pub fn default_host_state_dir() -> Option<PathBuf> {
     resolve_host_state_dir().map(|(path, _)| path)
 }
 
@@ -115,7 +115,7 @@ pub(crate) fn host_state_dir_is_explicit() -> bool {
 /// Worktree storage is host-scoped while the records that own it are
 /// repository-local, so when such a repository is deleted its worktree tree is
 /// left with no database that could ever account for it again.
-pub(crate) fn path_is_ephemeral(path: &Path) -> bool {
+pub fn path_is_ephemeral(path: &Path) -> bool {
     let temp = std::env::temp_dir();
     let temp = std::fs::canonicalize(&temp).unwrap_or(temp);
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -193,7 +193,7 @@ pub(crate) fn default_host_cache_dir() -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-pub(crate) fn protect_host_state_path(path: &Path, directory: bool) -> std::io::Result<()> {
+pub fn protect_host_state_path(path: &Path, directory: bool) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let mode = if directory { 0o700 } else { 0o600 };

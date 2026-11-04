@@ -150,7 +150,7 @@ pub(crate) fn policy_at_root(root: &Path) -> Result<GatePolicy, BrokerOpError> {
 }
 
 /// The policy as committed at `commit`.
-pub(crate) fn policy_at_commit(repo: &GitRepo, commit: &str) -> Result<GatePolicy, BrokerOpError> {
+pub fn policy_at_commit(repo: &GitRepo, commit: &str) -> Result<GatePolicy, BrokerOpError> {
     let gates = match repo.config_toml_at_commit(commit, "gates")? {
         Some(text) => crate::gates::parse_gates(&text)?,
         None => Vec::new(),
@@ -330,7 +330,7 @@ pub(crate) fn test_escape_enabled() -> bool {
 ///
 /// [`host_state::path_is_ephemeral`] is the same predicate the verification
 /// slot uses to decide a repository is a fixture rather than durable state.
-pub(crate) fn test_escape_enabled_for_a_repository(main_root: &Path) -> bool {
+pub fn test_escape_enabled_for_a_repository(main_root: &Path) -> bool {
     test_escape_enabled() && crate::host_state::path_is_ephemeral(main_root)
 }
 
@@ -472,7 +472,7 @@ fn assess_trusted_at_path(
 
 /// Standalone trust check for callers without an open Broker, such as hooks
 /// and the gate doctor. It opens the database only if it already exists.
-pub(crate) fn require_trusted_standalone(
+pub fn require_trusted_standalone(
     main_root: &Path,
     policy: &GatePolicy,
 ) -> Result<TrustDecision, BrokerOpError> {
@@ -577,7 +577,7 @@ fn policy_sources(
 }
 
 /// Read-only trust state for the repository containing `dir`.
-pub(crate) fn status(dir: &Path) -> Result<GateTrustStatus, BrokerOpError> {
+pub fn status(dir: &Path) -> Result<GateTrustStatus, BrokerOpError> {
     let (main_root, checkout_root) = locate(dir)?;
     let path = record_path(&main_root)?;
     let trusted_policies = read_record(&path)?
@@ -598,7 +598,7 @@ pub(crate) fn status(dir: &Path) -> Result<GateTrustStatus, BrokerOpError> {
 
 /// Record every untrusted source of the repository containing `dir`.
 /// The caller has already shown them to a human and obtained approval.
-pub(crate) fn trust(dir: &Path, source: &str) -> Result<GateTrustReport, BrokerOpError> {
+pub fn trust(dir: &Path, source: &str) -> Result<GateTrustReport, BrokerOpError> {
     let current = status(dir)?;
     let main_root = PathBuf::from(&current.repository);
     let recorded = current
@@ -635,7 +635,7 @@ pub(crate) fn trust(dir: &Path, source: &str) -> Result<GateTrustReport, BrokerO
 }
 
 /// The exact command a human runs to approve this repository's policy.
-pub(crate) fn trust_command(main_root: &Path) -> String {
+pub fn trust_command(main_root: &Path) -> String {
     format!(
         "aethyme broker advanced trust --repo {}",
         shell_word(&main_root.to_string_lossy())

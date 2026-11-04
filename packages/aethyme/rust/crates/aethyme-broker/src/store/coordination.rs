@@ -5,7 +5,7 @@ impl BrokerStore {
     /// current holder. The caller must already hold the session's shared
     /// operation guard; this transaction makes the holder comparison and the
     /// appended event one CAS against concurrent rebinds.
-    pub(crate) fn heartbeat_session_task_lease(
+    pub fn heartbeat_session_task_lease(
         &mut self,
         session_id: i64,
         caller: &crate::session_holder::AgentProcess,
@@ -109,7 +109,7 @@ impl BrokerStore {
     /// Remove age-expiry authority before a session command whose child
     /// lifetime is not covered by a durable operation witness. The exact
     /// current holder remains protected by the legacy process-lifetime rule.
-    pub(crate) fn downgrade_session_task_lease_for_holder(
+    pub fn downgrade_session_task_lease_for_holder(
         &mut self,
         session_id: i64,
         caller: Option<&crate::session_holder::AgentProcess>,
@@ -187,7 +187,7 @@ impl BrokerStore {
     /// Most recent coordinated operations for a report, newest first.
     /// When a session is selected, unrelated operations stay out of the
     /// snapshot rather than broadening its diagnostic scope.
-    pub(crate) fn recent_coordinated_operations(
+    pub fn recent_coordinated_operations(
         &self,
         limit: i64,
         session_id: Option<i64>,

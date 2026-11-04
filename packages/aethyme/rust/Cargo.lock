@@ -50,10 +50,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "aethyme-broker-cli"
+version = "0.8.56"
+dependencies = [
+ "aethyme-broker",
+ "aethyme-config",
+ "aethyme-contracts",
+ "aethyme-engine",
+ "aethyme-enhance",
+ "aethyme-graph-indexer",
+ "aethyme-graph-schema",
+ "aethyme-graph-storage",
+ "aethyme-testkit",
+ "fastrand",
+ "globset",
+ "libc",
+ "notify",
+ "noyalib",
+ "regex",
+ "rusqlite",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "similar",
+ "tar",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "aethyme-cli"
 version = "0.8.56"
 dependencies = [
  "aethyme-broker",
+ "aethyme-broker-cli",
  "aethyme-engine",
  "aethyme-enhance",
  "aethyme-graph-indexer",

@@ -2,6 +2,7 @@
 exclude = ["vendor/libsqlite3-sys-0.30.1"]
 members = [
     "crates/aethyme-broker",
+    "crates/aethyme-broker-cli",
     "crates/aethyme-cli",
     "crates/aethyme-config",
     "crates/aethyme-contracts",

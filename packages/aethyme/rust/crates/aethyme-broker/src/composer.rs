@@ -3356,7 +3356,7 @@ pub fn read_recipe(store: &CollaborationStore, recipe: &RecipeRef) -> Result<Rec
 /// Independent editable checkout metadata from retained bytes. This reuses the
 /// candidate writer's raw CAS/blob/private-index plumbing, with no parent or
 /// dependency on an old Git object database. The caller supplies a new root.
-pub(crate) fn generation_checkout(
+pub fn generation_checkout(
     store: &CollaborationStore,
     repo: &Path,
     scratch: &Path,
@@ -3495,12 +3495,12 @@ fn generation_files(root: &Path, omit_git: bool) -> Result<SourceSnapshot, Compo
         .map_err(|e| ComposeError::Archive(ArchiveError::InvalidSnapshot(e)))
 }
 /// Digest all private Git files before invoking Git while loading a generation.
-pub(crate) fn generation_metadata_digest(root: &Path) -> Result<String, ComposeError> {
+pub fn generation_metadata_digest(root: &Path) -> Result<String, ComposeError> {
     Ok(generation_files(&root.join(".git"), false)?
         .id()
         .to_string())
 }
-pub(crate) fn verify_generation_checkout(
+pub fn verify_generation_checkout(
     root: &Path,
     snapshot: &SourceSnapshot,
     tree: &str,

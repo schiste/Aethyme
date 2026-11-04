@@ -20,25 +20,29 @@
 //!   WAL mode + busy_timeout, no daemon. Designed for 15 concurrent
 //!   sessions, stress-tested at 20 (see `tests/stress.rs`).
 
-mod advisories;
-pub mod agent_hook;
+#[doc(hidden)]
+
+pub mod advisories;
 pub mod analysis_view;
 mod archive_cleanup;
 mod artifact_catalog;
-mod artifact_claim;
-mod atomic_file;
+#[doc(hidden)]
+pub mod atomic_file;
 pub mod attribution;
 pub mod base_incidents;
 mod blockers;
-mod bounded_output;
-mod broker;
+#[doc(hidden)]
+pub mod bounded_output;
+#[doc(hidden)]
+pub mod broker;
 mod change_classification;
-mod chau7_mcp;
 mod chau7_tabs;
 mod cleanup_audit;
-mod cleanup_batch;
+#[doc(hidden)]
+pub mod cleanup_batch;
 mod cleanup_resolve;
-mod clock;
+#[doc(hidden)]
+pub mod clock;
 pub mod service;
 /// The shared `.aethyme` configuration loader (#1223): `<stem>.toml`,
 /// `<stem>.yaml` or `<stem>.yml`, exactly one, as one `toml::Value`.
@@ -47,7 +51,6 @@ pub mod config_source {
 }
 pub mod collaboration_archive;
 pub mod collaboration_capture;
-pub mod collaboration_cli;
 pub mod collaboration_context;
 pub mod collaboration_gc;
 pub mod collaboration_identity_store;
@@ -56,14 +59,12 @@ pub mod collaboration_state;
 pub mod collaboration_submit;
 pub mod composer;
 pub mod composition;
-mod disk_headroom;
+#[doc(hidden)]
+pub mod disk_headroom;
 mod duplicate_work;
 pub mod exit_status;
-mod resource_pressure;
 mod root_generation;
 // The T03 mapping adapter is compiled for the experimental contract tests but is not activated by a provider.
-#[allow(dead_code)]
-pub mod experimental_symbol_mapping;
 pub mod local_capture_notice;
 pub mod native_gates;
 pub mod resolution;
@@ -72,20 +73,20 @@ pub use disk_headroom::{
     refusal as disk_headroom_refusal,
     refusal_with_gate_cache as disk_headroom_refusal_with_gate_cache,
 };
-pub mod cli;
-mod cli_output;
-mod console;
+#[doc(hidden)]
+pub mod console;
 pub mod contract_check;
 mod delivery;
 mod error;
 pub mod events;
 mod exposures;
 mod external_events;
-mod file_lock;
+#[doc(hidden)]
+pub mod file_lock;
 mod gate_admission;
-mod gate_cache_gc;
 mod gate_database;
-mod outbox;
+#[doc(hidden)]
+pub mod outbox;
 pub use gate_database::GateBrokerDatabase;
 mod gate_debris;
 mod gate_profile;
@@ -96,45 +97,42 @@ pub use gate_debris::{
     RuntimeResource, RuntimeResourceKind,
 };
 pub mod agent_supervisor;
-mod auto_cleanup;
+#[doc(hidden)]
+pub mod auto_cleanup;
 pub mod environments;
 pub mod execution_resources;
 pub mod execution_snapshot;
 pub mod execution_supervisor;
 pub mod execution_verifier;
-mod gate_doctor;
-mod gates;
-mod gc;
-mod gh_ref_guard;
-mod git;
-mod git_maintenance_lock;
+#[doc(hidden)]
+pub mod gates;
+#[doc(hidden)]
+pub mod gc;
+#[doc(hidden)]
+pub mod gh_ref_guard;
+#[doc(hidden)]
+pub mod git;
 mod github_target;
-mod graph_impact;
-mod graph_impact_envelope;
-mod graph_integrity;
-mod homebrew;
+#[doc(hidden)]
+pub mod graph_impact;
+#[doc(hidden)]
+pub mod graph_integrity;
 pub mod hooks;
 mod host_operations;
-mod host_state;
+#[doc(hidden)]
+pub mod host_state;
 pub mod init;
 pub(crate) mod inline_exec_supervisor;
 pub mod insights;
 pub mod install_health;
 pub mod install_replacement;
-mod issue_form;
-mod issue_set;
-mod issue_set_apply;
-mod issue_set_github;
 mod lease_export;
-mod leases;
+#[doc(hidden)]
+pub mod leases;
 pub mod local_acceptance;
 pub mod local_authority;
 pub mod local_budget;
 pub mod local_controller;
-pub mod local_exchange;
-pub mod local_generation;
-pub mod local_handoff;
-pub mod local_restore;
 pub mod local_source_transport;
 pub mod local_target;
 pub mod local_wave;
@@ -142,59 +140,56 @@ mod main_drift;
 pub mod main_reconcile;
 pub mod managed_services;
 mod measurement;
-mod merge;
-mod merge_chain;
+#[doc(hidden)]
+pub mod merge;
 mod operation_stats;
-mod operations;
-mod overlap_pairs;
-mod ownership;
-mod worktree_registry;
+#[doc(hidden)]
+pub mod operations;
+#[doc(hidden)]
+pub mod overlap_pairs;
+#[doc(hidden)]
+pub mod ownership;
+#[doc(hidden)]
+pub mod worktree_registry;
 pub use ownership::{
     MAX_OWNERSHIP_CLAIM_NAME_CHARS, OwnershipClaim, OwnershipClaimReport, OwnershipClaimView,
 };
-pub mod plugin_cli;
 mod pr;
 mod pr_body;
 mod pr_link;
-mod pr_monitoring;
 mod runtime_paths;
 pub use runtime_paths::broker_runtime_ignore_patterns;
 mod scopes;
-mod submit_progress;
+#[doc(hidden)]
+pub mod submit_progress;
 pub use submit_progress::{
     InFlightSubmit, SUBMIT_STALL_AFTER, SlotHolder, SubmitProgressRecord, WaitPosition,
 };
-mod waiters;
+#[doc(hidden)]
+pub mod waiters;
 pub use waiters::{CurrentWaiter, WaitRecord};
 pub mod lease_liveness;
 pub mod lease_requests;
-pub mod session_guidance;
 pub mod session_holder;
 mod test_storage;
-mod text_redaction;
-mod unpushed;
+#[doc(hidden)]
+pub mod text_redaction;
+#[doc(hidden)]
+pub mod unpushed;
 pub mod worktree_location;
 mod worktree_report;
-pub use pr_monitoring::{
-    activate as activate_pr_monitoring, active_sessions as pr_monitoring_sessions,
-    deactivate as deactivate_pr_monitoring, is_active as pr_monitoring_is_active,
-};
-#[cfg(any(target_os = "macos", all(test, unix)))]
-mod gc_sweep_service;
 mod outcome_issues;
 mod outcome_report;
 mod pr_projection;
 mod pr_watch;
-#[cfg(unix)]
-mod pr_watch_service;
-#[cfg(any(target_os = "macos", all(test, unix)))]
-mod pr_watch_service_install;
-mod preparation;
+#[doc(hidden)]
+pub mod preparation;
 mod promotion_record;
 mod quality_report;
 mod quick_test;
 mod readiness;
-mod recommendations;
+#[doc(hidden)]
+pub mod recommendations;
 mod reconciliation;
 mod release_compatibility;
 pub mod release_manifest;
@@ -202,11 +197,6 @@ mod remote_target;
 mod removal;
 pub mod renamed_targets;
 mod repo_watch;
-mod report;
-mod report_filing;
-#[cfg(unix)]
-mod scheduled_service;
-mod watch_tick_budget;
 pub use chau7_tabs::{
     Chau7DispatchAction, Chau7Resolution, Chau7ResolutionRefusal, Chau7Tab, Chau7TabReadiness,
     dispatch_action, resolve_session_tab, workspace_tab_ids,
@@ -223,7 +213,8 @@ pub use quality_report::{
     QualityReportStatus, QualityReportTotals, merge_quality_report_section, plan_quality_report,
     preserve_quality_report_section, publish_quality_report, render_quality_report,
 };
-mod reclaim;
+#[doc(hidden)]
+pub mod reclaim;
 mod reclaim_order;
 pub use reclaim::{
     ReclaimCandidate, ReclaimOutcome, ReclaimPlan, apply as apply_reclaim,
@@ -239,31 +230,42 @@ pub use representation::{
 };
 mod pr_overlap;
 mod repository_contract;
-mod resources;
+#[doc(hidden)]
+pub mod resources;
 mod retention;
-mod review;
+#[doc(hidden)]
+pub mod review;
 mod review_backend;
 mod review_execution;
 mod review_facts;
 mod review_ledger;
 mod review_report;
 mod review_trigger;
-mod rule_comments;
-mod schema;
+#[doc(hidden)]
+pub mod rule_comments;
+#[doc(hidden)]
+pub mod schema;
 mod session_abandonment;
-mod session_push;
+#[doc(hidden)]
+pub mod session_push;
 mod session_sync;
 mod shared_edit_advice;
-mod ship;
-mod status_reads;
-mod storage;
-mod store;
-mod types;
-mod update;
+#[doc(hidden)]
+pub mod ship;
+#[doc(hidden)]
+pub mod status_reads;
+#[doc(hidden)]
+pub mod store;
+#[doc(hidden)]
+pub mod types;
+#[doc(hidden)]
+pub mod update;
 mod update_cache;
-mod verification;
+#[doc(hidden)]
+pub mod verification;
 mod verify_loop;
-mod version;
+#[doc(hidden)]
+pub mod version;
 mod worktree_freshness;
 mod worktree_reconcile;
 
@@ -354,12 +356,6 @@ pub use external_events::{
     ExternalEventReconciliation, ExternalEventRecord, ExternalEventStatus,
     ExternalVerificationMethod, VerifiedExternalSource, external_event_digest,
 };
-pub use gate_doctor::{
-    GateDiagnostic, GateDiagnosticConfidence, GateDiagnosticId, GateDiagnosticSeverity,
-    GateDoctorError, GateDoctorGate, GateDoctorReport, GateProbeMutations, GateProbeOutcome,
-    GateProbeReport, GateProbeWorktree, inspect_gate_quality, probe_gate_quality,
-    static_gate_diagnostics,
-};
 pub use gates::{
     CachePolicy, GATE_SCOPE_MANIFEST_SCHEMA_VERSION, GATES_CONFIG_RELPATH, Gate, GateConfigError,
     GateProgressSink, GateResourceProvenance, GateRunOutcome, GateScopeDefinition, GateScopeError,
@@ -392,11 +388,9 @@ pub use graph_impact::{
     GraphImpactStatus, GraphStoreImpactProvider, diff_digest, parse_diff_text,
     revision_bound_impact_report,
 };
-pub use graph_impact_envelope::{UnbindableImpactReport, impact_analysis_envelope};
 pub use graph_integrity::{
     GraphIntegrityOutcome, GraphIntegrityRejection, GraphIntegrityStatus, GraphIntegrityVerdict,
 };
-pub use homebrew::render_homebrew_formula;
 pub use hooks::{HookReport, HookSnippet, HookState, HooksError};
 pub use host_operations::{
     HostOperation, HostOperationError, HostOperationGuard, default_host_operation_db_path,
@@ -410,11 +404,6 @@ pub use insights::{
     InsightGateRow, InsightSessionRow, InsightsInput, InsightsQuery, InsightsReport, Outcome,
     OutcomeCounts, PullRequestSummary, SessionInsightRow, SessionSummary, Stage, Window,
     fold_events, report, stage_for_event, stage_map,
-};
-pub use issue_form::{
-    ISSUE_FORM_RENDER_SCHEMA_VERSION, ISSUE_REVIEW_ARTIFACT_SCHEMA_VERSION, IssueFormFieldKind,
-    IssueFormFieldStatus, IssueFormRenderResult, IssueFormRenderedField, IssueFormWriteResult,
-    render_issue_form, write_issue_form_render_atomic,
 };
 pub use lease_export::{
     DEFAULT_LEASE_ROUTING_EXPORT_LIMIT, LEASE_ROUTING_EXPORT_SCHEMA_VERSION,
@@ -447,7 +436,8 @@ pub use operation_stats::{
 pub use operations::{
     CoordinatedCommand, CoordinatedOperationReport, OperationReconcileReport, PushedRef,
 };
-pub(crate) use operations::{
+#[doc(hidden)]
+pub use operations::{
     MissingOperationFlags, is_within, missing_operation_flags, worktree_relative_push_sources,
 };
 pub use operations::{
@@ -474,7 +464,8 @@ pub use pr::{
     PrActivityItem, PrCheckOptions, PrCheckReport, PrCheckRun, PrDecision, PrDecisionStatus,
     PrDispatchReport, PrDispatchStatus, PrError, PrMarker, PrSummary,
 };
-pub(crate) use pr_overlap::PlannedPathPrOverlapCheck;
+#[doc(hidden)]
+pub use pr_overlap::PlannedPathPrOverlapCheck;
 pub use pr_overlap::{
     PrOverlap, PrOverlapCheck, PrOverlapLineDetails, PrOverlapLineRange, PrOverlapPathRanges,
     PrOverlapRangeBasis,
@@ -569,21 +560,6 @@ pub use repo_watch::{
     is_repository_delivery_id, load_review_prompt_template, render_repository_prompt,
     review_prompt_variables,
 };
-pub use report::{
-    InvalidReportEntry, PreparedReport, REPORT_DOCUMENT_SCHEMA_VERSION, REPORT_FILINGS_FILENAME,
-    REPORT_FILINGS_SCHEMA_VERSION, REPORT_INVENTORY_SCHEMA_VERSION, REPORT_MAX_BYTES,
-    REPORT_RECENT_EVENT_LIMIT, REPORT_RECENT_GATE_LIMIT, REPORT_RECENT_OPERATION_LIMIT,
-    REPORT_SNAPSHOT_SCHEMA_VERSION, ReportBuild, ReportCaptureError, ReportCaptureResult,
-    ReportDocument, ReportEventType, ReportFilingState, ReportGateCacheSource,
-    ReportGateObservation, ReportGateProvenance, ReportGraphIntegrity, ReportInspection,
-    ReportKind, ReportLastFailure, ReportList, ReportOperation, ReportPlatform, ReportSession,
-    ReportSnapshot, ReportSnapshotBuilder, ReportSummary, list_reports, prepare_report,
-    show_report, write_report_atomic,
-};
-pub use report_filing::{
-    REPORT_FILE_SCHEMA_VERSION, ReportFileError, ReportFileResult, ReportFileState,
-    file_reviewed_report,
-};
 pub use repository_contract::{
     CANONICAL_REPOSITORY_MARKER_PATH, LOCAL_REPOSITORY_MARKER_PATH, RepositoryContract,
     RepositoryDeploymentMode, detect_repository_mode, repository_managed_paths,
@@ -672,16 +648,6 @@ pub use ship::{
     ShipPublicationAuthorization, ShipPublicationAuthorizationKind, ShipPublicationMode,
     ShipPublicationPolicy, ShipPush, ShipReviewEvidence,
 };
-pub use storage::{
-    STORAGE_ATTRIBUTION_SCHEMA_VERSION, STORAGE_PLAN_SCHEMA_VERSION,
-    STORAGE_RECONCILIATION_SCHEMA_VERSION, StorageAppliedItem, StorageApplyFailure,
-    StorageApplyReport, StorageAttribution, StorageAttributionReport, StorageCandidate,
-    StorageCandidateKind, StorageDirectoryKind, StorageEntry, StorageError, StorageFilesystemKind,
-    StorageGitEntry, StorageMarkerStatus, StoragePlan, StoragePrimaryArtifact,
-    StoragePrimaryCandidate, StoragePrimaryCheckout, StorageReconciliation,
-    StorageRecoveryArchiveGroup, StorageRoot, StorageSource, StorageSummary, storage_apply,
-    storage_attribute, storage_plan,
-};
 pub use store::BrokerStore;
 pub use types::{
     Advisory, AdvisoryAction, AdvisoryAudience, AdvisoryDeliveryMetric, AdvisoryDeliverySummary,
@@ -724,6 +690,22 @@ pub use worktree_report::{
     build_with as build_worktree_report_with,
 };
 
+#[doc(hidden)]
+
+pub mod resource_pressure;
+mod gate_cache_gc;
+mod storage;
+pub use storage::{
+    STORAGE_ATTRIBUTION_SCHEMA_VERSION, STORAGE_PLAN_SCHEMA_VERSION,
+    STORAGE_RECONCILIATION_SCHEMA_VERSION, StorageAppliedItem, StorageApplyFailure,
+    StorageApplyReport, StorageAttribution, StorageAttributionReport, StorageCandidate,
+    StorageCandidateKind, StorageDirectoryKind, StorageEntry, StorageError, StorageFilesystemKind,
+    StorageGitEntry, StorageMarkerStatus, StoragePlan, StoragePrimaryArtifact,
+    StoragePrimaryCandidate, StoragePrimaryCheckout, StorageReconciliation,
+    StorageRecoveryArchiveGroup, StorageRoot, StorageSource, StorageSummary, storage_apply,
+    storage_attribute, storage_plan,
+};
+
 /// Repo-relative location of the broker database.
 pub const BROKER_DB_RELPATH: &str = ".aethyme/broker.db";
 
@@ -749,7 +731,7 @@ pub const BROKER_DB_ENV: &str = "AETHYME_BROKER_DB";
 /// hide the original error; dropping the result would lose the fact that broker
 /// state is now incomplete. stderr is the broker's channel for non-fatal
 /// diagnostics, and `warning:` is the prefix the CLI already uses for them.
-pub(crate) fn warn_unrecorded<T, E: std::fmt::Display>(what: &str, result: Result<T, E>) {
+pub fn warn_unrecorded<T, E: std::fmt::Display>(what: &str, result: Result<T, E>) {
     if let Err(error) = result {
         eprintln!("warning: aethyme could not {what}: {error}");
     }

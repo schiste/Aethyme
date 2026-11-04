@@ -205,7 +205,7 @@ fn snapshot_path(root: &Path, digest: &str) -> io::Result<PathBuf> {
 /// Whether a reclaim confirmation has the exact digest syntax used by plan
 /// snapshots. Keep this pure so CLI refusals can happen before opening broker
 /// state or scanning a worktree root.
-pub(crate) fn is_reclaim_plan_digest(digest: &str) -> bool {
+pub fn is_reclaim_plan_digest(digest: &str) -> bool {
     digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
@@ -898,7 +898,7 @@ pub(crate) struct OpenFileUse {
 /// `lsof` listing must never be treated as an empty listing by a caller that
 /// decides whether to delete build output.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum OpenFileSnapshot {
+pub enum OpenFileSnapshot {
     Complete(Vec<OpenFileUse>),
     Incomplete {
         reason: String,
@@ -909,7 +909,7 @@ pub(crate) enum OpenFileSnapshot {
 /// Keep a worktree candidate when a complete snapshot attributes an open path
 /// to a process. The reason retains enough identity to find the process and
 /// file during a cleanup review.
-pub(crate) fn protect_worktrees_with_open_file_uses(
+pub fn protect_worktrees_with_open_file_uses(
     candidates: &mut [ReclaimCandidate],
     open_files: &[OpenFileUse],
 ) {
@@ -927,7 +927,7 @@ pub(crate) fn protect_worktrees_with_open_file_uses(
 /// Keep all otherwise-reclaimable candidates when process use could not be
 /// checked. The failure reason is deliberately bounded and is not evidence
 /// that a worktree is idle.
-pub(crate) fn protect_worktrees_when_open_file_snapshot_is_incomplete(
+pub fn protect_worktrees_when_open_file_snapshot_is_incomplete(
     candidates: &mut [ReclaimCandidate],
     reason: &str,
     observed: &[OpenFileUse],
@@ -1121,7 +1121,7 @@ const OPEN_FILE_SNAPSHOT_MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 /// command is supervised by `bounded_output`, and timeout, output-limit,
 /// nonzero-exit, malformed, or empty results remain `Incomplete` rather than
 /// being interpreted as no process use.
-pub(crate) fn open_file_snapshot_under(root: &Path) -> OpenFileSnapshot {
+pub fn open_file_snapshot_under(root: &Path) -> OpenFileSnapshot {
     open_file_snapshot_under_with_budget(root, OPEN_FILE_SNAPSHOT_BUDGET)
 }
 

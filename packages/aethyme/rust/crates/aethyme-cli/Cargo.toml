@@ -28,6 +28,7 @@ toml_edit = { workspace = true }
 # the harness plus JSON/tempdir helpers are all they need.
 [target.'cfg(unix)'.dependencies]
 aethyme-broker = { path = "../aethyme-broker" }
+aethyme-broker-cli = { path = "../aethyme-broker-cli" }
 aethyme-quality = { path = "../aethyme-quality" }
 
 [dev-dependencies]

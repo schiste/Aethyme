@@ -314,7 +314,7 @@ const PRE_PUSH_PATH_HINT: &str = "Hint: the pre-push hook could not find a requi
 /// failed push qualifies: the same failure text is shared by every coordinated
 /// git and gh operation, and gh's `HTTP 404: Not Found` would otherwise read
 /// as a hook that could not find its toolchain.
-pub(crate) fn missing_executable_path_hint(stdout: &str, stderr: &str) -> Option<&'static str> {
+pub fn missing_executable_path_hint(stdout: &str, stderr: &str) -> Option<&'static str> {
     let output = format!("{stdout}\n{stderr}").to_ascii_lowercase();
     let refused_push =
         output.contains("failed to push some refs") || output.contains("pre-push hook");
@@ -333,7 +333,7 @@ pub(crate) fn missing_executable_path_hint(stdout: &str, stderr: &str) -> Option
     .then_some(PRE_PUSH_PATH_HINT)
 }
 
-pub(crate) fn with_pre_push_path_hint(reason: &str) -> String {
+pub fn with_pre_push_path_hint(reason: &str) -> String {
     if reason.contains("pre-push hook refused this push")
         && missing_executable_path_hint("", reason).is_some()
         && !reason.contains(PRE_PUSH_PATH_HINT)
@@ -416,7 +416,7 @@ fn branch_refusal(branch: &str, default_branch: &str) -> Option<String> {
 /// `doctor`, `finish`. No tracked default branch, or a policy that cannot be
 /// read, means "not opted in" rather than an error, so those commands keep
 /// working in a repository `broker push` would refuse.
-pub(crate) fn session_push_enabled(repo: &GitRepo) -> bool {
+pub fn session_push_enabled(repo: &GitRepo) -> bool {
     tracked_default(repo).is_some_and(|default| push_authorized(repo, &default).unwrap_or(false))
 }
 

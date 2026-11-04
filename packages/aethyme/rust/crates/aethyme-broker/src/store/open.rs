@@ -1785,7 +1785,7 @@ impl BrokerStore {
 
     /// Release only `session_id`'s explicit claim on exactly `path`.
     /// Implicit diff-derived lease rows are left unchanged.
-    pub(crate) fn release_explicit_lease(
+    pub fn release_explicit_lease(
         &mut self,
         session_id: i64,
         path: &str,

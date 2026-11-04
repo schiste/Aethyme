@@ -193,7 +193,7 @@ impl Server {
         self.serve_requests_until(stop, None, None)
     }
 
-    pub(crate) fn serve_jobs_until(
+    pub fn serve_jobs_until(
         &self,
         stop: &AtomicBool,
         jobs: Arc<JobRuntime>,

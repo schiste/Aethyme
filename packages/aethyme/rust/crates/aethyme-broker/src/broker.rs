@@ -33,7 +33,7 @@ use crate::types::{
 use crate::version::{VersionDriftReport, VersionDriftStatus};
 use crate::worktree_reconcile::WorktreeReconciliation;
 
-pub(crate) mod gate_trust;
+pub mod gate_trust;
 
 /// Per-phase budget for the read-only `gates affected` inspection (#481).
 pub(crate) const GATES_AFFECTED_PHASE_BUDGET_MS: u64 = 5_000;
@@ -1045,7 +1045,7 @@ pub struct AdoptReport {
 }
 
 /// Internal timing transport keeps the public library report structs stable.
-pub(crate) struct TimedStartReport<T> {
+pub struct TimedStartReport<T> {
     pub report: T,
     pub phase_timings_ms: std::collections::BTreeMap<String, u64>,
 }
@@ -1914,7 +1914,7 @@ pub struct PendingOperationView {
 
 /// What prompts a collaboration-fence check (#660); see
 /// `Broker::collaboration_fence_state`.
-pub(crate) enum FenceTrigger<'a> {
+pub enum FenceTrigger<'a> {
     /// A broker open or unresolved caller read: check the fetched default
     /// branch because only committed policy can raise the compatibility fence.
     Open,
@@ -1925,7 +1925,7 @@ pub(crate) enum FenceTrigger<'a> {
 /// Additional recorded data used only by compact presentation. Keeping this
 /// separate preserves the established full and summary JSON contracts.
 #[derive(Debug)]
-pub(crate) struct RoutineStatusContext {
+pub struct RoutineStatusContext {
     pub session_contexts: Vec<(i64, String)>,
     pub collaboration_fence: Option<crate::CollaborationFence>,
     pub lease_release_requests: Vec<crate::lease_requests::LeaseReleaseRequest>,
@@ -2367,7 +2367,7 @@ pub struct LeasePlan {
     pub would_conflict: bool,
 }
 
-pub(crate) fn normalize_lease_path(path: &str) -> Result<String, BrokerOpError> {
+pub fn normalize_lease_path(path: &str) -> Result<String, BrokerOpError> {
     let invalid = |reason: &str| BrokerOpError::InvalidLeasePath {
         path: path.to_string(),
         reason: reason.to_string(),
@@ -3560,7 +3560,7 @@ mod finish;
 mod gates;
 mod leases;
 mod owners;
-pub(crate) use leases::{AbandonedSessionCloseOutcome, validate_session_commit_args};
+pub use leases::{AbandonedSessionCloseOutcome, validate_session_commit_args};
 pub use owners::{CommitOwner, MAX_OWNER_COMMITS, OwnedCommit, OwnersReport};
 pub(crate) mod lifecycle;
 mod scope_capture;
@@ -3569,7 +3569,7 @@ mod status_helpers;
 
 pub use scope_capture::ScopeCaptureReport;
 use scope_capture::derive_scopes_from_task;
-pub(super) use status_helpers::*;
+pub use status_helpers::*;
 
 #[cfg(test)]
 mod pid_liveness_tests;

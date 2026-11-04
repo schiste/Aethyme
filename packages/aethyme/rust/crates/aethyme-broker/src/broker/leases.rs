@@ -10,7 +10,7 @@ const SESSION_COMMIT_PARENT_OUTPUT_CAP: usize = 64 * 1024;
 /// Validate arguments after the literal `git commit` command prefix. Global
 /// routing switches are refused explicitly, and no option that skips a Git
 /// commit hook may pass through this broker lane.
-pub(crate) fn validate_session_commit_args(args: &[String]) -> Result<(), String> {
+pub fn validate_session_commit_args(args: &[String]) -> Result<(), String> {
     let option_end = args
         .iter()
         .position(|arg| arg == "--")
@@ -176,7 +176,7 @@ enum WorktreeDirectoryScan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AbandonedSessionCloseOutcome {
+pub enum AbandonedSessionCloseOutcome {
     Closed,
     NotDue,
     Changed,
@@ -1047,7 +1047,7 @@ impl Broker {
 
     /// Read-only diagnostics for explicit requests and final admission refusal.
     /// Never called by routine status, successful acquisition or wait retries.
-    pub(crate) fn resource_pressure_report(
+    pub fn resource_pressure_report(
         &self,
     ) -> Result<crate::resource_pressure::Report, BrokerOpError> {
         let sessions = self.store.live_sessions()?;
@@ -2433,7 +2433,7 @@ impl Broker {
     /// explicit non-interactive opt-in forces process-group supervision; JSON
     /// mode moves child stdout to stderr so the final report remains one JSON
     /// document. All other child stdio behavior is preserved.
-    pub(crate) fn guarded_exec_for_cli(
+    pub fn guarded_exec_for_cli(
         &mut self,
         session_id: i64,
         command: &[String],
@@ -2485,7 +2485,7 @@ impl Broker {
     /// dirty-path auditing; complete status and committed-tree audits bracket
     /// it so a successful commit cannot make an unauthorized path disappear
     /// from the post-command dirty list.
-    pub(crate) fn guarded_commit_for_cli(
+    pub fn guarded_commit_for_cli(
         &mut self,
         session_id: i64,
         caller_cwd: &Path,

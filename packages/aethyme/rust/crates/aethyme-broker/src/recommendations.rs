@@ -76,7 +76,7 @@ pub struct MaintainerRecommendation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RecommendationInspection {
+pub struct RecommendationInspection {
     pub state: &'static str,
     pub reason: Option<String>,
     pub recommendations: Vec<MaintainerRecommendation>,
@@ -88,7 +88,7 @@ pub(crate) struct RecommendationSnapshot {
     pub saturated_kinds: Vec<RecommendationKind>,
 }
 
-pub(crate) fn inspect_history_recommendations(main_root: &Path) -> RecommendationInspection {
+pub fn inspect_history_recommendations(main_root: &Path) -> RecommendationInspection {
     let database = main_root.join(crate::BROKER_DB_RELPATH);
     match std::fs::symlink_metadata(&database) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => RecommendationInspection {

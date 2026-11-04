@@ -90,7 +90,7 @@ pub(crate) fn normalize_claim_name(name: &str) -> Result<String, BrokerOpError> 
 
 /// `3h05m ago`-style age for status lines; claims live for hours, so the
 /// seconds a submit label carries would only be noise.
-pub(crate) fn age_label(ms: i64) -> String {
+pub fn age_label(ms: i64) -> String {
     let minutes = ms.max(0) / 60_000;
     match minutes {
         0 => "under a minute".to_string(),
@@ -324,7 +324,7 @@ pub(crate) fn ownership_claim_advice(
 }
 
 /// `session 12 [Codex <x@y>] (release-cut)`, as much as is known.
-pub(crate) fn describe_holder(view: &OwnershipClaimView) -> String {
+pub fn describe_holder(view: &OwnershipClaimView) -> String {
     let mut text = format!("session {}", view.claim.session_id);
     if let Some(agent) = view.holder_agent.as_deref() {
         text.push_str(&format!(" [{agent}]"));

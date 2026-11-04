@@ -10,7 +10,7 @@ use crate::{DeliveryCompletion, DeliveryStatus};
 ///
 /// A claim counts as an attempt. Retry delay grows 15s, 30s, 60s, 120s, 240s,
 /// then holds at 300s; this cap bounds a repeatedly unavailable recipient.
-pub(crate) const MAX_DELIVERY_ATTEMPTS: i64 = 20;
+pub const MAX_DELIVERY_ATTEMPTS: i64 = 20;
 
 /// SQL predicate shared by both `claim_next` queries. A first attempt is due
 /// immediately, a retry observes bounded exponential backoff, and an expired

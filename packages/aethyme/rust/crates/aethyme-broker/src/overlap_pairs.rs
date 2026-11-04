@@ -349,7 +349,7 @@ fn read_cache(store: &crate::store::BrokerStore) -> BTreeMap<String, CachedPair>
 /// Paths Git reported as conflicting between two sessions at the last
 /// classification, or `None` when the pair was never classified. For
 /// surfaces that hold a store but no broker, such as the post-commit radar.
-pub(crate) fn cached_conflicting_paths(
+pub fn cached_conflicting_paths(
     store: &crate::store::BrokerStore,
     first: i64,
     second: i64,

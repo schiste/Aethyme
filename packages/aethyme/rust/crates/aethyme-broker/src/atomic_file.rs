@@ -17,7 +17,7 @@ use std::path::Path;
 /// return path, including write, sync, and publication errors; its random name
 /// also means an interrupted process cannot wedge a later writer by reusing a
 /// PID-and-clock filename.
-pub(crate) fn with_synced_temporary<T, F>(target: &Path, bytes: &[u8], publish: F) -> io::Result<T>
+pub fn with_synced_temporary<T, F>(target: &Path, bytes: &[u8], publish: F) -> io::Result<T>
 where
     F: FnOnce(&Path) -> io::Result<T>,
 {
@@ -49,7 +49,7 @@ where
 /// operator choices; return false without opening or changing them.
 /// On Unix, sync the containing directory after temporary cleanup. Other
 /// platforms retain no-replace publication without a directory durability claim.
-pub(crate) fn write_synced_if_absent(target: &Path, bytes: &[u8]) -> io::Result<bool> {
+pub fn write_synced_if_absent(target: &Path, bytes: &[u8]) -> io::Result<bool> {
     let published = with_synced_temporary(target, bytes, |temporary| {
         match fs::hard_link(temporary, target) {
             Ok(()) => Ok(true),

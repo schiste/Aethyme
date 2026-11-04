@@ -4683,7 +4683,7 @@ impl Broker {
     /// maintenance. Recovery plans and confirmed applies may inspect a valid
     /// but incomplete repository UUID marker publication; ordinary and
     /// read-only opens remain strict and non-repairing.
-    pub(crate) fn open_for_explicit_worktree_root_recovery(
+    pub fn open_for_explicit_worktree_root_recovery(
         path_inside_repo: &Path,
     ) -> Result<Self, BrokerOpError> {
         Self::open_for_explicit_worktree_root_recovery_with_options(
@@ -4726,7 +4726,7 @@ impl Broker {
     /// Open for explicit cleanup planning or apply without running unrelated
     /// autonomous GC maintenance. Normal writable-open recovery and any
     /// already-confirmed GC journal retain their usual handling.
-    pub(crate) fn open_for_cleanup_resolve(path_inside_repo: &Path) -> Result<Self, BrokerOpError> {
+    pub fn open_for_cleanup_resolve(path_inside_repo: &Path) -> Result<Self, BrokerOpError> {
         Self::open_for_cleanup_resolve_with_options(path_inside_repo, BrokerOpenOptions::default())
     }
 
@@ -4791,7 +4791,7 @@ impl Broker {
 
     /// Observe current coordination state without startup recovery, GC, or
     /// initialization. Keep the same strict durable root identity checks.
-    pub(crate) fn open_status_snapshot(path_inside_repo: &Path) -> Result<Self, BrokerOpError> {
+    pub fn open_status_snapshot(path_inside_repo: &Path) -> Result<Self, BrokerOpError> {
         let broker = Self::open_snapshot(path_inside_repo)?;
         broker.validate_bound_repository_worktree_root()?;
         Ok(broker)
@@ -5055,7 +5055,7 @@ impl Broker {
     /// - Never fails: a read or write error is warned about, and a raise that
     ///   could not be written is reported as `pending`. The next writable
     ///   status, submit or promotion retries.
-    pub(crate) fn collaboration_fence_state(
+    pub fn collaboration_fence_state(
         &self,
         trigger: FenceTrigger<'_>,
     ) -> Option<crate::CollaborationFence> {
@@ -5497,7 +5497,7 @@ impl Broker {
         Ok(())
     }
 
-    pub(crate) fn host_operation_database_path(&self) -> Result<PathBuf, BrokerOpError> {
+    pub fn host_operation_database_path(&self) -> Result<PathBuf, BrokerOpError> {
         self.storage_context.ensure_valid()?;
         let path = self
             .host_operation_db_path
@@ -5516,7 +5516,7 @@ impl Broker {
         &mut self.store
     }
 
-    pub(crate) fn store_ref(&self) -> &BrokerStore {
+    pub fn store_ref(&self) -> &BrokerStore {
         &self.store
     }
 
@@ -5829,11 +5829,11 @@ impl Broker {
         })
     }
 
-    pub(crate) fn main_root_path(&self) -> PathBuf {
+    pub fn main_root_path(&self) -> PathBuf {
         self.main_root.clone()
     }
 
-    pub(crate) fn repo_handle(&self) -> &GitRepo {
+    pub fn repo_handle(&self) -> &GitRepo {
         &self.repo
     }
 
@@ -7304,7 +7304,7 @@ impl Broker {
     /// Ordinary starts are intentionally anchored to integration. A caller
     /// that explicitly identifies a pull request must use the routed review
     /// adapter, which provisions and verifies that pull request's exact head.
-    pub(crate) fn reject_integration_based_review_task(
+    pub fn reject_integration_based_review_task(
         pull_request: Option<i64>,
     ) -> Result<(), BrokerOpError> {
         if let Some(pull_request) = pull_request {
@@ -7365,7 +7365,7 @@ impl Broker {
         .map(|timed| timed.report)
     }
 
-    pub(crate) fn start_worktree_with_planned_paths_and_context_timed(
+    pub fn start_worktree_with_planned_paths_and_context_timed(
         &mut self,
         task: &str,
         paths: &[String],
@@ -7517,7 +7517,7 @@ impl Broker {
         .map(|timed| timed.report)
     }
 
-    pub(crate) fn start_agent_report_with_context_timed(
+    pub fn start_agent_report_with_context_timed(
         &mut self,
         task: &str,
         command: &str,
@@ -8081,7 +8081,7 @@ impl Broker {
     /// repository worktree storage. An unbound database remains usable for
     /// operations that do not depend on this root; current config and
     /// environment are never treated as proof of an existing root.
-    pub(crate) fn require_bound_repository_worktree_root(
+    pub fn require_bound_repository_worktree_root(
         &self,
         operation: &str,
     ) -> Result<PathBuf, BrokerOpError> {
@@ -8283,7 +8283,7 @@ impl Broker {
         Ok(plan)
     }
 
-    pub(crate) fn fresh_worktree_root_recovery_plan(
+    pub fn fresh_worktree_root_recovery_plan(
         &self,
     ) -> Result<FreshRootRecoveryPlan, BrokerOpError> {
         let binding = self.store.repository_worktree_binding()?;
@@ -8312,7 +8312,7 @@ impl Broker {
         self.build_fresh_root_recovery_plan(binding, registry)
     }
 
-    pub(crate) fn apply_fresh_worktree_root_recovery(
+    pub fn apply_fresh_worktree_root_recovery(
         &mut self,
         confirmed_digest: &str,
     ) -> Result<(), BrokerOpError> {
@@ -8785,7 +8785,7 @@ impl Broker {
         Ok(())
     }
 
-    pub(crate) fn legacy_worktree_root_binding_plan(
+    pub fn legacy_worktree_root_binding_plan(
         &self,
         requested_root: &Path,
         layout: crate::store::repository_binding::RepositoryWorktreeRootLayout,
@@ -8902,7 +8902,7 @@ impl Broker {
         })
     }
 
-    pub(crate) fn apply_legacy_worktree_root_binding(
+    pub fn apply_legacy_worktree_root_binding(
         &mut self,
         requested_root: &Path,
         layout: crate::store::repository_binding::RepositoryWorktreeRootLayout,

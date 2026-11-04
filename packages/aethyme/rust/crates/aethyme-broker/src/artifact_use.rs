@@ -151,7 +151,7 @@ pub(crate) struct ArtifactUseReconcileMarker {
 /// process group were observed absent during the current plan/apply pass.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ArtifactUseReconcileDisposition {
+pub enum ArtifactUseReconcileDisposition {
     RemoveIfConfirmed,
     Retain { reason: String },
     Unknown { reason: String },
@@ -160,19 +160,19 @@ pub(crate) enum ArtifactUseReconcileDisposition {
 /// Complete reviewed evidence for one closed session's canonical checkout
 /// cohort. This grants marker-removal authority only.
 #[derive(Clone, Debug, Serialize)]
-pub(crate) struct ArtifactUseReconcilePlan {
+pub struct ArtifactUseReconcilePlan {
     pub(crate) schema_version: u32,
-    pub(crate) selected_session_id: i64,
-    pub(crate) cohort: crate::auto_cleanup::ClosedArtifactCheckoutCohort,
+    pub selected_session_id: i64,
+    pub cohort: crate::auto_cleanup::ClosedArtifactCheckoutCohort,
     pub(crate) primary_root: PathBuf,
-    pub(crate) checkout_root: PathBuf,
+    pub checkout_root: PathBuf,
     checkout_key: String,
     primary_identity: DirectoryIdentity,
     checkout_identity: DirectoryIdentity,
     marker_directory_identity: DirectoryIdentity,
     registry_witness: crate::worktree_registry::ArtifactUsePrimaryRootWitness,
-    pub(crate) markers: Vec<ArtifactUseReconcileMarker>,
-    pub(crate) digest: String,
+    pub markers: Vec<ArtifactUseReconcileMarker>,
+    pub digest: String,
 }
 
 /// Per-marker result from a digest-confirmed apply. An unconfirmed directory
@@ -186,7 +186,7 @@ pub(crate) struct ArtifactUseReconcileMarkerOutcome {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
-pub(crate) enum ArtifactUseReconcileOutcomeKind {
+pub enum ArtifactUseReconcileOutcomeKind {
     Removed {
         directory_sync: ArtifactUseReconcileDirectorySync,
     },
@@ -200,7 +200,7 @@ pub(crate) enum ArtifactUseReconcileOutcomeKind {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ArtifactUseReconcileDirectorySync {
+pub enum ArtifactUseReconcileDirectorySync {
     Synced,
     Unconfirmed,
 }
@@ -231,10 +231,10 @@ pub(crate) enum ArtifactUseReconcileApplyStopKind {
 /// Result of applying one exact marker plan. A stopped result records safe
 /// per-marker progress instead of hiding earlier unlinks behind an error.
 #[derive(Clone, Debug, Serialize)]
-pub(crate) struct ArtifactUseReconcileReport {
-    pub(crate) plan_digest: String,
-    pub(crate) outcomes: Vec<ArtifactUseReconcileMarkerOutcome>,
-    pub(crate) stopped: Option<ArtifactUseReconcileApplyStop>,
+pub struct ArtifactUseReconcileReport {
+    pub plan_digest: String,
+    pub outcomes: Vec<ArtifactUseReconcileMarkerOutcome>,
+    pub stopped: Option<ArtifactUseReconcileApplyStop>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -856,7 +856,7 @@ pub(crate) fn begin_artifact_use_scope(
 
 /// Read-only plan for explicit reconciliation of one closed checkout cohort.
 /// The normal reclaimer remains strict and continues to block on every marker.
-pub(crate) fn plan_artifact_use_marker_reconciliation(
+pub fn plan_artifact_use_marker_reconciliation(
     primary_root: &Path,
     checkout_root: &Path,
     selected_session_id: i64,
@@ -873,7 +873,7 @@ pub(crate) fn plan_artifact_use_marker_reconciliation(
 /// re-read and its PID/start token and group absence are rechecked immediately
 /// before unlink. Later evidence or sync failures return typed per-marker
 /// progress; no process is signalled and no checkout is removed.
-pub(crate) fn apply_artifact_use_marker_reconciliation(
+pub fn apply_artifact_use_marker_reconciliation(
     primary_root: &Path,
     checkout_root: &Path,
     selected_session_id: i64,

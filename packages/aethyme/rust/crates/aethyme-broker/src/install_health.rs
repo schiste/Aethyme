@@ -349,7 +349,7 @@ pub fn session_start_warnings(now_unix_ms: i64) -> Vec<String> {
     session_start_warnings_with_build(now_unix_ms, None)
 }
 
-pub(crate) fn session_start_warnings_with_build(
+pub fn session_start_warnings_with_build(
     now_unix_ms: i64,
     running_build_banner: Option<&str>,
 ) -> Vec<String> {
@@ -478,7 +478,7 @@ fn prime_release_cache(now_unix_ms: i64) {
         .spawn();
 }
 
-pub(crate) fn resolve_on_path(name: &str) -> Option<PathBuf> {
+pub fn resolve_on_path(name: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
     std::env::split_paths(&std::env::var_os("PATH")?)
@@ -490,7 +490,7 @@ pub(crate) fn resolve_on_path(name: &str) -> Option<PathBuf> {
         })
 }
 
-pub(crate) fn first_line_of(command: &str, args: &[&str]) -> Option<String> {
+pub fn first_line_of(command: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(command).args(args).output().ok()?;
     if !output.status.success() {
         return None;

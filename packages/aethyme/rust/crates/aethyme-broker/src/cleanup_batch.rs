@@ -65,7 +65,7 @@ fn refused(session_id: i64, reason: impl Into<String>) -> BrokerOpError {
     }
 }
 
-pub(crate) fn validated_targets(ids: &[i64]) -> Result<Vec<i64>, BrokerOpError> {
+pub fn validated_targets(ids: &[i64]) -> Result<Vec<i64>, BrokerOpError> {
     if ids.is_empty() || ids.len() > MAX_CLEANUP_RESOLVE_BATCH_TARGETS {
         return Err(refused(
             0,

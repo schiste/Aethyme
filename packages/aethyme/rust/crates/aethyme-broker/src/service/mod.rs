@@ -6,7 +6,7 @@ pub mod jobs;
 pub mod protocol;
 
 #[cfg(unix)]
-pub(crate) mod client;
+pub mod client;
 
 #[cfg(unix)]
 pub mod discovery;
@@ -15,7 +15,7 @@ pub mod discovery;
 pub mod startup;
 
 #[cfg(unix)]
-pub(crate) mod job_runtime;
+pub mod job_runtime;
 
 #[cfg(unix)]
 pub mod transport;

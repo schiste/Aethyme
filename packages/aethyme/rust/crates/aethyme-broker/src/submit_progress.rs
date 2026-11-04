@@ -241,7 +241,7 @@ fn read_records(main_root: &Path) -> Vec<SubmitProgressRecord> {
 }
 
 /// `2m05s`, `45s`.
-pub(crate) fn duration_label(ms: i64) -> String {
+pub fn duration_label(ms: i64) -> String {
     let seconds = ms.max(0) / 1000;
     if seconds >= 60 {
         format!("{}m{:02}s", seconds / 60, seconds % 60)
@@ -251,7 +251,7 @@ pub(crate) fn duration_label(ms: i64) -> String {
 }
 
 /// One line saying where a waiting submit stands, for stderr and status.
-pub(crate) fn describe_position(position: &WaitPosition) -> String {
+pub fn describe_position(position: &WaitPosition) -> String {
     let mut line = format!(
         "position {} of {} waiting",
         position.position, position.waiting

@@ -96,11 +96,11 @@ pub(crate) struct PersistedProjectAssociation {
 // These accessors are consumed only by the reserved experimental resolver.
 #[allow(dead_code)]
 impl PersistedProjectAssociation {
-    pub(crate) fn descriptor(&self) -> &ProjectAssociationDescriptor {
+    pub fn descriptor(&self) -> &ProjectAssociationDescriptor {
         &self.descriptor
     }
 
-    pub(crate) fn is_confirmed(&self) -> bool {
+    pub fn is_confirmed(&self) -> bool {
         self.confirmed
     }
 }
@@ -511,7 +511,7 @@ pub fn resolve_approved_project_binding(
     resolve_approved_project_binding_with_archive_use(store, &archive_use)
 }
 
-pub(crate) fn resolve_approved_project_binding_with_archive_use(
+pub fn resolve_approved_project_binding_with_archive_use(
     store: &CollaborationStore,
     archive_use: &ArchiveUse,
 ) -> Result<Option<ApprovedProjectBinding>, IdentityStoreError> {
@@ -525,7 +525,7 @@ pub(crate) fn resolve_approved_project_binding_with_archive_use(
 /// independently reload both project bindings before resolving a mapping.
 // The resolver is intentionally not activated by a provider in experimental T03.
 #[allow(dead_code)]
-pub(crate) fn resolve_persisted_project_association_with_archive_use(
+pub fn resolve_persisted_project_association_with_archive_use(
     store: &CollaborationStore,
     association_record_id: &RecordId,
     archive_use: &ArchiveUse,
@@ -818,7 +818,7 @@ pub fn resolve_project_file_identity_state(
     resolve_project_file_identity_state_with_archive_use(store, binding, snapshot, &archive_use)
 }
 
-pub(crate) fn resolve_project_file_identity_state_with_archive_use(
+pub fn resolve_project_file_identity_state_with_archive_use(
     store: &CollaborationStore,
     binding: &ApprovedProjectBinding,
     snapshot: &SourceSnapshotId,
@@ -1964,7 +1964,7 @@ fn source_file_bytes(
     archive::read_object_bounded(store, &digest, limit).map_err(Into::into)
 }
 
-pub(crate) fn bootstrap_transition_sha256(
+pub fn bootstrap_transition_sha256(
     project_id: &ProjectId,
     descriptor_record_id: &RecordId,
     anchor_snapshot: &SourceSnapshotId,

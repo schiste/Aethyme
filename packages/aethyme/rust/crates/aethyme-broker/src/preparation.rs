@@ -22,7 +22,7 @@ use crate::{
 };
 
 #[path = "preparation_recovery_state.rs"]
-pub(crate) mod recovery_state;
+pub mod recovery_state;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "preparation_rotation_debt.rs"]
 pub(crate) mod rotation_debt;

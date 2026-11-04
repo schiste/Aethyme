@@ -1161,7 +1161,7 @@ fn read_brief(
     }
 }
 
-pub(crate) fn hex_digest(text: &str) -> Option<ObjectDigest> {
+pub fn hex_digest(text: &str) -> Option<ObjectDigest> {
     if text.len() != 64 {
         return None;
     }

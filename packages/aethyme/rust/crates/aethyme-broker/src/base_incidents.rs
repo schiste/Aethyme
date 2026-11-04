@@ -32,7 +32,7 @@ pub(crate) fn invalid(reason: impl Into<String>) -> crate::BrokerError {
     crate::BrokerError::InvalidBaseFailureIncident(reason.into())
 }
 
-pub(crate) fn normalize_test_ids(ids: &[String]) -> Result<Vec<String>, crate::BrokerError> {
+pub fn normalize_test_ids(ids: &[String]) -> Result<Vec<String>, crate::BrokerError> {
     if ids.is_empty() || ids.len() > 64 {
         return Err(invalid("supply 1..=64 failing test identifiers"));
     }
@@ -176,7 +176,7 @@ impl Broker {
 impl Broker {
     /// Shared stderr notice for start/adopt and gate execution. Deliberately
     /// avoids a process/session inventory audit just to render an observation.
-    pub(crate) fn warn_base_failure_incidents(&self) {
+    pub fn warn_base_failure_incidents(&self) {
         for advice in self.base_failure_incident_status_advice(None) {
             eprintln!("[base-failure] {}", advice.summary);
         }

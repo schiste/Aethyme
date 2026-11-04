@@ -567,7 +567,7 @@ impl Broker {
         Ok(self.affected_gates_with_timings(session_id)?.selected_gates)
     }
 
-    pub(crate) fn affected_gates_with_timings(
+    pub fn affected_gates_with_timings(
         &mut self,
         session_id: i64,
     ) -> Result<AffectedGatesReport, BrokerOpError> {

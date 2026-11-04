@@ -105,7 +105,7 @@ pub struct BrokerStore {
     path: PathBuf,
     /// Keeps a migrated temporary snapshot alive for the connection lifetime.
     _snapshot_dir: Option<tempfile::TempDir>,
-    pub(crate) binding_scope: Option<repository_identity::RepositoryBindingScope>,
+    pub binding_scope: Option<repository_identity::RepositoryBindingScope>,
 }
 
 /// One queue-row mutation committed with an integration reconciliation.
@@ -2861,12 +2861,12 @@ pub(crate) mod cleanup_cohort;
 mod coordination;
 #[path = "store/fresh_database.rs"]
 pub(crate) mod fresh_database;
-pub(crate) mod guarded_exec;
+pub mod guarded_exec;
 mod open;
 mod pull_requests;
 mod queue;
 #[path = "store/repository_binding.rs"]
-pub(crate) mod repository_binding;
-pub(crate) mod repository_identity;
+pub mod repository_binding;
+pub mod repository_identity;
 mod review;
 pub(crate) mod service_jobs;

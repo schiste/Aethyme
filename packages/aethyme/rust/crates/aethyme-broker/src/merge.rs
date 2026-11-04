@@ -315,7 +315,7 @@ pub(crate) fn session_baseline(
 /// `[worktrees]` both read it. The text is TOML: a YAML file is validated and
 /// rendered from the same value. An ambiguous or invalid file reads as absent
 /// here; callers that must report it use [`repository_config_checked`].
-pub(crate) fn repository_config_text(main_root: &Path) -> Option<String> {
+pub fn repository_config_text(main_root: &Path) -> Option<String> {
     repository_config_with_source(main_root).map(|(text, _)| text)
 }
 
@@ -328,7 +328,7 @@ pub(crate) fn repository_config_with_source(main_root: &Path) -> Option<(String,
 
 /// [`repository_config_with_source`], keeping why the configuration could
 /// not be resolved: two format twins, or YAML outside the strict subset.
-pub(crate) fn repository_config_checked(
+pub fn repository_config_checked(
     main_root: &Path,
 ) -> Result<Option<(String, &'static str)>, aethyme_config::ConfigSourceError> {
     crate::status_reads::configuration(main_root, || {
@@ -719,7 +719,7 @@ fn try_submission_plan_reuse_lock(
 }
 
 impl SubmissionPlan {
-    pub(crate) fn pending_owned_commit_ids(&self) -> Vec<String> {
+    pub fn pending_owned_commit_ids(&self) -> Vec<String> {
         self.commits
             .iter()
             .filter(|commit| {

@@ -1487,21 +1487,21 @@ fn open_registry_with_mode(
 /// the live inodes, owner marker, repository binding, both payload hashes, and
 /// the exact marker-byte digest.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub(crate) struct RootIdentityRecoveryPlan {
-    pub(crate) host_operation_database: PathBuf,
-    pub(crate) root: PathBuf,
-    pub(crate) repository_root: PathBuf,
-    pub(crate) repository_key: String,
-    pub(crate) old_payload_sha256: String,
-    pub(crate) new_payload_sha256: String,
-    pub(crate) owner_marker_sha256: String,
-    pub(crate) root_inode: u64,
-    pub(crate) root_volume_uuid_hex: String,
-    pub(crate) origin_inode: u64,
-    pub(crate) origin_volume_uuid_hex: String,
+pub struct RootIdentityRecoveryPlan {
+    pub host_operation_database: PathBuf,
+    pub root: PathBuf,
+    pub repository_root: PathBuf,
+    pub repository_key: String,
+    pub old_payload_sha256: String,
+    pub new_payload_sha256: String,
+    pub owner_marker_sha256: String,
+    pub root_inode: u64,
+    pub root_volume_uuid_hex: String,
+    pub origin_inode: u64,
+    pub origin_volume_uuid_hex: String,
     pub(crate) historical_uuid_proven: bool,
-    pub(crate) confirmation: String,
-    pub(crate) applied: bool,
+    pub confirmation: String,
+    pub applied: bool,
 }
 
 struct PreparedRootIdentityRecovery {
@@ -1729,7 +1729,7 @@ fn require_absolute_recovery_paths(
 /// Read-only plan for upgrading one exact legacy root under the same lock used
 /// by admission and removal claims. The caller supplies the host database and
 /// repository binding explicitly; environment-selected paths are not consulted.
-pub(crate) fn plan_root_identity_recovery(
+pub fn plan_root_identity_recovery(
     host_database: &Path,
     root: &Path,
     repository_root: &Path,
@@ -1771,7 +1771,7 @@ fn plan_root_identity_recovery_with(
 /// replacement payload, and exact owner-marker bytes hashes are all required;
 /// the retained row changes only by exact SQL compare-and-swap under the shared
 /// registry lock.
-pub(crate) fn apply_root_identity_recovery(
+pub fn apply_root_identity_recovery(
     host_database: &Path,
     root: &Path,
     repository_root: &Path,
@@ -2512,7 +2512,7 @@ impl ArtifactUsePrimaryRootWitness {
 /// Build a held, read-only witness for one exact repository primary root.
 /// Every matching retained root row and owner marker is revalidated while the
 /// host registry lock is held. A partial registry inventory is a refusal.
-pub(crate) fn artifact_use_primary_root_witness_guard(
+pub fn artifact_use_primary_root_witness_guard(
     host_database: &Path,
     primary_root: &Path,
     repository_key: &str,

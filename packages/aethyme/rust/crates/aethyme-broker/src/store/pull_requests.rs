@@ -2141,7 +2141,7 @@ impl BrokerStore {
     }
 
     /// Most recent event rows for an offline report, newest first.
-    pub(crate) fn recent_events(
+    pub fn recent_events(
         &self,
         limit: i64,
         session_id: Option<i64>,
@@ -2158,7 +2158,7 @@ impl BrokerStore {
 
     /// Most recent gate events for report provenance, including cache hits
     /// (which intentionally do not duplicate rows in `gate_results`).
-    pub(crate) fn recent_gate_events(
+    pub fn recent_gate_events(
         &self,
         limit: i64,
         session_id: Option<i64>,

@@ -89,7 +89,7 @@ impl RepositoryBindingScope {
 }
 
 /// Read the UUID without repairing, creating, or removing any marker entry.
-pub(crate) fn read_repository_uuid_marker(
+pub fn read_repository_uuid_marker(
     git_common_dir: &Path,
 ) -> Result<Option<String>, BrokerError> {
     #[cfg(unix)]
@@ -252,7 +252,7 @@ fn refusal(message: impl Into<String>) -> BrokerError {
     BrokerError::InvalidRepositoryWorktreeBinding(message.into())
 }
 
-pub(crate) fn validate_uuid_v4(value: &str) -> Result<(), BrokerError> {
+pub fn validate_uuid_v4(value: &str) -> Result<(), BrokerError> {
     let valid_shape = value.len() == 36
         && value.bytes().enumerate().all(|(index, byte)| match index {
             8 | 13 | 18 | 23 => byte == b'-',

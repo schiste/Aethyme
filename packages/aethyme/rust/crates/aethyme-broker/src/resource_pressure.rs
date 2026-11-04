@@ -39,7 +39,7 @@ pub(crate) fn activity(
 }
 
 #[derive(Debug, serde::Serialize)]
-pub(crate) struct Report {
+pub struct Report {
     schema: &'static str,
     observation: &'static str,
     session_count: usize,

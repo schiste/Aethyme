@@ -21,7 +21,7 @@ pub(crate) const SERVICE_SCHEMA: RecordSchema = RecordSchema {
 /// Validate the immutable appointment body against its indexed service row.
 /// This is used by lost-response status lookup, including lookups that span
 /// revisions or authority epochs. The row is not a dispatch capability.
-pub(crate) fn validate_status_binding(
+pub fn validate_status_binding(
     appointment: &str,
     target: &str,
     revision: &str,

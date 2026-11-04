@@ -56,7 +56,7 @@ pub enum PullRequestWatchStatus {
 }
 
 impl PullRequestWatchStatus {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Active => "active",
             Self::Paused => "paused",
@@ -108,7 +108,7 @@ pub enum PullRequestBatchStatus {
 }
 
 impl PullRequestBatchStatus {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Acknowledged => "acknowledged",
@@ -137,7 +137,7 @@ pub enum PullRequestBatchAckOutcome {
 }
 
 impl PullRequestBatchAckOutcome {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Addressed => "addressed",
             Self::Stale => "stale",
@@ -343,7 +343,7 @@ impl PullRequestWatchProvider for GithubCliPullRequestWatchProvider {
 }
 
 impl GithubCliPullRequestWatchProvider {
-    pub(crate) fn inspect_with_deadline(
+    pub fn inspect_with_deadline(
         request: &PullRequestWatchRequest,
         deadline: std::time::Duration,
     ) -> Result<PullRequestSnapshot, PullRequestWatchError> {
@@ -576,7 +576,7 @@ pub(crate) fn parse_iso8601_utc_ms(raw: &str) -> Option<i64> {
 
 /// Days since 1970-01-01 for a proleptic Gregorian date.
 ///
-/// The inverse of [`crate::cli::insights`]'s `civil_from_days`, kept here so
+/// The inverse of the CLI insights module's `civil_from_days`, kept here so
 /// the provider timestamp parsing does not depend on a CLI module. March is
 /// treated as month 0 so the leap day lands at the end of the year and no
 /// separate correction is needed.
