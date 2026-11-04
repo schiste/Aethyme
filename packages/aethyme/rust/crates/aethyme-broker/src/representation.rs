@@ -67,7 +67,9 @@ pub const DEFAULT_SEARCH_CAP: usize = 2_000;
 const MAX_LANDING_SEARCH_BUDGET: Duration = Duration::from_secs(30);
 /// A large but finite complete commit listing for oldest-first search.
 const MAX_LANDING_CANDIDATE_LIST_BYTES: usize = 16 * 1024 * 1024;
-const LANDING_SEARCH_ALGORITHM_VERSION: u8 = 4;
+/// Total search work remains bounded independently of each Git batch.
+const MAX_LANDING_QUERY_COUNT: usize = 1_000_000;
+const LANDING_SEARCH_ALGORITHM_VERSION: u8 = 5;
 
 fn landing_query_count(candidate_count: usize, path_count: usize) -> Option<usize> {
     candidate_count
@@ -378,7 +380,7 @@ fn find_landing_within(
         branch_tip,
         cap,
         search_deadline,
-        crate::git::MAX_GIT_BATCH_QUERY_COUNT,
+        MAX_LANDING_QUERY_COUNT,
         MAX_LANDING_CANDIDATE_LIST_BYTES,
     )
 }
@@ -413,7 +415,6 @@ fn find_landing_with_limits(
         ));
     }
 
-    let query_budget = query_budget.min(crate::git::MAX_GIT_BATCH_QUERY_COUNT);
     let query_limit_error = |needed| {
         unavailable(format!(
             "exact-content landing search needs {needed} candidate/path queries; the limit is {query_budget}"
@@ -421,6 +422,13 @@ fn find_landing_with_limits(
     };
     if content.paths.len() > query_budget {
         return Err(query_limit_error(content.paths.len()));
+    }
+    if content.paths.len() > crate::git::MAX_GIT_BATCH_QUERY_COUNT {
+        return Err(unavailable(format!(
+            "landing snapshot needs {} paths; Git batch limit is {}",
+            content.paths.len(),
+            crate::git::MAX_GIT_BATCH_QUERY_COUNT
+        )));
     }
 
     // Content already at the session's own base means the session changed
@@ -458,6 +466,7 @@ fn find_landing_with_limits(
         let spent = landing_query_count(examined, paths.len())
             .ok_or_else(|| unavailable("landing candidate/path query count overflowed".into()))?;
         let batch_len = ((query_budget - spent) / paths.len())
+            .min(crate::git::MAX_GIT_BATCH_QUERY_COUNT / paths.len())
             .min(CANDIDATE_BATCH)
             .min(window.len() - examined);
         if batch_len == 0 {
@@ -1735,6 +1744,36 @@ mod tests {
                 if reason.contains("needs 2 candidate/path queries")
                     && reason.contains("limit is 1")
         ));
+    }
+
+    #[test]
+    fn search_can_exceed_one_git_batch_while_respecting_total_budget() {
+        let (tmp, repo, base) = seeded();
+        write(tmp.path(), "filler.txt", "first\n");
+        commit(tmp.path(), "first");
+        write(tmp.path(), "filler.txt", "second\n");
+        let tip = commit(tmp.path(), "second");
+        let paths = (0..33_334)
+            .map(|n| (format!("missing-{n:05}"), Some("wanted".to_string())))
+            .collect();
+        let content = SessionContent {
+            base,
+            head: tip.clone(),
+            paths,
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let _git_deadline = crate::git::limit_git_until(deadline);
+        let result = find_landing_with_limits(
+            &repo,
+            &content,
+            &tip,
+            DEFAULT_SEARCH_CAP,
+            deadline,
+            100_002,
+            MAX_LANDING_CANDIDATE_LIST_BYTES,
+        )
+        .unwrap();
+        assert_eq!(result.examined, 2);
     }
 
     #[test]
