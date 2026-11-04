@@ -862,6 +862,56 @@ fn read_only_environment_store_rejects_symlink_paths() {
 }
 
 #[test]
+fn changing_only_activity_probes_keeps_components_running() {
+    let host = Host::new();
+    let worktree = tempfile::tempdir().unwrap();
+    let text = r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "db"
+runtime = "hooks"
+provision = 'echo provision >> "$MARKERS/db.provisions"'
+destroy = 'echo destroy >> "$MARKERS/db.provisions"'
+env = { MARKERS = "@MARKERS@" }
+activity_probe = "false"
+"#
+    .replace("@MARKERS@", &host.markers.to_string_lossy());
+    let first = snapshot(&text, "p", worktree.path(), None);
+    let changed = snapshot(
+        &text.replace("activity_probe = \"false\"", "activity_probe = \"true\""),
+        "p",
+        worktree.path(),
+        None,
+    );
+    let mut lifecycle = host.lifecycle();
+    let before = lifecycle
+        .up(&first, worktree.path(), None, None, &options())
+        .unwrap();
+    let before_components = lifecycle.store.components(&before.env_id).unwrap();
+    let after = lifecycle
+        .up(&changed, worktree.path(), None, None, &options())
+        .unwrap();
+    assert_eq!(after.phase, EnvironmentPhase::Active);
+    assert_eq!(after.profile_digest, changed.digest);
+    assert_eq!(
+        after.snapshot.components[0]
+            .commands
+            .activity_probe
+            .as_deref(),
+        Some("true")
+    );
+    let after_components = lifecycle.store.components(&after.env_id).unwrap();
+    assert_eq!(before_components[0].identity, after_components[0].identity);
+    assert_eq!(
+        std::fs::read_to_string(host.markers.join("db.provisions")).unwrap(),
+        "provision\n"
+    );
+    lifecycle.down(&after.env_id, None).unwrap();
+}
+
+#[test]
 fn a_changed_profile_needs_reconfigure() {
     let host = Host::new();
     let text = r#"
