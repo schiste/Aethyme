@@ -1933,13 +1933,15 @@ mod unix {
         #[test]
         fn fresh_database_sidecars_match_runtime_ignore_prefix() {
             let repo = tempfile::tempdir().unwrap();
-            init_repository(repo.path());
-            let database = repo.path().join(".aethyme/broker.db");
-            let paths = prepare_paths(repo.path(), &database).unwrap();
+            // The prepared paths are canonical; macOS's temp directory is not.
+            let root = repo.path().canonicalize().unwrap();
+            init_repository(&root);
+            let database = root.join(".aethyme/broker.db");
+            let paths = prepare_paths(&root, &database).unwrap();
 
             for path in [&paths.stage_path, &paths.lock_path] {
                 let relative = path
-                    .strip_prefix(repo.path())
+                    .strip_prefix(&root)
                     .unwrap()
                     .to_str()
                     .expect("database sidecar path is valid UTF-8");
@@ -1977,8 +1979,14 @@ mod unix {
             }
 
             let temp = tempfile::tempdir().expect("isolated test directory");
-            let raw_control_db = temp.path().join("raw-close-control.db");
-            let guarded_db = temp.path().join("guarded-probe.db");
+            // These databases open without following symlinks, and macOS's temp
+            // directory passes through one.
+            let root = temp
+                .path()
+                .canonicalize()
+                .expect("resolve the test directory");
+            let raw_control_db = root.join("raw-close-control.db");
+            let guarded_db = root.join("guarded-probe.db");
             create_delete_journal_database(&raw_control_db);
             create_delete_journal_database(&guarded_db);
 
