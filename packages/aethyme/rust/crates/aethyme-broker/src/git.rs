@@ -9694,6 +9694,47 @@ impl GitRepo {
 
     /// Whether `path` exists in the working tree as an untracked,
     /// non-ignored file: a new file no diff against a commit reports.
+    /// The patch of `paths` from `from` to `to`, or to the working tree when
+    /// `to` is `None`, with paths taken literally and taking no index lock in a
+    /// worktree another session is using.
+    pub(crate) fn overlap_diff(
+        &self,
+        from: &str,
+        to: Option<&str>,
+        paths: &[String],
+    ) -> Result<String, GitError> {
+        let mut args = vec![
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--unified=2",
+            from,
+        ];
+        args.extend(to);
+        args.push("--");
+        args.extend(paths.iter().map(String::as_str));
+        run_git(&self.root, &args)
+    }
+
+    /// Untracked, unignored files under `paths`.
+    pub(crate) fn untracked_under(&self, paths: &[String]) -> Result<Vec<String>, GitError> {
+        let mut args = vec![
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--",
+        ];
+        args.extend(paths.iter().map(String::as_str));
+        Ok(run_git(&self.root, &args)?
+            .lines()
+            .map(str::to_string)
+            .collect())
+    }
+
     pub(crate) fn path_is_untracked(&self, path: &str) -> Result<bool, GitError> {
         let listed = run_git(
             &self.root,

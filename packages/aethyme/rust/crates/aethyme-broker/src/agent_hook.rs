@@ -452,12 +452,13 @@ fn lease_overlap_summary(broker: &Broker, session: &Session) -> Option<String> {
                 by_session
                     .entry(lease.session_id)
                     .or_default()
-                    .insert((*path).to_string());
+                    .insert(crate::overlap_diff::narrower(&lease.path, path));
             }
         }
     }
     let mut names = Vec::new();
     let mut files = std::collections::BTreeSet::new();
+    let mut requests = Vec::new();
     for (id, paths) in by_session {
         let Ok(other) = broker.store_ref().session(id) else {
             continue;
@@ -472,6 +473,16 @@ fn lease_overlap_summary(broker: &Broker, session: &Session) -> Option<String> {
             Some(name) => format!("{id} ({name})"),
             None => id.to_string(),
         });
+        if requests.len() < crate::overlap_diff::max_holders() {
+            let explicit = leases
+                .iter()
+                .any(|lease| lease.session_id == id && lease.kind == crate::LeaseKind::Explicit);
+            requests.push(crate::overlap_diff::HolderRequest::new(
+                &other,
+                explicit,
+                paths.iter().cloned().collect(),
+            ));
+        }
         files.extend(paths);
     }
     if names.is_empty() {
@@ -498,10 +509,24 @@ fn lease_overlap_summary(broker: &Broker, session: &Session) -> Option<String> {
         String::new()
     };
     let noun = if count == 1 { "file" } else { "files" };
-    Some(format!(
+    let mut summary = format!(
         "Overlap: {who} {verb} changing {count} {noun} you lease: {}{more}. You'll get details when you edit them.",
         sample.join(", ")
-    ))
+    );
+    if crate::overlap_diff::enabled(broker.main_root()) {
+        let mut seen = SeenState::load(broker.main_root(), session.id);
+        for mut report in crate::overlap_diff::read_all(
+            broker.main_root(),
+            requests,
+            crate::overlap_diff::HOOK_BUDGET,
+        ) {
+            crate::overlap_diff::mark_shown(&mut report, &mut seen);
+            summary.push('\n');
+            summary.push_str(&crate::overlap_diff::render(&report, "  "));
+        }
+        seen.save();
+    }
+    Some(summary)
 }
 
 /// The host tab this agent runs in, when the host exports one — the same
@@ -852,6 +877,7 @@ fn on_pre_tool_use(
     let mut seen = SeenState::load(broker.main_root(), session.id);
     let mut cache = ChangeCache::load(broker.main_root(), session.id);
     let mut notes = Vec::new();
+    let mut diff_requests = Vec::new();
     for relative in &relatives {
         if notes.len() >= MAX_PEER_NOTES {
             break;
@@ -878,6 +904,11 @@ fn on_pre_tool_use(
                 continue;
             }
             let other = candidate.session;
+            diff_requests.push(crate::overlap_diff::HolderRequest::new(
+                other,
+                candidate.claimed.is_some(),
+                vec![relative.clone()],
+            ));
             let change = describe_change(
                 other,
                 relative,
@@ -901,6 +932,19 @@ fn on_pre_tool_use(
                 &change,
                 verdict.as_deref(),
             ));
+        }
+    }
+    if !notes.is_empty() && crate::overlap_diff::enabled(broker.main_root()) {
+        // One budget for the whole tool call, read together: an edit is waiting.
+        let reports = crate::overlap_diff::read_all(
+            broker.main_root(),
+            diff_requests,
+            crate::overlap_diff::HOOK_BUDGET,
+        );
+        for (note, mut report) in notes.iter_mut().zip(reports) {
+            crate::overlap_diff::mark_shown(&mut report, &mut seen);
+            note.push('\n');
+            note.push_str(&crate::overlap_diff::render(&report, "  "));
         }
     }
     seen.save();
@@ -1319,7 +1363,7 @@ fn render_peer_note(
 /// told. A small file in the main checkout's Git directory: never tracked,
 /// never shared, and a PreToolUse hook (read-only on the broker) can write
 /// it. Losing it only repeats a note.
-struct SeenState {
+pub(crate) struct SeenState {
     path: Option<std::path::PathBuf>,
     keys: Vec<String>,
     dirty: bool,
@@ -1329,7 +1373,7 @@ struct SeenState {
 const SEEN_CAPACITY: usize = 256;
 
 impl SeenState {
-    fn load(main_root: &std::path::Path, session_id: i64) -> Self {
+    pub(crate) fn load(main_root: &std::path::Path, session_id: i64) -> Self {
         let path = hook_state_path(main_root, "hook-seen", session_id);
         let keys = path
             .as_deref()
@@ -1347,7 +1391,7 @@ impl SeenState {
         self.keys.iter().any(|seen| seen == key)
     }
 
-    fn first_time(&mut self, key: &str) -> bool {
+    pub(crate) fn first_time(&mut self, key: &str) -> bool {
         if self.contains(key) {
             return false;
         }
@@ -1360,7 +1404,7 @@ impl SeenState {
         true
     }
 
-    fn save(&self) {
+    pub(crate) fn save(&self) {
         if self.dirty {
             save_hook_state(self.path.as_deref(), &self.keys);
         }

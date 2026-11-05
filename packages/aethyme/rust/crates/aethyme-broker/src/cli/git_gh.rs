@@ -594,6 +594,21 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
         );
         out!("  command ran: yes");
         out!("  execution receipt: {receipt_id}");
+        for lease in report
+            .conflicting_leases
+            .iter()
+            .chain(&report.warned_leases)
+        {
+            out!(
+                "  lease overlap: session {} holds {}: {}",
+                lease.session_id,
+                lease.path,
+                lease.reason.as_deref().unwrap_or("")
+            );
+            if let Some(changes) = &lease.other_changes {
+                out!("{}", crate::overlap_diff::render(changes, "    "));
+            }
+        }
         out!(
             "  ownership audit after execution: {}",
             if report.ownership_ok {
@@ -1578,6 +1593,7 @@ mod exec_report_tests {
             command_timed_out: false,
             ownership_ok: true,
             conflicting_leases: Vec::new(),
+            warned_leases: Vec::new(),
             before_dirty_paths: Vec::new(),
             after_dirty_paths: Vec::new(),
             newly_dirty_paths: vec!["src/changed.rs".into()],
@@ -1701,6 +1717,7 @@ mod exec_report_tests {
             holder_context: None,
             severity: None,
             reason: None,
+            other_changes: None,
         });
         let actions = exec_ownership_next_actions(&report);
         assert_eq!(actions.len(), 3);

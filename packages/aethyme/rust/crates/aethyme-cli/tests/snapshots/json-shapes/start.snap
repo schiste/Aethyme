@@ -29,6 +29,7 @@
     "broker_open": "integer",
     "checkout_count": "integer",
     "git_worktree_add": "integer",
+    "lease_overlaps": "integer",
     "lifecycle_lock_wait": "integer",
     "preparation_status": "integer",
     "response_preparation": "integer",

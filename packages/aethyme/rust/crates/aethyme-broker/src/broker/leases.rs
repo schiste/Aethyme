@@ -1626,6 +1626,9 @@ impl Broker {
             }
         }
         preparation.check()?;
+        let requested = std::slice::from_ref(&path);
+        self.attach_overlap_changes(session_id, requested, &mut blockers);
+        self.attach_overlap_changes(session_id, requested, &mut warnings);
         if !blockers.is_empty() {
             return Err(BrokerOpError::LeaseClaimConflict {
                 session_id,
@@ -1988,6 +1991,7 @@ impl Broker {
                         .iter()
                         .find(|view| view.lease_id == lease.id)
                         .map(|view| view.liveness_evidence.clone()),
+                    other_changes: None,
                     safe_next_actions: if owned_by_requester {
                         Vec::new()
                     } else {
@@ -2075,11 +2079,165 @@ impl Broker {
                     blocker_status: blocker.owner_status.as_str().to_string(),
                     blocker_worktree: blocker.owner_worktree.clone(),
                     remediation: blocker.safe_next_actions.join("\n  "),
+                    other_changes: self.planned_conflict_changes(path, blocker),
                 },
             ))
             .into());
         }
         Ok(())
+    }
+
+    /// `leases plan`: what each holder changed in the requested paths. A plan is
+    /// a question, so it answers in full and records nothing as shown.
+    pub fn attach_plan_changes(&self, plan: &mut LeasePlan) {
+        for path in &mut plan.paths {
+            let mut rows: Vec<LeaseBlocker> = path
+                .conflicts
+                .iter()
+                .map(|overlap| LeaseBlocker {
+                    session_id: overlap.session_id,
+                    path: overlap.path.clone(),
+                    kind: overlap.kind,
+                    holder_status: None,
+                    holder_context: None,
+                    severity: None,
+                    reason: None,
+                    other_changes: None,
+                })
+                .collect();
+            self.attach_overlap_changes(0, std::slice::from_ref(&path.path), &mut rows);
+            for (overlap, row) in path.conflicts.iter_mut().zip(rows) {
+                overlap.other_changes = row.other_changes;
+            }
+        }
+    }
+
+    fn planned_conflict_changes(
+        &mut self,
+        path: &LeasePathPlan,
+        blocker: &LeasePlanOverlap,
+    ) -> String {
+        let mut rows = vec![LeaseBlocker {
+            session_id: blocker.session_id,
+            path: blocker.path.clone(),
+            kind: blocker.kind,
+            holder_status: None,
+            holder_context: None,
+            severity: None,
+            reason: None,
+            other_changes: None,
+        }];
+        self.attach_overlap_changes(0, std::slice::from_ref(&path.path), &mut rows);
+        rows[0]
+            .other_changes
+            .as_ref()
+            .map(|changes| format!("\n{}", crate::overlap_diff::render(changes, "  ")))
+            .unwrap_or_default()
+    }
+
+    /// Other sessions' leases on the paths a new session just planned. Under
+    /// verify-only they never refuse, so this is how the agent hears of them.
+    pub(super) fn planned_lease_overlaps(
+        &mut self,
+        session_id: i64,
+        paths: &[String],
+    ) -> Vec<LeaseBlocker> {
+        let Ok(policy) = self.lease_refusal_policy() else {
+            return Vec::new();
+        };
+        let mut overlaps = Vec::new();
+        for path in paths {
+            let Ok(blockers) = self.lease_blockers(session_id, path) else {
+                continue;
+            };
+            for mut lease in blockers {
+                if !policy.is_live(lease.session_id) {
+                    continue;
+                }
+                lease.reason = Some(policy.non_blocking_reason(session_id, &lease));
+                overlaps.push(lease);
+            }
+        }
+        overlaps.sort_by(|a, b| {
+            (a.session_id, a.path.as_str(), a.kind.as_str()).cmp(&(
+                b.session_id,
+                b.path.as_str(),
+                b.kind.as_str(),
+            ))
+        });
+        overlaps
+            .dedup_by(|a, b| a.session_id == b.session_id && a.path == b.path && a.kind == b.kind);
+        self.attach_overlap_changes(session_id, paths, &mut overlaps);
+        overlaps
+    }
+
+    /// Put what each holder changed in the overlapping files on the first row
+    /// naming that holder. `session_id` 0 has no memory of what it was shown.
+    /// Never fails: see [`crate::overlap_diff`].
+    pub(crate) fn attach_overlap_changes(
+        &self,
+        session_id: i64,
+        touched: &[String],
+        rows: &mut [LeaseBlocker],
+    ) {
+        use crate::overlap_diff as diff;
+        if rows.is_empty() || !diff::enabled(&self.main_root) {
+            return;
+        }
+        let mut order: Vec<i64> = Vec::new();
+        for row in rows.iter() {
+            if !order.contains(&row.session_id) {
+                order.push(row.session_id);
+            }
+        }
+        let mut read = Vec::new();
+        let mut reports: Vec<diff::OverlapChanges> = Vec::new();
+        for (position, holder) in order.iter().enumerate() {
+            let Ok(session) = self.store.session(*holder) else {
+                continue;
+            };
+            let holder_rows = rows.iter().filter(|row| row.session_id == *holder);
+            let explicit = rows
+                .iter()
+                .any(|row| row.session_id == *holder && row.kind == LeaseKind::Explicit);
+            let mut paths: Vec<String> = holder_rows
+                .flat_map(|row| {
+                    touched
+                        .iter()
+                        .filter(|path| crate::leases::paths_overlap(&row.path, path))
+                        .map(|path| diff::narrower(&row.path, path))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            paths.sort();
+            paths.dedup();
+            if paths.is_empty() {
+                continue;
+            }
+            let request = diff::HolderRequest::new(&session, explicit, paths);
+            if position < diff::max_holders() {
+                read.push(request);
+            } else {
+                reports.push(diff::over_limit(&request));
+            }
+        }
+        reports.extend(diff::read_all(&self.main_root, read, diff::COMMAND_BUDGET));
+        let mut seen = (session_id != 0)
+            .then(|| crate::agent_hook::SeenState::load(&self.main_root, session_id));
+        for mut report in reports {
+            if let Some(seen) = seen.as_mut() {
+                diff::mark_shown(&mut report, seen);
+            }
+            if let Some(row) = rows
+                .iter_mut()
+                .find(|row| row.session_id == report.session_id)
+            {
+                row.other_changes = Some(report);
+            }
+        }
+        if let Some(seen) = seen {
+            seen.save();
+        }
     }
 
     pub(super) fn planned_explicit_leases(
@@ -2351,6 +2509,7 @@ impl Broker {
                     holder_context: self.lease_holder_context(blocker.session_id),
                     severity: None,
                     reason: None,
+                    other_changes: None,
                 });
             }
 
@@ -2402,6 +2561,7 @@ impl Broker {
                 kind: lease.kind,
                 severity: None,
                 reason: None,
+                other_changes: None,
             })
             .collect();
         blockers.sort_by(|a, b| {
@@ -3348,6 +3508,10 @@ impl Broker {
         }
         let command_success = status.succeeded;
         let ok = command_success && audit.ok;
+        let mut conflicting_leases = audit.conflicting_leases;
+        let mut warned_leases = audit.warned_leases;
+        self.attach_overlap_changes(session_id, &touched, &mut conflicting_leases);
+        self.attach_overlap_changes(session_id, &touched, &mut warned_leases);
         let report = GuardedExecReport {
             session_id,
             command: command.to_vec(),
@@ -3355,7 +3519,8 @@ impl Broker {
             command_success,
             command_timed_out: status.timed_out,
             ownership_ok: audit.ok,
-            conflicting_leases: audit.conflicting_leases,
+            conflicting_leases,
+            warned_leases,
             before_dirty_paths: before_dirty,
             after_dirty_paths: after_dirty,
             newly_dirty_paths,
@@ -5762,5 +5927,25 @@ mod active_lease_path_index_tests {
                 "indexed result for holder {holder} and {path}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod lease_refusal_rule_tests {
+    use super::*;
+
+    /// Only an active holder refuses: an idle holder's explicit lease warns.
+    #[test]
+    fn an_idle_holder_warns_and_an_active_one_refuses() {
+        let refuses =
+            |status| LeaseRefusalPolicy::refuses(false, LeaseKind::Explicit, Some(status));
+        assert!(refuses(SessionStatus::Active));
+        assert!(!refuses(SessionStatus::Idle));
+        assert!(!refuses(SessionStatus::Stale));
+        assert!(!LeaseRefusalPolicy::refuses(
+            true,
+            LeaseKind::Explicit,
+            Some(SessionStatus::Active)
+        ));
     }
 }

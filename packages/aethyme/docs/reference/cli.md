@@ -1621,10 +1621,19 @@ construction. The broker names that, from local facts only, and never blocks:
   a file name matched in every directory. The rules are read from
   `.aethyme/config.toml` as committed on the fetched default branch, else the
   main checkout's file, like `[promote]`.
+- **`[leases] overlap_diffs`** (default `true`): every overlap the broker
+  reports (`leases claim`, `leases plan`, `start --path`, `submit`, `exec` and
+  the agent hooks) carries the other session's changes to the overlapping files,
+  committed and uncommitted, compared with where that session branched off. It is
+  capped per file and per session, with the command that shows the rest, and
+  secrets are cut line by line. A change this session was shown is not repeated
+  until it moves. A diff that cannot be read says why and never fails the
+  command. Set it to `false` to report overlaps without their contents.
 - **`[leases] idle_minutes` and `stale_grace_minutes`** (defaults 30 and 15):
   lease liveness is bound to the session's holder process (#360). A lease is
   `active` while that process runs, `idle` once it has issued no broker
-  command for `idle_minutes` (informational: it holds the same), `stale` once
+  command for `idle_minutes` (informational: it still counts as an overlap,
+  though only a session the broker derives as active refuses), `stale` once
   the process is gone, and `unknown` when there is no recorded holder or no
   process table, which is never read as dead. A stale lease keeps its hold
   for `stale_grace_minutes` from the first time the broker saw the holder
