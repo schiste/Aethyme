@@ -510,7 +510,7 @@ fn json(output: Output) -> serde_json::Value {
 
 #[test]
 fn checkout_limit_counts_other_roots_and_preserves_reuse_without_allocating() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::canonical_tempdir();
     let repo = tmp.path().join("project");
     let state = tmp.path().join("state");
     fixture_at(&repo);
@@ -570,7 +570,7 @@ fn checkout_limit_counts_other_roots_and_preserves_reuse_without_allocating() {
 
 #[test]
 fn explicit_zero_checkout_limit_permits_new_allocations() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::canonical_tempdir();
     let repo = tmp.path().join("project");
     let state = tmp.path().join("state");
     fixture_at(&repo);
@@ -599,7 +599,7 @@ fn explicit_zero_checkout_limit_permits_new_allocations() {
 
 #[test]
 fn start_places_worktree_outside_repository_under_a_private_owned_root() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::canonical_tempdir();
     let repo = tmp.path().join("project");
     let state = tmp.path().join("state");
     fixture_at(&repo);
@@ -643,7 +643,7 @@ fn start_places_worktree_outside_repository_under_a_private_owned_root() {
 
 #[test]
 fn worktree_root_plan_is_read_only_and_distinguishes_same_named_clones() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::canonical_tempdir();
     let first = tmp.path().join("one/project");
     let second = tmp.path().join("two/project");
     let state = tmp.path().join("not-created");
@@ -673,7 +673,7 @@ fn worktree_root_plan_is_read_only_and_distinguishes_same_named_clones() {
 
 #[test]
 fn starts_from_a_broker_worktree_create_siblings_instead_of_nesting() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::canonical_tempdir();
     let repo = tmp.path().join("project");
     let state = tmp.path().join("state");
     fixture_at(&repo);
@@ -697,7 +697,7 @@ fn starts_from_a_broker_worktree_create_siblings_instead_of_nesting() {
 
 #[test]
 fn explicit_root_inside_a_linked_worktree_is_refused() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::canonical_tempdir();
     let repo = tmp.path().join("project");
     let state = tmp.path().join("state");
     let cache = tmp.path().join("cache");
@@ -749,7 +749,7 @@ fn explicit_root_inside_a_linked_worktree_is_refused() {
 
 #[test]
 fn host_state_inside_a_linked_worktree_falls_back_without_creating_its_worktrees_parent() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::canonical_tempdir();
     let repo = tmp.path().join("project");
     let linked_checkout = tmp.path().join("unmanaged-checkout");
     let cache = tmp.path().join("cache");
@@ -838,7 +838,7 @@ fn host_state_inside_a_linked_worktree_falls_back_without_creating_its_worktrees
 
 #[test]
 fn unavailable_host_placement_uses_reported_registered_fallback() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::canonical_tempdir();
     let repo = tmp.path().join("project");
     let state = tmp.path().join("state");
     fixture_at(&repo);
@@ -894,7 +894,7 @@ fn unavailable_host_placement_uses_reported_registered_fallback() {
 #[test]
 fn unavailable_history_refuses_before_fallback_root_checkout_or_agent_creation() {
     for agent in [false, true] {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = common::canonical_tempdir();
         let repo = tmp.path().join("project");
         let blocked_state = tmp.path().join("not-a-directory");
         let sentinel = tmp.path().join("agent-ran");
@@ -955,7 +955,7 @@ fn unavailable_history_refuses_before_fallback_root_checkout_or_agent_creation()
 
 #[test]
 fn cleanup_accepts_a_worktree_owned_by_the_external_root_marker() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = common::canonical_tempdir();
     let repo = tmp.path().join("project");
     let root = tmp.path().join("owned-worktrees");
     fixture_at(&repo);
@@ -982,7 +982,7 @@ fn cleanup_accepts_a_worktree_owned_by_the_external_root_marker() {
 fn low_space_refuses_host_and_environment_placement_before_checkout_or_agent_launch() {
     for override_root in [false, true] {
         for agent in [false, true] {
-            let tmp = tempfile::tempdir().unwrap();
+            let tmp = common::canonical_tempdir();
             let repo = tmp.path().join("project");
             let state = tmp.path().join("state");
             let cache = tmp.path().join("cache");
@@ -1240,7 +1240,7 @@ fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes(
             continue;
         }
         for agent in [false, true] {
-            let tmp = tempfile::tempdir().unwrap();
+            let tmp = common::canonical_tempdir();
             let repo = tmp.path().join("project");
             let state = tmp.path().join("state");
             let cache = tmp.path().join("cache");
@@ -1434,7 +1434,7 @@ fn unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes(
 
 #[test]
 fn synthetic_downgrade_status_leaves_database_root_and_cache_unchanged() {
-    let owner = tempfile::tempdir().unwrap();
+    let owner = common::canonical_tempdir();
     let fixture = synthetic_downgrade_legacy_root_fixture(owner.path());
     assert_eq!(read_meta(&fixture.database, "schema_version"), "52");
     assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "52");
@@ -1492,7 +1492,7 @@ fn synthetic_downgrade_status_leaves_database_root_and_cache_unchanged() {
 
 #[test]
 fn synthetic_downgrade_plan_apply_preserves_existing_sessions_and_allows_start_and_adopt() {
-    let owner = tempfile::tempdir().unwrap();
+    let owner = common::canonical_tempdir();
     let fixture = synthetic_downgrade_legacy_root_fixture(owner.path());
     let root_marker_before = std::fs::read(&fixture.root_marker).unwrap();
     let root_entries_before = std::fs::read_dir(&fixture.worktree_root)
@@ -1650,7 +1650,7 @@ fn synthetic_downgrade_plan_apply_preserves_existing_sessions_and_allows_start_a
         1
     );
 
-    let checkout_owner = tempfile::tempdir().unwrap();
+    let checkout_owner = common::canonical_tempdir();
     let checkout = checkout_owner.path().join("adopted");
     git(
         &fixture.repository,
@@ -1710,7 +1710,7 @@ fn recovery_plan_inspects_incomplete_repository_uuid_marker_without_settling_it(
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let owner = tempfile::tempdir().unwrap();
+    let owner = common::canonical_tempdir();
     let repository = owner.path().join("project");
     let host_state = owner.path().join("host-state");
     let preparation_cache = owner.path().join("preparation-cache");
@@ -1795,7 +1795,7 @@ fn recovery_plan_inspects_incomplete_repository_uuid_marker_without_settling_it(
 
 #[test]
 fn v028_schema52_snapshot_status_preserves_the_released_session_root_and_cache() {
-    let owner = tempfile::tempdir().unwrap();
+    let owner = common::canonical_tempdir();
     let fixture = v028_schema52_root_fixture(owner.path());
     assert_eq!(read_meta(&fixture.database, "schema_version"), "52");
     assert_eq!(read_meta(&fixture.database, "min_compatible_schema"), "52");
@@ -1834,7 +1834,7 @@ fn v028_schema52_snapshot_status_preserves_the_released_session_root_and_cache()
 
 #[test]
 fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger() {
-    let owner = tempfile::tempdir().unwrap();
+    let owner = common::canonical_tempdir();
     let fixture = v028_schema52_root_fixture(owner.path());
     let sessions_before = session_rows(&fixture.database);
     let events_before = event_rows(&fixture.database);
@@ -1946,7 +1946,7 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
     assert!(session_rows(&fixture.database).starts_with(&sessions_before));
     assert!(event_rows(&fixture.database).starts_with(&events_after_refusal));
 
-    let checkout_owner = tempfile::tempdir().unwrap();
+    let checkout_owner = common::canonical_tempdir();
     let checkout = checkout_owner.path().join("adopted");
     git(
         &fixture.repository,

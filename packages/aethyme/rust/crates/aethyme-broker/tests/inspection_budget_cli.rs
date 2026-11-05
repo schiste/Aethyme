@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::{Broker, BrokerStore, NewSession, SessionOrigin};
+use aethyme_broker::{Broker, BrokerOpenOptions, BrokerStore, NewSession, SessionOrigin};
 use std::time::{Duration, Instant};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
@@ -100,7 +100,12 @@ fn fixture() -> Fixture {
     git(&repo, &["fetch", "-q", "origin"]);
     git(&repo, &["remote", "set-head", "origin", "main"]);
 
-    let mut broker = Broker::open(&repo).unwrap();
+    // Name the placement root: an open without one reads the host's
+    // AETHYME_WORKTREE_ROOT, which the CLI runs below remove. The fixture's checkout
+    // then lands in the host's root, and scanning that root uses up the budget.
+    let worktrees = tmp.path().canonicalize().unwrap().join("worktrees");
+    let options = BrokerOpenOptions::default().with_worktree_root(worktrees);
+    let mut broker = Broker::open_with_options(&repo, options).unwrap();
     let session = broker.start_worktree("budget fixture", None).unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("work.txt"), "work\n").unwrap();

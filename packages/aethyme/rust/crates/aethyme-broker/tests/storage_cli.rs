@@ -59,10 +59,10 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 fn fixture() -> (TestRepo, tempfile::TempDir) {
-    let root = tempfile::tempdir().unwrap();
+    let root = common::canonical_tempdir();
     let repo_path = root.path().join("repo");
     std::fs::create_dir_all(&repo_path).unwrap();
-    let container = tempfile::tempdir().unwrap();
+    let container = common::canonical_tempdir();
     git(&repo_path, &["init", "-q", "-b", "main"]);
     std::fs::write(repo_path.join("README.md"), "fixture\n").unwrap();
     std::fs::write(repo_path.join(".gitignore"), "/.aethyme/\n").unwrap();
@@ -938,7 +938,7 @@ fn a_root_holding_anything_but_bookkeeping_is_not_empty() {
 #[test]
 fn storage_plan_lists_recovery_archives_without_proposing_them() {
     let (repo, _unused) = fixture();
-    let host = tempfile::tempdir().unwrap();
+    let host = common::canonical_tempdir();
     let container = host.path().join("worktrees");
     std::fs::create_dir_all(&container).unwrap();
     let before = json(run(
@@ -1101,7 +1101,7 @@ fn a_root_whose_worktrees_are_registered_here_is_attributed_then_reconciled() {
 #[test]
 fn a_root_this_repository_cannot_prove_is_never_marked() {
     let (repo, container) = fixture();
-    let other = tempfile::tempdir().unwrap();
+    let other = common::canonical_tempdir();
     git(other.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(other.path().join("README.md"), "other\n").unwrap();
     git(other.path(), &["add", "-A"]);
