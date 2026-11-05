@@ -81,6 +81,14 @@ pub(crate) fn capture_preparation_cache_root(
     Err(unsupported())
 }
 
+pub(crate) fn recheck_preparation_cache_root(
+    _path: &Path,
+    _pinned_directory: &File,
+    _expected_root_identity: &[u8],
+) -> io::Result<PreparationCacheRootCaptureState> {
+    Err(unsupported())
+}
+
 pub(crate) fn ensure_preparation_cache_root_child(
     _parent_path: &Path,
     _child_name: &str,
