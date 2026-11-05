@@ -4,6 +4,16 @@ on:
   schedule:
     - cron: "17 4 * * *"
   workflow_dispatch:
+    inputs:
+      allocator_comparison:
+        description: Compare default, rusty and mimalloc allocators on fixed Playgrounds
+        type: boolean
+        default: false
+      allocator_repetitions:
+        description: Repetitions per allocator (rotating order)
+        type: choice
+        options: ['3', '6']
+        default: '3'
 
 permissions:
   contents: read
@@ -14,6 +24,7 @@ concurrency:
 
 jobs:
   compare:
+    if: github.event_name != 'workflow_dispatch' || !inputs.allocator_comparison
     name: Compare fixed Playground latency baseline
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -100,5 +111,119 @@ jobs:
         with:
           name: product-latency-${{ github.run_id }}-${{ github.run_attempt }}
           path: packages/aethyme/rust/target/criterion
+          if-no-files-found: warn
+          retention-days: 14
+
+  allocator-comparison:
+    name: Allocator comparison (${{ matrix.os }})
+    if: github.event_name == 'workflow_dispatch' && inputs.allocator_comparison
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/packages/aethyme/rust/target
+      ALLOCATOR_REPETITIONS: ${{ inputs.allocator_repetitions }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: 1.96.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: packages/aethyme/rust
+          shared-key: allocator-comparison
+      - name: Validate measurement controls
+        run: python3 -m unittest discover -s packages/aethyme-eval/benchmarks/performance -p test_allocator_matrix.py -v
+      - name: Build the three allocator variants
+        run: |
+          python3 packages/aethyme-eval/benchmarks/performance/build_allocator_matrix.py \
+            --repo "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/allocator-evidence" \
+            --target-dir "$CARGO_TARGET_DIR" --isolated-ci
+      - name: Prepare frozen source-only Playgrounds
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, shutil, tarfile, time, urllib.request
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])/'allocator-sources'
+          root.mkdir()
+          sources = {
+            'django': ('django/django', 'b3997c604720ff061e9d3588c86a9bf7ca07fa32', 'fae2b202287491c7532905e33315f1872ade4ca05b748d180fe43e8a3a79a759'),
+            'ripgrep': ('BurntSushi/ripgrep', '91f5d22ef48bde459d90a8c7dbeab416e97d0f2b', 'e4a9b28571c59e43a80581c5059d3c3787355520c4257f610ffb667b2f1c0cb9')}
+          provenance = {}
+          for name, (repository, revision, expected) in sources.items():
+              url = f'https://codeload.github.com/{repository}/legacy.tar.gz/{revision}'
+              archive = root/(name+'.tar.gz')
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(url, timeout=120) as response:
+                          archive.write_bytes(response.read())
+                      break
+                  except Exception:
+                      if attempt == 2:
+                          raise
+                      time.sleep(2)
+              actual = hashlib.sha256(archive.read_bytes()).hexdigest()
+              if actual != expected:
+                  raise RuntimeError(f'{name}: frozen archive hash mismatch: {actual}')
+              unpack = root/(name+'-unpack'); unpack.mkdir()
+              with tarfile.open(archive) as tar:
+                  tar.extractall(unpack, filter='data')
+              child, = unpack.iterdir()
+              child.rename(root/name); unpack.rmdir()
+              provenance[name] = dict(url=url, revision=revision, archive_sha256=actual)
+          shutil.copytree(Path(os.environ['GITHUB_WORKSPACE'])/'packages/aethyme-eval/benchmarks/performance/fixture', root/'parcel')
+          provenance['parcel'] = dict(revision=os.environ['GITHUB_SHA'], path='packages/aethyme-eval/benchmarks/performance/fixture')
+          (Path(os.environ['RUNNER_TEMP'])/'allocator-evidence/sources.json').write_text(json.dumps(provenance, indent=2)+'\n')
+          PY
+      - name: Measure indexing, product commands, daemon retention and concurrency
+        run: |
+          set -euo pipefail
+          runner=packages/aethyme-eval/benchmarks/performance/allocator_matrix.py
+          sources="$RUNNER_TEMP/allocator-sources"
+          evidence="$RUNNER_TEMP/allocator-evidence"
+          python3 "$runner" --build "$evidence/build.json" --output "$evidence/index" \
+            --stage index --repetitions "$ALLOCATOR_REPETITIONS" \
+            --source "parcel=$sources/parcel" --source "ripgrep=$sources/ripgrep" --source "django=$sources/django"
+          python3 "$runner" --build "$evidence/build.json" --output "$evidence/product" \
+            --stage product --repetitions "$ALLOCATOR_REPETITIONS" --source "parcel=$sources/parcel"
+          python3 "$runner" --build "$evidence/build.json" --output "$evidence/daemon" \
+            --stage daemon --repetitions "$ALLOCATOR_REPETITIONS" --requests 100 --source "ripgrep=$sources/ripgrep"
+          python3 "$runner" --build "$evidence/build.json" --output "$evidence/concurrent" \
+            --stage concurrent --repetitions "$ALLOCATOR_REPETITIONS" --source "ripgrep=$sources/ripgrep"
+      - name: Verify conflicting allocator features refuse to build
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])/'allocator-evidence'
+          checks = [
+              ('aethyme-cli', 'aethyme', 'allocator-rusty,allocator-mimalloc', 'mutually exclusive'),
+              ('aethyme-engine', 'aethyme-engine-cli', 'dhat-heap,allocator-rusty', 'dhat-heap cannot be combined'),
+              ('aethyme-engine', 'aethyme-engine-cli', 'dhat-heap,allocator-mimalloc', 'dhat-heap cannot be combined')]
+          receipts = []
+          for i, (package, binary, features, expected) in enumerate(checks):
+              argv = ['cargo', 'build', '--release', '--locked', '-j1', '--manifest-path',
+                      'packages/aethyme/rust/Cargo.toml', '-p', package, '--bin', binary, '--features', features]
+              result = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=1800)
+              (root/f'feature-conflict-{i}.log').write_text(result.stdout)
+              receipts.append(dict(argv=argv, exit_code=result.returncode, expected_error=expected))
+              (root/'feature-conflicts.json').write_text(json.dumps(receipts, indent=2)+'\n')
+              if result.returncode == 0 or expected not in result.stdout:
+                  raise RuntimeError(f'feature guard {features} did not produce its expected refusal')
+          PY
+      - name: Upload raw allocator evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: allocator-comparison-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/allocator-evidence
+            !${{ runner.temp }}/allocator-evidence/bins
           if-no-files-found: warn
           retention-days: 14
