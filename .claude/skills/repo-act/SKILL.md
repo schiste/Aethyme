@@ -169,7 +169,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   commit sets rather than assuming a merge topology from a commit subject.
   Retain those checks with the measurement provenance.
 - For startup profiling, use Git Trace2 event logs to count actual Git
-  subprocess starts and group repeated argv. Stack-sample counts measure time in
+  subprocess starts and group repeated argv. Also sample the parent process:
+  repeated child calls can coexist with costly parent-side parsing or database
+  work that subprocess counts cannot reveal. Stack-sample counts measure time in
   sampled frames, not invocation counts; keep instrumented traces and timings
   separate from uninstrumented benchmark samples. Enable tracing through the
   child process's `GIT_TRACE2_EVENT`, not repository-local `trace2.eventTarget`,
