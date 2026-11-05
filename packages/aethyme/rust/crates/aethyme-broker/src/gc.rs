@@ -18,8 +18,8 @@ use crate::{
     GcCheckpointPinRelease, GcDeclinedArtifact, GcFileAction, GcFileCandidate,
     GcGateCacheCandidate, GcHealth, GcOrphanCandidate, GcPlan, GcPublicationExposureExpiry,
     GcRecoveryArchiveCandidate, GcRowCandidate, GcWorktreeBlockerSummary, GcWorktreeCandidate,
-    GitRepo, OperationStatus, RecoveryArchiveInventory, RetentionPolicy,
-    SessionRetirementDeferredReason, load_retention_policy, load_retention_policy_report,
+    GitRepo, RecoveryArchiveInventory, RetentionPolicy, SessionRetirementDeferredReason,
+    load_retention_policy, load_retention_policy_report,
 };
 
 mod tree_removal;
@@ -4664,7 +4664,7 @@ impl Broker {
             deferred_checks.push("coordinated_operations".into());
             Vec::new()
         } else {
-            self.store().coordinated_operations()?
+            self.store().gc_unresolved_operations()?
         };
         let publication_exposure_expiries = exposures
             .iter()
@@ -4729,18 +4729,11 @@ impl Broker {
             });
         }
         for operation in &operations {
-            if matches!(
-                operation.status,
-                OperationStatus::Prepared
-                    | OperationStatus::Running
-                    | OperationStatus::OutcomeUnknown
-            ) {
-                blockers.push(GcBlocker {
-                    kind: "unresolved_operation".into(),
-                    id: Some(operation.id),
-                    reason: "unresolved external outcome remains write-blocking".into(),
-                });
-            }
+            blockers.push(GcBlocker {
+                kind: "unresolved_operation".into(),
+                id: Some(operation.id),
+                reason: "unresolved external outcome remains write-blocking".into(),
+            });
         }
 
         let gate_root = main_root.join(".aethyme/logs/gates");
@@ -5179,17 +5172,10 @@ impl Broker {
             );
         }
         for operation in &operations {
-            if matches!(
-                operation.status,
-                OperationStatus::Prepared
-                    | OperationStatus::Running
-                    | OperationStatus::OutcomeUnknown
-            ) {
-                blocker_facts.insert(
-                    ("unresolved_operation".into(), Some(operation.id)),
-                    (0, operation.created_at),
-                );
-            }
+            blocker_facts.insert(
+                ("unresolved_operation".into(), Some(operation.id)),
+                (0, operation.created_at),
+            );
         }
         for ((kind, id), retained_bytes) in &blocked_worktree_bytes {
             if let Some(session_id) = id
