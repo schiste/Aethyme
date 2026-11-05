@@ -39,6 +39,7 @@ fn fixture(ahead: usize) -> (isolation::FixtureRepo, Broker) {
     let tmp = isolation::FixtureRepo::new();
     let root = tmp.path();
     git(root, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(root);
     std::fs::write(root.join("README.md"), "fixture\n").unwrap();
     std::fs::write(root.join(".gitignore"), "/.aethyme/\n").unwrap();
     git(root, &["add", "-A"]);

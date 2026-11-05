@@ -945,6 +945,7 @@ mod tests {
             format!("[collaboration]\ncapture = \"{policy}\"\nproject = \"proj-test\"\n"),
         )
         .unwrap();
+        aethyme_testkit::promote_on_submit(repo.path());
         let origin = committed.then(|| {
             let origin = tempfile::tempdir().unwrap();
             git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);

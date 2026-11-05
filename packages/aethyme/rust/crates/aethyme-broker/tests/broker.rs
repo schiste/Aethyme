@@ -55,6 +55,7 @@ fn ref_exists(cwd: &Path, reference: &str) -> bool {
 
 fn init_repo(root: &Path) {
     sh(root, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(root);
     std::fs::write(root.join("README.md"), "hello\n").unwrap();
     std::fs::write(root.join(".gitignore"), "/.aethyme/\n").unwrap();
     sh(root, &["add", "-A"]);

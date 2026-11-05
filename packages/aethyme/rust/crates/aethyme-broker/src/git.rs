@@ -1679,6 +1679,23 @@ fn run_git_bytes_with_stdin(cwd: &Path, args: &[&str], input: &[u8]) -> Result<V
     Ok(output.stdout)
 }
 
+fn checkout_worker_default_from_config(
+    config: Result<String, GitError>,
+    available_cpus: usize,
+) -> Option<&'static str> {
+    match config {
+        Err(GitError::Git { stderr, .. }) if stderr.is_empty() && available_cpus >= 8 => {
+            Some("checkout.workers=8")
+        }
+        Err(GitError::Git { stderr, .. }) if stderr.is_empty() && available_cpus >= 4 => {
+            Some("checkout.workers=4")
+        }
+        // A configured value, including an invalid one, belongs to Git.
+        // An unreadable config must not be mistaken for an absent value.
+        _ => None,
+    }
+}
+
 fn git_config_bool_or_unset(cwd: &Path, key: &str) -> Result<Option<bool>, GitError> {
     match run_git(cwd, &["config", "--bool", "--get", key]) {
         Ok(value) if value == "true" => Ok(Some(true)),
@@ -6692,6 +6709,19 @@ impl GitRepo {
         self.worktree_add_full(dest, branch, base)
     }
 
+    // Respect an operator's effective Git setting. Only supply a bounded
+    // command-local default when configuration is absent and the host has
+    // enough CPUs; never write repository or global configuration.
+    fn checkout_worker_default(&self, available_cpus: usize) -> Option<&'static str> {
+        if available_cpus < 4 {
+            return None;
+        }
+        checkout_worker_default_from_config(
+            run_git(&self.root, &["config", "--get", "checkout.workers"]),
+            available_cpus,
+        )
+    }
+
     fn worktree_add_full(
         &self,
         dest: &Path,
@@ -6704,17 +6734,20 @@ impl GitRepo {
                 source,
             })?;
         }
-        run_git(
-            &self.root,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                dest.to_str().unwrap_or_default(),
-                base,
-            ],
-        )?;
+        let available_cpus = std::thread::available_parallelism().map_or(1, usize::from);
+        let mut args = Vec::new();
+        if let Some(default) = self.checkout_worker_default(available_cpus) {
+            args.extend(["-c", default]);
+        }
+        args.extend([
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            dest.to_str().unwrap_or_default(),
+            base,
+        ]);
+        run_git(&self.root, &args)?;
         GitRepo::discover(dest)
     }
 
@@ -11655,6 +11688,82 @@ mod sparse_worktree_tests {
         ignore_rules.extend_from_slice(pattern.as_bytes());
         ignore_rules.extend_from_slice(b"\n");
         std::fs::write(exclude, ignore_rules).unwrap();
+    }
+
+    #[test]
+    fn checkout_worker_default_respects_config_and_cpu_limits() {
+        assert_eq!(
+            super::checkout_worker_default_from_config(
+                Err(GitError::Git {
+                    args: "config".into(),
+                    stderr: String::new(),
+                }),
+                8
+            ),
+            Some("checkout.workers=8")
+        );
+        assert_eq!(
+            super::checkout_worker_default_from_config(
+                Err(GitError::Git {
+                    args: "config".into(),
+                    stderr: String::new(),
+                }),
+                4
+            ),
+            Some("checkout.workers=4")
+        );
+        assert_eq!(
+            super::checkout_worker_default_from_config(
+                Err(GitError::Git {
+                    args: "config".into(),
+                    stderr: String::new(),
+                }),
+                2
+            ),
+            None
+        );
+        assert_eq!(
+            super::checkout_worker_default_from_config(
+                Err(GitError::Git {
+                    args: "config".into(),
+                    stderr: "invalid configuration".into(),
+                }),
+                8
+            ),
+            None
+        );
+        let (_fixture, root) = repository();
+        let repo = GitRepo::discover(&root).unwrap();
+        // Explicit local settings win regardless of user-global config.
+        git(&root, &["config", "checkout.workers", "1"]);
+        assert_eq!(repo.checkout_worker_default(8), None);
+        assert_eq!(repo.checkout_worker_default(2), None);
+        git(&root, &["config", "checkout.workers", "invalid"]);
+        assert_eq!(repo.checkout_worker_default(8), None);
+    }
+
+    #[test]
+    fn full_worktree_checkout_preserves_contents_and_config() {
+        let (fixture, root) = repository();
+        git(&root, &["config", "checkout.workers", "1"]);
+        let repo = GitRepo::discover(&root).unwrap();
+        let base = repo.head_commit().unwrap();
+        let path = fixture.path().join("linked/full");
+        let checkout = repo.worktree_add(&path, "agent/full", &base).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path.join("included/source.rs")).unwrap(),
+            "selected source"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("omitted/deep/data.txt")).unwrap(),
+            "omitted source proof"
+        );
+        assert!(checkout.dirty_paths().unwrap().is_empty());
+        assert_eq!(
+            super::run_git(&root, &["config", "--get", "checkout.workers"]).unwrap(),
+            "1"
+        );
+        repo.worktree_remove(&path, false).unwrap();
     }
 
     #[test]
