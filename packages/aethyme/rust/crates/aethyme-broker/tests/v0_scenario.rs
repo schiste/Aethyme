@@ -40,6 +40,7 @@ fn v0_three_agents_end_to_end() {
 
     // ── fixture repo with one cheap gate ─────────────────────────────
     sh(root, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/auth.py"), "auth = 1\n").unwrap();
     std::fs::write(root.join("src/api.py"), "api = 1\n").unwrap();

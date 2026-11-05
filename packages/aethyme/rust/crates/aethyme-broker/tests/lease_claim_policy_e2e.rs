@@ -29,12 +29,14 @@ fn sh(cwd: &Path, args: &[&str]) {
 
 fn init_repo(root: &Path, config: Option<&str>) {
     sh(root, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/auth.py"), "a\n").unwrap();
     std::fs::write(root.join("src/other.py"), "b\n").unwrap();
     if let Some(config) = config {
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
         std::fs::write(root.join(".aethyme/config.toml"), config).unwrap();
+        aethyme_testkit::promote_on_submit(root);
     }
     sh(root, &["add", "-A"]);
     sh(root, &["commit", "-qm", "init"]);

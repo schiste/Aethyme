@@ -1,5 +1,18 @@
 use super::*;
 
+const GC_EVENT_CANDIDATES_SQL: &str = "SELECT e.id, e.ts,
+                    length(e.kind) + COALESCE(length(e.payload_json), 0) + 32
+             FROM events e
+             WHERE e.ts < ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM sessions s
+                   WHERE s.id = e.session_id AND s.cleanup_state = 'open'
+               )
+               AND (?2 = 0 OR e.kind NOT LIKE 'advisory.%')
+               AND (?3 = 0 OR e.kind NOT LIKE 'exposure.%')
+               AND (?4 = 0 OR e.kind NOT LIKE 'operation.%')
+               AND (?5 = 0 OR e.kind NOT LIKE 'merge.%')";
+
 const ARTIFACT_SWEEP_NAMESPACE_REGISTRY_KEY: &str = "gc.artifact_sweep.v2.context_registry";
 const ARTIFACT_SWEEP_NAMESPACE_REGISTRY_MAX: usize = 64;
 const ARTIFACT_SWEEP_NAMESPACE_REGISTRY_MAX_BYTES: usize = 8 * 1024;
@@ -1581,20 +1594,7 @@ impl BrokerStore {
                 |row| row.get::<_, bool>(0),
             )?;
 
-        let mut event_sql = String::from(
-            "SELECT e.id, e.ts,
-                    length(e.kind) + COALESCE(length(e.payload_json), 0) + 32
-             FROM events e
-             WHERE e.ts < ?1
-               AND NOT EXISTS (
-                   SELECT 1 FROM sessions s
-                   WHERE s.id = e.session_id AND s.cleanup_state = 'open'
-               )
-               AND (?2 = 0 OR e.kind NOT LIKE 'advisory.%')
-               AND (?3 = 0 OR e.kind NOT LIKE 'exposure.%')
-               AND (?4 = 0 OR e.kind NOT LIKE 'operation.%')
-               AND (?5 = 0 OR e.kind NOT LIKE 'merge.%')",
-        );
+        let mut event_sql = String::from(GC_EVENT_CANDIDATES_SQL);
         let mut event_parameters = vec![
             rusqlite::types::Value::Integer(event_cutoff),
             rusqlite::types::Value::Integer(i64::from(u8::from(unresolved_advisories))),
@@ -1610,7 +1610,9 @@ impl BrokerStore {
             &mut next_parameter,
             &mut event_parameters,
         );
-        event_sql.push_str(" ORDER BY e.id");
+        // Ordering by the age index avoids a full scan when few events have expired.
+        // Restore the externally stable ID order after the bounded selection.
+        event_sql.push_str(" ORDER BY e.ts, e.id");
         let mut events = conn.prepare(&event_sql)?;
         let rows =
             events.query_map(rusqlite::params_from_iter(event_parameters.iter()), |row| {
@@ -1623,7 +1625,9 @@ impl BrokerStore {
                     content_fingerprint: None,
                 })
             })?;
-        candidates.extend(rows.collect::<Result<Vec<_>, _>>()?);
+        let mut event_candidates = rows.collect::<Result<Vec<_>, _>>()?;
+        event_candidates.sort_unstable_by_key(|candidate| candidate.id);
+        candidates.extend(event_candidates);
 
         let mut gate_sql = String::from(
             "SELECT r.id, r.created_at,
@@ -2523,5 +2527,62 @@ mod artifact_sweep_namespace_tests {
             )
             .unwrap();
         assert_eq!(raw_value, rusqlite::types::Value::Blob(blob));
+    }
+}
+
+#[cfg(test)]
+mod gc_event_age_index_tests {
+    use super::*;
+
+    #[test]
+    fn event_inventory_uses_age_index_and_preserves_id_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::migrate(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO events (id, schema_version, ts, kind) VALUES
+            (1, 1, 20, 'fixture'), (2, 1, 10, 'fixture'), (3, 1, 30, 'fixture');",
+        )
+        .unwrap();
+        let sql = format!("EXPLAIN QUERY PLAN {GC_EVENT_CANDIDATES_SQL} ORDER BY e.ts, e.id");
+        let details: Vec<String> = conn
+            .prepare(&sql)
+            .unwrap()
+            .query_map(params![25, 0, 0, 0, 0], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("events_by_retention_age")),
+            "{details:?}"
+        );
+        let store = BrokerStore {
+            conn,
+            path: PathBuf::from(":memory:"),
+            _snapshot_dir: None,
+            binding_scope: None,
+        };
+        let ids: Vec<_> = store
+            .gc_row_candidates_for_health(25, 0, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.kind == crate::GcRowKind::Event)
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(ids, [1, 2]);
+        // A missing index must still produce the same candidate order.
+        store
+            .conn
+            .execute("DROP INDEX events_by_retention_age", [])
+            .unwrap();
+        let ids: Vec<_> = store
+            .gc_row_candidates_for_health(25, 0, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.kind == crate::GcRowKind::Event)
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(ids, [1, 2]);
     }
 }

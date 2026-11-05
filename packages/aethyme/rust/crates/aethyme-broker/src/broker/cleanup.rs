@@ -3132,6 +3132,7 @@ impl Broker {
             &mut landing_cache,
             records.unwrap_or_default(),
             records_complete,
+            None,
         )?;
         Ok((plan, records_complete))
     }
@@ -3154,9 +3155,11 @@ impl Broker {
             landing_cache,
             crate::measurement::load_size_records(&self.main_root),
             true,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // The scan inputs and optional scope are independently supplied.
     fn cleanup_plan_scanned_core(
         &self,
         scan: crate::SizeScan,
@@ -3165,6 +3168,7 @@ impl Broker {
         landing_cache: &mut crate::representation::LandingVerdictCache,
         mut records: crate::measurement::SizeRecords,
         records_complete: bool,
+        scope: Option<(i64, i64, u32)>,
     ) -> Result<CleanupPlan, BrokerOpError> {
         // Cleared on every exit below, including an error return.
         struct ClearOnDrop<'a>(&'a std::cell::Cell<Option<std::time::Instant>>);
@@ -3178,6 +3182,9 @@ impl Broker {
         let target_snapshot = self.cleanup_target_snapshot();
         let mut plan = CleanupPlan {
             target_snapshot: target_snapshot.refs.clone(),
+            closed_before_ms: scope.map(|s| s.0),
+            after_session: scope.map(|s| s.1),
+            batch_limit: scope.map(|s| s.2),
             ..CleanupPlan::default()
         };
         let mut retained = crate::MeasuredTotal::default();
@@ -3194,7 +3201,28 @@ impl Broker {
         } else {
             Some(self.cleanup_live_checkout_snapshot(deadline)?)
         };
-        let sessions = self.store.cleaned_sessions()?;
+        let mut sessions = self.store.cleaned_sessions()?;
+        if let Some((before, after, limit)) = scope {
+            // A path may have been reused by a later closed session. Its older
+            // row must never make a recently closed checkout eligible.
+            let mut latest_by_path = std::collections::HashMap::new();
+            for session in &sessions {
+                latest_by_path
+                    .entry(session.worktree_path.clone())
+                    .and_modify(|id: &mut i64| *id = (*id).max(session.id))
+                    .or_insert(session.id);
+            }
+            sessions.retain(|session| {
+                latest_by_path.get(&session.worktree_path) == Some(&session.id)
+                    && session.origin == SessionOrigin::Spawned
+                    && session.id > after
+                    && session.closed_at.is_some_and(|closed| closed < before)
+                    && Path::new(&session.worktree_path).is_dir()
+            });
+            sessions.sort_by_key(|session| session.id);
+            sessions.truncate(limit as usize);
+            plan.batch_last_session = sessions.last().map(|session| session.id);
+        }
         for (index, session) in sessions.iter().enumerate() {
             if session.origin != SessionOrigin::Spawned {
                 continue;
@@ -3333,7 +3361,7 @@ impl Broker {
         if scan.measures() && records_complete {
             // Only a pass that enumerated everything may prune: a routine
             // check sees whatever subset it asked about.
-            if deadline.is_none() {
+            if deadline.is_none() && scope.is_none() {
                 records.retain_paths(&known);
             }
             crate::warn_unrecorded(
@@ -3506,7 +3534,32 @@ impl Broker {
         apply: bool,
         confirm: Option<&str>,
     ) -> Result<CleanupSweepReport, BrokerOpError> {
-        let plan = self.cleanup_plan()?;
+        self.cleanup_cleaned_worktrees_scoped(apply, confirm, None)
+    }
+
+    /// Plan and apply a fixed, explicitly bounded set of old closed sessions.
+    pub fn cleanup_cleaned_worktrees_scoped(
+        &mut self,
+        apply: bool,
+        confirm: Option<&str>,
+        scope: Option<(i64, i64, u32)>,
+    ) -> Result<CleanupSweepReport, BrokerOpError> {
+        let plan = if let Some((before, after, limit)) = scope {
+            if before <= 0 || after < 0 || limit == 0 || limit > 1000 {
+                return Err(BrokerOpError::CleanupInvalidScope);
+            }
+            self.cleanup_plan_scanned_core(
+                crate::SizeScan::Measure,
+                None,
+                None,
+                &mut crate::representation::LandingVerdictCache::default(),
+                crate::measurement::load_size_records(&self.main_root),
+                true,
+                scope,
+            )?
+        } else {
+            self.cleanup_plan()?
+        };
         let mut removed_session_ids = Vec::new();
         let mut failures = Vec::new();
         if apply {
@@ -3520,7 +3573,7 @@ impl Broker {
                 });
             }
             for item in plan.worktrees.iter().filter(|item| item.eligible()) {
-                match self.cleanup(item.session_id, false) {
+                match self.cleanup_scoped(item.session_id, scope.map(|s| s.0)) {
                     Ok(()) => removed_session_ids.push(item.session_id),
                     Err(error) => failures.push(CleanupSweepFailure {
                         session_id: item.session_id,
@@ -4472,6 +4525,34 @@ impl Broker {
             });
         }
         Ok(())
+    }
+
+    fn cleanup_scoped(
+        &mut self,
+        session_id: i64,
+        before: Option<i64>,
+    ) -> Result<(), BrokerOpError> {
+        if before.is_none() {
+            return self.cleanup(session_id, false);
+        }
+        let initial_session = self.store.session(session_id)?;
+        let _lifecycle_claim = self.claim_worktree_lifecycle()?;
+        let session = self.store.session(session_id)?;
+        ensure_lifecycle_session_unchanged(session_id, &initial_session, &session)?;
+        let before = before.expect("scoped cutoff is present");
+        if session.closed_at.is_none_or(|closed| closed >= before)
+            || self
+                .store
+                .cleaned_sessions()?
+                .iter()
+                .any(|other| other.worktree_path == session.worktree_path && other.id > session.id)
+        {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session_id,
+                reason: "checkout was reused or its closure no longer meets the cutoff; review a new cleanup plan".into(),
+            });
+        }
+        self.cleanup_under_lifecycle_claim(&session, false, None)
     }
 
     pub fn cleanup(&mut self, session_id: i64, force: bool) -> Result<(), BrokerOpError> {
@@ -5566,6 +5647,7 @@ mod registered_removal_failure_tests {
         let repository = root.join("repository");
         std::fs::create_dir_all(&repository).unwrap();
         git(&repository, &["init", "-q", "-b", "main"]);
+        aethyme_testkit::promote_on_submit(&repository);
         git(&repository, &["config", "user.name", "Cleanup test"]);
         git(
             &repository,
@@ -5831,6 +5913,7 @@ mod registered_removal_failure_tests {
         broker: &mut crate::Broker,
         label: &str,
     ) -> (crate::Session, std::path::PathBuf) {
+        aethyme_testkit::promote_on_submit(broker.main_root());
         let session = broker.start_worktree(label, None).unwrap();
         let worktree = Path::new(&session.worktree_path).to_path_buf();
         std::fs::write(worktree.join("session-change.txt"), "represented\n").unwrap();

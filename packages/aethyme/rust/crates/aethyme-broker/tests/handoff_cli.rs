@@ -33,6 +33,7 @@ fn run(repo: &Path, args: &[&str]) -> Output {
 
 fn init_repo(repo: &Path) {
     git(repo, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(repo);
     std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     git(repo, &["add", "-A"]);

@@ -36,6 +36,7 @@ fn fixture(promote_mode: Option<&str>) -> (common::FixtureRepository, Broker) {
     let tmp = common::FixtureRepository::from_tempdir(tempfile::tempdir().unwrap());
     let root = tmp.path();
     git(root, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(root);
     git(root, &["config", "user.name", "Aethyme Test"]);
     git(
         root,

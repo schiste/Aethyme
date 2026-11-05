@@ -302,6 +302,7 @@ fn fixture() -> tempfile::TempDir {
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(&repo);
     std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     git(&repo, &["add", "-A"]);
@@ -468,6 +469,7 @@ fn other_broker_json_shapes_match_snapshots() {
         "[graph]\nauthority = 'disabled'\n",
     )
     .unwrap();
+    aethyme_testkit::promote_on_submit(&repo);
     std::fs::write(
         repo.join(".aethyme/gates.toml"),
         "[[gate]]\nname = 'shape-gate'\ncommand = 'true'\ntriggers = ['src/**']\n",

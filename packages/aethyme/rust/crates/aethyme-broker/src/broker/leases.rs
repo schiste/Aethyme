@@ -3814,6 +3814,7 @@ mod generic_guarded_exec_tests {
     fn fixture() -> (tempfile::TempDir, crate::test_storage::TestStorage, Broker) {
         let repository = tempfile::tempdir().unwrap();
         git(repository.path(), &["init", "-q", "-b", "main"]);
+        aethyme_testkit::promote_on_submit(repository.path());
         std::fs::write(repository.path().join("tracked.txt"), "before\n").unwrap();
         git(repository.path(), &["add", "tracked.txt"]);
         git(repository.path(), &["commit", "-qm", "fixture"]);

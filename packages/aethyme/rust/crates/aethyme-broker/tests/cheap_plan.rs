@@ -55,6 +55,7 @@ fn fixture(
 ) -> (common::FixtureRepository, Broker) {
     let tmp = common::FixtureRepository::from_tempdir(tempfile::tempdir().unwrap());
     git(tmp.path(), &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);

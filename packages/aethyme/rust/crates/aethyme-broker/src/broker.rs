@@ -271,6 +271,8 @@ pub enum BrokerOpError {
     WorktreeInUseByLiveSession { id: i64, live_id: i64, path: String },
     #[error("bulk cleanup confirmation must be a full SHA-256 digest")]
     CleanupConfirmationNotSha256,
+    #[error("invalid cleanup batch scope")]
+    CleanupInvalidScope,
     /// The freshly computed digest is deliberately withheld: it is an opaque
     /// token whose only use is to be pasted back, and pasting it confirms a plan
     /// nobody read (issue #142).
@@ -1724,6 +1726,16 @@ pub struct CleanupPlan {
     /// longer matches after: a target that advanced can turn a retained
     /// worktree into an eligible one, and that is a different plan (#354).
     pub target_snapshot: Vec<String>,
+    /// Absolute UTC cutoff and cursor bind a scoped plan to its reviewed batch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_before_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after_session: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_limit: Option<u32>,
+    /// Last selected session ID, even if a checkout disappears during inspection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_last_session: Option<i64>,
     pub worktrees: Vec<CleanupWorktreePlan>,
     /// Worktrees a recorded-size plan listed without judging eligibility,
     /// because the health-check budget ran out first (#460). Always `0` on a
@@ -1759,6 +1771,10 @@ impl Default for CleanupPlan {
             unmeasured_worktree_count: 0,
             sizes_measured_at_ms: None,
             target_snapshot: Vec::new(),
+            closed_before_ms: None,
+            after_session: None,
+            batch_limit: None,
+            batch_last_session: None,
             worktrees: Vec::new(),
             eligibility_not_inspected_count: 0,
         }

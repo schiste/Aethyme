@@ -49,6 +49,7 @@ fn clear_git_environment(command: &mut Command) {
 fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
@@ -186,6 +187,7 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
 fn bulk_cleanup_rejects_force_and_session_mixups() {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
@@ -207,6 +209,7 @@ fn bulk_cleanup_rejects_force_and_session_mixups() {
 fn single_session_cleanup_refuses_sweep_only_flags() {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
@@ -233,6 +236,7 @@ fn single_session_cleanup_refuses_sweep_only_flags() {
 fn bulk_cleanup_confirmation_binds_the_exact_reviewed_branch_tip() {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
@@ -306,6 +310,7 @@ fn bulk_cleanup_confirmation_binds_the_exact_reviewed_branch_tip() {
 fn an_interrupted_worktree_removal_is_judged_and_completed_rather_than_refused() {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
@@ -419,6 +424,7 @@ fn a_squash_merged_session_is_eligible_on_its_recorded_representation() {
         &["init", "-q", "--bare", "-b", "main", "origin.git"],
     );
     git(&checkout, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(&checkout);
     std::fs::write(checkout.join("README.md"), "fixture\n").unwrap();
     std::fs::write(checkout.join(".gitignore"), "/.aethyme/\n").unwrap();
     git(&checkout, &["add", "-A"]);
@@ -508,3 +514,50 @@ impl Holder {
 
 #[path = "common/json_error.rs"]
 mod json_error;
+
+#[test]
+fn scoped_cleanup_cli_accepts_a_fixed_cutoff_and_rejects_incomplete_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
+    git(tmp.path(), &["add", "README.md"]);
+    git(tmp.path(), &["commit", "-qm", "init"]);
+    drop(Broker::open(tmp.path()).unwrap());
+    let output = run(
+        tmp.path(),
+        &[
+            "finish",
+            "cleanup",
+            "--all-cleaned",
+            "--closed-before-ms",
+            "123456",
+            "--after-session",
+            "3",
+            "--limit",
+            "5",
+            "--json",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["plan"]["closed_before_ms"], 123456);
+    assert_eq!(json["plan"]["after_session"], 3);
+    assert_eq!(json["plan"]["batch_limit"], 5);
+    assert!(json["plan"].get("batch_last_session").is_none());
+    let incomplete = run(
+        tmp.path(),
+        &[
+            "finish",
+            "cleanup",
+            "--all-cleaned",
+            "--closed-before-ms",
+            "123456",
+            "--json",
+        ],
+    );
+    assert!(!incomplete.status.success());
+}
