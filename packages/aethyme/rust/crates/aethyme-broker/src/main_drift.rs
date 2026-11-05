@@ -370,6 +370,140 @@ mod tests {
         }
     }
 
+    fn graph(root: &std::path::Path, revision: &str, related: bool) {
+        use aethyme_engine::model::{
+            edge::{Edge, EdgeKind},
+            file::{FileNode, FileRole},
+        };
+        use aethyme_engine::store::redb::graph_store::{
+            GraphStore, RepoMetadata, insert_edge, insert_file,
+        };
+        use aethyme_graph_storage::{GraphCoverage, write_coverage_artifacts};
+        let mut coverage = GraphCoverage::unavailable("fixture");
+        coverage.available = true;
+        coverage.source_revision = Some(revision.into());
+        coverage.indexed_revision = Some(revision.into());
+        coverage.source_tree_sha256 = Some("tree".into());
+        coverage.indexed_tree_sha256 = Some("tree".into());
+        coverage.coverage_mode = "complete".into();
+        coverage.safe_to_use = true;
+        coverage.gaps.clear();
+        coverage.files.parsed = 2;
+        coverage
+            .by_language
+            .insert("rust".into(), Default::default());
+        for kind in ["calls", "imports", "documents", "tests"] {
+            coverage.edge_counts_by_kind.insert(kind.into(), 0);
+        }
+        write_coverage_artifacts(root, &coverage, &[]).unwrap();
+        let store = GraphStore::open(root).unwrap();
+        let a = FileNode::new(
+            "Repo",
+            "a.rs",
+            Some("rust".into()),
+            FileRole::Source,
+            1,
+            1,
+            false,
+            None,
+        );
+        let b = FileNode::new(
+            "Repo",
+            "b.rs",
+            Some("rust".into()),
+            FileRole::Source,
+            1,
+            1,
+            false,
+            None,
+        );
+        let mut index = store.begin_index().unwrap();
+        insert_file(&mut index, &a).unwrap();
+        insert_file(&mut index, &b).unwrap();
+        if related {
+            insert_edge(
+                &mut index,
+                &Edge::new(&b.id, &a.id, EdgeKind::Imports, 1000, "fixture"),
+            )
+            .unwrap();
+        }
+        index.commit().unwrap();
+        store
+            .set_repo_metadata(&RepoMetadata {
+                root_path: root.display().to_string(),
+                commit_hash: Some(revision.into()),
+                indexed_at_unix: 0,
+                file_count: 2,
+                languages: vec!["rust".into()],
+            })
+            .unwrap();
+    }
+
+    fn git(root: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().into()
+    }
+
+    #[test]
+    fn complete_revision_bound_graphs_distinguish_disjoint_and_related_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join(".gitignore"), ".aethyme/\n").unwrap();
+        for path in ["a.rs", "b.rs"] {
+            std::fs::write(root.join(path), "base\n").unwrap();
+        }
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "base"]);
+        let worktree = temp.path().join("session");
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "session",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(worktree.join("a.rs"), "ours\n").unwrap();
+        git(&worktree, &["commit", "-qam", "ours"]);
+        let head = git(&worktree, &["rev-parse", "HEAD"]);
+        std::fs::write(root.join("b.rs"), "theirs\n").unwrap();
+        git(&root, &["commit", "-qam", "theirs"]);
+        let commit = git(&root, &["rev-parse", "HEAD"]);
+        graph(&root, &commit, false);
+        graph(&worktree, &head, false);
+        let repo = GitRepo::discover(&root).unwrap();
+        let mut result = measure(&repo, "origin/main", &commit, &head, CatchUp::Merge).unwrap();
+        assess_sync_impact(&repo, &worktree, &mut result);
+        assert_eq!(result.sync_impact, SyncImpact::Disjoint);
+        assert!(result.suggested_command.is_none());
+        graph(&worktree, &head, true);
+        let mut result = measure(&repo, "origin/main", &commit, &head, CatchUp::Merge).unwrap();
+        assess_sync_impact(&repo, &worktree, &mut result);
+        assert_eq!(result.sync_impact, SyncImpact::Related);
+        assert!(result.suggested_command.is_some());
+        std::fs::write(worktree.join("a.rs"), "dirty\n").unwrap();
+        let mut result = measure(&repo, "origin/main", &commit, &head, CatchUp::Merge).unwrap();
+        assess_sync_impact(&repo, &worktree, &mut result);
+        assert_eq!(result.sync_impact, SyncImpact::Unknown);
+    }
+
     #[test]
     fn a_cached_verdict_is_reused_only_for_the_same_refs() {
         let raw = serde_json::to_string(&drift("h1", "c1")).unwrap();
