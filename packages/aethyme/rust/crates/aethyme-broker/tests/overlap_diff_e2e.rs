@@ -300,6 +300,128 @@ fn guarded_exec_reports_a_non_blocking_overlap_with_its_diff() {
     assert_eq!(changes(row).state, State::AlreadyShown, "{row:?}");
 }
 
+/// `submit` reports the same changes, whether its overlap warns or refuses.
+#[test]
+fn a_verify_only_submit_warning_carries_the_diff() {
+    let tmp = FixtureRepository::new();
+    init_repo(tmp.path(), VERIFY_ONLY);
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
+    let owner_tree = add_worktree(tmp.path(), "owner");
+    let submitter_tree = add_worktree(tmp.path(), "submitter");
+    let owner = broker.adopt(&owner_tree, None).unwrap();
+    let submitter = broker.adopt(&submitter_tree, None).unwrap();
+    broker.claim_lease(owner.id, "src/auth.py", None).unwrap();
+    std::fs::write(owner_tree.join("src/auth.py"), "owner's line\n").unwrap();
+    commit_change(&submitter_tree, "submitter's line\n");
+
+    let outcome = broker.submit(submitter.id).unwrap();
+
+    let row = outcome
+        .lease_warnings
+        .iter()
+        .find(|row| row.session_id == owner.id)
+        .expect("the owner is reported");
+    let shown = changes(row);
+    assert_eq!(shown.state, State::Changes, "{shown:?}");
+    assert!(
+        shown
+            .uncommitted
+            .as_deref()
+            .is_some_and(|text| text.contains("+owner's line")),
+        "{shown:?}"
+    );
+}
+
+#[test]
+fn a_refused_submit_carries_the_diff_in_its_report_and_its_message() {
+    let tmp = FixtureRepository::new();
+    init_repo(tmp.path(), AUTO);
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
+    let owner_tree = add_worktree(tmp.path(), "owner");
+    let submitter_tree = add_worktree(tmp.path(), "submitter");
+    let owner = broker.adopt(&owner_tree, None).unwrap();
+    let submitter = broker.adopt(&submitter_tree, None).unwrap();
+    broker.claim_lease(owner.id, "src/auth.py", None).unwrap();
+    std::fs::write(owner_tree.join("src/auth.py"), "owner's line\n").unwrap();
+    commit_change(&submitter_tree, "submitter's line\n");
+
+    let error = broker.submit(submitter.id).unwrap_err();
+
+    let BrokerOpError::OwnershipViolation { summary, report } = error else {
+        panic!("expected an ownership violation");
+    };
+    assert_eq!(report.conflicting_leases.len(), 1);
+    let shown = changes(&report.conflicting_leases[0]);
+    assert!(
+        shown
+            .uncommitted
+            .as_deref()
+            .is_some_and(|text| text.contains("+owner's line")),
+        "{shown:?}"
+    );
+    assert!(summary.contains("| +owner's line"), "{summary}");
+}
+
+/// The radar speaks after a commit. Its diff comes from the same reader, so a
+/// repository's setting and the secret handling apply to it too.
+#[test]
+fn the_conflict_radar_carries_the_diff_and_honours_the_setting() {
+    for (config, expect_diff) in [(VERIFY_ONLY, true), (OFF, false)] {
+        let tmp = FixtureRepository::new();
+        init_repo(tmp.path(), config);
+        let mut broker = open_fixture_repository_broker(&tmp).unwrap();
+        let owner_tree = add_worktree(tmp.path(), "owner");
+        let committer_tree = add_worktree(tmp.path(), "committer");
+        let owner = broker.adopt(&owner_tree, None).unwrap();
+        broker.adopt(&committer_tree, None).unwrap();
+        broker.claim_lease(owner.id, "src/auth.py", None).unwrap();
+        std::fs::write(owner_tree.join("src/auth.py"), "owner's line\n").unwrap();
+        commit_change(&committer_tree, "committer's line\n");
+
+        let lines = aethyme_broker::hooks::conflict_radar(&committer_tree).unwrap();
+
+        let text = lines.join("\n");
+        assert!(text.contains("conflict radar"), "{text}");
+        assert_eq!(text.contains("| +owner's line"), expect_diff, "{text}");
+    }
+}
+
+/// Through the message an agent reads: nothing here relies on the redactor seeing
+/// the whole key at once, because the diff arrives one line at a time.
+#[test]
+fn a_private_key_and_a_secret_file_never_reach_the_overlap_message() {
+    let tmp = FixtureRepository::new();
+    init_repo(tmp.path(), VERIFY_ONLY);
+    let mut broker = open_fixture_repository_broker(&tmp).unwrap();
+    let owner_tree = add_worktree(tmp.path(), "owner");
+    let owner = broker.adopt(&owner_tree, None).unwrap();
+    let claimer = broker
+        .adopt(&add_worktree(tmp.path(), "claimer"), None)
+        .unwrap();
+    let body = "b3BlbnNzaC1rZXk";
+    broker.claim_lease(owner.id, "src/auth.py", None).unwrap();
+    broker.claim_lease(owner.id, ".env", None).unwrap();
+    std::fs::write(
+        owner_tree.join("src/auth.py"),
+        format!(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\n-----END OPENSSH PRIVATE KEY-----\nvisible\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(owner_tree.join(".env"), "PLAIN_SETTING=dotenv-contents\n").unwrap();
+    sh(&owner_tree, &["add", "-N", ".env"]);
+
+    let code = broker.claim_lease(claimer.id, "src/auth.py", None).unwrap();
+    let env = broker.claim_lease(claimer.id, ".env", None).unwrap();
+
+    let code = aethyme_broker::overlap_diff::render(changes(&code.warnings[0]), "");
+    assert!(!code.contains(body), "{code}");
+    assert!(code.contains("+visible"), "{code}");
+    let env = aethyme_broker::overlap_diff::render(changes(&env.warnings[0]), "");
+    assert!(!env.contains("dotenv-contents"), "{env}");
+    assert!(env.contains("contents withheld"), "{env}");
+}
+
 #[test]
 fn a_secret_in_the_other_sessions_change_is_cut() {
     let tmp = FixtureRepository::new();

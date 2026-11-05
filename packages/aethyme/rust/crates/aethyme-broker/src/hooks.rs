@@ -1255,6 +1255,29 @@ pub fn conflict_radar(cwd: &Path) -> Result<Vec<String>, HooksError> {
     ranked.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
 
     let mut warnings = Vec::new();
+    // The same bounded read as every other overlap. A commit waits on this hook,
+    // so it has the hook budget, and only the first few sessions are read.
+    let mut diff_requests = Vec::new();
+    if crate::overlap_diff::enabled(&main_root) {
+        for (conflicts, session_id, conflicting, files) in
+            ranked.iter().take(crate::overlap_diff::max_holders())
+        {
+            let paths = if *conflicts { conflicting } else { files };
+            diff_requests.push(crate::overlap_diff::HolderRequest::new(
+                &sessions[session_id],
+                false,
+                paths
+                    .iter()
+                    .take(crate::overlap_pairs::OVERLAP_SAMPLE_PATHS)
+                    .cloned()
+                    .collect(),
+            ));
+        }
+    }
+    let diffs =
+        crate::overlap_diff::read_all(&main_root, diff_requests, crate::overlap_diff::HOOK_BUDGET);
+    let mut seen = own_session.map(|own| crate::agent_hook::SeenState::load(&main_root, own));
+    let mut diffs = diffs.into_iter();
     for (conflicts, session_id, conflicting, files) in ranked {
         let task = sessions[&session_id]
             .task
@@ -1294,6 +1317,15 @@ pub fn conflict_radar(cwd: &Path) -> Result<Vec<String>, HooksError> {
                  this commit touches: {list}{more}"
             )
         });
+        if let Some(mut report) = diffs.next() {
+            if let Some(seen) = seen.as_mut() {
+                crate::overlap_diff::mark_shown(&mut report, seen);
+            }
+            warnings.push(crate::overlap_diff::render(&report, "  "));
+        }
+    }
+    if let Some(seen) = seen.as_mut() {
+        seen.save();
     }
     Ok(warnings)
 }

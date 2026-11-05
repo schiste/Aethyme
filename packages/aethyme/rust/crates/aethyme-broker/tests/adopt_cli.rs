@@ -1271,7 +1271,7 @@ fn unknown_adopted_base_tracks_current_integration_and_requires_explicit_sync() 
 }
 
 #[test]
-fn unknown_reuse_base_refuses_verify_only_even_when_old_integration_matches_head() {
+fn unknown_reuse_base_does_not_move_a_verify_only_session_behind_its_default() {
     let tmp = fixture();
     let original_head = set_integration_at_head(tmp.path());
     stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
@@ -1305,7 +1305,7 @@ fn unknown_reuse_base_refuses_verify_only_even_when_old_integration_matches_head
     assert!(!refused.status.success());
     assert!(
         json_error::message(&refused)
-            .contains("verify-only policy does not select the integration branch"),
+            .contains("the session checkout is behind the selected base refs/heads/main"),
         "{}",
         json_error::message(&refused)
     );
@@ -1314,6 +1314,104 @@ fn unknown_reuse_base_refuses_verify_only_even_when_old_integration_matches_head
     assert_eq!(unchanged.task, session.task);
     assert_eq!(unchanged.diff_base, session.diff_base);
     assert_eq!(unchanged.adoption_base, session.adoption_base);
+}
+
+/// A repository that never chose a mode and has no remote, the way a fresh local
+/// repository starts. The other fixtures here set `auto`.
+fn fresh_local_fixture() -> common::FixtureRepository {
+    let tmp = common::FixtureRepository::new();
+    git(tmp.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
+    std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
+    git(tmp.path(), &["add", "README.md", ".gitignore"]);
+    git(tmp.path(), &["commit", "-qm", "init"]);
+    tmp
+}
+
+fn run_in(fixture: &common::FixtureRepository, directory: &Path, args: &[&str]) -> Output {
+    common::broker_cli_for_fixture(CLI, args, fixture.path())
+        .current_dir(directory)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn a_fresh_local_repository_reuses_an_adopted_session_it_contains() {
+    let tmp = fresh_local_fixture();
+    let linked = tempfile::tempdir().unwrap();
+    let checkout = linked.path().join("feature");
+    git(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            checkout.to_str().unwrap(),
+        ],
+    );
+    let adopt = ["start", "--adopt", "--task", "first", "--json"];
+    stdout(&run_in(&tmp, &checkout, &adopt));
+
+    let reuse = ["start", "--adopt", "--reuse", "--task", "second", "--json"];
+    stdout(&run_in(&tmp, &checkout, &reuse));
+    assert_eq!(stored_session(&tmp, 1).task.as_deref(), Some("second"));
+
+    // Work of its own still contains the default branch.
+    std::fs::write(checkout.join("work.txt"), "work\n").unwrap();
+    git(&checkout, &["add", "work.txt"]);
+    git(&checkout, &["commit", "-qm", "work"]);
+    let reuse = ["start", "--adopt", "--reuse", "--task", "third", "--json"];
+    stdout(&run_in(&tmp, &checkout, &reuse));
+    assert_eq!(stored_session(&tmp, 1).task.as_deref(), Some("third"));
+
+    // Once the two diverge, reuse refuses, moves nothing and records nothing.
+    advance_main(tmp.path(), "new-default.txt");
+    let head = git_output(&checkout, &["rev-parse", "HEAD"]);
+    let reuse = ["start", "--adopt", "--reuse", "--task", "refused", "--json"];
+    let refused = run_in(&tmp, &checkout, &reuse);
+    assert!(!refused.status.success());
+    assert!(
+        json_error::message(&refused).contains("have diverged"),
+        "{}",
+        json_error::message(&refused)
+    );
+    assert_eq!(git_output(&checkout, &["rev-parse", "HEAD"]), head);
+    assert_eq!(stored_session(&tmp, 1).task.as_deref(), Some("third"));
+}
+
+#[test]
+fn a_fresh_local_repository_finishes_once_the_work_is_on_its_default_branch() {
+    let tmp = fresh_local_fixture();
+    stdout(&run(tmp.path(), &["start", "--task", "work", "--json"]));
+    let session = stored_session(&tmp, 1);
+    let worktree = Path::new(&session.worktree_path);
+    std::fs::write(worktree.join("work.txt"), "work\n").unwrap();
+    git(worktree, &["add", "work.txt"]);
+    git(worktree, &["commit", "-qm", "work"]);
+
+    // Unlanded work is never discarded, and the refusal names the landing that
+    // a repository with nothing to push to can do.
+    let refused = run(tmp.path(), &["finish", "--session", "1"]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!refused.status.success(), "{text}");
+    assert!(
+        text.contains("merge the session branch into the local default branch"),
+        "{text}"
+    );
+    assert!(worktree.join("work.txt").is_file());
+
+    git(
+        tmp.path(),
+        &["merge", "-q", "--no-ff", "-m", "land", &session.branch],
+    );
+    stdout(&run(tmp.path(), &["finish", "--session", "1"]));
+    assert!(tmp.path().join("work.txt").is_file());
 }
 
 #[test]

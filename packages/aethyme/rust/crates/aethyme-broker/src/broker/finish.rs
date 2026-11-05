@@ -874,10 +874,17 @@ impl Broker {
                     .next_commands
                     .push(format!("aethyme broker submit --session {session_id}"));
             } else {
+                // With no fetched default branch there is nothing to push to,
+                // so name the landing that this repository can actually do.
+                let land = if self.repo.upstream_default().is_none() {
+                    "merge the session branch into the local default branch"
+                } else {
+                    "land the work"
+                };
                 report.warnings.push(format!(
                     "HEAD has {} committed {} not represented on any delivery target. This \
-                     repository does not promote, so submitting again cannot change that — land \
-                     the work, then prove it landed",
+                     repository does not promote, so submitting again cannot change that — {land}, \
+                     then prove it landed",
                     report.unsubmitted_commits,
                     plural_word(report.unsubmitted_commits as usize, "change", "changes")
                 ));

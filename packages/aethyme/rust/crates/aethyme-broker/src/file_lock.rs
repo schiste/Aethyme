@@ -649,15 +649,23 @@ mod tests {
         // operation's durable artifact/gate/journal witnesses, not by leaking
         // the lock into unrelated long-lived helpers.
         drop(shared);
-        assert!(
-            try_acquire_session_operation_guard(
+        // Another test thread's fork can hold the description open until its
+        // exec closes it, so this claim may miss briefly. The child above stays
+        // alive throughout, so one that had inherited the lock never lets go.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let exclusive = loop {
+            let attempt = try_acquire_session_operation_guard(
                 repository.path(),
                 41,
                 SessionOperationLockMode::Exclusive,
             )
-            .unwrap()
-            .is_some()
-        );
+            .unwrap();
+            if attempt.is_some() || Instant::now() >= deadline {
+                break attempt;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert!(exclusive.is_some());
         std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"done\n")
             .expect("release child barrier");
         child.wait().expect("wait for lock-holding child");

@@ -1629,6 +1629,12 @@ construction. The broker names that, from local facts only, and never blocks:
   secrets are cut line by line. A change this session was shown is not repeated
   until it moves. A diff that cannot be read says why and never fails the
   command. Set it to `false` to report overlaps without their contents.
+  The diffs are also in the post-commit conflict radar; `broker status` overlap
+  lists do not read them, so it stays fast. Secret removal is best effort: it
+  recognises common credentials and private keys, and files that exist to hold
+  secrets (`.env*`, `*.pem`, `*.key`, `id_rsa*` and similar) show only that they
+  changed. Set this to `false` where another session's uncommitted work must
+  not reach an agent's context.
 - **`[leases] overlap_impact`** (default `false`): when an agent is about to edit
   a file, the `PreToolUse` hook also names another live session changing a file
   that one directly calls or imports, with that session's diff. The evidence is
