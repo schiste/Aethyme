@@ -741,7 +741,7 @@ Usage:
       conflict, nothing changes and the conflicting paths are listed. Only
       the local session branch moves; nothing is pushed, so follow a sync
       with `broker push`. Run it before resuming a reused session and
-      `push` reports related or unknown impact. Graph-disjoint impact permits
+      when `push` reports related or unknown impact. Graph-disjoint impact permits
       deferring intermediate sync; validate the current merge candidate before merge.
   aethyme broker repair --session <id> [--json]
       Conflict-scoped recovery: apply the documented local rebase path for

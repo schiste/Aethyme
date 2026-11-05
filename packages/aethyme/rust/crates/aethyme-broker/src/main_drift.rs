@@ -477,16 +477,24 @@ mod tests {
         git(
             &root,
             &[
-                "worktree",
-                "add",
-                "-qb",
-                "session",
+                "clone",
+                "-q",
+                root.to_str().unwrap(),
                 worktree.to_str().unwrap(),
             ],
         );
         std::fs::write(worktree.join("a.rs"), "ours\n").unwrap();
         git(&worktree, &["commit", "-qam", "ours"]);
         let head = git(&worktree, &["rev-parse", "HEAD"]);
+        git(
+            &root,
+            &[
+                "fetch",
+                "-q",
+                worktree.to_str().unwrap(),
+                "HEAD:refs/heads/session",
+            ],
+        );
         std::fs::write(root.join("b.rs"), "theirs\n").unwrap();
         git(&root, &["commit", "-qam", "theirs"]);
         let commit = git(&root, &["rev-parse", "HEAD"]);
