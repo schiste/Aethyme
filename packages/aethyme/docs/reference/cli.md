@@ -418,6 +418,13 @@ excluded; prunable registrations and manually created linked worktrees count.
 Set `[worktrees].max_checkouts` to change the limit, or explicitly set it to
 zero to disable it. At the limit, reuse remains available and existing
 checkouts are preserved. Run `broker gc plan` to inspect cleanup candidates.
+A foreground lifecycle command (`start`, adoption, `finish`, `close`, `cleanup`,
+`submit`) waits up to 180 s for the repository's lifecycle claim, or until its
+own `--timeout` if that comes first. After 5 s it says on stderr who holds the
+claim, and repeats that every 30 s; a refusal names the holder's pid, command and
+time held, or says the holder could not be identified. Bounded maintenance still
+skips instead of waiting.
+
 The count guard runs under the lifecycle claim before root preparation and
 allocation, using one strict Git inventory without walking worktree contents.
 It complements the free-space floor; it is not a byte quota on active commands
