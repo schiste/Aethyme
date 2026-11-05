@@ -144,6 +144,61 @@ fn without_the_key_worktrees_stay_in_the_default_location() {
     assert!(started["worktree_placement"]["fallback_reason"].is_null());
 }
 
+/// macOS's /var and a relocated home both put a symlink above the host state
+/// directory. That is not a redirected base, so placement stays in host state,
+/// and the second start finds the same root through the recorded binding.
+#[cfg(unix)]
+#[test]
+fn a_symlink_above_the_host_state_directory_keeps_the_default_location() {
+    let mut fx = fixture();
+    let real = canonical(fx._tmp.path()).join("real-parent");
+    std::fs::create_dir_all(real.join("state")).unwrap();
+    let link = fx._tmp.path().join("linked-parent");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    fx.host = link.join("state");
+
+    for task in ["first", "second"] {
+        let started = fx.start(task);
+        assert_eq!(
+            started["worktree_placement"]["source"], "host_state",
+            "{started}"
+        );
+        assert!(
+            started["worktree_placement"]["fallback_reason"].is_null(),
+            "{started}"
+        );
+        let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
+        assert!(
+            canonical(&worktree).starts_with(real.join("state/worktrees")),
+            "{started}"
+        );
+    }
+}
+
+/// A host state directory that is itself a symlink points somewhere else
+/// entirely. Placement must not create a worktrees directory at its target.
+#[cfg(unix)]
+#[test]
+fn a_host_state_directory_that_is_itself_a_symlink_is_not_used_for_worktrees() {
+    let mut fx = fixture();
+    let target = fx._tmp.path().join("redirect-target");
+    std::fs::create_dir_all(&target).unwrap();
+    let link = fx._tmp.path().join("redirected-state");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    fx.host = link;
+
+    let started = fx.start("redirected");
+    assert_eq!(
+        started["worktree_placement"]["source"], "repository_fallback",
+        "{started}"
+    );
+    let reason = started["worktree_placement"]["fallback_reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no fallback reason: {started}"));
+    assert!(reason.contains("not a real directory"), "{reason}");
+    assert!(!target.join("worktrees").exists());
+}
+
 #[test]
 fn sparse_checkout_is_opt_in_and_leased_paths_are_present_without_false_deletions() {
     let fx = fixture();
