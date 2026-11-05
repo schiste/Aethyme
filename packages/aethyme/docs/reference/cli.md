@@ -1208,9 +1208,10 @@ commit. Under normal promotion policy, a session with unknown legacy/adopted
 provenance is checked against the currently configured integration ref and is
 never moved automatically; if it
 is behind, reuse is refused unless the caller explicitly chooses
-`--sync-integration`. Plain reuse of unknown provenance under verify-only policy
-is refused because that policy does not select the integration branch; create a
-new session with an explicit base. The explicit `--sync-integration` path uses the current integration ref and
+`--sync-integration`. Under verify-only policy, or before an integration branch
+exists, it is checked the same way against the base a new session would get. If
+integration existed when the session was last checked and has since gone, reuse
+is refused and no other base is chosen. The explicit `--sync-integration` path uses the current integration ref and
 still requires a clean, fast-forwardable checkout. A recorded fetched-default
 base and an integration base both require a successful bounded fetch at reuse.
 This includes `--sync-integration`; a failed fetch never refreshes the stored
