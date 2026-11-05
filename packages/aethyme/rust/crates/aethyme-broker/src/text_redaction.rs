@@ -34,7 +34,9 @@ const VALUE_PREFIXES: &[&str] = &[
 
 /// Prefixes too short or too common to mean a credential on their own: each
 /// counts only when followed by enough characters of the value's alphabet.
-const SIZED_PREFIXES: &[(&str, usize, fn(char) -> bool)] = &[
+type SizedPrefix = (&'static str, usize, fn(char) -> bool);
+
+const SIZED_PREFIXES: &[SizedPrefix] = &[
     ("AKIA", 16, is_upper_alphanumeric),
     ("ASIA", 16, is_upper_alphanumeric),
     ("AIza", 35, is_url_safe_value),
