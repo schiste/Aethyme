@@ -168,6 +168,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   may rewrite source ancestry; verify the exact expected tree and record both
   commit sets rather than assuming a merge topology from a commit subject.
   Retain those checks with the measurement provenance.
+- For broker command performance, inspect the repository's local
+  `.aethyme/logs/command-metrics.jsonl` before estimating timing from agent
+  transcripts. Filter by command, outcome and observation period; report the
+  number of records with phase timings separately from all invocations.
+  Command and phase measurements describe recorded workloads, not a controlled
+  before/after benchmark; use isolated Playground samples for that comparison.
 - For startup profiling, use Git Trace2 event logs to count actual Git
   subprocess starts and group repeated argv. Also sample the parent process:
   repeated child calls can coexist with costly parent-side parsing or database
