@@ -196,7 +196,7 @@ fn an_unlanded_closed_worktree_is_not_proposed() {
 
 #[test]
 fn a_closed_worktree_inside_its_grace_period_is_not_proposed() {
-    // No key: the shipped 5 day checkout grace applies.
+    // No key: the shipped 1 day checkout grace applies.
     let (_tmp, mut broker) = repository(None);
     let (id, worktree) = session_with_commit(&mut broker, "recent", true);
     broker.close(id).unwrap();
