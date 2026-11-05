@@ -137,7 +137,7 @@ protected metadata roots, active use and unresolved ownership continue to retain
 data. Selected ignored directories stay opaque; nested metadata inside them is
 disposable too.
 Standalone ignored files are outside this new directory policy. The separate
-whole-checkout grace is 120 hours (5 days) by default. Recovery archive
+whole-checkout grace is 24 hours (1 day) by default. Recovery archive
 retention remains 15 days.
 
 Broker schema 58 raises the compatibility floor to 58 for the gate-use protocol.

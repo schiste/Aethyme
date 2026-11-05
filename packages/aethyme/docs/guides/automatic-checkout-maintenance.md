@@ -21,13 +21,13 @@ open forever. Explicit claims with active or unknown holder liveness still
 protect their session unless the exact live holder's opted-in task lease has
 expired and its stale grace has elapsed.
 
-Closed checkouts have a five-day grace period. Configure retention in the primary
+Closed checkouts have a one-day grace period. Configure retention in the primary
 repository's `.aethyme/broker.toml`:
 
 ```toml
 [retention]
 session_abandoned_after_hours = 72
-closed_worktree_grace_hours = 120
+closed_worktree_grace_hours = 24
 # Off by default; requires a coordinated broker upgrade and client drain.
 expire_abandoned_task_leases = false
 ```
@@ -104,7 +104,7 @@ archive resolution for an old checkout whose device identity changed. Older
 runtimes refuse schema-3 witnesses; use the new paired runtime for maintenance
 of repositories containing them.
 
-This opt-in can compact a checkout during its ordinary five-day grace period.
+This opt-in can compact a checkout during its ordinary one-day grace period.
 Every retirement archive records a minimum retention floor of at least 15 days
 and at least the configured `closed_worktree_grace_hours`, measured from the
 archive's recorded creation time. The floor is stored in the archive receipt
