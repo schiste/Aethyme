@@ -61,6 +61,7 @@ fn fixture(config: &str) -> Fixture {
         &["init", "-q", "--bare", "-b", "main", "origin.git"],
     );
     git(&repo, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(&repo);
     std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     git(&repo, &["add", "-A"]);
@@ -70,6 +71,7 @@ fn fixture(config: &str) -> Fixture {
         // default branch, and finish reads it the same way.
         std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
         std::fs::write(repo.join(".aethyme/config.toml"), config).unwrap();
+        aethyme_testkit::promote_on_submit(&repo);
         git(&repo, &["add", "-f", ".aethyme/config.toml"]);
         git(&repo, &["commit", "-qm", "enable the push lane"]);
     }

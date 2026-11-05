@@ -23,7 +23,7 @@
 //! `broker advanced gh` call. Waiting happens between operations, never while
 //! one holds the repository lock.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -130,6 +130,14 @@ impl RunState {
             Some("success" | "skipped" | "neutral")
         )
     }
+
+    fn cancelled(&self) -> bool {
+        self.completed() && self.conclusion.as_deref() == Some("cancelled")
+    }
+
+    fn newer_than(&self, other: &RunState) -> bool {
+        (self.started_at.as_str(), self.id) > (other.started_at.as_str(), other.id)
+    }
 }
 
 /// The latest run of each name. A rerun or a re-trigger leaves the older run
@@ -138,14 +146,40 @@ impl RunState {
 pub fn latest_runs(runs: &[RunState]) -> Vec<RunState> {
     let mut latest: BTreeMap<&str, &RunState> = BTreeMap::new();
     for run in runs {
-        let newer = latest.get(run.name.as_str()).is_none_or(|current| {
-            (run.started_at.as_str(), run.id) > (current.started_at.as_str(), current.id)
-        });
-        if newer {
+        if latest
+            .get(run.name.as_str())
+            .is_none_or(|current| run.newer_than(current))
+        {
             latest.insert(run.name.as_str(), run);
         }
     }
     latest.into_values().cloned().collect()
+}
+
+/// The latest runs of a merge commit, with each cancelled one replaced by the
+/// newest later run of its workflow on the branch. A workflow that cancels
+/// superseded runs says nothing about a merge commit that was followed quickly
+/// by another, and the later run tests a tree containing that commit, so it
+/// decides. A cancelled run nothing followed stays, and fails the commit: nobody
+/// tested it.
+pub fn follow_superseded(runs: &[RunState], later: &[RunState]) -> Vec<RunState> {
+    latest_runs(runs)
+        .into_iter()
+        .map(|run| {
+            if !run.cancelled() {
+                return run;
+            }
+            later
+                .iter()
+                .filter(|candidate| candidate.name == run.name && candidate.newer_than(&run))
+                .fold(None, |newest: Option<&RunState>, candidate| match newest {
+                    Some(current) if !candidate.newer_than(current) => Some(current),
+                    _ => Some(candidate),
+                })
+                .cloned()
+                .unwrap_or(run)
+        })
+        .collect()
 }
 
 /// What a set of runs says about a commit.
@@ -204,6 +238,8 @@ pub trait ChainReader {
     fn check_runs(&self, sha: &str) -> Result<Vec<RunState>, String>;
     /// Workflow runs for `sha` on branch `base`.
     fn branch_runs(&self, sha: &str, base: &str) -> Result<Vec<RunState>, String>;
+    /// Workflow runs from pushes to branch `base` created at or after `since`.
+    fn pushes_since(&self, base: &str, since: &str) -> Result<Vec<RunState>, String>;
 }
 
 /// How a coordinated write ended.
@@ -535,6 +571,44 @@ impl<R: ChainReader, W: ChainWriter, C: ChainClock> Chain<'_, R, W, C> {
         }
     }
 
+    /// The runs that decide `merge_commit`: see [`follow_superseded`]. Reads the
+    /// branch only when a run was cancelled, and says once which run it follows.
+    fn deciding_runs(
+        &mut self,
+        number: u64,
+        merge_commit: &str,
+        base: &str,
+        runs: &[RunState],
+        followed: &mut BTreeSet<u64>,
+    ) -> Step<Vec<RunState>> {
+        let latest = latest_runs(runs);
+        let Some(since) = latest
+            .iter()
+            .filter(|run| run.cancelled())
+            .map(|run| run.started_at.as_str())
+            .min()
+        else {
+            return Ok(latest);
+        };
+        let later = self.read(
+            number,
+            Stage::MainChecks,
+            self.reader.pushes_since(base, since),
+        )?;
+        let deciding = follow_superseded(runs, &later);
+        for run in &deciding {
+            if !latest.contains(run) && followed.insert(run.id) {
+                self.say(format!(
+                    "#{number} {} on {} was cancelled by a newer {base} run; following run {}",
+                    run.name,
+                    short(merge_commit),
+                    run.id
+                ));
+            }
+        }
+        Ok(deciding)
+    }
+
     /// Waits for the default branch's runs on `merge_commit`. Returns the
     /// passing run names and the workflow dispatched, if one was.
     fn wait_for_main(
@@ -546,12 +620,14 @@ impl<R: ChainReader, W: ChainWriter, C: ChainClock> Chain<'_, R, W, C> {
         let started = self.clock.now();
         let mut dispatched: Option<String> = None;
         let mut last_pending: Option<Vec<String>> = None;
+        let mut followed = BTreeSet::new();
         loop {
             let runs = self.read(
                 number,
                 Stage::MainChecks,
                 self.reader.branch_runs(merge_commit, base),
             )?;
+            let runs = self.deciding_runs(number, merge_commit, base, &runs, &mut followed)?;
             let elapsed = self.clock.now().duration_since(started);
             match run_verdict(&runs) {
                 RunVerdict::Passed { names } => return Ok((names, dispatched)),
@@ -953,6 +1029,19 @@ impl ChainReader for GhChainReader {
         ])?;
         Ok(Self::runs(&value, "workflow_runs", "created_at"))
     }
+
+    fn pushes_since(&self, base: &str, since: &str) -> Result<Vec<RunState>, String> {
+        // Only pushes: a fork's pull request from its own `main` also lists
+        // under this branch name, and must not decide this repository's commit.
+        let value = self.gh(&[
+            "api",
+            &format!(
+                "repos/{}/actions/runs?branch={base}&event=push&created=%3E%3D{since}&per_page=100",
+                self.repository
+            ),
+        ])?;
+        Ok(Self::runs(&value, "workflow_runs", "created_at"))
+    }
 }
 
 #[cfg(test)]
@@ -997,6 +1086,9 @@ mod tests {
             Ok(Vec::new())
         }
         fn branch_runs(&self, _: &str, _: &str) -> Result<Vec<RunState>, String> {
+            Ok(Vec::new())
+        }
+        fn pushes_since(&self, _: &str, _: &str) -> Result<Vec<RunState>, String> {
             Ok(Vec::new())
         }
     }
@@ -1072,6 +1164,53 @@ mod tests {
                 names: vec!["lint".into(), "tests".into()]
             }
         );
+    }
+
+    #[test]
+    fn the_newest_later_run_of_the_workflow_decides_a_cancelled_run() {
+        let own = [
+            run("CI", Some("cancelled"), "2026-10-03T15:00:00Z", 10),
+            run("Gates", Some("success"), "2026-10-03T15:00:00Z", 11),
+        ];
+        let later = [
+            run("CI", Some("failure"), "2026-10-03T15:20:00Z", 30),
+            run("Gates", Some("failure"), "2026-10-03T15:20:00Z", 31),
+            run("CI", Some("cancelled"), "2026-10-03T15:10:00Z", 20),
+            // The cancelled run itself: `created` is inclusive.
+            run("CI", Some("cancelled"), "2026-10-03T15:00:00Z", 10),
+            run("CI", Some("success"), "2026-10-03T14:00:00Z", 5),
+        ];
+        // A later failure of a workflow this commit passed is not this commit's.
+        let deciding = follow_superseded(&own, &later);
+        assert_eq!(deciding.iter().map(|r| r.id).collect::<Vec<_>>(), [30, 11]);
+        assert_eq!(
+            run_verdict(&deciding),
+            RunVerdict::Failed {
+                failed: vec!["CI (failure)".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn a_cancelled_run_nothing_followed_still_fails_the_commit() {
+        let own = [run("CI", Some("cancelled"), "2026-10-03T15:00:00Z", 10)];
+        let later = [
+            run("Other", Some("success"), "2026-10-03T15:20:00Z", 30),
+            run("CI", Some("success"), "2026-10-03T14:00:00Z", 5),
+        ];
+        assert_eq!(
+            run_verdict(&follow_superseded(&own, &later)),
+            RunVerdict::Failed {
+                failed: vec!["CI (cancelled)".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn a_failed_run_is_never_replaced_by_a_later_pass() {
+        let own = [run("CI", Some("failure"), "2026-10-03T15:00:00Z", 10)];
+        let later = [run("CI", Some("success"), "2026-10-03T15:20:00Z", 30)];
+        assert_eq!(follow_superseded(&own, &later)[0].id, 10);
     }
 
     #[test]

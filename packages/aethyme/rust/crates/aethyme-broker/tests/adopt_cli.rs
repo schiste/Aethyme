@@ -50,6 +50,7 @@ fn stdout(output: &Output) -> String {
 fn fixture() -> common::FixtureRepository {
     let tmp = common::FixtureRepository::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "README.md", ".gitignore"]);
@@ -756,6 +757,7 @@ fn reuse_revalidates_and_fast_forwards_a_clean_conventional_base() {
         "[worktree_freshness]\nmax_age_seconds = 86400\n",
     )
     .unwrap();
+    aethyme_testkit::promote_on_submit(tmp.path());
     let started = stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
     let started: serde_json::Value = serde_json::from_str(&started).unwrap();
     assert_eq!(started["start_base"]["evidence"], "conventional_main");
@@ -1730,6 +1732,7 @@ fn adopt_cli_requires_reuse_for_integration_sync() {
 fn adopt_warns_about_uncommitted_paths_it_did_not_create() {
     let repo = tempfile::tempdir().unwrap();
     git(repo.path(), &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(repo.path());
     std::fs::write(repo.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
     git(repo.path(), &["add", "-A"]);

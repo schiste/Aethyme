@@ -112,7 +112,8 @@ ID   STATUS   ORIGIN   BRANCH                   TASK
 
 Both agents are about to change the same `GREETING` line. Alpha commits
 and submits first: merge simulation is clean, the gate runs on the merged
-tree, and the entry auto-promotes onto the local `aethyme/integration`
+tree, and with `[promote] mode = "auto"` set for this demo (the default is
+`verify-only`) the entry auto-promotes onto the local `aethyme/integration`
 branch.
 
 ```bash

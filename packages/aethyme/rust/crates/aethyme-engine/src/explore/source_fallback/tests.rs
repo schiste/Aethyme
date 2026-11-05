@@ -608,6 +608,32 @@ fn hit_count_is_configurable_and_ranking_is_deterministic() {
         },
     );
     assert_eq!(three.hints.len(), 3);
+    let full = inspect_with(
+        root,
+        "cache",
+        &SourceSearchOptions {
+            max_hits: 40,
+            ..options()
+        },
+    );
+    assert_eq!(full.hints.len(), 40);
+    assert!(!full.truncated);
+    assert_eq!(
+        serde_json::to_value(&three.hints).unwrap(),
+        serde_json::to_value(&full.hints[..3]).unwrap()
+    );
+    assert_eq!(three.answer_safety, full.answer_safety);
+    let zero = inspect_with(
+        root,
+        "cache",
+        &SourceSearchOptions {
+            max_hits: 0,
+            ..options()
+        },
+    );
+    assert!(zero.hints.is_empty());
+    assert!(zero.truncated);
+    assert_eq!(zero.answer_safety, full.answer_safety);
 }
 
 #[test]

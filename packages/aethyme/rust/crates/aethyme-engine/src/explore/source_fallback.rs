@@ -308,10 +308,9 @@ pub(super) fn inspect_with(
     result.complete = incomplete_reason.is_none();
     result.incomplete_reason = incomplete_reason;
 
-    let (mut ranked, signals): (Vec<_>, Vec<_>) = rank(&query, &files).into_iter().unzip();
+    let (ranked, signals) = rank(&query, &files, options.max_hits);
     result.answer_safety = answer_safety(&signals, result.complete);
-    result.truncated = !result.complete || ranked.len() > options.max_hits;
-    ranked.truncate(options.max_hits);
+    result.truncated = !result.complete || signals.len() > options.max_hits;
     result.hints = ranked;
     if !result.hints.is_empty() {
         result.subsystems.push(ExploreSubsystem {
@@ -832,7 +831,11 @@ fn best_window(lines: &[MatchedLine], idf: &[f64]) -> Option<(u32, u32, u32, f64
 ///
 /// `None` for a file that matches no term in any field: it only counts
 /// toward the corpus size.
-fn document(file: &ScannedFile, query: &QueryTerms) -> Option<Document> {
+fn document(
+    file: &ScannedFile,
+    query: &QueryTerms,
+    lengths: [f64; bm25f::FIELD_COUNT],
+) -> Option<Document> {
     let (name_parts, dir_parts) = path_parts(&file.path);
     let path_match = || {
         query.terms.iter().any(|term| {
@@ -846,7 +849,7 @@ fn document(file: &ScannedFile, query: &QueryTerms) -> Option<Document> {
         return None;
     }
     let mut doc = Document::new(query.terms.len() + query.compounds.len());
-    doc.len = field_lengths(file);
+    doc.len = lengths;
     for (bit, term) in query.terms.iter().enumerate() {
         let hits = |parts: &[String]| {
             parts
@@ -995,14 +998,20 @@ fn best_passages<'a>(
         .collect()
 }
 
-fn rank(query: &QueryTerms, files: &[ScannedFile]) -> Vec<(AnswerItem, HitSignal)> {
+fn rank(
+    query: &QueryTerms,
+    files: &[ScannedFile],
+    max_hits: usize,
+) -> (Vec<AnswerItem>, Vec<HitSignal>) {
+    // Field-length averages and idf come from every searched file, not
+    // only the ones that match a term (the only ones ranked). Reuse these
+    // lengths for matching documents instead of calculating them twice.
+    let lengths = files.par_iter().map(field_lengths).collect::<Vec<_>>();
     let (candidates, documents): (Vec<&ScannedFile>, Vec<Document>) = files
         .par_iter()
-        .filter_map(|file| Some((file, document(file, query)?)))
+        .zip(lengths.par_iter())
+        .filter_map(|(file, &length)| Some((file, document(file, query, length)?)))
         .unzip();
-    // Field-length averages and idf come from every searched file, not
-    // only the ones that match a term (the only ones ranked).
-    let lengths = files.par_iter().map(field_lengths).collect::<Vec<_>>();
     let mut corpus = Corpus::new(
         &documents,
         query.terms.len() + query.compounds.len(),
@@ -1060,15 +1069,30 @@ fn rank(query: &QueryTerms, files: &[ScannedFile]) -> Vec<(AnswerItem, HitSignal
         if score <= 0.0 {
             continue;
         }
-        let window = best_window(&file.lines, idf);
         let symbol = best_symbol(&file.definitions, query, idf);
-        scored.push((score, file, matched, coverage, window, symbol));
+        scored.push((score, file, matched, coverage, symbol));
     }
     scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.path.cmp(&b.1.path)));
 
-    scored
+    // Safety must consider the entire ranking, including duplicate exact
+    // symbols beyond the output limit. Detailed passage and JSON construction
+    // is needed only for hits that will actually be returned.
+    let signals = scored
+        .iter()
+        .map(|(score, _, _, coverage, symbol)| HitSignal {
+            score: *score,
+            coverage: *coverage,
+            exact_symbol: symbol
+                .as_ref()
+                .filter(|symbol| symbol.exact)
+                .map(|symbol| split_identifier(&symbol.definition.name).concat()),
+        })
+        .collect();
+    let items = scored
         .into_iter()
-        .map(|(score, file, matched, coverage, window, symbol)| {
+        .take(max_hits)
+        .map(|(score, file, matched, coverage, symbol)| {
+            let window = best_window(&file.lines, idf);
             let mut line_refs: Vec<serde_json::Value> = Vec::new();
             let covered = |refs: &[serde_json::Value], line: u32| {
                 refs.iter().any(|existing| {
@@ -1149,15 +1173,7 @@ fn rank(query: &QueryTerms, files: &[ScannedFile]) -> Vec<(AnswerItem, HitSignal
             // characters per call.
             reason.push_str(&format!("; {} file", file.role.as_str()));
             let confidence = ((0.25 + 0.45 * coverage) * 100.0).round() / 100.0;
-            let signal = HitSignal {
-                score,
-                coverage,
-                exact_symbol: symbol
-                    .as_ref()
-                    .filter(|symbol| symbol.exact)
-                    .map(|symbol| split_identifier(&symbol.definition.name).concat()),
-            };
-            let item = AnswerItem {
+            AnswerItem {
                 kind: "source_file".into(),
                 target: file.path.clone(),
                 path: Some(file.path.clone()),
@@ -1179,10 +1195,10 @@ fn rank(query: &QueryTerms, files: &[ScannedFile]) -> Vec<(AnswerItem, HitSignal
                     })),
                     "line_refs": line_refs,
                 }),
-            };
-            (item, signal)
+            }
         })
-        .collect()
+        .collect();
+    (items, signals)
 }
 
 mod bm25f;

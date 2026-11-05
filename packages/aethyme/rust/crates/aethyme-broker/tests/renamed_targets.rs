@@ -33,6 +33,7 @@ fn fixture(rename: bool) -> (FixtureRepository, std::path::PathBuf, i64) {
     let repo = fixture.path().to_path_buf();
     std::fs::create_dir_all(repo.join("plugins/old")).unwrap();
     sh(&repo, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(&repo);
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     std::fs::write(
         repo.join("plugins/old/tool.py"),
@@ -109,6 +110,7 @@ fn an_unaffected_session_reports_nothing() {
     let fixture = FixtureRepository::new();
     let repo = fixture.path();
     sh(repo, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(repo);
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     std::fs::write(repo.join("keep.txt"), "stable\n").unwrap();
     sh(repo, &["add", "-A"]);

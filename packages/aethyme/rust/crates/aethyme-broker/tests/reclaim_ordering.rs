@@ -61,6 +61,7 @@ fn write_policy(main_root: &Path, retained_bytes_budget: u64) {
 fn fixture() -> (common::FixtureRepository, Broker) {
     let tmp = common::FixtureRepository::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);

@@ -549,6 +549,9 @@ pub(super) fn render_cleanup_sweep_report(report: &crate::CleanupSweepReport, de
         report.plan.eligible_branch_count,
     );
     out!("  reviewed plan digest: {}", report.plan.digest);
+    if let Some(cursor) = report.plan.batch_last_session {
+        out!("  next batch cursor: --after-session {cursor}");
+    }
     render_capped(&report.plan.worktrees, GC_LIST_CAP, detail, |item| {
         out!(
             "  session {}: {} ({}) — {}",
@@ -592,8 +595,15 @@ pub(super) fn render_cleanup_sweep_report(report: &crate::CleanupSweepReport, de
             );
         }
     } else if report.plan.eligible_worktree_count > 0 || report.plan.eligible_branch_count > 0 {
+        let scope = match (report.plan.closed_before_ms, report.plan.batch_limit) {
+            (Some(before), Some(limit)) => format!(
+                " --closed-before-ms {before} --after-session {} --limit {limit}",
+                report.plan.after_session.unwrap_or(0)
+            ),
+            _ => String::new(),
+        };
         out!(
-            "  apply: aethyme broker finish cleanup --all-cleaned --apply --confirm {}",
+            "  apply: aethyme broker finish cleanup --all-cleaned{scope} --apply --confirm {}",
             report.plan.digest
         );
     }
@@ -2507,13 +2517,30 @@ pub(super) fn run_cleanup(parsed: Parsed) -> Result<(), UsageError> {
                     .into(),
             ));
         }
-        let report = broker.cleanup_cleaned_worktrees(parsed.apply, parsed.confirm.as_deref())?;
+        let scope = match (parsed.closed_before_ms, parsed.cleanup_after_session, parsed.limit) {
+            (None, None, None) => None,
+            (Some(before), after, Some(limit)) if before > 0 && after.unwrap_or(0) >= 0 && (1..=1000).contains(&limit) => Some((before, after.unwrap_or(0), limit)),
+            _ => return Err(UsageError::Message("scoped cleanup requires --closed-before-ms and --limit (1-1000), with optional non-negative --after-session".into())),
+        };
+        let report = broker.cleanup_cleaned_worktrees_scoped(
+            parsed.apply,
+            parsed.confirm.as_deref(),
+            scope,
+        )?;
         if parsed.json {
             out!("{}", serde_json::to_string_pretty(&report)?);
         } else {
             render_cleanup_sweep_report(&report, parsed.detail);
         }
     } else {
+        if parsed.closed_before_ms.is_some()
+            || parsed.cleanup_after_session.is_some()
+            || parsed.limit.is_some()
+        {
+            return Err(UsageError::Message(
+                "cleanup scope flags require --all-cleaned".into(),
+            ));
+        }
         if parsed.apply {
             return Err(UsageError::Message(
                 "cleanup <session-id> does not take --apply; use the exact command after finish reports cleanup safe"

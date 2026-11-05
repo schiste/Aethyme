@@ -411,6 +411,21 @@ fn a_redeploy_swaps_revisions_without_a_failed_request() {
             }
         })
     };
+    // More requests in flight when the old server stops, which is what used to
+    // reach a client as a reset. Only the client above reads revisions, in order.
+    let pressure: Vec<_> = (0..4)
+        .map(|_| {
+            let (route, client_stop) = (route.clone(), client_stop.clone());
+            std::thread::spawn(move || {
+                let mut responses = Vec::new();
+                while !client_stop.load(Ordering::SeqCst) {
+                    responses.push(get(proxy_port, &route, "/version.txt").unwrap_or_default());
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                responses
+            })
+        })
+        .collect();
     let wait_for = |count: usize| {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while results.lock().unwrap().len() < count {
@@ -439,18 +454,23 @@ fn a_redeploy_swaps_revisions_without_a_failed_request() {
     wait_for(seen + 5);
     client_stop.store(true, Ordering::SeqCst);
     client.join().unwrap();
+    let pressure: Vec<String> = pressure
+        .into_iter()
+        .flat_map(|thread| thread.join().unwrap())
+        .collect();
     stop.store(true, Ordering::SeqCst);
     let results = results.lock().unwrap().clone();
 
     let failed: Vec<&String> = results
         .iter()
+        .chain(&pressure)
         .filter(|r| !(r.starts_with("HTTP/1.0 200") || r.starts_with("HTTP/1.1 200")))
         .collect();
     assert!(
         failed.is_empty(),
         "{} of {} request(s) failed, first: {:?}",
         failed.len(),
-        results.len(),
+        results.len() + pressure.len(),
         failed.first()
     );
     assert!(results.first().unwrap().ends_with("v1"));

@@ -61,11 +61,22 @@ fn commit_work(broker: &mut Broker, task: &str) -> i64 {
     session.id
 }
 
-/// The default is unchanged: a repository that says nothing still promotes.
+/// Promotion is opt-in: a repository that says nothing verifies and moves nothing.
 #[test]
-fn an_unconfigured_repository_still_promotes_automatically() {
+fn an_unconfigured_repository_verifies_and_promotes_nothing() {
     let (_fixture, mut broker) = fixture(None);
     let session = commit_work(&mut broker, "default");
+    let outcome = broker.submit(session).unwrap();
+    assert!(!outcome.promoted, "{outcome:?}");
+    assert!(outcome.promotion_suppressed.is_some());
+    assert_eq!(outcome.entry.status, MergeStatus::Verified);
+}
+
+/// Promotion stays available to a repository that chooses it.
+#[test]
+fn auto_repositories_promote_on_submit() {
+    let (_fixture, mut broker) = fixture(Some("auto"));
+    let session = commit_work(&mut broker, "chosen");
     let outcome = broker.submit(session).unwrap();
     assert!(outcome.promoted, "{outcome:?}");
     assert!(outcome.promotion_suppressed.is_none());
@@ -270,7 +281,7 @@ fn finish_still_tells_a_promoting_repository_to_submit() {
 /// distinguishes the flag from the repository policy.
 #[test]
 fn the_flag_suppresses_promotion_for_one_run_without_changing_policy() {
-    let (_tmp, mut broker) = fixture(None);
+    let (_tmp, mut broker) = fixture(Some("auto"));
     let session = commit_work(&mut broker, "one-run");
 
     let outcome = broker

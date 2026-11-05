@@ -25,6 +25,7 @@ fn sh(cwd: &Path, args: &[&str]) {
 
 fn init_repo(root: &Path) {
     sh(root, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/auth.py"), "a\n").unwrap();
     std::fs::write(root.join("src/other.py"), "b\n").unwrap();
@@ -268,6 +269,7 @@ fn explicit_directory_claim_overlaps_other_sessions_files() {
         "[leases]\nignore = [\"src/\"]\n",
     )
     .unwrap();
+    aethyme_testkit::promote_on_submit(tmp.path());
     let overlaps = broker.refresh_leases().unwrap();
     assert!(
         overlaps.is_empty(),

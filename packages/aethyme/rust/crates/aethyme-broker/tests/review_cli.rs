@@ -48,8 +48,10 @@ impl Fixture {
     fn new_with_policy(policy: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         git(root.path(), &["init", "-q", "-b", "main"]);
+        aethyme_testkit::promote_on_submit(root.path());
         std::fs::create_dir_all(root.path().join(".aethyme")).unwrap();
         std::fs::write(root.path().join(".aethyme/config.toml"), policy).unwrap();
+        aethyme_testkit::promote_on_submit(root.path());
         std::fs::write(
             root.path().join(".gitignore"),
             "/.aethyme/broker.db*\n/remote.git/\n/fake-bin/\n/gh-writes\n/host-state/\n",

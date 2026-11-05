@@ -169,7 +169,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   commit sets rather than assuming a merge topology from a commit subject.
   Retain those checks with the measurement provenance.
 - For startup profiling, use Git Trace2 event logs to count actual Git
-  subprocess starts and group repeated argv. Stack-sample counts measure time in
+  subprocess starts and group repeated argv. Also sample the parent process:
+  repeated child calls can coexist with costly parent-side parsing or database
+  work that subprocess counts cannot reveal. Stack-sample counts measure time in
   sampled frames, not invocation counts; keep instrumented traces and timings
   separate from uninstrumented benchmark samples. Enable tracing through the
   child process's `GIT_TRACE2_EVENT`, not repository-local `trace2.eventTarget`,
@@ -681,6 +683,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   numeric value). Avoid changing profile settings on a warm target. Expand to
   verbose or workspace-wide runs only when explicitly needed or after a
   focused failure.
+- For a slow CLI rebuild, a temporary diagnostic runner can link the already
+  built engine library and call its public entrypoint. Record artifact identity
+  and compare outputs, but measure the actual release CLI before claiming an
+  end-to-end target: a runner can omit startup, routing, and packaging costs.
 - For path-identity fixture failures on macOS, inspect the inherited `TMPDIR`
   and its canonical path. Reproduce the exact named cases at the unchanged
   base, then rerun with an existing writable canonical temporary root (for
