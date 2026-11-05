@@ -62,7 +62,12 @@ matching pass receipt; preserve the prior receipts before uninstalling.
 For scheduled cleanup on macOS, a loaded LaunchAgent proves only scheduler
 registration. Check `broker gc service status --json` and its matching
 `last_pass` before claiming delivery; inspect the pass outcome separately
-before claiming reclamation. A runtime stored on a removable volume can wait
+before claiming reclamation. `sweep_paused` means the bounded artifact sweep
+reported incomplete; it does not by itself mean the service is disabled or
+prove the worker is stuck. Check the current continuation process, its lock
+holder and subsequent receipts before diagnosing a stall. The artifact sweep
+and closed-worktree cleanup are different operations; inspect each separately.
+A runtime stored on a removable volume can wait
 at a macOS file-access prompt before product code starts. If there is no pass
 receipt, inspect launchd state and a short process sample, then confirm any
 OS permission request through the human operator. Do not bypass macOS privacy
