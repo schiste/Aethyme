@@ -19,6 +19,9 @@
 //!   1 — link failed; error on stderr
 //!   2 — argument validation failed (clap-default)
 
+#[path = "../../../../allocator.rs"]
+mod allocator;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;

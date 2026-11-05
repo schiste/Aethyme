@@ -5,6 +5,9 @@
 //! shell without going through aethyme-engine. Future phases
 //! will wire equivalent queries into the engine's intent layer.
 
+#[path = "../../../../allocator.rs"]
+mod allocator;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 

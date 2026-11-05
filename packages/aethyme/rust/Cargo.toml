@@ -17,6 +17,8 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
+mimalloc = "=0.1.52"
+rusty_alloc-api = "=2.4.0"
 bincode = "1"
 blake3 = "1"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

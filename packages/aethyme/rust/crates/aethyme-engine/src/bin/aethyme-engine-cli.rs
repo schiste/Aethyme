@@ -1,8 +1,20 @@
+#[path = "../../../../allocator.rs"]
+mod allocator;
+
 use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-#[cfg(feature = "dhat-heap")]
+#[cfg(all(
+    feature = "dhat-heap",
+    any(feature = "allocator-rusty", feature = "allocator-mimalloc")
+))]
+compile_error!("dhat-heap cannot be combined with an alternative allocator");
+
+#[cfg(all(
+    feature = "dhat-heap",
+    not(any(feature = "allocator-rusty", feature = "allocator-mimalloc"))
+))]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 

@@ -12,6 +12,8 @@ name = "aethyme"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc = { workspace = true, optional = true }
+rusty_alloc-api = { workspace = true, optional = true }
 aethyme-engine = { path = "../aethyme-engine" }
 aethyme-enhance = { path = "../aethyme-enhance" }
 aethyme-graph-indexer = { path = "../aethyme-graph-indexer" }
@@ -65,3 +67,7 @@ path = "tests/help_surface.rs"
 [[test]]
 name = "repository_deploy_cli"
 path = "tests/repository_deploy_cli.rs"
+
+[features]
+allocator-rusty = ["dep:rusty_alloc-api"]
+allocator-mimalloc = ["dep:mimalloc"]

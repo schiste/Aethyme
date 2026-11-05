@@ -2,6 +2,9 @@
 //!
 //! Windows phase 1 provides native navigation and generated deployment;
 //! Unix retains the full broker-backed command suite.
+#[path = "../../../allocator.rs"]
+mod allocator;
+
 #[cfg(unix)]
 include!("main_unix.rs");
 

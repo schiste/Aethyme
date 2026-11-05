@@ -40,6 +40,8 @@ name = "aethyme-graph-link"
 path = "src/bin/aethyme-graph-link.rs"
 
 [dependencies]
+mimalloc = { workspace = true, optional = true }
+rusty_alloc-api = { workspace = true, optional = true }
 # Types this indexer produces (the schema crate is the contract).
 aethyme-graph-schema = { path = "../aethyme-graph-schema" }
 # Storage crate for Fragment construction + SymbolRecord build-up.
@@ -145,3 +147,7 @@ workspace = true
 [[test]]
 name = "it"
 path = "tests/it.rs"
+
+[features]
+allocator-rusty = ["dep:rusty_alloc-api"]
+allocator-mimalloc = ["dep:mimalloc"]

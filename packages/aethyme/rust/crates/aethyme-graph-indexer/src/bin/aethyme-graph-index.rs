@@ -16,6 +16,9 @@
 //!   1 — indexing failed; error printed to stderr
 //!   2 — argument validation failed (clap-default)
 
+#[path = "../../../../allocator.rs"]
+mod allocator;
+
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 use std::time::Instant;

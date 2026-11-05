@@ -16,6 +16,8 @@ name = "aethyme-engine-cli"
 path = "src/bin/aethyme-engine-cli.rs"
 
 [dependencies]
+mimalloc = { workspace = true, optional = true }
+rusty_alloc-api = { workspace = true, optional = true }
 rayon = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
@@ -37,6 +39,8 @@ aethyme-testkit = { path = "../aethyme-testkit" }
 tempfile = { workspace = true }
 
 [features]
+allocator-rusty = ["dep:rusty_alloc-api"]
+allocator-mimalloc = ["dep:mimalloc"]
 dhat-heap = ["dep:dhat"]
 
 [lints]
