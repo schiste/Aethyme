@@ -78,7 +78,10 @@ def job_phases(jobs: list[dict]) -> list[dict]:
     phases = []
     for job in jobs:
         name = job.get("name", "")
-        if not name.startswith("Rust workspace tests") and name != "Broker performance controls":
+        if (
+            not name.startswith(("Rust workspace tests", "cargo-test gate"))
+            and name != "Broker performance controls"
+        ):
             continue
         steps = [
             {"name": step.get("name"), "seconds": seconds(step.get("started_at"), step.get("completed_at"))}

@@ -1,10 +1,18 @@
 name: Aethyme Gates
 
 # Convergence lane: gates.toml is the single definition of "verified" —
-# this workflow runs the exact gates, via the exact runner, that the
-# broker runs before promoting a session (`aethyme broker advanced gates run
-# --all`). Certify merged trees here; OSS CI runs the full Rust workspace
-# on pull requests. Keep the binary-driven subset available manually.
+# this workflow runs the gates, via the runner, that the broker runs before
+# promoting a session (`aethyme broker advanced gates run --only <gate>`).
+# Certify merged trees here; OSS CI runs the full Rust workspace on pull
+# requests. Keep the binary-driven subset available manually.
+#
+# One gate runs differently. `cargo-test` runs as the `cargo-test-*` jobs below,
+# with the commands OSS CI's suite uses: one compile, then partitions of it on
+# separate runners. On one runner it took 19m49 of a 28m17 run (run 41915934574)
+# with the runner saturated, so more tuning could not help it. These are the
+# same suites this workflow already accepts as covering that gate when a
+# pull-request run tested the tree, and `cargo-test` remains the broker's gate
+# for local submissions.
 #
 # No untrusted event data (`github.event.*`) is interpolated into any
 # `run:` block here — every step is a fixed command.
@@ -36,8 +44,44 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # A merge commit whose tree a pull-request run already tested (OSS CI's
+  # record-tested-tree job, after the workspace suite and the examples and
+  # doctests passed) skips the gates those suites cover. Only an artifact from a
+  # run in this repository counts, not one from a fork. Every other gate still
+  # runs, including gates added later. A manual dispatch, or any tree no PR run
+  # tested, runs every gate. A failed lookup runs nothing and fails the workflow.
+  tested-tree:
+    name: Look for a pull-request run of this tree
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.lookup.outputs.run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Look for a pull-request run that tested this tree
+        id: lookup
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tree="$(git rev-parse 'HEAD^{tree}')"
+          repo_id="$(gh api "repos/$GITHUB_REPOSITORY" --jq .id)"
+          run="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=tested-tree-$tree&per_page=100" \
+            --jq "[.artifacts[] | select(.expired == false and .workflow_run.head_repository_id == $repo_id) | .workflow_run.id] | first // empty")"
+          if [ -n "$run" ]; then
+            echo "Tree $tree passed the workspace suite in pull-request run $run."
+          else
+            echo "No pull-request run tested tree $tree; every gate runs."
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
   gates:
     name: Run all gates
+    needs: tested-tree
     runs-on: ubuntu-latest
     steps:
       # A gate refuses to start below its storage reserve, which turned main
@@ -80,14 +124,6 @@ jobs:
         with:
           toolchain: stable
 
-      # The cargo-test gate runs the workspace suite under nextest when it is
-      # on PATH (`.aethyme/gates.toml`); under `cargo test` that gate took
-      # about 17 minutes here. Same pinned version as oss-ci.yml.
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
-        with:
-          tool: cargo-nextest@0.9.146
-
       # The Rust gates build into the broker's managed cache,
       # `<host cache>/gates/<repository key>/rust-workspace-v3`, where the key
       # is the SHA-256 of the repository's canonical origin
@@ -121,29 +157,6 @@ jobs:
           CARGO_TARGET_DIR: ${{ env.GATE_CACHE_DIR }}
         run: cargo build --locked --manifest-path packages/aethyme/rust/Cargo.toml --bin aethyme
 
-      # A merge commit whose tree a pull-request run already tested
-      # (OSS CI's record-tested-tree job, after the workspace suite and the
-      # examples and doctests passed) skips the gates those suites cover.
-      # Only an artifact from a run in this repository counts, not one from a
-      # fork. Every other gate still runs, including gates added later.
-      # A manual dispatch, or any tree no PR run tested, runs every gate.
-      - name: Look for a pull-request run that tested this tree
-        if: github.event_name == 'push'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tree="$(git rev-parse 'HEAD^{tree}')"
-          repo_id="$(gh api "repos/$GITHUB_REPOSITORY" --jq .id)"
-          run="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=tested-tree-$tree&per_page=100" \
-            --jq "[.artifacts[] | select(.expired == false and .workflow_run.head_repository_id == $repo_id) | .workflow_run.id] | first // empty")"
-          if [ -n "$run" ]; then
-            echo "Tree $tree passed the workspace suite in pull-request run $run."
-            echo "TESTED_BY_RUN=$run" >> "$GITHUB_ENV"
-          else
-            echo "No pull-request run tested tree $tree; every gate runs."
-          fi
-
       - name: Run all gates
         env:
           # A fresh runner has no gate-trust record and no gate history, so the
@@ -155,6 +168,7 @@ jobs:
           # commit when the merged commits declare no contract decision; the
           # decision conventionally lives in the PR body. Read-only.
           GH_TOKEN: ${{ github.token }}
+          TESTED_BY_RUN: ${{ needs.tested-tree.outputs.run }}
           # Gates the pull-request suites run in full: the workspace suite
           # (cargo-test), the examples and their guard tests (fast-guards),
           # and the testkit contract tests (workflow-contract, gate-policy).
@@ -163,25 +177,26 @@ jobs:
           # all four cores instead of their bounds for shared workstations.
           AETHYME_GATE_BUILD_JOBS: "4"
           AETHYME_GATE_TEST_THREADS: "4"
-          # The cargo-test gate records its phases here for the summary below.
-          AETHYME_GATE_PHASES: ${{ runner.temp }}/gate-telemetry/phases.tsv
+          # Runs as this workflow's cargo-test-* jobs when no pull-request run
+          # tested the tree.
+          RUNS_IN_SHARDS: "cargo-test"
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/gate-telemetry"
           exec > >(tee "$RUNNER_TEMP/gate-telemetry/gates.log") 2>&1
           aethyme="$GATE_CACHE_DIR/debug/aethyme"
-          if [ -z "${TESTED_BY_RUN:-}" ]; then
-            exec "$aethyme" broker advanced gates run --all
-          fi
           # An assignment carries the pipeline's failure to `set -e`; a `for`
           # over a command substitution would run no gate and pass.
           gates="$("$aethyme" broker advanced gates manifest --json | jq -r '.manifest.gates[].name')"
           [ -n "$gates" ] || { echo "the gate manifest lists no gates" >&2; exit 1; }
           for gate in $gates; do
-            case " $COVERED_BY_PR_SUITE " in
-              *" $gate "*) echo "gate $gate: covered by pull-request run $TESTED_BY_RUN on this tree" ;;
-              *) "$aethyme" broker advanced gates run --all --only "$gate" ;;
-            esac
+            if [ -n "$TESTED_BY_RUN" ] && [[ " $COVERED_BY_PR_SUITE " == *" $gate "* ]]; then
+              echo "gate $gate: covered by pull-request run $TESTED_BY_RUN on this tree"
+            elif [[ " $RUNS_IN_SHARDS " == *" $gate "* ]]; then
+              echo "gate $gate: runs in this workflow's shard jobs"
+            else
+              "$aethyme" broker advanced gates run --all --only "$gate"
+            fi
           done
 
       # The broker's human report includes only the final 20 lines. A failed
@@ -211,23 +226,15 @@ jobs:
             done
 
       # Best effort: the gates above already decided this job's verdict, so a
-      # summary problem warns instead of failing it. A tree a pull-request run
-      # tested runs no cargo-test gate, and the summary says so.
+      # summary problem warns instead of failing it.
       - name: Summarize the gates
         if: ${{ !cancelled() }}
         run: |
           set -uo pipefail
           out="$RUNNER_TEMP/gate-telemetry"
           mkdir -p "$out"
-          # nextest keeps its store under the workspace, not CARGO_TARGET_DIR.
-          report=packages/aethyme/rust/target/nextest/local/junit.xml
-          timings="$GATE_CACHE_DIR/cargo-timings/cargo-timing.html"
-          [ ! -f "$report" ] || cp "$report" "$out/"
-          [ ! -f "$timings" ] || cp "$timings" "$out/"
           if python3 .github/scripts/gate-telemetry.py \
             --gate-log "$out/gates.log" \
-            --phases "$out/phases.tsv" \
-            --junit "$report" \
             --markdown "$out/summary.md" \
             --json "$out/gate-telemetry.json"; then
             cat "$out/summary.md" >> "$GITHUB_STEP_SUMMARY"
@@ -259,3 +266,233 @@ jobs:
           find "$dir" -maxdepth 1 -type f -perm -u+x -delete
           find "$dir/deps" -maxdepth 1 -type f -perm -u+x ! -name '*.so' ! -name '*.dylib' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
           du -sh "$GATE_CACHE_DIR"
+
+  # ── The cargo-test gate ─────────────────────────────────────────────────
+  # The commands and shape of OSS CI's rust-tests-build, rust-tests-shard and
+  # rust-examples-doctests; `the_cargo_test_jobs_run_the_pull_request_suite`
+  # keeps them equal. These jobs have their own names because a required check
+  # matches by name, so a dispatch here must not satisfy one on the same commit.
+  # Twelve shards where pull requests use ten: the slowest of ten took up to
+  # 198 s, and the build sets a floor of about 200 s under this gate.
+  cargo-test-build:
+    name: cargo-test gate (build)
+    needs: tested-tree
+    if: ${{ needs.tested-tree.outputs.run == '' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/aethyme/rust
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Same history as the shards, so build scripts see the same tree.
+          fetch-depth: 0
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+
+      # Restores the cache OSS CI's `warm-rust-cache` saves from main.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: packages/aethyme/rust
+          shared-key: rust-tests
+          save-if: false
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-nextest@0.9.146
+
+      # Set on this step only: rust-cache keys on CARGO_* variables present when
+      # it restores.
+      - name: Build the test archive
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: ../scripts/test-like-ci.sh --archive "$RUNNER_TEMP/rust-tests.tar.zst"
+
+      - name: Record the build facts
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/rust-tests.tar.zst"
+          bytes=$(stat -c %s "$archive")
+          binaries=$(tar --zstd -tf "$archive" | grep -c '^target/debug/deps/')
+          mkdir -p "$RUNNER_TEMP/rust-tests-build"
+          printf '{"archive_bytes": %s, "test_binaries": %s}\n' "$bytes" "$binaries" \
+            > "$RUNNER_TEMP/rust-tests-build/build.json"
+          cp target/cargo-timings/cargo-timing.html "$RUNNER_TEMP/rust-tests-build/"
+          echo "Archive: $((bytes / 1048576)) MiB, $binaries test binaries"
+
+      - name: Upload the test archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rust-tests-archive
+          path: ${{ runner.temp }}/rust-tests.tar.zst
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload the build telemetry
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rust-tests-build
+          path: ${{ runner.temp }}/rust-tests-build/
+          if-no-files-found: error
+          retention-days: 14
+
+  cargo-test-shard:
+    name: cargo-test gate (shard ${{ matrix.shard }}/12)
+    needs: cargo-test-build
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/aethyme/rust
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # A few tests run cargo themselves.
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-nextest@0.9.146
+
+      - name: Download the test archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rust-tests-archive
+          path: ${{ runner.temp }}/rust-tests-archive
+
+      - name: Run workspace tests
+        run: ../scripts/test-like-ci.sh --from-archive "$RUNNER_TEMP/rust-tests-archive/rust-tests.tar.zst" --partition "hash:${{ matrix.shard }}/12"
+
+      - name: Upload the shard report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rust-tests-junit-shard-${{ matrix.shard }}
+          path: packages/aethyme/rust/target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+  # nextest runs neither example targets nor doctests.
+  cargo-test-examples-doctests:
+    name: cargo-test gate (examples and doctests)
+    needs: tested-tree
+    if: ${{ needs.tested-tree.outputs.run == '' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/aethyme/rust
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: packages/aethyme/rust
+          shared-key: rust-tests
+          save-if: false
+
+      - name: Run example tests
+        run: cargo test --locked --workspace --examples
+
+      - name: Run doctests
+        run: cargo test --locked --workspace --doc
+
+  # The gate's verdict and telemetry: job phases, shard balance, slowest and
+  # flaky tests, and the time from the first of these jobs to the last.
+  cargo-test:
+    name: cargo-test gate
+    needs: [tested-tree, cargo-test-build, cargo-test-shard, cargo-test-examples-doctests]
+    if: ${{ !cancelled() && needs.tested-tree.result == 'success' && needs.tested-tree.outputs.run == '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require every part of the gate
+        env:
+          BUILD: ${{ needs.cargo-test-build.result }}
+          SHARDS: ${{ needs.cargo-test-shard.result }}
+          EXAMPLES: ${{ needs.cargo-test-examples-doctests.result }}
+        run: |
+          set -euo pipefail
+          echo "build=$BUILD shards=$SHARDS examples=$EXAMPLES"
+          [[ "$BUILD" == success && "$SHARDS" == success && "$EXAMPLES" == success ]]
+
+      - name: Download the shard reports
+        if: ${{ always() && needs.cargo-test-build.result == 'success' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: rust-tests-junit-shard-*
+          path: ${{ runner.temp }}/rust-tests-junit
+
+      - name: Download the build telemetry
+        if: ${{ always() && needs.cargo-test-build.result == 'success' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rust-tests-build
+          path: ${{ runner.temp }}/rust-tests-build
+
+      # Best effort: the step above decided this gate's verdict.
+      - name: Summarize the run
+        if: ${{ always() && needs.cargo-test-build.result == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -uo pipefail
+          out="$RUNNER_TEMP/rust-test-telemetry"
+          mkdir -p "$out"
+          if ! gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100" \
+            > "$out/jobs.json"; then
+            echo "::warning::Job timings are unavailable; the summary reports them as such."
+            rm -f "$out/jobs.json"
+          fi
+          if python3 .github/scripts/rust-test-telemetry.py \
+            --junit-dir "$RUNNER_TEMP/rust-tests-junit" \
+            --build-json "$RUNNER_TEMP/rust-tests-build/build.json" \
+            --jobs-json "$out/jobs.json" \
+            --markdown "$out/summary.md" \
+            --json "$out/rust-test-telemetry.json"; then
+            cat "$out/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::The cargo-test telemetry could not be summarized."
+          fi
+
+      - name: Upload the run telemetry
+        if: ${{ always() && needs.cargo-test-build.result == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: rust-test-telemetry
+          path: ${{ runner.temp }}/rust-test-telemetry/
+          if-no-files-found: warn
+          retention-days: 90
