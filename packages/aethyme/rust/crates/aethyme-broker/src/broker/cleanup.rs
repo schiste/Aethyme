@@ -3202,8 +3202,18 @@ impl Broker {
         };
         let mut sessions = self.store.cleaned_sessions()?;
         if let Some((before, after, limit)) = scope {
+            // A path may have been reused by a later closed session. Its older
+            // row must never make a recently closed checkout eligible.
+            let mut latest_by_path = std::collections::HashMap::new();
+            for session in &sessions {
+                latest_by_path
+                    .entry(session.worktree_path.clone())
+                    .and_modify(|id: &mut i64| *id = (*id).max(session.id))
+                    .or_insert(session.id);
+            }
             sessions.retain(|session| {
-                session.origin == SessionOrigin::Spawned
+                latest_by_path.get(&session.worktree_path) == Some(&session.id)
+                    && session.origin == SessionOrigin::Spawned
                     && session.id > after
                     && session.closed_at.is_some_and(|closed| closed < before)
                     && Path::new(&session.worktree_path).is_dir()

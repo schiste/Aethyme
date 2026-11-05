@@ -652,3 +652,21 @@ fn scoped_cleanup_preserves_dirty_worktree() {
         "preserve"
     );
 }
+
+#[test]
+fn scoped_cleanup_does_not_use_an_old_closure_after_checkout_reuse() {
+    let (tmp, mut broker) = repository(Some(0));
+    let (old, recent, path) = closed_then_adopted(&mut broker, "scoped-reused");
+    broker.close(recent).unwrap();
+    drop(broker);
+    set_closed_at(&tmp.path(), old, 1_000);
+    set_closed_at(&tmp.path(), recent, 3_000);
+    let mut broker = tmp.open();
+    let plan = broker
+        .cleanup_cleaned_worktrees_scoped(false, None, Some((2_000, 0, 10)))
+        .unwrap()
+        .plan;
+    assert!(!plan.worktrees.iter().any(|item| item.session_id == old));
+    assert_eq!(plan.eligible_worktree_count, 0);
+    assert!(path.exists());
+}
