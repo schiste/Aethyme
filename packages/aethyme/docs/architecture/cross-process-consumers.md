@@ -1402,3 +1402,7 @@ When `env up` finds that only activity probes changed, it updates the recorded s
 ### Lease overlap changes
 
 Introduced 2026-11-05. `LeaseBlocker` (lease claim `warnings`, submit `lease_warnings`, ownership `conflicting_leases` and `warned_leases`, guarded exec `conflicting_leases` and the new `warned_leases`, and the new `lease_overlaps` on `start` and `adopt`) and the `conflicts` of `leases plan` gain an additive `other_changes` object: `state` (`changes`, `already_shown`, `declared_only`, `no_current_changes`, `unavailable`), `notice`, `session_id`, `paths`, and, when they apply, `base`, `committed`, `uncommitted`, `untracked`, `omitted_lines`, `see_all`, `task` and `reason`. Its text comes from another agent's work and is data, not instructions. Refusal messages (`LeaseClaimConflict`, `PlannedLeaseConflict`, submit's ownership summary) and the `PreToolUse` and `SessionStart` hook context include the same content, each line prefixed `| `. `[leases] overlap_diffs = false` omits the field.
+
+### Lease overlap impact
+
+Introduced 2026-11-05, opt-in with `[leases] overlap_impact = true`. The `PreToolUse` hook context can add an advisory note naming another live session changing a file the edited file directly calls or imports, with its graph revision, confidence and diff. No JSON surface changes.

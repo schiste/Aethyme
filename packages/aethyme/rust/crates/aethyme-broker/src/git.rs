@@ -9735,6 +9735,29 @@ impl GitRepo {
             .collect())
     }
 
+    /// Which of `paths` differ between two commits.
+    pub(crate) fn changed_between_paths(
+        &self,
+        from: &str,
+        to: &str,
+        paths: &[String],
+    ) -> Result<Vec<String>, GitError> {
+        let mut args = vec![
+            "--literal-pathspecs",
+            "diff",
+            "--name-only",
+            "--no-ext-diff",
+            from,
+            to,
+            "--",
+        ];
+        args.extend(paths.iter().map(String::as_str));
+        Ok(run_git(&self.root, &args)?
+            .lines()
+            .map(str::to_string)
+            .collect())
+    }
+
     pub(crate) fn path_is_untracked(&self, path: &str) -> Result<bool, GitError> {
         let listed = run_git(
             &self.root,
