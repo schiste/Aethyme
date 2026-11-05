@@ -3572,7 +3572,7 @@ impl Broker {
                 });
             }
             for item in plan.worktrees.iter().filter(|item| item.eligible()) {
-                match self.cleanup(item.session_id, false) {
+                match self.cleanup_scoped(item.session_id, scope.map(|s| s.0)) {
                     Ok(()) => removed_session_ids.push(item.session_id),
                     Err(error) => failures.push(CleanupSweepFailure {
                         session_id: item.session_id,
@@ -4524,6 +4524,34 @@ impl Broker {
             });
         }
         Ok(())
+    }
+
+    fn cleanup_scoped(
+        &mut self,
+        session_id: i64,
+        before: Option<i64>,
+    ) -> Result<(), BrokerOpError> {
+        if before.is_none() {
+            return self.cleanup(session_id, false);
+        }
+        let initial_session = self.store.session(session_id)?;
+        let _lifecycle_claim = self.claim_worktree_lifecycle()?;
+        let session = self.store.session(session_id)?;
+        ensure_lifecycle_session_unchanged(session_id, &initial_session, &session)?;
+        let before = before.expect("scoped cutoff is present");
+        if !session.closed_at.is_some_and(|closed| closed < before)
+            || self
+                .store
+                .cleaned_sessions()?
+                .iter()
+                .any(|other| other.worktree_path == session.worktree_path && other.id > session.id)
+        {
+            return Err(BrokerOpError::DirtyWorktree {
+                id: session_id,
+                reason: "checkout was reused or its closure no longer meets the cutoff; review a new cleanup plan".into(),
+            });
+        }
+        self.cleanup_under_lifecycle_claim(&session, false, None)
     }
 
     pub fn cleanup(&mut self, session_id: i64, force: bool) -> Result<(), BrokerOpError> {
