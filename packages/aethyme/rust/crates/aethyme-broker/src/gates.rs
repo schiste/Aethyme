@@ -3202,9 +3202,10 @@ where
             if !profile.writers_quiescent() {
                 return Err(crate::BrokerError::Io {
                     path: checkout.root().to_path_buf(),
-                    source: std::io::Error::other(
-                        "execution-profile probe quiescence is unknown; gate dispatch refused and artifact-use marker retained",
-                    ),
+                    source: std::io::Error::other(format!(
+                        "execution-profile probe quiescence is unknown ({}); gate dispatch refused and artifact-use marker retained",
+                        profile.incomplete()
+                    )),
                 }
                 .into());
             }
@@ -3233,8 +3234,9 @@ where
                 )?
             } else {
                 progress.report(&format!(
-                    "gate {} cache unavailable: execution profile could not be captured",
-                    gate.name
+                    "gate {} cache unavailable: execution profile could not be captured ({})",
+                    gate.name,
+                    profile.map_or_else(String::new, |profile| profile.incomplete())
                 ));
                 None
             }

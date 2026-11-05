@@ -130,6 +130,7 @@ fn run_landing_case(same_target_race: Option<bool>) {
     std::fs::create_dir(&repo).unwrap();
     std::fs::create_dir(&fake_bin).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(&repo);
     git(&repo, &["config", "user.name", "Aethyme Test"]);
     git(
         &repo,

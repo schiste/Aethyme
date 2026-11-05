@@ -119,6 +119,8 @@ const TOOL_PROBES: &[ToolProbe] = &[
 pub(crate) struct ExecutionProfile {
     digest: Option<String>,
     writers_quiescent: bool,
+    /// Why each incomplete probe has no result, as `tool: reason`.
+    incomplete: Vec<String>,
 }
 
 impl ExecutionProfile {
@@ -172,6 +174,7 @@ impl ExecutionProfile {
 
         let mut tools = BTreeMap::new();
         let mut complete = true;
+        let mut incomplete = Vec::new();
         let mut writers_quiescent = true;
         for (name, observation) in tool_results {
             writers_quiescent &= observation.writers_quiescent;
@@ -181,6 +184,7 @@ impl ExecutionProfile {
                 }
                 Err(reason) => {
                     complete = false;
+                    incomplete.push(format!("{name}: {reason}"));
                     tools.insert(name, ToolVersionFingerprint::Unavailable { reason });
                 }
             }
@@ -196,6 +200,7 @@ impl ExecutionProfile {
         Self {
             digest: complete.then(|| digest(&input)),
             writers_quiescent,
+            incomplete,
         }
     }
 
@@ -211,6 +216,7 @@ impl ExecutionProfile {
                 tools: BTreeMap::new(),
             })),
             writers_quiescent: true,
+            incomplete: Vec::new(),
         }
     }
 
@@ -219,6 +225,7 @@ impl ExecutionProfile {
         Self {
             digest: None,
             writers_quiescent: true,
+            incomplete: vec!["fixture: incomplete".to_string()],
         }
     }
 
@@ -227,7 +234,13 @@ impl ExecutionProfile {
         Self {
             digest: None,
             writers_quiescent: false,
+            incomplete: vec!["fixture: uncertain".to_string()],
         }
+    }
+
+    /// Why the profile is incomplete, naming each probe. Empty when complete.
+    pub(crate) fn incomplete(&self) -> String {
+        self.incomplete.join("; ")
     }
 
     pub(crate) fn digest(&self) -> Option<&str> {

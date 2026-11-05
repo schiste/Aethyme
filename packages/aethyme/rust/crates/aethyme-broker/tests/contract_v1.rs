@@ -610,6 +610,7 @@ fn sh(cwd: &Path, args: &[&str]) {
 
 fn init_repo(root: &Path) {
     sh(root, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/a.py"), "a = 1\n").unwrap();
     std::fs::write(root.join("src/b.py"), "b = 1\n").unwrap();

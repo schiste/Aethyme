@@ -5647,6 +5647,7 @@ mod registered_removal_failure_tests {
         let repository = root.join("repository");
         std::fs::create_dir_all(&repository).unwrap();
         git(&repository, &["init", "-q", "-b", "main"]);
+        aethyme_testkit::promote_on_submit(&repository);
         git(&repository, &["config", "user.name", "Cleanup test"]);
         git(
             &repository,
@@ -5912,6 +5913,7 @@ mod registered_removal_failure_tests {
         broker: &mut crate::Broker,
         label: &str,
     ) -> (crate::Session, std::path::PathBuf) {
+        aethyme_testkit::promote_on_submit(broker.main_root());
         let session = broker.start_worktree(label, None).unwrap();
         let worktree = Path::new(&session.worktree_path).to_path_buf();
         std::fs::write(worktree.join("session-change.txt"), "represented\n").unwrap();
@@ -6270,6 +6272,25 @@ mod registered_removal_failure_tests {
         assert_new_schema_refusal(&error);
         assert!(!reached_claim.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!storage.worktree_root().exists());
+    }
+
+    /// Reported from Mockup: a start holds this claim for 20-25 s under load, and
+    /// the next start gave up after 10 s with no session and no worktree.
+    #[test]
+    fn start_waits_for_a_lifecycle_claim_held_past_ten_seconds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = initialized_repository(tmp.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let claim = crate::file_lock::acquire_repository_lifecycle_lock(&root).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(11));
+            drop(claim);
+        });
+        let session = broker.start_worktree("wait for the holder", None).unwrap();
+        release.join().unwrap();
+        assert_eq!(broker.store().live_sessions().unwrap().len(), 1);
+        assert!(std::path::Path::new(&session.worktree_path).exists());
     }
 
     #[test]

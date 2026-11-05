@@ -715,8 +715,7 @@ fn check_config_valid(main_root: &Path) -> Check {
             return Check {
                 id: "certify.config",
                 status: CheckStatus::Warn,
-                detail: "no config.toml — defaults apply (auto-promote, aethyme/integration)"
-                    .into(),
+                detail: "no config.toml — defaults apply (verify-only, aethyme/integration)".into(),
             };
         }
         Err(error) => {
@@ -1281,13 +1280,13 @@ const CONFIG_TEMPLATE: &str = "\
 schema = 1
 
 [promote]
-# \"auto\" (default): verified submissions promote to the local integration
-# branch immediately. \"manual\" holds them for `aethyme broker submit promote`.
-# \"verify-only\" verifies and promotes nothing -- for a repository that ships
+# \"verify-only\" (default): verifies and promotes nothing -- the repository ships
 # through pull requests, where a second copy of the work on an integration
-# branch costs drift and contributes nothing. An unrecognised value falls back
-# to \"auto\"; `aethyme certify` warns on unknown keys but not unknown values.
-mode = \"auto\"
+# branch costs drift and contributes nothing. \"auto\": verified submissions
+# promote to the local integration branch immediately. \"manual\" holds them for
+# `aethyme broker submit promote`. An unrecognised value warns and falls back to
+# \"verify-only\".
+mode = \"verify-only\"
 # branch = \"aethyme/integration\"
 
 # Delivery route for a promoted prefix. The policy is read from the target

@@ -61,6 +61,7 @@ impl DeployDivergenceFixture {
         std::fs::create_dir_all(&remote).unwrap();
         git(&remote, &["init", "--bare", "-q", "-b", "main"]);
         git(&repo, &["init", "-q", "-b", "main"]);
+        aethyme_testkit::promote_on_submit(&repo);
         std::fs::create_dir_all(repo.join("src")).unwrap();
         std::fs::create_dir_all(repo.join("docs")).unwrap();
         std::fs::write(repo.join(".gitignore"), ".aethyme/\n").unwrap();
@@ -169,6 +170,7 @@ fn patch_equivalent_promotion_is_landed_when_local_main_already_equals_upstream(
     std::fs::create_dir_all(&remote).unwrap();
     git(&remote, &["init", "--bare", "-q", "-b", "main"]);
     git(&repo, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(&repo);
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::write(repo.join(".gitignore"), ".aethyme/\n").unwrap();
     std::fs::write(repo.join("src/service.txt"), "feature=off\nmode=base\n").unwrap();
@@ -491,6 +493,7 @@ fn first_blocked_report_templates_mixed_recorded_and_unrecorded_resolutions() {
     std::fs::create_dir_all(&remote).unwrap();
     git(&remote, &["init", "--bare", "-q", "-b", "main"]);
     git(&repo, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(&repo);
     std::fs::write(repo.join(".gitignore"), ".aethyme/\n").unwrap();
     std::fs::write(repo.join("src/recorded.txt"), "base\n").unwrap();
     std::fs::write(repo.join("src/unrecorded.txt"), "base\n").unwrap();
@@ -936,6 +939,7 @@ fn reviewed_unrecorded_work_is_replayed_in_integration_order() {
     std::fs::create_dir(&repository).unwrap();
     let repo = repository.as_path();
     git(repo, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(repo);
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::create_dir_all(repo.join("docs")).unwrap();
     std::fs::write(repo.join(".gitignore"), ".aethyme/\n").unwrap();
@@ -1119,6 +1123,7 @@ fn upstream_pulled_into_main_after_promotion() -> (tempfile::TempDir, PathBuf, S
     std::fs::create_dir_all(&remote).unwrap();
     git(&remote, &["init", "--bare", "-q", "-b", "main"]);
     git(&repo, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(&repo);
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::write(repo.join(".gitignore"), ".aethyme/\n").unwrap();
     std::fs::write(repo.join("src/service.txt"), "feature=off\n").unwrap();
@@ -1277,6 +1282,7 @@ fn a_refusal_names_the_checked_out_branch_rather_than_local_main() {
     std::fs::create_dir_all(&remote).unwrap();
     git(&remote, &["init", "--bare", "-q", "-b", "main"]);
     git(&repo, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(&repo);
     std::fs::write(repo.join(".gitignore"), ".aethyme/\n").unwrap();
     std::fs::write(repo.join("a.txt"), "a\n").unwrap();
     git(&repo, &["add", "."]);

@@ -611,9 +611,11 @@ impl Broker {
         select_delivery_policy: bool,
         only: bool,
     ) -> Result<ShipPlan, BrokerOpError> {
-        if crate::merge::PromoteConfig::load(self.main_root()).mode
-            == crate::merge::PromoteMode::VerifyOnly
-        {
+        // A repository that never chose a mode can still publish a promoted
+        // entry on an explicit request: `aethyme deploy` publishes a first
+        // enrollment this way, and that commit is what sets the mode.
+        let promote = crate::merge::PromoteConfig::load(self.main_root());
+        if promote.mode == crate::merge::PromoteMode::VerifyOnly && promote.mode_chosen {
             return Err(BrokerOpError::ShipPublicationPolicy {
                 reason: "broker ship is unavailable in verify-only repositories".into(),
                 remediation: "use `aethyme broker push --session <id> --pr` to publish through the pull-request workflow".into(),

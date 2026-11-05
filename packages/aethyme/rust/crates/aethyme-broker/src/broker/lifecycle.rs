@@ -1205,30 +1205,19 @@ fn validate_captured_preparation_cache_root(
     captured_resource_db_path: Option<&Path>,
     pinned_directory: &File,
 ) -> Result<(), BrokerOpError> {
-    crate::preparation::rotation_debt::validate_preparation_cache_root_handle(
+    let state = crate::preparation::rotation_debt::recheck_preparation_cache_root(
         path,
         pinned_directory,
         expected_identity,
     )
     .map_err(|error| BrokerOpError::InvalidStorageContext {
         reason: format!(
-            "captured preparation-cache root {} no longer matches its pinned identity: {error}",
+            "cannot recheck captured preparation-cache root {}: {error}",
             path.display()
         )
         .into_boxed_str(),
     })?;
-    let capture = crate::preparation::rotation_debt::capture_preparation_cache_root(path).map_err(
-        |error| BrokerOpError::InvalidStorageContext {
-            reason: format!(
-                "cannot recheck captured preparation-cache root {}: {error}",
-                path.display()
-            )
-            .into_boxed_str(),
-        },
-    )?;
-    if capture.identity != expected_identity
-        || !matches_capture_state(expected_state, &capture.state)
-    {
+    if !matches_capture_state(expected_state, &state) {
         return Err(BrokerOpError::InvalidStorageContext {
             reason: format!(
                 "captured preparation-cache root {} has changed marker or namespace state",
@@ -9248,7 +9237,7 @@ impl Broker {
                 {
                     return Ok(None);
                 }
-                (expected_parent, self.main_root.as_path())
+                (expected_parent, self.main_root.clone())
             }
             WorktreeRootSource::HostState => {
                 let Some(host_state) = self.storage_context.host_state_dir.as_deref() else {
@@ -9277,7 +9266,18 @@ impl Broker {
                         "captured host-state parent is not a real directory".into(),
                     ));
                 }
-                (parent, host_state)
+                // The base itself is a real directory, so this only resolves
+                // symlinks above it, such as macOS's /var or a relocated home.
+                // Without it the base's name is not canonical, and placement
+                // falls back into the repository. The binding records this
+                // real path.
+                let host_state = host_state.canonicalize().map_err(|error| {
+                    refusal(
+                        host_state,
+                        format!("cannot resolve captured host-state parent: {error}"),
+                    )
+                })?;
+                (host_state.join("worktrees"), host_state)
             }
             _ => return Ok(None),
         };
@@ -9307,6 +9307,7 @@ impl Broker {
             }
         }
 
+        let ancestor = ancestor.as_path();
         let ancestor_identity = match bound_directory_identity(ancestor) {
             Ok(identity) => identity,
             Err(_reason) if source == WorktreeRootSource::HostState => {
@@ -11416,6 +11417,83 @@ mod worktree_root_candidate_tests {
 #[cfg(test)]
 mod artifact_sweep_namespace_tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn cache_root_recheck_reuses_pin_and_rejects_changed_ownership() {
+        use crate::preparation::rotation_debt;
+        use std::os::unix::fs::symlink;
+
+        for change in ["marker", "lock", "extra", "child", "root", "symlink"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let parent = temporary.path().canonicalize().unwrap();
+            let root = parent.join("cache");
+            std::fs::create_dir(&root).unwrap();
+            let resource_db = parent.join("host-resources.db");
+            std::fs::File::create(&resource_db).unwrap();
+            let (_, identity, _, handle) = capture_preparation_cache_root(&root).unwrap();
+            let initialized = rotation_debt::initialize_preparation_cache_root(
+                &root,
+                &identity,
+                &handle,
+                &resource_db,
+                || Ok(false),
+            )
+            .unwrap();
+            let (_, identity, state, handle) = capture_preparation_cache_root(&root).unwrap();
+
+            // The old per-mutation sequence walked the whole path four times.
+            let before = rotation_debt::root_path_walk_count();
+            rotation_debt::validate_preparation_cache_root_handle(&root, &handle, &identity)
+                .unwrap();
+            rotation_debt::capture_preparation_cache_root(&root).unwrap();
+            assert_eq!(rotation_debt::root_path_walk_count() - before, 4);
+            let validate = || {
+                validate_captured_preparation_cache_root(
+                    &root,
+                    &identity,
+                    &state,
+                    Some(&resource_db),
+                    &handle,
+                )
+            };
+            let before = rotation_debt::root_path_walk_count();
+            validate().unwrap();
+            assert_eq!(rotation_debt::root_path_walk_count() - before, 2);
+
+            match change {
+                "marker" => {
+                    std::fs::write(root.join(".aethyme-preparation-cache-root-v2"), b"{}").unwrap()
+                }
+                "lock" => std::fs::write(
+                    root.join(".aethyme-preparation-cache-root.lock"),
+                    b"changed",
+                )
+                .unwrap(),
+                "extra" => std::fs::write(root.join("unowned"), b"preserve").unwrap(),
+                "child" => {
+                    let child =
+                        root.join(format!(".aethyme-preparation-cache-{}", initialized.nonce));
+                    std::fs::rename(&child, parent.join("old-child")).unwrap();
+                    std::fs::create_dir(&child).unwrap();
+                }
+                "root" | "symlink" => {
+                    let detached = parent.join("detached");
+                    std::fs::rename(&root, &detached).unwrap();
+                    if change == "root" {
+                        std::fs::create_dir(&root).unwrap();
+                    } else {
+                        symlink(&detached, &root).unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                validate().is_err(),
+                "must detect {change} after successful validation"
+            );
+        }
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]

@@ -34,6 +34,7 @@ fn git(repo: &Path, args: &[&str]) {
 
 fn fixture(tmp: &Path) {
     git(tmp, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(tmp);
     std::fs::write(tmp.join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
     git(tmp, &["add", "-A"]);

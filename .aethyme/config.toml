@@ -2,7 +2,7 @@
 # Reference: docs/aethyme-local-agent-broker.md
 
 [promote]
-# "auto" (default): verified submissions promote to the local integration
+# "auto": verified submissions promote to the local integration
 # branch immediately (decision 2026-07-13, after the first dogfood run).
 # "manual" holds verified entries for an explicit `broker submit promote`.
 # "verify-only" verifies and promotes nothing.

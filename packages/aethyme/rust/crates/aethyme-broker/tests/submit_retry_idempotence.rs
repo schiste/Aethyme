@@ -36,6 +36,7 @@ fn repo_with_session(
     let repo = tmp.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     sh(&repo, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(&repo);
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     std::fs::write(repo.join("base.txt"), "base\n").unwrap();
     sh(&repo, &["add", "-A"]);

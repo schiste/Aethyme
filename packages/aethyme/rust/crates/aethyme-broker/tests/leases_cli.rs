@@ -33,6 +33,7 @@ fn run(repo: &Path, args: &[&str]) -> Output {
 fn fixture() -> common::FixtureRepository {
     let tmp = common::FixtureRepository::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::create_dir_all(tmp.path().join("src")).unwrap();
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join("src/owned.rs"), "owned\n").unwrap();
@@ -100,6 +101,7 @@ fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
         "schema = 1\n[leases.routing]\ndirty-secret = [\"private/\"]\n",
     )
     .unwrap();
+    aethyme_testkit::promote_on_submit(tmp.path());
     let planner_id = planner.id.to_string();
 
     let json_output = run(
@@ -281,6 +283,7 @@ fn lease_export_is_bounded_redacted_routed_and_read_only() {
         "schema = 1\n[leases.routing]\nbackend = [\"src/\"]\ndocumentation = [\"docs/\"]\n",
     )
     .unwrap();
+    aethyme_testkit::promote_on_submit(tmp.path());
     git(tmp.path(), &["add", "-f", ".aethyme/config.toml"]);
     git(tmp.path(), &["commit", "-qm", "routing config"]);
 

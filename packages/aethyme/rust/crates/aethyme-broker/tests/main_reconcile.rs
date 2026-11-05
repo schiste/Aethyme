@@ -36,6 +36,7 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     std::fs::create_dir_all(&remote).unwrap();
     sh(&remote, &["init", "--bare", "-q", "-b", "main"]);
     sh(&repo, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(&repo);
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     std::fs::write(repo.join("src.txt"), "base\n").unwrap();
     sh(&repo, &["add", "-A"]);

@@ -198,6 +198,10 @@ pub enum PromotionIntent {
 pub struct PromoteConfig {
     pub branch: String,
     pub mode: PromoteMode,
+    /// False when `mode` is only the default: no configuration, or none that
+    /// sets a mode. A repository in that state has made no delivery decision,
+    /// which is how a first enrollment still publishes its own configuration.
+    pub mode_chosen: bool,
 }
 
 fn invalid_promote_mode_warning(value: Option<&str>) -> String {
@@ -232,6 +236,7 @@ impl PromoteConfig {
                 Self {
                     branch: DEFAULT_INTEGRATION_BRANCH.to_string(),
                     mode: PromoteMode::VerifyOnly,
+                    mode_chosen: true,
                 },
                 Some(format!(
                     "repository configuration is unresolved ({}); promotion is disabled until it is corrected",
@@ -242,9 +247,13 @@ impl PromoteConfig {
     }
 
     pub(crate) fn from_text(text: Option<&str>) -> (Self, Option<String>) {
+        // Verify-only unless the repository opts in: promoting needs the
+        // integration branch to stay current, and each session branch's own pull
+        // request is otherwise the only delivery path.
         let mut config = Self {
             branch: DEFAULT_INTEGRATION_BRANCH.to_string(),
-            mode: PromoteMode::Auto,
+            mode: PromoteMode::VerifyOnly,
+            mode_chosen: false,
         };
         let mut warning = None;
         let Some(text) = text else {
@@ -253,7 +262,7 @@ impl PromoteConfig {
         let value = match text.parse::<toml::Value>() {
             Ok(value) => value,
             Err(error) => {
-                config.mode = PromoteMode::VerifyOnly;
+                config.mode_chosen = true;
                 warning = Some(format!(
                     "repository configuration is invalid ({error}); promotion is disabled until it is corrected"
                 ));
@@ -265,6 +274,7 @@ impl PromoteConfig {
                 config.branch = branch.to_string();
             }
             if let Some(mode) = promote.get("mode") {
+                config.mode_chosen = true;
                 // Decision for #691: preserve broker diagnostics while failing
                 // closed. An unknown critical mode warns and disables promotion
                 // instead of silently restoring the permissive `auto` default.
@@ -2731,6 +2741,36 @@ fn write_action_required(
 
 #[cfg(test)]
 mod verdict_tests {
+    /// Promotion is opt-in: no file, and a file that does not choose, both
+    /// verify only. Choosing still works.
+    #[test]
+    fn a_repository_promotes_only_when_it_chooses_to() {
+        use super::{PromoteConfig, PromoteMode};
+
+        let mode = |text: Option<&str>| PromoteConfig::from_text(text).0.mode;
+        let chosen = |text: Option<&str>| PromoteConfig::from_text(text).0.mode_chosen;
+        assert_eq!(mode(None), PromoteMode::VerifyOnly);
+        assert!(!chosen(None) && !chosen(Some("[promote]\nbranch = \"x\"\n")));
+        assert!(chosen(Some("[promote]\nmode = \"verify-only\"\n")));
+        assert!(
+            chosen(Some("[promote\n")),
+            "a broken file refuses, as before"
+        );
+        assert_eq!(mode(Some("schema = 1\n")), PromoteMode::VerifyOnly);
+        assert_eq!(
+            mode(Some("[promote]\nbranch = \"x\"\n")),
+            PromoteMode::VerifyOnly
+        );
+        assert_eq!(
+            mode(Some("[promote]\nmode = \"auto\"\n")),
+            PromoteMode::Auto
+        );
+        assert_eq!(
+            mode(Some("[promote]\nmode = \"manual\"\n")),
+            PromoteMode::Manual
+        );
+    }
+
     use super::{GateVerdict, gate_verdict};
     use crate::gates::GateRunOutcome;
     use crate::types::{GateEnvironment, GateFailureClass, GateStatus};

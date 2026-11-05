@@ -142,6 +142,37 @@ pub(crate) fn capture_preparation_cache_root(
     let identity = identity_for_directory(&directory)?;
     ensure_cache_root_path_identity(path, &directory, &identity, deadline)?;
     let identity_bytes = identity.encode()?;
+    let state = read_preparation_cache_root_state(path, &directory, &identity, deadline)?;
+    ensure_cache_root_path_identity(path, &directory, &identity, deadline)?;
+    Ok(PreparationCacheRootCapture {
+        directory,
+        identity: identity_bytes,
+        state,
+    })
+}
+
+/// Re-read ownership and namespace state through the already pinned root.
+/// Every call checks the path binding before and after reading current state;
+/// neither marker contents nor successful validation are cached across mutations.
+pub(crate) fn recheck_preparation_cache_root(
+    path: &Path,
+    pinned_directory: &File,
+    expected_root_identity: &[u8],
+) -> io::Result<PreparationCacheRootCaptureState> {
+    let identity = decode_directory_identity(expected_root_identity)?;
+    let deadline = Instant::now() + PREPARATION_ROOT_LOCK_WAIT;
+    ensure_cache_root_path_identity(path, pinned_directory, &identity, deadline)?;
+    let state = read_preparation_cache_root_state(path, pinned_directory, &identity, deadline)?;
+    ensure_cache_root_path_identity(path, pinned_directory, &identity, deadline)?;
+    Ok(state)
+}
+
+fn read_preparation_cache_root_state(
+    path: &Path,
+    directory: &File,
+    identity: &DirectoryIdentity,
+    deadline: Instant,
+) -> io::Result<PreparationCacheRootCaptureState> {
     let lock_name = component(PREPARATION_ROOT_LOCK)?;
     let lock = read_component(directory.as_raw_fd(), &lock_name)?;
     if lock.as_ref().is_some_and(|lock| !lock.bytes.is_empty()) {
@@ -156,7 +187,7 @@ pub(crate) fn capture_preparation_cache_root(
             if lock.is_some() {
                 allowed.push(PREPARATION_ROOT_LOCK.as_bytes());
             }
-            if !preparation_root_contains_only_names(&directory, &allowed, deadline)? {
+            if !preparation_root_contains_only_names(directory, &allowed, deadline)? {
                 return Err(invalid_record(
                     "uninitialized preparation-cache root contains unowned entries",
                 ));
@@ -164,7 +195,7 @@ pub(crate) fn capture_preparation_cache_root(
             PreparationCacheRootCaptureState::Uninitialized
         }
         Some(marker) => {
-            let parsed = decode_preparation_cache_root_marker(&marker.bytes, path, &identity)?;
+            let parsed = decode_preparation_cache_root_marker(&marker.bytes, path, identity)?;
             if lock.is_none() {
                 return Err(invalid_record(
                     "initialized preparation-cache root has no stable lock file",
@@ -181,7 +212,7 @@ pub(crate) fn capture_preparation_cache_root(
             if child_identity.is_some() {
                 allowed.push(child_name.to_bytes());
             }
-            if !preparation_root_contains_only_names(&directory, &allowed, deadline)? {
+            if !preparation_root_contains_only_names(directory, &allowed, deadline)? {
                 return Err(invalid_record(
                     "initialized preparation-cache root contains unknown entries",
                 ));
@@ -193,12 +224,7 @@ pub(crate) fn capture_preparation_cache_root(
             }
         }
     };
-    ensure_cache_root_path_identity(path, &directory, &identity, deadline)?;
-    Ok(PreparationCacheRootCapture {
-        directory,
-        identity: identity_bytes,
-        state,
-    })
+    Ok(state)
 }
 
 /// Create or open one private cache-root child beneath a pinned, owner-bound
@@ -256,9 +282,8 @@ pub(crate) fn ensure_preparation_cache_root_child(
     ensure_cache_root_path_identity(parent_path, &parent, &expected_parent, deadline)
 }
 
-/// Initialize only the opt-in root marker/nonce child. The caller must already
-/// hold the unchanged repository-scoped preparation lease. Journal inspection
-/// runs under the root lock and must use the captured host-resource DB.
+/// Preserve the former standalone check for the path-walk regression baseline.
+#[cfg(test)]
 pub(crate) fn validate_preparation_cache_root_handle(
     path: &Path,
     pinned_directory: &File,
@@ -956,7 +981,19 @@ pub(crate) fn probe(cache_root: &Path, max_entries: usize, deadline: Instant) ->
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static ROOT_PATH_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn root_path_walk_count() -> usize {
+    ROOT_PATH_WALKS.get()
+}
+
 fn open_real_directory_chain(path: &Path, deadline: Instant) -> io::Result<File> {
+    #[cfg(test)]
+    ROOT_PATH_WALKS.set(ROOT_PATH_WALKS.get() + 1);
     let mut directory = open_directory(Path::new("/"))?;
     let mut saw_root = false;
     for component in path.components() {
