@@ -48,6 +48,7 @@ impl Fixture {
         };
         let repo = fixture.repo.path();
         git(repo, &["init", "-q", "-b", "main"]);
+        aethyme_testkit::promote_on_submit(repo);
         std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
         std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
         std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
@@ -89,6 +90,7 @@ impl Fixture {
 
     fn configure(&self, config: &str) {
         std::fs::write(self.repo.path().join(".aethyme/config.toml"), config).unwrap();
+        aethyme_testkit::promote_on_submit(self.repo.path());
     }
 
     fn cli(&self, args: &[&str], container: Option<&Path>) -> Output {

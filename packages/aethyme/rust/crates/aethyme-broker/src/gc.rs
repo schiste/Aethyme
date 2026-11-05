@@ -14676,6 +14676,7 @@ mod tests {
     fn a_health_check_counts_worktrees_it_had_no_budget_to_scan() {
         let tmp = tempfile::tempdir().unwrap();
         git(tmp.path(), &["init", "-q", "-b", "main"]);
+        aethyme_testkit::promote_on_submit(tmp.path());
         std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
         std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
         git(tmp.path(), &["add", "-A"]);
@@ -15288,6 +15289,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         git(root, &["init", "-q", "-b", "main"]);
+        aethyme_testkit::promote_on_submit(root);
         std::fs::write(root.join("README.md"), "fixture\n").unwrap();
         std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
         git(root, &["add", "README.md", ".gitignore"]);
@@ -15886,6 +15888,7 @@ mod tests {
         let root_path = tmp.path().canonicalize().unwrap();
         let root = root_path.as_path();
         git(root, &["init", "-q", "-b", "main"]);
+        aethyme_testkit::promote_on_submit(root);
         std::fs::write(root.join("README.md"), "fixture\n").unwrap();
         std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
         git(root, &["add", "README.md", ".gitignore"]);
@@ -17499,6 +17502,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         git(root, &["init", "-q", "-b", "main"]);
+        aethyme_testkit::promote_on_submit(root);
         std::fs::write(root.join("README.md"), "fixture\n").unwrap();
         std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
         git(root, &["add", "README.md", ".gitignore"]);
@@ -17634,6 +17638,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         git(root, &["init", "-q", "-b", "main"]);
+        aethyme_testkit::promote_on_submit(root);
         std::fs::write(root.join("README.md"), "fixture\n").unwrap();
         std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
         git(root, &["add", "README.md", ".gitignore"]);

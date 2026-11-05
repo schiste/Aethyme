@@ -39,6 +39,7 @@ fn numbered(edit: Option<(usize, &str)>) -> String {
 
 fn init_repo(root: &Path) {
     sh(root, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     for name in ["auth.py", "other.py", "third.py"] {
         std::fs::write(root.join("src").join(name), numbered(None)).unwrap();

@@ -57,6 +57,7 @@ impl Fixture {
 fn fixture() -> (Fixture, Broker, i64, PathBuf) {
     let tmp = Fixture::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
@@ -717,6 +718,7 @@ fn ephemeral_repositories_never_anchor_worktrees_in_durable_host_state() {
     // supplies a library override and therefore cannot exercise that default.
     let tmp = Fixture::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     git(tmp.path(), &["add", "README.md"]);
     git(tmp.path(), &["commit", "-qm", "init"]);

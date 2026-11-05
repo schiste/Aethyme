@@ -160,6 +160,15 @@ pub fn run_broker_quick_test_with_options(
     if !init.certified() {
         return Err(QuickTestError::InitNotCertified);
     }
+    // This check proves the path from a verified submission to the integration
+    // branch, which a repository has to opt into.
+    let config = temp_repo.path().join(".aethyme/config.toml");
+    let scaffold = std::fs::read_to_string(&config)?;
+    let promoting = scaffold.replace("\nmode = \"verify-only\"\n", "\nmode = \"auto\"\n");
+    if promoting == scaffold {
+        return Err(std::io::Error::other("the scaffold no longer sets a promote mode").into());
+    }
+    std::fs::write(&config, promoting)?;
     git(temp_repo.path(), &["add", "-A"])?;
     git(
         temp_repo.path(),

@@ -46,6 +46,7 @@ impl Fixture {
         let repo = tmp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
         git(&repo, &["init", "-q", "-b", "main"]);
+        aethyme_testkit::promote_on_submit(&repo);
         std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
         std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
         git(&repo, &["add", "-A"]);

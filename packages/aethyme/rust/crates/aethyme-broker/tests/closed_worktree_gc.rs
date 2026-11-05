@@ -60,6 +60,7 @@ fn repository(grace_hours: Option<u32>) -> (Fixture, common::FixtureBroker) {
     let repo = tmp.path();
     std::fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(&repo);
     std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
     std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
     git(&repo, &["add", "-A"]);
