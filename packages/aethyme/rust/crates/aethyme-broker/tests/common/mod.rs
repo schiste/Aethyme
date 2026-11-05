@@ -33,6 +33,7 @@ pub fn disabled_bridge_path() -> PathBuf {
 /// directory passes through a symlink (`/var` to `/private/var`), and the broker
 /// refuses a non-canonical explicit override such as `AETHYME_WORKTREE_ROOT`, so a
 /// fixture that passes one of these paths as an override must start from here.
+#[allow(dead_code)]
 pub fn canonical_tempdir() -> tempfile::TempDir {
     let parent = std::env::temp_dir().canonicalize().unwrap();
     tempfile::tempdir_in(parent).unwrap()
