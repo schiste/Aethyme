@@ -384,7 +384,7 @@ fn main_skips_only_the_gates_a_pr_run_tested_on_the_same_tree() {
     let job = block(&gates, "  gates:");
     assert!(job.contains(&"          TESTED_BY_RUN: ${{ needs.tested-tree.outputs.run }}"));
     assert!(job.contains(
-        &"          COVERED_BY_PR_SUITE: \"cargo-test fast-guards workflow-contract gate-policy\""
+        &"          COVERED_BY_WORKSPACE_SUITE: \"cargo-test fast-guards workflow-contract gate-policy\""
     ));
     // The gates to run come from the manifest, not from a list in the workflow.
     // An assignment, so a failing manifest fails the step instead of running
@@ -422,9 +422,11 @@ fn main_skips_only_the_gates_a_pr_run_tested_on_the_same_tree() {
             "{gate} is not a gate"
         );
     }
-    assert!(!job.iter().any(
-        |line| line.contains("COVERED_BY_PR_SUITE") && line.contains("cross-process-contract")
-    ));
+    assert!(
+        !job.iter()
+            .any(|line| line.contains("COVERED_BY_WORKSPACE_SUITE")
+                && line.contains("cross-process-contract"))
+    );
 }
 
 /// On main the cargo-test gate runs as jobs, because one runner spent 19m49 on
@@ -490,10 +492,45 @@ fn the_cargo_test_jobs_run_the_pull_request_suite() {
     assert!(verdict.contains(&"    if: ${{ !cancelled() && needs.tested-tree.result == 'success' && needs.tested-tree.outputs.run == '' }}"));
     assert!(verdict.contains(&"          [[ \"$BUILD\" == success && \"$SHARDS\" == success && \"$EXAMPLES\" == success ]]"));
 
-    // The gates job leaves out cargo-test and nothing else.
+    // The gates job leaves out only the gates this suite runs in full, and
+    // each one's test targets must be in that suite: none selects a package or
+    // feature the workspace run would miss.
     let job = block(&gates, "  gates:");
-    assert!(job.contains(&"          RUNS_IN_SHARDS: \"cargo-test\""));
-    assert!(job.contains(&"            elif [[ \" $RUNS_IN_SHARDS \" == *\" $gate \"* ]]; then"));
+    assert!(job.contains(
+        &"            if [[ \" $COVERED_BY_WORKSPACE_SUITE \" != *\" $gate \"* ]]; then"
+    ));
+    let policy: toml::Value = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(5)
+            .unwrap()
+            .join(".aethyme/gates.toml"),
+    )
+    .unwrap()
+    .parse()
+    .unwrap();
+    for name in ["fast-guards", "workflow-contract", "gate-policy"] {
+        let command = policy["gate"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|gate| gate["name"].as_str() == Some(name))
+            .and_then(|gate| gate["command"].as_str())
+            .unwrap();
+        assert!(command.contains("cargo test --locked"), "{name}: {command}");
+        for excluded in [
+            "--exclude",
+            "--features",
+            "--all-features",
+            "--release",
+            "--profile",
+        ] {
+            assert!(
+                !command.contains(excluded),
+                "{name} runs more than the suite: {command}"
+            );
+        }
+    }
 
     // A required check matches by name, so a manual dispatch here must not be
     // able to satisfy one on the same commit.
@@ -512,6 +549,64 @@ fn the_cargo_test_jobs_run_the_pull_request_suite() {
             "{name} is a required check's name"
         );
     }
+}
+
+/// The removal has never run on GitHub: every runner so far had 86 GiB free. Run
+/// the step's own script against stand-ins for `df` and `sudo`.
+#[cfg(unix)]
+#[test]
+fn the_disk_step_removes_toolchains_only_below_its_threshold() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let gates = workflow("aethyme-gates.yml");
+    let step = gates
+        .split("      - name: Free runner disk when it is low")
+        .nth(1)
+        .unwrap();
+    let script = block(step, "        run: |")
+        .into_iter()
+        .map(|line| line.strip_prefix("          ").unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let run = |free: &str| {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let log = root.path().join("sudo.log");
+        for (name, body) in [
+            ("df", format!("#!/bin/sh\nprintf 'Avail\\n {free}G\\n'\n")),
+            (
+                "sudo",
+                format!("#!/bin/sh\necho \"$*\" >> '{}'\n", log.display()),
+            ),
+        ] {
+            let path = bin.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = std::process::Command::new("bash")
+            .args(["-c", &script])
+            .env("PATH", path)
+            .env("GITHUB_WORKSPACE", root.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        std::fs::read_to_string(&log).unwrap_or_default()
+    };
+
+    assert_eq!(run("86"), "");
+    assert_eq!(run("30"), "");
+    let removed = run("29");
+    for path in ["/usr/local/lib/android", "/opt/ghc", "/usr/share/dotnet"] {
+        assert!(removed.contains(path), "{removed}");
+    }
+    assert!(removed.starts_with("rm -rf "), "{removed}");
 }
 
 /// macOS is tested nightly, and that run must be the whole workspace: until

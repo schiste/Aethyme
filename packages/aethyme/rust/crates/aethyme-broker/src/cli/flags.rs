@@ -12,6 +12,7 @@ pub(super) const GLOBAL_FLAGS: &[&str] = &["--json", "--json-output"];
 pub(super) const VALUE_FLAGS: &[&str] = &[
     "--adapter",
     "--agent",
+    "--after-session",
     "--ai-provider",
     "--automation-id",
     "--base",
@@ -21,6 +22,7 @@ pub(super) const VALUE_FLAGS: &[&str] = &[
     "--checks-timeout",
     "--claim",
     "--cleanup-command",
+    "--closed-before-ms",
     "--cmd",
     "--commits",
     "--completed-for-commit",
@@ -642,6 +644,9 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
         &[
             "--force",
             "--all-cleaned",
+            "--closed-before-ms",
+            "--after-session",
+            "--limit",
             "--apply",
             "--confirm",
             "--dry-run",

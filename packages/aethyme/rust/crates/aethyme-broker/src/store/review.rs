@@ -1,5 +1,12 @@
 use super::*;
 
+/// The operation facts needed to keep unresolved external outcomes blocked by GC.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct GcUnresolvedOperation {
+    pub id: i64,
+    pub created_at: i64,
+}
+
 impl BrokerStore {
     // ── review lifecycle ─────────────────────────────────────────────
 
@@ -1149,6 +1156,33 @@ impl BrokerStore {
             .map_err(Into::into)
     }
 
+    /// Read only the facts GC uses, without decoding historical operation payloads.
+    /// Parse every status so an unknown stored state cannot silently lose a blocker.
+    pub(crate) fn gc_unresolved_operations(
+        &self,
+    ) -> Result<Vec<GcUnresolvedOperation>, BrokerError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, status, created_at FROM coordinated_operations ORDER BY id")?;
+        let mut rows = stmt.query([])?;
+        let mut unresolved = Vec::new();
+        while let Some(row) = rows.next()? {
+            let status: String = row.get(1)?;
+            if matches!(
+                OperationStatus::parse(&status)?,
+                OperationStatus::Prepared
+                    | OperationStatus::Running
+                    | OperationStatus::OutcomeUnknown
+            ) {
+                unresolved.push(GcUnresolvedOperation {
+                    id: row.get(0)?,
+                    created_at: row.get(2)?,
+                });
+            }
+        }
+        Ok(unresolved)
+    }
+
     pub fn coordinated_operations(&self) -> Result<Vec<CoordinatedOperation>, BrokerError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, provider, repository, scope, effect,
@@ -1237,5 +1271,58 @@ impl BrokerStore {
             operations,
             next_before_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod gc_operation_projection_tests {
+    use super::*;
+
+    #[test]
+    fn gc_reads_all_unresolved_statuses_without_decoding_payloads_and_rejects_unknown_status() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE coordinated_operations (id INTEGER PRIMARY KEY, status TEXT NOT NULL, created_at INTEGER NOT NULL, agent_provenance_json TEXT);
+            INSERT INTO coordinated_operations VALUES
+                (1, 'prepared', 10, 'not-json'),
+                (2, 'running', 20, 'not-json'),
+                (3, 'outcome_unknown', 30, 'not-json'),
+                (4, 'succeeded', 40, 'not-json'),
+                (5, 'failed', 50, 'not-json'),
+                (6, 'reconciled_succeeded', 60, 'not-json'),
+                (7, 'reconciled_failed', 70, 'not-json');").unwrap();
+        let store = BrokerStore {
+            conn,
+            path: PathBuf::from(":memory:"),
+            _snapshot_dir: None,
+            binding_scope: None,
+        };
+        assert_eq!(
+            store.gc_unresolved_operations().unwrap(),
+            vec![
+                GcUnresolvedOperation {
+                    id: 1,
+                    created_at: 10
+                },
+                GcUnresolvedOperation {
+                    id: 2,
+                    created_at: 20
+                },
+                GcUnresolvedOperation {
+                    id: 3,
+                    created_at: 30
+                },
+            ]
+        );
+        store
+            .conn
+            .execute(
+                "INSERT INTO coordinated_operations VALUES (8, 'future_status', 80, NULL)",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.gc_unresolved_operations(),
+            Err(BrokerError::InvalidEnumValue { .. })
+        ));
     }
 }
