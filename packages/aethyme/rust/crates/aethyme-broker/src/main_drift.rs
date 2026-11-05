@@ -99,6 +99,23 @@ pub(crate) fn assess_sync_impact(
         drift.sync_impact = SyncImpact::Related;
         return;
     }
+    // File parsing coverage alone does not establish relationship resolution.
+    // Missing use evidence or unresolved edges cannot prove disjointness.
+    for root in [local.root(), repo.root()] {
+        let Ok(coverage) = aethyme_graph_storage::read_coverage(root) else {
+            return;
+        };
+        let Some(evidence) = coverage.use_evidence_by_language else {
+            return;
+        };
+        if evidence.is_empty()
+            || evidence
+                .values()
+                .any(|entry| entry.unresolved_calls > 0 || entry.unresolved_imports > 0)
+        {
+            return;
+        }
+    }
     let mut surfaces = [BTreeSet::new(), BTreeSet::new()];
     for (root, revision) in [
         (local.root(), drift.head.as_str()),
@@ -393,6 +410,10 @@ mod tests {
         coverage.safe_to_use = true;
         coverage.gaps.clear();
         coverage.files.parsed = 2;
+        coverage.use_evidence_by_language = Some(std::collections::BTreeMap::from([(
+            "rust".into(),
+            aethyme_graph_storage::GraphUseEvidence::default(),
+        )]));
         coverage
             .by_language
             .insert("rust".into(), Default::default());
@@ -505,6 +526,19 @@ mod tests {
         assess_sync_impact(&repo, &worktree, &mut result);
         assert_eq!(result.sync_impact, SyncImpact::Disjoint);
         assert!(result.suggested_command.is_none());
+        let mut coverage = aethyme_graph_storage::read_coverage(&worktree).unwrap();
+        coverage
+            .use_evidence_by_language
+            .as_mut()
+            .unwrap()
+            .get_mut("rust")
+            .unwrap()
+            .unresolved_calls = 1;
+        aethyme_graph_storage::write_coverage_artifacts(&worktree, &coverage, &[]).unwrap();
+        let mut unresolved = measure(&repo, "origin/main", &commit, &head, CatchUp::Merge).unwrap();
+        assess_sync_impact(&repo, &worktree, &mut unresolved);
+        assert_eq!(unresolved.sync_impact, SyncImpact::Unknown);
+        assert!(unresolved.suggested_command.is_some());
         graph(&worktree, &head, true);
         let mut result = measure(&repo, "origin/main", &commit, &head, CatchUp::Merge).unwrap();
         assess_sync_impact(&repo, &worktree, &mut result);
