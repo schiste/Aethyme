@@ -179,7 +179,7 @@ impl Default for RetentionPolicy {
             terminal_merge_queue_days: 180,
             command_metrics_days: 30,
             closed_worktrees_days: 7,
-            closed_worktree_grace_hours: 5 * 24,
+            closed_worktree_grace_hours: 24,
             auto_cleanup_worktrees_on_finish: true,
             compact_closed_worktrees: false,
             publication_exposure_days: 30,
@@ -1448,7 +1448,7 @@ mod tests {
         assert!(policy.terminal_events_days >= policy.gate_results_days);
         assert!(policy.terminal_merge_queue_days >= policy.gate_results_days);
         assert!(policy.startup_budget_ms <= 25);
-        assert_eq!(policy.closed_worktree_grace_hours, 120);
+        assert_eq!(policy.closed_worktree_grace_hours, 24);
         assert!(!policy.compact_closed_worktrees);
         assert!(!policy.expire_abandoned_task_leases);
         assert_eq!(
