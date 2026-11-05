@@ -508,3 +508,50 @@ impl Holder {
 
 #[path = "common/json_error.rs"]
 mod json_error;
+
+#[test]
+fn scoped_cleanup_cli_accepts_a_fixed_cutoff_and_rejects_incomplete_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
+    git(tmp.path(), &["add", "README.md"]);
+    git(tmp.path(), &["commit", "-qm", "init"]);
+    drop(Broker::open(tmp.path()).unwrap());
+    let output = run(
+        tmp.path(),
+        &[
+            "finish",
+            "cleanup",
+            "--all-cleaned",
+            "--closed-before-ms",
+            "123456",
+            "--after-session",
+            "3",
+            "--limit",
+            "5",
+            "--json",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["plan"]["closed_before_ms"], 123456);
+    assert_eq!(json["plan"]["after_session"], 3);
+    assert_eq!(json["plan"]["batch_limit"], 5);
+    assert!(json["plan"].get("batch_last_session").is_none());
+    let incomplete = run(
+        tmp.path(),
+        &[
+            "finish",
+            "cleanup",
+            "--all-cleaned",
+            "--closed-before-ms",
+            "123456",
+            "--json",
+        ],
+    );
+    assert!(!incomplete.status.success());
+}
