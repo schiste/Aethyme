@@ -831,7 +831,11 @@ fn best_window(lines: &[MatchedLine], idf: &[f64]) -> Option<(u32, u32, u32, f64
 ///
 /// `None` for a file that matches no term in any field: it only counts
 /// toward the corpus size.
-fn document(file: &ScannedFile, query: &QueryTerms) -> Option<Document> {
+fn document(
+    file: &ScannedFile,
+    query: &QueryTerms,
+    lengths: [f64; bm25f::FIELD_COUNT],
+) -> Option<Document> {
     let (name_parts, dir_parts) = path_parts(&file.path);
     let path_match = || {
         query.terms.iter().any(|term| {
@@ -845,7 +849,7 @@ fn document(file: &ScannedFile, query: &QueryTerms) -> Option<Document> {
         return None;
     }
     let mut doc = Document::new(query.terms.len() + query.compounds.len());
-    doc.len = field_lengths(file);
+    doc.len = lengths;
     for (bit, term) in query.terms.iter().enumerate() {
         let hits = |parts: &[String]| {
             parts
@@ -999,13 +1003,15 @@ fn rank(
     files: &[ScannedFile],
     max_hits: usize,
 ) -> (Vec<AnswerItem>, Vec<HitSignal>) {
+    // Field-length averages and idf come from every searched file, not
+    // only the ones that match a term (the only ones ranked). Reuse these
+    // lengths for matching documents instead of calculating them twice.
+    let lengths = files.par_iter().map(field_lengths).collect::<Vec<_>>();
     let (candidates, documents): (Vec<&ScannedFile>, Vec<Document>) = files
         .par_iter()
-        .filter_map(|file| Some((file, document(file, query)?)))
+        .zip(lengths.par_iter())
+        .filter_map(|(file, &length)| Some((file, document(file, query, length)?)))
         .unzip();
-    // Field-length averages and idf come from every searched file, not
-    // only the ones that match a term (the only ones ranked).
-    let lengths = files.par_iter().map(field_lengths).collect::<Vec<_>>();
     let mut corpus = Corpus::new(
         &documents,
         query.terms.len() + query.compounds.len(),
