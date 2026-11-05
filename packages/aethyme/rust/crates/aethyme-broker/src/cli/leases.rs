@@ -1310,6 +1310,7 @@ mod tests {
             path: requested_path.into(),
             owned: Vec::new(),
             conflicts: vec![crate::LeasePlanOverlap {
+                other_changes: None,
                 relation,
                 session_id: 7,
                 path: lease_path.into(),
