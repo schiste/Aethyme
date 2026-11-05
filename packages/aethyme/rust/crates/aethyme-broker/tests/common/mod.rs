@@ -29,6 +29,15 @@ pub fn disabled_bridge_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fakes/no-chau7-bridge")
 }
 
+/// A temporary directory whose path is already canonical. macOS's default temp
+/// directory passes through a symlink (`/var` to `/private/var`), and the broker
+/// refuses a non-canonical explicit override such as `AETHYME_WORKTREE_ROOT`, so a
+/// fixture that passes one of these paths as an override must start from here.
+pub fn canonical_tempdir() -> tempfile::TempDir {
+    let parent = std::env::temp_dir().canonicalize().unwrap();
+    tempfile::tempdir_in(parent).unwrap()
+}
+
 #[allow(dead_code)]
 pub fn broker_cli(binary: &str, args: &[&str]) -> Command {
     let mut command = Command::new(binary);
