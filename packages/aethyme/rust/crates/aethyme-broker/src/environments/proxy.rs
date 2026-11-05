@@ -439,62 +439,139 @@ fn handle(mut client: TcpStream, config: &ProxyConfig) -> io::Result<()> {
         }
         Err(reason) => return path_target_unavailable(&mut client, &host_route, &reason),
     };
-    if let Err(reason) = ensure_awake(config, &route) {
-        return respond_json(
-            &mut client,
-            "503 Service Unavailable",
-            json!({
-                "env_id": route.env_id,
-                "component": route.component,
-                "error": reason,
-                "next_action": format!("aethyme env logs {}", route.env_id),
-            }),
-            &[("Retry-After", "5".into())],
-        );
+    // A redeploy can stop the upstream at any point below, between this check
+    // and the upstream's first response byte. Each lost attempt starts again
+    // here, where the request is held until the environment has settled.
+    let mut route = route;
+    let mut attempt = 1;
+    loop {
+        if let Err(reason) = ensure_awake(config, &route) {
+            return respond_json(
+                &mut client,
+                "503 Service Unavailable",
+                json!({
+                    "env_id": route.env_id,
+                    "component": route.component,
+                    "error": reason,
+                    "next_action": format!("aethyme env logs {}", route.env_id),
+                }),
+                &[("Retry-After", "5".into())],
+            );
+        }
+        // Re-read just before connecting: waking or a blue/green flip may have
+        // changed the selected slot and its upstream.
+        let routes = match config.routes() {
+            Ok(routes) => routes,
+            Err(reason) => return route_snapshot_unavailable(&mut client, &reason),
+        };
+        let Some(host_route) = lookup(&routes, &host).cloned() else {
+            return respond(
+                &mut client,
+                "503 Service Unavailable",
+                "text/plain",
+                &[],
+                b"route vanished\n",
+            );
+        };
+        route = match target(&routes, &host_route, &head.path) {
+            Ok(Target::Route(route)) => route,
+            Ok(Target::Url(url)) => return forward_url(client, &head, &url),
+            Err(reason) => return path_target_unavailable(&mut client, &host_route, &reason),
+        };
+        touch_debounced(&config.root, &route.env_id);
+        if host_route.env_id != route.env_id {
+            touch_debounced(&config.root, &host_route.env_id);
+        }
+        if let Some(directory) = &route.static_dir {
+            return serve_static(&mut client, &head, directory, route.spa_fallback);
+        }
+        let Some(port) = route.upstream else {
+            if attempt < UPSTREAM_ATTEMPTS {
+                attempt += 1;
+                continue;
+            }
+            return respond(
+                &mut client,
+                "503 Service Unavailable",
+                "text/plain",
+                &[("Retry-After", "5".into())],
+                b"environment is not active\n",
+            );
+        };
+        match open_upstream(port, &head)? {
+            Upstream::Ready(upstream) => {
+                client.set_read_timeout(None)?;
+                return splice(client, upstream);
+            }
+            Upstream::Lost(_) if attempt < UPSTREAM_ATTEMPTS => attempt += 1,
+            Upstream::Lost(error) => return Err(error),
+        }
     }
-    // Re-read just before connecting: waking or a blue/green flip may have
-    // changed the selected slot and its upstream.
-    let routes = match config.routes() {
-        Ok(routes) => routes,
-        Err(reason) => return route_snapshot_unavailable(&mut client, &reason),
-    };
-    let Some(host_route) = lookup(&routes, &host).cloned() else {
-        return respond(
-            &mut client,
-            "503 Service Unavailable",
-            "text/plain",
-            &[],
-            b"route vanished\n",
-        );
-    };
-    let route = match target(&routes, &host_route, &head.path) {
-        Ok(Target::Route(route)) => route,
-        Ok(Target::Url(url)) => return forward_url(client, &head, &url),
-        Err(reason) => return path_target_unavailable(&mut client, &host_route, &reason),
-    };
-    touch_debounced(&config.root, &route.env_id);
-    if host_route.env_id != route.env_id {
-        touch_debounced(&config.root, &host_route.env_id);
-    }
-    if let Some(directory) = &route.static_dir {
-        return serve_static(&mut client, &head, directory, route.spa_fallback);
-    }
-    let Some(port) = route.upstream else {
-        return respond(
-            &mut client,
-            "503 Service Unavailable",
-            "text/plain",
-            &[("Retry-After", "5".into())],
-            b"environment is not active\n",
-        );
-    };
-    let mut upstream = TcpStream::connect_timeout(
+}
+
+/// Tries for one request. A redeploy can cost two: one to a server it is
+/// stopping, and one to a route read before the swap began.
+const UPSTREAM_ATTEMPTS: usize = 3;
+
+/// How long a replayable request waits to see the upstream answer before it is
+/// committed to that upstream. A slower response streams normally, but cannot be
+/// replayed if the upstream stops before it starts.
+const FIRST_BYTE_WINDOW: Duration = Duration::from_secs(5);
+
+enum Upstream {
+    /// Connected, and the request is sent.
+    Ready(TcpStream),
+    /// Gone with no response, and the request is safe to send again.
+    Lost(io::Error),
+}
+
+/// Whether a request can be sent twice: it has no body, and its method promises
+/// no effect. This is the only case where a lost upstream can be hidden from the
+/// client, since a server may have acted on anything else before it stopped.
+fn replayable(head: &Head) -> bool {
+    matches!(head.method.as_str(), "GET" | "HEAD")
+        && head.header("Content-Length").is_none()
+        && head.header("Transfer-Encoding").is_none()
+}
+
+/// Connect to `port` and send the request. Nothing has been sent when a connection
+/// fails, so every request may try again after that. A replayable request also
+/// waits for the first response byte, because a server stopped mid-request
+/// resets the connection and the client would otherwise see that reset.
+fn open_upstream(port: u16, head: &Head) -> io::Result<Upstream> {
+    let mut upstream = match TcpStream::connect_timeout(
         &SocketAddr::from(([127, 0, 0, 1], port)),
         Duration::from_secs(5),
-    )?;
-    client.set_read_timeout(None)?;
-    upstream.write_all(&head.raw)?;
-    splice(client, upstream)
+    ) {
+        Ok(upstream) => upstream,
+        Err(error) => return Ok(Upstream::Lost(error)),
+    };
+    if !replayable(head) {
+        upstream.write_all(&head.raw)?;
+        return Ok(Upstream::Ready(upstream));
+    }
+    if let Err(error) = upstream.write_all(&head.raw) {
+        return Ok(Upstream::Lost(error));
+    }
+    // macOS refuses a socket option once the peer has closed, even with its
+    // response waiting to be read: neither call's failure says the upstream is
+    // lost. Only the peek decides, and a closed socket's reads cannot block.
+    let _ = upstream.set_read_timeout(Some(FIRST_BYTE_WINDOW));
+    let first = upstream.peek(&mut [0u8; 1]);
+    let _ = upstream.set_read_timeout(None);
+    Ok(match first {
+        Ok(0) => Upstream::Lost(io::ErrorKind::UnexpectedEof.into()),
+        Ok(_) => Upstream::Ready(upstream),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            Upstream::Ready(upstream)
+        }
+        Err(error) => Upstream::Lost(error),
+    })
 }
 
 /// Copy bytes both ways until each side closes.
@@ -726,5 +803,86 @@ fn control_request(
             &[],
             b"unknown control endpoint\n",
         ),
+    }
+}
+
+#[cfg(test)]
+mod upstream_tests {
+    use super::*;
+
+    fn head(method: &str, headers: &[(&str, &str)]) -> Head {
+        Head {
+            method: method.into(),
+            path: "/".into(),
+            headers: headers
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            raw: format!("{method} / HTTP/1.1\r\n\r\n").into_bytes(),
+        }
+    }
+
+    /// A server that reads the request, then does what `then` says.
+    fn server(then: fn(TcpStream)) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 256];
+            stream.read(&mut request).unwrap();
+            then(stream);
+        });
+        port
+    }
+
+    #[test]
+    fn a_server_that_stops_before_answering_can_be_asked_again() {
+        let port = server(drop);
+        assert!(matches!(
+            open_upstream(port, &head("GET", &[])).unwrap(),
+            Upstream::Lost(_)
+        ));
+    }
+
+    #[test]
+    fn a_server_that_answers_is_kept_with_its_response_unread() {
+        let port = server(|mut stream| stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap());
+        let Upstream::Ready(mut upstream) = open_upstream(port, &head("GET", &[])).unwrap() else {
+            panic!("the server answered");
+        };
+        let mut response = String::new();
+        upstream.read_to_string(&mut response).unwrap();
+        assert_eq!(response, "HTTP/1.1 200 OK\r\n\r\n");
+    }
+
+    /// The server may have acted on these before it stopped, so they are never
+    /// sent twice, and the proxy must not wait for an answer before streaming a
+    /// body the server may be waiting for.
+    #[test]
+    fn a_request_that_can_change_state_is_never_held_for_a_replay() {
+        for request in [
+            head("POST", &[]),
+            head("DELETE", &[]),
+            head("GET", &[("content-length", "3")]),
+            head("GET", &[("Transfer-Encoding", "chunked")]),
+        ] {
+            let port = server(drop);
+            assert!(matches!(
+                open_upstream(port, &request).unwrap(),
+                Upstream::Ready(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_refused_connection_sent_nothing_so_any_request_may_try_again() {
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        assert!(matches!(
+            open_upstream(port, &head("POST", &[])).unwrap(),
+            Upstream::Lost(_)
+        ));
     }
 }

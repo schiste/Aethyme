@@ -85,6 +85,48 @@ impl Drop for EnvGuard {
     }
 }
 
+/// Answer the execution profile's version probes without the host's tools, for
+/// the length of a test that asserts a cache hit. A hit needs every probe to
+/// answer within its budget, and a tool's first run on a cold runner may not, so
+/// such a test would otherwise depend on the host. `sh` and `git` stay real: the
+/// gates and the broker run them, so they are already warm.
+///
+/// `PATH` is part of the profile, so these tests take turns: under `cargo test`
+/// they share a process, and a change mid-test would miss the cache.
+#[cfg(unix)]
+fn instant_tool_probes() -> InstantToolProbes {
+    use std::os::unix::fs::PermissionsExt;
+
+    static TURN: Mutex<()> = Mutex::new(());
+    let turn = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let tools = tempfile::tempdir().unwrap();
+    for tool in [
+        "rustc", "cargo", "python", "python3", "pytest", "node", "go",
+    ] {
+        let path = tools.path().join(tool);
+        std::fs::write(&path, "#!/bin/sh\necho stub\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    let path = format!("{}:{inherited}", tools.path().display());
+    let path = EnvGuard::set("PATH", &path);
+    InstantToolProbes {
+        _path: path,
+        _tools: tools,
+        _turn: turn,
+    }
+}
+
+/// Fields drop in order: `PATH` is restored before the tools go and the next
+/// test's turn begins.
+#[cfg(unix)]
+struct InstantToolProbes {
+    _path: EnvGuard,
+    _tools: tempfile::TempDir,
+    _turn: std::sync::MutexGuard<'static, ()>,
+}
+
 fn sh(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
@@ -216,6 +258,8 @@ fn refresh_committed_graph(root: &Path) {
 
 #[test]
 fn session_and_full_tree_gates_record_committed_graph_authority_as_advice() {
+    #[cfg(unix)]
+    let _tools = instant_tool_probes();
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     write_gates(
@@ -731,6 +775,8 @@ triggers = ["**/*.py"]
 
 #[test]
 fn selection_run_cache_and_fail_fast() {
+    #[cfg(unix)]
+    let _tools = instant_tool_probes();
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     write_gates(
@@ -915,6 +961,8 @@ triggers = ["**/*.py"]
 
 #[test]
 fn executed_gates_record_machine_load_and_free_disk_and_cache_hits_do_not() {
+    #[cfg(unix)]
+    let _tools = instant_tool_probes();
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     write_gates(
@@ -1438,6 +1486,8 @@ triggers = ["**/*.py"]
 
 #[test]
 fn run_all_runs_every_gate_in_cost_order_ignoring_diff_selection() {
+    #[cfg(unix)]
+    let _tools = instant_tool_probes();
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     // Triggers deliberately match NOTHING in the repo: diff selection
