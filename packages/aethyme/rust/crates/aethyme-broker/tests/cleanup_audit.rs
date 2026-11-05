@@ -616,6 +616,7 @@ fn audit_is_scoped_to_the_named_repository_and_renders_a_summary() {
         "[cleanup]\nauto_remove = false\n",
     )
     .unwrap();
+    aethyme_testkit::promote_on_submit(repo);
 
     // Run from an unrelated directory, naming the repository explicitly.
     let output = isolation::command(

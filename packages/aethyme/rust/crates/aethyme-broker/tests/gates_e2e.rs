@@ -101,6 +101,7 @@ fn sh(cwd: &Path, args: &[&str]) {
 
 fn init_repo(root: &Path) {
     sh(root, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/app.py"), "x = 1\n").unwrap();
     std::fs::write(root.join("docs.md"), "docs\n").unwrap();
@@ -227,6 +228,7 @@ fn session_and_full_tree_gates_record_committed_graph_authority_as_advice() {
         "[graph]\nauthority='committed_fragments'\nrepository='fixture'\n",
     )
     .unwrap();
+    aethyme_testkit::promote_on_submit(tmp.path());
     bootstrap_repo(tmp.path(), env!("CARGO_PKG_VERSION")).unwrap();
     commit_all(tmp.path(), "enroll authoritative graph");
     refresh_committed_graph(tmp.path());

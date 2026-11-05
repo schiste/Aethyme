@@ -47,6 +47,7 @@ pub mod repos;
 pub use bins::{aethyme_bin, engine_bin, graph_index_bin};
 pub use invoke::{Invoke, InvokeResult, invoke_aethyme};
 pub use paths::{package_root, repo_root, rust_workspace_root};
+pub use repos::promote_on_submit;
 
 pub use serde_json;
 pub use tempfile;

@@ -31,6 +31,7 @@ fn git(repo: &Path, args: &[&str]) -> String {
 fn fixture() -> (FixtureRepository, common::FixtureBroker, i64, String) {
     let fixture = FixtureRepository::new();
     git(fixture.path(), &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(fixture.path());
     std::fs::write(fixture.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(fixture.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(fixture.path(), &["add", "-A"]);

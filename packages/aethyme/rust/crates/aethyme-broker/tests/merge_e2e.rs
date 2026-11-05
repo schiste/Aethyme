@@ -35,6 +35,7 @@ fn sh(cwd: &Path, args: &[&str]) {
 
 fn init_repo(root: &Path) {
     sh(root, &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(root);
     // Broker operations spawn their own Git processes, so configure the
     // disposable repository itself instead of relying on the test runner's
     // global identity or on environment variables attached to `sh` above.
@@ -386,6 +387,7 @@ fn submit_advises_on_a_stale_authoritative_graph_and_still_promotes() {
         "[graph]\nauthority = 'committed_fragments'\nrepository = 'fixture'\n",
     )
     .unwrap();
+    aethyme_testkit::promote_on_submit(tmp.path());
     bootstrap_repo(tmp.path(), env!("CARGO_PKG_VERSION")).unwrap();
     sh(tmp.path(), &["add", "-A"]);
     sh(tmp.path(), &["commit", "-qm", "enroll authoritative graph"]);

@@ -5566,6 +5566,7 @@ mod registered_removal_failure_tests {
         let repository = root.join("repository");
         std::fs::create_dir_all(&repository).unwrap();
         git(&repository, &["init", "-q", "-b", "main"]);
+        aethyme_testkit::promote_on_submit(&repository);
         git(&repository, &["config", "user.name", "Cleanup test"]);
         git(
             &repository,

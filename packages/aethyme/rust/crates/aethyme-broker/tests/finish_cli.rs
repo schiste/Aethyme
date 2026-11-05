@@ -139,6 +139,7 @@ fn promoted_fixture_with_worktree_root_and_gitignore(
 ) -> (isolation::FixtureRepo, i64, std::path::PathBuf, String) {
     let tmp = isolation::FixtureRepo::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), gitignore).unwrap();
     git(tmp.path(), &["add", "-A"]);
@@ -388,6 +389,7 @@ fn finish_preserves_discovery_errors_before_closing_the_session() {
 
     let tmp = isolation::FixtureRepo::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
@@ -524,6 +526,7 @@ fn finish_timeout_does_not_kill_worktree_removal_after_the_session_closes() {
 
     let tmp = isolation::FixtureRepo::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(tmp.path());
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
@@ -1114,6 +1117,7 @@ fn invalid_finish_cleanup_proof_keeps_checkout_after_transient_git_errors() {
         "[cleanup]\nauto_remove = false\n",
     )
     .unwrap();
+    aethyme_testkit::promote_on_submit(tmp.path());
 
     let session = session_id.to_string();
     let finish = run(

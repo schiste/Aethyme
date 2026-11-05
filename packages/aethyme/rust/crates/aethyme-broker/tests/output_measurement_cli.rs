@@ -36,6 +36,7 @@ fn run(repo: &Path, measure: Option<&str>, args: &[&str]) -> Output {
 fn fixture() -> tempfile::TempDir {
     let repo = tempfile::tempdir().unwrap();
     git(repo.path(), &["init", "-q", "-b", "main"]);
+    aethyme_testkit::promote_on_submit(repo.path());
     std::fs::write(repo.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
     git(repo.path(), &["add", "-A"]);
