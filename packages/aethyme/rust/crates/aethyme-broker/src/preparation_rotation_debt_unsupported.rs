@@ -97,14 +97,6 @@ pub(crate) fn ensure_preparation_cache_root_child(
     Err(unsupported())
 }
 
-pub(crate) fn validate_preparation_cache_root_handle(
-    _path: &Path,
-    _pinned_directory: &File,
-    _expected_root_identity: &[u8],
-) -> io::Result<()> {
-    Err(unsupported())
-}
-
 pub(crate) fn initialize_preparation_cache_root(
     _path: &Path,
     _expected_root_identity: &[u8],

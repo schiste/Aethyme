@@ -282,9 +282,8 @@ pub(crate) fn ensure_preparation_cache_root_child(
     ensure_cache_root_path_identity(parent_path, &parent, &expected_parent, deadline)
 }
 
-/// Initialize only the opt-in root marker/nonce child. The caller must already
-/// hold the unchanged repository-scoped preparation lease. Journal inspection
-/// runs under the root lock and must use the captured host-resource DB.
+/// Preserve the former standalone check for the path-walk regression baseline.
+#[cfg(test)]
 pub(crate) fn validate_preparation_cache_root_handle(
     path: &Path,
     pinned_directory: &File,
