@@ -1679,9 +1679,17 @@ fn run_git_bytes_with_stdin(cwd: &Path, args: &[&str], input: &[u8]) -> Result<V
     Ok(output.stdout)
 }
 
-fn checkout_worker_default_from_config(config: Result<String, GitError>) -> Option<&'static str> {
+fn checkout_worker_default_from_config(
+    config: Result<String, GitError>,
+    available_cpus: usize,
+) -> Option<&'static str> {
     match config {
-        Err(GitError::Git { stderr, .. }) if stderr.is_empty() => Some("checkout.workers=4"),
+        Err(GitError::Git { stderr, .. }) if stderr.is_empty() && available_cpus >= 8 => {
+            Some("checkout.workers=8")
+        }
+        Err(GitError::Git { stderr, .. }) if stderr.is_empty() && available_cpus >= 4 => {
+            Some("checkout.workers=4")
+        }
         // A configured value, including an invalid one, belongs to Git.
         // An unreadable config must not be mistaken for an absent value.
         _ => None,
@@ -6708,10 +6716,10 @@ impl GitRepo {
         if available_cpus < 4 {
             return None;
         }
-        checkout_worker_default_from_config(run_git(
-            &self.root,
-            &["config", "--get", "checkout.workers"],
-        ))
+        checkout_worker_default_from_config(
+            run_git(&self.root, &["config", "--get", "checkout.workers"]),
+            available_cpus,
+        )
     }
 
     fn worktree_add_full(
@@ -11685,17 +11693,43 @@ mod sparse_worktree_tests {
     #[test]
     fn checkout_worker_default_respects_config_and_cpu_limits() {
         assert_eq!(
-            super::checkout_worker_default_from_config(Err(GitError::Git {
-                args: "config".into(),
-                stderr: String::new(),
-            })),
+            super::checkout_worker_default_from_config(
+                Err(GitError::Git {
+                    args: "config".into(),
+                    stderr: String::new(),
+                }),
+                8
+            ),
+            Some("checkout.workers=8")
+        );
+        assert_eq!(
+            super::checkout_worker_default_from_config(
+                Err(GitError::Git {
+                    args: "config".into(),
+                    stderr: String::new(),
+                }),
+                4
+            ),
             Some("checkout.workers=4")
         );
         assert_eq!(
-            super::checkout_worker_default_from_config(Err(GitError::Git {
-                args: "config".into(),
-                stderr: "invalid configuration".into(),
-            })),
+            super::checkout_worker_default_from_config(
+                Err(GitError::Git {
+                    args: "config".into(),
+                    stderr: String::new(),
+                }),
+                2
+            ),
+            None
+        );
+        assert_eq!(
+            super::checkout_worker_default_from_config(
+                Err(GitError::Git {
+                    args: "config".into(),
+                    stderr: "invalid configuration".into(),
+                }),
+                8
+            ),
             None
         );
         let (_fixture, root) = repository();
