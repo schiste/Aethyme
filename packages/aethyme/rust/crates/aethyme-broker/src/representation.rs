@@ -397,9 +397,11 @@ fn find_landing_within_cached(
         content,
         branch_tip,
         cap,
-        search_deadline,
-        MAX_LANDING_QUERY_COUNT,
-        MAX_LANDING_CANDIDATE_LIST_BYTES,
+        LandingSearchLimits {
+            deadline: search_deadline,
+            query_budget: MAX_LANDING_QUERY_COUNT,
+            candidate_list_byte_budget: MAX_LANDING_CANDIDATE_LIST_BYTES,
+        },
         patch_cache,
     )
 }
@@ -425,11 +427,19 @@ fn find_landing_with_limits(
         content,
         branch_tip,
         cap,
-        deadline,
-        query_budget,
-        candidate_list_byte_budget,
+        LandingSearchLimits {
+            deadline,
+            query_budget,
+            candidate_list_byte_budget,
+        },
         &mut Default::default(),
     )
+}
+
+struct LandingSearchLimits {
+    deadline: Instant,
+    query_budget: usize,
+    candidate_list_byte_budget: usize,
 }
 
 fn find_landing_with_limits_cached(
@@ -437,11 +447,14 @@ fn find_landing_with_limits_cached(
     content: &SessionContent,
     branch_tip: &str,
     cap: usize,
-    deadline: Instant,
-    query_budget: usize,
-    candidate_list_byte_budget: usize,
+    limits: LandingSearchLimits,
     patch_cache: &mut crate::git::PatchIdCache,
 ) -> Result<LandingSearch, BrokerOpError> {
+    let LandingSearchLimits {
+        deadline,
+        query_budget,
+        candidate_list_byte_budget,
+    } = limits;
     if content.is_empty() {
         return Ok(LandingSearch {
             outcome: LandingOutcome::NothingToRepresent,
