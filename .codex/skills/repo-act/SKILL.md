@@ -681,6 +681,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   numeric value). Avoid changing profile settings on a warm target. Expand to
   verbose or workspace-wide runs only when explicitly needed or after a
   focused failure.
+- For a slow CLI rebuild, a temporary diagnostic runner can link the already
+  built engine library and call its public entrypoint. Record artifact identity
+  and compare outputs, but measure the actual release CLI before claiming an
+  end-to-end target: a runner can omit startup, routing, and packaging costs.
 - For path-identity fixture failures on macOS, inspect the inherited `TMPDIR`
   and its canonical path. Reproduce the exact named cases at the unchanged
   base, then rerun with an existing writable canonical temporary root (for
