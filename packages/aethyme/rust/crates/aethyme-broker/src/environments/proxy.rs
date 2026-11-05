@@ -553,23 +553,25 @@ fn open_upstream(port: u16, head: &Head) -> io::Result<Upstream> {
     if let Err(error) = upstream.write_all(&head.raw) {
         return Ok(Upstream::Lost(error));
     }
-    // macOS refuses a socket option once the peer has closed, even with its
-    // response waiting to be read: neither call's failure says the upstream is
-    // lost. Only the peek decides, and a closed socket's reads cannot block.
-    let _ = upstream.set_read_timeout(Some(FIRST_BYTE_WINDOW));
-    let first = upstream.peek(&mut [0u8; 1]);
-    let _ = upstream.set_read_timeout(None);
+    // Polled rather than a read timeout: macOS refuses socket options once the
+    // peer has closed, even with its response waiting to be read.
+    upstream.set_nonblocking(true)?;
+    let deadline = Instant::now() + FIRST_BYTE_WINDOW;
+    let first = loop {
+        match upstream.peek(&mut [0u8; 1]) {
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            other => break other,
+        }
+    };
+    upstream.set_nonblocking(false)?;
     Ok(match first {
         Ok(0) => Upstream::Lost(io::ErrorKind::UnexpectedEof.into()),
         Ok(_) => Upstream::Ready(upstream),
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            ) =>
-        {
-            Upstream::Ready(upstream)
-        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Upstream::Ready(upstream),
         Err(error) => Upstream::Lost(error),
     })
 }
@@ -829,7 +831,7 @@ mod upstream_tests {
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0u8; 256];
-            stream.read(&mut request).unwrap();
+            assert!(stream.read(&mut request).unwrap() > 0);
             then(stream);
         });
         port
