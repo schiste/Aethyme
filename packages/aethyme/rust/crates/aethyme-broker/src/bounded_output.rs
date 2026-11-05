@@ -431,6 +431,33 @@ fn sleep_until_poll(deadline: Instant) {
     }
 }
 
+/// One owned-group spawn at a time in this process.
+///
+/// A spawn that overlaps another can leave the other's pipe ends open in the
+/// new child: on macOS a pipe is not close-on-exec until after it is created,
+/// and elsewhere the forked child holds them until it execs. Those probes then
+/// look as if a descendant kept their output open after their group was gone,
+/// and an unproven cleanup refuses the gate, so concurrent profile probes
+/// failed gate dispatch at random.
+#[cfg(unix)]
+static OWNED_GROUP_SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(unix)]
+fn spawn_in_owned_group(command: &mut Command) -> io::Result<Child> {
+    use std::os::unix::process::CommandExt;
+
+    // The guarded value is empty, so a panicking holder leaves nothing to repair.
+    let _spawning = OWNED_GROUP_SPAWN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+}
+
 /// Run a short-lived profile probe in a process group owned by this call.
 ///
 /// Unlike [`output_limited`], this path also stops cooperative descendants
@@ -471,8 +498,6 @@ pub(crate) fn output_limited_in_owned_group_until(
     stop: &mut dyn FnMut() -> bool,
     partial: &mut PartialOutput,
 ) -> io::Result<Option<LimitedOutput>> {
-    use std::os::unix::process::CommandExt;
-
     let started = Instant::now();
     let deadline = started
         .checked_add(budget)
@@ -484,12 +509,7 @@ pub(crate) fn output_limited_in_owned_group_until(
         return Ok(Some(LimitedOutput::Deadline));
     }
 
-    let child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()?;
+    let child = spawn_in_owned_group(command)?;
     let process_group = child.id() as i32;
     let mut child = OwnedProbeChild::new(child, process_group);
     let mut stdout_reader = child
@@ -611,8 +631,6 @@ pub(crate) fn stream_stdout_to_writer_limited_in_owned_group<W: Write>(
     max_stderr_bytes: usize,
     writer: &mut W,
 ) -> io::Result<LimitedStreamOutput> {
-    use std::os::unix::process::CommandExt;
-
     let started = Instant::now();
     let deadline = started
         .checked_add(budget)
@@ -627,12 +645,7 @@ pub(crate) fn stream_stdout_to_writer_limited_in_owned_group<W: Write>(
         return Ok(LimitedStreamOutput::Deadline);
     }
 
-    let child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()?;
+    let child = spawn_in_owned_group(command)?;
     let process_group = child.id() as i32;
     let mut child = OwnedProbeChild::new(child, process_group);
     let mut stdout_reader = child
@@ -1270,6 +1283,32 @@ fn join_reader(reader: JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom, Write};
+
+    /// Overlapping spawns leak pipe ends into each other's children, so an
+    /// owned-group spawn waits for the one in progress.
+    #[cfg(unix)]
+    #[test]
+    fn owned_group_spawns_never_overlap() {
+        let held = OWNED_GROUP_SPAWN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (sender, receiver) = mpsc::channel();
+        let spawner = std::thread::spawn(move || {
+            let mut command = Command::new("true");
+            let result = output_limited_in_owned_group(&mut command, Duration::from_secs(60), 64);
+            sender.send(()).unwrap();
+            result
+        });
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a spawn ran while another held the claim"
+        );
+        drop(held);
+        assert!(matches!(
+            spawner.join().unwrap().unwrap(),
+            LimitedOutput::Completed(_)
+        ));
+    }
 
     #[cfg(unix)]
     fn assert_process_absent(pid: u32) {
