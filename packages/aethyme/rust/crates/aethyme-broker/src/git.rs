@@ -210,6 +210,26 @@ pub enum CherrySide {
     Right,
 }
 
+/// Patch identities reused only within one landing audit or cleanup plan.
+/// Entries are scoped to the repository and are published only after a full,
+/// successful Git batch. Empty diffs are cached as `None`.
+#[derive(Debug, Default)]
+pub(crate) struct PatchIdCache {
+    entries: std::collections::BTreeMap<(PathBuf, String), Option<String>>,
+    #[cfg(test)]
+    hits: usize,
+}
+
+#[cfg(test)]
+impl PatchIdCache {
+    pub(crate) fn hit_count(&self) -> usize {
+        self.hits
+    }
+}
+
+/// Cap retained entries; exceeding it only causes a subsequent re-computation.
+const MAX_PATCH_ID_CACHE_ENTRIES: usize = 65_536;
+
 /// Both side-specific patch-equivalence results for one symmetric range.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PairedCherryMarks {
@@ -4779,10 +4799,20 @@ impl GitRepo {
     /// either side has no commits, neither side can have a patch-equivalent
     /// commit, so the nonempty side is returned as non-equivalent without
     /// generating patches.
+    #[cfg(test)]
     pub(crate) fn cherry_marked_both(
         &self,
         left: &str,
         right: &str,
+    ) -> Result<PairedCherryMarks, GitError> {
+        self.cherry_marked_both_cached(left, right, &mut PatchIdCache::default())
+    }
+
+    pub(crate) fn cherry_marked_both_cached(
+        &self,
+        left: &str,
+        right: &str,
+        cache: &mut PatchIdCache,
     ) -> Result<PairedCherryMarks, GitError> {
         let range = format!("{left}...{right}");
         let left = self.cherry_side_commits(&range, "--left-only")?;
@@ -4808,7 +4838,7 @@ impl GitRepo {
             .filter(|(_, has_parent)| *has_parent)
             .map(|(commit, _)| commit.clone())
             .collect::<Vec<_>>();
-        let patch_ids = self.first_parent_patch_ids(&with_parent)?;
+        let patch_ids = self.cached_first_parent_patch_ids(&with_parent, cache)?;
         let left_patch_ids = left
             .iter()
             .filter_map(|(commit, _)| patch_ids.get(commit).map(String::as_str))
@@ -4839,6 +4869,44 @@ impl GitRepo {
             left_only: left,
             right_only: right,
         })
+    }
+
+    /// Reuse only successful, complete batches; missing IDs represent empty
+    /// diffs, never errors. Callers still perform their exact tree checks.
+    fn cached_first_parent_patch_ids(
+        &self,
+        commits: &[String],
+        cache: &mut PatchIdCache,
+    ) -> Result<BTreeMap<String, String>, GitError> {
+        // A warm cache must not bypass the caller's inspection deadline.
+        let started = Instant::now();
+        effective_git_deadline("cached patch-id", git_timeout(), started)?;
+        let missing = commits
+            .iter()
+            .filter(|commit| {
+                !cache
+                    .entries
+                    .contains_key(&(self.root.clone(), (*commit).clone()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let fresh = self.first_parent_patch_ids(&missing)?;
+        let mut result = fresh.clone();
+        for commit in commits {
+            let key = (self.root.clone(), commit.clone());
+            if let Some(value) = cache.entries.get(&key) {
+                #[cfg(test)]
+                {
+                    cache.hits += 1;
+                }
+                if let Some(value) = value {
+                    result.insert(commit.clone(), value.clone());
+                }
+            } else if cache.entries.len() < MAX_PATCH_ID_CACHE_ENTRIES {
+                cache.entries.insert(key, fresh.get(commit).cloned());
+            }
+        }
+        Ok(result)
     }
 
     /// Commits reachable from `to` that descend from `from`, excluding
@@ -9815,6 +9883,66 @@ mod batched_commit_tests {
             }
         }
         (patch_ids, log_output.stdout)
+    }
+
+    #[test]
+    fn patch_id_cache_reuses_complete_batches_without_changing_cherry_marks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("base"), "base\n").unwrap();
+        run(root, &["add", "base"]);
+        run(root, &["commit", "-qm", "base"]);
+        run(root, &["branch", "worker1"]);
+        run(root, &["branch", "worker2"]);
+        std::fs::write(root.join("target"), "target\n").unwrap();
+        run(root, &["add", "target"]);
+        run(root, &["commit", "-qm", "target"]);
+        run(root, &["commit", "--allow-empty", "-qm", "empty"]);
+        let empty = run(root, &["rev-parse", "HEAD"]);
+        for branch in ["worker1", "worker2"] {
+            run(root, &["checkout", "-q", branch]);
+            std::fs::write(root.join(branch), format!("{branch}\n")).unwrap();
+            run(root, &["add", branch]);
+            run(root, &["commit", "-qm", branch]);
+        }
+        let repo = GitRepo::discover(root).unwrap();
+        let mut cache = PatchIdCache::default();
+        for branch in ["worker1", "worker2"] {
+            let expected = repo.cherry_marked_both("main", branch).unwrap();
+            let actual = repo
+                .cherry_marked_both_cached("main", branch, &mut cache)
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
+        assert!(
+            cache.hits >= 2,
+            "the second comparison must reuse target patches"
+        );
+        assert_eq!(cache.entries.get(&(repo.root.clone(), empty)), Some(&None));
+
+        let before = cache.entries.clone();
+        let bad = "0000000000000000000000000000000000000001".to_string();
+        assert!(
+            repo.cached_first_parent_patch_ids(&[bad], &mut cache)
+                .is_err()
+        );
+        assert_eq!(
+            cache.entries, before,
+            "a failed batch must not populate the cache"
+        );
+
+        let deadline = limit_git_until(Instant::now() - Duration::from_millis(1));
+        let existing = before.keys().next().unwrap().1.clone();
+        assert!(matches!(
+            repo.cached_first_parent_patch_ids(&[existing], &mut cache),
+            Err(GitError::TimedOut { .. })
+        ));
+        drop(deadline);
+        assert_eq!(
+            cache.entries, before,
+            "an expired query must not change cached evidence"
+        );
     }
 
     #[test]
