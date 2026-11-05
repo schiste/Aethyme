@@ -22,7 +22,8 @@ protect their session unless the exact live holder's opted-in task lease has
 expired and its stale grace has elapsed.
 
 Closed checkouts have a one-day grace period. Configure retention in the primary
-repository's `.aethyme/broker.toml`:
+repository's `.aethyme/broker.toml`. Existing explicit overrides continue to
+apply after an upgrade:
 
 ```toml
 [retention]
