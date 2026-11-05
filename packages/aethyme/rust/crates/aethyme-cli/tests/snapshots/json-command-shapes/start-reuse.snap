@@ -32,6 +32,7 @@
     "head": "string",
     "reference": "string",
     "suggested_command": "null",
+    "sync_impact": "string",
     "would_conflict": "bool"
   },
   "diff_base": "string",
