@@ -341,6 +341,11 @@ fn push_reports_a_clean_default_branch_change_as_clean() {
     assert_eq!(drift["behind"], 1, "{drift}");
     assert_eq!(drift["would_conflict"], false, "{drift}");
     assert_eq!(drift["conflicting_paths"], serde_json::json!([]));
+    assert_eq!(
+        drift["sync_impact"], "unknown",
+        "missing graph evidence must not defer sync: {drift}"
+    );
+    assert!(drift["suggested_command"].is_string(), "{drift}");
 }
 
 #[test]
