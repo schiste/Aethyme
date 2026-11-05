@@ -49,6 +49,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- For short CLI benchmarks, wait on OS process-exit notifications rather than
+  adding a polling sleep to the measured wall time. Collect CPU time and peak
+  RSS from the completed child, normalize platform-specific RSS units, and
+  retain raw command receipts. Before long runs, exercise success, nonzero exit,
+  and timeout controls through the exact runner; signal only the owned process
+  group before reaping it. Verify semantic output equality before comparing speed.
+
 - When changing a retention default, inspect fixtures that inherit the default
   as well as tests with explicit overrides. Update their age assumptions and
   reference documentation; exercise retention and expiry on both sides of the
