@@ -2718,6 +2718,27 @@ fn write_action_required(
 
 #[cfg(test)]
 mod verdict_tests {
+    /// Promotion is opt-in: no file, and a file that does not choose, both
+    /// verify only. Choosing still works.
+    #[test]
+    fn a_repository_promotes_only_when_it_chooses_to() {
+        let mode = |text: Option<&str>| PromoteConfig::from_text(text).0.mode;
+        assert_eq!(mode(None), PromoteMode::VerifyOnly);
+        assert_eq!(mode(Some("schema = 1\n")), PromoteMode::VerifyOnly);
+        assert_eq!(
+            mode(Some("[promote]\nbranch = \"x\"\n")),
+            PromoteMode::VerifyOnly
+        );
+        assert_eq!(
+            mode(Some("[promote]\nmode = \"auto\"\n")),
+            PromoteMode::Auto
+        );
+        assert_eq!(
+            mode(Some("[promote]\nmode = \"manual\"\n")),
+            PromoteMode::Manual
+        );
+    }
+
     use super::{GateVerdict, gate_verdict};
     use crate::gates::GateRunOutcome;
     use crate::types::{GateEnvironment, GateFailureClass, GateStatus};
