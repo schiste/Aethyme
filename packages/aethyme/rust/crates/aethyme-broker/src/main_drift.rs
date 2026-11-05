@@ -42,8 +42,116 @@ pub struct DefaultBranchDrift {
     pub would_conflict: bool,
     /// Up to [`CONFLICT_SAMPLE`] conflicting paths.
     pub conflicting_paths: Vec<String>,
+    /// Revision-bound relationship assessment; unknown keeps the conservative sync advice.
+    #[serde(default)]
+    pub sync_impact: SyncImpact,
     /// How to catch up, when the branch is behind.
     pub suggested_command: Option<String>,
+}
+
+/// Whether the changed surfaces can safely defer an intermediate sync.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncImpact {
+    #[default]
+    Unknown,
+    Related,
+    Disjoint,
+}
+
+/// A disjoint verdict is valid only for clean, exactly indexed revisions on
+/// both sides. Missing files, graph coverage or relationships are not proof.
+pub(crate) fn assess_sync_impact(
+    repo: &GitRepo,
+    worktree: &std::path::Path,
+    drift: &mut DefaultBranchDrift,
+) {
+    use crate::graph_impact::{
+        GRAPH_IMPACT_MAX_BUDGET, GraphImpactContractStatus, GraphImpactMode,
+        GraphStoreImpactProvider, revision_bound_impact_report,
+    };
+    use std::collections::BTreeSet;
+    if drift.behind == 0 || drift.would_conflict {
+        return;
+    }
+    let Ok(local) = GitRepo::discover(worktree) else {
+        return;
+    };
+    if local.resolve_ref("HEAD").as_deref() != Some(drift.head.as_str())
+        || !matches!(local.changed_files(&drift.head), Ok(files) if files.is_empty())
+    {
+        return;
+    }
+    let Ok(base) = repo.merge_base(&drift.head, &drift.commit) else {
+        return;
+    };
+    let (Ok(ours), Ok(theirs)) = (
+        repo.changed_between_all_paths(&base, &drift.head),
+        repo.changed_between_all_paths(&base, &drift.commit),
+    ) else {
+        return;
+    };
+    if ours.is_empty() || theirs.is_empty() {
+        return;
+    }
+    let ours_set: BTreeSet<_> = ours.iter().cloned().collect();
+    if theirs.iter().any(|p| ours_set.contains(p)) {
+        drift.sync_impact = SyncImpact::Related;
+        return;
+    }
+    let mut surfaces = [BTreeSet::new(), BTreeSet::new()];
+    for (root, revision) in [
+        (local.root(), drift.head.as_str()),
+        (repo.root(), drift.commit.as_str()),
+    ] {
+        for (index, files) in [&ours, &theirs].into_iter().enumerate() {
+            for mode in [
+                GraphImpactMode::Calls,
+                GraphImpactMode::Imports,
+                GraphImpactMode::Documents,
+            ] {
+                let Ok(report) = revision_bound_impact_report(
+                    root,
+                    revision,
+                    revision,
+                    files,
+                    mode,
+                    GRAPH_IMPACT_MAX_BUDGET,
+                    &GraphStoreImpactProvider,
+                ) else {
+                    return;
+                };
+                if report.status != GraphImpactContractStatus::Complete
+                    || report.coverage.unsupported_files > 0
+                    || report.coverage.excluded_files > 0
+                    || report.risk_hints.global_config_surface
+                    || report.risk_hints.workspace_surface
+                {
+                    return;
+                }
+                let impact = report.impact;
+                surfaces[index].extend(files.iter().cloned());
+                for paths in [
+                    impact.direct,
+                    impact.transitive,
+                    impact.callers,
+                    impact.importers,
+                    impact.documents,
+                    impact.tests,
+                    impact.configs,
+                    impact.manifests,
+                ] {
+                    surfaces[index].extend(paths);
+                }
+            }
+        }
+    }
+    if !surfaces[0].is_disjoint(&surfaces[1]) {
+        drift.sync_impact = SyncImpact::Related;
+        return;
+    }
+    drift.sync_impact = SyncImpact::Disjoint;
+    drift.suggested_command = None;
 }
 
 /// How a branch catches up with the default branch.
@@ -108,6 +216,7 @@ pub(crate) fn measure(
         ahead,
         would_conflict: !conflicts.is_empty(),
         conflicting_paths: conflicts.into_iter().take(CONFLICT_SAMPLE).collect(),
+        sync_impact: SyncImpact::Unknown,
         suggested_command: (behind > 0).then(|| catch_up.command(remote, reference)),
     })
 }
@@ -152,7 +261,7 @@ impl crate::Broker {
             };
             let key = cache_key(session.id);
             let raw = self.store_ref().meta_get(&key).ok().flatten();
-            let drift = match cached(raw.as_deref(), &head, &default.commit) {
+            let mut drift = match cached(raw.as_deref(), &head, &default.commit) {
                 Some(drift) => drift,
                 None if budget > 0 => {
                     budget -= 1;
@@ -171,6 +280,16 @@ impl crate::Broker {
                 }
                 None => continue,
             };
+            drift.sync_impact = SyncImpact::Unknown;
+            if drift.behind > 0 {
+                let catch_up = CatchUp::for_branch(repo, &default.remote, &session.branch);
+                drift.suggested_command = Some(catch_up.command(&default.remote, &reference));
+                assess_sync_impact(
+                    repo,
+                    std::path::Path::new(&session.worktree_path),
+                    &mut drift,
+                );
+            }
             if let Some(row) = behind_main_row(session.id, &drift) {
                 advice.push(row);
             }
@@ -193,6 +312,15 @@ fn behind_main_row(session_id: i64, drift: &DefaultBranchDrift) -> Option<crate:
                 drift.behind,
                 drift.reference,
                 drift.conflicting_paths.join(", ")
+            ),
+        )
+    } else if drift.sync_impact == SyncImpact::Disjoint {
+        (
+            crate::StatusAdviceSeverity::Info,
+            "the changed surfaces are graph-disjoint",
+            format!(
+                "session {session_id} is {} commit(s) behind {}; graph impact is disjoint, so intermediate sync may be deferred; validate the current merge candidate before merging",
+                drift.behind, drift.reference
             ),
         )
     } else {
@@ -237,6 +365,7 @@ mod tests {
             ahead: 1,
             would_conflict: true,
             conflicting_paths: vec!["a.txt".into()],
+            sync_impact: SyncImpact::Unknown,
             suggested_command: Some("git fetch origin && git merge origin/main".into()),
         }
     }

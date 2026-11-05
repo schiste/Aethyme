@@ -382,8 +382,9 @@ before duplicating work.
    `aethyme broker push --session <id>`. Once there is a first meaningful
    commit, open a draft PR with `aethyme broker push --session <id> --pr`, and
    keep pushing until it is ready. Run `aethyme broker sync --session <id>`
-   before resuming a reused session and whenever push reports the branch is
-   behind the default branch. Never leave work only in the worktree.
+   before resuming a reused session and when push reports related or unknown
+   impact. A graph-disjoint verdict permits deferring intermediate sync; validate
+   the current merge candidate before merging. Never leave work only in the worktree.
 3. When done: `aethyme broker submit --session <id>`, then
    `aethyme broker finish --session <id>` (it refuses while commits are unpushed).
 
@@ -1130,13 +1131,17 @@ mod tests {
             .first()
             .expect("at least one substantive commit policy")
             .required_sections;
-        assert!(substantive
-            .iter()
-            .all(|policy| policy.required_sections == required_sections));
-        assert!(COMMIT_POLICIES
-            .iter()
-            .filter(|policy| !policy.body_required)
-            .all(|policy| policy.required_sections.is_empty()));
+        assert!(
+            substantive
+                .iter()
+                .all(|policy| policy.required_sections == required_sections)
+        );
+        assert!(
+            COMMIT_POLICIES
+                .iter()
+                .filter(|policy| !policy.body_required)
+                .all(|policy| policy.required_sections.is_empty())
+        );
 
         let doc = render_agents_document(None).unwrap();
         assert!(doc.contains(&format!("Types: {}.", policy_list(&all))));
@@ -1334,7 +1339,7 @@ mod tests {
             "`aethyme broker status --json` when exact session or lease-path evidence is",
             "Commit early and small, and after each commit run\n   `aethyme broker push --session <id>`",
             "open a draft PR with `aethyme broker push --session <id> --pr`",
-            "keep pushing until it is ready. Run `aethyme broker sync --session <id>`\n   before resuming a reused session and whenever push reports the branch is\n   behind the default branch. Never leave work only in the worktree.",
+            "keep pushing until it is ready. Run `aethyme broker sync --session <id>`\n   before resuming a reused session and when push reports related or unknown\n   impact. A graph-disjoint verdict permits deferring intermediate sync; validate\n   the current merge candidate before merging. Never leave work only in the worktree.",
             "`aethyme broker finish --session <id>` (it refuses while commits are unpushed)",
             "authorizes pushing your own\nsession branch and opening a draft PR; nothing else.",
             "`aethyme broker advanced git`",
