@@ -4,6 +4,29 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.59] - 2026-11-05
+
+### Added
+
+- Add bounded, age-scoped cleanup of closed worktrees, with recently reused checkouts excluded and ownership rechecked under the lifecycle lock (#1453).
+
+### Fixed
+
+- Reuse pinned preparation-cache roots during recovery validation, halving full ancestor-path walks while retaining ownership and replacement checks (#1463).
+- Keep host-state worktrees under a symlinked parent (#1461).
+- Wait for lifecycle claims and identify the session holding them (#1458).
+- Hold environment requests through a redeploy instead of failing them (#1457).
+- Follow the newer run when merge-chain encounters a cancelled base run (#1455).
+- Make verify-only the default promotion mode (#1456).
+
+### Changed
+
+- Parallelize fresh worktree checkout (#1459).
+- Render only retained Explore source-search hits (#1451).
+- Reuse integration branches and retention indexes during cleanup, and avoid decoding operation history during GC planning (#1445, #1447, #1449).
+- Stop repeating subsets of the workspace test suite on main (#1450).
+- Clarify paused artifact-sweep status and document lightweight profiling techniques (#1448, #1452, #1454).
+
 ## [0.8.58] - 2026-11-05
 
 ### Added
