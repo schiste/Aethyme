@@ -278,7 +278,7 @@ impl Broker {
             vec![head]
         });
         let integration = crate::merge::PromoteConfig::load(&self.main_root_path()).branch;
-        if let Some(commit) = self.integration_tip() {
+        if let Some(commit) = repo.resolve_ref(&format!("refs/heads/{integration}")) {
             refs.insert(format!("refs/heads/{integration}={commit}"));
             if let Some(targets) = &mut delivery_targets {
                 targets.push(commit);
