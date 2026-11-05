@@ -6817,9 +6817,25 @@ impl Broker {
         promote: &crate::PromoteConfig,
     ) -> Result<ReuseTarget, BrokerOpError> {
         if promote.mode == crate::PromoteMode::VerifyOnly {
-            return Err(reuse_freshness_refusal(
-                "the session base source is unknown and verify-only policy does not select the integration branch; start a new session with an explicit base",
-            ));
+            // An adopted session records no base source. Verify-only never
+            // selects integration, so check it against the base a new session
+            // would get. `evidence: None` keeps this a containment check: the
+            // relation below refuses to move a checkout that is behind it.
+            let base = self
+                .select_session_start_base_with_promote(None, promote)
+                .map_err(|error| {
+                    reuse_freshness_refusal(format!(
+                        "the session base source is unknown and no base could be selected: {error}; start a new session with an explicit base"
+                    ))
+                })?;
+            return Ok(ReuseTarget {
+                reference: base.ref_name,
+                commit: base.commit,
+                evidence: None,
+                default_ref: base.default_ref,
+                promote_branch: promote.branch.clone(),
+                verify_ref: true,
+            });
         }
         let reference = format!("refs/heads/{}", promote.branch);
         let commit = self.repo.resolve_ref(&reference).ok_or_else(|| {
