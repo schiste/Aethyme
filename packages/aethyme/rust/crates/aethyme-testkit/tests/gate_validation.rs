@@ -3,8 +3,9 @@
 //! From 2026-09-30 to 2026-10-01 the gate ran `cargo test --workspace
 //! --examples`, which restricts Cargo to example targets: three example
 //! binaries ran and no library, binary or integration test did. Nothing
-//! failed, so nothing noticed. Aethyme Gates on `main` and every local
-//! `broker submit` use this gate, and a release requires it to pass.
+//! failed, so nothing noticed. Every local `broker submit` uses this gate. On
+//! `main`, Aethyme Gates runs the suite in shards instead, with the same
+//! coverage, and a release requires it to pass (`ci_validation.rs`).
 
 use std::path::PathBuf;
 
@@ -30,11 +31,6 @@ fn cargo_test_command() -> String {
 fn cargo_test_runs(command: &str) -> Vec<String> {
     command
         .split(['&', ';'])
-        // The gate runs each step through its timing helper: `phase NAME cargo ...`.
-        .map(|part| match part.find("cargo test") {
-            Some(start) if part.trim_start().starts_with("phase ") => &part[start..],
-            _ => part,
-        })
         .map(str::trim)
         .filter(|part| part.starts_with("cargo test"))
         .map(str::to_owned)
@@ -93,8 +89,7 @@ fn the_nextest_path_runs_the_whole_workspace_and_the_doctests() {
     let nextest = command
         .split(['&', ';'])
         .map(str::trim)
-        // The test build's `--no-run` step precedes it; this is the real run.
-        .find(|part| part.contains("cargo nextest run") && !part.contains("--no-run"))
+        .find(|part| part.contains("cargo nextest run"))
         .unwrap_or_else(|| panic!("no nextest run in the cargo-test gate: {command}"));
     assert!(
         nextest.contains("--workspace")
@@ -124,8 +119,7 @@ fn the_nextest_path_runs_the_whole_workspace_and_the_doctests() {
         Some(2)
     );
     assert!(
-        command
-            .contains("export AETHYME_TESTKIT_PREBUILT_BINS=1; phase test-run cargo nextest run")
+        command.contains("AETHYME_TESTKIT_PREBUILT_BINS=1 cargo nextest run")
             && command.contains("cargo build --locked --workspace --bins"),
         "nextest needs the product binaries built first: {command}"
     );

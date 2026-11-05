@@ -19,10 +19,6 @@ status-level = "fail"
 # Bound each test process so a hang cannot hold the local gate indefinitely.
 slow-timeout = { period = "60s", terminate-after = 5 }
 
-[profile.local.junit]
-# Per-test detail for the cargo-test gate's telemetry (.aethyme/gates.toml).
-path = "junit.xml"
-
 [profile.ci]
 # Report every failure in one run instead of stopping at the first.
 fail-fast = false

@@ -115,6 +115,11 @@ max_bytes = 12884901888
 
 [[gate]]
 name = "cargo-test"
+# 2026-11-05: Aethyme Gates no longer runs this command on main. It takes 20
+# minutes on one saturated runner, so the workflow runs the same suites as jobs:
+# one compile, then partitions on separate runners, as pull requests do
+# (`the_cargo_test_jobs_run_the_pull_request_suite` in ci_validation.rs). This
+# command stays the definition for local `broker submit`.
 # 2026-09-29: --no-fail-fast. Without it the run stops at the first failing
 # test binary, so a change breaking several suites surfaced one per submit:
 # session 716 took 10 submits and 5 h 45 m, each revealing a new binary (#411).
@@ -144,13 +149,7 @@ name = "cargo-test"
 # cannot change them. The bounds protect a shared workstation, but they left
 # GitHub's 4-core runner at a load of about 1 while this gate used 2292-2400 s
 # of its 2400 s limit, and timed out on main three times that day.
-# 2026-11-04: AETHYME_GATE_PHASES names a file for each phase's seconds and exit
-# status, and adds Cargo's timing report to the test build. Only
-# aethyme-gates.yml sets it. A passing gate otherwise prints no detail at all, so
-# nothing could say whether its time went to compiling or to the tests. The test
-# build is its own phase for the same reason, and nextest's JUnit report comes
-# from [profile.local.junit] in .config/nextest.toml.
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-1}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" CARGO_PROFILE_DEV_DEBUG=1 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && m=packages/aethyme/rust/Cargo.toml; phase() { name=$1; shift; began=$(date +%s); "$@"; status=$?; if [ -n "${AETHYME_GATE_PHASES:-}" ]; then printf "%s\t%s\t%s\n" "$name" "$(($(date +%s) - began))" "$status" >> "$AETHYME_GATE_PHASES"; fi; return "$status"; }; if cargo nextest --version >/dev/null 2>&1; then phase product-binaries cargo build --locked --workspace --bins --quiet --manifest-path "$m" && phase test-build cargo nextest run --locked --workspace --profile local --build-jobs "$CARGO_BUILD_JOBS" --cargo-quiet --manifest-path "$m" --no-run ${AETHYME_GATE_PHASES:+--timings} && ( export AETHYME_TESTKIT_PREBUILT_BINS=1; phase test-run cargo nextest run --locked --workspace --profile local --build-jobs "$CARGO_BUILD_JOBS" --no-fail-fast --cargo-quiet --manifest-path "$m" ); suite=$?; phase doctests cargo test --locked --workspace --doc --quiet --no-fail-fast --manifest-path "$m"; doc=$?; else phase workspace-tests cargo test --locked --workspace --quiet --no-fail-fast --manifest-path "$m"; suite=$?; doc=0; fi; phase examples cargo test --locked --workspace --examples --quiet --no-fail-fast --manifest-path "$m"; examples=$?; [ "$suite" -eq 0 ] && [ "$doc" -eq 0 ] && [ "$examples" -eq 0 ]'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-1}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" CARGO_PROFILE_DEV_DEBUG=1 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && m=packages/aethyme/rust/Cargo.toml; if cargo nextest --version >/dev/null 2>&1; then cargo build --locked --workspace --bins --quiet --manifest-path "$m" && AETHYME_TESTKIT_PREBUILT_BINS=1 cargo nextest run --locked --workspace --profile local --build-jobs "$CARGO_BUILD_JOBS" --no-fail-fast --cargo-quiet --manifest-path "$m"; suite=$?; cargo test --locked --workspace --doc --quiet --no-fail-fast --manifest-path "$m"; doc=$?; else cargo test --locked --workspace --quiet --no-fail-fast --manifest-path "$m"; suite=$?; doc=0; fi; cargo test --locked --workspace --examples --quiet --no-fail-fast --manifest-path "$m"; examples=$?; [ "$suite" -eq 0 ] && [ "$doc" -eq 0 ] && [ "$examples" -eq 0 ]'
 cost = 3
 # 2026-09-26: raised from 1200. A full workspace run took 1056 s on a passing
 # gate that day and hit 1200 four times (sessions 677, 684, 621) while other

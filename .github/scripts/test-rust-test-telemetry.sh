@@ -51,7 +51,9 @@ cat > "$work/jobs.json" <<'JSON'
   {"name": "Rust workspace tests (shard 1/2)", "conclusion": "success",
    "created_at": "2026-11-04T07:03:30Z", "started_at": "2026-11-04T07:03:40Z", "completed_at": "2026-11-04T07:06:00Z", "steps": []},
   {"name": "Rust workspace tests", "conclusion": null,
-   "created_at": "2026-11-04T07:06:00Z", "started_at": "2026-11-04T07:06:05Z", "completed_at": null, "steps": []}
+   "created_at": "2026-11-04T07:06:00Z", "started_at": "2026-11-04T07:06:05Z", "completed_at": null, "steps": []},
+  {"name": "cargo-test gate (shard 1/2)", "conclusion": "success",
+   "created_at": "2026-11-04T07:03:30Z", "started_at": "2026-11-04T07:03:40Z", "completed_at": "2026-11-04T07:04:00Z", "steps": []}
 ]}
 JSON
 
@@ -71,7 +73,7 @@ assert s["slowest"][0]["name"] == "slow" and s["slowest"][0]["shard"] == "shard-
 assert [x["name"] for x in s["flaky"]] == ["wobbly"], s["flaky"]
 assert [x["name"] for x in s["failed"]] == ["broken"], s["failed"]
 jobs = {j["job"]: j for j in s["jobs"]}
-assert set(jobs) == {"Rust workspace tests (build)", "Rust workspace tests (shard 1/2)", "Rust workspace tests"}, jobs
+assert set(jobs) == {"Rust workspace tests (build)", "Rust workspace tests (shard 1/2)", "Rust workspace tests", "cargo-test gate (shard 1/2)"}, jobs
 assert jobs["Rust workspace tests"]["running"] and jobs["Rust workspace tests"]["seconds"] is None, jobs
 assert not jobs["Rust workspace tests (build)"]["running"], jobs
 build = jobs["Rust workspace tests (build)"]
