@@ -1629,6 +1629,12 @@ construction. The broker names that, from local facts only, and never blocks:
   secrets are cut line by line. A change this session was shown is not repeated
   until it moves. A diff that cannot be read says why and never fails the
   command. Set it to `false` to report overlaps without their contents.
+  The diffs are also in the post-commit conflict radar; `broker status` overlap
+  lists do not read them, so it stays fast. Secret removal is best effort: it
+  recognises common credentials and private keys, and files that exist to hold
+  secrets (`.env*`, `*.pem`, `*.key`, `id_rsa*` and similar) show only that they
+  changed. Set this to `false` where another session's uncommitted work must
+  not reach an agent's context.
 - **`[leases] idle_minutes` and `stale_grace_minutes`** (defaults 30 and 15):
   lease liveness is bound to the session's holder process (#360). A lease is
   `active` while that process runs, `idle` once it has issued no broker
