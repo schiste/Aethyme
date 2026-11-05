@@ -12,8 +12,15 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const LIFECYCLE_LOCK_WAIT: Duration = Duration::from_secs(10);
+/// How long a foreground lifecycle command waits for the claim. A start on
+/// Mockup (11,437 tracked files, load about 40) held it for 20-25 s, so a 10 s
+/// wait failed 102 starts in one day (2026-11-05), each leaving its agent to
+/// retry by hand. This covers about seven such holders queued ahead.
+const LIFECYCLE_LOCK_WAIT: Duration = Duration::from_secs(180);
 const LIFECYCLE_LOCK_POLL: Duration = Duration::from_millis(50);
+/// When a waiting command first says so, and how often after that.
+const LIFECYCLE_WAIT_NOTICE_AFTER: Duration = Duration::from_secs(5);
+const LIFECYCLE_WAIT_NOTICE_EVERY: Duration = Duration::from_secs(30);
 
 /// Open (creating if needed) a lock file without truncating it.
 pub(crate) fn open_lock_file(path: &Path) -> io::Result<File> {
@@ -34,8 +41,74 @@ pub(crate) fn open_lock_file(path: &Path) -> io::Result<File> {
 /// scoped to checkout creation/adoption/removal; ordinary edits, builds, and
 /// submissions do not acquire it. The lock file is never unlinked: doing so
 /// while another process holds it would allow a second inode at the same path.
+///
+/// Waits at most [`LIFECYCLE_LOCK_WAIT`], and never past an active command-scoped
+/// Git deadline such as `finish --timeout`.
 pub(crate) fn acquire_repository_lifecycle_lock(main_root: &Path) -> io::Result<ExclusiveFileLock> {
-    acquire_repository_lifecycle_lock_with_wait(main_root, LIFECYCLE_LOCK_WAIT)
+    let wait = crate::git::active_git_deadline().map_or(LIFECYCLE_LOCK_WAIT, |deadline| {
+        LIFECYCLE_LOCK_WAIT.min(deadline.saturating_duration_since(Instant::now()))
+    });
+    acquire_repository_lifecycle_lock_with_wait(main_root, wait)
+}
+
+/// The command holding the claim, for the first words of its arguments: `broker
+/// start`, never the free text or paths that follow them.
+fn lifecycle_operation() -> String {
+    std::env::args()
+        .skip(1)
+        .take_while(|word| !word.starts_with('-') && !word.contains(['/', '\\']))
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Say who holds the claim, for the next waiter. Telemetry only: a failed write
+/// must not fail the operation that already owns the lock, and the waiter reports
+/// an unidentified holder.
+fn record_lifecycle_holder(lock: &ExclusiveFileLock) {
+    crate::warn_unrecorded(
+        "record the worktree lifecycle lock holder",
+        lock.record_holder(&format!(
+            "pid={} since_ms={} operation={}",
+            std::process::id(),
+            crate::clock::epoch_ms(),
+            lifecycle_operation()
+        )),
+    );
+}
+
+/// The holder a contended lock file names, in words for the person waiting.
+///
+/// flock has no owner to ask, and the record is written just after locking, so
+/// it can briefly name the previous holder, and a binary older than this record
+/// writes none. A named process that has exited therefore says that the holder
+/// is unidentified, not that the lock is free.
+fn describe_lifecycle_holder(path: &Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let field = |name: &str| {
+        text.split_whitespace()
+            .find_map(|word| word.strip_prefix(name))
+            .map(str::to_owned)
+    };
+    let (Some(pid), Some(since_ms)) = (
+        field("pid=").and_then(|pid| pid.parse::<i64>().ok()),
+        field("since_ms=").and_then(|since| since.parse::<i64>().ok()),
+    ) else {
+        return "the holder did not record itself (an older aethyme binary?)".into();
+    };
+    if !crate::blockers::process_alive(pid) {
+        return format!(
+            "the last recorded holder, pid {pid}, has exited, so the current holder is \
+             unidentified (an older aethyme binary?)"
+        );
+    }
+    let operation = text
+        .split_once("operation=")
+        .map(|(_, operation)| operation.trim())
+        .filter(|operation| !operation.is_empty())
+        .unwrap_or("unknown operation");
+    let held_for = (crate::clock::epoch_ms() - since_ms).max(0) / 1000;
+    format!("pid {pid} ({operation}) has held it for {held_for} s and is running")
 }
 
 /// Make a nonblocking claim for a checkout lifecycle operation.
@@ -58,6 +131,7 @@ pub(crate) fn try_acquire_repository_lifecycle_lock(
         ));
     }
     verify_named_lock_file(&path, &lock.file)?;
+    record_lifecycle_holder(&lock);
     Ok(Some(lock))
 }
 
@@ -291,7 +365,9 @@ pub(crate) fn acquire_repository_lifecycle_lock_with_wait(
     wait: Duration,
 ) -> io::Result<ExclusiveFileLock> {
     let path = repository_lifecycle_lock_path(main_root)?;
-    let deadline = Instant::now() + wait;
+    let started = Instant::now();
+    let deadline = started + wait;
+    let mut next_notice = started + LIFECYCLE_WAIT_NOTICE_AFTER;
     loop {
         let file = open_lock_file_nofollow(&path)?;
         match ExclusiveFileLock::try_acquire(file)? {
@@ -306,20 +382,33 @@ pub(crate) fn acquire_repository_lifecycle_lock_with_wait(
                     ));
                 }
                 verify_named_lock_file(&path, &lock.file)?;
+                record_lifecycle_holder(&lock);
                 return Ok(lock);
             }
             None if Instant::now() >= deadline => {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     format!(
-                        "another broker lifecycle operation holds {}; retry this command after it finishes",
-                        path.display()
+                        "another broker lifecycle operation holds {}: {}; waited {} s, retry this command after it finishes",
+                        path.display(),
+                        describe_lifecycle_holder(&path),
+                        started.elapsed().as_secs(),
                     ),
                 ));
             }
-            None => thread::sleep(
-                LIFECYCLE_LOCK_POLL.min(deadline.saturating_duration_since(Instant::now())),
-            ),
+            None => {
+                let now = Instant::now();
+                if now >= next_notice {
+                    eprintln!(
+                        "waiting for the repository lifecycle lock: {}; waited {} of at most {} s",
+                        describe_lifecycle_holder(&path),
+                        started.elapsed().as_secs(),
+                        wait.as_secs(),
+                    );
+                    next_notice = now + LIFECYCLE_WAIT_NOTICE_EVERY;
+                }
+                thread::sleep(LIFECYCLE_LOCK_POLL.min(deadline.saturating_duration_since(now)));
+            }
         }
     }
 }
@@ -686,6 +775,83 @@ mod tests {
         std::fs::write(&path, b"holder").unwrap();
         let _lock = ExclusiveFileLock::acquire(open_lock_file(&path).unwrap()).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"holder");
+    }
+
+    #[test]
+    fn a_foreground_claim_outlasts_a_holder_past_the_old_ten_second_wait() {
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path().canonicalize().unwrap();
+        let held = acquire_repository_lifecycle_lock(&root).unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_secs(11));
+            drop(held);
+        });
+        let started = Instant::now();
+        acquire_repository_lifecycle_lock(&root).unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(10));
+        release.join().unwrap();
+    }
+
+    #[test]
+    fn a_foreground_claim_never_waits_past_the_commands_git_deadline() {
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path().canonicalize().unwrap();
+        let _held = acquire_repository_lifecycle_lock(&root).unwrap();
+        let started = Instant::now();
+        let error = crate::git::with_git_deadline(Duration::from_millis(200), || {
+            acquire_repository_lifecycle_lock(&root)
+        })
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_refusal_names_the_holder_how_long_it_held_and_that_it_runs() {
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path().canonicalize().unwrap();
+        let _held = acquire_repository_lifecycle_lock(&root).unwrap();
+        let message =
+            acquire_repository_lifecycle_lock_with_wait(&root, Duration::from_millis(100))
+                .err()
+                .unwrap()
+                .to_string();
+        assert!(
+            message.contains(&format!("pid {} (", std::process::id()))
+                && message.contains("has held it for")
+                && message.contains("is running")
+                && message.contains("retry this command"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_does_not_blame_an_exited_or_unrecorded_holder() {
+        let repository = tempfile::tempdir().unwrap();
+        let root = repository.path().canonicalize().unwrap();
+        let path = repository_lifecycle_lock_path(&root).unwrap();
+        // Held by something that recorded nothing, as an older binary does.
+        let held = ExclusiveFileLock::acquire(open_lock_file_nofollow(&path).unwrap()).unwrap();
+        let refusal = || {
+            acquire_repository_lifecycle_lock_with_wait(&root, Duration::from_millis(100))
+                .err()
+                .unwrap()
+                .to_string()
+        };
+        let message = refusal();
+        assert!(message.contains("did not record itself"), "{message}");
+
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let pid = exited.id();
+        exited.wait().unwrap();
+        held.record_holder(&format!("pid={pid} since_ms=1 operation=broker start"))
+            .unwrap();
+        let message = refusal();
+        assert!(
+            message.contains(&format!("pid {pid}, has exited")) && message.contains("unidentified"),
+            "{message}"
+        );
     }
 
     #[test]

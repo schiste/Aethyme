@@ -6191,6 +6191,25 @@ mod registered_removal_failure_tests {
         assert!(!storage.worktree_root().exists());
     }
 
+    /// Reported from Mockup: a start holds this claim for 20-25 s under load, and
+    /// the next start gave up after 10 s with no session and no worktree.
+    #[test]
+    fn start_waits_for_a_lifecycle_claim_held_past_ten_seconds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = initialized_repository(tmp.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let claim = crate::file_lock::acquire_repository_lifecycle_lock(&root).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(11));
+            drop(claim);
+        });
+        let session = broker.start_worktree("wait for the holder", None).unwrap();
+        release.join().unwrap();
+        assert_eq!(broker.store().live_sessions().unwrap().len(), 1);
+        assert!(std::path::Path::new(&session.worktree_path).exists());
+    }
+
     #[test]
     fn start_rechecks_the_floor_after_waiting_for_the_lifecycle_claim() {
         let tmp = tempfile::tempdir().unwrap();
