@@ -61,6 +61,7 @@ case "$1" in
         sha="${path#*/commits/}"
         respond "checks-${sha%%/*}"
         ;;
+      */actions/runs*event=push*) respond "pushes" ;;
       */actions/runs*)
         sha="${path#*head_sha=}"
         sha="${sha%%&*}"
@@ -391,6 +392,100 @@ fn a_red_base_after_a_merge_stops_the_chain() {
     assert!(!fixture.log().contains("pr view 6"), "{}", fixture.log());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("main is red after merging #5"), "{stdout}");
+}
+
+/// A merge followed quickly by another has its base run cancelled by the newer
+/// one (`cancel-in-progress`). That is not a red base: the newer run decides.
+#[test]
+fn a_base_run_cancelled_by_a_newer_merge_follows_the_newer_run() {
+    let fixture = fixture_with_a_cancelled_base_run();
+    fixture.script(
+        "pushes",
+        1,
+        &branch_runs(&[("CI", "in_progress", None, "2026-10-03T10:20:00Z")]),
+    );
+    fixture.script(
+        "pushes",
+        2,
+        &branch_runs(&[("CI", "completed", Some("success"), "2026-10-03T10:20:00Z")]),
+    );
+
+    let output = fixture.chain(&["5"]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    let log = fixture.log();
+    assert!(
+        log.contains("branch=main&event=push&created=%3E%3D2026-10-03T10:10:00Z"),
+        "{log}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("CI on mmm was cancelled by a newer main run"),
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("was cancelled by a newer").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(stdout.contains("waiting on CI"), "{stdout}");
+}
+
+/// The newer run tests a tree containing the merge, so its failure is a red base.
+#[test]
+fn a_newer_run_that_fails_still_stops_the_chain() {
+    let fixture = fixture_with_a_cancelled_base_run();
+    fixture.script(
+        "pushes",
+        1,
+        &branch_runs(&[("CI", "completed", Some("failure"), "2026-10-03T10:20:00Z")]),
+    );
+
+    let output = fixture.chain(&["5", "6"]);
+    assert_eq!(output.status.code(), Some(4), "{}", text(&output));
+    assert!(!fixture.log().contains("pr view 6"), "{}", fixture.log());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("main is red after merging #5: CI (failure)"),
+        "{stdout}"
+    );
+}
+
+/// A cancellation nothing followed means nobody tested the merge.
+#[test]
+fn a_cancelled_base_run_with_no_newer_run_stops_the_chain() {
+    let fixture = fixture_with_a_cancelled_base_run();
+    fixture.script(
+        "pushes",
+        1,
+        &branch_runs(&[("CI", "completed", Some("cancelled"), "2026-10-03T10:10:00Z")]),
+    );
+
+    let output = fixture.chain(&["5", "6"]);
+    assert_eq!(output.status.code(), Some(4), "{}", text(&output));
+    assert!(!fixture.log().contains("pr view 6"), "{}", fixture.log());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("main is red after merging #5: CI (cancelled)"),
+        "{stdout}"
+    );
+}
+
+fn fixture_with_a_cancelled_base_run() -> Fixture {
+    let fixture = Fixture::new();
+    fixture.script("pr-5", 1, &pr(5, "OPEN", false, "aaa", None));
+    fixture.script("compare-aaa", 1, r#"{"behind_by":0}"#);
+    fixture.script("checks-aaa", 1, &checks(GREEN));
+    fixture.script(
+        "pr-5@merged",
+        1,
+        &pr(5, "MERGED", false, "aaa", Some("mmm")),
+    );
+    fixture.script(
+        "runs-mmm",
+        1,
+        &branch_runs(&[("CI", "completed", Some("cancelled"), "2026-10-03T10:10:00Z")]),
+    );
+    fixture
 }
 
 /// Re-running after a stop skips what already merged, verifies the base on
