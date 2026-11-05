@@ -9,7 +9,9 @@
 //! command. A missing worktree, a Git failure or an expired deadline turns into
 //! an `unavailable` report that says why. The text comes from another agent, so
 //! each line is fenced with a prefix it cannot close, and labelled as not being
-//! instructions. Secrets are cut with [`crate::text_redaction::redact_secrets`].
+//! instructions. Secrets are cut with [`crate::text_redaction::redact_secrets`],
+//! which is best effort, so files that exist to hold secrets show only that
+//! they changed, and a private key is hidden from its first line to its last.
 //!
 //! The Git reads run on their own threads. That runs one holder's diff beside
 //! the next, so the wall-clock cost is about one holder's, and keeps a timeout
@@ -156,6 +158,7 @@ pub(crate) fn read_all(
     let joined = std::thread::scope(|scope| {
         scope
             .spawn(move || {
+                crate::git::drop_inherited_git_environment_on_this_thread();
                 let _deadline = limit_git_until(deadline);
                 let main = GitRepo::at_known_root(&main_root);
                 let branch = crate::merge::PromoteConfig::load(&main_root).branch;
@@ -167,6 +170,7 @@ pub(crate) fn read_all(
                         .iter()
                         .map(|request| {
                             inner.spawn(move || {
+                                crate::git::drop_inherited_git_environment_on_this_thread();
                                 let _deadline = limit_git_until(deadline);
                                 read_one(request, integration, upstream)
                             })
@@ -315,16 +319,36 @@ fn cap_diff(diff: &str, budget: &mut usize, omitted: &mut usize) -> Option<Strin
     }
     let mut shown = Vec::new();
     let mut in_file = 0;
+    let mut withheld = false;
+    let mut in_private_key = false;
     for line in diff.lines() {
-        if line.starts_with("diff --git ") {
+        let header = line.starts_with("diff --git ");
+        if header {
             in_file = 0;
+            withheld = secret_path_in_header(line);
+            // A key cut off by a hunk or a file boundary ends with its file.
+            in_private_key = false;
         }
+        if withheld && !header {
+            *omitted += 1;
+            continue;
+        }
+        if in_private_key {
+            in_private_key = !crate::text_redaction::closes_key_block(line);
+            *omitted += 1;
+            continue;
+        }
+        in_private_key = crate::text_redaction::opens_private_key(line);
         if in_file >= MAX_LINES_PER_FILE || *budget == 0 {
             *omitted += 1;
             continue;
         }
         in_file += 1;
         *budget -= 1;
+        if withheld {
+            shown.push(format!("{line} {WITHHELD}"));
+            continue;
+        }
         let line = crate::text_redaction::redact_secrets(line);
         let mut chars = line.chars();
         let mut kept: String = chars.by_ref().take(MAX_CHARS_PER_LINE).collect();
@@ -334,6 +358,49 @@ fn cap_diff(diff: &str, budget: &mut usize, omitted: &mut usize) -> Option<Strin
         shown.push(kept);
     }
     (!shown.is_empty()).then(|| shown.join("\n"))
+}
+
+const WITHHELD: &str = "[contents withheld: this kind of file holds secrets]";
+
+/// The paths named by a `diff --git a/x b/x` line, which end in the new name.
+fn secret_path_in_header(header: &str) -> bool {
+    let names = header.trim_start_matches("diff --git ");
+    names
+        .rsplit_once(" b/")
+        .or_else(|| names.rsplit_once(" \"b/"))
+        .is_some_and(|(old, new)| {
+            is_secret_path(new.trim_end_matches('"')) || is_secret_path(old.trim_matches('"'))
+        })
+}
+
+/// Files whose whole purpose is holding credentials. Examples of them are not.
+pub(crate) fn is_secret_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    if name.ends_with(".example")
+        || name.ends_with(".sample")
+        || name.ends_with(".template")
+        || name.ends_with(".dist")
+        || name.ends_with(".pub")
+    {
+        return false;
+    }
+    name == ".env"
+        || name.starts_with(".env.")
+        || [".pem", ".key", ".p12", ".pfx", ".jks", ".keystore"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+        || ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        || matches!(
+            name.as_str(),
+            ".npmrc" | ".pypirc" | ".netrc" | ".pgpass" | ".git-credentials" | "credentials"
+        )
+        || ["credentials", "secrets"].iter().any(|stem| {
+            [".json", ".yml", ".yaml", ".toml", ".env"]
+                .iter()
+                .any(|suffix| name == format!("{stem}{suffix}"))
+        })
 }
 
 /// Replace a change this session was already shown with a pointer to it. A
@@ -493,6 +560,94 @@ mod tests {
         assert!(!shown.contains("ghp_abcdef"), "{shown}");
         assert!(shown.contains("[redacted]"), "{shown}");
         assert!(shown.contains("+after"), "{shown}");
+    }
+
+    fn capped(diff: &str) -> (String, usize) {
+        let mut budget = MAX_LINES_PER_HOLDER;
+        let mut omitted = 0;
+        (cap_diff(diff, &mut budget, &mut omitted).unwrap(), omitted)
+    }
+
+    #[test]
+    fn a_private_key_is_hidden_from_its_first_line_to_its_last() {
+        let (shown, omitted) = capped(
+            "diff --git a/a b/a\n@@ -1 +1 @@\n+-----BEGIN RSA PRIVATE KEY-----\n+c2hvcnQ=\n+Proc-Type: 4\n+-----END RSA PRIVATE KEY-----\n+after\n",
+        );
+        assert!(shown.contains("+[redacted]"), "{shown}");
+        assert!(!shown.contains("c2hvcnQ"), "{shown}");
+        assert!(!shown.contains("Proc-Type"), "{shown}");
+        assert!(shown.contains("+after"), "{shown}");
+        assert_eq!(omitted, 3);
+    }
+
+    #[test]
+    fn a_key_cut_by_the_line_cap_or_its_file_does_not_leak_or_hide_the_next_file() {
+        // Its END line was never reached: the next file is ordinary again.
+        let (shown, _) = capped(
+            "diff --git a/a b/a\n+-----BEGIN PRIVATE KEY-----\n+c2hvcnQ=\ndiff --git a/b b/b\n+visible\n",
+        );
+        assert!(!shown.contains("c2hvcnQ"), "{shown}");
+        assert!(shown.contains("+visible"), "{shown}");
+
+        // The per-file cap lands inside the key.
+        let mut diff = String::from("diff --git a/a b/a\n");
+        for line in 0..(MAX_LINES_PER_FILE - 2) {
+            diff.push_str(&format!("+line {line}\n"));
+        }
+        diff.push_str("+-----BEGIN PRIVATE KEY-----\n+c2hvcnQ=\n+c2hvcnQy\n");
+        let (shown, _) = capped(&diff);
+        assert!(!shown.contains("c2hvcnQ"), "{shown}");
+    }
+
+    #[test]
+    fn a_deleted_or_context_key_is_hidden_too() {
+        for prefix in ["-", " "] {
+            let (shown, _) = capped(&format!(
+                "diff --git a/a b/a\n{prefix}-----BEGIN EC PRIVATE KEY-----\n{prefix}c2hvcnQ=\n"
+            ));
+            assert!(!shown.contains("c2hvcnQ"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn a_secret_file_shows_only_that_it_changed() {
+        let (shown, omitted) = capped(
+            "diff --git a/.env b/.env\nindex 1..2 100644\n+SHORT=x\n+plain\ndiff --git a/b b/b\n+visible\n",
+        );
+        assert!(
+            shown.contains("a/.env b/.env [contents withheld"),
+            "{shown}"
+        );
+        assert!(!shown.contains("plain"), "{shown}");
+        assert!(shown.contains("+visible"), "{shown}");
+        assert_eq!(omitted, 3);
+    }
+
+    #[test]
+    fn secret_paths_are_recognised_and_their_examples_are_not() {
+        for path in [
+            ".env",
+            "deploy/.env.production",
+            "certs/server.pem",
+            "certs/server.key",
+            "keys/id_rsa",
+            "keys/id_ed25519",
+            ".npmrc",
+            "config/credentials.json",
+            "config/secrets.yml",
+        ] {
+            assert!(is_secret_path(path), "{path}");
+        }
+        for path in [
+            ".env.example",
+            "keys/id_rsa.pub",
+            "src/secrets.rs",
+            "src/key.rs",
+            "src/env.rs",
+            "docs/credentials.md",
+        ] {
+            assert!(!is_secret_path(path), "{path}");
+        }
     }
 
     #[test]

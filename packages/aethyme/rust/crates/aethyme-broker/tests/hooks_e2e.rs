@@ -632,6 +632,33 @@ triggers = ["**/*.py"]
     assert!(String::from_utf8_lossy(&wt_blocked.stderr).contains("py-content"));
 }
 
+/// Git hands the hook this commit's `GIT_DIR` and `GIT_INDEX_FILE`. Read with those
+/// in place, the "other session's" diff would be the committer's own work.
+#[test]
+fn post_commit_radar_shows_the_other_sessions_change_not_the_committers() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let repo = GitRepo::discover(tmp.path()).unwrap();
+    hooks::install(&repo, Path::new(SHIM)).unwrap();
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let wt_a = add_worktree(tmp.path(), "diff-a");
+    let a = broker.adopt(&wt_a, Some("other")).unwrap();
+    std::fs::write(wt_a.join("src/app.py"), "a's edit\n").unwrap();
+    let wt_b = add_worktree(tmp.path(), "diff-b");
+    broker.adopt(&wt_b, Some("committer")).unwrap();
+    std::fs::write(wt_b.join("src/app.py"), "b's edit\n").unwrap();
+    broker.refresh_leases().unwrap();
+    assert!(a.id > 0);
+
+    sh(&wt_b, &["add", "src/app.py"]);
+    let commit = git_output(&wt_b, &["commit", "-qm", "b commits the contested file"]);
+
+    let stderr = String::from_utf8_lossy(&commit.stderr);
+    assert!(commit.status.success(), "{stderr}");
+    assert!(stderr.contains("| +a's edit"), "{stderr}");
+    assert!(!stderr.contains("b's edit"), "{stderr}");
+}
+
 #[test]
 fn post_commit_radar_warns_on_overlap_and_never_blocks() {
     let tmp = tempfile::tempdir().unwrap();

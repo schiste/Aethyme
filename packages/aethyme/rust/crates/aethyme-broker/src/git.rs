@@ -750,8 +750,24 @@ pub(crate) fn git_command() -> Command {
     let mut command = Command::new(&git_program().program);
     if graph_verification_git_enabled() {
         configure_isolated_graph_git_command(&mut command);
+    } else if DROP_INHERITED_GIT_ENVIRONMENT.with(std::cell::Cell::get) {
+        remove_git_environment(&mut command);
     }
     command
+}
+
+thread_local! {
+    static DROP_INHERITED_GIT_ENVIRONMENT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Every Git command this thread runs ignores `GIT_*` from the process
+/// environment. For a thread reading another checkout: Git hands a hook its own
+/// `GIT_DIR` and `GIT_INDEX_FILE`, which would answer for the committing worktree
+/// whatever directory the command runs in. Only for a thread that ends with its
+/// read, because nothing restores it.
+pub(crate) fn drop_inherited_git_environment_on_this_thread() {
+    DROP_INHERITED_GIT_ENVIRONMENT.with(|flag| flag.set(true));
 }
 
 fn resolve_git_program() -> GitProgram {
