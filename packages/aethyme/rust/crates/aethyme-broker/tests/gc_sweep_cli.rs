@@ -2619,9 +2619,27 @@ fn inline_sweep_removes_closed_cache_and_preserves_an_idle_open_cache() {
         closed_worktree.exists(),
         "automatic inline cleanup preserves the closed checkout"
     );
+    // The inline pass has a fixed 250 ms budget (INLINE_ARTIFACT_SWEEP_BUDGET_MS)
+    // and reports when it ran out. Only a pass that finished must have reclaimed
+    // the cache; a pass a slow host cut short leaves it to the next lane, which
+    // gets the same assertions below.
+    let report: serde_json::Value = serde_json::from_str(
+        &rusqlite::Connection::open(repo.path().join(".aethyme/broker.db"))
+            .unwrap()
+            .query_row(
+                "SELECT value FROM meta WHERE key LIKE 'gc.artifact_sweep.v2.%.last_report'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    if report["complete"] != serde_json::Value::Bool(true) {
+        sweep(repo.path(), container.path());
+    }
     assert!(
         !closed_worktree.join("rust/target").exists(),
-        "the same inline sweep reclaims the eligible closed cache"
+        "the sweep reclaims the eligible closed cache: {report}"
     );
     assert!(
         open_worktree.join("rust/target/CACHEDIR.TAG").exists(),

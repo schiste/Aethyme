@@ -470,6 +470,13 @@ mod unix {
         }
     }
 
+    /// How long one sidecar's name may keep moving before it is refused. A
+    /// time limit, not a pass count: on Linux an unlink shows zero links until
+    /// the unlinking process finishes it, and that process can be descheduled
+    /// for longer than many passes take (64 passes ran out on CI).
+    const SIDECAR_SETTLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
+    const SIDECAR_RECHECK_PAUSE: std::time::Duration = std::time::Duration::from_millis(1);
+
     #[derive(Clone, Copy)]
     enum SidecarCheckStage {
         Lstat,
@@ -1009,37 +1016,69 @@ mod unix {
         verify_parent(paths)?;
         for suffix in ["-journal", "-wal", "-shm"] {
             let sidecar = append_suffix(db_path, suffix);
-            let Some(before) = lstat_optional(&sidecar)? else {
-                continue;
-            };
-            if let Some(violation) = sidecar_metadata_violation(&before) {
-                return Err(sidecar_check_refusal(
-                    SidecarCheckStage::Lstat,
-                    &sidecar,
-                    violation,
-                ));
-            }
-            let expected = file_identity(&before);
-            let (_file, opened) =
-                SqliteProbeFile::open(&sidecar, SQLITE_PROBE_SIDECAR, "SQLite sidecar")?;
-            if let Some(violation) = sidecar_snapshot_violation(&opened, expected) {
-                return Err(sidecar_check_refusal(
-                    SidecarCheckStage::Opened,
-                    &sidecar,
-                    violation,
-                ));
-            }
-            let named =
-                fs::symlink_metadata(&sidecar).map_err(|source| io_error(&sidecar, source))?;
-            if let Some(violation) = sidecar_snapshot_violation(&named, expected) {
-                return Err(sidecar_check_refusal(
-                    SidecarCheckStage::Named,
-                    &sidecar,
-                    violation,
-                ));
+            let settle_by = std::time::Instant::now() + SIDECAR_SETTLE_LIMIT;
+            while let Some(changed) = check_existing_sidecar(&sidecar)? {
+                if std::time::Instant::now() >= settle_by {
+                    return Err(changed);
+                }
+                std::thread::sleep(SIDECAR_RECHECK_PAUSE);
             }
         }
         verify_parent(paths)
+    }
+
+    /// One pass over one sidecar. `Ok(None)` means it is absent or safe;
+    /// `Ok(Some(refusal))` means the name moved during the pass, which is what
+    /// SQLite does when another process's last connection closes (it unlinks
+    /// the WAL and SHM files) or a new one recreates them. The caller checks
+    /// the current name again and refuses only if it never settles. Anything
+    /// unsafe about the file a name currently resolves to still refuses at once.
+    fn check_existing_sidecar(sidecar: &Path) -> Result<Option<BrokerError>, BrokerError> {
+        let moved = |stage, violation: SidecarMetadataViolation| {
+            let refusal = sidecar_check_refusal(stage, sidecar, violation);
+            if matches!(
+                violation,
+                SidecarMetadataViolation::ZeroLinks | SidecarMetadataViolation::IdentityChanged
+            ) {
+                Ok(Some(refusal))
+            } else {
+                Err(refusal)
+            }
+        };
+        let Some(before) = lstat_optional(sidecar)? else {
+            return Ok(None);
+        };
+        if let Some(violation) = sidecar_metadata_violation(&before) {
+            return moved(SidecarCheckStage::Lstat, violation);
+        }
+        let expected = file_identity(&before);
+        let (_file, opened) =
+            match SqliteProbeFile::open(sidecar, SQLITE_PROBE_SIDECAR, "SQLite sidecar") {
+                Ok(opened) => opened,
+                Err(error) => {
+                    let still_there = lstat_optional(sidecar)?
+                        .is_some_and(|current| file_identity(&current) == expected);
+                    return if still_there {
+                        Err(error)
+                    } else {
+                        Ok(Some(error))
+                    };
+                }
+            };
+        if let Some(violation) = sidecar_snapshot_violation(&opened, expected) {
+            return moved(SidecarCheckStage::Opened, violation);
+        }
+        let Some(named) = lstat_optional(sidecar)? else {
+            return Ok(Some(sidecar_check_refusal(
+                SidecarCheckStage::Named,
+                sidecar,
+                SidecarMetadataViolation::IdentityChanged,
+            )));
+        };
+        if let Some(violation) = sidecar_snapshot_violation(&named, expected) {
+            return moved(SidecarCheckStage::Named, violation);
+        }
+        Ok(None)
     }
 
     pub(super) fn verify_legacy_database_file_for_binding(path: &Path) -> Result<(), BrokerError> {
@@ -3039,6 +3078,57 @@ mod unix {
             assert!(wal_path.is_file());
             drop(reopened);
             drop(store);
+        }
+
+        /// SQLite unlinks the WAL and SHM files when the last connection
+        /// closes, so another process can see either one disappear at any step
+        /// of the check. That is not an unsafe sidecar.
+        #[test]
+        fn a_sidecar_removed_by_the_last_connection_is_not_refused() {
+            const CHURN_DB: &str = "AETHYME_TEST_SIDECAR_CHURN_DB";
+            // Re-executed below as the other process. It has to be another
+            // process: SQLite retains descriptors on files its own process has
+            // open, which is not what a concurrent broker command looks like.
+            if let Some(db) = std::env::var_os(CHURN_DB) {
+                loop {
+                    let connection = rusqlite::Connection::open(&db).unwrap();
+                    connection
+                        .execute_batch(
+                            "PRAGMA journal_mode = WAL; \
+                             INSERT OR REPLACE INTO meta (key, value) VALUES ('test.churn', 'x');",
+                        )
+                        .unwrap();
+                }
+            }
+            let repo = tempfile::tempdir().unwrap();
+            init_repository(repo.path());
+            let db_path = repo.path().join(".aethyme/broker.db");
+            drop(open_in_repo(repo.path(), &db_path).unwrap());
+            let paths = prepare_paths(repo.path(), &db_path).unwrap();
+            let mut churn = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "store::fresh_database::unix::tests::a_sidecar_removed_by_the_last_connection_is_not_refused",
+                ])
+                .env(CHURN_DB, &paths.final_path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut checks = 0_u64;
+            let mut refused = None;
+            while std::time::Instant::now() < deadline && refused.is_none() {
+                checks += 1;
+                refused = check_existing_sidecars(&paths, &paths.final_path).err();
+            }
+            churn.kill().unwrap();
+            churn.wait().unwrap();
+            assert!(
+                refused.is_none(),
+                "refused after {checks} checks: {}",
+                refused.unwrap()
+            );
         }
 
         #[test]
