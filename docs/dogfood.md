@@ -61,7 +61,7 @@ aethyme broker advanced agents           # live sessions with activity-derived l
 
 # An agent's work is committed and ready:
 aethyme broker submit --session <id>     # simulate → affected gates on merged tree
-                                         # → auto-promotes to the LOCAL integration
+                                         # → with `[promote] mode = "auto"`, promotes to the LOCAL integration
                                          # branch when verified (default; [promote]
                                          # mode = "manual" for an explicit step)
 
