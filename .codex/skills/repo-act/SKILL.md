@@ -54,6 +54,13 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   reference documentation; exercise retention and expiry on both sides of the
   new window. Distinguish automatic grace from explicit reviewed cleanup, and
   report live policy overrides separately from an unreleased code default.
+- For graph producer test fixtures, use private repositories or clones with
+  independent Git metadata. Canonical graph writes intentionally refuse linked
+  worktrees and broker-managed repositories; do not bypass that guard.
+- For graph-backed fast paths, distinguish file parsing coverage from relationship
+  resolution. Inspect per-language use evidence and unresolved calls and imports;
+  missing or unresolved evidence cannot prove disjointness. Observed counts alone
+  do not certify relationship completeness.
 - For graph consumer changes, include a real producer-to-materialization-to-query
   fixture alongside hand-built store tests. Verify relationship endpoints resolve
   to the expected typed nodes, and move persisted fragments to a differently

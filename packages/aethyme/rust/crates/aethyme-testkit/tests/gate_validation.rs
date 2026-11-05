@@ -3,8 +3,9 @@
 //! From 2026-09-30 to 2026-10-01 the gate ran `cargo test --workspace
 //! --examples`, which restricts Cargo to example targets: three example
 //! binaries ran and no library, binary or integration test did. Nothing
-//! failed, so nothing noticed. Aethyme Gates on `main` and every local
-//! `broker submit` use this gate, and a release requires it to pass.
+//! failed, so nothing noticed. Every local `broker submit` uses this gate. On
+//! `main`, Aethyme Gates runs the suite in shards instead, with the same
+//! coverage, and a release requires it to pass (`ci_validation.rs`).
 
 use std::path::PathBuf;
 

@@ -123,6 +123,10 @@ pub fn environment_variables(
     let mut vars = BTreeMap::new();
     vars.insert("AETHYME_ENV_ID".to_string(), environment.env_id.clone());
     vars.insert("AETHYME_ENV_NAMESPACE".into(), bindings.namespace.clone());
+    vars.insert(
+        "AETHYME_ENV_COMPOSE_PROJECT".into(),
+        super::drivers::project_name(&bindings.namespace),
+    );
     vars.insert("AETHYME_ENV_PROFILE".into(), environment.profile.clone());
     vars.insert(
         "AETHYME_ENV_WORKTREE".into(),

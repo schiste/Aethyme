@@ -1378,7 +1378,7 @@ fn automatic_cleanup_honors_default_close_grace() {
 
     let report = run(&mut broker);
     assert!(report.removed.is_empty(), "{report:#?}");
-    assert!(kept_reason(&report, &worktree).contains("120 hour closed-worktree grace"));
+    assert!(kept_reason(&report, &worktree).contains("24 hour closed-worktree grace"));
     assert!(worktree.is_dir());
     // The same checkout is still eligible for the operator's explicit cleanup.
     assert!(
@@ -1442,11 +1442,7 @@ fn automatic_cleanup_releases_checkout_after_grace_expires() {
     let fx = fixture();
     let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (id, worktree, _) = merged_closed_session(&fx, &mut broker, true);
-    std::fs::write(
-        fx.repo.join(".aethyme/broker.toml"),
-        "[retention]\nclosed_worktree_grace_hours = 24\n",
-    )
-    .unwrap();
+    std::fs::remove_file(fx.repo.join(".aethyme/broker.toml")).unwrap();
     let report = run(&mut broker);
     assert!(report.removed.is_empty(), "{report:#?}");
     assert!(kept_reason(&report, &worktree).contains("closed-worktree grace"));

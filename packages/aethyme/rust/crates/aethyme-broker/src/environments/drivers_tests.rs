@@ -406,6 +406,10 @@ fn variables_name_the_environment_ports_urls_and_receipts() {
     assert!(vars["AETHYME_ENV_RECEIPT_SRV"].contains("db_copy"));
     assert_eq!(vars["AETHYME_ENV_HOOK_ATTEMPT"], "2");
     assert_eq!(vars["AETHYME_ENV_NAMESPACE"], ctx.bindings.namespace);
+    assert_eq!(
+        vars["AETHYME_ENV_COMPOSE_PROJECT"],
+        super::drivers::project_name(&ctx.bindings.namespace)
+    );
 }
 
 #[test]
