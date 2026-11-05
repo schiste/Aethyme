@@ -361,6 +361,24 @@ fn find_landing_within(
     cap: usize,
     deadline: Option<std::time::Instant>,
 ) -> Result<LandingSearch, BrokerOpError> {
+    find_landing_within_cached(
+        repo,
+        content,
+        branch_tip,
+        cap,
+        deadline,
+        &mut Default::default(),
+    )
+}
+
+fn find_landing_within_cached(
+    repo: &GitRepo,
+    content: &SessionContent,
+    branch_tip: &str,
+    cap: usize,
+    deadline: Option<std::time::Instant>,
+    patch_cache: &mut crate::git::PatchIdCache,
+) -> Result<LandingSearch, BrokerOpError> {
     #[cfg(test)]
     TEST_LANDING_SEARCH_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     let started = Instant::now();
@@ -374,7 +392,7 @@ fn find_landing_within(
     let search_deadline =
         deadline.map_or(requested_deadline, |caller| caller.min(requested_deadline));
     let _git_deadline = crate::git::limit_git_until(search_deadline);
-    find_landing_with_limits(
+    find_landing_with_limits_cached(
         repo,
         content,
         branch_tip,
@@ -382,6 +400,7 @@ fn find_landing_within(
         search_deadline,
         MAX_LANDING_QUERY_COUNT,
         MAX_LANDING_CANDIDATE_LIST_BYTES,
+        patch_cache,
     )
 }
 
@@ -391,6 +410,7 @@ fn landing_search_budget_expired(detail: impl std::fmt::Display) -> BrokerOpErro
     }
 }
 
+#[cfg(test)]
 fn find_landing_with_limits(
     repo: &GitRepo,
     content: &SessionContent,
@@ -399,6 +419,28 @@ fn find_landing_with_limits(
     deadline: Instant,
     query_budget: usize,
     candidate_list_byte_budget: usize,
+) -> Result<LandingSearch, BrokerOpError> {
+    find_landing_with_limits_cached(
+        repo,
+        content,
+        branch_tip,
+        cap,
+        deadline,
+        query_budget,
+        candidate_list_byte_budget,
+        &mut Default::default(),
+    )
+}
+
+fn find_landing_with_limits_cached(
+    repo: &GitRepo,
+    content: &SessionContent,
+    branch_tip: &str,
+    cap: usize,
+    deadline: Instant,
+    query_budget: usize,
+    candidate_list_byte_budget: usize,
+    patch_cache: &mut crate::git::PatchIdCache,
 ) -> Result<LandingSearch, BrokerOpError> {
     if content.is_empty() {
         return Ok(LandingSearch {
@@ -531,7 +573,8 @@ fn find_landing_with_limits(
     // A truncated window says nothing about the history beyond it, and the
     // patch comparison would have to read all of that history.
     if !truncated
-        && let Some((commit, position)) = patch_landing(repo, content, branch_tip, window)?
+        && let Some((commit, position)) =
+            patch_landing_cached(repo, content, branch_tip, window, patch_cache)?
     {
         // Patch IDs nominate a candidate; only exact entries on every changed
         // path can establish that the fixed commit carries this session's work.
@@ -588,11 +631,28 @@ fn find_landing_with_limits(
 /// [`GitRepo::cherry_marked`] compares the session side against the branch
 /// commits since the two diverged, including those reached through a merge's
 /// second parent.
+#[cfg(test)]
 fn patch_landing(
     repo: &GitRepo,
     content: &SessionContent,
     branch_tip: &str,
     candidates: &[String],
+) -> Result<Option<(String, usize)>, BrokerOpError> {
+    patch_landing_cached(
+        repo,
+        content,
+        branch_tip,
+        candidates,
+        &mut Default::default(),
+    )
+}
+
+fn patch_landing_cached(
+    repo: &GitRepo,
+    content: &SessionContent,
+    branch_tip: &str,
+    candidates: &[String],
+    patch_cache: &mut crate::git::PatchIdCache,
 ) -> Result<Option<(String, usize)>, BrokerOpError> {
     let unavailable = |source: crate::GitError| BrokerOpError::RepresentationUnavailable {
         reason: format!(
@@ -610,7 +670,7 @@ fn patch_landing(
     // equivalent there. A session commit missing from this list is a merge,
     // or is on the branch already.
     let paired_marks = repo
-        .cherry_marked_both(branch_tip, &content.head)
+        .cherry_marked_both_cached(branch_tip, &content.head, patch_cache)
         .map_err(unavailable)?;
     let unmerged = paired_marks
         .right_only
@@ -711,6 +771,7 @@ struct LandingCacheKey {
 #[derive(Debug, Default)]
 pub(crate) struct LandingVerdictCache {
     verdicts: BTreeMap<LandingCacheKey, LandingVerdict>,
+    patch_ids: crate::git::PatchIdCache,
     #[cfg(test)]
     hits: usize,
 }
@@ -844,7 +905,15 @@ pub(crate) fn work_landed_with_cache(
         return Ok(verdict);
     }
 
-    let verdict = work_landed_from_base(repo, &head_oid, &target_oid, &base, profile, deadline)?;
+    let verdict = work_landed_from_base(
+        repo,
+        &head_oid,
+        &target_oid,
+        &base,
+        profile,
+        deadline,
+        &mut cache.patch_ids,
+    )?;
     cache.insert_complete(key, &verdict);
     Ok(verdict)
 }
@@ -870,7 +939,15 @@ fn work_landed_with_profile(
         });
     }
     let base = landing_base(repo, head, target)?;
-    work_landed_from_base(repo, head, target, &base, profile, deadline)
+    work_landed_from_base(
+        repo,
+        head,
+        target,
+        &base,
+        profile,
+        deadline,
+        &mut Default::default(),
+    )
 }
 
 fn work_landed_from_base(
@@ -880,9 +957,17 @@ fn work_landed_from_base(
     base: &str,
     profile: LandingSearchProfile,
     deadline: Option<std::time::Instant>,
+    patch_cache: &mut crate::git::PatchIdCache,
 ) -> Result<LandingVerdict, BrokerOpError> {
     let content = session_content(repo, base, head)?;
-    let search = find_landing_within(repo, &content, target, profile.candidate_cap, deadline)?;
+    let search = find_landing_within_cached(
+        repo,
+        &content,
+        target,
+        profile.candidate_cap,
+        deadline,
+        patch_cache,
+    )?;
     Ok(match search.outcome {
         LandingOutcome::NothingToRepresent => LandingVerdict::Landed {
             evidence: LandingEvidence::NoNetChange,
@@ -1409,6 +1494,45 @@ mod tests {
         assert!(
             matches!(&error, BrokerOpError::RepresentationUnavailable { reason } if reason.contains("time budget")),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn landing_audit_reuses_patch_ids_across_distinct_session_heads() {
+        let (tmp, repo, base) = seeded();
+        let mut heads = Vec::new();
+        for name in ["session1", "session2"] {
+            git(tmp.path(), &["checkout", "-q", "-b", name, &base]);
+            write(tmp.path(), &format!("{name}.txt"), name);
+            heads.push(commit(tmp.path(), name));
+        }
+        git(tmp.path(), &["checkout", "-q", "main"]);
+        write(tmp.path(), "target.txt", "unrelated target\n");
+        let target = commit(tmp.path(), "target");
+        let mut cache = LandingVerdictCache::default();
+        for head in &heads {
+            let expected = work_landed_within(&repo, head, &target, None).unwrap();
+            let actual = work_landed_with_cache(
+                &repo,
+                head,
+                &target,
+                None,
+                LandingSearchProfile::default(),
+                &mut cache,
+            )
+            .unwrap();
+            assert_eq!(actual, expected);
+            assert!(matches!(
+                actual,
+                LandingVerdict::NotLanded {
+                    truncated: false,
+                    ..
+                }
+            ));
+        }
+        assert!(
+            cache.patch_ids.hit_count() > 0,
+            "the second head must reuse target patches"
         );
     }
 
