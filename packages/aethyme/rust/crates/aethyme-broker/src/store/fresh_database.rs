@@ -470,8 +470,12 @@ mod unix {
         }
     }
 
-    /// Passes over one sidecar before a name that keeps moving is refused.
-    const SIDECAR_CHECK_ATTEMPTS: usize = 64;
+    /// How long one sidecar's name may keep moving before it is refused. A
+    /// time limit, not a pass count: on Linux an unlink shows zero links until
+    /// the unlinking process finishes it, and that process can be descheduled
+    /// for longer than many passes take (64 passes ran out on CI).
+    const SIDECAR_SETTLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
+    const SIDECAR_RECHECK_PAUSE: std::time::Duration = std::time::Duration::from_millis(1);
 
     #[derive(Clone, Copy)]
     enum SidecarCheckStage {
@@ -1012,12 +1016,12 @@ mod unix {
         verify_parent(paths)?;
         for suffix in ["-journal", "-wal", "-shm"] {
             let sidecar = append_suffix(db_path, suffix);
-            let mut attempts_left = SIDECAR_CHECK_ATTEMPTS;
+            let settle_by = std::time::Instant::now() + SIDECAR_SETTLE_LIMIT;
             while let Some(changed) = check_existing_sidecar(&sidecar)? {
-                attempts_left -= 1;
-                if attempts_left == 0 {
+                if std::time::Instant::now() >= settle_by {
                     return Err(changed);
                 }
+                std::thread::sleep(SIDECAR_RECHECK_PAUSE);
             }
         }
         verify_parent(paths)
