@@ -11410,6 +11410,7 @@ mod artifact_sweep_namespace_tests {
             let root = parent.join("cache");
             std::fs::create_dir(&root).unwrap();
             let resource_db = parent.join("host-resources.db");
+            std::fs::File::create(&resource_db).unwrap();
             let (_, identity, _, handle) = capture_preparation_cache_root(&root).unwrap();
             let initialized = rotation_debt::initialize_preparation_cache_root(
                 &root,
