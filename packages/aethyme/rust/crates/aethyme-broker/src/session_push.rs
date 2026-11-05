@@ -821,14 +821,14 @@ impl Broker {
         let catch_up = crate::main_drift::CatchUp::for_branch(repo, &default.remote, branch);
         let drift = match crate::main_drift::measure(repo, &reference, &commit, head, catch_up) {
             Ok(mut drift) => {
-                if fetch_error.is_none() {
-                    if let Ok(session) = self.store_ref().session(session_id) {
-                        crate::main_drift::assess_sync_impact(
-                            repo,
-                            Path::new(&session.worktree_path),
-                            &mut drift,
-                        );
-                    }
+                if fetch_error.is_none()
+                    && let Ok(session) = self.store_ref().session(session_id)
+                {
+                    crate::main_drift::assess_sync_impact(
+                        repo,
+                        Path::new(&session.worktree_path),
+                        &mut drift,
+                    );
                 }
                 if let Ok(raw) = serde_json::to_string(&drift) {
                     crate::warn_unrecorded(
