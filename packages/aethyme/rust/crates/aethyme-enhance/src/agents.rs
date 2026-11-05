@@ -1131,17 +1131,13 @@ mod tests {
             .first()
             .expect("at least one substantive commit policy")
             .required_sections;
-        assert!(
-            substantive
-                .iter()
-                .all(|policy| policy.required_sections == required_sections)
-        );
-        assert!(
-            COMMIT_POLICIES
-                .iter()
-                .filter(|policy| !policy.body_required)
-                .all(|policy| policy.required_sections.is_empty())
-        );
+        assert!(substantive
+            .iter()
+            .all(|policy| policy.required_sections == required_sections));
+        assert!(COMMIT_POLICIES
+            .iter()
+            .filter(|policy| !policy.body_required)
+            .all(|policy| policy.required_sections.is_empty()));
 
         let doc = render_agents_document(None).unwrap();
         assert!(doc.contains(&format!("Types: {}.", policy_list(&all))));
