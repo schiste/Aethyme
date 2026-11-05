@@ -1167,7 +1167,7 @@ fn rank(
             // characters per call.
             reason.push_str(&format!("; {} file", file.role.as_str()));
             let confidence = ((0.25 + 0.45 * coverage) * 100.0).round() / 100.0;
-            let item = AnswerItem {
+            AnswerItem {
                 kind: "source_file".into(),
                 target: file.path.clone(),
                 path: Some(file.path.clone()),
@@ -1189,8 +1189,7 @@ fn rank(
                     })),
                     "line_refs": line_refs,
                 }),
-            };
-            item
+            }
         })
         .collect();
     (items, signals)
