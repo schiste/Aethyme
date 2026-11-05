@@ -5832,6 +5832,7 @@ mod registered_removal_failure_tests {
         broker: &mut crate::Broker,
         label: &str,
     ) -> (crate::Session, std::path::PathBuf) {
+        aethyme_testkit::promote_on_submit(broker.main_root());
         let session = broker.start_worktree(label, None).unwrap();
         let worktree = Path::new(&session.worktree_path).to_path_buf();
         std::fs::write(worktree.join("session-change.txt"), "represented\n").unwrap();

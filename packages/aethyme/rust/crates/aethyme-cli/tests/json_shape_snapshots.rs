@@ -320,7 +320,6 @@ fn fixture_with_local_origin() -> (tempfile::TempDir, PathBuf, PathBuf) {
     std::fs::create_dir_all(&host).unwrap();
     git(&origin, &["init", "--bare", "-q", "-b", "main"]);
     git(&repo, &["init", "-q", "-b", "main"]);
-    aethyme_testkit::promote_on_submit(&repo);
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
     std::fs::write(repo.join("src/app.txt"), "base\n").unwrap();

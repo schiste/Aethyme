@@ -76,6 +76,7 @@ fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
         tmp.path(),
         &["clone", "-q", origin.to_str().unwrap(), "repo"],
     );
+    aethyme_testkit::promote_on_submit(&repo);
     (tmp, publisher, repo)
 }
 
