@@ -169,17 +169,18 @@ jobs:
           # decision conventionally lives in the PR body. Read-only.
           GH_TOKEN: ${{ github.token }}
           TESTED_BY_RUN: ${{ needs.tested-tree.outputs.run }}
-          # Gates the pull-request suites run in full: the workspace suite
-          # (cargo-test), the examples and their guard tests (fast-guards),
-          # and the testkit contract tests (workflow-contract, gate-policy).
-          COVERED_BY_PR_SUITE: "cargo-test fast-guards workflow-contract gate-policy"
+          # Gates the workspace suite runs in full: the suite itself
+          # (cargo-test), the examples and their guard tests (fast-guards), and
+          # the contract tests (workflow-contract, gate-policy). Either a
+          # pull-request run on this tree or this workflow's cargo-test-* jobs
+          # run that suite. The three subsets exist to fail fast and to cover
+          # paths that select no Rust gate on a local submission; here they
+          # only repeated tests, for 6m20 of a 10m30 job (run 41987378379).
+          COVERED_BY_WORKSPACE_SUITE: "cargo-test fast-guards workflow-contract gate-policy"
           # This runner is dedicated to these gates, so the Rust gates may use
           # all four cores instead of their bounds for shared workstations.
           AETHYME_GATE_BUILD_JOBS: "4"
           AETHYME_GATE_TEST_THREADS: "4"
-          # Runs as this workflow's cargo-test-* jobs when no pull-request run
-          # tested the tree.
-          RUNS_IN_SHARDS: "cargo-test"
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/gate-telemetry"
@@ -190,12 +191,12 @@ jobs:
           gates="$("$aethyme" broker advanced gates manifest --json | jq -r '.manifest.gates[].name')"
           [ -n "$gates" ] || { echo "the gate manifest lists no gates" >&2; exit 1; }
           for gate in $gates; do
-            if [ -n "$TESTED_BY_RUN" ] && [[ " $COVERED_BY_PR_SUITE " == *" $gate "* ]]; then
-              echo "gate $gate: covered by pull-request run $TESTED_BY_RUN on this tree"
-            elif [[ " $RUNS_IN_SHARDS " == *" $gate "* ]]; then
-              echo "gate $gate: runs in this workflow's shard jobs"
-            else
+            if [[ " $COVERED_BY_WORKSPACE_SUITE " != *" $gate "* ]]; then
               "$aethyme" broker advanced gates run --all --only "$gate"
+            elif [ -n "$TESTED_BY_RUN" ]; then
+              echo "gate $gate: covered by pull-request run $TESTED_BY_RUN on this tree"
+            else
+              echo "gate $gate: runs in this workflow's shard jobs"
             fi
           done
 
