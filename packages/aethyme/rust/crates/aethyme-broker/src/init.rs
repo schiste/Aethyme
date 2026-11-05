@@ -598,7 +598,7 @@ const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
         ],
     ),
     ("broker", &["pr"]),
-    ("leases", &["ignore", "routing"]),
+    ("leases", &["ignore", "routing", "overlap_diffs"]),
     ("graph", &["authority", "repository"]),
     ("review", &["trigger", "routing", "reporting", "projection"]),
     ("collaboration", crate::collaboration_submit::KNOWN_SETTINGS),

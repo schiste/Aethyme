@@ -756,6 +756,9 @@ fn render_submit_text(
                 warning.path,
                 warning.reason.as_deref().unwrap_or("not blocking")
             );
+            if let Some(changes) = &warning.other_changes {
+                eprintln!("{}", crate::overlap_diff::render(changes, "  "));
+            }
         }
         if outcome.no_changes {
             // "Nothing pending" is the right summary only when nothing was

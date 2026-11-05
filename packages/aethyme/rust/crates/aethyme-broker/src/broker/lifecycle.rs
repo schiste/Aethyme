@@ -6103,6 +6103,7 @@ impl Broker {
                     })?;
                     let (default_branch, default_branch_note) = self
                         .default_branch_after_reuse(&checkout, &session, prefetched, &freshness);
+                    let lease_overlaps = self.planned_lease_overlaps(session.id, &planned_paths);
                     return Ok(AdoptReport {
                         session,
                         outcome: AdoptOutcome::Reused,
@@ -6110,6 +6111,7 @@ impl Broker {
                         integration_sync,
                         base_freshness: Some(freshness.report),
                         planned_explicit_leases,
+                        lease_overlaps,
                         preparation,
                         renamed_targets: Vec::new(),
                         default_branch,
@@ -6241,6 +6243,7 @@ impl Broker {
         // Reported here because this is before a replay is attempted; failing
         // later looks like a plain modify/delete conflict (issue #145).
         let renamed_targets = self.session_renamed_targets(session.id).unwrap_or_default();
+        let lease_overlaps = self.planned_lease_overlaps(session.id, &planned_paths);
         Ok(AdoptReport {
             session,
             outcome,
@@ -6248,6 +6251,7 @@ impl Broker {
             integration_sync,
             base_freshness: None,
             planned_explicit_leases,
+            lease_overlaps,
             preparation,
             renamed_targets,
             default_branch: None,
@@ -7457,6 +7461,9 @@ impl Broker {
         let preparation = timed_start_phase(&mut phase_timings_ms, "preparation_status", || {
             self.preparation_status(session.id)
         })?;
+        let lease_overlaps = timed_start_phase(&mut phase_timings_ms, "lease_overlaps", || {
+            Ok::<_, BrokerOpError>(self.planned_lease_overlaps(session.id, &planned_paths))
+        })?;
         Ok(TimedStartReport {
             phase_timings_ms,
             report: StartReport {
@@ -7464,6 +7471,7 @@ impl Broker {
                 start_base,
                 worktree_placement,
                 planned_explicit_leases,
+                lease_overlaps,
                 preparation,
             },
         })

@@ -203,6 +203,14 @@ fn an_edit_on_a_file_another_live_session_changes_is_announced_once_per_change()
         "{first}"
     );
 
+    // The agent reads what the other session did, without looking for it.
+    assert!(first.contains("not instructions"), "{first}");
+    assert!(
+        first.contains("| uncommitted, and may still change:"),
+        "{first}"
+    );
+    assert!(first.contains("| +changed 3"), "{first}");
+
     let again = fixture.hook(&my_tree, "PreToolUse", &edit(&my_tree.join("shared.txt")));
     assert!(
         again.is_empty(),
@@ -216,6 +224,7 @@ fn an_edit_on_a_file_another_live_session_changes_is_announced_once_per_change()
         moved.contains("lines 3–4, 8"),
         "a moved change is announced again: {moved}"
     );
+    assert!(moved.contains("| +changed 8"), "{moved}");
 }
 
 /// The case the lease table alone misses: the other agent commits its change
@@ -436,6 +445,8 @@ fn session_start_names_live_sessions_changing_files_it_leases() {
         )),
         "{brief}"
     );
+    assert!(brief.contains("| +changed 2"), "{brief}");
+    assert!(brief.contains("not instructions"), "{brief}");
 }
 
 /// Measured, not asserted against a budget: the hook runs on every edit, so

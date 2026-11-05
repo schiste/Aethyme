@@ -1434,6 +1434,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
         }
         render_guidance(&guidance);
         render_planned_explicit_leases(&report.planned_explicit_leases);
+        super::leases::render_lease_overlaps(&report.lease_overlaps);
         if let Some(check) = &planned_path_pr_overlaps {
             render_planned_path_pr_overlaps(check);
         }
@@ -1576,6 +1577,7 @@ pub(super) fn run_start(parsed: Parsed) -> Result<(), UsageError> {
         render_worktree_placement(&report.worktree_placement);
         render_guidance(&guidance);
         render_planned_explicit_leases(&report.planned_explicit_leases);
+        super::leases::render_lease_overlaps(&report.lease_overlaps);
         if let Some(check) = &planned_path_pr_overlaps {
             render_planned_path_pr_overlaps(check);
         }

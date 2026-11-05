@@ -147,6 +147,8 @@ mod notes_cli;
 mod outcomes_cli;
 #[path = "output_measurement_cli.rs"]
 mod output_measurement_cli;
+#[path = "overlap_diff_e2e.rs"]
+mod overlap_diff_e2e;
 #[path = "overlap_scaling_e2e.rs"]
 mod overlap_scaling_e2e;
 #[path = "overlap_severity_e2e.rs"]

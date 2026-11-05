@@ -278,6 +278,7 @@ fn validate_planned_lease_conflicts(
                     blocker_status,
                     blocker_worktree,
                     remediation,
+                    other_changes: String::new(),
                 },
             )));
         }

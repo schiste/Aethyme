@@ -109,6 +109,9 @@ pub(super) fn render_lease_plan(report: &crate::LeasePlan, json: bool) -> Result
                     overlap.owner_worktree,
                 );
                 if label == "conflict" {
+                    if let Some(changes) = &overlap.other_changes {
+                        out!("{}", crate::overlap_diff::render(changes, "      "));
+                    }
                     for action in &overlap.safe_next_actions {
                         out!("    next: {action}");
                     }
@@ -203,6 +206,21 @@ fn render_lease_coverage(report: &crate::leases::LeaseCoverageReport) {
                 claim,
                 report.session_id
             );
+        }
+    }
+}
+
+pub(super) fn render_lease_overlaps(overlaps: &[crate::LeaseBlocker]) {
+    for overlap in overlaps {
+        out!(
+            "  note: session {} also holds {} [{}]: {}",
+            overlap.session_id,
+            overlap.path,
+            overlap.kind.as_str(),
+            overlap.reason.as_deref().unwrap_or("")
+        );
+        if let Some(changes) = &overlap.other_changes {
+            out!("{}", crate::overlap_diff::render(changes, "    "));
         }
     }
 }
@@ -414,6 +432,9 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                         warning.kind.as_str(),
                         warning.reason.as_deref().unwrap_or("")
                     );
+                    if let Some(changes) = &warning.other_changes {
+                        out!("{}", crate::overlap_diff::render(changes, "    "));
+                    }
                 }
             }
         }
@@ -424,7 +445,8 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                     "plan requires at least one path".into(),
                 ));
             }
-            let report = broker.plan_leases(paths, parsed.session)?;
+            let mut report = broker.plan_leases(paths, parsed.session)?;
+            broker.attach_plan_changes(&mut report);
             let coverage = if let Some(session_id) = parsed.session {
                 let leases = broker.store().active_leases()?;
                 let normalized_paths = report

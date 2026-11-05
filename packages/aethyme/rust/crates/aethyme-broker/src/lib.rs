@@ -146,6 +146,7 @@ mod merge;
 mod merge_chain;
 mod operation_stats;
 mod operations;
+pub mod overlap_diff;
 mod overlap_pairs;
 mod ownership;
 mod worktree_registry;

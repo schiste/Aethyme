@@ -1018,10 +1018,21 @@ impl Broker {
         // commits from being counted as session work when integration is stale (#352).
         self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Submit);
         progress.phase("auditing lease ownership");
-        let ownership = self.audit_submit_ownership(session_id)?;
+        let mut ownership = self.audit_submit_ownership(session_id)?;
         if !ownership.ok {
+            let changed = ownership.changed_paths.clone();
+            self.attach_overlap_changes(session_id, &changed, &mut ownership.conflicting_leases);
+            let mut summary = ownership.failure_summary();
+            for changes in ownership
+                .conflicting_leases
+                .iter()
+                .filter_map(|lease| lease.other_changes.as_ref())
+            {
+                summary.push('\n');
+                summary.push_str(&crate::overlap_diff::render(changes, "  "));
+            }
             return Err(BrokerOpError::OwnershipViolation {
-                summary: ownership.failure_summary(),
+                summary,
                 report: Box::new(ownership),
             });
         }
@@ -1118,6 +1129,11 @@ impl Broker {
             prepared_plan,
         )?;
         outcome.lease_warnings = ownership.warned_leases;
+        self.attach_overlap_changes(
+            session_id,
+            &ownership.changed_paths,
+            &mut outcome.lease_warnings,
+        );
         Ok(outcome)
     }
 

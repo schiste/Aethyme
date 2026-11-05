@@ -1028,6 +1028,9 @@ pub struct AdoptReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_freshness: Option<AdoptBaseFreshness>,
     pub planned_explicit_leases: Vec<crate::Lease>,
+    /// Other sessions' leases on the planned paths that did not refuse them.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub lease_overlaps: Vec<LeaseBlocker>,
     pub preparation: crate::PreparationStatus,
     /// Paths this session still targets that a later promotion renamed. Empty
     /// for the ordinary case (issue #145).
@@ -1059,6 +1062,9 @@ pub struct StartReport {
     pub start_base: SessionStartBase,
     pub worktree_placement: WorktreePlacement,
     pub planned_explicit_leases: Vec<crate::Lease>,
+    /// Other sessions' leases on the planned paths that did not refuse them.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub lease_overlaps: Vec<LeaseBlocker>,
     pub preparation: crate::PreparationStatus,
 }
 
@@ -2208,7 +2214,15 @@ fn describe_lease_blockers(blockers: &[LeaseBlocker]) -> String {
     if blockers.len() > shown.len() {
         shown.push(format!("and {} more", blockers.len() - shown.len()));
     }
-    shown.join("; ")
+    let mut text = shown.join("; ");
+    for changes in blockers
+        .iter()
+        .filter_map(|blocker| blocker.other_changes.as_ref())
+    {
+        text.push('\n');
+        text.push_str(&crate::overlap_diff::render(changes, "  "));
+    }
+    text
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2230,6 +2244,10 @@ pub struct LeaseBlocker {
     /// Why this lease blocks, or why it only warns.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// What the holder changed in the overlapping files, on the row reporting
+    /// them. Absent when the repository turned this off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub other_changes: Option<crate::overlap_diff::OverlapChanges>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2363,6 +2381,9 @@ pub struct LeasePlanOverlap {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub liveness_evidence: Option<crate::lease_liveness::LeaseLivenessEvidence>,
     pub safe_next_actions: Vec<String>,
+    /// What the holder changed in the requested path, for `leases plan`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub other_changes: Option<crate::overlap_diff::OverlapChanges>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -2502,6 +2523,9 @@ pub struct GuardedExecReport {
     /// The post-execution ownership audit, independent of the child exit status.
     pub ownership_ok: bool,
     pub conflicting_leases: Vec<LeaseBlocker>,
+    /// Other sessions' leases on touched paths that did not refuse them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warned_leases: Vec<LeaseBlocker>,
     pub before_dirty_paths: Vec<String>,
     pub after_dirty_paths: Vec<String>,
     pub newly_dirty_paths: Vec<String>,
