@@ -242,9 +242,12 @@ impl PromoteConfig {
     }
 
     pub(crate) fn from_text(text: Option<&str>) -> (Self, Option<String>) {
+        // Verify-only unless the repository opts in: promoting needs the
+        // integration branch to stay current, and each session branch's own pull
+        // request is otherwise the only delivery path.
         let mut config = Self {
             branch: DEFAULT_INTEGRATION_BRANCH.to_string(),
-            mode: PromoteMode::Auto,
+            mode: PromoteMode::VerifyOnly,
         };
         let mut warning = None;
         let Some(text) = text else {
