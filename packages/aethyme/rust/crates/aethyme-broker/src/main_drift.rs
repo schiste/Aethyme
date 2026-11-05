@@ -249,6 +249,7 @@ impl crate::Broker {
         };
         let reference = format!("{}/{}", default.remote, default.branch);
         let mut budget = STATUS_REMEASURE_BUDGET;
+        let mut graph_budget = STATUS_REMEASURE_BUDGET;
         let mut advice = Vec::new();
         for session in sessions {
             // A session working on the default branch itself is the default
@@ -284,11 +285,14 @@ impl crate::Broker {
             if drift.behind > 0 {
                 let catch_up = CatchUp::for_branch(repo, &default.remote, &session.branch);
                 drift.suggested_command = Some(catch_up.command(&default.remote, &reference));
-                assess_sync_impact(
-                    repo,
-                    std::path::Path::new(&session.worktree_path),
-                    &mut drift,
-                );
+                if graph_budget > 0 {
+                    graph_budget -= 1;
+                    assess_sync_impact(
+                        repo,
+                        std::path::Path::new(&session.worktree_path),
+                        &mut drift,
+                    );
+                }
             }
             if let Some(row) = behind_main_row(session.id, &drift) {
                 advice.push(row);
