@@ -7,10 +7,27 @@ import unittest
 from unittest.mock import patch
 
 from build_allocator_matrix import require_admission
-from allocator_matrix import Runner, environment, semantic, tree_hash
+from allocator_matrix import Runner, environment, native_peak_rss, semantic, tree_hash
 
 
 class AllocatorRunnerControls(unittest.TestCase):
+    def test_peak_rss_excludes_large_launcher_heap(self):
+        allocation = bytearray(128*1024*1024)
+        for i in range(0, len(allocation), 4096):
+            allocation[i] = 1
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            row, _ = Runner(root).run("small-child", [sys.executable, "-c", "x = bytearray(8*1024*1024)"], root, environment(root))
+            self.assertGreater(row["peak_rss_bytes"], 0)
+            self.assertLess(row["peak_rss_bytes"], len(allocation)//2)
+            self.assertEqual(allocation[-4096], 1)
+
+    def test_native_rss_units_and_missing_measurements(self):
+        self.assertEqual(native_peak_rss("2048\n", "Linux"), 2097152)
+        self.assertEqual(native_peak_rss("   2097152  maximum resident set size\n", "Darwin"), 2097152)
+        with self.assertRaisesRegex(RuntimeError, "unambiguous"):
+            native_peak_rss("", "Linux")
+
     def test_success_accounts_completed_child(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

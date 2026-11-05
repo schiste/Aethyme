@@ -2,7 +2,7 @@
 """Compare pinned allocator builds on disposable source-only Playgrounds.
 
 Run on macOS or Linux. Builds are supplied, never compiled by this runner.
-Raw stdout/stderr, wait4 CPU/RSS, argv, hashes and semantic checks are retained.
+Raw stdout/stderr, wait4 CPU, native-time child RSS, argv and hashes are retained.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import select
 import signal
@@ -55,7 +56,7 @@ def environment(home):
                GIT_AUTHOR_NAME="Allocator benchmark", GIT_COMMITTER_NAME="Allocator benchmark",
                GIT_AUTHOR_EMAIL="benchmark@example.invalid", GIT_COMMITTER_EMAIL="benchmark@example.invalid",
                GIT_AUTHOR_DATE="2026-11-05T00:00:00Z", GIT_COMMITTER_DATE="2026-11-05T00:00:00Z",
-               RAYON_NUM_THREADS="4", CHAU7_CTO_OPTIM_ACTIVE="1")
+               RAYON_NUM_THREADS="4", CHAU7_CTO_OPTIM_ACTIVE="1", LC_ALL="C")
     return env
 
 
@@ -81,6 +82,21 @@ def exit_ready(pid, timeout):
     raise RuntimeError("requires pidfd_open or kqueue for timed process accounting")
 
 
+def native_peak_rss(text, system):
+    """Read the application's RSS, excluding the Python launcher's pre-exec peak."""
+    if system == "Darwin":
+        matches = re.findall(r"^\s*(\d+)\s+maximum resident set size\s*$", text, re.MULTILINE)
+        scale = 1
+    elif system == "Linux":
+        matches = re.findall(r"^\s*(\d+)\s*$", text, re.MULTILINE)
+        scale = 1024
+    else:
+        raise RuntimeError("native RSS accounting requires macOS or Linux")
+    if len(matches) != 1:
+        raise RuntimeError("native time did not provide one unambiguous RSS measurement")
+    return int(matches[0])*scale
+
+
 class Runner:
     def __init__(self, output):
         self.output = output
@@ -90,10 +106,14 @@ class Runner:
         stem = self.output/f"{len(self.rows):04d}-{label}"
         stdout = stem.with_suffix(".stdout")
         stderr = stem.with_suffix(".stderr")
+        resources = stem.with_suffix(".resources")
+        system = platform.system()
+        time_flags = ["-l"] if system == "Darwin" else ["-f", "%M"]
+        measurement_argv = ["/usr/bin/time", *time_flags, "-o", str(resources), *[str(x) for x in argv]]
         start = time.monotonic()
         load = os.getloadavg()
         with stdout.open("xb") as out, stderr.open("xb") as err:
-            p = subprocess.Popen([str(x) for x in argv], cwd=cwd, env=env,
+            p = subprocess.Popen(measurement_argv, cwd=cwd, env=dict(env, LC_ALL="C"),
                                  stdout=out, stderr=err, start_new_session=True)
             # Wait for exit readiness, avoiding a polling interval in short CLI timings.
             # The child remains unreaped until after any timeout signal, so its PID
@@ -113,9 +133,18 @@ class Runner:
                 os.killpg(p.pid, signal.SIGKILL)
             pid, status, usage = os.wait4(p.pid, 0)
             p.returncode = os.waitstatus_to_exitcode(status)
-        row = dict(label=label, argv=[str(x) for x in argv], cwd=str(cwd),
-                   wall_s=time.monotonic()-start, user_s=usage.ru_utime,
-                   system_s=usage.ru_stime, peak_rss_bytes=usage.ru_maxrss*(1 if platform.system()=="Darwin" else 1024),
+        elapsed = time.monotonic()-start
+        resource_error = None
+        try:
+            peak_rss = native_peak_rss(resources.read_text(), system)
+        except (OSError, RuntimeError) as error:
+            peak_rss = None
+            resource_error = str(error)
+        row = dict(label=label, argv=[str(x) for x in argv], measurement_argv=measurement_argv, cwd=str(cwd),
+                   wall_s=elapsed, user_s=usage.ru_utime,
+                   system_s=usage.ru_stime, peak_rss_bytes=peak_rss,
+                   supervisor_peak_rss_bytes=usage.ru_maxrss*(1 if system=="Darwin" else 1024),
+                   rss_measurement="native-time-child", resource_error=resource_error,
                    exit_code=p.returncode, timeout=expired, load_before=load,
                    stdout=str(stdout), stderr=str(stderr))
         self.rows.append(row)
@@ -123,6 +152,8 @@ class Runner:
             f.write(json.dumps(row)+"\n")
         if p.returncode or expired:
             raise RuntimeError(f"{label} failed: {row}; {stderr.read_text()[-4000:]}")
+        if resource_error:
+            raise RuntimeError(f"{label} RSS measurement failed: {resource_error}")
         return row, stdout.read_text()
 
     def git(self, repo, env, *args):
@@ -242,7 +273,8 @@ def main():
     run=Runner(args.output)
     report=dict(platform=platform.platform(), build_sha256=digest(args.build.read_bytes()),
                 runner_sha256=digest(Path(__file__).read_bytes()), stage=args.stage, repetitions=args.repetitions,
-                rayon_threads=4, source_hashes={k:tree_hash(v) for k,v in sources.items()}, samples=[])
+                rayon_threads=4, rss_measurement="native-time-child", locale="C",
+                source_hashes={k:tree_hash(v) for k,v in sources.items()}, samples=[])
     dump(args.output/"report.json",report)
     with tempfile.TemporaryDirectory(prefix="allocator-playground-") as tmp:
         tmp=Path(tmp)
