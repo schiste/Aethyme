@@ -9229,7 +9229,7 @@ impl Broker {
                 {
                     return Ok(None);
                 }
-                (expected_parent, self.main_root.as_path())
+                (expected_parent, self.main_root.clone())
             }
             WorktreeRootSource::HostState => {
                 let Some(host_state) = self.storage_context.host_state_dir.as_deref() else {
@@ -9258,7 +9258,18 @@ impl Broker {
                         "captured host-state parent is not a real directory".into(),
                     ));
                 }
-                (parent, host_state)
+                // The base itself is a real directory, so this only resolves
+                // symlinks above it, such as macOS's /var or a relocated home.
+                // Without it the base's name is not canonical, and placement
+                // falls back into the repository. The binding records this
+                // real path.
+                let host_state = host_state.canonicalize().map_err(|error| {
+                    refusal(
+                        host_state,
+                        format!("cannot resolve captured host-state parent: {error}"),
+                    )
+                })?;
+                (host_state.join("worktrees"), host_state)
             }
             _ => return Ok(None),
         };
@@ -9288,6 +9299,7 @@ impl Broker {
             }
         }
 
+        let ancestor = ancestor.as_path();
         let ancestor_identity = match bound_directory_identity(ancestor) {
             Ok(identity) => identity,
             Err(_reason) if source == WorktreeRootSource::HostState => {
