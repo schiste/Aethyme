@@ -342,8 +342,8 @@ fn cleanup_keeps_the_time_a_session_was_first_closed() {
 }
 
 #[test]
-fn default_close_grace_keeps_four_days_but_expires_after_five() {
-    for (days, expected_proposed) in [(4, false), (5, true)] {
+fn default_close_grace_keeps_23_hours_but_expires_after_25() {
+    for (hours, expected_proposed) in [(23, false), (25, true)] {
         let (tmp, mut broker) = repository(None);
         let (id, _worktree) = session_with_commit(&mut broker, "default-grace", true);
         broker.close(id).unwrap();
@@ -352,14 +352,14 @@ fn default_close_grace_keeps_four_days_but_expires_after_five() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64
-            - days * 24 * 3_600_000;
+            - hours * 3_600_000;
         set_closed_at(&tmp.path(), id, closed_at);
 
         let mut broker = tmp.open();
         assert_eq!(
             proposed(&mut broker).contains(&id),
             expected_proposed,
-            "default grace at {days} days"
+            "default grace at {hours} hours"
         );
     }
 }
