@@ -857,7 +857,7 @@ Usage:
       Aethyme source checkout, then fail if integration moved during the
       run so the result cannot be mistaken for current-tip proof.
   aethyme broker cleanup <session-id> [--force] [--json]
-  aethyme broker cleanup --all-cleaned [--apply --confirm <sha256>] [--json]
+  aethyme broker cleanup --all-cleaned [--closed-before-ms <UTC-ms> --limit <1-1000> [--after-session <id>]] [--apply --confirm <sha256>] [--json]
       Remove one session worktree, or inventory all retained broker-owned
       worktrees from already-closed sessions. Bulk cleanup is a read-only plan
       by default; --apply revalidates and removes only clean worktrees whose
@@ -1732,6 +1732,8 @@ struct Parsed {
     take_over: bool,
     all: bool,
     all_cleaned: bool,
+    closed_before_ms: Option<i64>,
+    cleanup_after_session: Option<i64>,
     cleanup_batch: bool,
     allow_adopted: bool,
     retire: bool,
@@ -1896,6 +1898,8 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         take_over: false,
         all: false,
         all_cleaned: false,
+        closed_before_ms: None,
+        cleanup_after_session: None,
         cleanup_batch: false,
         allow_adopted: false,
         retire: false,
@@ -1988,6 +1992,24 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
             "--adopt" => parsed.adopt = true,
             "--all" => parsed.all = true,
             "--all-cleaned" => parsed.all_cleaned = true,
+            "--closed-before-ms" => {
+                let value = iter.next().ok_or(UsageError::Message(
+                    "--closed-before-ms requires a value".into(),
+                ))?;
+                parsed.closed_before_ms = Some(value.parse().map_err(|_| {
+                    UsageError::Message(
+                        "--closed-before-ms must be a UTC timestamp in milliseconds".into(),
+                    )
+                })?);
+            }
+            "--after-session" => {
+                let value = iter.next().ok_or(UsageError::Message(
+                    "--after-session requires a value".into(),
+                ))?;
+                parsed.cleanup_after_session = Some(value.parse().map_err(|_| {
+                    UsageError::Message("--after-session must be a non-negative session id".into())
+                })?);
+            }
             "--archive" => parsed.archive = true,
             "--batch" => parsed.cleanup_batch = true,
             "--allow-adopted" => parsed.allow_adopted = true,

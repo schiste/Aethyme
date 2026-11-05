@@ -228,6 +228,21 @@ the work was lost or that deletion is safe.
 
 Adopted worktrees are never in the bulk sweep. Neither are live sessions.
 
+For large inventories, select a bounded batch using a fixed UTC cutoff in
+milliseconds and a session cursor:
+
+```sh
+aethyme broker finish cleanup --all-cleaned --closed-before-ms <UTC-ms> --limit 50 --after-session 0 --json
+```
+
+The plan includes `batch_last_session`, the cursor for the next batch. Reuse
+exactly the same scope flags and the plan digest when applying that batch.
+The cursor advances past retained as well as eligible candidates, so review
+refusals separately rather than repeatedly scanning the same blocked rows. A
+missing cursor means there are no matching sessions after the supplied cursor.
+The fixed cutoff, cursor and limit are part of the confirmation digest; changing
+any of them requires a new plan. Each item is revalidated before removal.
+
 ## 3. Apply the safe subset
 
 ```sh

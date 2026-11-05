@@ -561,3 +561,94 @@ fn a_resumed_gc_apply_retains_a_checkout_recreated_after_an_absent_path_plan() {
     );
     assert!(!broker.store().session(live.id).unwrap().status.is_closed());
 }
+
+#[test]
+fn scoped_cleanup_binds_cutoff_and_cursor_to_the_reviewed_plan() {
+    let (tmp, mut broker) = repository(Some(0));
+    let (old, old_path) = session_with_commit(&mut broker, "scoped-old", true);
+    broker.close(old).unwrap();
+    let (recent, recent_path) = session_with_commit(&mut broker, "scoped-recent", true);
+    broker.close(recent).unwrap();
+    drop(broker);
+    set_closed_at(&tmp.path(), old, 1_000);
+    set_closed_at(&tmp.path(), recent, 3_000);
+    let mut broker = tmp.open();
+    let scope = Some((2_000, 0, 1));
+    let plan = broker
+        .cleanup_cleaned_worktrees_scoped(false, None, scope)
+        .unwrap()
+        .plan;
+    assert_eq!(
+        plan.worktrees
+            .iter()
+            .map(|item| item.session_id)
+            .collect::<Vec<_>>(),
+        vec![old]
+    );
+    assert_eq!(plan.closed_before_ms, Some(2_000));
+    assert!(
+        broker
+            .cleanup_cleaned_worktrees_scoped(true, Some(&plan.digest), Some((4_000, 0, 1)))
+            .is_err()
+    );
+    assert!(old_path.exists());
+    assert!(recent_path.exists());
+    let report = broker
+        .cleanup_cleaned_worktrees_scoped(true, Some(&plan.digest), scope)
+        .unwrap();
+    assert_eq!(report.removed_session_ids, vec![old]);
+    assert!(!old_path.exists());
+    assert!(recent_path.exists());
+    let next = broker
+        .cleanup_cleaned_worktrees_scoped(false, None, Some((4_000, old, 1)))
+        .unwrap()
+        .plan;
+    assert_eq!(
+        next.worktrees
+            .iter()
+            .map(|item| item.session_id)
+            .collect::<Vec<_>>(),
+        vec![recent]
+    );
+}
+
+#[test]
+fn scoped_cleanup_does_not_remove_a_checkout_adopted_by_a_live_session() {
+    let (_tmp, mut broker) = repository(Some(0));
+    let (closed, _live, path) = closed_then_adopted(&mut broker, "scoped-live");
+    let scope = Some((i64::MAX, 0, 10));
+    let plan = broker
+        .cleanup_cleaned_worktrees_scoped(false, None, scope)
+        .unwrap()
+        .plan;
+    assert!(plan.worktrees.iter().any(|item| item.session_id == closed));
+    assert_eq!(plan.eligible_worktree_count, 0);
+    let result = broker
+        .cleanup_cleaned_worktrees_scoped(true, Some(&plan.digest), scope)
+        .unwrap();
+    assert!(result.removed_session_ids.is_empty());
+    assert!(path.exists());
+}
+
+#[test]
+fn scoped_cleanup_preserves_dirty_worktree() {
+    let (_tmp, mut broker) = repository(Some(0));
+    let (id, path) = session_with_commit(&mut broker, "scoped-dirty", true);
+    broker.close(id).unwrap();
+    std::fs::write(path.join("unsaved.txt"), "preserve").unwrap();
+    let scope = Some((i64::MAX, 0, 10));
+    let plan = broker
+        .cleanup_cleaned_worktrees_scoped(false, None, scope)
+        .unwrap()
+        .plan;
+    assert!(plan.worktrees.iter().any(|item| item.session_id == id));
+    assert_eq!(plan.eligible_worktree_count, 0);
+    let report = broker
+        .cleanup_cleaned_worktrees_scoped(true, Some(&plan.digest), scope)
+        .unwrap();
+    assert!(report.removed_session_ids.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(path.join("unsaved.txt")).unwrap(),
+        "preserve"
+    );
+}

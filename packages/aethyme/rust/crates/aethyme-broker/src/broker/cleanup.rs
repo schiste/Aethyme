@@ -3132,6 +3132,7 @@ impl Broker {
             &mut landing_cache,
             records.unwrap_or_default(),
             records_complete,
+            None,
         )?;
         Ok((plan, records_complete))
     }
@@ -3154,6 +3155,7 @@ impl Broker {
             landing_cache,
             crate::measurement::load_size_records(&self.main_root),
             true,
+            None,
         )
     }
 
@@ -3165,6 +3167,7 @@ impl Broker {
         landing_cache: &mut crate::representation::LandingVerdictCache,
         mut records: crate::measurement::SizeRecords,
         records_complete: bool,
+        scope: Option<(i64, i64, u32)>,
     ) -> Result<CleanupPlan, BrokerOpError> {
         // Cleared on every exit below, including an error return.
         struct ClearOnDrop<'a>(&'a std::cell::Cell<Option<std::time::Instant>>);
@@ -3178,6 +3181,9 @@ impl Broker {
         let target_snapshot = self.cleanup_target_snapshot();
         let mut plan = CleanupPlan {
             target_snapshot: target_snapshot.refs.clone(),
+            closed_before_ms: scope.map(|s| s.0),
+            after_session: scope.map(|s| s.1),
+            batch_limit: scope.map(|s| s.2),
             ..CleanupPlan::default()
         };
         let mut retained = crate::MeasuredTotal::default();
@@ -3194,7 +3200,18 @@ impl Broker {
         } else {
             Some(self.cleanup_live_checkout_snapshot(deadline)?)
         };
-        let sessions = self.store.cleaned_sessions()?;
+        let mut sessions = self.store.cleaned_sessions()?;
+        if let Some((before, after, limit)) = scope {
+            sessions.retain(|session| {
+                session.origin == SessionOrigin::Spawned
+                    && session.id > after
+                    && session.closed_at.is_some_and(|closed| closed < before)
+                    && Path::new(&session.worktree_path).is_dir()
+            });
+            sessions.sort_by_key(|session| session.id);
+            sessions.truncate(limit as usize);
+            plan.batch_last_session = sessions.last().map(|session| session.id);
+        }
         for (index, session) in sessions.iter().enumerate() {
             if session.origin != SessionOrigin::Spawned {
                 continue;
@@ -3333,7 +3350,7 @@ impl Broker {
         if scan.measures() && records_complete {
             // Only a pass that enumerated everything may prune: a routine
             // check sees whatever subset it asked about.
-            if deadline.is_none() {
+            if deadline.is_none() && scope.is_none() {
                 records.retain_paths(&known);
             }
             crate::warn_unrecorded(
@@ -3506,7 +3523,32 @@ impl Broker {
         apply: bool,
         confirm: Option<&str>,
     ) -> Result<CleanupSweepReport, BrokerOpError> {
-        let plan = self.cleanup_plan()?;
+        self.cleanup_cleaned_worktrees_scoped(apply, confirm, None)
+    }
+
+    /// Plan and apply a fixed, explicitly bounded set of old closed sessions.
+    pub fn cleanup_cleaned_worktrees_scoped(
+        &mut self,
+        apply: bool,
+        confirm: Option<&str>,
+        scope: Option<(i64, i64, u32)>,
+    ) -> Result<CleanupSweepReport, BrokerOpError> {
+        let plan = if let Some((before, after, limit)) = scope {
+            if before <= 0 || after < 0 || limit == 0 || limit > 1000 {
+                return Err(BrokerOpError::CleanupInvalidScope);
+            }
+            self.cleanup_plan_scanned_core(
+                crate::SizeScan::Measure,
+                None,
+                None,
+                &mut crate::representation::LandingVerdictCache::default(),
+                crate::measurement::load_size_records(&self.main_root),
+                true,
+                scope,
+            )?
+        } else {
+            self.cleanup_plan()?
+        };
         let mut removed_session_ids = Vec::new();
         let mut failures = Vec::new();
         if apply {
