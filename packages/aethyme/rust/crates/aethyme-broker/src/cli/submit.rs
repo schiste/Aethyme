@@ -1021,6 +1021,13 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
                 drift.behind
             );
         }
+        if drift.sync_impact == crate::main_drift::SyncImpact::Disjoint {
+            out!(
+                "  Graph impact is disjoint; intermediate sync may be deferred. Validate the current merge candidate before merging."
+            );
+        } else if !drift.would_conflict {
+            out!("  Graph impact is not proven disjoint; sync before continuing.");
+        }
         if let Some(command) = &drift.suggested_command {
             out!("  Catch up with: {command}");
         }

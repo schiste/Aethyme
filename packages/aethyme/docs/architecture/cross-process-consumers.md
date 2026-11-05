@@ -674,6 +674,16 @@ Before `status`, `start`, `sync`, `push`, `submit` or `finish` runs from the pri
 
 ### Session pull request open mode (#887)
 
+`broker push --json` reports `default_branch.sync_impact` as `unknown`,
+`related`, or `disjoint`. `disjoint` permits deferring an intermediate sync
+only for the exact fetched default-branch and session commits and clean
+working tree that were assessed. It requires complete, untruncated graph
+coverage for both revisions; missing or incomplete evidence returns `unknown`.
+A conflict or related surface still requires sync. The decision never replaces
+validation of the current merge candidate before merging. The cached drift
+comparison is ref-bound; status recomputes worktree-dependent impact rather
+than trusting a cached impact verdict.
+
 `aethyme broker push --session <id> --pr` creates a new pull request using the trusted default branch config `[broker.pr] open_as = "draft" | "ready"` in `.aethyme/config.toml`. A missing setting defaults to `draft`. The value is read from the fetched default-branch commit, not the session worktree; invalid values or unsupported keys inside `[broker.pr]` refuse before the session branch is pushed. The mode only applies when creating a pull request: an existing pull request is reported as the provider reports it and is not changed.
 
 This setting is a user-facing broker config contract. Changes to its accepted values, trust source, default, or existing-PR behavior require updating the config template and the session-push contract tests.
