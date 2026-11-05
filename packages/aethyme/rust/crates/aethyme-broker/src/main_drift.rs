@@ -109,6 +109,11 @@ pub(crate) fn assess_sync_impact(
             return;
         };
         if evidence.is_empty()
+            || coverage.by_language.iter().any(|(language, bucket)| {
+                evidence
+                    .get(language)
+                    .is_none_or(|entry| entry.files != bucket.files)
+            })
             || evidence
                 .values()
                 .any(|entry| entry.unresolved_calls > 0 || entry.unresolved_imports > 0)
@@ -527,6 +532,15 @@ mod tests {
         assert_eq!(result.sync_impact, SyncImpact::Disjoint);
         assert!(result.suggested_command.is_none());
         let mut coverage = aethyme_graph_storage::read_coverage(&worktree).unwrap();
+        coverage.use_evidence_by_language.as_mut().unwrap().clear();
+        aethyme_graph_storage::write_coverage_artifacts(&worktree, &coverage, &[]).unwrap();
+        let mut missing = measure(&repo, "origin/main", &commit, &head, CatchUp::Merge).unwrap();
+        assess_sync_impact(&repo, &worktree, &mut missing);
+        assert_eq!(missing.sync_impact, SyncImpact::Unknown);
+        coverage.use_evidence_by_language.as_mut().unwrap().insert(
+            "rust".into(),
+            aethyme_graph_storage::GraphUseEvidence::default(),
+        );
         coverage
             .use_evidence_by_language
             .as_mut()
