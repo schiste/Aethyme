@@ -165,17 +165,18 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
     );
     let job = block(&gates, "  gates:");
     // Unless a pull-request run already tested this exact tree, every gate
-    // runs (`main_skips_only_the_gates_a_pr_run_tested_on_the_same_tree`).
-    assert!(job.contains(&"            exec \"$aethyme\" broker advanced gates run --all"));
-    // The job always runs; only the tree lookup is limited to pushes.
+    // runs (`main_skips_only_the_gates_a_pr_run_tested_on_the_same_tree`), and
+    // cargo-test runs in shards
+    // (`the_cargo_test_jobs_run_the_pull_request_suite`). The job always runs;
+    // only the tree lookup is limited to pushes.
     assert!(!job.iter().any(|line| line.starts_with("    if:")));
+    assert!(block(&gates, "  tested-tree:").contains(&"        if: github.event_name == 'push'"));
     assert_eq!(
         job.iter()
             .filter(|line| line.trim_start().starts_with("if:"))
             .copied()
             .collect::<Vec<_>>(),
         [
-            "        if: github.event_name == 'push'",
             "        if: failure()",
             "        if: ${{ !cancelled() }}",
             "        if: ${{ !cancelled() }}"
@@ -194,11 +195,6 @@ fn main_gates_use_the_whole_runner_and_keep_their_storage_reserve() {
 
     // Passing gates print no detail, so the workflow records it. A summary
     // problem must not change the verdict the gates reached.
-    assert!(
-        run.contains(
-            &"          AETHYME_GATE_PHASES: ${{ runner.temp }}/gate-telemetry/phases.tsv"
-        )
-    );
     let summary = block(&gates, "      - name: Summarize the gates");
     assert!(summary.contains(&"          set -uo pipefail"));
     assert!(
@@ -206,24 +202,13 @@ fn main_gates_use_the_whole_runner_and_keep_their_storage_reserve() {
             &"            echo \"::warning::The gate telemetry could not be summarized.\""
         )
     );
-    assert!(
-        summary.contains(&"          report=packages/aethyme/rust/target/nextest/local/junit.xml")
-    );
     assert!(gates.contains("      - name: Upload the gate telemetry"));
-    let nextest = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .unwrap()
-            .join(".config/nextest.toml"),
-    )
-    .unwrap();
-    assert!(nextest.contains("[profile.local.junit]"));
 
-    let free = gates
+    let job = &gates[gates.find("\n  gates:\n").unwrap()..];
+    let free = job
         .find("      - name: Free runner disk when it is low")
         .unwrap();
-    assert!(free < gates.find("      - name: Checkout").unwrap());
+    assert!(free < job.find("      - name: Checkout").unwrap());
     let step = block(&gates, "      - name: Free runner disk when it is low");
     assert!(step.contains(&"          if [ \"$free\" -lt 30 ]; then"));
 }
@@ -238,11 +223,8 @@ fn main_gate_router_prebuild_reuses_the_managed_debug_target() {
     let build = gates
         .find("      - name: Build aethyme in the gates' managed cache")
         .unwrap();
-    let lookup = gates
-        .find("      - name: Look for a pull-request run that tested this tree")
-        .unwrap();
     let run = gates.find("      - name: Run all gates").unwrap();
-    assert!(locate_cache < cache && cache < build && build < lookup && lookup < run);
+    assert!(locate_cache < cache && cache < build && build < run);
     assert!(
         !gates.contains("Cache the aethyme release build"),
         "the gate router must not be built twice in separate targets"
@@ -391,13 +373,16 @@ fn main_skips_only_the_gates_a_pr_run_tested_on_the_same_tree() {
     assert!(record.contains(&"          name: tested-tree-${{ env.TESTED_TREE }}"));
 
     let gates = workflow("aethyme-gates.yml");
-    let job = block(&gates, "  gates:");
-    assert!(job.contains(&"          tree=\"$(git rev-parse 'HEAD^{tree}')\""));
+    let lookup = block(&gates, "  tested-tree:");
+    assert!(lookup.contains(&"          tree=\"$(git rev-parse 'HEAD^{tree}')\""));
     // An artifact uploaded by a fork's run never counts.
     assert!(
-        job.iter()
+        lookup
+            .iter()
             .any(|line| line.contains(".workflow_run.head_repository_id == $repo_id"))
     );
+    let job = block(&gates, "  gates:");
+    assert!(job.contains(&"          TESTED_BY_RUN: ${{ needs.tested-tree.outputs.run }}"));
     assert!(job.contains(
         &"          COVERED_BY_PR_SUITE: \"cargo-test fast-guards workflow-contract gate-policy\""
     ));
@@ -410,9 +395,11 @@ fn main_skips_only_the_gates_a_pr_run_tested_on_the_same_tree() {
                 .contains("broker advanced gates manifest --json | jq -r '.manifest.gates[].name'")
     }));
     assert!(job.contains(&"          for gate in $gates; do"));
-    assert!(job.contains(
-        &"              *) \"$aethyme\" broker advanced gates run --all --only \"$gate\" ;;"
-    ));
+    assert!(
+        job.contains(
+            &"              \"$aethyme\" broker advanced gates run --all --only \"$gate\""
+        )
+    );
 
     // Every skipped gate must exist, and the contract gate, which reads the
     // merged PR's body, is never skipped.
@@ -438,6 +425,93 @@ fn main_skips_only_the_gates_a_pr_run_tested_on_the_same_tree() {
     assert!(!job.iter().any(
         |line| line.contains("COVERED_BY_PR_SUITE") && line.contains("cross-process-contract")
     ));
+}
+
+/// On main the cargo-test gate runs as jobs, because one runner spent 19m49 on
+/// it with its CPUs saturated. A tree the pull-request suite tested already
+/// counts as covered, so these jobs must be that suite: same commands, every
+/// partition, and a verdict that fails when any part fails or is skipped. A
+/// gate other than cargo-test still runs in the gates job.
+#[test]
+fn the_cargo_test_jobs_run_the_pull_request_suite() {
+    let run_lines = |text: &str, job: &str| -> Vec<String> {
+        block(text, job)
+            .iter()
+            .filter(|line| line.trim_start().starts_with("run:"))
+            .map(|line| line.trim().to_owned())
+            .collect()
+    };
+    let oss = workflow("oss-ci.yml");
+    let gates = workflow("aethyme-gates.yml");
+
+    let oss_build = run_lines(&oss, "  rust-tests-build:");
+    assert!(oss_build.iter().any(|line| line.contains("--archive")));
+    assert_eq!(
+        run_lines(&gates, "  cargo-test-build:")
+            .iter()
+            .filter(|line| !line.starts_with("run: |"))
+            .collect::<Vec<_>>(),
+        oss_build
+            .iter()
+            .filter(|line| !line.starts_with("run: |") && !line.contains("cargo fmt"))
+            .collect::<Vec<_>>(),
+    );
+    let examples = run_lines(&gates, "  cargo-test-examples-doctests:");
+    assert_eq!(
+        examples.iter().collect::<Vec<_>>(),
+        run_lines(&oss, "  rust-examples-doctests:")
+            .iter()
+            .filter(|line| !line.contains("cargo fmt"))
+            .collect::<Vec<_>>(),
+    );
+
+    // The matrix must name every partition its command divides the suite into.
+    let shard = block(&gates, "  cargo-test-shard:");
+    assert!(shard.contains(&"    needs: cargo-test-build"));
+    assert!(shard.contains(&"      fail-fast: false"));
+    assert!(shard.contains(&"        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]"));
+    assert_eq!(
+        run_lines(&gates, "  cargo-test-shard:"),
+        run_lines(&oss, "  rust-tests-shard:")
+            .iter()
+            .map(|line| line.replace("/10\"", "/12\""))
+            .collect::<Vec<_>>(),
+    );
+
+    // Skipped only when a pull-request run tested the tree.
+    for job in ["  cargo-test-build:", "  cargo-test-examples-doctests:"] {
+        assert!(
+            block(&gates, job).contains(&"    if: ${{ needs.tested-tree.outputs.run == '' }}"),
+            "{job}"
+        );
+    }
+    let verdict = block(&gates, "  cargo-test:");
+    assert!(verdict.contains(&"    needs: [tested-tree, cargo-test-build, cargo-test-shard, cargo-test-examples-doctests]"));
+    assert!(verdict.contains(&"    if: ${{ !cancelled() && needs.tested-tree.result == 'success' && needs.tested-tree.outputs.run == '' }}"));
+    assert!(verdict.contains(&"          [[ \"$BUILD\" == success && \"$SHARDS\" == success && \"$EXAMPLES\" == success ]]"));
+
+    // The gates job leaves out cargo-test and nothing else.
+    let job = block(&gates, "  gates:");
+    assert!(job.contains(&"          RUNS_IN_SHARDS: \"cargo-test\""));
+    assert!(job.contains(&"            elif [[ \" $RUNS_IN_SHARDS \" == *\" $gate \"* ]]; then"));
+
+    // A required check matches by name, so a manual dispatch here must not be
+    // able to satisfy one on the same commit.
+    for name in block(&gates, "jobs:")
+        .iter()
+        .filter_map(|line| line.strip_prefix("    name: "))
+    {
+        assert!(
+            ![
+                "Rust lint (fmt, clippy)",
+                "Rust workspace tests",
+                "Rust examples and doctests",
+                "Cross-process contract check",
+            ]
+            .contains(&name),
+            "{name} is a required check's name"
+        );
+    }
 }
 
 /// macOS is tested nightly, and that run must be the whole workspace: until
