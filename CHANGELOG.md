@@ -4,6 +4,24 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.58] - 2026-11-05
+
+### Added
+
+- Use revision-bound graph evidence to guide broker synchronization, retaining synchronization when relatedness cannot be established (#1439, #1441, #1442).
+- Expose the Compose project name to environment provisioning hooks (#1436).
+
+### Fixed
+
+- Allow activity probes to be updated without destroying components and distinguish probe errors from idle results (#1435).
+- Wait briefly for concurrent worktree registry writes instead of failing immediately (#1433).
+- Default closed-checkout cleanup to a one-day grace period; explicit retention overrides remain in effect (#1444).
+
+### Changed
+
+- Run the cargo-test gate in shards and improve host resource admission (#1430, #1434, #1438).
+- Reuse patch IDs when checking whether checkout work has already landed (#1443).
+
 ## [0.8.57] - 2026-11-04
 
 ### Added
