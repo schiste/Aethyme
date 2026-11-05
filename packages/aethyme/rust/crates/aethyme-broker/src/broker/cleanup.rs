@@ -3159,6 +3159,7 @@ impl Broker {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // The scan inputs and optional scope are independently supplied.
     fn cleanup_plan_scanned_core(
         &self,
         scan: crate::SizeScan,
@@ -4539,7 +4540,7 @@ impl Broker {
         let session = self.store.session(session_id)?;
         ensure_lifecycle_session_unchanged(session_id, &initial_session, &session)?;
         let before = before.expect("scoped cutoff is present");
-        if !session.closed_at.is_some_and(|closed| closed < before)
+        if session.closed_at.is_none_or(|closed| closed >= before)
             || self
                 .store
                 .cleaned_sessions()?
