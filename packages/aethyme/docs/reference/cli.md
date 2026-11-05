@@ -1635,6 +1635,14 @@ construction. The broker names that, from local facts only, and never blocks:
   secrets (`.env*`, `*.pem`, `*.key`, `id_rsa*` and similar) show only that they
   changed. Set this to `false` where another session's uncommitted work must
   not reach an agent's context.
+- **`[leases] overlap_impact`** (default `false`): when an agent is about to edit
+  a file, the `PreToolUse` hook also names another live session changing a file
+  that one directly calls or imports, with that session's diff. The evidence is
+  the code graph, which must be bound to a revision where both files read as the
+  sessions started from them; an absent or stale graph says nothing, and a partial
+  one states its low confidence. It is off by default because on Aethyme's own
+  history 6 of 15 findings named nothing the other change had touched, and a graph
+  query takes about a second on a large store.
 - **`[leases] idle_minutes` and `stale_grace_minutes`** (defaults 30 and 15):
   lease liveness is bound to the session's holder process (#360). A lease is
   `active` while that process runs, `idle` once it has issued no broker

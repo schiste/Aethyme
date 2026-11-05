@@ -379,7 +379,7 @@ fn behind_main_row(session_id: i64, drift: &DefaultBranchDrift) -> Option<crate:
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn drift(head: &str, commit: &str) -> DefaultBranchDrift {
@@ -396,7 +396,7 @@ mod tests {
         }
     }
 
-    fn graph(root: &std::path::Path, revision: &str, related: bool) {
+    pub(crate) fn graph(root: &std::path::Path, revision: &str, related: bool) {
         use aethyme_engine::model::{
             edge::{Edge, EdgeKind},
             file::{FileNode, FileRole},
@@ -469,7 +469,7 @@ mod tests {
             .unwrap();
     }
 
-    fn git(root: &std::path::Path, args: &[&str]) -> String {
+    pub(crate) fn git(root: &std::path::Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
             .args(args)
             .current_dir(root)

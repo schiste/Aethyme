@@ -934,6 +934,7 @@ fn on_pre_tool_use(
             ));
         }
     }
+    let impact = peer_impact_notes(broker, session, &relatives, &peers, &leases, &mut seen);
     if !notes.is_empty() && crate::overlap_diff::enabled(broker.main_root()) {
         // One budget for the whole tool call, read together: an edit is waiting.
         let reports = crate::overlap_diff::read_all(
@@ -947,12 +948,77 @@ fn on_pre_tool_use(
             note.push_str(&crate::overlap_diff::render(&report, "  "));
         }
     }
+    notes.extend(impact);
     seen.save();
     cache.save();
     if notes.is_empty() {
         return HookOutcome::Silent;
     }
     HookOutcome::Context(notes.join("\n"))
+}
+
+/// Files these edits depend on that another live session is changing, from the
+/// code graph. Free on a repository with no graph, and silent on one it cannot
+/// trust: see [`crate::peer_impact`]. Once per change, like the notes above.
+fn peer_impact_notes(
+    broker: &Broker,
+    session: &Session,
+    relatives: &[String],
+    peers: &[Session],
+    leases: &[crate::Lease],
+    seen: &mut SeenState,
+) -> Vec<String> {
+    use crate::{overlap_diff, peer_impact};
+    let main_root = broker.main_root();
+    if !peer_impact::enabled(main_root) {
+        return Vec::new();
+    }
+    let changed: Vec<peer_impact::Peer> = peers
+        .iter()
+        .map(|peer| {
+            let files = leases
+                .iter()
+                .filter(|lease| {
+                    lease.session_id == peer.id && lease.kind == crate::LeaseKind::Implicit
+                })
+                .map(|lease| lease.path.clone())
+                .collect();
+            peer_impact::Peer::new(peer, files)
+        })
+        .collect();
+    let my_base = session
+        .diff_base
+        .as_deref()
+        .or(session.adoption_base.as_deref());
+    let mut notes = Vec::new();
+    for relative in relatives {
+        let deadline = std::time::Instant::now() + overlap_diff::HOOK_BUDGET;
+        for finding in peer_impact::find(main_root, relative, my_base, &changed, deadline) {
+            let Some(peer) = peers.iter().find(|peer| peer.id == finding.session_id) else {
+                continue;
+            };
+            let mut hunks = overlap_diff::read_all(
+                main_root,
+                vec![peer_impact::hunk_request(peer, &finding)],
+                overlap_diff::HOOK_BUDGET,
+            );
+            let mut hunk = hunks.pop();
+            let digest_key = format!(
+                "peer-impact|{}|{}|{}",
+                finding.session_id, finding.changed_file, finding.path
+            );
+            if let Some(hunk) = hunk.as_mut() {
+                overlap_diff::mark_shown(hunk, seen);
+                if hunk.state == overlap_diff::OverlapChangesState::AlreadyShown {
+                    continue;
+                }
+            } else if !seen.first_time(&digest_key) {
+                continue;
+            }
+            notes.push(peer_impact::render(&finding, hunk.as_ref()));
+        }
+    }
+    notes
 }
 
 /// One other live session, considered for one path the agent is about to
@@ -1570,6 +1636,77 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Through the hook's own path: opted in, a session changing a file this
+    /// edit depends on is named with its diff, once; not opted in, it is silent.
+    #[test]
+    fn a_dependency_another_session_is_changing_is_flagged_only_when_opted_in() {
+        use crate::main_drift::tests::{git, graph};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join(".gitignore"), ".aethyme/\n").unwrap();
+        for path in ["a.rs", "b.rs"] {
+            std::fs::write(root.join(path), "base\n").unwrap();
+        }
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "base"]);
+        let head = git(&root, &["rev-parse", "HEAD"]);
+        graph(&root, &head, true);
+
+        let mut broker = Broker::open(&root).unwrap();
+        let worktree = |name: &str| {
+            let path = temp.path().join(name);
+            git(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &format!("agent/{name}"),
+                    path.to_str().unwrap(),
+                    "main",
+                ],
+            );
+            path
+        };
+        let other_tree = worktree("other");
+        let other = broker.adopt(&other_tree, Some("rework a")).unwrap();
+        let me = broker.adopt(&worktree("me"), Some("use a")).unwrap();
+        std::fs::write(other_tree.join("a.rs"), "changed by the other session\n").unwrap();
+        broker.refresh_leases().unwrap();
+        let leases = broker.store_ref().active_leases().unwrap();
+        let peers = vec![broker.store_ref().session(other.id).unwrap()];
+        let notes = |broker: &Broker, seen: &mut SeenState| {
+            peer_impact_notes(broker, &me, &["b.rs".to_string()], &peers, &leases, seen)
+        };
+        let mut seen = SeenState::load(&root, me.id);
+
+        assert!(notes(&broker, &mut seen).is_empty(), "off by default");
+
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/config.toml"),
+            "[leases]\noverlap_impact = true\n",
+        )
+        .unwrap();
+        let found = notes(&broker, &mut seen);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let note = &found[0];
+        assert!(
+            note.contains(&format!("session {} is changing `a.rs`", other.id)),
+            "{note}"
+        );
+        assert!(note.contains("Advisory, not a conflict"), "{note}");
+        assert!(note.contains("| +changed by the other session"), "{note}");
+
+        assert!(
+            notes(&broker, &mut seen).is_empty(),
+            "shown once per change"
+        );
+    }
 
     #[test]
     fn silence_renders_no_envelope() {
