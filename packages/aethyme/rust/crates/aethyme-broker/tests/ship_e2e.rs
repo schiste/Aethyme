@@ -266,7 +266,7 @@ impl Fixture {
             format!("[delivery]\ndefault = \"{mode}\"\n"),
         )
         .unwrap();
-        aethyme_testkit::promote_on_submit(self.repo);
+        aethyme_testkit::promote_on_submit(&self.repo);
         git(&self.repo, &["add", "-f", ".aethyme/config.toml"]);
         git(&self.repo, &["commit", "-qm", "configure delivery"]);
         git(&self.repo, &["push", "-q", "origin", "main"]);
@@ -280,7 +280,7 @@ impl Fixture {
             format!("[publication]\nmode = \"{mode}\"\nallow_break_glass = false\n"),
         )
         .unwrap();
-        aethyme_testkit::promote_on_submit(self.repo);
+        aethyme_testkit::promote_on_submit(&self.repo);
         git(&self.repo, &["add", "-f", ".aethyme/config.toml"]);
         git(&self.repo, &["commit", "-qm", "configure publication"]);
         git(&self.repo, &["push", "-q", "origin", "main"]);
@@ -883,7 +883,7 @@ fn a_push_only_delivery_table_keeps_the_unconfigured_ship_route() {
         "[delivery]\npush_session_branches = true\n",
     )
     .unwrap();
-    aethyme_testkit::promote_on_submit(fixture.repo);
+    aethyme_testkit::promote_on_submit(&fixture.repo);
     git(&fixture.repo, &["add", "-f", ".aethyme/config.toml"]);
     git(
         &fixture.repo,
@@ -919,7 +919,7 @@ fn ship_plan_reads_publication_policy_from_the_remote_default_commit() {
         "[publication]\nmode = \"direct\"\nallow_break_glass = false\n",
     )
     .unwrap();
-    aethyme_testkit::promote_on_submit(worktree);
+    aethyme_testkit::promote_on_submit(&worktree);
     git(&worktree, &["add", "feature.txt"]);
     git(&worktree, &["add", "-f", ".aethyme/config.toml"]);
     git(

@@ -470,7 +470,7 @@ fn other_broker_json_shapes_match_snapshots() {
         "[graph]\nauthority = 'disabled'\n",
     )
     .unwrap();
-    aethyme_testkit::promote_on_submit(repo);
+    aethyme_testkit::promote_on_submit(&repo);
     std::fs::write(
         repo.join(".aethyme/gates.toml"),
         "[[gate]]\nname = 'shape-gate'\ncommand = 'true'\ntriggers = ['src/**']\n",

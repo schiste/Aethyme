@@ -65,7 +65,7 @@ fn fixture() -> Fixture {
 impl Fixture {
     fn configure(&self, text: &str) {
         std::fs::write(self.repo.join(".aethyme/config.toml"), text).unwrap();
-        aethyme_testkit::promote_on_submit(self.repo);
+        aethyme_testkit::promote_on_submit(&self.repo);
     }
 
     /// Commit `text` as the config, publish it to a bare origin as the

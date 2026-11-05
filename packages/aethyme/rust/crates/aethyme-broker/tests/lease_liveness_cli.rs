@@ -72,7 +72,7 @@ fn fixture(config: &str) -> Fixture {
     git(&repo, &["commit", "-qm", "init"]);
     std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
     std::fs::write(repo.join(".aethyme/config.toml"), config).unwrap();
-    aethyme_testkit::promote_on_submit(repo);
+    aethyme_testkit::promote_on_submit(&repo);
     let host = tmp.path().join("host");
     std::fs::create_dir_all(&host).unwrap();
     Fixture {
