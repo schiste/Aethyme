@@ -34,7 +34,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 61;
+pub const SCHEMA_VERSION: i64 = 62;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -109,6 +109,8 @@ pub const SCHEMA_VERSION: i64 = 61;
 /// - v61: one new table for automation notes (#1238). An older binary never
 ///   names it, so it neither shows nor acknowledges them; nothing existing
 ///   changes, so the floor stays v60.
+/// - v62: one index for per-session event lookups. Older binaries maintain it
+///   on write without naming it, so the floor stays v60.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 60;
 
 /// Migration that introduced profile-bound gate-cache reads and writes.
@@ -2116,6 +2118,12 @@ CREATE INDEX IF NOT EXISTS automation_notes_by_recipient
     ON automation_notes (recipient_session_id, acknowledged_at, id);
 ";
 
+const MIGRATION_V62: &str = "
+-- Latest-event-of-a-kind lookups for one session walked that kind's whole
+-- history, once per live session on every liveness assessment.
+CREATE INDEX IF NOT EXISTS events_by_session_kind ON events (session_id, kind, id);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -2178,6 +2186,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V59,
     MIGRATION_V60,
     MIGRATION_V61,
+    MIGRATION_V62,
 ];
 
 /// Migrations that only add columns. One is skipped when every column it adds
@@ -3088,7 +3097,7 @@ mod tests {
         set_meta(&conn, "min_compatible_schema", 58);
         let before: i64 = conn
             .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'automation_notes%'",
+                "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'automation_notes%' AND name <> 'events_by_session_kind'",
                 [],
                 |row| row.get(0),
             )
@@ -3112,7 +3121,7 @@ mod tests {
         assert_eq!(MIGRATIONS[59], MIGRATION_V60);
         let after: i64 = conn
             .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'automation_notes%'",
+                "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'automation_notes%' AND name <> 'events_by_session_kind'",
                 [],
                 |row| row.get(0),
             )
@@ -3129,7 +3138,7 @@ mod tests {
 
         migrate(&conn).unwrap();
 
-        assert_eq!(current_version(&conn).unwrap(), 61);
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 60);
         assert!(schema_is_compatible_with(&conn, 61, 60).unwrap());
         assert_eq!(MIGRATIONS[60], MIGRATION_V61);
@@ -4434,6 +4443,27 @@ mod tests {
             .unwrap();
         assert_eq!(live, ("open".into(), None, None));
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v62_finds_a_sessions_latest_event_through_an_index_and_keeps_the_floor() {
+        let conn = migrated_through(61);
+        set_meta(&conn, "min_compatible_schema", 60);
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 60);
+        assert!(schema_is_compatible_with(&conn, 62, 60).unwrap());
+        for query in [
+            "SELECT id FROM events WHERE session_id = 1 AND kind = 'k' ORDER BY id DESC LIMIT 1",
+            "SELECT id, ts, payload_json FROM events
+             WHERE session_id = 1 AND kind IN ('a', 'b') ORDER BY id DESC LIMIT 1",
+        ] {
+            let plan: String = conn
+                .query_row(&format!("EXPLAIN QUERY PLAN {query}"), [], |row| row.get(3))
+                .unwrap();
+            assert!(plan.contains("events_by_session_kind"), "{query}: {plan}");
+        }
     }
 
     #[test]
