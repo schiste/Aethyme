@@ -3,8 +3,9 @@ name: Aethyme Gates
 # Convergence lane: gates.toml is the single definition of "verified" —
 # this workflow runs the gates, via the runner, that the broker runs before
 # promoting a session (`aethyme broker advanced gates run --only <gate>`).
-# Certify merged trees here; OSS CI runs the full Rust workspace on pull
-# requests. Keep the binary-driven subset available manually.
+# Certify merged trees here. Pull requests no longer run the Rust workspace, so
+# this is the first run of the suite on a merged change; dispatch OSS CI on a
+# branch to run it sooner. Keep the binary-driven subset available manually.
 #
 # One gate runs differently. `cargo-test` runs as the `cargo-test-*` jobs below,
 # with the commands OSS CI's suite uses: one compile, then partitions of it on
@@ -44,6 +45,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Finds nothing while OSS CI has no pull_request trigger, so every gate runs.
+  # Kept so restoring that trigger needs no change here.
   # A merge commit whose tree a pull-request run already tested (OSS CI's
   # record-tested-tree job, after the workspace suite and the examples and
   # doctests passed) skips the gates those suites cover. Only an artifact from a

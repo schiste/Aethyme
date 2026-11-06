@@ -1,9 +1,16 @@
 name: OSS CI
 
+# Runs on merged main, not on pull requests. Aethyme Gates owns main's test
+# verdict; this workflow adds lint, the product path and the performance
+# controls there, and warms the cache. Dispatch it on a branch to run the whole
+# pull-request suite before merging:
+#   gh workflow run oss-ci.yml --ref <branch>
+# The job conditions still accept a `pull_request` event, so restoring that
+# trigger brings the old lane back, fast lanes and tested-tree record included.
 on:
-  pull_request:
   push:
     branches: ["main", "master"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -268,7 +275,7 @@ jobs:
   rust-tests-build:
     name: Rust workspace tests (build)
     needs: classify_changes
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && (needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}
+    if: ${{ !cancelled() && github.event_name != 'push' && (needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -397,7 +404,7 @@ jobs:
   broker-performance-controls:
     name: Broker performance controls
     needs: classify_changes
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && (needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}
+    if: ${{ !cancelled() && (needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -430,7 +437,7 @@ jobs:
     # Mirrored Markdown-only PRs run the exact skill parity tests with rustc
     # directly. Exact performance-reporting PRs also run parity plus bounded
     # Python/workflow checks; all uncertain diffs run the full Rust suite.
-    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+    if: ${{ !cancelled() && github.event_name != 'push' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -529,7 +536,7 @@ jobs:
   rust-examples-doctests:
     name: Rust examples and doctests
     needs: classify_changes
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && (needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}
+    if: ${{ !cancelled() && github.event_name != 'push' && (needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -596,8 +603,8 @@ jobs:
           retention-days: 14
 
   # ── Cache warm-up ───────────────────────────────────────────────────────
-  # Compiles main's tests on each push so the pull-request test jobs above
-  # restore a warm cache instead of starting cold. Builds only; main's test
+  # Compiles main's tests on each push so the contract check and a dispatched
+  # run of the test jobs above restore a warm cache instead of starting cold. Builds only; main's test
   # verdict is Aethyme Gates. macOS is tested nightly (macos-nightly.yml),
   # which keeps its own cache.
   warm-rust-cache:

@@ -1,6 +1,6 @@
 # Testing Guide
 
-Last Updated: 2026-11-04
+Last Updated: 2026-11-06
 
 The suite is Rust. There is no database, no services, and no Python —
 `src/` was deleted on 2026-08-01 (python-retirement Phase 6) and the dev
@@ -191,6 +191,29 @@ needs an interpreter. `.github/workflows/oss-ci.yml` proves it in the
 containing nothing else, asserts no `python`/`python3` is reachable, and
 then runs the full product surface — enhance deploy/verify, ai-ready,
 autofix, the deployed SessionStart hook, indexing, and the explore chain.
+
+## Where CI Runs
+
+CI runs on merged `main`, not on pull requests. Aethyme Gates runs the workspace
+suite, examples and doctests there, and OSS CI adds lint, the product path and
+the broker performance controls. Windows smoke runs on every push to `main`. The
+release-targets build and the Homebrew rehearsal run on a push to `main` that
+touches their paths. The rehearsal never writes to the tap.
+
+Pull requests run one check, the cross-process contract check, because it reads
+the PR body and its verdict is only useful before the merge.
+
+To run the pull-request suite on a branch before merging:
+
+```bash
+gh workflow run oss-ci.yml --ref <branch>
+gh workflow run windows-release.yml --ref <branch>
+gh workflow run release-targets.yml --ref <branch>
+```
+
+A broken change is therefore found on `main` after it lands, so read main's runs
+before cutting a release. The release workflow requires Aethyme Gates to have
+passed on the tagged commit.
 
 ## What The Suite Proves
 

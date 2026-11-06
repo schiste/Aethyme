@@ -6,8 +6,8 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd "$script_dir/../.." && pwd)
 workflow="$repo_root/.github/workflows/oss-ci.yml"
 full_path_condition="needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')"
-rust_tests_condition="\${{ !cancelled() && github.event_name == 'pull_request' }}"
-examples_condition="\${{ !cancelled() && github.event_name == 'pull_request' && ($full_path_condition) }}"
+rust_tests_condition="\${{ !cancelled() && github.event_name != 'push' }}"
+examples_condition="\${{ !cancelled() && github.event_name != 'push' && ($full_path_condition) }}"
 product_condition="\${{ !cancelled() && (github.event_name != 'pull_request' || $full_path_condition) }}"
 
 fail() {
