@@ -1,21 +1,9 @@
 name: Windows release smoke
 
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/release.yml"
-      - ".github/workflows/windows-release.yml"
-      - "scripts/windows-release-smoke.ps1"
-      - "packages/aethyme/rust/Cargo.lock"
-      - "packages/aethyme/rust/Cargo.toml"
-      - "packages/aethyme/rust/crates/aethyme-cli/**"
-      - "packages/aethyme/rust/crates/aethyme-engine/**"
-      - "packages/aethyme/rust/crates/aethyme-enhance/**"
-      - "packages/aethyme/rust/crates/aethyme-quality/**"
-      - "packages/aethyme/rust/crates/aethyme-graph-indexer/**"
-      - "packages/aethyme/rust/crates/aethyme-graph-storage/**"
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read

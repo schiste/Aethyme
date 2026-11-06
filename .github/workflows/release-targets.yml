@@ -6,7 +6,8 @@ name: Release Targets
 # because nothing exercised it before a tag. This is not a required check.
 
 on:
-  pull_request:
+  push:
+    branches: [main]
     paths:
       - .github/workflows/release.yml
       - .github/workflows/release-targets.yml
@@ -19,12 +20,13 @@ on:
       - packages/aethyme/rust/crates/aethyme-broker/tests/host_operations_e2e.rs
       - packages/aethyme/rust/crates/aethyme-testkit/tests/release_installer.rs
       - packages/aethyme/rust/crates/aethyme-testkit/tests/release_contract.rs
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-targets-${{ github.event.pull_request.number }}
+  group: release-targets-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

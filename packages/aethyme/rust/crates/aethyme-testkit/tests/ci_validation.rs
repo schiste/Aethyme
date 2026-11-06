@@ -25,26 +25,77 @@ fn block<'a>(text: &'a str, header: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// CI runs on merged main. The contract check is the one exception, because its
+/// verdict is only useful before the merge.
 #[test]
-fn pr_and_main_have_one_automatic_full_workspace_owner() {
+fn pull_requests_trigger_only_the_contract_check() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(5)
+        .unwrap();
+    let mut triggered = Vec::new();
+    for entry in std::fs::read_dir(root.join(".github/workflows")).unwrap() {
+        let path = entry.unwrap().path();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let on = block(&text, "on:");
+        if on.iter().any(|line| {
+            line.trim_start().starts_with("pull_request")
+                || line.trim_start().starts_with("merge_group")
+        }) {
+            triggered.push(path.file_name().unwrap().to_string_lossy().into_owned());
+        }
+    }
+    assert_eq!(triggered, ["cross-process-contract.yml"]);
+
+    // Each workflow that left the pull-request lane can still be run by hand on
+    // a branch, and on main. The tap's dispatch publishes, so its branch-free
+    // rehearsal stays on push.
+    for name in ["oss-ci.yml", "windows-release.yml", "release-targets.yml"] {
+        let text = workflow(name);
+        let on = block(&text, "on:");
+        assert!(on.contains(&"  workflow_dispatch:"), "{name}");
+        assert!(on.contains(&"  push:"), "{name}");
+    }
+    let tap = workflow("homebrew-tap.yml");
+    assert!(block(&tap, "on:").contains(&"  push:"));
+    // A release calls the tap workflow from a tag push, so the event name cannot
+    // tell a rehearsal from a publication; only the absent tag can.
+    assert!(tap.contains("if [ -z \"$INPUT_TAG\" ]; then"));
+    assert!(tap.contains("            mode=rehearse"));
+    assert!(!tap.contains("\"$EVENT_NAME\" = push"));
+    assert!(!tap.contains("github.event_name == 'push'"));
+    assert!(workflow("release.yml").contains("uses: ./.github/workflows/homebrew-tap.yml"));
+
+    // Main runs what the pull-request lane used to be the only run of.
+    let oss = workflow("oss-ci.yml");
+    let controls = block(&oss, "  broker-performance-controls:");
+    assert!(
+        !controls
+            .iter()
+            .any(|line| line.contains("github.event_name"))
+    );
+}
+
+#[test]
+fn main_has_one_automatic_full_workspace_owner() {
     let oss = workflow("oss-ci.yml");
     assert_eq!(
         block(&oss, "on:"),
         [
-            "  pull_request:",
             "  push:",
-            "    branches: [\"main\", \"master\"]"
+            "    branches: [\"main\", \"master\"]",
+            "  workflow_dispatch:"
         ]
     );
     // `rust-tests` keeps the required check name. The suite itself is built
     // once into a nextest archive and run in ten hash partitions; the verdict
     // job requires the build, every shard and the performance controls.
     let rust = block(&oss, "  rust-tests:");
-    assert!(rust.contains(&"    if: ${{ !cancelled() && github.event_name == 'pull_request' }}"));
+    assert!(rust.contains(&"    if: ${{ !cancelled() && github.event_name != 'push' }}"));
     assert!(rust.contains(&"    needs: [classify_changes, rust-tests-build, rust-tests-shard, broker-performance-controls]"));
     let build = block(&oss, "  rust-tests-build:");
     assert!(build.contains(&"    needs: classify_changes"));
-    assert!(build.contains(&"    if: ${{ !cancelled() && github.event_name == 'pull_request' && (needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}"));
+    assert!(build.contains(&"    if: ${{ !cancelled() && github.event_name != 'push' && (needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}"));
     // The workspace suite runs under nextest. `cargo test --workspace
     // --examples` once stood in for it, but a target flag narrows cargo's
     // selection to examples only, so it ran three binaries.
@@ -70,11 +121,11 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
     // nextest runs neither example targets nor doctests, and the
     // release-manifest assertions in
     // `crates/aethyme-broker/examples/release_manifest.rs` live in an example.
-    // They run in a job of their own, beside the workspace suite, on every
-    // full-validation pull request. Docs-fast pull requests run only parity.
+    // They run in a job of their own, beside the workspace suite, whenever the
+    // suite is dispatched.
     let examples = block(&oss, "  rust-examples-doctests:");
     assert!(examples.contains(&"    needs: classify_changes"));
-    assert!(examples.contains(&"    if: ${{ !cancelled() && github.event_name == 'pull_request' && (needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}"));
+    assert!(examples.contains(&"    if: ${{ !cancelled() && github.event_name != 'push' && (needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}"));
     assert!(examples.contains(&"        run: cargo test --locked --workspace --examples"));
     assert!(examples.contains(&"        run: cargo test --locked --workspace --doc"));
     // The job-level event guard and the full-suite/parity step guards are
@@ -87,7 +138,7 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
     assert_eq!(
         rust_conditions,
         [
-            "if: ${{ !cancelled() && github.event_name == 'pull_request' }}",
+            "if: ${{ !cancelled() && github.event_name != 'push' }}",
             "if: ${{ needs.classify_changes.result == 'success' && (needs.classify_changes.outputs.docs_fast == 'true' || needs.classify_changes.outputs.performance_fast == 'true') }}",
             "if: ${{ needs.classify_changes.result == 'success' && (needs.classify_changes.outputs.docs_fast == 'true' || needs.classify_changes.outputs.performance_fast == 'true') }}",
             "if: ${{ needs.classify_changes.result == 'success' && needs.classify_changes.outputs.performance_fast == 'true' }}",
@@ -97,7 +148,7 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
             "if: ${{ always() && needs.rust-tests-build.result == 'success' }}",
             "if: ${{ always() && needs.rust-tests-build.result == 'success' }}",
         ],
-        "PR guard; parity toolchain and parity on either fast path; performance validation; the full-suite verdict; four telemetry steps"
+        "Not on push; parity toolchain and parity on either fast path; performance validation; the full-suite verdict; four telemetry steps"
     );
     assert!(rust.contains(&"        run: bash .github/scripts/validate-performance-fast-lane.sh"));
     // A skipped or failed build, shard or control job fails the verdict.
@@ -110,7 +161,7 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
     // of its own beside the build. Pin its condition and exact suites.
     let controls = block(&oss, "  broker-performance-controls:");
     assert!(controls.contains(&"    needs: classify_changes"));
-    assert!(controls.contains(&"    if: ${{ !cancelled() && github.event_name == 'pull_request' && (needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}"));
+    assert!(controls.contains(&"    if: ${{ !cancelled() && (needs.classify_changes.result != 'success' || (needs.classify_changes.outputs.docs_fast != 'true' && needs.classify_changes.outputs.performance_fast != 'true')) }}"));
     assert_eq!(
         controls
             .iter()
@@ -360,7 +411,8 @@ fn failed_gate_diagnostics_report_failure_before_log_creation() {
     );
 }
 
-/// Main's Aethyme Gates skip a gate only when a pull-request run of this
+/// Pull requests run no suite, so this skip finds nothing today; it stays for a
+/// restored trigger. Main's Aethyme Gates skip a gate only when a pull-request run of this
 /// repository passed both suites on a byte-identical tree, and then only the
 /// gates those suites cover. Any other gate, including one added later, runs.
 #[test]

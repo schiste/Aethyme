@@ -34,7 +34,9 @@ on:
         description: Stable release tag to publish (vX.Y.Z)
         required: true
         type: string
-  pull_request:
+  # Rehearses against the live tap and never writes. It has no `tag` input.
+  push:
+    branches: [main]
     paths:
       - .github/workflows/homebrew-tap.yml
       - .github/workflows/release.yml
@@ -47,11 +49,11 @@ permissions:
 
 jobs:
   publish:
-    name: ${{ github.event_name == 'pull_request' && 'Rehearse Homebrew tap publication' || 'Update Homebrew tap' }}
+    name: ${{ inputs.tag == '' && 'Rehearse Homebrew tap publication' || 'Update Homebrew tap' }}
     runs-on: ubuntu-latest
     concurrency:
-      group: ${{ github.event_name == 'pull_request' && format('homebrew-tap-pr-{0}', github.event.pull_request.number) || 'homebrew-tap' }}
-      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+      group: ${{ inputs.tag == '' && 'homebrew-tap-rehearsal' || 'homebrew-tap' }}
+      cancel-in-progress: ${{ inputs.tag == '' }}
     steps:
       - name: Resolve release and mode
         id: release
@@ -62,7 +64,9 @@ jobs:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           set -euo pipefail
-          if [ "$EVENT_NAME" = pull_request ]; then
+          # Only a direct push to main has no tag. A release calls this workflow
+          # from a tag push, so its event is `push` too and it must publish.
+          if [ -z "$INPUT_TAG" ]; then
             tag="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts \
               --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName')"
             mode=rehearse
@@ -89,7 +93,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # A publication renders with the tagged source; a rehearsal with
-          # the pull request's.
+          # the pushed commit's.
           ref: ${{ steps.release.outputs.mode == 'publish' && format('refs/tags/{0}', steps.release.outputs.tag) || '' }}
           fetch-depth: 0
           persist-credentials: false

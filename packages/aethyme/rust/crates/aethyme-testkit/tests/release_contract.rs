@@ -818,11 +818,11 @@ fn homebrew_tap_workflow_publishes_from_the_signed_manifest() {
     let tap = std::fs::read_to_string(root.join(".github/workflows/homebrew-tap.yml")).unwrap();
 
     // release.yml hands stable tags to the reusable workflow, which is also
-    // the retry path and the pull-request rehearsal.
+    // the retry path and, on main, the rehearsal.
     assert!(release.contains("uses: ./.github/workflows/homebrew-tap.yml"));
     assert!(release.contains("if: ${{ !contains(github.ref_name, '-') }}"));
     assert!(!release.contains("git push origin HEAD:main"));
-    for trigger in ["workflow_call:", "workflow_dispatch:", "pull_request:"] {
+    for trigger in ["workflow_call:", "workflow_dispatch:", "push:"] {
         assert!(tap.contains(trigger), "homebrew-tap.yml lost {trigger}");
     }
 
