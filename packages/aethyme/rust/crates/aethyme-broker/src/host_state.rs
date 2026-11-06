@@ -122,6 +122,42 @@ pub(crate) fn path_is_ephemeral(path: &Path) -> bool {
     path.starts_with(&temp)
 }
 
+/// Test-only: keep a throwaway repository's worktrees away from a worktree root
+/// the host set for real repositories. `.cargo/config.toml` sets it for every
+/// test, so a developer's exported `AETHYME_WORKTREE_ROOT` cannot fill that root
+/// with worktree trees no database will ever account for.
+///
+/// Honoured only for a repository under the system temporary directory, the same
+/// narrowing as the gate-trust escape: `.cargo/config.toml` also reaches
+/// `cargo run`, and a real checkout must keep the root its host chose.
+const TEST_CONTAIN_WORKTREES_ENV: &str = "AETHYME_TEST_CONTAIN_WORKTREES";
+
+/// Whether a test run ignores the `AETHYME_WORKTREE_ROOT` value `root` for the
+/// repository at `main_root`. A root under the temporary directory is one a test
+/// chose for itself, so it stays in force, strict rules included.
+pub(crate) fn contains_test_worktrees(main_root: &Path, root: &Path) -> bool {
+    contains_test_worktrees_from(
+        std::env::var_os(TEST_CONTAIN_WORKTREES_ENV).as_deref(),
+        main_root,
+        root,
+    )
+}
+
+/// [`contains_test_worktrees`] with the environment value supplied, so the
+/// narrowing is tested without mutating the process environment.
+fn contains_test_worktrees_from(
+    value: Option<&std::ffi::OsStr>,
+    main_root: &Path,
+    root: &Path,
+) -> bool {
+    value.is_some_and(|value| value == "1")
+        && path_is_ephemeral(main_root)
+        // The root need not exist yet, so it may not canonicalize through the
+        // symlink in macOS's temporary directory; compare the raw form as well.
+        && !root.starts_with(std::env::temp_dir())
+        && !path_is_ephemeral(root)
+}
+
 /// Explain a host-state I/O failure, naming the usual cause when access is denied.
 ///
 /// Coordination state is host-scoped by design: it must be visible to every
@@ -208,6 +244,29 @@ pub(crate) fn protect_host_state_path(_path: &Path, _directory: bool) -> std::io
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_throwaway_repository_in_a_test_run_ignores_a_root_outside_temp() {
+        let temp = std::env::temp_dir();
+        let on = Some(std::ffi::OsStr::new("1"));
+        let throwaway = temp.join("fixture");
+        let host_root = Path::new("/aethyme-host-root");
+        let real_repository = Path::new("/aethyme-real-repository");
+
+        assert!(contains_test_worktrees_from(on, &throwaway, host_root));
+        assert!(
+            !contains_test_worktrees_from(None, &throwaway, host_root),
+            "without the test setting the host's root stays strict"
+        );
+        assert!(
+            !contains_test_worktrees_from(on, real_repository, host_root),
+            "cargo run on a real checkout keeps the host's root"
+        );
+        assert!(
+            !contains_test_worktrees_from(on, &throwaway, &temp.join("chosen-by-the-test")),
+            "a root under the temporary directory is one the test chose"
+        );
+    }
 
     /// A denial must say it is a denial, and must not read as a broken install
     /// (#132: the caller's wrapper turned this into "install or upgrade Aethyme").

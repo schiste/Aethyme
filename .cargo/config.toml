@@ -17,6 +17,12 @@ AETHYME_TRUST_NONINTERACTIVE_FOR_TESTS = "1"
 # value. See `aethyme_broker::TEST_AVAILABLE_BYTES_ENV`.
 AETHYME_TEST_AVAILABLE_BYTES = "1099511627776"
 
+# Test-only: a throwaway repository under the system temp dir ignores an exported
+# AETHYME_WORKTREE_ROOT outside that dir, so a test run cannot fill the host's
+# real root with trees no database accounts for. Ignored for any other
+# repository, and a test that picks a root under the temp dir keeps it.
+AETHYME_TEST_CONTAIN_WORKTREES = "1"
+
 # Exact root fingerprint for the source-identity build scripts. This keeps a
 # shared Cargo target correct across worktrees. Invocations from outside the
 # repository must pass this file with `--config` to retain warm reuse; without

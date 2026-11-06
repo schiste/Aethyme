@@ -1644,7 +1644,11 @@ pub(crate) fn plan_worktree_root_with_context(
                 Some(WorktreeRootSource::LibraryOverride),
                 None,
             )
-        } else if let Some(base) = &context.worktree_root_environment_override {
+        } else if let Some(base) = context
+            .worktree_root_environment_override
+            .as_ref()
+            .filter(|base| !crate::host_state::contains_test_worktrees(main_root, base))
+        {
             let container = absolute_root(base);
             (
                 Some(container.join(&repository_key)),
