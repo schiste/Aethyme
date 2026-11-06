@@ -801,6 +801,18 @@ pub(super) fn read_pull_request_facts(
         pull_request,
         ..Default::default()
     };
+    // These provider reads are independent. Start the label lookup first so
+    // its network latency overlaps the PR view; collect both before planning
+    // any writes, including when either provider call fails.
+    let labels = std::process::Command::new("gh")
+        .current_dir(root)
+        .args([
+            "label", "list", "--repo", repository, "--limit", "200", "--json", "name",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
     let view = std::process::Command::new("gh")
         .current_dir(root)
         .args([
@@ -813,6 +825,7 @@ pub(super) fn read_pull_request_facts(
             "labels,comments",
         ])
         .output();
+    let labels = labels.and_then(|child| child.wait_with_output());
     if let Ok(output) = view
         && output.status.success()
         && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
@@ -842,12 +855,6 @@ pub(super) fn read_pull_request_facts(
                 .unwrap_or(&[]),
         );
     }
-    let labels = std::process::Command::new("gh")
-        .current_dir(root)
-        .args([
-            "label", "list", "--repo", repository, "--limit", "200", "--json", "name",
-        ])
-        .output();
     if let Ok(output) = labels
         && output.status.success()
         && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
