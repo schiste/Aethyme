@@ -23,10 +23,10 @@ const HEAD: &str = "cccccccccccccccccccccccccccccccccccccccc";
 const FAKE_GH: &str = r#"#!/bin/sh
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   if [ -n "$AETHYME_READ_BARRIER" ] && [ "$7" = "labels,comments" ]; then
-    touch "$AETHYME_READ_BARRIER/view"
+    touch "$AETHYME_READ_BARRIER/view-started"
     i=0
-    while [ ! -f "$AETHYME_READ_BARRIER/labels" ] && [ "$i" -lt 200 ]; do sleep 0.02; i=$((i + 1)); done
-    [ -f "$AETHYME_READ_BARRIER/labels" ] && touch "$AETHYME_READ_BARRIER/view-overlapped"
+    while [ ! -f "$AETHYME_READ_BARRIER/labels-started" ] && [ "$i" -lt 200 ]; do sleep 0.02; i=$((i + 1)); done
+    [ -f "$AETHYME_READ_BARRIER/labels-started" ] && touch "$AETHYME_READ_BARRIER/view-overlapped"
   fi
   case "$*" in
     *"--json headRefOid")
@@ -42,10 +42,10 @@ if [ "$1" = "pr" ] && [ "$2" = "diff" ]; then
 fi
 if [ "$1" = "label" ] && [ "$2" = "list" ]; then
   if [ -n "$AETHYME_READ_BARRIER" ]; then
-    touch "$AETHYME_READ_BARRIER/labels"
+    touch "$AETHYME_READ_BARRIER/labels-started"
     i=0
-    while [ ! -f "$AETHYME_READ_BARRIER/view" ] && [ "$i" -lt 200 ]; do sleep 0.02; i=$((i + 1)); done
-    [ -f "$AETHYME_READ_BARRIER/view" ] && touch "$AETHYME_READ_BARRIER/labels-overlapped"
+    while [ ! -f "$AETHYME_READ_BARRIER/view-started" ] && [ "$i" -lt 200 ]; do sleep 0.02; i=$((i + 1)); done
+    [ -f "$AETHYME_READ_BARRIER/view-started" ] && touch "$AETHYME_READ_BARRIER/labels-overlapped"
   fi
   printf '['
   sep=''

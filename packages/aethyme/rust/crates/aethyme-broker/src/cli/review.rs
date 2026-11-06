@@ -809,6 +809,7 @@ pub(super) fn read_pull_request_facts(
         .args([
             "label", "list", "--repo", repository, "--limit", "200", "--json", "name",
         ])
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn();
