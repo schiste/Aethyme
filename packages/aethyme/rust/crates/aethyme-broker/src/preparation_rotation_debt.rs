@@ -70,6 +70,13 @@ impl DirectoryIdentity {
     pub(crate) fn same_filesystem(&self, other: &Self) -> bool {
         self.device == other.device && self.filesystem_id == other.filesystem_id
     }
+
+    /// Device number and filesystem ID both come from the mount, and macOS
+    /// renumbers a volume when it reconnects, so a saved identity can only
+    /// keep naming a directory through its inode.
+    fn same_inode(&self, other: &Self) -> bool {
+        self.inode == other.inode
+    }
 }
 
 const PREPARATION_ROOT_MARKER: &str = ".aethyme-preparation-cache-root-v2";
@@ -529,7 +536,10 @@ fn decode_preparation_cache_root_marker(
     if marker.schema != PREPARATION_ROOT_MARKER_SCHEMA
         || marker.version != PREPARATION_ROOT_MARKER_VERSION
         || marker.root_path != expected_path
-        || !marker.root_identity.same_directory(expected_identity)
+        // The marker was read through this directory's own handle and names
+        // this path, so its inode is what shows it was written here rather
+        // than copied in. Live identities are still compared exactly elsewhere.
+        || !marker.root_identity.same_inode(expected_identity)
         || !is_hex(&marker.nonce, 64, 64)
         || serde_json::to_vec(&marker)
             .map_err(|error| invalid_record(&format!("cannot validate root marker: {error}")))?
@@ -5530,6 +5540,60 @@ mod tests {
                 .unwrap();
         assert_eq!(completed.nonce, initialized.nonce);
         assert!(child.is_dir());
+    }
+
+    fn rewrite_root_marker(root: &Path, rewrite: impl Fn(&mut serde_json::Value)) {
+        let path = root.join(".aethyme-preparation-cache-root-v2");
+        let mut marker: super::PreparationCacheRootMarker =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut identity = serde_json::to_value(&marker.root_identity).unwrap();
+        rewrite(&mut identity);
+        marker.root_identity = serde_json::from_value(identity).unwrap();
+        fs::write(&path, serde_json::to_vec(&marker).unwrap()).unwrap();
+    }
+
+    fn initialized_cache_root(temporary: &tempfile::TempDir) -> (std::path::PathBuf, String) {
+        let root = temporary.path().canonicalize().unwrap().join("cache");
+        fs::create_dir(&root).unwrap();
+        let captured = super::capture_preparation_cache_root(&root).unwrap();
+        let initialized =
+            initialize_test_cache_root(&root, &captured.identity, &captured.directory, || {
+                Ok(false)
+            })
+            .unwrap();
+        (root, initialized.nonce)
+    }
+
+    #[test]
+    fn cache_root_marker_survives_a_renumbered_mount() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (root, nonce) = initialized_cache_root(&temporary);
+        rewrite_root_marker(&root, |identity| {
+            identity["device"] = (identity["device"].as_u64().unwrap() + 4).into();
+            identity["filesystem_id"] = "00000000ffffffff".into();
+        });
+        match super::capture_preparation_cache_root(&root).unwrap().state {
+            super::PreparationCacheRootCaptureState::Marked { nonce: read, .. } => {
+                assert_eq!(read, nonce);
+            }
+            state => panic!("unexpected state: {state:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_root_marker_copied_from_another_directory_is_still_refused() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (root, _) = initialized_cache_root(&temporary);
+        rewrite_root_marker(&root, |identity| {
+            identity["inode"] = (identity["inode"].as_u64().unwrap() + 1).into();
+        });
+        let error = super::capture_preparation_cache_root(&root).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its pinned directory"),
+            "{error}"
+        );
     }
 
     #[test]
