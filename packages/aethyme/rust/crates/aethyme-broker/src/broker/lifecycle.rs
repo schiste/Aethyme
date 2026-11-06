@@ -3017,11 +3017,8 @@ mod fresh_root_recovery_inventory_tests {
 
     #[test]
     fn bound_root_still_refuses_a_replaced_directory_or_a_split_volume() {
-        let cases: [(
-            &str,
-            fn(&mut BoundDirectoryIdentity),
-            fn(&mut BoundDirectoryIdentity),
-        ); 6] = [
+        type Rewrite = fn(&mut BoundDirectoryIdentity);
+        let cases: [(&str, Rewrite, Rewrite); 6] = [
             ("root inode", |_| {}, |v| v.inode += 1),
             ("parent inode", |v| v.inode += 1, |_| {}),
             ("root owner", |_| {}, |v| v.uid += 1),
