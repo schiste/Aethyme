@@ -6,9 +6,15 @@ artifacts and their exact source revision are recorded in each signed
 
 ## [0.8.61] - 2026-11-06
 
+### Fixed
+
+- Keep working in a repository after its external drive reconnects with a new device number. Broker commands failed with "bound worktree root or parent identity changed", and no recovery command covered it. A device-only change is now accepted when the registry's saved volume UUID matches the live volume (#1484).
+
 ### Changed
 
 - Record broker startup, session push, and review-on-push phase durations in successful push command metrics (#1479).
+- Run full CI on merged `main` instead of on pull requests, which keep only the cross-process contract check (#1483).
+- Document how to refresh generated guidance without losing it (#1482).
 
 ## [0.8.60] - 2026-11-06
 
