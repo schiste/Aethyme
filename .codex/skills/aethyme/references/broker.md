@@ -56,8 +56,13 @@ When refreshing an installed cleanup service to another immutable runtime,
 retain its installed plan, deactivate with that plan's digest, then uninstall
 with the same digest before installing the newly reviewed plan. An install
 refusal because the service file differs is not permission to overwrite it.
-Activate the new plan and verify its generation through service status and a
-matching pass receipt; preserve the prior receipts before uninstalling.
+Activate the new plan and verify its generation through read-only service
+status; preserve the prior receipts before uninstalling. Observe a matching
+receipt from the next normal scheduled pass before claiming delivery. If no
+matching receipt exists yet, report activation as verified and delivery as
+pending. A request to install or refresh service pins does not authorize an
+extra cleanup run: do not kickstart GC solely to manufacture a verification
+receipt unless cleanup execution was separately authorized.
 
 For scheduled cleanup on macOS, a loaded LaunchAgent proves only scheduler
 registration. Check `broker gc service status --json` and its matching
