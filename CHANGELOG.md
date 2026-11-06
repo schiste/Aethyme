@@ -4,6 +4,12 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.61] - 2026-11-06
+
+### Changed
+
+- Record broker startup, session push, and review-on-push phase durations in successful push command metrics (#1479).
+
 ## [0.8.60] - 2026-11-06
 
 ### Added
