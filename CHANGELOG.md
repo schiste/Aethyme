@@ -4,6 +4,12 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.62] - 2026-11-06
+
+### Fixed
+
+- Keep `broker submit prepare` and `broker gc storage` working after an external drive reconnects with a new device number. The preparation-cache root marker failed with "does not match its pinned directory", and no command could repair it. The marker is now matched to its directory by path and inode (#1486).
+
 ## [0.8.61] - 2026-11-06
 
 ### Fixed
