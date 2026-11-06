@@ -337,6 +337,15 @@ impl Subject {
         }
     }
     pub(crate) fn evidence(&mut self) -> TrustedEvidence {
+        self.evidence_of_run("a".repeat(64))
+    }
+    /// Evidence with a new lifetime. Evidence is identified by its content, so
+    /// a new lifetime needs a run of its own.
+    pub(crate) fn reissued_evidence(&mut self) -> TrustedEvidence {
+        static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.evidence_of_run(format!("{:064x}", RUNS.fetch_add(1, Ordering::Relaxed)))
+    }
+    fn evidence_of_run(&mut self, run: String) -> TrustedEvidence {
         let assertions = self
             .inventory
             .cases
@@ -354,7 +363,7 @@ impl Subject {
             &self.execution,
             &self.artifact,
             &self.permit,
-            "a".repeat(64),
+            run,
             assertions,
             VerificationOutcome::Passed,
         )
