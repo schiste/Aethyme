@@ -945,7 +945,10 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
     let session = parsed
         .session
         .ok_or(UsageError::Message("push requires --session <id>".into()))?;
+    let open_started = std::time::Instant::now();
     let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let open_ms = open_started.elapsed().as_millis() as u64;
+    let push_started = std::time::Instant::now();
     let mut report = match broker.push_session(session, parsed.open_pr) {
         Ok(report) => report,
         Err(crate::BrokerOpError::CoordinatedOperationBlocked { recovery, .. }) => {
@@ -962,7 +965,17 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
         }
         Err(error) => return Err(error.into()),
     };
+    let push_ms = push_started.elapsed().as_millis() as u64;
+    let review_started = std::time::Instant::now();
     report.review_run = review_on_push(broker.main_root(), &report);
+    let review_ms = review_started.elapsed().as_millis() as u64;
+    telemetry::set_command_metric_details(serde_json::json!({
+        "phase_timings_ms": {
+            "broker_open": open_ms,
+            "push_session": push_ms,
+            "review_on_push": review_ms,
+        }
+    }));
     if parsed.json {
         out!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());

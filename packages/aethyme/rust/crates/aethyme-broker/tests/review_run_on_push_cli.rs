@@ -310,6 +310,19 @@ fn nothing_runs_when_run_on_push_is_off() {
 
     let pushed = report(&fixture.push(session, &branch, &head, &[]));
     assert!(pushed.get("review_run").is_none(), "{pushed:#}");
+    let metrics = std::fs::read_to_string(fixture.repo.join(".aethyme/logs/command-metrics.jsonl"))
+        .expect("push writes command metrics");
+    let metric = metrics
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|metric| metric["command"] == "push")
+        .expect("push metric exists");
+    for phase in ["broker_open", "push_session", "review_on_push"] {
+        assert!(
+            metric["phase_timings_ms"][phase].as_u64().is_some(),
+            "missing {phase}: {metric}"
+        );
+    }
     assert!(fixture.writes().is_empty());
     assert!(fixture.comments().is_empty());
 }
