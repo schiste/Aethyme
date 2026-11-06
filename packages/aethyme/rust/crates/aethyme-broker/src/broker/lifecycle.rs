@@ -1945,6 +1945,15 @@ pub(crate) struct BoundDirectoryIdentity {
     uid: u32,
 }
 
+impl BoundDirectoryIdentity {
+    /// The same path, inode and owner, whatever device number this mount has.
+    fn same_object_ignoring_device(&self, current: &Self) -> bool {
+        self.canonical_path == current.canonical_path
+            && self.inode == current.inode
+            && self.uid == current.uid
+    }
+}
+
 struct FreshWorktreeRootCandidate {
     root: PathBuf,
     parent_identity_json: String,
@@ -2898,6 +2907,134 @@ mod fresh_root_recovery_inventory_tests {
             host_operation_database,
             expected_parent,
             reservation,
+        }
+    }
+
+    fn bound_root_fixture() -> FreshRootFixture {
+        let mut fixture = fresh_root_fixture(false);
+        let plan = fixture.broker.fresh_worktree_root_recovery_plan().unwrap();
+        fixture
+            .broker
+            .apply_fresh_worktree_root_recovery(&plan.digest)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .repository_worktree_binding()
+                .unwrap()
+                .state,
+            RepositoryWorktreeBindingState::Bound
+        );
+        fixture
+    }
+
+    /// Rewrite the identities saved when the root was bound, as an older mount
+    /// or a replaced directory would have left them.
+    fn rewrite_bound_identities(
+        fixture: &FreshRootFixture,
+        rewrite_parent: impl Fn(&mut BoundDirectoryIdentity),
+        rewrite_root: impl Fn(&mut BoundDirectoryIdentity),
+    ) {
+        let binding = fixture
+            .broker
+            .store_ref()
+            .repository_worktree_binding()
+            .unwrap();
+        let mut parent: BoundDirectoryIdentity =
+            serde_json::from_str(binding.parent_identity_json.as_deref().unwrap()).unwrap();
+        let mut root: BoundDirectoryIdentity =
+            serde_json::from_str(binding.worktree_identity_json.as_deref().unwrap()).unwrap();
+        rewrite_parent(&mut parent);
+        rewrite_root(&mut root);
+        rusqlite::Connection::open(fixture.broker.store_ref().db_path())
+            .unwrap()
+            .execute(
+                "UPDATE repository_worktree_binding
+                 SET parent_identity_json = ?1, worktree_identity_json = ?2",
+                rusqlite::params![
+                    serde_json::to_string(&parent).unwrap(),
+                    serde_json::to_string(&root).unwrap()
+                ],
+            )
+            .unwrap();
+    }
+
+    fn assert_bound_root_refused(fixture: &FreshRootFixture, expected: &str) {
+        let error = fixture
+            .broker
+            .validate_bound_repository_worktree_root()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{error}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bound_root_survives_a_renumbered_mount_when_the_registry_saved_its_volume() {
+        let fixture = bound_root_fixture();
+        rewrite_bound_identities(&fixture, |v| v.device += 4, |v| v.device += 4);
+        assert_eq!(
+            fixture
+                .broker
+                .validate_bound_repository_worktree_root()
+                .unwrap(),
+            Some(fixture.root.clone())
+        );
+    }
+
+    #[test]
+    fn bound_root_with_a_new_device_needs_a_saved_volume_uuid() {
+        let fixture = bound_root_fixture();
+        rewrite_bound_identities(&fixture, |v| v.device += 4, |v| v.device += 4);
+        let registry =
+            crate::worktree_registry::registry_path(&fixture.host_operation_database).unwrap();
+        let connection = rusqlite::Connection::open(registry).unwrap();
+        let (key, payload): (String, String) = connection
+            .query_row(
+                "SELECT key, payload FROM roots WHERE instr(payload, ?1) > 0",
+                [fixture.root.to_str().unwrap()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let mut record: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        record["identity"]
+            .as_object_mut()
+            .unwrap()
+            .remove("volume_uuid");
+        record["origin_identity"]
+            .as_object_mut()
+            .unwrap()
+            .remove("volume_uuid");
+        connection
+            .execute(
+                "UPDATE roots SET payload = ?2 WHERE key = ?1",
+                rusqlite::params![key, record.to_string()],
+            )
+            .unwrap();
+        assert_bound_root_refused(&fixture, "cannot be proven to be the same volume");
+    }
+
+    #[test]
+    fn bound_root_still_refuses_a_replaced_directory_or_a_split_volume() {
+        type Rewrite = fn(&mut BoundDirectoryIdentity);
+        let cases: [(&str, Rewrite, Rewrite); 6] = [
+            ("root inode", |_| {}, |v| v.inode += 1),
+            ("parent inode", |v| v.inode += 1, |_| {}),
+            ("root owner", |_| {}, |v| v.uid += 1),
+            ("parent owner", |v| v.uid += 1, |_| {}),
+            ("root path", |_| {}, |v| v.canonical_path.push("moved")),
+            ("only the parent moved volume", |v| v.device += 4, |_| {}),
+        ];
+        for (name, rewrite_parent, rewrite_root) in cases {
+            let fixture = bound_root_fixture();
+            rewrite_bound_identities(&fixture, rewrite_parent, rewrite_root);
+            let error = fixture
+                .broker
+                .validate_bound_repository_worktree_root()
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("identity changed"), "{name}: {error}");
         }
     }
 
@@ -8079,19 +8216,28 @@ impl Broker {
             .map_err(|error| refusal(format!("stored parent identity is invalid: {error}")))?;
         let expected_root: BoundDirectoryIdentity = serde_json::from_str(stored_root)
             .map_err(|error| refusal(format!("stored worktree identity is invalid: {error}")))?;
-        if observed_parent != expected_parent || observed_root != expected_root {
+        if !expected_parent.same_object_ignoring_device(&observed_parent)
+            || !expected_root.same_object_ignoring_device(&observed_root)
+            || (expected_parent.device == expected_root.device)
+                != (observed_parent.device == observed_root.device)
+        {
             return Err(refusal(
                 "bound worktree root or parent identity changed".into(),
             ));
         }
+        // Device numbers are scoped to one mount: macOS renumbers a volume when
+        // it reconnects. Only the registry, which saved the volume UUID, can
+        // tell that from a different volume mounted at the same path.
+        let device_renumbered = observed_root.device != expected_root.device;
         let expected_marker = WorktreeRootMarker {
             schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
             repository_key: current_repository_key.clone(),
             repository_root: current_repository_root.clone(),
         };
         self.verify_worktree_root_marker(&root.join(WORKTREE_ROOT_MARKER), &expected_marker)?;
+        let host_database = self.host_operation_database_path()?;
         crate::worktree_registry::verify_exact_registration(
-            &self.host_operation_database_path()?,
+            &host_database,
             root,
             &expected_marker,
             binding.root_source.ok_or_else(|| {
@@ -8099,6 +8245,18 @@ impl Broker {
             })?,
         )
         .map_err(|error| refusal(format!("cannot verify worktree-root registration: {error}")))?;
+        if device_renumbered {
+            crate::worktree_registry::verify_registration_saved_root_volume(
+                &host_database,
+                root,
+                &expected_marker,
+            )
+            .map_err(|error| {
+                refusal(format!(
+                    "bound worktree root device number changed and cannot be proven to be the same volume: {error}"
+                ))
+            })?;
+        }
         Ok(Some(root.to_path_buf()))
     }
 

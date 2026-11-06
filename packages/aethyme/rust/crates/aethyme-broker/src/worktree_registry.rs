@@ -2421,6 +2421,31 @@ pub(crate) fn verify_exact_registration(
     Ok(())
 }
 
+/// Prove a bound root by its stable volume rather than its device number.
+/// Retained validation has already compared a saved UUID with the live volume,
+/// so what remains is that the record saved one: a record without a UUID can
+/// only speak for the device number it saw.
+pub(crate) fn verify_registration_saved_root_volume(
+    host_database: &Path,
+    root: &Path,
+    marker: &WorktreeRootMarker,
+) -> io::Result<()> {
+    let connection = open_registry(host_database, false)?;
+    let payload = retained_registration(&connection, root)?
+        .ok_or_else(|| invalid("bound root has no retained registry record"))?;
+    let record = validate_retained_registration(root, &payload)?;
+    marker_owner_matches(&record, marker)?;
+    let saved_volume = record
+        .identity
+        .as_ref()
+        .and_then(|identity| identity.volume_uuid)
+        .filter(|uuid| uuid.iter().any(|byte| *byte != 0));
+    if saved_volume.is_none() {
+        return Err(invalid("retained root record saved no volume UUID"));
+    }
+    Ok(())
+}
+
 pub(crate) fn registered_source(
     host_database: &Path,
     root: &Path,
