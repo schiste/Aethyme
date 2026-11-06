@@ -1247,3 +1247,39 @@ fn queue_entry(id: i64, session_id: i64, status: crate::MergeStatus) -> MergeQue
         updated_at: 0,
     }
 }
+
+/// Liveness visits every live session, and has side effects, so a claim nothing
+/// overlaps must not work it out. A session whose process is gone would be
+/// recorded as exited if it did.
+#[test]
+fn a_claim_nothing_overlaps_does_not_assess_other_sessions() {
+    let (repo, _git) = landing_fixture();
+    let storage = crate::test_storage::TestStorage::new();
+    let mut broker = storage.open(repo.path()).unwrap();
+    let me = broker.start_worktree("claimer", None).unwrap();
+    let other = broker.start_worktree("other", None).unwrap();
+    let gone_pid = i64::from(i32::MAX);
+    rusqlite::Connection::open(broker.store().db_path())
+        .unwrap()
+        .execute(
+            "UPDATE sessions SET pid = ?1 WHERE id = ?2",
+            rusqlite::params![gone_pid, other.id],
+        )
+        .unwrap();
+
+    broker.claim_lease(me.id, "src/mine.rs", None).unwrap();
+    assert_ne!(
+        broker.store().session(other.id).unwrap().status,
+        SessionStatus::Exited,
+        "a non-overlapping claim assessed an unrelated session"
+    );
+
+    broker.claim_lease(other.id, "src/theirs.rs", None).unwrap();
+    let report = broker.claim_lease(me.id, "src/theirs.rs", None).unwrap();
+    assert!(report.accepted);
+    assert_eq!(
+        broker.store().session(other.id).unwrap().status,
+        SessionStatus::Exited,
+        "an overlapping claim still assesses its holder"
+    );
+}
