@@ -4,6 +4,26 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.60] - 2026-11-06
+
+### Added
+
+- Show the other session's changes to the overlapping files on every lease overlap, including refused claims and the post-commit conflict radar; set `[leases] overlap_diffs = false` to turn this off (#1462, #1471).
+- Optionally flag another session changing a file that the file being edited directly calls or imports, off by default through `[leases] overlap_impact` (#1467).
+
+### Fixed
+
+- Let `start --reuse` reuse adopted sessions in verify-only repositories, and in `auto` repositories where the integration branch never existed; a session behind or diverged from its base is still refused and not moved (#1473, #1475).
+- Give local-merge guidance from `finish` when no default branch has been fetched (#1473).
+- Stop concurrent broker commands refusing each other's SQLite sidecars and metadata probes (#1470).
+- Keep key material out of overlap diffs (#1471).
+
+### Changed
+
+- Request pull request labels and repository labels concurrently during review-on-push (#1477).
+- Keep test fixtures out of the host's worktree root, and remove flaky test dependencies on host timing (#1469, #1472, #1474, #1476).
+- Clarify cleanup-service rollout verification, command-metric profiling and process measurement guidance (#1460, #1466, #1478).
+
 ## [0.8.59] - 2026-11-05
 
 ### Added
