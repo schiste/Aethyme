@@ -49,6 +49,17 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- For short CLI benchmarks, wait on OS process-exit notifications rather than
+  adding a polling sleep to the measured wall time. Retain raw command receipts
+  and normalize platform-specific CPU/RSS accounting. On Linux, a Python-launched
+  child's `wait4` peak RSS can include the launcher's pre-exec high-water mark;
+  use a small native supervisor and verify a large-parent/small-child control
+  before trusting application memory figures. Exclude contaminated historical
+  readings rather than treating a harness correction as a retroactive fix.
+  Before long runs, exercise success, nonzero exit, and timeout controls through
+  the exact runner; signal only the owned process group before reaping it.
+  Verify semantic output equality before comparing speed.
+
 - When changing a retention default, inspect fixtures that inherit the default
   as well as tests with explicit overrides. Update their age assumptions and
   reference documentation; exercise retention and expiry on both sides of the
