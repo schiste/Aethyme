@@ -435,6 +435,16 @@ fn main_skips_only_the_gates_a_pr_run_tested_on_the_same_tree() {
 /// partition, and a verdict that fails when any part fails or is skipped. A
 /// gate other than cargo-test still runs in the gates job.
 #[test]
+fn every_cargo_test_keeps_fixtures_out_of_the_hosts_worktree_root() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(5)
+        .unwrap();
+    let config = std::fs::read_to_string(root.join(".cargo/config.toml")).unwrap();
+    assert!(config.contains("AETHYME_TEST_CONTAIN_WORKTREES = \"1\""));
+}
+
+#[test]
 fn the_cargo_test_jobs_run_the_pull_request_suite() {
     let run_lines = |text: &str, job: &str| -> Vec<String> {
         block(text, job)

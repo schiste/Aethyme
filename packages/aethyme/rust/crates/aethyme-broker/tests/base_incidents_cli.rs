@@ -411,8 +411,53 @@ fn start_and_gate_entrypoints_emit_incident_notice_without_claiming_owner_livene
     }
 }
 
+/// Run the scenario below in a child process whose version probes answer from
+/// stubs. Its gates need a complete execution profile, which needs every tool to
+/// answer within the probe budget, and a tool's first run on a cold runner may
+/// not. A child keeps `PATH` out of the other tests sharing this binary's process.
+/// `sh` and `git` stay real: the gates and the broker run them.
+#[cfg(unix)]
 #[test]
 fn executed_gate_resolves_only_after_passing_tree_is_the_fetched_default() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tools = tempfile::tempdir().unwrap();
+    for tool in [
+        "rustc", "cargo", "python", "python3", "pytest", "node", "go",
+    ] {
+        let path = tools.path().join(tool);
+        std::fs::write(&path, "#!/bin/sh\necho stub\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "base_incidents_cli::executed_gate_scenario",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("PATH", format!("{}:{inherited}", tools.path().display()))
+        .env(SCENARIO_ENV, "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+const SCENARIO_ENV: &str = "AETHYME_BASE_INCIDENT_SCENARIO";
+
+#[cfg(unix)]
+#[test]
+#[ignore = "child helper invoked by executed_gate_resolves_only_after_passing_tree_is_the_fetched_default"]
+fn executed_gate_scenario() {
+    if std::env::var_os(SCENARIO_ENV).is_none() {
+        return;
+    }
     // A deterministic synthetic command, not a Cargo build or a real project
     // test. The marker lives under .git and cannot change the source tree.
     let gates = "[[gate]]\nname='unit'\ncommand=\"if test -f .git/allow-pass; then exit 0; else echo 'test failed'; exit 1; fi\"\n";

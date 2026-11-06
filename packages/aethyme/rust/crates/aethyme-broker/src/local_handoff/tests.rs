@@ -52,6 +52,10 @@ fn request(
     g: &PreparedGeneration,
     operation: &str,
 ) -> Result<PreparedHandoff, HandoffError> {
+    // The handoff is valid only as long as its evidence, and the launch after it
+    // qualifies against the same evidence. The fixture's is issued once, so a
+    // slow test could reach this with little of it left.
+    f.evidence = f.v.reissued_evidence();
     let grant = acceptance::qualify(
         &mut f.v.f.store,
         &f.v.owner,

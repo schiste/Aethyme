@@ -1984,3 +1984,44 @@ fn v028_schema52_first_write_requires_reviewed_binding_and_preserves_the_ledger(
 
 #[path = "common/json_error.rs"]
 mod json_error;
+
+/// Where `start` puts a session for a repository at `repo`, with the host's root
+/// exported and `temp` standing in for the system temporary directory.
+fn started_worktree(repo: &Path, temp: &Path, host_root: &Path, contain: bool) -> PathBuf {
+    fixture_at(repo);
+    let mut command = common::broker_cli(CLI, &["start", "--task", "placement", "--json"]);
+    command
+        .current_dir(repo)
+        .env("TMPDIR", temp)
+        .env("AETHYME_HOST_STATE_DIR", temp.join("state"))
+        .env("AETHYME_HOST_CACHE_DIR", temp.join("cache"))
+        .env("AETHYME_WORKTREE_ROOT", host_root);
+    if contain {
+        command.env("AETHYME_TEST_CONTAIN_WORKTREES", "1");
+    } else {
+        command.env_remove("AETHYME_TEST_CONTAIN_WORKTREES");
+    }
+    let session = json(command.output().unwrap());
+    PathBuf::from(session["worktree_path"].as_str().unwrap())
+}
+
+#[test]
+fn a_host_worktree_root_does_not_collect_throwaway_repositories_in_a_test_run() {
+    let tmp = common::canonical_tempdir();
+    let temp = tmp.path().join("temp");
+    let host_root = tmp.path().join("host-root");
+    let real = tmp.path().join("real");
+    std::fs::create_dir_all(&temp).unwrap();
+    std::fs::create_dir_all(&host_root).unwrap();
+
+    let contained = started_worktree(&temp.join("contained"), &temp, &host_root, true);
+    assert!(contained.starts_with(&temp), "{}", contained.display());
+    assert_eq!(std::fs::read_dir(&host_root).unwrap().count(), 0);
+
+    // The two narrowings: outside a test run, and for a real repository, the
+    // exported root is still the one in force.
+    let strict = started_worktree(&temp.join("strict"), &temp, &host_root, false);
+    assert!(strict.starts_with(&host_root), "{}", strict.display());
+    let real = started_worktree(&real.join("repository"), &temp, &host_root, true);
+    assert!(real.starts_with(&host_root), "{}", real.display());
+}

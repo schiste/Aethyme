@@ -49,6 +49,17 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- For short CLI benchmarks, wait on OS process-exit notifications rather than
+  adding a polling sleep to the measured wall time. Retain raw command receipts
+  and normalize platform-specific CPU/RSS accounting. On Linux, a Python-launched
+  child's `wait4` peak RSS can include the launcher's pre-exec high-water mark;
+  use a small native supervisor and verify a large-parent/small-child control
+  before trusting application memory figures. Exclude contaminated historical
+  readings rather than treating a harness correction as a retroactive fix.
+  Before long runs, exercise success, nonzero exit, and timeout controls through
+  the exact runner; signal only the owned process group before reaping it.
+  Verify semantic output equality before comparing speed.
+
 - When changing a retention default, inspect fixtures that inherit the default
   as well as tests with explicit overrides. Update their age assumptions and
   reference documentation; exercise retention and expiry on both sides of the
@@ -168,6 +179,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   may rewrite source ancestry; verify the exact expected tree and record both
   commit sets rather than assuming a merge topology from a commit subject.
   Retain those checks with the measurement provenance.
+- For broker command performance, inspect the repository's local
+  `.aethyme/logs/command-metrics.jsonl` before estimating timing from agent
+  transcripts. Filter by command, outcome and observation period; report the
+  number of records with phase timings separately from all invocations.
+  Command and phase measurements describe recorded workloads, not a controlled
+  before/after benchmark; use isolated Playground samples for that comparison.
 - For startup profiling, use Git Trace2 event logs to count actual Git
   subprocess starts and group repeated argv. Also sample the parent process:
   repeated child calls can coexist with costly parent-side parsing or database
