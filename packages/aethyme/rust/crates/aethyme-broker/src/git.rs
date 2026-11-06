@@ -2909,9 +2909,169 @@ pub struct ConfigEntry {
     pub value: String,
 }
 
+/// Per-process memory of "which repository is this path in", enabled only by the
+/// one-shot CLI: one command asked Git the same two questions 28 times. Every
+/// hit re-checks the checkout's `.git` entry, so a removed or replaced checkout
+/// asks Git again rather than getting an old answer.
+mod repository_identity_cache {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+
+    /// A main checkout's `.git` directory changes constantly as Git works, so it
+    /// is compared by identity alone; a worktree's `.git` file also by content.
+    #[derive(Clone, PartialEq, Eq)]
+    struct GitEntry {
+        file_type: std::fs::FileType,
+        identity: (u64, u64),
+        file: Option<(Option<std::time::SystemTime>, u64)>,
+    }
+
+    fn git_entry(root: &Path) -> Option<GitEntry> {
+        let metadata = std::fs::symlink_metadata(root.join(".git")).ok()?;
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.dev(), metadata.ino())
+        };
+        #[cfg(not(unix))]
+        let identity = (0, 0);
+        Some(GitEntry {
+            file_type: metadata.file_type(),
+            identity,
+            file: (!metadata.is_dir()).then(|| (metadata.modified().ok(), metadata.len())),
+        })
+    }
+
+    /// Git reads these from the environment, and they change the answers.
+    fn environment_allows_memory() -> bool {
+        std::env::var_os("GIT_DIR").is_none()
+            && std::env::var_os("GIT_WORK_TREE").is_none()
+            && std::env::var_os("GIT_COMMON_DIR").is_none()
+    }
+
+    #[derive(Default)]
+    pub(super) struct Memory {
+        roots: HashMap<PathBuf, (PathBuf, GitEntry)>,
+        common_dirs: HashMap<PathBuf, (PathBuf, GitEntry)>,
+    }
+
+    impl Memory {
+        pub(super) fn root_for(&self, path: &Path) -> Option<PathBuf> {
+            let (root, entry) = self.roots.get(path)?;
+            // A repository created inside the path since would change the answer.
+            let same_checkout = root == path || !path.join(".git").exists();
+            (same_checkout && git_entry(root).as_ref() == Some(entry)).then(|| root.clone())
+        }
+
+        pub(super) fn remember_root(&mut self, path: &Path, root: &Path) {
+            if let Some(entry) = git_entry(root) {
+                self.roots
+                    .insert(path.to_path_buf(), (root.to_path_buf(), entry));
+            }
+        }
+
+        pub(super) fn common_dir_for(&self, root: &Path) -> Option<PathBuf> {
+            let (common, entry) = self.common_dirs.get(root)?;
+            (git_entry(root).as_ref() == Some(entry) && common.is_dir()).then(|| common.clone())
+        }
+
+        pub(super) fn remember_common_dir(&mut self, root: &Path, common: &Path) {
+            if let Some(entry) = git_entry(root) {
+                self.common_dirs
+                    .insert(root.to_path_buf(), (common.to_path_buf(), entry));
+            }
+        }
+    }
+
+    fn with_memory<T>(use_memory: impl FnOnce(&mut Memory) -> T) -> Option<T> {
+        if !ENABLED.load(Ordering::Relaxed) || !environment_allows_memory() {
+            return None;
+        }
+        static MEMORY: OnceLock<Mutex<Memory>> = OnceLock::new();
+        let mut memory = MEMORY.get_or_init(Mutex::default).lock().ok()?;
+        Some(use_memory(&mut memory))
+    }
+
+    pub fn enable() {
+        ENABLED.store(true, Ordering::Relaxed);
+    }
+
+    pub(super) fn root_for(path: &Path) -> Option<PathBuf> {
+        with_memory(|memory| memory.root_for(path)).flatten()
+    }
+
+    pub(super) fn remember_root(path: &Path, root: &Path) {
+        with_memory(|memory| memory.remember_root(path, root));
+    }
+
+    pub(super) fn common_dir_for(root: &Path) -> Option<PathBuf> {
+        with_memory(|memory| memory.common_dir_for(root)).flatten()
+    }
+
+    pub(super) fn remember_common_dir(root: &Path, common: &Path) {
+        with_memory(|memory| memory.remember_common_dir(root, common));
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Memory;
+
+        #[test]
+        fn a_changed_or_removed_checkout_is_not_answered_from_memory() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("checkout");
+            let nested = root.join("src");
+            std::fs::create_dir_all(&nested).unwrap();
+            let git_file = root.join(".git");
+            let common = tmp.path().join("common");
+            std::fs::create_dir(&common).unwrap();
+            std::fs::write(&git_file, "gitdir: one\n").unwrap();
+
+            let mut memory = Memory::default();
+            memory.remember_root(&nested, &root);
+            memory.remember_common_dir(&root, &common);
+            assert_eq!(memory.root_for(&nested).as_deref(), Some(root.as_path()));
+            assert_eq!(
+                memory.common_dir_for(&root).as_deref(),
+                Some(common.as_path())
+            );
+
+            std::fs::create_dir(nested.join(".git")).unwrap();
+            assert_eq!(
+                memory.root_for(&nested),
+                None,
+                "a repository appeared inside"
+            );
+            std::fs::remove_dir(nested.join(".git")).unwrap();
+
+            std::fs::write(&git_file, "gitdir: a longer replacement\n").unwrap();
+            assert_eq!(memory.root_for(&nested), None, "the checkout was replaced");
+            assert_eq!(memory.common_dir_for(&root), None);
+
+            memory.remember_common_dir(&root, &common);
+            std::fs::remove_dir(&common).unwrap();
+            assert_eq!(memory.common_dir_for(&root), None, "common dir removed");
+
+            memory.remember_root(&nested, &root);
+            std::fs::remove_file(&git_file).unwrap();
+            assert_eq!(memory.root_for(&nested), None, "the checkout was removed");
+        }
+    }
+}
+
+/// For a one-shot command that owns its process; see the module above.
+pub use repository_identity_cache::enable as enable_repository_identity_memory;
+
 impl GitRepo {
     /// Discover the repository containing `path`.
     pub fn discover(path: &Path) -> Result<Self, GitError> {
+        if let Some(root) = repository_identity_cache::root_for(path) {
+            return Ok(Self { root });
+        }
         let root =
             run_git(path, &["rev-parse", "--show-toplevel"]).map_err(|error| match error {
                 GitError::Git { args, stderr }
@@ -2928,9 +3088,9 @@ impl GitRepo {
                 // invalid checkout.
                 other => other,
             })?;
-        Ok(Self {
-            root: PathBuf::from(root),
-        })
+        let root = PathBuf::from(root);
+        repository_identity_cache::remember_root(path, &root);
+        Ok(Self { root })
     }
 
     /// Gates cannot infer all tracked inputs from a command, so refuse to
@@ -2963,8 +3123,13 @@ impl GitRepo {
     /// directory every linked worktree shares. Installed git hooks live
     /// in `<common>/hooks`, which is what makes them worktree-wide.
     pub fn git_common_dir(&self) -> Result<PathBuf, GitError> {
+        if let Some(common) = repository_identity_cache::common_dir_for(&self.root) {
+            return Ok(common);
+        }
         let common = run_git(&self.root, &["rev-parse", "--git-common-dir"])?;
-        Ok(Self::absolute_common_dir(&self.root, &common))
+        let common = Self::absolute_common_dir(&self.root, &common);
+        repository_identity_cache::remember_common_dir(&self.root, &common);
+        Ok(common)
     }
 
     /// Resolve a checkout's common directory without a separate root lookup.
