@@ -22,6 +22,12 @@ const HEAD: &str = "cccccccccccccccccccccccccccccccccccccccc";
 /// write is logged with its exact argv and succeeds.
 const FAKE_GH: &str = r#"#!/bin/sh
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  if [ -n "$AETHYME_READ_BARRIER" ] && [ "$7" = "labels,comments" ]; then
+    touch "$AETHYME_READ_BARRIER/view"
+    i=0
+    while [ ! -f "$AETHYME_READ_BARRIER/labels" ] && [ "$i" -lt 200 ]; do sleep 0.02; i=$((i + 1)); done
+    [ -f "$AETHYME_READ_BARRIER/labels" ] && touch "$AETHYME_READ_BARRIER/view-overlapped"
+  fi
   case "$*" in
     *"--json headRefOid")
       printf '{"headRefOid":"%s"}\n' "$AETHYME_FAKE_PR_HEAD"
@@ -35,6 +41,12 @@ if [ "$1" = "pr" ] && [ "$2" = "diff" ]; then
   exit 0
 fi
 if [ "$1" = "label" ] && [ "$2" = "list" ]; then
+  if [ -n "$AETHYME_READ_BARRIER" ]; then
+    touch "$AETHYME_READ_BARRIER/labels"
+    i=0
+    while [ ! -f "$AETHYME_READ_BARRIER/view" ] && [ "$i" -lt 200 ]; do sleep 0.02; i=$((i + 1)); done
+    [ -f "$AETHYME_READ_BARRIER/view" ] && touch "$AETHYME_READ_BARRIER/labels-overlapped"
+  fi
   printf '['
   sep=''
   for name in $(cat "$AETHYME_FAKE_GH_LABELS" 2>/dev/null); do
@@ -205,6 +217,40 @@ impl Fixture {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn review_fetches_pr_and_repository_labels_concurrently() {
+    let fixture = Fixture::new();
+    let barrier = fixture.bin.path().to_str().unwrap();
+    let output = fixture.cli(
+        &[
+            "advanced",
+            "review",
+            "run",
+            "--session",
+            &fixture.session,
+            "--repo",
+            "acme/product",
+            "--pr",
+            "7",
+            "--from-provider",
+            "--json",
+        ],
+        &[("AETHYME_READ_BARRIER", barrier)],
+    );
+    assert!(
+        output.status.success(),
+        "review failed: {}\n{}",
+        stderr(&output),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    for marker in ["view-overlapped", "labels-overlapped"] {
+        assert!(
+            fixture.bin.path().join(marker).exists(),
+            "provider reads did not overlap: {marker}"
+        );
+    }
 }
 
 #[test]
