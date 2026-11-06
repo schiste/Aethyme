@@ -82,6 +82,13 @@ claim; trace the consumer's check and state its limits.
 - `references/policy.md`: commit format, branch and review practice, generated
   files and overrides, verifying the enhancement.
 
+## Generated Guidance Refresh
+
+A generated-only deploy can rewrite existing skill and reference files as well
+as version stamps. Claim the paths it may change before running the broker guard,
+then inspect the complete diff; preserve maintained guidance that the generator
+would remove and retain only the intended refresh.
+
 ## When Not To Use Aethyme
 
 - A simple file read, exact path lookup, or tiny grep already answers the task.
