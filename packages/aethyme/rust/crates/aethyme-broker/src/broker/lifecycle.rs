@@ -6387,9 +6387,9 @@ impl Broker {
             }
         } else {
             // Older rows have no trusted source provenance. Compare against
-            // the exact configured integration ref, never a newly inferred
-            // default/upstream fallback, and allow the relation check below
-            // to accept only a checkout that already contains it.
+            // the configured integration ref, or the base a new session would
+            // get when there is none, and allow the relation check below to
+            // accept only a checkout that already contains it.
             self.resolve_unknown_reuse_target(None, &promote)?
         };
 
@@ -6820,9 +6820,18 @@ impl Broker {
         previous: Option<&crate::broker::SessionBaseObservation>,
         promote: &crate::PromoteConfig,
     ) -> Result<ReuseTarget, BrokerOpError> {
-        if promote.mode == crate::PromoteMode::VerifyOnly {
-            // An adopted session records no base source. Verify-only never
-            // selects integration, so check it against the base a new session
+        let reference = format!("refs/heads/{}", promote.branch);
+        let integration = self.repo.resolve_ref(&reference);
+        // A reference this session was last checked against has gone away, which
+        // says something happened to it. One it never saw says only that nothing
+        // has been promoted here yet.
+        let integration_vanished = integration.is_none()
+            && previous.is_some_and(|observation| observation.target_ref == reference);
+        if promote.mode == crate::PromoteMode::VerifyOnly
+            || (integration.is_none() && !integration_vanished)
+        {
+            // An adopted session records no base source. When integration is not
+            // what a new session would start from, check it against the base one
             // would get. `evidence: None` keeps this a containment check: the
             // relation below refuses to move a checkout that is behind it.
             let base = self
@@ -6841,10 +6850,9 @@ impl Broker {
                 verify_ref: true,
             });
         }
-        let reference = format!("refs/heads/{}", promote.branch);
-        let commit = self.repo.resolve_ref(&reference).ok_or_else(|| {
+        let commit = integration.ok_or_else(|| {
             reuse_freshness_refusal(format!(
-                "the session base source is unknown and configured integration ref {reference} is missing; no fallback base was selected"
+                "the session base source is unknown and configured integration ref {reference}, which this session was last checked against, is missing; no fallback base was selected. Restore it or start a new session"
             ))
         })?;
         Ok(ReuseTarget {

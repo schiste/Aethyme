@@ -1414,9 +1414,12 @@ fn a_fresh_local_repository_finishes_once_the_work_is_on_its_default_branch() {
     assert!(tmp.path().join("work.txt").is_file());
 }
 
+/// `start` cuts from the default branch before anything has been promoted, so a
+/// follow-up on an adopted session is checked against that same base.
 #[test]
-fn unknown_adopted_base_refuses_when_configured_integration_is_missing() {
-    for malformed in [false, true] {
+fn unknown_adopted_base_without_integration_is_checked_against_the_default_branch() {
+    // Normal adoption, then the two ways a row can have lost its provenance.
+    for damage in [None, Some("deleted"), Some("malformed")] {
         let tmp = fixture();
         stdout(&run(
             tmp.path(),
@@ -1424,38 +1427,125 @@ fn unknown_adopted_base_refuses_when_configured_integration_is_missing() {
         ));
         let session = stored_session(&tmp, 1);
         let original_head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
-        if malformed {
-            overwrite_stored_base_observation(&tmp, session.id, "not-json");
-        } else {
-            delete_stored_base_observation(&tmp, session.id);
+        match damage {
+            Some("deleted") => delete_stored_base_observation(&tmp, session.id),
+            Some(_) => overwrite_stored_base_observation(&tmp, session.id, "not-json"),
+            None => {}
         }
+
+        let reused = stdout(&run(
+            tmp.path(),
+            &["start", "--reuse", "--task", "follow-up", "--json"],
+        ));
+        let reused: serde_json::Value = serde_json::from_str(&reused).unwrap();
+        assert_eq!(reused["base_freshness"]["target_ref"], "refs/heads/main");
+        assert_eq!(reused["base_freshness"]["relation"], "current");
+        assert!(reused["base_freshness"].get("source").is_none());
+        assert_eq!(
+            git_output(tmp.path(), &["rev-parse", "HEAD"]),
+            original_head
+        );
+        let stored = stored_session(&tmp, session.id);
+        assert_eq!(stored.task.as_deref(), Some("follow-up"));
+        assert_eq!(stored.diff_base, session.diff_base);
+        assert_eq!(
+            git_output(
+                tmp.path(),
+                &["for-each-ref", "refs/heads/aethyme/integration"]
+            ),
+            "",
+            "checking against the default branch must not create integration"
+        );
+    }
+}
+
+/// The fallback only checks. A session that does not contain the default branch
+/// is refused and stays where it is.
+#[test]
+fn unknown_base_without_integration_does_not_move_a_session_off_the_default_branch() {
+    for diverged in [false, true] {
+        let tmp = fixture();
+        set_integration_at_head(tmp.path());
+        stdout(&run(tmp.path(), &["start", "--task", "initial", "--json"]));
+        let session = stored_session(&tmp, 1);
+        let worktree = Path::new(&session.worktree_path);
+        delete_stored_base_observation(&tmp, session.id);
+        git(
+            tmp.path(),
+            &["update-ref", "-d", "refs/heads/aethyme/integration"],
+        );
+        if diverged {
+            std::fs::write(worktree.join("session.txt"), "session\n").unwrap();
+            git(worktree, &["add", "session.txt"]);
+            git(worktree, &["commit", "-qm", "session work"]);
+        }
+        let before = git_output(worktree, &["rev-parse", "HEAD"]);
+        advance_main(tmp.path(), "new-default.txt");
 
         let refused = run(
             tmp.path(),
             &[
                 "start",
                 "--reuse",
+                &session.worktree_path,
                 "--task",
-                "no inferred fallback",
+                "must not be recorded",
                 "--json",
             ],
         );
         assert!(!refused.status.success());
-        assert!(
-            json_error::message(&refused)
-                .contains("configured integration ref refs/heads/aethyme/integration is missing"),
-            "{}",
-            json_error::message(&refused)
-        );
-        assert_eq!(
-            git_output(tmp.path(), &["rev-parse", "HEAD"]),
-            original_head
-        );
-        assert_eq!(
-            stored_session(&tmp, session.id).task.as_deref(),
-            Some("initial")
-        );
+        let message = json_error::message(&refused);
+        let expected = if diverged {
+            "the session and selected base refs/heads/main have diverged"
+        } else {
+            "the session checkout is behind the selected base refs/heads/main"
+        };
+        assert!(message.contains(expected), "{message}");
+        assert_eq!(git_output(worktree, &["rev-parse", "HEAD"]), before);
+        assert_eq!(stored_session(&tmp, session.id).task, session.task);
     }
+}
+
+/// Integration going away after this session was checked against it is not the
+/// same as nothing having been promoted yet, so it is reported, not stepped over.
+#[test]
+fn unknown_adopted_base_refuses_when_the_integration_it_was_checked_against_is_gone() {
+    let tmp = fixture();
+    set_integration_at_head(tmp.path());
+    stdout(&run(
+        tmp.path(),
+        &["start", "--adopt", "--task", "initial", "--json"],
+    ));
+    let session = stored_session(&tmp, 1);
+    stdout(&run(
+        tmp.path(),
+        &["start", "--reuse", "--task", "checked", "--json"],
+    ));
+    let original_head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    git(
+        tmp.path(),
+        &["update-ref", "-d", "refs/heads/aethyme/integration"],
+    );
+
+    let refused = run(
+        tmp.path(),
+        &["start", "--reuse", "--task", "must refuse", "--json"],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        json_error::message(&refused)
+            .contains("configured integration ref refs/heads/aethyme/integration, which this session was last checked against, is missing"),
+        "{}",
+        json_error::message(&refused)
+    );
+    assert_eq!(
+        git_output(tmp.path(), &["rev-parse", "HEAD"]),
+        original_head
+    );
+    assert_eq!(
+        stored_session(&tmp, session.id).task.as_deref(),
+        Some("checked")
+    );
 }
 
 /// `start --adopt` registers an existing worktree, so there is no base to choose. The
