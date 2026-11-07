@@ -2329,6 +2329,46 @@ fn owned_merge_history_refuses_when_current_integration_is_not_an_ancestor() {
 }
 
 #[test]
+fn synchronized_merge_replays_without_rewriting_session_history() {
+    let tmp = common::FixtureRepository::new();
+    init_repo(tmp.path());
+    let mut broker = common::open_fixture_repository_broker(&tmp)
+        .unwrap()
+        .into_broker();
+    let worktree = agent_worktree(tmp.path(), "synced");
+    let session = broker.adopt(&worktree, None).unwrap();
+    commit_edit(&worktree, "src/a.py", "a = 7\n");
+    commit_edit(tmp.path(), "src/b.py", "b = 7\n");
+    let upstream = resolve(tmp.path(), "HEAD");
+    sh(
+        &worktree,
+        &["merge", "--no-ff", &upstream, "-m", "sync upstream"],
+    );
+    let source = resolve(&worktree, "HEAD");
+    commit_edit(tmp.path(), "src/c.py", "c = 8\n");
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/heads/aethyme/integration", "HEAD"],
+    );
+
+    let outcome = broker.submit(session.id).unwrap();
+    assert!(outcome.promoted, "{outcome:?}");
+    assert_eq!(
+        file_at(tmp.path(), "aethyme/integration", "src/a.py"),
+        "a = 7\n"
+    );
+    assert_eq!(
+        file_at(tmp.path(), "aethyme/integration", "src/b.py"),
+        "b = 7\n"
+    );
+    assert_eq!(
+        file_at(tmp.path(), "aethyme/integration", "src/c.py"),
+        "c = 8\n"
+    );
+    assert_eq!(resolve(&worktree, "HEAD"), source);
+}
+
+#[test]
 fn base_gate_policy_judges_a_submission_that_weakens_or_deletes_its_gates() {
     let tmp = common::FixtureRepository::new();
     init_repo(tmp.path());

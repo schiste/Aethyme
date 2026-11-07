@@ -10,10 +10,11 @@ use crate::snapshot::GeneratedFiles;
 const DEFAULT_FINDING_LIMIT: usize = 100;
 
 const HELP: &str = "Usage: aethyme quality inspect [OPTIONS]
+       aethyme quality code-shape [OPTIONS]
 
   Run bounded, optional repository-quality analysis.
 
-  This report is advisory. Use `aethyme broker status readiness` for authoritative
+  The inspect report is advisory. Use `aethyme broker status readiness` for authoritative
   operational readiness.
 
 Options:
@@ -41,6 +42,9 @@ struct Args {
 }
 
 pub fn run(args: &[String]) -> u8 {
+    if args.first().map(String::as_str) == Some("code-shape") {
+        return crate::code_shape_cli::run(&args[1..]);
+    }
     if args.is_empty() || args == ["--help"] {
         print!("{HELP}");
         return 0;

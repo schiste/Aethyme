@@ -57,6 +57,9 @@ pub fn route(args: &[String]) -> Option<HelpRoute> {
     if PASSTHROUGH_NATIVE.contains(&command) {
         return Some(HelpRoute::Native(args.to_vec()));
     }
+    if command == "quality" && args.get(1).is_some_and(|arg| arg == "code-shape") {
+        return Some(HelpRoute::Native(args.to_vec()));
+    }
     if GROUP_NATIVE.contains(&command) {
         return Some(HelpRoute::Native(vec![
             command.to_string(),
@@ -374,5 +377,12 @@ mod tests {
         assert!(route(&args("readiness --help")).is_none());
         assert!(route(&args("enhance deploy --help")).is_none());
         assert!(route(&args("enhance verify --help")).is_none());
+    }
+    #[test]
+    fn code_shape_help_preserves_the_subcommand() {
+        let Some(HelpRoute::Native(forwarded)) = route(&args("quality code-shape --help")) else {
+            panic!("code-shape has native help");
+        };
+        assert_eq!(forwarded, args("quality code-shape --help"));
     }
 }

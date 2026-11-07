@@ -1781,7 +1781,14 @@ impl Broker {
             {
                 continue;
             }
-            if commit.parents.len() != 1 {
+            // A sync merge can be replayed as its first-parent delta when
+            // the other parent is already present in the captured integration
+            // history. This retains merge-resolution edits without importing
+            // an unaccepted side branch. Other merge shapes remain refused.
+            let replayable_sync = commit.parents.len() == 2
+                && repo.has_complete_unmodified_history()?
+                && repo.is_ancestor_checked(&commit.parents[1], &plan.integration_head)?;
+            if commit.parents.len() != 1 && !replayable_sync {
                 let short_commit = commit.commit.get(..12).unwrap_or(&commit.commit);
                 return Err(BrokerOpError::UnsupportedSubmissionCommit {
                     session_id: plan.session_id,

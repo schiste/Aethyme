@@ -743,6 +743,7 @@ Graph and analysis:
 
 Quality:
   quality inspect [--repo <path>] bounded optional repository-quality analysis
+  quality code-shape [--repo <path>] configurable code-shape diagnostics
 
 Deprecated command spellings were removed in v0.8.8; current commands above are canonical.
 ";

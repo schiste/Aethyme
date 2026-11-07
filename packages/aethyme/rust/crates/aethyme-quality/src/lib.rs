@@ -37,3 +37,8 @@ pub mod walk;
 
 #[cfg(test)]
 mod testsupport;
+
+pub mod code_shape;
+pub mod code_shape_cli;
+pub mod code_shape_graph;
+pub mod code_shape_scan;
