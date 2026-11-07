@@ -23,7 +23,7 @@ fn children(node: Node<'_>) -> Vec<Node<'_>> {
 }
 
 fn mark_lines(node: Node<'_>, lines: &mut BTreeSet<usize>) {
-    if node.kind() == "comment" {
+    if node.kind() == "comment" || node.start_byte() == node.end_byte() {
         return;
     }
     if node.child_count() == 0 {
@@ -462,5 +462,12 @@ mod tests {
         let source = "def f(values):\n    xs = [x for x in values if x]\n    match xs:\n        case [x]: return x\n        case _: return None\n";
         let result = measure(Path::new("x.py"), source).unwrap();
         assert_eq!(result.max_cyclomatic_complexity, 4);
+    }
+    #[test]
+    fn empty_and_comment_only_files_have_no_code_lines() {
+        for source in ["", "// comment\n"] {
+            let result = measure(Path::new("empty.ts"), source).unwrap();
+            assert_eq!(result.source_lines, 0);
+        }
     }
 }
