@@ -746,3 +746,19 @@ blocked.
    authoritative and they are committed, after updating the engine pin and
    using that pinned engine. Do not infer that graph generation applies from a
    generic release-contract assertion when this repository has graph disabled.
+
+## Local friction reports
+
+For a reproducible Aethyme failure or meaningful slowdown, inspect
+`aethyme broker advanced report list --json` for a matching report, then capture
+an additional observation when useful with `report capture --kind <bug-or-improvement>
+--title "<command and symptom>" --session <id>`. Run the full command as
+`aethyme broker advanced report capture`; keep sensitive details out of the
+title. Captures are local to the broker's main repository root and shared by its
+worktrees, not across separate repositories. They omit task text by default and
+are not filed automatically. Review retained metadata before sharing.
+
+When using `broker advanced insights --json` to investigate recurring friction,
+read its window and coverage alongside its counts; absent session activity is
+unknown, not proof of no friction. Report lists, command metrics, and insights
+can have different coverage and retention.
