@@ -1,6 +1,7 @@
 exit: 0
 --- stdout
 Usage: aethyme quality inspect [OPTIONS]
+       aethyme quality code-shape [OPTIONS]
 
   Run bounded, optional repository-quality analysis.
 

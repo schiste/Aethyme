@@ -133,6 +133,7 @@ const COMMANDS: &[&str] = &[
     "ai-ready",
     "quality",
     "quality inspect",
+    "quality code-shape",
     "autofix",
     // broker: the public verbs and their merged forms
     "broker",
