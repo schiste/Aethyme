@@ -9797,9 +9797,57 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn a_host_state_container_reached_through_a_symlink_binds_as_a_keyed_container() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let owner_root = base.join("repository");
+        init_storage_root_test_repository(&owner_root);
+        let real = base.join("real");
+        std::fs::create_dir(&real).unwrap();
+        for directory in [
+            "host-state",
+            "host-cache",
+            "collaboration",
+            "preparation-cache",
+        ] {
+            std::fs::create_dir(real.join(directory)).unwrap();
+            crate::host_state::protect_host_state_path(&real.join(directory), true).unwrap();
+        }
+        // A symlinked ancestor, as macOS reaches its temporary directory through
+        // /var -> /private/var, or an operator through a symlinked volume.
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let options = crate::BrokerOpenOptions::default()
+            .with_host_state_dir(alias.join("host-state"))
+            .with_host_cache_dir(alias.join("host-cache"))
+            .with_host_operation_database(alias.join("host-state/host-operations.db"))
+            .with_collaboration_state(alias.join("collaboration"))
+            // The cache root override must be canonical; only the container is aliased.
+            .with_preparation_cache_root(real.join("preparation-cache"));
+        let mut broker = crate::Broker::open_with_options(&owner_root, options).unwrap();
+        broker.prepare_worktree_root_for_submission().unwrap();
+
+        let binding = broker.store().repository_worktree_binding().unwrap();
+        assert_eq!(
+            binding.root_layout,
+            Some(crate::store::repository_binding::RepositoryWorktreeRootLayout::KeyedContainer),
+            "a symlinked container must not demote the root to a direct root"
+        );
+        assert!(
+            broker
+                .worktree_root_plan()
+                .unwrap()
+                .root_container
+                .is_some(),
+            "GC discovers orphaned sibling roots through the container"
+        );
+    }
+
+    #[test]
     fn durable_binding_retains_empty_root_but_allows_stray_child_review() {
         let tmp = tempfile::tempdir().unwrap();
-        let owner_root = tmp.path().join("repository");
+        let owner_root = tmp.path().canonicalize().unwrap().join("repository");
         init_storage_root_test_repository(&owner_root);
         let storage = crate::test_storage::TestStorage::new();
         let mut broker = storage.open(&owner_root).unwrap();
