@@ -1189,32 +1189,20 @@ impl BrokerStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Lease releases by one holder in a request's event window.
-    /// Callers scope these reads to involved sessions and request ids, avoiding
-    /// a repository-wide scan of release history on each status read.
-    pub(crate) fn lease_release_events_for_holder_since(
+    /// Lease releases after a request event, for every holder in one read.
+    /// `lease_requests` applies each holder's own window.
+    pub(crate) fn lease_release_events_since(
         &self,
-        holder_session_id: i64,
         after_event_id: i64,
-        before: Option<(i64, i64)>,
     ) -> Result<Vec<Event>, BrokerError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, schema_version, ts, kind, session_id, payload_json
              FROM events
-             WHERE kind = ?1 AND session_id = ?2 AND id > ?3
-               AND (?4 IS NULL OR id < ?4 OR ts <= ?5)
+             WHERE kind = ?1 AND id > ?2
              ORDER BY id",
         )?;
-        let before_event_id = before.map(|(event_id, _)| event_id);
-        let before_ts = before.map(|(_, ts)| ts);
         let rows = stmt.query_map(
-            params![
-                crate::events::LEASE_RELEASED,
-                holder_session_id,
-                after_event_id,
-                before_event_id,
-                before_ts
-            ],
+            params![crate::events::LEASE_RELEASED, after_event_id],
             |row| {
                 Ok(Event {
                     id: row.get(0)?,
@@ -1427,20 +1415,18 @@ impl BrokerStore {
 
     /// Session terminal events after a release request. These resolve
     /// requests from the requester side in event-id order.
-    pub(crate) fn lease_request_closure_events_for_session_since(
+    pub(crate) fn lease_request_closure_events_since(
         &self,
-        session_id: i64,
         after_event_id: i64,
     ) -> Result<Vec<Event>, BrokerError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, schema_version, ts, kind, session_id, payload_json
              FROM events
-             WHERE session_id = ?1 AND id > ?2 AND kind IN (?3, ?4, ?5, ?6)
+             WHERE id > ?1 AND kind IN (?2, ?3, ?4, ?5)
              ORDER BY id",
         )?;
         let rows = stmt.query_map(
             params![
-                session_id,
                 after_event_id,
                 "session.closed",
                 "session.cleaned",

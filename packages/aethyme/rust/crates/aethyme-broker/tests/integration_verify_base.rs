@@ -539,6 +539,63 @@ fn submit_refreshes_integration_before_planning() {
     );
 }
 
+/// A diverged integration is left for the reviewed path, so reaching that
+/// answer must not diff history: in a long repository it took minutes per sync.
+#[test]
+fn sync_does_not_assess_drift_on_a_diverged_integration() {
+    let fixture = Fixture::new("verify-only", 1);
+    let mut broker = fixture.broker();
+    let session = broker.start_worktree("diverged sync", None).unwrap();
+    let root = &fixture.root;
+    git(root, &["switch", "-q", "--detach"]);
+    std::fs::write(root.join("unique.txt"), "unique\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "unique to integration"]);
+    let diverged = git(root, &["rev-parse", "HEAD"]);
+    git(root, &["update-ref", INTEGRATION, &diverged]);
+    git(root, &["switch", "-q", "main"]);
+    fixture.merge_upstream(1);
+
+    let trace = fixture._tmp.path().join("sync-trace.json");
+    let id = session.id.to_string();
+    let mut command = common::broker_cli_for_fixture(
+        env!("CARGO_BIN_EXE_broker-cli-shim"),
+        &["sync", "--session", &id],
+        root,
+    );
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .unwrap();
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    let output = command
+        .current_dir(root)
+        .env("GIT_TRACE2_EVENT", &trace)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        fixture.integration(),
+        diverged,
+        "unique work is never moved"
+    );
+    let events = std::fs::read_to_string(trace).unwrap();
+    assert!(events.contains("\"start\""), "Git tracing must be active");
+    assert!(
+        !events.contains("patch-id"),
+        "sync assessed drift on a diverged integration"
+    );
+}
+
 #[test]
 fn sync_refreshes_integration_after_its_fetch() {
     let fixture = Fixture::new("verify-only", 1);

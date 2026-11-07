@@ -377,6 +377,7 @@ pub use gc::{
     GC_PLAN_SCHEMA_VERSION, INLINE_ARTIFACT_SWEEP_BUDGET_MS,
     UNCLASSIFIED_ARTIFACT_REPORT_THRESHOLD_BYTES,
 };
+pub use git::enable_repository_identity_memory;
 pub use git::{
     CherrySide, CommitShape, GitError, GitRepo, LoggedCommit, MergeSimulation, RemoteDefaultBranch,
     UncommittedSummary,
