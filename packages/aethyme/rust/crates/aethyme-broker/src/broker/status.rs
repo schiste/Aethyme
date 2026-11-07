@@ -361,11 +361,7 @@ impl Broker {
             .into_iter()
             .filter_map(|session| session.context_label().map(|context| (session.id, context)))
             .collect();
-        let lease_release_requests = self
-            .lease_release_requests()?
-            .into_iter()
-            .filter(|request| request.state == crate::lease_requests::RequestState::Pending)
-            .collect();
+        let lease_release_requests = self.pending_lease_release_requests()?;
         let pending = self.store.pending_coordinated_operations()?;
         Ok(RoutineStatusContext {
             session_contexts,
