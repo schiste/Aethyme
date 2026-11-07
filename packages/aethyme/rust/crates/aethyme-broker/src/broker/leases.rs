@@ -1737,6 +1737,21 @@ impl Broker {
         })
     }
 
+    /// Pending requests for routine status, excluding historical resolved work.
+    pub(crate) fn pending_lease_release_requests(
+        &self,
+    ) -> Result<Vec<crate::lease_requests::LeaseReleaseRequest>, BrokerOpError> {
+        let leases = self.store.active_leases()?;
+        let paths_by_holder = index_active_lease_paths_by_holder(
+            leases
+                .iter()
+                .map(|lease| (lease.session_id, lease.path.as_str())),
+        );
+        crate::lease_requests::pending_requests(&self.store, |holder, path| {
+            holder_has_overlapping_active_lease(&paths_by_holder, holder, path)
+        })
+    }
+
     /// Ask every other session holding a lease on `path` to release it. One
     /// request per holder; an identical pending request is returned, not
     /// repeated. Requests against a holder already gone past its grace are

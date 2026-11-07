@@ -11,8 +11,9 @@
 #   runs the dependencies of the diff it is verifying — closing the v0
 #   caveat that a dependency-changing diff could pass against the main
 #   checkout's environment.
-# - Rust gates use one broker-managed, repository-scoped cache. The broker
-#   exports its safe path, serializes writers across clones, reports cache
+# - Rust gates use broker-managed, repository-scoped caches. The contract
+#   check has a separate cache from workspace tests. The broker exports each
+#   safe path, serializes writers for that cache across clones, reports cache
 #   provenance, and rotates before a run when the 12 GiB budget is exceeded.
 #   Authoritative disposable builds keep incremental compilation disabled and
 #   reduce debug information so useful artifacts stay compact.
@@ -311,6 +312,10 @@ resource_wait_seconds = 900
 # threshold and a global 4x ceiling; timeout logs include start and timeout load.
 max_load_per_cpu = 3.0
 
+# Keep contract builds separate from the shared workspace test cache. Each
+# remains exclusively leased, but a long test run need not block contract
+# checks in another session. The first contract build is cold and uses its
+# own bounded cache; fast-guards and cargo-test still share their artifacts.
 [gate.managed_cache]
-key = "rust-workspace-v3"
+key = "rust-contract-v1"
 max_bytes = 12884901888
