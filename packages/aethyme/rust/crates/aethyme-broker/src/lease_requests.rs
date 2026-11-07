@@ -648,4 +648,125 @@ mod tests {
         assert_eq!(all[0].request_id, id);
         assert_eq!(all[0].state, RequestState::Released);
     }
+
+    fn request_between(store: &mut BrokerStore, path: &str, requester: i64, holder: i64) -> i64 {
+        store
+            .append_event(
+                REQUESTED,
+                Some(requester),
+                Some(&request_payload(path, requester, holder, "need it")),
+            )
+            .unwrap()
+    }
+
+    fn release(store: &mut BrokerStore, holder: i64, path: &str) -> i64 {
+        store
+            .append_event(
+                crate::events::LEASE_RELEASED,
+                Some(holder),
+                Some(&serde_json::json!({"path": path, "reason": "done"}).to_string()),
+            )
+            .unwrap()
+    }
+
+    fn store_event_ts(store: &BrokerStore, id: i64) -> i64 {
+        store
+            .connection()
+            .query_row("SELECT ts FROM events WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_release_resolves_only_its_own_holders_later_requests() {
+        let (_dir, mut store) = store();
+        let before_any_request = release(&mut store, 10, "a.rs");
+        let early = request_between(&mut store, "a.rs", 1, 10);
+        let other_holder = request_between(&mut store, "a.rs", 1, 20);
+        let other_path = request_between(&mut store, "b.rs", 1, 10);
+        let released = release(&mut store, 10, "a.rs");
+        let after_release = request_between(&mut store, "a.rs", 1, 10);
+        // Latest, so it would win if a release could reach another holder's
+        // requests, whichever holder's requests it reached.
+        let stranger = store
+            .append_event(
+                crate::events::LEASE_RELEASED,
+                Some(30),
+                Some(&serde_json::json!({"path": "a.rs", "reason": "stranger"}).to_string()),
+            )
+            .unwrap();
+        assert!(before_any_request < early && early < released && released < after_release);
+        assert!(after_release < stranger);
+
+        let all = requests(&store, |_, _| false).unwrap();
+        let by_id = |id: i64| all.iter().find(|r| r.request_id == id).unwrap();
+        assert_eq!(by_id(early).state, RequestState::Released);
+        assert_eq!(by_id(early).resolution_reason.as_deref(), Some("done"));
+        // Each of these has no matching release, so it falls through to the
+        // holder-let-go evidence rather than borrowing another request's.
+        for id in [other_holder, other_path, after_release] {
+            assert_eq!(by_id(id).state, RequestState::Released);
+            assert_eq!(
+                by_id(id).resolution_reason.as_deref(),
+                Some("release_evidence_unavailable")
+            );
+        }
+    }
+
+    #[test]
+    fn a_release_after_the_outcome_cannot_displace_the_release_before_it() {
+        let (_dir, mut store) = store();
+        let id = request_between(&mut store, "a.rs", 1, 10);
+        let released = release(&mut store, 10, "a.rs");
+        let outcome = store
+            .append_event(
+                DECLINED,
+                Some(10),
+                Some(&outcome_payload(id, "a.rs", Some("busy"))),
+            )
+            .unwrap();
+        let later = release(&mut store, 10, "a.rs");
+        assert!(id < released && released < outcome && outcome < later);
+        // Dated after the outcome, so it sits outside the holder's window.
+        store
+            .connection()
+            .execute(
+                "UPDATE events SET ts = ts + 1000 WHERE id = ?1",
+                rusqlite::params![later],
+            )
+            .unwrap();
+
+        let all = requests(&store, |_, _| false).unwrap();
+        assert_eq!(all[0].state, RequestState::Released);
+        assert_eq!(all[0].resolved_at, Some(store_event_ts(&store, released)));
+    }
+
+    #[test]
+    fn a_closure_cancels_only_its_own_requesters_earlier_requests() {
+        let (_dir, mut store) = store();
+        let earlier_closure = store
+            .append_event("session.closed", Some(1), Some("{}"))
+            .unwrap();
+        let cancelled = request_between(&mut store, "a.rs", 1, 10);
+        let other_requester = request_between(&mut store, "b.rs", 2, 10);
+        let closure = store
+            .append_event("session.closed", Some(1), Some("{}"))
+            .unwrap();
+        let after_closure = request_between(&mut store, "c.rs", 1, 10);
+        store
+            .append_event("session.closed", Some(3), Some("{}"))
+            .unwrap();
+        assert!(earlier_closure < cancelled && cancelled < closure && closure < after_closure);
+
+        let all = requests(&store, |_, _| true).unwrap();
+        let by_id = |id: i64| all.iter().find(|r| r.request_id == id).unwrap();
+        assert_eq!(by_id(cancelled).state, RequestState::Cancelled);
+        assert_eq!(
+            by_id(cancelled).resolution_reason.as_deref(),
+            Some("requester_closed")
+        );
+        assert_eq!(by_id(other_requester).state, RequestState::Pending);
+        assert_eq!(by_id(after_closure).state, RequestState::Pending);
+    }
 }
