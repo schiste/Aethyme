@@ -1,5 +1,7 @@
 # Code-shape diagnostics
 
+Last Updated: 2026-11-07
+
 `aethyme quality code-shape --repo .` reports source-shape review signals for
 tracked JavaScript, TypeScript, and Python files. It uses the current working
 contents of tracked files. Findings are advisory by default: they are prompts
