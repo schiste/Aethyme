@@ -4,6 +4,31 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.63] - 2026-11-07
+
+**Breaking:** Broker database schema advances to 62, and `broker sync` and `broker submit` no longer clean a diverged integration branch merely because its work has landed. See [upgrade and rollback guidance](UPGRADING.md#v0863).
+
+### Added
+
+- Check configurable source-code shape guidance in warning or enforcing modes with `aethyme quality code-shape` (#1503).
+- Collect local agent feedback and broker friction signals on demand (#1496, #1497).
+
+### Fixed
+
+- Reclaim eligible closed checkouts automatically when the checkout limit is reached, while preserving protected or unproven worktrees (#1507).
+- Submit synchronized session histories whose merge parents are already in integration without rewriting those histories (#1503).
+- Allow artifact-use marker review to recover safely after mount renumbering, with clearer refusal guidance (#1487).
+- Discover sibling worktree roots when a host container is reached through a symlink (#1506).
+- Isolate broker test fixtures from host state and macOS temporary-path differences (#1506, #1508).
+
+### Changed
+
+- Reduce broker status, lease-claim, no-op sync, and integration-status work on repositories with large histories (#1495, #1500, #1504).
+- Fail fast when quarantined host resources make a requested capacity impossible (#1504).
+- Isolate contract-gate builds from workspace-test cache contention (#1499).
+- Document contract preflight and fixture-isolation practices, preserving mirrored skill parity (#1501, #1509, #1511).
+- Restore the workspace dependency contract for code-shape parsers without changing their pinned versions (#1510).
+
 ## [0.8.62] - 2026-11-06
 
 ### Fixed
