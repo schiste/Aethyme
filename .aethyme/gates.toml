@@ -11,8 +11,9 @@
 #   runs the dependencies of the diff it is verifying — closing the v0
 #   caveat that a dependency-changing diff could pass against the main
 #   checkout's environment.
-# - Rust gates use one broker-managed, repository-scoped cache. The broker
-#   exports its safe path, serializes writers across clones, reports cache
+# - Rust gates use broker-managed, repository-scoped caches. The contract
+#   check has a separate cache from workspace tests. The broker exports each
+#   safe path, serializes writers for that cache across clones, reports cache
 #   provenance, and rotates before a run when the 12 GiB budget is exceeded.
 #   Authoritative disposable builds keep incremental compilation disabled and
 #   reduce debug information so useful artifacts stay compact.
