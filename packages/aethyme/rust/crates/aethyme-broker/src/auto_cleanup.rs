@@ -786,6 +786,16 @@ impl ClosedArtifactCheckoutCohortUnavailableReason {
     }
 }
 
+/// What a closed checkout cohort will authorize. Marker review removes only
+/// artifact-use markers, so it tolerates a renumbered mount on a witness saved
+/// without volume UUIDs and never advances the index. Reclaim can delete
+/// checkout contents and keeps the exact witness comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosedCohortPurpose {
+    Reclaim,
+    MarkerReview,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ClosedArtifactCheckoutCohortResolution {
     Available(ClosedArtifactCheckoutCohort),
@@ -814,6 +824,22 @@ impl ClosedArtifactCheckoutCohort {
             .iter()
             .find(|session| session.id == self.owner_session_id)
             .and_then(|session| session.spawned_instance_witness.as_ref())
+    }
+
+    /// Whether a spawn witness in this verified cohort saw `device` on this
+    /// repository's own `.git`. It is durable evidence that a legacy marker's
+    /// saved primary device number named this repository's volume.
+    pub(crate) fn witnesses_primary_git_device(&self, primary_root: &Path, device: u64) -> bool {
+        let git_common = primary_root.join(".git");
+        self.sessions.iter().any(|session| {
+            session
+                .spawned_instance_witness
+                .as_ref()
+                .is_some_and(|witness| {
+                    witness.git_common_device == device
+                        && Path::new(&witness.git_common_path) == git_common
+                })
+        })
     }
 
     pub(crate) fn matches_checkout_instance(&self, checkout: &GitRepo) -> bool {
@@ -1647,12 +1673,18 @@ impl Broker {
         worktree: &Path,
         deadline: Option<Instant>,
     ) -> Result<Option<ClosedArtifactCheckoutCohort>, BrokerOpError> {
-        self.closed_artifact_checkout_cohort_for_session_mode(session_id, worktree, deadline, true)
+        self.closed_artifact_checkout_cohort_for_session_mode(
+            session_id,
+            worktree,
+            deadline,
+            ClosedCohortPurpose::Reclaim,
+        )
     }
 
     /// Read-only variant for explicit artifact-use marker review. An
     /// incomplete path index is a refusal here: planning must not advance or
-    /// otherwise mutate the cleanup cohort index.
+    /// otherwise mutate the cleanup cohort index. See [`ClosedCohortPurpose`]
+    /// for how its witness comparison differs from reclaim.
     pub(crate) fn closed_artifact_checkout_cohort_for_session_readonly(
         &mut self,
         session_id: i64,
@@ -1660,7 +1692,10 @@ impl Broker {
         deadline: Option<Instant>,
     ) -> Result<ClosedArtifactCheckoutCohortResolution, BrokerOpError> {
         self.closed_artifact_checkout_cohort_for_session_detailed_mode(
-            session_id, worktree, deadline, false,
+            session_id,
+            worktree,
+            deadline,
+            ClosedCohortPurpose::MarkerReview,
         )
     }
 
@@ -1669,14 +1704,11 @@ impl Broker {
         session_id: i64,
         worktree: &Path,
         deadline: Option<Instant>,
-        advance_incomplete_index: bool,
+        purpose: ClosedCohortPurpose,
     ) -> Result<Option<ClosedArtifactCheckoutCohort>, BrokerOpError> {
         Ok(
             match self.closed_artifact_checkout_cohort_for_session_detailed_mode(
-                session_id,
-                worktree,
-                deadline,
-                advance_incomplete_index,
+                session_id, worktree, deadline, purpose,
             )? {
                 ClosedArtifactCheckoutCohortResolution::Available(cohort) => Some(cohort),
                 ClosedArtifactCheckoutCohortResolution::Unavailable(_) => None,
@@ -1694,7 +1726,10 @@ impl Broker {
         deadline: Option<Instant>,
     ) -> Result<ClosedArtifactCheckoutCohortResolution, BrokerOpError> {
         self.closed_artifact_checkout_cohort_for_session_detailed_mode(
-            session_id, worktree, deadline, true,
+            session_id,
+            worktree,
+            deadline,
+            ClosedCohortPurpose::Reclaim,
         )
     }
 
@@ -1703,7 +1738,7 @@ impl Broker {
         session_id: i64,
         worktree: &Path,
         deadline: Option<Instant>,
-        advance_incomplete_index: bool,
+        purpose: ClosedCohortPurpose,
     ) -> Result<ClosedArtifactCheckoutCohortResolution, BrokerOpError> {
         use self::ClosedArtifactCheckoutCohortResolution::{Available, Unavailable};
         use self::ClosedArtifactCheckoutCohortUnavailableReason as Reason;
@@ -1718,7 +1753,7 @@ impl Broker {
         // Successful removals and concurrent authority changes enqueue only
         // their affected rows. Drain those deltas in place; do not restart the
         // full filesystem lap between candidates in one pass.
-        while advance_incomplete_index
+        while purpose == ClosedCohortPurpose::Reclaim
             && !index_state.complete
             && index_state.after_session_id >= index_state.high_water_session_id
             && index_state.pending_dirty_rows > 0
@@ -1859,7 +1894,14 @@ impl Broker {
                     witness.worktree_path == canonical_path
                         && current_witness
                             .as_ref()
-                            .is_some_and(|current| witness.matches_current_instance(current))
+                            .is_some_and(|current| match purpose {
+                                ClosedCohortPurpose::Reclaim => {
+                                    witness.matches_current_instance(current)
+                                }
+                                ClosedCohortPurpose::MarkerReview => {
+                                    witness.matches_instance_for_marker_review(current)
+                                }
+                            })
                 })
             {
                 return Ok(unavailable(Reason::SpawnedWitnessMismatch));
@@ -3912,6 +3954,134 @@ mod tests {
         ));
         assert!(report.stopped.is_none());
         assert!(!marker_path.exists());
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    impl ArtifactUseReconcileFixture {
+        /// Rewrite the session's witness as one saved without volume UUIDs
+        /// before a mount renumbering, and its marker as a legacy marker.
+        fn age_witness_and_marker(&mut self, marker_path: &Path, marker_device: u64) -> u64 {
+            let mut saved = self
+                .broker
+                .store()
+                .spawned_worktree_instance_witness(self.session.id)
+                .unwrap()
+                .expect("spawn records a witness");
+            saved.schema_version = 2;
+            saved.volume_uuids = None;
+            saved.git_admin_device += 1;
+            saved.git_common_device += 1;
+            let witnessed_device = saved.git_common_device;
+            let connection = rusqlite::Connection::open(self.broker.store().db_path()).unwrap();
+            connection
+                .execute(
+                    "UPDATE spawned_worktree_instances SET witness_json = ?2 WHERE session_id = ?1",
+                    rusqlite::params![self.session.id, serde_json::to_string(&saved).unwrap()],
+                )
+                .unwrap();
+
+            let bytes = std::fs::read(marker_path).unwrap();
+            let mut marker: crate::file_lock::artifact_use::ArtifactUseMarker =
+                serde_json::from_slice(&bytes).unwrap();
+            marker.schema_version = 1;
+            marker.primary_volume_uuid = None;
+            marker.checkout_volume_uuid = None;
+            marker.primary_device = if marker_device == 0 {
+                witnessed_device
+            } else {
+                marker_device
+            };
+            std::fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+            witnessed_device
+        }
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn marker_review_survives_a_renumbered_mount_that_reclaim_still_refuses() {
+        let mut fixture = ArtifactUseReconcileFixture::new();
+        let invocation_id = "reconcile-renumbered-mount-fixture";
+        let mut child = fixture.start_running_marker(invocation_id);
+        child.wait().unwrap();
+        let marker_path = fixture.marker_path(invocation_id);
+        fixture.age_witness_and_marker(&marker_path, 0);
+
+        let (cohort, registry) = fixture.close_and_bind();
+        let plan = fixture.plan(&cohort, &registry);
+        assert_eq!(plan.markers.len(), 1);
+        assert!(
+            matches!(
+                &plan.markers[0].disposition,
+                crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::RemoveIfConfirmed
+            ),
+            "{:?}",
+            plan.markers[0].disposition
+        );
+
+        let session_id = fixture.session.id;
+        let checkout_root = fixture.checkout_root.clone();
+        assert!(matches!(
+            fixture
+                .broker
+                .closed_artifact_checkout_cohort_for_session_detailed(
+                    session_id,
+                    &checkout_root,
+                    None,
+                )
+                .unwrap(),
+            super::ClosedArtifactCheckoutCohortResolution::Unavailable(
+                super::ClosedArtifactCheckoutCohortUnavailableReason::SpawnedWitnessMismatch
+            )
+        ));
+
+        let report = fixture.apply(&cohort, &registry, &plan.digest).unwrap();
+        assert!(matches!(
+            &report.outcomes[0].outcome,
+            crate::file_lock::artifact_use::ArtifactUseReconcileOutcomeKind::Removed { .. }
+        ));
+        assert!(!marker_path.exists());
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn marker_review_retains_a_legacy_device_number_nothing_witnessed() {
+        let mut fixture = ArtifactUseReconcileFixture::new();
+        let invocation_id = "reconcile-unwitnessed-device-fixture";
+        let mut child = fixture.start_running_marker(invocation_id);
+        child.wait().unwrap();
+        let marker_path = fixture.marker_path(invocation_id);
+        fixture.age_witness_and_marker(&marker_path, u64::MAX);
+
+        let (cohort, registry) = fixture.close_and_bind();
+        let plan = fixture.plan(&cohort, &registry);
+        assert!(matches!(
+            &plan.markers[0].disposition,
+            crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::Retain { reason }
+                if reason.contains("no validated registry witness")
+        ));
+        assert!(marker_path.exists());
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn marker_review_still_refuses_a_live_process_after_a_renumbered_mount() {
+        let mut fixture = ArtifactUseReconcileFixture::new();
+        let invocation_id = "reconcile-renumbered-live-fixture";
+        let mut child = fixture.start_running_marker(invocation_id);
+        let marker_path = fixture.marker_path(invocation_id);
+        fixture.age_witness_and_marker(&marker_path, 0);
+
+        let (cohort, registry) = fixture.close_and_bind();
+        let plan = fixture.plan(&cohort, &registry);
+        let disposition = plan.markers[0].disposition.clone();
+        child.wait().unwrap();
+        assert!(
+            !matches!(
+                disposition,
+                crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::RemoveIfConfirmed
+            ),
+            "{disposition:?}"
+        );
     }
 
     #[cfg(target_os = "macos")]

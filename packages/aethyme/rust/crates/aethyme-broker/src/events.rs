@@ -365,6 +365,56 @@ impl SpawnedWorktreeInstanceWitness {
                 current.volume_uuids.as_ref().map(|v| v.git_admin),
             )
     }
+
+    /// Identity for reviewing artifact-use markers, which removes only a
+    /// marker and never a checkout. macOS renumbers mounts, so a witness saved
+    /// without volume UUIDs can differ from today's device numbers while
+    /// naming the same objects. The random root generation written at spawn
+    /// already binds this checkout, so such a witness compares paths, inodes
+    /// and that generation here. A saved UUID must still match, and a witness
+    /// without a generation stays unsupported. Reclaiming a checkout keeps the
+    /// exact checks in [`Self::matches_current_instance`].
+    pub(crate) fn matches_instance_for_marker_review(&self, current: &Self) -> bool {
+        let same = |saved_inode: u64,
+                    saved_uuid: Option<[u8; 16]>,
+                    current_inode: u64,
+                    current_uuid: Option<[u8; 16]>| {
+            saved_inode == current_inode
+                && saved_uuid.is_none_or(|saved| current_uuid == Some(saved))
+        };
+        let saved = self.volume_uuids.as_ref();
+        let observed = current.volume_uuids.as_ref();
+        self.is_supported()
+            && current.is_supported()
+            && self.worktree_path == current.worktree_path
+            && self.git_admin_path == current.git_admin_path
+            && self.git_common_path == current.git_common_path
+            && self.root_generation_sha256 == current.root_generation_sha256
+            && same(
+                self.worktree_inode,
+                saved.map(|v| v.worktree),
+                current.worktree_inode,
+                observed.map(|v| v.worktree),
+            )
+            && same(
+                self.git_pointer_inode,
+                saved.map(|v| v.git_pointer),
+                current.git_pointer_inode,
+                observed.map(|v| v.git_pointer),
+            )
+            && same(
+                self.git_admin_inode,
+                saved.map(|v| v.git_admin),
+                current.git_admin_inode,
+                observed.map(|v| v.git_admin),
+            )
+            && same(
+                self.git_common_inode,
+                saved.map(|v| v.git_common),
+                current.git_common_inode,
+                observed.map(|v| v.git_common),
+            )
+    }
 }
 
 /// Immutable identity captured before `finish` begins physical cleanup. A
@@ -834,6 +884,68 @@ mod spawned_instance_volume_tests {
         let encoded = serde_json::to_string(&saved).unwrap();
         let decoded = serde_json::from_str::<SpawnedWorktreeInstanceWitness>(&encoded).unwrap();
         assert_eq!(saved, decoded);
+    }
+
+    fn uuid_less_witness() -> SpawnedWorktreeInstanceWitness {
+        let mut saved = witness();
+        saved.schema_version = 2;
+        saved.volume_uuids = None;
+        saved
+    }
+
+    fn renumbered(saved: &SpawnedWorktreeInstanceWitness) -> SpawnedWorktreeInstanceWitness {
+        let mut current = witness();
+        current.worktree_device = saved.worktree_device + 10;
+        current.git_pointer_device = saved.git_pointer_device + 10;
+        current.git_admin_device = saved.git_admin_device + 10;
+        current.git_common_device = saved.git_common_device + 10;
+        current
+    }
+
+    #[test]
+    fn marker_review_accepts_a_renumbered_mount_that_reclaim_still_refuses() {
+        let saved = uuid_less_witness();
+        let current = renumbered(&saved);
+        assert!(saved.matches_instance_for_marker_review(&current));
+        assert!(!saved.matches_current_instance(&current));
+    }
+
+    #[test]
+    fn marker_review_refuses_replaced_objects_paths_generations_and_volumes() {
+        let saved = uuid_less_witness();
+        let mutations: &[fn(&mut SpawnedWorktreeInstanceWitness)] = &[
+            |v| v.worktree_inode += 1,
+            |v| v.git_pointer_inode += 1,
+            |v| v.git_admin_inode += 1,
+            |v| v.git_common_inode += 1,
+            |v| v.worktree_path.push('x'),
+            |v| v.git_admin_path.push('x'),
+            |v| v.git_common_path.push('x'),
+            |v| v.root_generation_sha256 = Some("b".repeat(64)),
+            |v| v.root_generation_sha256 = None,
+        ];
+        for (index, mutate) in mutations.iter().enumerate() {
+            let mut current = renumbered(&saved);
+            mutate(&mut current);
+            assert!(
+                !saved.matches_instance_for_marker_review(&current),
+                "mutation {index}"
+            );
+        }
+
+        let with_uuids = witness();
+        let mut other_volume = renumbered(&with_uuids);
+        other_volume.volume_uuids.as_mut().unwrap().git_common = [3; 16];
+        assert!(!with_uuids.matches_instance_for_marker_review(&other_volume));
+        assert!(with_uuids.matches_instance_for_marker_review(&renumbered(&with_uuids)));
+    }
+
+    #[test]
+    fn marker_review_refuses_a_witness_without_a_spawn_generation() {
+        let mut saved = uuid_less_witness();
+        saved.schema_version = 1;
+        saved.root_generation_sha256 = None;
+        assert!(!saved.matches_instance_for_marker_review(&renumbered(&saved)));
     }
 
     #[test]

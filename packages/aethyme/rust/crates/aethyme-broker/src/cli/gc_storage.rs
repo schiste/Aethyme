@@ -1305,6 +1305,48 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+/// A refusal says what it means for this session and that waiting is safe, so
+/// an agent does not treat a correct refusal as something to work around.
+fn artifact_use_refusal_message(
+    reason: crate::auto_cleanup::ClosedArtifactCheckoutCohortUnavailableReason,
+    id: i64,
+    session_open: bool,
+    session_cleaned: bool,
+) -> String {
+    use crate::auto_cleanup::ClosedArtifactCheckoutCohortUnavailableReason as Reason;
+    let guidance = match reason {
+        Reason::SessionChanged if session_open => format!(
+            "Session {id} is still open, so its markers may belong to live work. Finish it, then plan again."
+        ),
+        Reason::SessionChanged if session_cleaned => {
+            format!("Session {id} has already been cleaned, so this command no longer covers it.")
+        }
+        Reason::NonClosedAlias => format!(
+            "Another session using the checkout of session {id} is still open. Finish it, then plan again."
+        ),
+        Reason::IndexMissing | Reason::IndexIncomplete | Reason::IndexChanged | Reason::WitnessChanged => {
+            "The cleanup index is catching up with recent session changes, and later broker commands advance it. Plan again later.".to_owned()
+        }
+        Reason::SpawnedWitnessMismatch => format!(
+            "The checkout of session {id} cannot prove it is the one recorded at spawn: the record has no spawn generation, or the checkout was replaced. Planning again will not change that."
+        ),
+        Reason::SpawnedOwnerMissing => format!(
+            "Only adopted sessions use the checkout of session {id}, and an adopted session cannot prove who created it. Planning again will not change that."
+        ),
+        Reason::CheckoutMissing => {
+            format!("The checkout of session {id} no longer exists, so it holds no disk space.")
+        }
+        Reason::AliasOverlapOutsideCohort => format!(
+            "Another session's recorded path overlaps the checkout of session {id}, with no proof that session's checkout is gone. Planning again will not change that."
+        ),
+        _ => "Inspect the selected session and `aethyme broker gc plan --json` for the missing checkout proof.".to_owned(),
+    };
+    format!(
+        "artifact-use reconciliation refused: {}; no markers were changed. {guidance} Leaving the marker retained is safe: it only holds back automatic cleanup of this checkout. Do not remove markers manually",
+        reason.code()
+    )
+}
+
 fn run_gc_artifact_use_reconcile(parsed: Parsed) -> Result<(), UsageError> {
     if parsed.positional.len() != 4 || parsed.positional[1] != "reconcile" {
         return Err(UsageError::Message(
@@ -1366,9 +1408,11 @@ fn run_gc_artifact_use_reconcile(parsed: Parsed) -> Result<(), UsageError> {
     )? {
         crate::auto_cleanup::ClosedArtifactCheckoutCohortResolution::Available(cohort) => cohort,
         crate::auto_cleanup::ClosedArtifactCheckoutCohortResolution::Unavailable(reason) => {
-            return Err(UsageError::Message(format!(
-                "artifact-use reconciliation refused: {}; no markers were changed. Inspect the selected session and `aethyme broker gc plan --json` for the missing checkout proof; do not remove markers manually",
-                reason.code()
+            return Err(UsageError::Message(artifact_use_refusal_message(
+                reason,
+                session_id,
+                !session.status.is_closed(),
+                session.cleanup_state == crate::types::SessionCleanupState::Cleaned,
             )));
         }
     };
@@ -2115,6 +2159,51 @@ fn run_storage_identity(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod artifact_use_refusal_tests {
+    use super::artifact_use_refusal_message;
+    use crate::auto_cleanup::ClosedArtifactCheckoutCohortUnavailableReason as Reason;
+
+    #[test]
+    fn every_refusal_keeps_its_code_and_says_retaining_is_safe() {
+        for (reason, expected) in [
+            (Reason::IndexIncomplete, "Plan again later"),
+            (Reason::SpawnedWitnessMismatch, "Planning again will not"),
+            (Reason::SpawnedOwnerMissing, "adopted session"),
+            (Reason::CheckoutMissing, "no longer exists"),
+            (Reason::AliasOverlapOutsideCohort, "overlaps"),
+            (Reason::NonClosedAlias, "still open"),
+            (Reason::SessionChanged, "gc plan --json"),
+        ] {
+            let message = artifact_use_refusal_message(reason, 7, false, false);
+            assert!(
+                message.starts_with(&format!(
+                    "artifact-use reconciliation refused: {}; no markers were changed.",
+                    reason.code()
+                )),
+                "{message}"
+            );
+            assert!(message.contains(expected), "{message}");
+            assert!(message.contains("retained is safe"), "{message}");
+            assert!(
+                message.contains("Do not remove markers manually"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_changed_session_says_whether_it_is_open_or_already_cleaned() {
+        let open = artifact_use_refusal_message(Reason::SessionChanged, 7, true, false);
+        assert!(open.contains("Session 7 is still open"), "{open}");
+        let cleaned = artifact_use_refusal_message(Reason::SessionChanged, 7, false, true);
+        assert!(
+            cleaned.contains("Session 7 has already been cleaned"),
+            "{cleaned}"
+        );
+    }
 }
 
 #[cfg(test)]
