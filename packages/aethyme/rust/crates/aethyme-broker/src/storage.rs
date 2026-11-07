@@ -6300,12 +6300,15 @@ mod tests {
     impl LiveRootFailureFixture {
         fn new(placement_root_count: usize) -> Self {
             let temporary = tempfile::tempdir().unwrap();
-            let main_root = temporary.path().join("repository");
+            // Placement roots are opened without following symlinks, and macOS
+            // reaches its temporary directory through one.
+            let temporary_root = temporary.path().canonicalize().unwrap();
+            let main_root = temporary_root.join("repository");
             std::fs::create_dir_all(&main_root).unwrap();
-            let storage_root = temporary.path().join("worktrees");
+            let storage_root = temporary_root.join("worktrees");
             std::fs::create_dir_all(&storage_root).unwrap();
 
-            let host_cache_root = temporary.path().join("host-preparation-cache");
+            let host_cache_root = temporary_root.join("host-preparation-cache");
             let cache_candidate = host_cache_root
                 .join(TEST_PREPARATION_REPOSITORY)
                 .join("deadbeefdead");
@@ -6318,7 +6321,7 @@ mod tests {
 
             let mut bindings = Vec::new();
             for index in 0..placement_root_count {
-                let placement_root = temporary.path().join(format!("placement-{index}"));
+                let placement_root = temporary_root.join(format!("placement-{index}"));
                 std::fs::create_dir_all(&placement_root).unwrap();
                 let cache_root = placement_root
                     .join(crate::broker::lifecycle::WORKTREE_VOLUME_PREPARATION_CACHE_ROOT);
@@ -6329,7 +6332,7 @@ mod tests {
                 };
                 let marker_path = placement_root.join(WORKTREE_ROOT_MARKER);
                 std::fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
-                let resource_db_path = test_host_resource_db(temporary.path());
+                let resource_db_path = test_host_resource_db(&temporary_root);
                 let placement_identity =
                     crate::preparation::rotation_debt::DirectoryIdentity::capture(&placement_root)
                         .unwrap()
@@ -9196,7 +9199,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repository = init_storage_root_test_repository(&tmp.path().join("repository"));
         let owner_root = repository.root().canonicalize().unwrap();
-        let storage_root = tmp.path().join("worktrees").join("repository-key");
+        let storage_root = tmp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("worktrees")
+            .join("repository-key");
         std::fs::create_dir_all(&storage_root).unwrap();
         let marker = WorktreeRootMarker {
             schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
@@ -9789,9 +9797,57 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn a_host_state_container_reached_through_a_symlink_binds_as_a_keyed_container() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let owner_root = base.join("repository");
+        init_storage_root_test_repository(&owner_root);
+        let real = base.join("real");
+        std::fs::create_dir(&real).unwrap();
+        for directory in [
+            "host-state",
+            "host-cache",
+            "collaboration",
+            "preparation-cache",
+        ] {
+            std::fs::create_dir(real.join(directory)).unwrap();
+            crate::host_state::protect_host_state_path(&real.join(directory), true).unwrap();
+        }
+        // A symlinked ancestor, as macOS reaches its temporary directory through
+        // /var -> /private/var, or an operator through a symlinked volume.
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let options = crate::BrokerOpenOptions::default()
+            .with_host_state_dir(alias.join("host-state"))
+            .with_host_cache_dir(alias.join("host-cache"))
+            .with_host_operation_database(alias.join("host-state/host-operations.db"))
+            .with_collaboration_state(alias.join("collaboration"))
+            // The cache root override must be canonical; only the container is aliased.
+            .with_preparation_cache_root(real.join("preparation-cache"));
+        let mut broker = crate::Broker::open_with_options(&owner_root, options).unwrap();
+        broker.prepare_worktree_root_for_submission().unwrap();
+
+        let binding = broker.store().repository_worktree_binding().unwrap();
+        assert_eq!(
+            binding.root_layout,
+            Some(crate::store::repository_binding::RepositoryWorktreeRootLayout::KeyedContainer),
+            "a symlinked container must not demote the root to a direct root"
+        );
+        assert!(
+            broker
+                .worktree_root_plan()
+                .unwrap()
+                .root_container
+                .is_some(),
+            "GC discovers orphaned sibling roots through the container"
+        );
+    }
+
+    #[test]
     fn durable_binding_retains_empty_root_but_allows_stray_child_review() {
         let tmp = tempfile::tempdir().unwrap();
-        let owner_root = tmp.path().join("repository");
+        let owner_root = tmp.path().canonicalize().unwrap().join("repository");
         init_storage_root_test_repository(&owner_root);
         let storage = crate::test_storage::TestStorage::new();
         let mut broker = storage.open(&owner_root).unwrap();
@@ -9871,7 +9927,7 @@ mod tests {
     #[test]
     fn empty_root_apply_waits_for_start_lifecycle_claim_and_rechecks() {
         let tmp = tempfile::tempdir().unwrap();
-        let owner_root = tmp.path().join("repository");
+        let owner_root = tmp.path().canonicalize().unwrap().join("repository");
         let owner = init_storage_root_test_repository(&owner_root);
         // The scoped storage snapshot now requires a valid owner binding row.
         // Bind another legitimate root so this fixture can still exercise the

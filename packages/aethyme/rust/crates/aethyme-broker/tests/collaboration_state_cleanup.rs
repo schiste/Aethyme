@@ -327,7 +327,16 @@ fn run_every_deleter(host: &Host, container: Option<&Path>, refused_gc_root: Opt
         ],
     );
     if let Some(refused_gc_root) = refused_gc_root {
-        let expected_path = refused_gc_root.to_string_lossy().into_owned();
+        // Storage reports the resolved path; the orphan itself is gone by now,
+        // so resolve its parent (macOS reaches temp through /var).
+        let expected_path = refused_gc_root
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .join(refused_gc_root.file_name().unwrap())
+            .to_string_lossy()
+            .into_owned();
         assert!(
             storage_apply["applied"]
                 .as_array()
