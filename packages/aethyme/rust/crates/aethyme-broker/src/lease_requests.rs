@@ -120,6 +120,23 @@ pub fn requests(
     store: &BrokerStore,
     holds: impl Fn(i64, &str) -> bool,
 ) -> Result<Vec<LeaseReleaseRequest>, crate::BrokerOpError> {
+    requests_impl(store, holds, false)
+}
+
+/// Only requests that can still be pending. Resolved requests and requests
+/// with no currently held overlapping lease cannot contribute to this view.
+pub(crate) fn pending_requests(
+    store: &BrokerStore,
+    holds: impl Fn(i64, &str) -> bool,
+) -> Result<Vec<LeaseReleaseRequest>, crate::BrokerOpError> {
+    requests_impl(store, holds, true)
+}
+
+fn requests_impl(
+    store: &BrokerStore,
+    holds: impl Fn(i64, &str) -> bool,
+    pending_only: bool,
+) -> Result<Vec<LeaseReleaseRequest>, crate::BrokerOpError> {
     let events = store.lease_release_events()?;
     let mut requests: Vec<LeaseReleaseRequest> = Vec::new();
     let mut request_ids = HashSet::<i64>::new();
@@ -169,6 +186,17 @@ pub fn requests(
         }
     }
 
+    if pending_only {
+        // Explicit outcomes always resolve a request. A request without a
+        // currently held overlapping lease is also resolved, even when its
+        // original release event has been pruned. Filtering before scanning
+        // historical releases keeps compact status proportional to candidates.
+        requests.retain(|request| {
+            !outcome_resolutions.contains_key(&request.request_id)
+                && holds(request.holder_session_id, &request.path)
+        });
+    }
+
     let mut resolutions = outcome_resolutions.clone();
     let mut held_by_request = HashMap::<i64, bool>::new();
     let mut release_resolutions = HashMap::<i64, RequestResolution>::new();
@@ -216,9 +244,11 @@ pub fn requests(
     // hundreds of holders scanned the whole history once for each of them on
     // every status read. Each holder still sees only its own window.
     let first_request_id = requests.iter().map(|request| request.request_id).min();
-    let release_events = match first_request_id {
-        Some(first) => store.lease_release_events_since(first)?,
-        None => Vec::new(),
+    let release_events = match (pending_only, first_request_id) {
+        // Every remaining candidate has an overlapping live lease. Historical
+        // releases cannot resolve it under the full-history rules below.
+        (true, _) | (_, None) => Vec::new(),
+        (false, Some(first)) => store.lease_release_events_since(first)?,
     };
     for event in &release_events {
         let Some(holder_session_id) = event.session_id else {
@@ -368,6 +398,9 @@ pub fn requests(
             request.resolved_at = Some(*closed_at);
             request.resolution_reason = Some("requester_closed".into());
         }
+    }
+    if pending_only {
+        requests.retain(|request| request.state == RequestState::Pending);
     }
     Ok(requests)
 }

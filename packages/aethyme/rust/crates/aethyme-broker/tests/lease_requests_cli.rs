@@ -453,3 +453,59 @@ fn a_holder_of_unknown_liveness_is_never_granted_against() {
     );
     assert!(fx.holds(holding));
 }
+
+#[test]
+fn compact_status_keeps_new_pending_request_after_resolved_lease_is_reclaimed() {
+    let fx = fixture(VERIFY_ONLY);
+    let (holder, requester) = (Agent::spawn(), Agent::spawn());
+    let holding = fx.holder_as(&holder.pid());
+    let asking = fx.start_as(&requester.pid(), "asker");
+    let first = fx.request(&requester.pid(), asking)["request_id"]
+        .as_i64()
+        .unwrap();
+    fx.json_as(
+        &holder.pid(),
+        &[
+            "advanced",
+            "leases",
+            "ack",
+            &first.to_string(),
+            "--session",
+            &holding.to_string(),
+            "--json",
+        ],
+    );
+    fx.json_as(
+        &holder.pid(),
+        &[
+            "advanced",
+            "leases",
+            "claim",
+            PATH,
+            "--session",
+            &holding.to_string(),
+            "--json",
+        ],
+    );
+    let second = fx.request(&requester.pid(), asking)["request_id"]
+        .as_i64()
+        .unwrap();
+    let full = fx.json_as("0", &["status", "--json"]);
+    let compact = fx.json_as("0", &["status", "--compact", "--json"]);
+    let pending: Vec<_> = full["lease_release_requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["state"] == "pending")
+        .map(|row| row["request_id"].as_i64().unwrap())
+        .collect();
+    let compact_ids: Vec<_> = compact["lease_release_requests"]["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["request_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(pending, vec![second]);
+    assert_eq!(compact_ids, pending);
+    assert_eq!(compact["lease_release_requests"]["count"], 1);
+}
