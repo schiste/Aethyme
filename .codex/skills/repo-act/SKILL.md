@@ -92,6 +92,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   under paths containing spaces and apostrophes, even when CI paths are simple.
   After a quoting failure, audit sibling transport command setters before
   starting another CI or local qualification cycle.
+- For broker CLI fixtures, isolate host state, host cache, preparation cache,
+  and worktree placement for both the library broker and its CLI children.
+  Use `common::open_fixture_broker` and `common::broker_cli_for_fixture` together;
+  shared host recovery and inventory can consume timing budgets or alter host state.
 - Cargo integration tests can replace a previously built CLI artifact. Record
   binary hashes before and after tests; matching source revisions alone do not
   prove that the bytes stayed unchanged. Qualify the exact artifacts selected
