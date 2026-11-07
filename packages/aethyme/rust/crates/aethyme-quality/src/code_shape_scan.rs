@@ -49,6 +49,7 @@ fn complexity(node: Node<'_>, source: &str, root: bool) -> usize {
                 | "arrow_function"
                 | "method_definition"
                 | "lambda"
+                | "class_definition"
         )
     {
         return 0;
@@ -76,7 +77,10 @@ fn complexity(node: Node<'_>, source: &str, root: bool) -> usize {
     {
         count += 1;
     }
-    if kind == "case_clause" && text(node, source).trim_start().starts_with("case _:") {
+    if kind == "case_clause"
+        && (text(node, source).trim_start().starts_with("case _:")
+            || text(node, source).trim_start().starts_with("case _ if "))
+    {
         count = count.saturating_sub(1);
     }
     if matches!(kind, "binary_expression" | "boolean_operator") {
@@ -95,9 +99,11 @@ fn complexity(node: Node<'_>, source: &str, root: bool) -> usize {
 }
 
 fn callable(node: Node<'_>, internal: bool, m: &mut SourceMetrics, source: &str) {
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
     m.callables += 1;
     m.internal_callables += usize::from(internal);
-    let body = node.child_by_field_name("body").unwrap_or(node);
     let mut body_lines = BTreeSet::new();
     mark_lines(body, &mut body_lines);
     let lines = body_lines.len();
@@ -450,5 +456,11 @@ mod tests {
             "__all__ = ['exposed']\ndef exposed():\n    return 1\ndef hidden():\n    return 2\n";
         let result = measure(Path::new("x.py"), source).unwrap();
         assert_eq!((result.exports, result.internal_callables), (1, 1));
+    }
+    #[test]
+    fn python_comprehensions_and_match_wildcards_count_decisions() {
+        let source = "def f(values):\n    xs = [x for x in values if x]\n    match xs:\n        case [x]: return x\n        case _: return None\n";
+        let result = measure(Path::new("x.py"), source).unwrap();
+        assert_eq!(result.max_cyclomatic_complexity, 4);
     }
 }

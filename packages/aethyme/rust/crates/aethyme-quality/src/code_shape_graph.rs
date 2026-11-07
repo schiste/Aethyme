@@ -409,4 +409,24 @@ mod tests {
         .unwrap();
         assert_eq!(graph.incomplete.len(), 1);
     }
+    #[test]
+    fn cycle_members_do_not_include_bridges_or_dependents() {
+        let sources = BTreeMap::from([
+            (PathBuf::from("a.ts"), "import './b';".to_string()),
+            (
+                PathBuf::from("b.ts"),
+                "import './a'; import './c';".to_string(),
+            ),
+            (PathBuf::from("c.ts"), "import './d';".to_string()),
+            (PathBuf::from("d.ts"), "export const d = 1;".to_string()),
+            (PathBuf::from("e.ts"), "import './a';".to_string()),
+        ]);
+        let graph = build(&sources, &[]).unwrap();
+        assert!(graph.in_cycle(Path::new("a.ts")));
+        assert!(graph.in_cycle(Path::new("b.ts")));
+        for file in ["c.ts", "d.ts", "e.ts"] {
+            assert!(!graph.in_cycle(Path::new(file)), "{file}");
+        }
+        assert_eq!(graph.fan_in(Path::new("a.ts")), 2);
+    }
 }
