@@ -36,6 +36,15 @@ consumer. This file exists so that doesn't happen again.
    `scripts/eval/verify-playground.sh` against any deployed
    playground; it asserts a subset of the contracts below.
 
+## Code-shape diagnostics
+
+`aethyme quality code-shape` is an opt-in CLI for source-shape diagnostics.
+Its JSON output has `schema_version: 1` and `kind: code_shape`. Error mode
+returns 1 for findings and 2 for incomplete analysis or operational errors;
+warning mode returns 0 for findings. Its configuration, file scope and
+limitations are described in [code-shape.md](../guides/code-shape.md).
+The initial external consumers are manual operators and opt-in CI scripts.
+
 ## Opt-in broker service transport
 
 `aethyme broker advanced service serve <private-runtime-directory>` runs a

@@ -66,11 +66,18 @@ fn complexity(node: Node<'_>, source: &str, root: bool) -> usize {
             | "conditional_expression"
             | "ternary_expression"
             | "case_clause"
+            | "for_in_clause"
+            | "if_clause"
     ));
     if matches!(kind, "member_expression" | "subscript_expression")
-        && text(node, source).contains("?.")
+        && children(node)
+            .iter()
+            .any(|child| child.kind() == "optional_chain")
     {
         count += 1;
+    }
+    if kind == "case_clause" && text(node, source).trim_start().starts_with("case _:") {
+        count = count.saturating_sub(1);
     }
     if matches!(kind, "binary_expression" | "boolean_operator") {
         if let Some(operator) = node.child_by_field_name("operator") {
