@@ -166,6 +166,25 @@ pub(crate) fn timeout_seconds_for_load(
     Some(scaled_seconds.min(u128::from(u64::MAX)) as u64)
 }
 
+/// Environment variable through which every gate command learns how many
+/// logical CPUs were idle as it started. Gates choose their own worker counts
+/// from it; the broker only reports the measurement. It is removed, not left
+/// inherited, when the load cannot be read, so a command never sizes itself
+/// on a number the broker did not measure.
+pub(crate) const IDLE_CPUS_ENV: &str = "AETHYME_GATE_IDLE_CPUS";
+
+/// Logical CPUs not covered by the one-minute load at gate start: the CPU
+/// count minus the load, rounded down and never negative. `None` when either
+/// reading is missing or invalid, so callers can tell "no capacity" from
+/// "not measured".
+pub(crate) fn idle_cpus(load_1m: Option<f64>, cpu_count: Option<i64>) -> Option<u64> {
+    let (load_1m, cpu_count) = (load_1m?, cpu_count?);
+    if !load_1m.is_finite() || load_1m < 0.0 || cpu_count <= 0 {
+        return None;
+    }
+    Some((cpu_count as f64 - load_1m).max(0.0).floor() as u64)
+}
+
 /// Resolve load admission for one configured gate using an injected host.
 /// Production supplies the system host; tests use deterministic samples.
 pub(crate) fn admit_gate_with(
@@ -541,5 +560,23 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad} should be rejected");
         }
+    }
+
+    #[test]
+    fn idle_cpus_is_the_unloaded_capacity_rounded_down_and_never_negative() {
+        assert_eq!(idle_cpus(Some(3.4), Some(10)), Some(6));
+        assert_eq!(idle_cpus(Some(0.0), Some(10)), Some(10));
+        assert_eq!(idle_cpus(Some(9.99), Some(10)), Some(0));
+        // An oversubscribed host has no idle capacity, not negative capacity.
+        assert_eq!(idle_cpus(Some(57.0), Some(10)), Some(0));
+    }
+
+    #[test]
+    fn idle_cpus_is_unmeasured_without_a_valid_load_and_cpu_count() {
+        assert_eq!(idle_cpus(None, Some(10)), None);
+        assert_eq!(idle_cpus(Some(1.0), None), None);
+        assert_eq!(idle_cpus(Some(1.0), Some(0)), None);
+        assert_eq!(idle_cpus(Some(f64::NAN), Some(10)), None);
+        assert_eq!(idle_cpus(Some(-1.0), Some(10)), None);
     }
 }

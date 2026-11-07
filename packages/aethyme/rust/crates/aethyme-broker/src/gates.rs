@@ -4927,6 +4927,15 @@ fn run_gate_command_inner(
     if let Some(cache) = context.managed_cache {
         process.env("AETHYME_GATE_CACHE_DIR", &cache.directory);
     }
+    // From the same reading the log header records, so a log always shows
+    // the capacity the command sized itself on.
+    match crate::gate_admission::idle_cpus(
+        context.environment.load_avg_1m_start,
+        context.environment.cpu_count,
+    ) {
+        Some(idle) => process.env(crate::gate_admission::IDLE_CPUS_ENV, idle.to_string()),
+        None => process.env_remove(crate::gate_admission::IDLE_CPUS_ENV),
+    };
     // A gate resolves `git` and `cargo` through PATH, not through the binary
     // this crate proved for itself, so a wrapper the broker routed around
     // still reaches the gate. Left alone when the probe proved nothing to
@@ -6515,6 +6524,47 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!checkout_root.join("closed-child-started").exists());
+    }
+
+    /// The command sees the idle capacity derived from the reading its log
+    /// header records, and no value at all when the load was not measured --
+    /// not one inherited from whatever started the broker.
+    #[test]
+    fn gate_command_receives_the_measured_idle_cpus_or_none() {
+        let seen_by = |environment: &GateEnvironment| {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().canonicalize().unwrap().join("repo");
+            init_repo(&root);
+            let run_dir = temp.path().join("run");
+            std::fs::create_dir(&run_dir).unwrap();
+            let log = temp.path().join("log");
+            let database = std::cell::OnceCell::new();
+            let labels = crate::gate_debris::GateRunLabels::new("idle", None, "synthetic");
+            let lines = Lines::default();
+            let outcome = run_gate_command(
+                "printf %s \"${AETHYME_GATE_IDLE_CPUS-unset}\" > seen",
+                command_context(
+                    &root,
+                    &run_dir,
+                    &log,
+                    environment,
+                    &lines,
+                    &database,
+                    &labels,
+                ),
+                &mut GateArtifactUseGuard::without_marker(),
+            )
+            .unwrap();
+            assert_eq!(outcome.exit_code, Some(0));
+            std::fs::read_to_string(root.join("seen")).unwrap()
+        };
+        let measured = GateEnvironment {
+            load_avg_1m_start: Some(3.4),
+            cpu_count: Some(10),
+            ..GateEnvironment::default()
+        };
+        assert_eq!(seen_by(&measured), "6");
+        assert_eq!(seen_by(&GateEnvironment::default()), "unset");
     }
 
     #[test]

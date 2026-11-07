@@ -14,6 +14,9 @@
 #         # CI build job: compile the full workspace suite once into an archive
 #     packages/aethyme/scripts/test-like-ci.sh --from-archive FILE --partition hash:1/6
 #         # CI shard job: run one partition of that archive, with the CI profile
+#     packages/aethyme/scripts/test-like-ci.sh --base aethyme/integration --print-selection
+#         # print what --changed would test and exit: a nextest filterset,
+#         # `workspace`, or `none`; the broker's cargo-test gate runs on it
 #
 # --changed (the default) selects affected crates and their reverse
 # dependencies. Repository-wide inputs that affect every suite fall back to
@@ -44,6 +47,7 @@ library=0
 archive_out=""
 archive_in=""
 partition=""
+print_selection=0
 extra=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -79,6 +83,9 @@ while [ $# -gt 0 ]; do
         --partition)
             partition="${2:?--partition needs a spec such as hash:1/6}"
             shift 2 ;;
+        --print-selection)
+            print_selection=1
+            shift ;;
         -h|--help)
             awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
             exit 0 ;;
@@ -91,6 +98,13 @@ while [ $# -gt 0 ]; do
             exit 2 ;;
     esac
 done
+
+if [ "$print_selection" -eq 1 ]; then
+    if [ "$coverage" != changed ] || [ -n "$archive_out" ] || [ -n "$archive_in" ] || [ -n "$partition" ] || [ -n "$package" ] || [ "$library" -eq 1 ] || [ "${#extra[@]}" -gt 0 ]; then
+        echo "error: --print-selection only reports changed-path selection; pass at most --base" >&2
+        exit 2
+    fi
+fi
 
 if [ -n "$archive_out" ] || [ -n "$archive_in" ]; then
     if [ -n "$archive_out" ] && [ -n "$archive_in" ]; then
@@ -154,7 +168,7 @@ export TMPDIR="$canonical_tmpdir"
 
 root="$(git rev-parse --show-toplevel)"
 rust="$root/packages/aethyme/rust"
-command -v cargo-nextest >/dev/null 2>&1 || {
+[ "$print_selection" -eq 1 ] || command -v cargo-nextest >/dev/null 2>&1 || {
     echo "error: cargo-nextest is not installed; run: cargo install --locked cargo-nextest" >&2
     exit 2
 }
@@ -197,6 +211,10 @@ if [ "$coverage" = changed ]; then
         } | sort -u
     )"
     if [ -z "$changed" ]; then
+        if [ "$print_selection" -eq 1 ]; then
+            echo none
+            exit 0
+        fi
         echo "No changes since $base; nothing to test. Use --full to run the workspace."
         exit 0
     fi
@@ -214,8 +232,15 @@ if [ "$coverage" = changed ]; then
                 ;;
             *)
                 # Docs, scripts and repository files are read by the testkit
-                # and CLI suites (docs hygiene, spelling, deployed files).
-                term="package(aethyme-testkit) | package(aethyme-cli)"
+                # and CLI suites (docs hygiene, spelling, deployed files), and
+                # by the broker suites that assert over the live repository:
+                # gate_policy (gates.toml, install.sh, scripts/pilot-*.jq),
+                # and in the `it` binary certify_scaffold, config_formats and
+                # review_routing (.aethyme/) and plugin_floor (plugins/).
+                # COUPLING: a new broker test reading a file outside its crate
+                # belongs in this list. Missing it narrows only this local run:
+                # the pull-request CI job always runs the full workspace.
+                term="package(aethyme-testkit) | package(aethyme-cli) | binary_id(aethyme-broker::gate_policy) | (binary_id(aethyme-broker::it) & test(/^(certify_scaffold|config_formats|plugin_floor|review_routing)::/))"
                 ;;
         esac
         case " | $expr | " in
@@ -223,6 +248,10 @@ if [ "$coverage" = changed ]; then
             *) expr="${expr:+$expr | }$term" ;;
         esac
     done <<<"$changed"
+    if [ "$print_selection" -eq 1 ]; then
+        if [ "$coverage" = changed ]; then echo "$expr"; else echo workspace; fi
+        exit 0
+    fi
     if [ "$coverage" = changed ]; then
         filter=(-E "$expr")
         echo "Testing what changed since $base: $expr"

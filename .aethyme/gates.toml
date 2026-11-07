@@ -93,8 +93,11 @@ triggers = ["packages/aethyme-eval/**"]
 # also runs under `cargo-test`, so nothing is lost if this gate is removed.
 # Local Rust gates bound compilation and test execution separately. Keep
 # these defaults explicit so an inherited environment cannot fan out workers.
+# Every Rust gate opens with the same sizing step (see `cargo-test`, 2026-11-07):
+# the broker's AETHYME_GATE_IDLE_CPUS becomes 2-8 test workers and 1-4 build
+# jobs, and its absence keeps one job and two workers.
 name = "fast-guards"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-1}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" CARGO_PROFILE_DEV_DEBUG=1 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --workspace --examples --quiet --manifest-path packages/aethyme/rust/Cargo.toml --test help_snapshots --test help_surface --test help_everywhere --test broker_discarded_results --test deprecated_spelling_callers --test docs_hygiene --test no_eval_tuning --test pr_template --test grammar_provenance --test gate_policy'
+command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;; ?????*) gi=16 ;; esac; gt=$gi; [ "$gt" -ge 2 ] || gt=2; [ "$gt" -le 8 ] || gt=8; gj=$((gi / 2)); [ "$gj" -ge 1 ] || gj=1; [ "$gj" -le 4 ] || gj=4; export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-$gj}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" CARGO_PROFILE_DEV_DEBUG=1 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --workspace --examples --quiet --manifest-path packages/aethyme/rust/Cargo.toml --test help_snapshots --test help_surface --test help_everywhere --test broker_discarded_results --test deprecated_spelling_callers --test docs_hygiene --test no_eval_tuning --test pr_template --test grammar_provenance --test gate_policy'
 cost = 2
 timeout_seconds = 2400
 resource_wait_seconds = 900
@@ -150,7 +153,31 @@ name = "cargo-test"
 # cannot change them. The bounds protect a shared workstation, but they left
 # GitHub's 4-core runner at a load of about 1 while this gate used 2292-2400 s
 # of its 2400 s limit, and timed out on main three times that day.
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-1}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" CARGO_PROFILE_DEV_DEBUG=1 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && m=packages/aethyme/rust/Cargo.toml; if cargo nextest --version >/dev/null 2>&1; then cargo build --locked --workspace --bins --quiet --manifest-path "$m" && AETHYME_TESTKIT_PREBUILT_BINS=1 cargo nextest run --locked --workspace --profile local --build-jobs "$CARGO_BUILD_JOBS" --no-fail-fast --cargo-quiet --manifest-path "$m"; suite=$?; cargo test --locked --workspace --doc --quiet --no-fail-fast --manifest-path "$m"; doc=$?; else cargo test --locked --workspace --quiet --no-fail-fast --manifest-path "$m"; suite=$?; doc=0; fi; cargo test --locked --workspace --examples --quiet --no-fail-fast --manifest-path "$m"; examples=$?; [ "$suite" -eq 0 ] && [ "$doc" -eq 0 ] && [ "$examples" -eq 0 ]'
+# 2026-11-07: the fixed bounds could no longer finish locally either. The suite
+# holds 73 minutes of test time (7,126 tests in CI's JUnit, 2026-11-07), so two
+# workers need at least 2,200 s before the build, doctests and examples. This
+# gate's last local pass was 2026-10-08 (395 s, before the bounds, at 3,874
+# tests); every run from then to 2026-11-07 failed or was cut off, and the
+# timeouts since 2026-10-29 started at 0.4-2.4 load per CPU. One killed run had
+# judged 4,099 of 6,999 tests. Two changes:
+# - Sizing. The broker exports AETHYME_GATE_IDLE_CPUS (logical CPUs minus the
+#   one-minute load at start; absent when unmeasured). Test workers are that
+#   count clamped to 2-8, build jobs half of it clamped to 1-4. Most of the
+#   suite waits on git and SQLite rather than the CPU, so workers track idle
+#   CPUs, not a fraction of them. A busy host still gets one job and two
+#   workers, and AETHYME_GATE_BUILD_JOBS / AETHYME_GATE_TEST_THREADS still
+#   override both.
+# - Selection. nextest runs what `test-like-ci.sh --print-selection` reports
+#   against aethyme/integration: the changed crates and their reverse
+#   dependencies, plus the suites that read changed repository files. A
+#   repository-wide input, no merge base or no change runs the whole workspace.
+#   Doctests and examples always run the whole workspace. This gate is a local
+#   pre-check: every pull request's CI job and Aethyme Gates on main run the
+#   full suite, so a narrowing here delays a failure, it does not ship one.
+#   The verdict is cached by tree like every gate. The tree judged is the merge
+#   candidate, which changes whenever its base does, so a cached verdict is
+#   reused only for the same merged content.
+command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;; ?????*) gi=16 ;; esac; gt=$gi; [ "$gt" -ge 2 ] || gt=2; [ "$gt" -le 8 ] || gt=8; gj=$((gi / 2)); [ "$gj" -ge 1 ] || gj=1; [ "$gj" -le 4 ] || gj=4; export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-$gj}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" CARGO_PROFILE_DEV_DEBUG=1 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && m=packages/aethyme/rust/Cargo.toml; if cargo nextest --version >/dev/null 2>&1; then sel="$(packages/aethyme/scripts/test-like-ci.sh --base aethyme/integration --print-selection)" || sel=; case "$sel" in none|workspace) sel= ;; esac; cargo build --locked --workspace --bins --quiet --manifest-path "$m" && if [ -z "$sel" ]; then AETHYME_TESTKIT_PREBUILT_BINS=1 cargo nextest run --locked --workspace --profile local --build-jobs "$CARGO_BUILD_JOBS" --no-fail-fast --cargo-quiet --manifest-path "$m"; else echo "cargo-test: testing what changed since aethyme/integration: $sel"; AETHYME_TESTKIT_PREBUILT_BINS=1 cargo nextest run --locked --workspace --profile local --build-jobs "$CARGO_BUILD_JOBS" --no-fail-fast --no-tests warn --cargo-quiet --manifest-path "$m" -E "$sel"; fi; suite=$?; cargo test --locked --workspace --doc --quiet --no-fail-fast --manifest-path "$m"; doc=$?; else cargo test --locked --workspace --quiet --no-fail-fast --manifest-path "$m"; suite=$?; doc=0; fi; cargo test --locked --workspace --examples --quiet --no-fail-fast --manifest-path "$m"; examples=$?; [ "$suite" -eq 0 ] && [ "$doc" -eq 0 ] && [ "$examples" -eq 0 ]'
 cost = 3
 # 2026-09-26: raised from 1200. A full workspace run took 1056 s on a passing
 # gate that day and hit 1200 four times (sessions 677, 684, 621) while other
@@ -197,7 +224,7 @@ max_bytes = 12884901888
 # Shell/jq-only changes must exercise the trust/privacy contracts they change,
 # without selecting the full workspace suite. This does not remove any gate.
 name = "script-contract"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-1}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-testkit --test release_contract installer_ && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-testkit --test pilot_report'
+command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;; ?????*) gi=16 ;; esac; gt=$gi; [ "$gt" -ge 2 ] || gt=2; [ "$gt" -le 8 ] || gt=8; gj=$((gi / 2)); [ "$gj" -ge 1 ] || gj=1; [ "$gj" -le 4 ] || gj=4; export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-$gj}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-testkit --test release_contract installer_ && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-testkit --test pilot_report'
 cost = 1
 timeout_seconds = 300
 resource_wait_seconds = 900
@@ -227,7 +254,7 @@ max_bytes = 12884901888
 # or it is unguarded on the workflow-only path. These suites also run under
 # `cargo-test`, so nothing here is lost when Rust changes.
 name = "workflow-contract"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-1}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-testkit --test release_contract --test ci_validation && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --test repository_deploy_cli'
+command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;; ?????*) gi=16 ;; esac; gt=$gi; [ "$gt" -ge 2 ] || gt=2; [ "$gt" -le 8 ] || gt=8; gj=$((gi / 2)); [ "$gj" -ge 1 ] || gj=1; [ "$gj" -le 4 ] || gj=4; export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-$gj}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-testkit --test release_contract --test ci_validation && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --test repository_deploy_cli'
 cost = 1
 timeout_seconds = 600
 resource_wait_seconds = 900
@@ -258,7 +285,7 @@ max_bytes = 12884901888
 # COUPLING: the suite also runs under `cargo-test`, so nothing here is lost
 # when Rust changes; this gate only adds the config-only path.
 name = "gate-policy"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-1}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-broker --test gate_policy'
+command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;; ?????*) gi=16 ;; esac; gt=$gi; [ "$gt" -ge 2 ] || gt=2; [ "$gt" -le 8 ] || gt=8; gj=$((gi / 2)); [ "$gj" -ge 1 ] || gj=1; [ "$gj" -le 4 ] || gj=4; export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-$gj}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-broker --test gate_policy'
 cost = 1
 timeout_seconds = 600
 resource_wait_seconds = 900
@@ -301,7 +328,7 @@ max_bytes = 12884901888
 # session the decision still belongs in a commit message, which needs no
 # network.
 name = "cross-process-contract"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-1}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-2}" CARGO_PROFILE_DEV_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && BASE="$(git merge-base HEAD aethyme/integration 2>/dev/null || git rev-parse HEAD~1)" && cargo run --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --bin aethyme -- broker check-contract --base "$BASE" --commit-messages --merged-pr'
+command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;; ?????*) gi=16 ;; esac; gt=$gi; [ "$gt" -ge 2 ] || gt=2; [ "$gt" -le 8 ] || gt=8; gj=$((gi / 2)); [ "$gj" -ge 1 ] || gj=1; [ "$gj" -le 4 ] || gj=4; export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-$gj}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" CARGO_PROFILE_DEV_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && BASE="$(git merge-base HEAD aethyme/integration 2>/dev/null || git rev-parse HEAD~1)" && cargo run --locked --quiet --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli --bin aethyme -- broker check-contract --base "$BASE" --commit-messages --merged-pr'
 cost = 1
 cache = false
 timeout_seconds = 300
