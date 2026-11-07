@@ -13,6 +13,8 @@ struct Config {
     policy: Policy,
     /// Exact dependency names known to refer to packages outside the repository.
     external_imports: Vec<String>,
+    /// Import-prefix to repository-relative directory mappings.
+    aliases: BTreeMap<String, String>,
     /// Additional paths or directory prefixes excluded from behavior findings.
     exclude: Vec<String>,
 }
@@ -186,6 +188,21 @@ fn execute(args: &[String]) -> Result<(Report, bool), String> {
         config.policy.level = level;
     }
     config.policy.validate()?;
+    for (prefix, target) in &config.aliases {
+        if !prefix.ends_with('/')
+            || prefix.starts_with('.')
+            || Path::new(target).components().any(|c| {
+                !matches!(
+                    c,
+                    std::path::Component::Normal(_) | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err(format!(
+                "invalid alias {prefix:?}: prefixes must end in / and targets must stay within the repository"
+            ));
+        }
+    }
     if config.policy.level == Level::Off {
         return Ok((
             Report {
@@ -213,7 +230,7 @@ fn execute(args: &[String]) -> Result<(Report, bool), String> {
     if sources.is_empty() && config.policy.level != Level::Off {
         return Err("no eligible JavaScript, TypeScript or Python files found".into());
     }
-    let graph = code_shape_graph::build(&sources, &config.external_imports)?;
+    let graph = code_shape_graph::build(&sources, &config.external_imports, &config.aliases)?;
     let complete = graph.incomplete.is_empty();
     let mut findings = Vec::new();
     let mut count = 0;

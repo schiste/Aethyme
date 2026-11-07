@@ -68,6 +68,7 @@ fn add_js(
     source: &str,
     file: &Path,
     known: &BTreeSet<PathBuf>,
+    aliases: &BTreeMap<String, String>,
     edges: &mut BTreeSet<PathBuf>,
     incomplete: &mut Vec<String>,
 ) {
@@ -120,6 +121,21 @@ fn add_js(
                         file.display()
                     )),
                 }
+            } else if let Some((prefix, target)) = aliases
+                .iter()
+                .filter(|(prefix, _)| spec.starts_with(prefix.as_str()))
+                .max_by_key(|(prefix, _)| prefix.len())
+            {
+                match resolve(&Path::new(target).join(&spec[prefix.len()..]), known) {
+                    Some(target) if target != file => {
+                        edges.insert(target);
+                    }
+                    Some(_) => (),
+                    None => incomplete.push(format!(
+                        "{}: unresolved mapped alias {spec}",
+                        file.display()
+                    )),
+                }
             } else if !spec.starts_with("node:") {
                 // Bare names can be workspace packages or tsconfig aliases; assuming
                 // all of them external would create false passes.
@@ -131,7 +147,7 @@ fn add_js(
         }
     }
     for child in children(node) {
-        add_js(child, source, file, known, edges, incomplete);
+        add_js(child, source, file, known, aliases, edges, incomplete);
     }
 }
 fn add_python(
@@ -252,7 +268,11 @@ fn add_python(
     }
 }
 
-pub fn build(sources: &BTreeMap<PathBuf, String>, external: &[String]) -> Result<Graph, String> {
+pub fn build(
+    sources: &BTreeMap<PathBuf, String>,
+    external: &[String],
+    aliases: &BTreeMap<String, String>,
+) -> Result<Graph, String> {
     let known: BTreeSet<_> = sources.keys().cloned().collect();
     let mut graph = Graph::default();
     for (file, source) in sources {
@@ -289,6 +309,7 @@ pub fn build(sources: &BTreeMap<PathBuf, String>, external: &[String]) -> Result
                 source,
                 file,
                 &known,
+                aliases,
                 &mut edges,
                 &mut graph.incomplete,
             );
@@ -391,7 +412,7 @@ mod tests {
             ),
             (PathBuf::from("c.ts"), "export type C = string;".to_string()),
         ]);
-        let graph = build(&sources, &[]).unwrap();
+        let graph = build(&sources, &[], &BTreeMap::new()).unwrap();
         assert!(graph.incomplete.is_empty(), "{:?}", graph.incomplete);
         assert_eq!(graph.fan_in(Path::new("b.ts")), 1);
         assert!(graph.in_cycle(Path::new("a.ts")));
@@ -405,6 +426,7 @@ mod tests {
                 "import x from '@app/missing';".to_string(),
             )]),
             &[],
+            &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(graph.incomplete.len(), 1);
@@ -421,12 +443,27 @@ mod tests {
             (PathBuf::from("d.ts"), "export const d = 1;".to_string()),
             (PathBuf::from("e.ts"), "import './a';".to_string()),
         ]);
-        let graph = build(&sources, &[]).unwrap();
+        let graph = build(&sources, &[], &BTreeMap::new()).unwrap();
         assert!(graph.in_cycle(Path::new("a.ts")));
         assert!(graph.in_cycle(Path::new("b.ts")));
         for file in ["c.ts", "d.ts", "e.ts"] {
             assert!(!graph.in_cycle(Path::new(file)), "{file}");
         }
         assert_eq!(graph.fan_in(Path::new("a.ts")), 2);
+    }
+    #[test]
+    fn configured_aliases_resolve_to_local_edges_and_do_not_mask_missing_targets() {
+        let aliases = BTreeMap::from([("@/".into(), "src/".into())]);
+        let sources = BTreeMap::from([
+            (
+                PathBuf::from("src/a.ts"),
+                "import '@/b'; import '@/missing';".to_string(),
+            ),
+            (PathBuf::from("src/b.ts"), "export const b = 1;".to_string()),
+        ]);
+        let graph = build(&sources, &["@/missing".into()], &aliases).unwrap();
+        assert_eq!(graph.fan_in(Path::new("src/b.ts")), 1);
+        assert_eq!(graph.incomplete.len(), 1);
+        assert!(graph.incomplete[0].contains("unresolved mapped alias"));
     }
 }

@@ -17,6 +17,7 @@ explicit `--config PATH` selects another file. The values below are the defaults
 ```toml
 # Exact names of imports known to refer to packages outside this repository.
 external_imports = []
+# Import aliases are configured in an optional [aliases] table below.
 # Additional behavior-module paths or directory prefixes to omit from findings.
 exclude = []
 
@@ -57,6 +58,15 @@ List an exact name in `external_imports` only after verifying it is external;
 for example `external_imports = ["react", "django.db"]`. Dynamic imports and
 unresolved relative imports cannot be waived this way. An incomplete report
 omits graph-derived findings and error mode exits 2, so it cannot silently pass.
-The current resolver does not implement TypeScript path aliases or Python
-package-discovery configuration; repositories using those features may need
-additional resolver support before enforcement is usable.
+Map local aliases explicitly, for example:
+
+```toml
+[aliases]
+"@/" = "src/"
+```
+
+Alias prefixes end in `/`; their targets are repository-relative directories.
+A mapped but unresolved alias remains incomplete even if listed as external.
+The resolver does not read TypeScript path configuration or Python package
+discovery configuration automatically; repositories using more complex
+resolution may need additional resolver support before enforcement is usable.
