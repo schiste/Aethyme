@@ -94,6 +94,25 @@ fn legacy_uuid_recovery_needed(
             && (saved.device != current.device || saved.filesystem != current.filesystem))
 }
 
+/// The exact reviewed-recovery command for a retained root whose only
+/// fault is a legacy identity saved without a volume UUID. Recovery is bound
+/// to the owning repository, so the command names where to run it.
+fn identity_recovery_command(host_database: &Path, record: &RootRecord) -> Option<String> {
+    let saved = record.identity.as_ref()?;
+    let current = directory_identity(&record.root, &real_directory(&record.root).ok()?).ok()??;
+    (legacy_uuid_recovery_needed(Some(saved), Some(&current)) && saved.inode == current.inode).then(
+        || {
+            let quote = |path: &Path| crate::broker::shell_quote(&path.to_string_lossy());
+            format!(
+                "cd {} && aethyme broker gc storage identity plan {} {}",
+                quote(&record.repository_root),
+                quote(host_database),
+                quote(&record.root),
+            )
+        },
+    )
+}
+
 fn changed_identity_reason(
     object: &str,
     saved: Option<&DirectoryIdentity>,
@@ -1574,9 +1593,11 @@ fn observe_recovery_record(
         || record.repository_root != repository_root
         || record.repository_key != repository_key
     {
-        return Err(invalid(
-            "current repository binding differs from the retained root owner",
-        ));
+        return Err(invalid(format!(
+            "current repository binding differs from the retained root owner; run this from {} ({})",
+            record.repository_root.display(),
+            record.repository_key,
+        )));
     }
 
     let (marker, marker_payload) = read_marker_with_payload(root)?;
@@ -2381,8 +2402,11 @@ pub(crate) fn inventory(host_database: &Path, deadline: Option<Instant>) -> Inve
                     Ok(false) => {}
                     Err(error) => {
                         result.complete = false;
+                        let next = identity_recovery_command(host_database, &record)
+                            .map(|command| format!("; next: {command}"))
+                            .unwrap_or_default();
                         result.issues.push(format!(
-                            "registered root {} uninspected: {error}",
+                            "registered root {} uninspected: {error}{next}",
                             record.root.display()
                         ));
                     }
@@ -4016,6 +4040,49 @@ mod tests {
             retained_registration(&open_registry(&fixture.database, false).unwrap(), &root)
                 .unwrap(),
             Some(previous)
+        );
+
+        // Inventory names the exact reviewed-recovery command, run from the
+        // owning repository, so the operator never has to reconstruct it.
+        let quote = |path: &Path| crate::broker::shell_quote(&path.to_string_lossy());
+        let expected = format!(
+            "next: cd {} && aethyme broker gc storage identity plan {} {}",
+            quote(&owner.repository_root),
+            quote(&fixture.database),
+            quote(&root),
+        );
+        let report = inventory(&fixture.database, None);
+        assert!(!report.complete);
+        assert!(
+            report.issues.iter().any(|issue| issue.ends_with(&expected)),
+            "{:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn recovery_from_another_repository_names_the_owning_repository() {
+        let fixture = Fixture::new();
+        let (root, owner) = fixture.root("root");
+        fixture.register(&root, &owner);
+        retain_legacy_registration(&fixture, &root);
+
+        let other = fixture.origin.with_file_name("other-repository");
+        let error = plan_root_identity_recovery_with(
+            &fixture.database,
+            &root,
+            &other,
+            "other-0000000000000000",
+            &current_recovery_identity,
+        )
+        .expect_err("another repository cannot review this root");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "current repository binding differs from the retained root owner; run this from {} ({})",
+                owner.repository_root.display(),
+                owner.repository_key,
+            )
         );
     }
 

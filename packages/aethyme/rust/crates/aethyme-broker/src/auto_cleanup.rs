@@ -842,6 +842,28 @@ impl ClosedArtifactCheckoutCohort {
         })
     }
 
+    /// Whether a spawn witness in this verified cohort saw `device` on this
+    /// exact checkout root object. A legacy marker saved the checkout's
+    /// mount-scoped device number; macOS renumbers it on remount, so the
+    /// witness, not the live mount, is the evidence that it named this checkout.
+    pub(crate) fn witnesses_checkout_root_device(
+        &self,
+        checkout_root: &Path,
+        device: u64,
+        inode: u64,
+    ) -> bool {
+        self.sessions.iter().any(|session| {
+            session
+                .spawned_instance_witness
+                .as_ref()
+                .is_some_and(|witness| {
+                    witness.worktree_device == device
+                        && witness.worktree_inode == inode
+                        && Path::new(&witness.worktree_path) == checkout_root
+                })
+        })
+    }
+
     pub(crate) fn matches_checkout_instance(&self, checkout: &GitRepo) -> bool {
         self.worktree.as_path() == checkout.root()
             && self
@@ -3960,7 +3982,15 @@ mod tests {
     impl ArtifactUseReconcileFixture {
         /// Rewrite the session's witness as one saved without volume UUIDs
         /// before a mount renumbering, and its marker as a legacy marker.
-        fn age_witness_and_marker(&mut self, marker_path: &Path, marker_device: u64) -> u64 {
+        /// A remount renumbers every object on the volume, so both the
+        /// repository's `.git` and the checkout root get new device numbers.
+        /// A zero marker device means "the number the witness saw".
+        fn age_witness_and_marker(
+            &mut self,
+            marker_path: &Path,
+            primary_marker_device: u64,
+            checkout_marker_device: u64,
+        ) -> u64 {
             let mut saved = self
                 .broker
                 .store()
@@ -3971,7 +4001,10 @@ mod tests {
             saved.volume_uuids = None;
             saved.git_admin_device += 1;
             saved.git_common_device += 1;
+            saved.worktree_device += 1;
+            saved.git_pointer_device += 1;
             let witnessed_device = saved.git_common_device;
+            let witnessed_checkout_device = saved.worktree_device;
             let connection = rusqlite::Connection::open(self.broker.store().db_path()).unwrap();
             connection
                 .execute(
@@ -3986,10 +4019,15 @@ mod tests {
             marker.schema_version = 1;
             marker.primary_volume_uuid = None;
             marker.checkout_volume_uuid = None;
-            marker.primary_device = if marker_device == 0 {
+            marker.primary_device = if primary_marker_device == 0 {
                 witnessed_device
             } else {
-                marker_device
+                primary_marker_device
+            };
+            marker.checkout_device = if checkout_marker_device == 0 {
+                witnessed_checkout_device
+            } else {
+                checkout_marker_device
             };
             std::fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
             witnessed_device
@@ -4004,7 +4042,7 @@ mod tests {
         let mut child = fixture.start_running_marker(invocation_id);
         child.wait().unwrap();
         let marker_path = fixture.marker_path(invocation_id);
-        fixture.age_witness_and_marker(&marker_path, 0);
+        fixture.age_witness_and_marker(&marker_path, 0, 0);
 
         let (cohort, registry) = fixture.close_and_bind();
         let plan = fixture.plan(&cohort, &registry);
@@ -4050,7 +4088,7 @@ mod tests {
         let mut child = fixture.start_running_marker(invocation_id);
         child.wait().unwrap();
         let marker_path = fixture.marker_path(invocation_id);
-        fixture.age_witness_and_marker(&marker_path, u64::MAX);
+        fixture.age_witness_and_marker(&marker_path, u64::MAX, 0);
 
         let (cohort, registry) = fixture.close_and_bind();
         let plan = fixture.plan(&cohort, &registry);
@@ -4064,12 +4102,36 @@ mod tests {
 
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     #[test]
+    fn marker_review_retains_a_checkout_device_number_nothing_witnessed() {
+        let mut fixture = ArtifactUseReconcileFixture::new();
+        let invocation_id = "reconcile-unwitnessed-checkout-device-fixture";
+        let mut child = fixture.start_running_marker(invocation_id);
+        child.wait().unwrap();
+        let marker_path = fixture.marker_path(invocation_id);
+        fixture.age_witness_and_marker(&marker_path, 0, u64::MAX);
+
+        let (cohort, registry) = fixture.close_and_bind();
+        let plan = fixture.plan(&cohort, &registry);
+        assert!(
+            matches!(
+                &plan.markers[0].disposition,
+                crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::Retain { reason }
+                    if reason == "artifact-use marker checkout root device does not match"
+            ),
+            "{:?}",
+            plan.markers[0].disposition
+        );
+        assert!(marker_path.exists());
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
     fn marker_review_still_refuses_a_live_process_after_a_renumbered_mount() {
         let mut fixture = ArtifactUseReconcileFixture::new();
         let invocation_id = "reconcile-renumbered-live-fixture";
         let mut child = fixture.start_running_marker(invocation_id);
         let marker_path = fixture.marker_path(invocation_id);
-        fixture.age_witness_and_marker(&marker_path, 0);
+        fixture.age_witness_and_marker(&marker_path, 0, 0);
 
         let (cohort, registry) = fixture.close_and_bind();
         let plan = fixture.plan(&cohort, &registry);
