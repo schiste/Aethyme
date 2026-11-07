@@ -2834,6 +2834,15 @@ impl Broker {
             .flatten();
         let broker_owned =
             unreachable.is_none() && self.is_broker_owned_worktree(session, &worktree_path);
+        // A partially removed checkout may have lost its Git pointer. Its
+        // durable finish intent can prove ownership without Git, but only
+        // after validating the marked root and every recorded identity.
+        let orphan_proof = if unreachable.is_none() && worktree_present {
+            self.interrupted_finish_orphan_cleanup_proof(session)
+        } else {
+            None
+        };
+        let broker_owned = broker_owned || orphan_proof.is_some();
         let adopted_archive_path = if !broker_owned
             && allow_adopted_path
             && session.origin == SessionOrigin::Adopted
@@ -2886,7 +2895,7 @@ impl Broker {
                 None,
             )
         } else if worktree_present {
-            if let Some(proof) = self.interrupted_finish_orphan_cleanup_proof(session) {
+            if let Some(proof) = orphan_proof {
                 self.branch_provenance_disposition(
                     session,
                     &proof.head,
@@ -4123,7 +4132,7 @@ impl Broker {
         let canonical_path = worktree_path.canonicalize().ok()?;
         if canonical_path.to_str()? != proof.worktree_path
             || !self
-                .is_broker_owned_worktree_checked(&current, worktree_path)
+                .is_broker_owned_worktree_root_checked(&current, worktree_path)
                 .ok()?
         {
             return None;

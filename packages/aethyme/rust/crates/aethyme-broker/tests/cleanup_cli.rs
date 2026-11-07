@@ -308,6 +308,23 @@ fn bulk_cleanup_confirmation_binds_the_exact_reviewed_branch_tip() {
 /// did, so cleanup must still judge it -- and finish the removal.
 #[test]
 fn an_interrupted_worktree_removal_is_judged_and_completed_rather_than_refused() {
+    const CHILD: &str = "AETHYME_TEST_EXTERNAL_ORPHAN_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let root = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "cleanup_cli::an_interrupted_worktree_removal_is_judged_and_completed_rather_than_refused", "--nocapture"])
+            .env(CHILD, "1")
+            .env("AETHYME_WORKTREE_ROOT", root.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     aethyme_testkit::promote_on_submit(tmp.path());
@@ -319,6 +336,10 @@ fn an_interrupted_worktree_removal_is_judged_and_completed_rather_than_refused()
     let mut broker = Broker::open(tmp.path()).unwrap();
     let session = broker.start_worktree("interrupted removal", None).unwrap();
     let worktree = std::path::PathBuf::from(&session.worktree_path);
+    assert!(
+        !worktree.starts_with(tmp.path()),
+        "fixture requires an external worktree"
+    );
     std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
     git(&worktree, &["add", "done.txt"]);
     git(&worktree, &["commit", "-qm", "done"]);

@@ -1228,11 +1228,10 @@ impl Broker {
             .unwrap_or(false)
     }
 
-    /// Check worktree ownership without collapsing Git or filesystem
-    /// uncertainty into the same `false` result as a known non-owned path.
-    /// Callers doing bounded maintenance must hold `limit_git_until` around
-    /// this method so all nested Git invocations share their pass deadline.
-    pub(crate) fn is_broker_owned_worktree_checked(
+    // The root marker identifies the repository, but does not by itself prove
+    // that an existing checkout is owned. Callers must also verify Git or an
+    // exact durable interrupted-cleanup proof before acting on the path.
+    pub(super) fn is_broker_owned_worktree_root_checked(
         &self,
         session: &Session,
         path: &Path,
@@ -1244,12 +1243,26 @@ impl Broker {
             return Ok(false);
         };
         let parent = canonical_path_or_missing(parent)?;
-        let legacy_root = self.legacy_broker_worktree_root();
-        let legacy = canonical_path_or_missing(&legacy_root)?;
-        let owned_root = parent == legacy || self.worktree_root_marker_matches_checked(&parent)?;
-        if !owned_root {
+        let legacy = canonical_path_or_missing(&self.legacy_broker_worktree_root())?;
+        Ok(parent == legacy || self.worktree_root_marker_matches_checked(&parent)?)
+    }
+
+    /// Check worktree ownership without collapsing Git or filesystem
+    /// uncertainty into the same `false` result as a known non-owned path.
+    /// Callers doing bounded maintenance must hold `limit_git_until` around
+    /// this method so all nested Git invocations share their pass deadline.
+    pub(crate) fn is_broker_owned_worktree_checked(
+        &self,
+        session: &Session,
+        path: &Path,
+    ) -> Result<bool, GitError> {
+        if !self.is_broker_owned_worktree_root_checked(session, path)? {
             return Ok(false);
         }
+        let Some(parent) = path.parent() else {
+            return Ok(false);
+        };
+        let parent = canonical_path_or_missing(parent)?;
         match std::fs::symlink_metadata(path) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
