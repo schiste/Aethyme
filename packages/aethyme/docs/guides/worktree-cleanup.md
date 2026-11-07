@@ -176,10 +176,16 @@ A process that died while using a checkout leaves a marker that holds back
 automatic cleanup of that checkout. `aethyme broker gc artifact-use reconcile plan
 <session>` reviews those markers, and `apply` removes one only when the session is
 closed and its process is proven gone. Records written before a Mac renumbered
-its mounts are accepted when the checkout still carries its spawn generation, or
-when a spawn record saw the old device number on this repository's `.git`. A
+its mounts are accepted when the checkout still carries its spawn generation, and
+when a spawn record saw each old device number: on this repository's `.git` for
+the primary, and on the same checkout root path and inode for the checkout. A
 refusal names what is missing and whether planning again can help. Leaving a
 marker retained is always safe.
+
+Planning also refuses while any registered worktree root cannot be inspected. A
+root registered before volume UUIDs were saved needs a reviewed identity
+recovery after its mount was renumbered; the refusal prints the exact `gc storage
+identity plan` command, including the owning repository it must run from.
 
 Strict mode also disables automatic artifact sweeps, including already queued
 background removals. Remove the leftovers manually, or inspect an explicit
