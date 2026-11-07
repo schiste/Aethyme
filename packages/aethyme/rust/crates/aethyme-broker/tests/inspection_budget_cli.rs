@@ -5,10 +5,11 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::{Broker, BrokerOpenOptions, BrokerStore, NewSession, SessionOrigin};
+use aethyme_broker::{BrokerStore, NewSession, SessionOrigin};
 use std::time::{Duration, Instant};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
+mod common;
 
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -40,8 +41,8 @@ fn run_timed(
     budget_ms: Option<u64>,
     worktree_root: Option<&Path>,
 ) -> (serde_json::Value, Duration) {
-    let mut command = Command::new(CLI);
-    command.args(args).current_dir(repo);
+    let mut command = common::broker_cli_for_fixture(CLI, args, repo);
+    command.current_dir(repo);
     match budget_ms {
         Some(ms) => command.env("AETHYME_STATUS_INSPECTION_BUDGET_MS", ms.to_string()),
         None => command.env_remove("AETHYME_STATUS_INSPECTION_BUDGET_MS"),
@@ -100,12 +101,9 @@ fn fixture() -> Fixture {
     git(&repo, &["fetch", "-q", "origin"]);
     git(&repo, &["remote", "set-head", "origin", "main"]);
 
-    // Name the placement root: an open without one reads the host's
-    // AETHYME_WORKTREE_ROOT, which the CLI runs below remove. The fixture's checkout
-    // then lands in the host's root, and scanning that root uses up the budget.
-    let worktrees = tmp.path().canonicalize().unwrap().join("worktrees");
-    let options = BrokerOpenOptions::default().with_worktree_root(worktrees);
-    let mut broker = Broker::open_with_options(&repo, options).unwrap();
+    // Both the broker and its CLI children must use fixture-owned host state;
+    // otherwise unrelated host recovery and worktree scans consume the budget.
+    let mut broker = common::open_fixture_broker(&repo, tmp.path()).unwrap();
     let session = broker.start_worktree("budget fixture", None).unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("work.txt"), "work\n").unwrap();
