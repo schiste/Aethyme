@@ -569,6 +569,60 @@ fn checkout_limit_counts_other_roots_and_preserves_reuse_without_allocating() {
 }
 
 #[test]
+fn checkout_limit_reclaims_an_eligible_closed_checkout_before_refusing() {
+    let tmp = common::canonical_tempdir();
+    let repo = tmp.path().join("project");
+    let state = tmp.path().join("state");
+    let origin = tmp.path().join("origin.git");
+    git(
+        tmp.path(),
+        &["init", "--bare", "-b", "main", origin.to_str().unwrap()],
+    );
+    fixture_at(&repo);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-u", "origin", "main"]);
+    git(&repo, &["remote", "set-head", "origin", "main"]);
+    std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
+    std::fs::write(
+        repo.join(".aethyme/config.toml"),
+        "[worktrees]\nmax_checkouts = 1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".aethyme/broker.toml"),
+        "[retention]\nclosed_worktree_grace_hours = 0\nauto_cleanup_worktrees_on_finish = false\n",
+    )
+    .unwrap();
+
+    let first = json(run_with_host_state(
+        &repo,
+        &state,
+        &["start", "--task", "first", "--json"],
+    ));
+    let first_path = PathBuf::from(first["worktree_path"].as_str().unwrap());
+    let first_id = first["id"].as_i64().unwrap().to_string();
+    json(run(
+        &repo,
+        &state,
+        &["finish", "close", "--session", &first_id, "--json"],
+    ));
+    assert!(
+        first_path.exists(),
+        "close retains the checkout for this fixture"
+    );
+
+    let next = json(run(&repo, &state, &["start", "--task", "next", "--json"]));
+    assert!(
+        !first_path.exists(),
+        "only the proven disposable checkout is reclaimed"
+    );
+    assert!(Path::new(next["worktree_path"].as_str().unwrap()).exists());
+}
+
+#[test]
 fn explicit_zero_checkout_limit_permits_new_allocations() {
     let tmp = common::canonical_tempdir();
     let repo = tmp.path().join("project");
