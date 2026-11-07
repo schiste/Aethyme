@@ -601,7 +601,7 @@ fn sync_does_not_assess_drift_on_a_diverged_integration() {
 #[test]
 fn integration_status_does_not_diff_upstream_to_assess_drift() {
     let fixture = Fixture::new("verify-only", 1);
-    let mut broker = fixture.broker();
+    let broker = fixture.broker();
     let root = &fixture.root;
     git(root, &["switch", "-q", "--detach"]);
     std::fs::write(root.join("unique.txt"), "unique\n").unwrap();
