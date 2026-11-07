@@ -524,6 +524,11 @@ blocked.
    aethyme broker submit --session <your-session-id>
    ```
 
+   Before submitting, put `Contract decision: <none|introduce|soft-retire|hard-delete>`
+   in a session commit message: submit preflight reads pending commit messages,
+   not the PR body. For `none` on a tracked-symbol removal, also include a
+   `Contract justification:` of at least 24 characters explaining the match.
+
    This simulates the merge and runs only the checks your diff affects.
    Submit replays session-owned commits as an ordered, single-parent patch
    series. If your session contains an owned merge commit, submission refuses
