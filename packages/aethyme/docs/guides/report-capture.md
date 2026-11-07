@@ -217,3 +217,41 @@ Before `report file`, confirm all of the following:
 - every required issue-form section is complete;
 - the supplied SHA-256 was computed after the final edit;
 - there is no unresolved `outcome_unknown` filing operation for the report.
+
+## Collect agent feedback and recorded signals
+
+When Aethyme itself blocks or slows a normal task, check `report list --json`
+for an existing observation and capture a new report only if it adds useful
+evidence. Use a short title describing the command and symptom, with no
+sensitive task details. Pass the current `--session` so the allowlisted
+snapshot can include its diagnostic context. Do not use `--include-task` by
+default. The reports live under the broker's main repository root, so reports
+captured from its session worktrees share the same local list. Capture does not
+send a message or create an issue.
+
+For an on-demand, local triage view, run from this repository or one of its
+broker worktrees:
+
+```bash
+packages/aethyme/scripts/agent-feedback.sh > /tmp/aethyme-feedback.json
+```
+
+This requires `aethyme` and `jq`. It combines `insights` (default 30-day
+window, without per-session or per-PR detail), command metrics, the local
+report list, and compact current status. Each source has an `available` flag;
+the script exits nonzero if a source fails or returns invalid JSON, while still
+returning the other sources. Check stderr and the flags before drawing
+conclusions. The output can include report titles and operational metadata;
+review it before sharing.
+
+Use the coverage and window in `insights` alongside its counts. Missing session
+activity is unknown, not evidence that those sessions had no friction. Metrics
+and reports have their own retention and do not necessarily cover that same
+window. Deferred compact status checks are unknown, not successful checks.
+Group related reports and signals, inspect their underlying evidence, and
+prioritize by impact, frequency, and confidence. Add reproduction steps,
+expected versus actual behavior, impact, and workaround when preparing a
+reviewed issue; the snapshot does not capture arbitrary agent prose. Follow the
+review and filing steps above only when filing is authorized. Revisit the view
+when planning improvement work; there is no background collector or automatic
+issue creation.

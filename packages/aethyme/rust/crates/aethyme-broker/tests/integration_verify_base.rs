@@ -596,6 +596,62 @@ fn sync_does_not_assess_drift_on_a_diverged_integration() {
     );
 }
 
+/// Only the integration layer decides the assessment, so reporting a diverged
+/// integration must not read upstream's history commit by commit.
+#[test]
+fn integration_status_does_not_diff_upstream_to_assess_drift() {
+    let fixture = Fixture::new("verify-only", 1);
+    let broker = fixture.broker();
+    let root = &fixture.root;
+    git(root, &["switch", "-q", "--detach"]);
+    std::fs::write(root.join("unique.txt"), "unique\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "unique to integration"]);
+    let diverged = git(root, &["rev-parse", "HEAD"]);
+    git(root, &["update-ref", INTEGRATION, &diverged]);
+    git(root, &["switch", "-q", "main"]);
+    fixture.merge_upstream(3);
+
+    let trace = fixture._tmp.path().join("integration-status-trace.json");
+    let mut command = common::broker_cli_for_fixture(
+        env!("CARGO_BIN_EXE_broker-cli-shim"),
+        &["advanced", "integration", "status", "--json"],
+        root,
+    );
+    broker
+        .configure_storage_context_for_child(&mut command)
+        .unwrap();
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    let output = command
+        .current_dir(root)
+        .env("GIT_TRACE2_EVENT", &trace)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let unrecorded = report["reconciliation"]["unrecorded_commits"]
+        .as_array()
+        .expect("the diverged integration is assessed");
+    assert_eq!(unrecorded.len(), 1, "{report}");
+    assert_eq!(unrecorded[0], diverged.as_str());
+
+    let events = std::fs::read_to_string(trace).unwrap();
+    assert!(events.contains("\"start\""), "Git tracing must be active");
+    assert!(
+        !events.contains("patch-id"),
+        "assessing drift computed patch ids"
+    );
+}
+
 #[test]
 fn sync_refreshes_integration_after_its_fetch() {
     let fixture = Fixture::new("verify-only", 1);

@@ -4790,6 +4790,8 @@ struct Occupied {
     /// A supervised run keeps capacity reserved until observed group absence or
     /// generation-bound reconciliation, even after its coordinator PID dies.
     supervised_hold: bool,
+    /// Set when the lease is quarantined, whether or not its holder still runs.
+    quarantined: bool,
 }
 
 /// Quarantined leases keep occupying their resources, because reusing a name
@@ -4812,13 +4814,13 @@ fn load_occupied(conn: &Connection) -> Result<Vec<Occupied>, HostResourceError> 
         conn.prepare(
             "SELECT a.lease_id,l.generation,a.kind,a.value,a.units,a.capacity_limit,l.holder_pid,\
              EXISTS(SELECT 1 FROM resource_supervised_capacity_holds h \
-                    WHERE h.lease_id=l.lease_id AND h.generation=l.generation) \
+                    WHERE h.lease_id=l.lease_id AND h.generation=l.generation),l.state \
              FROM resource_allocations a JOIN resource_leases l ON l.lease_id=a.lease_id \
              WHERE l.state IN ('active','quarantined') ORDER BY l.generation,a.resource_key",
         )?
     } else {
         conn.prepare(
-            "SELECT a.lease_id,l.generation,a.kind,a.value,a.units,a.capacity_limit,l.holder_pid,0 \
+            "SELECT a.lease_id,l.generation,a.kind,a.value,a.units,a.capacity_limit,l.holder_pid,0,l.state \
              FROM resource_allocations a JOIN resource_leases l ON l.lease_id=a.lease_id \
              WHERE l.state IN ('active','quarantined') ORDER BY l.generation,a.resource_key",
         )?
@@ -4836,6 +4838,7 @@ fn load_occupied(conn: &Connection) -> Result<Vec<Occupied>, HostResourceError> 
                 holder_pid,
                 holder_gone: holder_pid.is_some_and(holder_process_is_gone),
                 supervised_hold: row.get(7)?,
+                quarantined: row.get::<_, String>(8)? == "quarantined",
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -4965,7 +4968,38 @@ fn plan_allocations(
                             .fold(0u128, |total, units| {
                                 total.saturating_add(u128::from(units))
                             });
-                        if used.saturating_add(bundle.requested_units) > u128::from(bundle.limit) {
+                        let stranded = matching
+                            .iter()
+                            .filter(|o| o.quarantined && o.holder_pid.is_none_or(|_| o.holder_gone))
+                            .collect::<Vec<_>>();
+                        let stranded_units = stranded
+                            .iter()
+                            .filter_map(|o| o.units)
+                            .fold(0u128, |total, units| {
+                                total.saturating_add(u128::from(units))
+                            });
+                        // No release by a live holder can make room: only an
+                        // operator's reconcile frees these units, so polling
+                        // for them would only spend the caller's whole budget.
+                        if let Some(first) = stranded.first()
+                            && stranded_units.saturating_add(bundle.requested_units)
+                                > u128::from(bundle.limit)
+                        {
+                            conflicts.push(conflict(
+                                ORPHANED_HOLDER_CONFLICT_CODE,
+                                &requirement.key,
+                                "capacity",
+                                format!("{pool}:{}/{limit}", bundle.requested_units),
+                                &format!(
+                                    "{stranded_units}/{limit} units are held by quarantined lease(s) with no live holder, so this request for {} cannot fit until they are reconciled; waiting cannot release them, review cleanup and run aethyme broker advanced resources reconcile {} --confirm {}",
+                                    bundle.requested_units, first.lease_id, first.generation
+                                ),
+                                Some(first.lease_id.clone()),
+                            ));
+                            rejected = true;
+                        } else if used.saturating_add(bundle.requested_units)
+                            > u128::from(bundle.limit)
+                        {
                             conflicts.push(conflict(
                                 "resource_contention",
                                 &requirement.key,
@@ -5182,6 +5216,9 @@ fn any_port_bindable(value: &str) -> bool {
 }
 
 fn blocker_recovery(conflict: &HostResourceConflict, leases: &[HostResourceLease]) -> String {
+    if conflict.kind == "capacity" && conflict.code == ORPHANED_HOLDER_CONFLICT_CODE {
+        return conflict.reason.clone();
+    }
     if conflict.code == "capacity_policy_mismatch" {
         return "use one limit for this pool throughout the request and match any existing holder; waiting cannot change policy".into();
     }
@@ -5219,6 +5256,16 @@ fn wait_advice(blockers: &[HostResourceBlocker]) -> HostResourceWaitAdvice {
             waitable: false,
             reason: "capacity_policy_mismatch".into(),
             action: "use one limit for this pool throughout the request and match any existing holder; waiting cannot change policy".into(),
+        };
+    }
+    if let Some(blocker) = blockers.iter().find(|blocker| {
+        blocker.conflict.kind == "capacity"
+            && blocker.conflict.code == ORPHANED_HOLDER_CONFLICT_CODE
+    }) {
+        return HostResourceWaitAdvice {
+            waitable: false,
+            reason: ORPHANED_HOLDER_CONFLICT_CODE.into(),
+            action: blocker.conflict.reason.clone(),
         };
     }
     // Only an exact exclusive-key collision is made impossible by this
@@ -7364,6 +7411,83 @@ mod tests {
             coordinator.reserve_managed_storage(&changed, 1000),
             Err(HostResourceError::IdempotencyMismatch(_))
         ));
+    }
+
+    fn workers(units: u32) -> Vec<HostResourceRequirement> {
+        vec![HostResourceRequirement {
+            key: "workers".into(),
+            resource: HostResourceKind::Capacity {
+                pool: "workers".into(),
+                units,
+                limit: 4,
+            },
+        }]
+    }
+
+    #[test]
+    fn stranded_capacity_refuses_only_a_request_that_can_never_fit() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = HostResourceCoordinator::open(&t.path().join("h.db")).unwrap();
+        let mut leaked = req("leaked", workers(2));
+        leaked.holder_pid = None;
+        let leaked = c.acquire(&leaked).unwrap();
+
+        // While it is merely active, the holder may still release it: wait.
+        assert!(
+            c.explain(&req("active-holder", workers(4)))
+                .unwrap()
+                .wait
+                .waitable
+        );
+
+        c.conn
+            .execute(
+                "UPDATE resource_leases SET state='quarantined' WHERE lease_id=?1",
+                [&leaked.lease.lease_id],
+            )
+            .unwrap();
+
+        let explanation = c.explain(&req("whole-pool", workers(4))).unwrap();
+        assert!(!explanation.wait.waitable);
+        assert_eq!(explanation.wait.reason, ORPHANED_HOLDER_CONFLICT_CODE);
+        assert!(
+            explanation.wait.action.contains(&format!(
+                "reconcile {} --confirm {}",
+                leaked.lease.lease_id, leaked.lease.generation
+            )),
+            "{}",
+            explanation.wait.action
+        );
+
+        let mut callbacks = 0;
+        let error = c
+            .acquire_with_wait(
+                &req("whole-pool", workers(4)),
+                std::time::Duration::from_secs(30),
+                |_| callbacks += 1,
+            )
+            .unwrap_err();
+        let HostResourceError::Conflict { code, .. } = error else {
+            panic!("a request that cannot fit must conflict");
+        };
+        assert_eq!(code, ORPHANED_HOLDER_CONFLICT_CODE);
+        assert_eq!(callbacks, 0, "it must not enter the wait loop");
+
+        // The units stay reserved, and what still fits is unaffected.
+        let fits = c.acquire(&req("fits", workers(2))).unwrap();
+        let waits = c.explain(&req("another", workers(2))).unwrap();
+        assert!(waits.wait.waitable, "a live holder can still make room");
+        c.release(
+            &fits.lease.lease_id,
+            fits.lease.generation,
+            &fits.ownership_token,
+        )
+        .unwrap();
+
+        c.reconcile(&leaked.lease.lease_id, leaked.lease.generation)
+            .unwrap();
+        c.acquire(&req("whole-pool-after-reconcile", workers(4)))
+            .unwrap();
     }
 
     fn req(id: &str, resources: Vec<HostResourceRequirement>) -> HostResourceRequest {
