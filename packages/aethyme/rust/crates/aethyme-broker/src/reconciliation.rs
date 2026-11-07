@@ -468,22 +468,38 @@ impl Broker {
         deadline: Option<std::time::Instant>,
     ) -> Result<Option<IntegrationDriftAssessment>, BrokerOpError> {
         let expired = || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
-        let queue = self.store_ref().merge_queue()?;
-        let Some(plan) = build_reconciliation_plan_within(
-            self.repo_handle(),
-            &queue,
-            upstream_head,
-            integration_head,
-            deadline,
-        )?
-        else {
+        if expired() {
             return Ok(None);
-        };
+        }
+        let queue = self.store_ref().merge_queue()?;
+        // Only the integration layer decides this assessment. Building the full
+        // reconciliation plan here also diffed every upstream commit, which on
+        // a long history took minutes and was never read.
+        let common_base = self
+            .repo_handle()
+            .merge_base(upstream_head, integration_head)?;
+        let recorded: BTreeSet<String> = queue
+            .iter()
+            .filter(|entry| entry.status == MergeStatus::Promoted)
+            .filter_map(promoted_commit)
+            .collect();
+        let unrecorded_commits: Vec<String> = self
+            .repo_handle()
+            .first_parent_commits_between_oldest(&common_base, integration_head)?
+            .into_iter()
+            .filter(|commit| !recorded.contains(commit))
+            .collect();
         let CandidateLayer {
             candidates,
             described_chain_is_complete,
             ..
-        } = build_candidate_layer(self.repo_handle(), &queue, &plan, integration_head)?;
+        } = build_candidate_layer(
+            self.repo_handle(),
+            &queue,
+            &common_base,
+            &unrecorded_commits,
+            integration_head,
+        )?;
         if expired() {
             return Ok(None);
         }
@@ -536,14 +552,6 @@ impl Broker {
                     evidence,
                 }
             })
-            .collect();
-        let unrecorded_commits: Vec<String> = plan
-            .commits
-            .iter()
-            .filter(|commit| {
-                commit.origin == IntegrationReconcileCommitOrigin::UnrecordedIntegrationCommit
-            })
-            .map(|commit| commit.commit.clone())
             .collect();
         let landed_entry_count = entries
             .iter()
@@ -989,7 +997,21 @@ impl Broker {
             candidates,
             integration_layer,
             described_chain_is_complete,
-        } = build_candidate_layer(self.repo_handle(), &queue, &report.plan, &old_integration)?;
+        } = build_candidate_layer(
+            self.repo_handle(),
+            &queue,
+            &report.plan.common_base,
+            &report
+                .plan
+                .commits
+                .iter()
+                .filter(|commit| {
+                    commit.origin == IntegrationReconcileCommitOrigin::UnrecordedIntegrationCommit
+                })
+                .map(|commit| commit.commit.clone())
+                .collect::<Vec<_>>(),
+            &old_integration,
+        )?;
         if !described_chain_is_complete {
             report.safe = false;
             report.warnings.push(
@@ -1370,7 +1392,8 @@ impl Broker {
 fn build_candidate_layer(
     repo: &crate::git::GitRepo,
     queue: &[MergeQueueEntry],
-    plan: &IntegrationReconcilePlan,
+    common_base: &str,
+    unrecorded_commits: &[String],
     old_integration: &str,
 ) -> Result<CandidateLayer, BrokerOpError> {
     // Every promoted entry ever recorded is a candidate when integration
@@ -1413,7 +1436,7 @@ fn build_candidate_layer(
     }
 
     let integration_layer =
-        repo.first_parent_commits_between_oldest(&plan.common_base, old_integration)?;
+        repo.first_parent_commits_between_oldest(common_base, old_integration)?;
     let positions: BTreeMap<String, usize> = integration_layer
         .iter()
         .enumerate()
@@ -1423,14 +1446,8 @@ fn build_candidate_layer(
         .iter()
         .map(|candidate| candidate.merge_commit.as_str())
         .collect();
-    let described_unrecorded: BTreeSet<&str> = plan
-        .commits
-        .iter()
-        .filter(|commit| {
-            commit.origin == IntegrationReconcileCommitOrigin::UnrecordedIntegrationCommit
-        })
-        .map(|commit| commit.commit.as_str())
-        .collect();
+    let described_unrecorded: BTreeSet<&str> =
+        unrecorded_commits.iter().map(String::as_str).collect();
     let described_chain_is_complete = integration_layer.iter().all(|commit| {
         recorded.contains(commit.as_str()) || described_unrecorded.contains(commit.as_str())
     });
