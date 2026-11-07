@@ -2402,11 +2402,12 @@ mod graph_fence_tests {
     #[test]
     fn independent_repositories_get_scoped_rows_in_one_shared_legacy_database() {
         let temp = tempfile::tempdir().unwrap();
-        let repo_a = temp.path().join("repo-a");
-        let repo_b = temp.path().join("repo-b");
+        let temp_root = temp.path().canonicalize().unwrap();
+        let repo_a = temp_root.join("repo-a");
+        let repo_b = temp_root.join("repo-b");
         init_git_root(&repo_a);
         init_git_root(&repo_b);
-        let database = temp.path().join("shared/broker.db");
+        let database = temp_root.join("shared/broker.db");
         std::fs::create_dir_all(database.parent().unwrap()).unwrap();
 
         // Seed the documented legacy open path before attaching the first repo.
@@ -2495,7 +2496,8 @@ mod graph_fence_tests {
     #[test]
     fn nested_and_linked_worktree_paths_resolve_to_one_repository_binding() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("main-repository");
+        let temp_root = temp.path().canonicalize().unwrap();
+        let root = temp_root.join("main-repository");
         init_git_root(&root);
         let commit = std::process::Command::new("git")
             .args([
@@ -2520,7 +2522,7 @@ mod graph_fence_tests {
             "fixture commit failed: {}",
             String::from_utf8_lossy(&commit.stderr)
         );
-        let linked = temp.path().join("linked-worktree");
+        let linked = temp_root.join("linked-worktree");
         let worktree = std::process::Command::new("git")
             .args(["worktree", "add", "--quiet", "--detach"])
             .arg(&linked)
@@ -2537,7 +2539,7 @@ mod graph_fence_tests {
         );
         let nested = root.join("nested/source");
         std::fs::create_dir_all(&nested).unwrap();
-        let database = temp.path().join("shared/broker.db");
+        let database = temp_root.join("shared/broker.db");
         std::fs::create_dir_all(database.parent().unwrap()).unwrap();
 
         let main_store = BrokerStore::open_repository_path(&root, &database).unwrap();

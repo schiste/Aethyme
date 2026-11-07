@@ -249,13 +249,15 @@ mod tests {
     fn only_a_throwaway_repository_in_a_test_run_ignores_a_root_outside_temp() {
         let temp = std::env::temp_dir();
         let on = Some(std::ffi::OsStr::new("1"));
-        let throwaway = temp.join("fixture");
+        let fixture = tempfile::tempdir().unwrap();
+        // A real repository exists, so it canonicalizes through a symlinked temp dir.
+        let throwaway = fixture.path();
         let host_root = Path::new("/aethyme-host-root");
         let real_repository = Path::new("/aethyme-real-repository");
 
-        assert!(contains_test_worktrees_from(on, &throwaway, host_root));
+        assert!(contains_test_worktrees_from(on, throwaway, host_root));
         assert!(
-            !contains_test_worktrees_from(None, &throwaway, host_root),
+            !contains_test_worktrees_from(None, throwaway, host_root),
             "without the test setting the host's root stays strict"
         );
         assert!(
@@ -263,7 +265,7 @@ mod tests {
             "cargo run on a real checkout keeps the host's root"
         );
         assert!(
-            !contains_test_worktrees_from(on, &throwaway, &temp.join("chosen-by-the-test")),
+            !contains_test_worktrees_from(on, throwaway, &temp.join("chosen-by-the-test")),
             "a root under the temporary directory is one the test chose"
         );
     }
