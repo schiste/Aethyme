@@ -81,16 +81,14 @@ fn add_js(
         }
         module = node.child_by_field_name("source");
         // A list made entirely of type specifiers does not add a runtime edge.
-        if module.is_some() && (raw.starts_with("import {") || raw.starts_with("export {")) {
-            if let Some((_, rest)) = raw.split_once('{') {
-                if let Some((list, _)) = rest.split_once('}') {
-                    if !list.trim().is_empty()
-                        && list.split(',').all(|s| s.trim().starts_with("type "))
-                    {
-                        return;
-                    }
-                }
-            }
+        if module.is_some()
+            && (raw.starts_with("import {") || raw.starts_with("export {"))
+            && let Some((_, rest)) = raw.split_once('{')
+            && let Some((list, _)) = rest.split_once('}')
+            && !list.trim().is_empty()
+            && list.split(',').all(|s| s.trim().starts_with("type "))
+        {
+            return;
         }
     } else if kind == "call_expression" {
         let func = node
@@ -108,42 +106,42 @@ fn add_js(
             }
         }
     }
-    if let Some(module) = module {
-        if let Some(spec) = unquote(text(module, source)) {
-            if spec.starts_with('.') {
-                match resolve(&file.parent().unwrap_or(Path::new("")).join(spec), known) {
-                    Some(target) if target != file => {
-                        edges.insert(target);
-                    }
-                    Some(_) => (),
-                    None => incomplete.push(format!(
-                        "{}: unresolved relative import {spec}",
-                        file.display()
-                    )),
+    if let Some(module) = module
+        && let Some(spec) = unquote(text(module, source))
+    {
+        if spec.starts_with('.') {
+            match resolve(&file.parent().unwrap_or(Path::new("")).join(spec), known) {
+                Some(target) if target != file => {
+                    edges.insert(target);
                 }
-            } else if let Some((prefix, target)) = aliases
-                .iter()
-                .filter(|(prefix, _)| spec.starts_with(prefix.as_str()))
-                .max_by_key(|(prefix, _)| prefix.len())
-            {
-                match resolve(&Path::new(target).join(&spec[prefix.len()..]), known) {
-                    Some(target) if target != file => {
-                        edges.insert(target);
-                    }
-                    Some(_) => (),
-                    None => incomplete.push(format!(
-                        "{}: unresolved mapped alias {spec}",
-                        file.display()
-                    )),
-                }
-            } else if !spec.starts_with("node:") {
-                // Bare names can be workspace packages or tsconfig aliases; assuming
-                // all of them external would create false passes.
-                incomplete.push(format!(
-                    "{}: unresolved package or alias {spec}",
+                Some(_) => (),
+                None => incomplete.push(format!(
+                    "{}: unresolved relative import {spec}",
                     file.display()
-                ));
+                )),
             }
+        } else if let Some((prefix, target)) = aliases
+            .iter()
+            .filter(|(prefix, _)| spec.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len())
+        {
+            match resolve(&Path::new(target).join(&spec[prefix.len()..]), known) {
+                Some(target) if target != file => {
+                    edges.insert(target);
+                }
+                Some(_) => (),
+                None => incomplete.push(format!(
+                    "{}: unresolved mapped alias {spec}",
+                    file.display()
+                )),
+            }
+        } else if !spec.starts_with("node:") {
+            // Bare names can be workspace packages or tsconfig aliases; assuming
+            // all of them external would create false passes.
+            incomplete.push(format!(
+                "{}: unresolved package or alias {spec}",
+                file.display()
+            ));
         }
     }
     for child in children(node) {
@@ -228,19 +226,19 @@ fn add_python(
             bases.push(PathBuf::from(&suffix));
             bases.push(Path::new("backend").join(&suffix));
         }
-        if node.kind() == "import_from_statement" {
-            if let Some((_, names)) = raw.split_once(" import ") {
-                for name in names.trim_matches(|c| c == '(' || c == ')').split(',') {
-                    let name = name.split_whitespace().next().unwrap_or("");
-                    if name == "*" {
-                        continue;
-                    }
-                    for base in &bases {
-                        if let Some(target) = resolve(&base.join(name), known) {
-                            if target != file {
-                                edges.insert(target);
-                            }
-                        }
+        if node.kind() == "import_from_statement"
+            && let Some((_, names)) = raw.split_once(" import ")
+        {
+            for name in names.trim_matches(|c| c == '(' || c == ')').split(',') {
+                let name = name.split_whitespace().next().unwrap_or("");
+                if name == "*" {
+                    continue;
+                }
+                for base in &bases {
+                    if let Some(target) = resolve(&base.join(name), known)
+                        && target != file
+                    {
+                        edges.insert(target);
                     }
                 }
             }

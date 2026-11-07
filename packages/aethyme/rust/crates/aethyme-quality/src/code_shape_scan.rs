@@ -83,13 +83,13 @@ fn complexity(node: Node<'_>, source: &str, root: bool) -> usize {
     {
         count = count.saturating_sub(1);
     }
-    if matches!(kind, "binary_expression" | "boolean_operator") {
-        if let Some(operator) = node.child_by_field_name("operator") {
-            count += usize::from(matches!(
-                text(operator, source),
-                "&&" | "||" | "??" | "and" | "or"
-            ));
-        }
+    if matches!(kind, "binary_expression" | "boolean_operator")
+        && let Some(operator) = node.child_by_field_name("operator")
+    {
+        count += usize::from(matches!(
+            text(operator, source),
+            "&&" | "||" | "??" | "and" | "or"
+        ));
     }
     count
         + children(node)
@@ -169,22 +169,22 @@ fn variable_functions(
         .into_iter()
         .filter(|n| n.kind() == "variable_declarator")
     {
-        if let Some(value) = variable.child_by_field_name("value") {
-            if matches!(
+        if let Some(value) = variable.child_by_field_name("value")
+            && matches!(
                 value.kind(),
                 "arrow_function" | "function_expression" | "generator_function"
-            ) {
-                let name = variable
-                    .child_by_field_name("name")
-                    .map(|n| text(n, source))
-                    .unwrap_or("");
-                callable(
-                    value,
-                    !exported && !exported_names.contains(name),
-                    m,
-                    source,
-                );
-            }
+            )
+        {
+            let name = variable
+                .child_by_field_name("name")
+                .map(|n| text(n, source))
+                .unwrap_or("");
+            callable(
+                value,
+                !exported && !exported_names.contains(name),
+                m,
+                source,
+            );
         }
     }
 }
@@ -322,10 +322,10 @@ pub fn measure(path: &Path, source: &str) -> Result<SourceMetrics, String> {
                     }
                 }
             }
-            if let Some(value) = entry.child_by_field_name("value") {
-                if value.kind() == "identifier" {
-                    exported_names.insert(text(value, source).to_string());
-                }
+            if let Some(value) = entry.child_by_field_name("value")
+                && value.kind() == "identifier"
+            {
+                exported_names.insert(text(value, source).to_string());
             }
         }
     }

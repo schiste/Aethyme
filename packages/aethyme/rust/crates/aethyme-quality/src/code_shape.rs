@@ -132,8 +132,8 @@ pub fn violations(policy: &Policy, metrics: &Metrics) -> Result<Vec<Violation>, 
             record(name, actual.to_string(), format!("{min}..={max}"));
         }
     }
-    if !(policy.min_exports..=policy.max_exports).contains(&metrics.exports)
-        && !(policy.allow_zero_exports && metrics.exports == 0)
+    if !((policy.min_exports..=policy.max_exports).contains(&metrics.exports)
+        || policy.allow_zero_exports && metrics.exports == 0)
     {
         record(
             "exports",
