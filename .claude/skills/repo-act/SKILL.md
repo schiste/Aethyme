@@ -96,6 +96,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   and worktree placement for both the library broker and its CLI children.
   Use `common::open_fixture_broker` and `common::broker_cli_for_fixture` together;
   shared host recovery and inventory can consume timing budgets or alter host state.
+  For whole-workspace runs, avoid global `AETHYME_HOST_STATE_DIR`,
+  `AETHYME_HOST_CACHE_DIR`, and `AETHYME_PREPARATION_CACHE_ROOT` overrides:
+  they can conflict with explicit fixture storage. Isolate with temporary XDG
+  state and cache directories, and reproduce failures with the same environment.
 - Declare new registry requirements in `[workspace.dependencies]` and inherit
   them from crates with `workspace = true`; run the workspace dependency contract.
 - Cargo integration tests can replace a previously built CLI artifact. Record
