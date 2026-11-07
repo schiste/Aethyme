@@ -1588,6 +1588,24 @@ fn refused_worktree_root_plan(
     }
 }
 
+/// Whether `configured` names `canonical`, either directly or through a
+/// symlinked ancestor. `configured` itself may not exist yet, so its parent is
+/// resolved when it cannot be.
+fn resolves_to(configured: &Path, canonical: &Path) -> bool {
+    configured == canonical
+        || configured
+            .canonicalize()
+            .is_ok_and(|resolved| resolved == canonical)
+        || configured
+            .parent()
+            .zip(configured.file_name())
+            .is_some_and(|(parent, name)| {
+                parent
+                    .canonicalize()
+                    .is_ok_and(|parent| parent.join(name) == canonical)
+            })
+}
+
 pub(crate) fn plan_worktree_root_with_context(
     main_root: &Path,
     git_common_dir: Option<&Path>,
@@ -9397,16 +9415,18 @@ impl Broker {
         // the directory or ownership marker; the later destination check
         // still protects the actual worktree path.
         self.refuse_nested_worktree_path(&root)?;
+        // `parent` and `root` are canonical; the plan keeps paths as configured,
+        // which may reach them through a symlinked ancestor (macOS `/var`).
         let layout = if source != WorktreeRootSource::RepositoryFallback
             && source != WorktreeRootSource::LibraryOverride
             && (plan
                 .root_container
                 .as_deref()
-                .is_some_and(|container| container == parent)
+                .is_some_and(|container| resolves_to(container, &parent))
                 || plan
                     .host_state_fallback_root
                     .as_deref()
-                    .is_some_and(|fallback| fallback == root))
+                    .is_some_and(|fallback| resolves_to(fallback, &root)))
         {
             crate::store::repository_binding::RepositoryWorktreeRootLayout::KeyedContainer
         } else {

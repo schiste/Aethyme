@@ -1163,7 +1163,32 @@ mod gate_result_clear_metadata_tests {
             "[retention]\nartifact_sweep_budget_ms = 0\n",
         )
         .unwrap();
-        let mut broker = crate::Broker::open_for_compatibility_backfill(&repo).unwrap();
+        // Private host coordination: the host's real worktree registry must not
+        // decide whether this plan is complete, and a missing registry would.
+        let database = fixture.path().join("host-state/host-operations.db");
+        let mut broker = crate::Broker::open_for_compatibility_backfill(&repo)
+            .unwrap()
+            .with_host_operation_database(&database)
+            .with_worktree_root(fixture.path().join("current-root"));
+        let live_root = fixture.path().join("live-root");
+        std::fs::create_dir(&live_root).unwrap();
+        let live_marker = crate::broker::WorktreeRootMarker {
+            schema_version: crate::broker::WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "live-root".into(),
+            repository_root: repo.clone(),
+        };
+        std::fs::write(
+            live_root.join(crate::broker::WORKTREE_ROOT_MARKER),
+            serde_json::to_vec(&live_marker).unwrap(),
+        )
+        .unwrap();
+        crate::worktree_registry::register(
+            &database,
+            &live_root,
+            &live_marker,
+            crate::WorktreeRootSource::LibraryOverride,
+        )
+        .unwrap();
 
         let session_id =
             insert_gc_fixture_session(broker.store(), &fixture.path().join("session-worktree"));
