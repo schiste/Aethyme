@@ -1703,6 +1703,63 @@ impl Broker {
         )
     }
 
+    /// Whether every pending index change provably leaves this checkout's
+    /// indexed rows correct: the last discovery lap completed, no row is
+    /// unresolved, and no pending session's new or previously indexed path
+    /// overlaps the checkout or shares its Git directory. Any doubt, including
+    /// a path that cannot be resolved or more rows than the bound, is `false`.
+    /// It never writes the index.
+    fn pending_cleanup_delta_spares_checkout(
+        &mut self,
+        canonical_path: &str,
+        git_dir: Option<&Path>,
+        deadline: Option<Instant>,
+    ) -> Result<bool, BrokerOpError> {
+        let Some(delta) = self.store().cleanup_cohort_pending_delta(
+            crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
+            CLEANUP_COHORT_SCAN_PAGE_SIZE,
+        )?
+        else {
+            return Ok(false);
+        };
+        let Some(rows) = delta.rows else {
+            return Ok(false);
+        };
+        // With nothing pending, an incomplete index means a lap restart that
+        // the delta cannot describe.
+        if !delta.lap_complete || delta.unresolved_rows != 0 || rows.is_empty() {
+            return Ok(false);
+        }
+        let checkout = Path::new(canonical_path);
+        let overlaps = |path: &Path| path.starts_with(checkout) || checkout.starts_with(path);
+        let same_git_dir = |other: &Path| git_dir.is_some_and(|git_dir| git_dir == other);
+        for row in &rows {
+            if deadline_expired(deadline) {
+                return Ok(false);
+            }
+            if let Some((raw, indexed_canonical, indexed_git_dir)) = &row.indexed
+                && (overlaps(Path::new(raw))
+                    || overlaps(Path::new(indexed_canonical))
+                    || indexed_git_dir
+                        .as_deref()
+                        .is_some_and(|dir| same_git_dir(Path::new(dir))))
+            {
+                return Ok(false);
+            }
+            if let Some(raw) = &row.current_raw_path {
+                let resolved = ResolvedWorktreePath::resolve(Path::new(raw));
+                if !resolved.resolution_errors.is_empty()
+                    || overlaps(Path::new(raw))
+                    || overlaps(&resolved.canonical_or_raw)
+                    || resolved.git_dir.as_deref().is_some_and(same_git_dir)
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// Read-only variant for explicit artifact-use marker review. An
     /// incomplete path index is a refusal here: planning must not advance or
     /// otherwise mutate the cleanup cohort index. See [`ClosedCohortPurpose`]
@@ -1795,7 +1852,11 @@ impl Broker {
         if deadline_expired(deadline) {
             return Ok(unavailable(Reason::DeadlineExceeded));
         }
-        if !index_state.complete || index_state.unresolved_rows != 0 {
+        // Reclaim needs the whole index. Marker review only needs the rows for
+        // this checkout, so a busy repository's unrelated session churn is
+        // checked below against the pending delta instead of refusing here.
+        let scoped_index_check = !index_state.complete || index_state.unresolved_rows != 0;
+        if scoped_index_check && purpose == ClosedCohortPurpose::Reclaim {
             return Ok(unavailable(Reason::IndexIncomplete));
         }
         let witness_revision = self.store().cleanup_witness_revision()?;
@@ -1813,6 +1874,16 @@ impl Broker {
         let Some(canonical_path) = resolved.canonical_or_raw.to_str().map(str::to_owned) else {
             return Ok(unavailable(Reason::PathNotUtf8));
         };
+        let checkout_git_dir = resolved.git_dir.clone();
+        if scoped_index_check
+            && !self.pending_cleanup_delta_spares_checkout(
+                &canonical_path,
+                checkout_git_dir.as_deref(),
+                deadline,
+            )?
+        {
+            return Ok(unavailable(Reason::IndexIncomplete));
+        }
         let (sessions, group_truncated) = self.store().cleanup_cohort_sessions_for_path(
             crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE,
             &canonical_path,
@@ -1986,15 +2057,26 @@ impl Broker {
             }
         }
 
-        if self
+        let index_now = self
             .store()
-            .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)?
-            .is_none_or(|current| {
-                current.revision != index_state.revision
-                    || current.alias_refresh_generation != index_state.alias_refresh_generation
-                    || !current.complete
-            })
-        {
+            .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)?;
+        let index_moved = index_now.as_ref().is_none_or(|current| {
+            current.revision != index_state.revision
+                || current.alias_refresh_generation != index_state.alias_refresh_generation
+        });
+        // A scoped review re-proves the pending delta, which may have grown
+        // while the cohort was read; otherwise the index must still be complete.
+        let index_still_valid = !index_moved
+            && if scoped_index_check {
+                self.pending_cleanup_delta_spares_checkout(
+                    &canonical_path,
+                    checkout_git_dir.as_deref(),
+                    deadline,
+                )?
+            } else {
+                index_now.is_some_and(|current| current.complete)
+            };
+        if !index_still_valid {
             return Ok(unavailable(Reason::IndexChanged));
         }
         if self.store().cleanup_witness_revision()? != witness_revision {
@@ -4098,6 +4180,113 @@ mod tests {
                 if reason.contains("no validated registry witness")
         ));
         assert!(marker_path.exists());
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    impl ArtifactUseReconcileFixture {
+        /// Insert another session row the way `broker start` does; the real
+        /// schema trigger queues its dirty row and bumps the cleanup revision.
+        fn start_other_session(&mut self, worktree: &Path) {
+            let at = now_ms();
+            rusqlite::Connection::open(self.broker.store().db_path())
+                .unwrap()
+                .execute(
+                    "INSERT INTO sessions (worktree_path, branch, origin, status,
+                     cleanup_state, created_at, updated_at, last_activity_at)
+                     VALUES (?1, 'agent/other', 'spawned', 'active', 'open', ?2, ?2, ?2)",
+                    rusqlite::params![worktree.to_string_lossy(), at],
+                )
+                .unwrap();
+        }
+
+        fn index_snapshot(&mut self) -> (i64, i64, bool, i64) {
+            let state = self
+                .broker
+                .store()
+                .cleanup_cohort_scan_state(crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE)
+                .unwrap()
+                .unwrap();
+            (
+                state.revision,
+                state.after_session_id,
+                state.complete,
+                state.pending_dirty_rows,
+            )
+        }
+
+        fn review_cohort(&mut self) -> super::ClosedArtifactCheckoutCohortResolution {
+            let session_id = self.session.id;
+            let checkout_root = self.checkout_root.clone();
+            self.broker
+                .closed_artifact_checkout_cohort_for_session_readonly(
+                    session_id,
+                    &checkout_root,
+                    None,
+                )
+                .unwrap()
+        }
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn marker_review_tolerates_unrelated_session_churn_without_writing_the_index() {
+        let mut fixture = ArtifactUseReconcileFixture::new();
+        let invocation_id = "reconcile-unrelated-churn-fixture";
+        let mut child = fixture.start_running_marker(invocation_id);
+        child.wait().unwrap();
+        fixture.close_and_bind();
+
+        let sibling = fixture
+            .checkout_root
+            .with_file_name("unrelated-sibling-checkout");
+        std::fs::create_dir_all(&sibling).unwrap();
+        fixture.start_other_session(&sibling);
+        let before = fixture.index_snapshot();
+        assert!(!before.2, "a new session must leave the index incomplete");
+        assert_eq!(before.3, 1);
+
+        let cohort = match fixture.review_cohort() {
+            super::ClosedArtifactCheckoutCohortResolution::Available(cohort) => cohort,
+            super::ClosedArtifactCheckoutCohortResolution::Unavailable(reason) => {
+                panic!("unrelated churn refused marker review: {}", reason.code())
+            }
+        };
+        assert_eq!(
+            fixture.index_snapshot(),
+            before,
+            "review must not write the index"
+        );
+        assert_eq!(cohort.session_ids(), vec![fixture.session.id]);
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn marker_review_refuses_pending_churn_that_touches_the_checkout() {
+        for (label, nested) in [("same path", false), ("nested path", true)] {
+            let mut fixture = ArtifactUseReconcileFixture::new();
+            let invocation_id = "reconcile-touching-churn-fixture";
+            let mut child = fixture.start_running_marker(invocation_id);
+            child.wait().unwrap();
+            fixture.close_and_bind();
+
+            let touching = if nested {
+                fixture.checkout_root.join("nested-checkout")
+            } else {
+                fixture.checkout_root.clone()
+            };
+            fixture.start_other_session(&touching);
+            let before = fixture.index_snapshot();
+            assert!(
+                matches!(
+                    fixture.review_cohort(),
+                    super::ClosedArtifactCheckoutCohortResolution::Unavailable(
+                        super::ClosedArtifactCheckoutCohortUnavailableReason::IndexIncomplete
+                    )
+                ),
+                "{label}"
+            );
+            assert_eq!(fixture.index_snapshot(), before, "{label}");
+        }
     }
 
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
