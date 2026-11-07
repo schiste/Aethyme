@@ -432,10 +432,13 @@ fn main_with_args(args: &[String]) -> ExitCode {
         "broker" if readiness_remediation::is_command(command.args) => {
             ExitCode::from(readiness_remediation::run(&command.args[1..]))
         }
-        "broker" => ExitCode::from(aethyme_broker::cli::run_resolved_with_mode(
-            command.args,
-            broker_compatibility_mode,
-        )),
+        "broker" => {
+            aethyme_broker::enable_repository_identity_memory();
+            ExitCode::from(aethyme_broker::cli::run_resolved_with_mode(
+                command.args,
+                broker_compatibility_mode,
+            ))
+        }
         "update" => ExitCode::from(aethyme_broker::run_update_cli(command.args)),
         // #293/#251: the supported upgrade path, spelled as the decision named it.
         "self-update" => ExitCode::from(aethyme_broker::run_update_cli(&self_update_args(

@@ -1605,10 +1605,24 @@ impl Broker {
         // Keep implicit warnings at their recorded snapshot and do not advance
         // the global refresh timestamp here.
         preparation.check()?;
+        // Holder liveness only decides between overlapping leases, and working
+        // it out visits every live session, so a claim nobody overlaps skips it.
+        if self.lease_blockers(session_id, &path)?.is_empty() {
+            self.store.claim_lease(session_id, &path, ttl_ms)?;
+            return Ok(LeaseClaimReport {
+                session_id,
+                path,
+                accepted: true,
+                blockers: Vec::new(),
+                warnings: Vec::new(),
+            });
+        }
         let policy = self.lease_refusal_policy()?;
         preparation.check()?;
         let mut blockers = Vec::new();
         let mut warnings = Vec::new();
+        // Read after the policy: assessing liveness updates the holder status
+        // these rows report.
         for mut lease in self.lease_blockers(session_id, &path)? {
             if lease.kind == LeaseKind::Implicit && !policy.is_live(lease.session_id) {
                 continue;
@@ -5142,6 +5156,12 @@ mod generic_guarded_exec_tests {
 
         let (_repository, _storage, mut broker) = fixture();
         let session = broker.start_worktree("bounded lease claim", None).unwrap();
+        // Only an overlapping claim reads Git; one nothing overlaps has nothing
+        // to time out.
+        let holder = broker.start_worktree("overlapping holder", None).unwrap();
+        broker
+            .claim_lease(holder.id, "claim-target.txt", None)
+            .unwrap();
         let explicit_before: i64 = broker
             .store
             .connection()

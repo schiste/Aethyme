@@ -802,9 +802,11 @@ impl Broker {
     /// repositories are never touched.
     ///
     /// Never fails the calling command: a refusal or error leaves integration
-    /// where it was, and status advice still describes it. `status`, the
-    /// orientation step every agent runs first, only takes the strictly-behind
-    /// case, which needs no drift assessment.
+    /// where it was, and status advice still describes it. Every trigger only
+    /// takes the strictly-behind case, which needs no drift assessment: on a
+    /// diverged integration that assessment diffs all of history and, with
+    /// work held back for review, moves nothing, so a no-op `sync` in a long
+    /// repository spent minutes reaching that answer again.
     pub fn refresh_disposable_integration(
         &mut self,
         trigger: IntegrationRefreshTrigger,
@@ -819,9 +821,7 @@ impl Broker {
         if self.repo_handle().is_ancestor(&upstream_head, &integration) {
             return None;
         }
-        if trigger == IntegrationRefreshTrigger::Status
-            && !self.repo_handle().is_ancestor(&integration, &upstream_head)
-        {
+        if !self.repo_handle().is_ancestor(&integration, &upstream_head) {
             return None;
         }
         let report = match self.auto_cleanup_landed_integration(&upstream_ref) {

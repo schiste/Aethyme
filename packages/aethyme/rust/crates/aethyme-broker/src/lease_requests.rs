@@ -13,7 +13,7 @@
 //! releases the path through another lifecycle operation. Nothing here changes
 //! the broker schema.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::BrokerStore;
 
@@ -122,6 +122,7 @@ pub fn requests(
 ) -> Result<Vec<LeaseReleaseRequest>, crate::BrokerOpError> {
     let events = store.lease_release_events()?;
     let mut requests: Vec<LeaseReleaseRequest> = Vec::new();
+    let mut request_ids = HashSet::<i64>::new();
     let mut outcome_resolutions = HashMap::<i64, RequestResolution>::new();
     for event in &events {
         let Some(payload) = event.payload_json.as_deref() else {
@@ -131,6 +132,7 @@ pub fn requests(
             let Ok(requested) = serde_json::from_str::<RequestedPayload>(payload) else {
                 continue;
             };
+            request_ids.insert(event.id);
             requests.push(LeaseReleaseRequest {
                 request_id: event.id,
                 path: requested.path,
@@ -153,10 +155,7 @@ pub fn requests(
         let Ok(outcome) = serde_json::from_str::<OutcomePayload>(payload) else {
             continue;
         };
-        if requests
-            .iter()
-            .any(|request| request.request_id == outcome.request_id)
-        {
+        if request_ids.contains(&outcome.request_id) {
             record_resolution(
                 &mut outcome_resolutions,
                 outcome.request_id,
@@ -175,8 +174,17 @@ pub fn requests(
     let mut release_resolutions = HashMap::<i64, RequestResolution>::new();
     let mut release_scan_after = HashMap::<i64, i64>::new();
     let mut release_scan_before = HashMap::<i64, Option<(i64, i64)>>::new();
-    let mut closure_scan_after = HashMap::<i64, i64>::new();
-    for request in &requests {
+    let mut requests_by_holder = HashMap::<i64, Vec<usize>>::new();
+    let mut requests_by_requester = HashMap::<i64, Vec<usize>>::new();
+    for (index, request) in requests.iter().enumerate() {
+        requests_by_holder
+            .entry(request.holder_session_id)
+            .or_default()
+            .push(index);
+        requests_by_requester
+            .entry(request.requester_session_id)
+            .or_default()
+            .push(index);
         held_by_request.insert(
             request.request_id,
             holds(request.holder_session_id, &request.path),
@@ -202,31 +210,44 @@ pub fn requests(
                 entry.insert(before);
             }
         }
-        closure_scan_after
-            .entry(request.requester_session_id)
-            .and_modify(|first_id| *first_id = (*first_id).min(request.request_id))
-            .or_insert(request.request_id);
     }
 
-    for (holder_session_id, first_request_id) in release_scan_after {
-        let before = release_scan_before
+    // One pass over the release history, not one per holder: a repository with
+    // hundreds of holders scanned the whole history once for each of them on
+    // every status read. Each holder still sees only its own window.
+    let first_request_id = requests.iter().map(|request| request.request_id).min();
+    let release_events = match first_request_id {
+        Some(first) => store.lease_release_events_since(first)?,
+        None => Vec::new(),
+    };
+    for event in &release_events {
+        let Some(holder_session_id) = event.session_id else {
+            continue;
+        };
+        let Some(holder_requests) = requests_by_holder.get(&holder_session_id) else {
+            continue;
+        };
+        if release_scan_after
             .get(&holder_session_id)
-            .copied()
-            .flatten();
-        for event in store.lease_release_events_for_holder_since(
-            holder_session_id,
-            first_request_id,
-            before,
-        )? {
-            let Some(payload) = event.payload_json.as_deref() else {
-                continue;
-            };
-            let Ok(released) = serde_json::from_str::<ReleasedPayload>(payload) else {
-                continue;
-            };
-            for request in &requests {
-                if request.holder_session_id != holder_session_id
-                    || request.request_id >= event.id
+            .is_none_or(|first| event.id <= *first)
+        {
+            continue;
+        }
+        if let Some(Some((before_id, before_ts))) = release_scan_before.get(&holder_session_id)
+            && event.id >= *before_id
+            && event.ts > *before_ts
+        {
+            continue;
+        }
+        let Some(payload) = event.payload_json.as_deref() else {
+            continue;
+        };
+        let Ok(released) = serde_json::from_str::<ReleasedPayload>(payload) else {
+            continue;
+        };
+        {
+            for request in holder_requests.iter().map(|index| &requests[*index]) {
+                if request.request_id >= event.id
                     || !crate::leases::paths_overlap(&request.path, &released.path)
                 {
                     continue;
@@ -281,15 +302,20 @@ pub fn requests(
         record_resolution(&mut resolutions, request_id, resolution);
     }
 
-    for (requester_session_id, first_request_id) in closure_scan_after {
-        for event in store.lease_request_closure_events_for_session_since(
-            requester_session_id,
-            first_request_id,
-        )? {
-            for request in &requests {
-                if request.requester_session_id == requester_session_id
-                    && request.request_id < event.id
-                {
+    let closure_events = match first_request_id {
+        Some(first) => store.lease_request_closure_events_since(first)?,
+        None => Vec::new(),
+    };
+    for event in &closure_events {
+        let Some(requester_requests) = event
+            .session_id
+            .and_then(|session_id| requests_by_requester.get(&session_id))
+        else {
+            continue;
+        };
+        {
+            for request in requester_requests.iter().map(|index| &requests[*index]) {
+                if request.request_id < event.id {
                     record_resolution(
                         &mut resolutions,
                         request.request_id,
@@ -544,6 +570,41 @@ mod tests {
         );
         assert_eq!(requests[0].state, RequestState::Acked);
         assert_eq!(requests[1].state, RequestState::Pending);
+    }
+
+    #[test]
+    fn release_and_closure_evidence_only_applies_to_its_own_sessions() {
+        let (_dir, mut store) = store();
+        let id = request(&mut store, "a.rs");
+        let other_holder = serde_json::json!({"path": "a.rs", "reason": "other"}).to_string();
+        store
+            .append_event(crate::events::LEASE_RELEASED, Some(9), Some(&other_holder))
+            .unwrap();
+        store
+            .append_event("session.closed", Some(9), Some("{}"))
+            .unwrap();
+        let all = requests(&store, |_, _| false).unwrap();
+        assert_eq!(all[0].request_id, id);
+        assert_eq!(
+            all[0].resolution_reason.as_deref(),
+            Some("release_evidence_unavailable"),
+            "another session's release or closure must not resolve it"
+        );
+
+        let holder = serde_json::json!({"path": "a.rs", "reason": "mine"}).to_string();
+        let released = store
+            .append_event(crate::events::LEASE_RELEASED, Some(1), Some(&holder))
+            .unwrap();
+        let all = requests(&store, |_, _| false).unwrap();
+        assert_eq!(all[0].state, RequestState::Released);
+        assert_eq!(all[0].resolution_reason.as_deref(), Some("mine"));
+        assert!(released > id);
+
+        store
+            .append_event("session.closed", Some(2), Some("{}"))
+            .unwrap();
+        let all = requests(&store, |_, _| true).unwrap();
+        assert_eq!(all[0].state, RequestState::Cancelled);
     }
 
     #[test]
