@@ -98,8 +98,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   shared host recovery and inventory can consume timing budgets or alter host state.
   For whole-workspace runs, avoid global `AETHYME_HOST_STATE_DIR`,
   `AETHYME_HOST_CACHE_DIR`, and `AETHYME_PREPARATION_CACHE_ROOT` overrides:
-  they can conflict with explicit fixture storage. Isolate with temporary XDG
-  state and cache directories, and reproduce failures with the same environment.
+  they can conflict with explicit fixture storage. Isolate with XDG state and
+  cache directories outside `TMPDIR`; reproducing inside `TMPDIR` can change
+  temporary-repository worktree placement. Reproduce failures in the same environment.
 - Declare new registry requirements in `[workspace.dependencies]` and inherit
   them from crates with `workspace = true`; run the workspace dependency contract.
 - Cargo integration tests can replace a previously built CLI artifact. Record
