@@ -514,3 +514,27 @@ esac
         }
     }
 }
+
+#[test]
+fn contract_check_has_a_separate_managed_cache_from_workspace_tests() {
+    let gates = load_gates(&repo_root()).expect("the shipped gates.toml parses");
+    let find = |name: &str| {
+        gates
+            .iter()
+            .find(|gate| gate.name == name)
+            .unwrap()
+            .managed_cache
+            .as_ref()
+            .unwrap()
+    };
+    assert_ne!(
+        find("cross-process-contract").key,
+        find("cargo-test").key,
+        "contract checks should not wait for the workspace test cache"
+    );
+    assert_eq!(
+        find("fast-guards").key,
+        find("cargo-test").key,
+        "workspace test gates must still reuse the same cache"
+    );
+}
