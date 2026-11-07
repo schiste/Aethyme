@@ -16,6 +16,7 @@ artifacts and their exact source revision are recorded in each signed
 ### Fixed
 
 - Reclaim eligible closed checkouts automatically when the checkout limit is reached, while preserving protected or unproven worktrees (#1507).
+- Resume interrupted cleanup of external broker worktrees after their Git pointer has already been removed, using the recorded recovery proof (#1514).
 - Submit synchronized session histories whose merge parents are already in integration without rewriting those histories (#1503).
 - Allow artifact-use marker review to recover safely after mount renumbering, with clearer refusal guidance (#1487).
 - Discover sibling worktree roots when a host container is reached through a symlink (#1506).
