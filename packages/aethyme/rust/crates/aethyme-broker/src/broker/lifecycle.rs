@@ -8020,13 +8020,39 @@ impl Broker {
         // writes the marker and build defaults, so it belongs under the same
         // claim as storage's empty-root removal; otherwise a confirmed sweep
         // could delete a root prepared before this final claim.
-        let lifecycle_claim =
+        let mut lifecycle_claim =
             timed_start_phase(&mut phase_timings_ms, "lifecycle_lock_wait", || {
                 self.claim_worktree_lifecycle()
             })?;
-        timed_start_phase(&mut phase_timings_ms, "checkout_count", || {
-            self.preflight_worktree_checkout_count()
+        let full = timed_start_phase(&mut phase_timings_ms, "checkout_count", || {
+            self.worktree_checkout_limit()
         })?;
+        if full.is_some() {
+            // GC takes its own lock before the lifecycle lock. Release ours
+            // before asking the existing proof-based cleanup to make room,
+            // then reacquire it and count again before allocating anything.
+            drop(lifecycle_claim);
+            let cleanup =
+                timed_start_phase(&mut phase_timings_ms, "checkout_capacity_cleanup", || {
+                    self.auto_cleanup_now(Some(
+                        std::time::Instant::now() + std::time::Duration::from_secs(5),
+                    ))
+                });
+            crate::warn_unrecorded("recover checkout capacity", cleanup.map(|_| ()));
+            lifecycle_claim = timed_start_phase(
+                &mut phase_timings_ms,
+                "lifecycle_lock_wait_after_cleanup",
+                || self.claim_worktree_lifecycle(),
+            )?;
+            if let Some((count, maximum)) = self.worktree_checkout_limit()? {
+                return Err(BrokerOpError::WorktreeRootUnavailable {
+                    path: self.main_root.clone(),
+                    reason: format!(
+                        "linked checkout limit reached ({count}/{maximum}); no checkout was allocated. Reuse an existing worktree with broker start --reuse <worktree>, finish delivered sessions, or inspect broker gc plan. Configure [worktrees].max_checkouts to change the limit; explicit zero disables it"
+                    ),
+                });
+            }
+        }
         let placement = timed_start_phase(&mut phase_timings_ms, "worktree_root", || {
             self.prepare_broker_worktree_root()
         })?;
@@ -10104,7 +10130,7 @@ impl Broker {
             })
     }
 
-    fn preflight_worktree_checkout_count(&self) -> Result<(), BrokerOpError> {
+    fn worktree_checkout_limit(&self) -> Result<Option<(usize, u32)>, BrokerOpError> {
         // Invalid placement configuration already has a documented host-root
         // fallback and diagnostic. Keep that behavior, with the bounded
         // default rather than letting invalid policy disable admission.
@@ -10114,21 +10140,13 @@ impl Broker {
         };
         let maximum = config.max_checkouts();
         if maximum == 0 {
-            return Ok(());
+            return Ok(None);
         }
         // Git's strict inventory includes its primary checkout. Count every
         // other registration, including prunable ones and other placement
         // roots, without opening or recursively sizing any checkout.
         let count = self.repo.worktree_inventory()?.len().saturating_sub(1);
-        if count >= maximum as usize {
-            return Err(BrokerOpError::WorktreeRootUnavailable {
-                path: self.main_root.clone(),
-                reason: format!(
-                    "linked checkout limit reached ({count}/{maximum}); no checkout was allocated. Reuse an existing worktree with broker start --reuse <worktree>, finish delivered sessions, or inspect broker gc plan. Configure [worktrees].max_checkouts to change the limit; explicit zero disables it"
-                ),
-            });
-        }
-        Ok(())
+        Ok((count >= maximum as usize).then_some((count, maximum)))
     }
 
     fn preflight_session_checkout_storage(
