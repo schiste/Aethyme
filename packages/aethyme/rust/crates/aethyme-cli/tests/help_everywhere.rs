@@ -382,3 +382,15 @@ fn help_after_the_command_separator_belongs_to_the_command() {
     assert_ne!(output.status.code(), Some(0));
     assert!(!String::from_utf8_lossy(&output.stdout).contains("Usage"));
 }
+
+#[test]
+fn code_shape_help_shows_its_own_options() {
+    let output = Command::new(env!("CARGO_BIN_EXE_aethyme"))
+        .args(["quality", "code-shape", "--help"])
+        .output()
+        .expect("run aethyme");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("--level warning|error|off"), "{stdout}");
+    assert!(stdout.contains("--config PATH"), "{stdout}");
+}

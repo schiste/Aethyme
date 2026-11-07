@@ -14,7 +14,7 @@ const HELP: &str = "Usage: aethyme quality inspect [OPTIONS]
 
   Run bounded, optional repository-quality analysis.
 
-  This report is advisory. Use `aethyme broker status readiness` for authoritative
+  The inspect report is advisory. Use `aethyme broker status readiness` for authoritative
   operational readiness.
 
 Options:
