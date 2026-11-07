@@ -92,6 +92,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   under paths containing spaces and apostrophes, even when CI paths are simple.
   After a quoting failure, audit sibling transport command setters before
   starting another CI or local qualification cycle.
+- For broker CLI fixtures, isolate host state, host cache, preparation cache,
+  and worktree placement for both the library broker and its CLI children.
+  Use `common::open_fixture_broker` and `common::broker_cli_for_fixture` together;
+  shared host recovery and inventory can consume timing budgets or alter host state.
+- Declare new registry requirements in `[workspace.dependencies]` and inherit
+  them from crates with `workspace = true`; run the workspace dependency contract.
 - Cargo integration tests can replace a previously built CLI artifact. Record
   binary hashes before and after tests; matching source revisions alone do not
   prove that the bytes stayed unchanged. Qualify the exact artifacts selected
@@ -258,7 +264,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   the intended content and inspect the resulting diff. Verify the deployed text
   and mirrored-skill parity; never commit a template overwrite blindly.
 - Keep matching `.claude/skills` and `.codex/skills` files byte-identical when
-  editing a mirrored skill; the skill-surface parity check enforces this.
+  editing a mirrored skill; run `cargo test -p aethyme-testkit --test it
+  skill_surface_parity::claude_and_codex_skill_trees_stay_byte_identical -- --exact`.
 - Before adding broker-owned persistent sidecars, verify each generated path
   matches `runtime_paths.rs` and the standard runtime `.gitignore` prefix. Add
   a regression from the path producer to the runtime-path classifier; keep
