@@ -37,3 +37,5 @@ pub mod walk;
 
 #[cfg(test)]
 mod testsupport;
+
+pub mod code_shape;
