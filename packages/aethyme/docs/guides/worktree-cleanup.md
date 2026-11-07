@@ -172,6 +172,15 @@ artifact-use protocol. That protocol is available on Unix; unattended ignored
 folder and whole-checkout cleanup remain blocked on unsupported targets. Explicit
 normal cleanup keeps its existing platform checks there.
 
+A process that died while using a checkout leaves a marker that holds back
+automatic cleanup of that checkout. `aethyme broker gc artifact-use reconcile plan
+<session>` reviews those markers, and `apply` removes one only when the session is
+closed and its process is proven gone. Records written before a Mac renumbered
+its mounts are accepted when the checkout still carries its spawn generation, or
+when a spawn record saw the old device number on this repository's `.git`. A
+refusal names what is missing and whether planning again can help. Leaving a
+marker retained is always safe.
+
 Strict mode also disables automatic artifact sweeps, including already queued
 background removals. Remove the leftovers manually, or inspect an explicit
 reviewed artifact cleanup or force-discard operation. Changing strict mode after

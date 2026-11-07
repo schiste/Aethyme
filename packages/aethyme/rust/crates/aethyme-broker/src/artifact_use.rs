@@ -1624,11 +1624,18 @@ fn reconciliation_disposition(
             locations.primary_identity.inode,
         )
     };
-    if !registry.matches_marker_identity(
-        Path::new(&marker.primary_root),
-        registry_device,
-        registry_inode,
-    ) {
+    // A legacy marker saved only a mount-scoped device number. Besides the
+    // registry's history, the cohort's verified spawn witnesses may have seen
+    // that number on this repository's `.git`.
+    let legacy_device_witnessed = marker.schema_version == LEGACY_MARKER_SCHEMA_VERSION
+        && cohort.witnesses_primary_git_device(&locations.primary_root, marker.primary_device);
+    if !legacy_device_witnessed
+        && !registry.matches_marker_identity(
+            Path::new(&marker.primary_root),
+            registry_device,
+            registry_inode,
+        )
+    {
         return retain("primary device identity has no validated registry witness");
     }
     if marker.phase != ArtifactUsePhase::Running {
