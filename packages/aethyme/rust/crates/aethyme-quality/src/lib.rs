@@ -39,3 +39,4 @@ pub mod walk;
 mod testsupport;
 
 pub mod code_shape;
+pub mod code_shape_scan;
