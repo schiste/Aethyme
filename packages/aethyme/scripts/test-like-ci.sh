@@ -14,6 +14,9 @@
 #         # CI build job: compile the full workspace suite once into an archive
 #     packages/aethyme/scripts/test-like-ci.sh --from-archive FILE --partition hash:1/6
 #         # CI shard job: run one partition of that archive, with the CI profile
+#     packages/aethyme/scripts/test-like-ci.sh --from-archive FILE --partition hash:1/6 --selection EXPR
+#         # the same, limited to a nextest filterset; a partition the filter
+#         # leaves empty passes, since the selection is split across shards
 #     packages/aethyme/scripts/test-like-ci.sh --base aethyme/integration --print-selection
 #         # print what --changed would test and exit: a nextest filterset,
 #         # `workspace`, or `none`; the broker's cargo-test gate runs on it
@@ -48,6 +51,7 @@ archive_out=""
 archive_in=""
 partition=""
 print_selection=0
+selection_expr=""
 extra=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -86,6 +90,9 @@ while [ $# -gt 0 ]; do
         --print-selection)
             print_selection=1
             shift ;;
+        --selection)
+            selection_expr="${2:?--selection needs a nextest filterset}"
+            shift 2 ;;
         -h|--help)
             awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
             exit 0 ;;
@@ -100,7 +107,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$print_selection" -eq 1 ]; then
-    if [ "$coverage" != changed ] || [ -n "$archive_out" ] || [ -n "$archive_in" ] || [ -n "$partition" ] || [ -n "$package" ] || [ "$library" -eq 1 ] || [ "${#extra[@]}" -gt 0 ]; then
+    if [ "$coverage" != changed ] || [ -n "$archive_out" ] || [ -n "$archive_in" ] || [ -n "$partition" ] || [ -n "$package" ] || [ "$library" -eq 1 ] || [ -n "$selection_expr" ] || [ "${#extra[@]}" -gt 0 ]; then
         echo "error: --print-selection only reports changed-path selection; pass at most --base" >&2
         exit 2
     fi
@@ -115,11 +122,14 @@ if [ -n "$archive_out" ] || [ -n "$archive_in" ]; then
         echo "error: archive modes always cover the full workspace; drop --full, --changed, --base, --package and --lib" >&2
         exit 2
     fi
-    if [ -n "$archive_out" ] && { [ -n "$partition" ] || [ "${#extra[@]}" -gt 0 ]; }; then
-        echo "error: --archive only builds; pass --partition and nextest options to --from-archive" >&2
+    if [ -n "$archive_out" ] && { [ -n "$partition" ] || [ -n "$selection_expr" ] || [ "${#extra[@]}" -gt 0 ]; }; then
+        echo "error: --archive only builds; pass --partition, --selection and nextest options to --from-archive" >&2
         exit 2
     fi
     if [ -n "$archive_out" ]; then coverage=archive; else coverage=from-archive; fi
+elif [ -n "$selection_expr" ]; then
+    echo "error: --selection only applies to --from-archive" >&2
+    exit 2
 elif [ -n "$partition" ]; then
     echo "error: --partition only applies to --from-archive" >&2
     exit 2
@@ -282,7 +292,11 @@ elif [ "$coverage" = full ] || [ "$coverage" = from-archive ]; then
         test_command=(cargo nextest run --locked --workspace --profile ci --no-tests fail)
     else
         # An archive run resolves and builds nothing, so nextest refuses --locked.
-        test_command=(cargo nextest run --archive-file "$archive_in" --extract-to "$rust" --extract-overwrite --workspace-remap "$rust" --profile ci --no-tests fail)
+        if [ -n "$selection_expr" ]; then
+            test_command=(cargo nextest run --archive-file "$archive_in" --extract-to "$rust" --extract-overwrite --workspace-remap "$rust" --profile ci --no-tests warn -E "$selection_expr")
+        else
+            test_command=(cargo nextest run --archive-file "$archive_in" --extract-to "$rust" --extract-overwrite --workspace-remap "$rust" --profile ci --no-tests fail)
+        fi
         if [ -n "$partition" ]; then
             test_command+=(--partition "$partition")
         fi

@@ -1,5 +1,14 @@
 name: Aethyme Gates
 
+# The push tier of three (see the `fast-guards` gate in .aethyme/gates.toml):
+# pre-push runs a selected tenth of the suite locally; a push to main runs, in
+# the cargo-test-* jobs, the crates the commit changed and their reverse
+# dependencies plus the repository guard suites; a release runs everything.
+# The whole workspace runs when the commit changes the workspace version (a
+# release is prepared), when a repository-wide input changes, and on a manual
+# dispatch. Only such a run records `full-suite`, which a release tag requires
+# (.github/scripts/wait-for-release-gates.sh).
+#
 # Convergence lane: gates.toml is the single definition of "verified" —
 # this workflow runs the gates, via the runner, that the broker runs before
 # promoting a session (`aethyme broker advanced gates run --only <gate>`).
@@ -58,11 +67,15 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       run: ${{ steps.lookup.outputs.run }}
+      scope: ${{ steps.scope.outputs.scope }}
+      selection: ${{ steps.scope.outputs.selection }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The scope compares this commit with its first parent.
+          fetch-depth: 2
 
       - name: Look for a pull-request run that tested this tree
         id: lookup
@@ -81,6 +94,38 @@ jobs:
             echo "No pull-request run tested tree $tree; every gate runs."
           fi
           echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      # full: the whole workspace. changed: the crates this commit changed,
+      # their reverse dependencies and the guard suites. A dispatch, a
+      # workspace version change or a commit with no parent runs everything,
+      # as does any repository-wide input (`--print-selection` says workspace).
+      - name: Choose the test scope
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          version() { git show "$1:packages/aethyme/rust/Cargo.toml" | sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *//p'; }
+          scope=full
+          selection=""
+          if [ "$EVENT_NAME" = push ] && git rev-parse --verify --quiet HEAD^1 >/dev/null; then
+            if [ "$(version HEAD)" != "$(version HEAD^1)" ]; then
+              echo "The workspace version changed: a release is prepared."
+            else
+              changed="$(packages/aethyme/scripts/test-like-ci.sh --base HEAD^1 --print-selection)"
+              case "$changed" in
+                workspace) echo "A repository-wide input changed." ;;
+                none) scope=none ;;
+                *)
+                  scope=changed
+                  selection="($changed) | package(aethyme-testkit) | package(aethyme-cli) | binary_id(aethyme-broker::gate_policy)"
+                  ;;
+              esac
+            fi
+          fi
+          echo "Test scope: $scope${selection:+: $selection}"
+          echo "scope=$scope" >> "$GITHUB_OUTPUT"
+          echo "selection=$selection" >> "$GITHUB_OUTPUT"
 
   gates:
     name: Run all gates
@@ -281,7 +326,7 @@ jobs:
   cargo-test-build:
     name: cargo-test gate (build)
     needs: tested-tree
-    if: ${{ needs.tested-tree.outputs.run == '' }}
+    if: ${{ needs.tested-tree.outputs.run == '' && needs.tested-tree.outputs.scope != 'none' }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -378,7 +423,7 @@ jobs:
 
   cargo-test-shard:
     name: cargo-test gate (shard ${{ matrix.shard }}/12)
-    needs: cargo-test-build
+    needs: [tested-tree, cargo-test-build]
     strategy:
       fail-fast: false
       matrix:
@@ -420,7 +465,15 @@ jobs:
           path: ${{ runner.temp }}/rust-tests-archive
 
       - name: Run workspace tests
-        run: ../scripts/test-like-ci.sh --from-archive "$RUNNER_TEMP/rust-tests-archive/rust-tests.tar.zst" --partition "hash:${{ matrix.shard }}/12"
+        env:
+          SELECTION: ${{ needs.tested-tree.outputs.selection }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SELECTION" ]; then
+            ../scripts/test-like-ci.sh --from-archive "$RUNNER_TEMP/rust-tests-archive/rust-tests.tar.zst" --partition "hash:${{ matrix.shard }}/12" --selection "$SELECTION"
+          else
+            ../scripts/test-like-ci.sh --from-archive "$RUNNER_TEMP/rust-tests-archive/rust-tests.tar.zst" --partition "hash:${{ matrix.shard }}/12"
+          fi
 
       - name: Upload the shard report
         if: ${{ always() }}
@@ -435,7 +488,7 @@ jobs:
   cargo-test-examples-doctests:
     name: cargo-test gate (examples and doctests)
     needs: tested-tree
-    if: ${{ needs.tested-tree.outputs.run == '' }}
+    if: ${{ needs.tested-tree.outputs.run == '' && needs.tested-tree.outputs.scope != 'none' }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -479,13 +532,35 @@ jobs:
 
       - name: Require every part of the gate
         env:
+          SCOPE: ${{ needs.tested-tree.outputs.scope }}
           BUILD: ${{ needs.cargo-test-build.result }}
           SHARDS: ${{ needs.cargo-test-shard.result }}
           EXAMPLES: ${{ needs.cargo-test-examples-doctests.result }}
         run: |
           set -euo pipefail
-          echo "build=$BUILD shards=$SHARDS examples=$EXAMPLES"
-          [[ "$BUILD" == success && "$SHARDS" == success && "$EXAMPLES" == success ]]
+          echo "scope=$SCOPE build=$BUILD shards=$SHARDS examples=$EXAMPLES"
+          case "$SCOPE" in
+            none) echo "No change since the parent commit; nothing to test." ;;
+            full|changed) [[ "$BUILD" == success && "$SHARDS" == success && "$EXAMPLES" == success ]] ;;
+            *) echo "unknown test scope '$SCOPE'" >&2; exit 1 ;;
+          esac
+
+      # A release tag requires this record (wait-for-release-gates.sh).
+      - name: Record a passing full suite
+        if: ${{ needs.tested-tree.outputs.scope == 'full' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/full-suite"
+          git rev-parse HEAD > "$RUNNER_TEMP/full-suite/commit"
+
+      - name: Upload the full-suite record
+        if: ${{ needs.tested-tree.outputs.scope == 'full' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: full-suite
+          path: ${{ runner.temp }}/full-suite/
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Download the shard reports
         if: ${{ always() && needs.cargo-test-build.result == 'success' }}

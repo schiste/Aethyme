@@ -1348,9 +1348,15 @@ fn release_gate_waits_for_success_and_rejects_failures() {
     let fixture = tempfile::tempdir().unwrap();
     let gh = fixture.path().join("gh");
     std::fs::write(&gh, r##"#!/usr/bin/env bash
+case "$2" in
+  */runs/7/artifacts*) echo '{"artifacts":[{"name":"full-suite","expired":false}]}'; exit 0 ;;
+  */runs/8/artifacts*) echo '{"artifacts":[]}'; exit 0 ;;
+esac
 case "$CASE" in
-  pending) if test -e "$STATE"; then echo '{"workflow_runs":[{"status":"completed","conclusion":"success"}]}'; else touch "$STATE"; echo '{"workflow_runs":[{"status":"in_progress","conclusion":null}]}'; fi ;;
-  failed) echo '{"workflow_runs":[{"status":"completed","conclusion":"failure"}]}' ;;
+  pending) if test -e "$STATE"; then echo '{"workflow_runs":[{"id":7,"status":"completed","conclusion":"success"}]}'; else touch "$STATE"; echo '{"workflow_runs":[{"id":7,"status":"in_progress","conclusion":null}]}'; fi ;;
+  changed_only) echo '{"workflow_runs":[{"id":8,"status":"completed","conclusion":"success"}]}' ;;
+  full_after_changed) echo '{"workflow_runs":[{"id":8,"status":"completed","conclusion":"success"},{"id":7,"status":"completed","conclusion":"success"}]}' ;;
+  failed) echo '{"workflow_runs":[{"id":9,"status":"completed","conclusion":"failure"}]}' ;;
   missing) echo '{"workflow_runs":[]}' ;;
   api_error) exit 1 ;;
 esac
@@ -1359,7 +1365,9 @@ esac
     let script =
         aethyme_testkit::paths::repo_root().join(".github/scripts/wait-for-release-gates.sh");
     for (case, wait, succeeds, expected) in [
-        ("pending", "3", true, "passed on"),
+        ("pending", "3", true, "passed the full suite on"),
+        ("full_after_changed", "0", true, "passed the full suite on"),
+        ("changed_only", "3", false, "without the full suite"),
         ("failed", "3", false, "completed without success"),
         ("missing", "0", false, "Timed out"),
         ("api_error", "0", false, "Timed out"),

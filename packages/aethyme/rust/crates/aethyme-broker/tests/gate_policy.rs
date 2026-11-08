@@ -227,9 +227,23 @@ fn fast_guards_precede_cargo_test_on_every_path_it_covers() {
         missing.is_empty(),
         "cargo-test triggers missing from fast-guards: {missing:?}"
     );
+    // The pre-push tier: format, compile every test target, and run the
+    // selected tests (`prepush-selection.sh`) when nextest is installed.
+    for step in [
+        "cargo fmt --all --check",
+        "packages/aethyme/scripts/prepush-selection.sh --base aethyme/integration",
+        "cargo nextest run --locked --workspace --profile local",
+        "-E \"$sel\"",
+    ] {
+        assert!(
+            fast.command.contains(step),
+            "fast-guards does not run {step:?}"
+        );
+    }
     for suite in FAST_GUARD_SUITES {
         assert!(
             fast.command.contains(&format!("--test {suite} "))
+                || fast.command.contains(&format!("--test {suite};"))
                 || fast.command.ends_with(&format!("--test {suite}")),
             "fast-guards does not run {suite}"
         );
@@ -367,6 +381,12 @@ fn only_the_gate_settings_raise_the_rust_gate_workers() {
     )
     .unwrap();
     fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
+    // fast-guards asks the shipped selector for its tests; this fixture has
+    // no checkout, so a stand-in answers with a fixed filterset.
+    let selector = root.join("packages/aethyme/scripts/prepush-selection.sh");
+    fs::create_dir_all(selector.parent().unwrap()).unwrap();
+    fs::write(&selector, "#!/bin/sh\necho 'binary_id(stub)'\n").unwrap();
+    fs::set_permissions(&selector, fs::Permissions::from_mode(0o700)).unwrap();
     let events = root.join("events");
     let gates = load_gates(&repo_root()).unwrap();
     let run = |name: &str, settings: &[(&str, &str)]| {
@@ -595,6 +615,12 @@ esac
     )
     .unwrap();
     fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
+    // fast-guards asks the shipped selector for its tests; this fixture has
+    // no checkout, so a stand-in answers with a fixed filterset.
+    let selector = root.join("packages/aethyme/scripts/prepush-selection.sh");
+    fs::create_dir_all(selector.parent().unwrap()).unwrap();
+    fs::write(&selector, "#!/bin/sh\necho 'binary_id(stub)'\n").unwrap();
+    fs::set_permissions(&selector, fs::Permissions::from_mode(0o700)).unwrap();
     let events = root.join("events");
     let gates = load_gates(&repo_root()).unwrap();
     let names = [
