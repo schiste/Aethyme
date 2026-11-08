@@ -20,6 +20,7 @@ artifacts and their exact source revision are recorded in each signed
 - Submit synchronized session histories whose merge parents are already in integration without rewriting those histories (#1503).
 - Allow artifact-use marker review to recover safely after mount renumbering, including a separately mounted checkout, with clearer refusal guidance (#1487, #1515).
 - Let artifact-use marker review proceed during unrelated session-index changes while retaining checkout safety checks (#1516).
+- Retire proven markers from removed predecessor checkouts when a worktree path is reused, including after a drive remount (#1518).
 - Discover sibling worktree roots when a host container is reached through a symlink (#1506).
 - Isolate broker test fixtures from host state and macOS temporary-path differences (#1506, #1508).
 
