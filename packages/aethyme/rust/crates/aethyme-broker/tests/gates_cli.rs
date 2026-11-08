@@ -2114,7 +2114,10 @@ fn host_failures_exit_environment_and_a_repeated_git_is_refused() {
     ));
     assert!(status.contains("inspect the gate log"), "{status}");
     assert!(!status.contains("the code was not judged"), "{status}");
-    assert!(!status.contains("resubmit without changing code"), "{status}");
+    assert!(
+        !status.contains("resubmit without changing code"),
+        "{status}"
+    );
 
     let repeated = run_with_managed_worktree_root(
         &worktree,
