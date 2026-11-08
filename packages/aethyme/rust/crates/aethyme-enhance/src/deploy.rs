@@ -265,9 +265,10 @@ fn deploy_inner(
                 continue;
             }
             let existing = read_text(&path)?;
-            if generated_policy_receipt(&existing)
-                .is_some_and(|receipt| receipt.policy_sha256 != policy_sha256(&receipt.policy_body))
-            {
+            if generated_policy_receipt(&existing).is_some_and(|receipt| {
+                !policy_receipt_body_is_intact(&receipt)
+                    || !crate::local::bridge_block_is_valid(&existing)
+            }) {
                 return Err(format!(
                     "customized generated policy {relative} requires reviewed resolution; run `aethyme upgrade plan --repo . --diff`, choose preserve, merge, or replace, then apply the confirmed plan"
                 ));
@@ -311,7 +312,11 @@ fn deploy_inner(
             continue;
         }
         let dest = repo.join(relative_path);
-        let content = render_target(repo, relative_path, template)?;
+        let mut content = render_target(repo, relative_path, template)?;
+        if *relative_path == "CLAUDE.md" && dest.exists() {
+            let existing = read_text(&dest)?;
+            content = crate::local::preserve_appended_bridge(&existing, &content)?;
+        }
         if dest.exists() && !force && read_text(&dest)? == content {
             // Still ensure the executable bit is right on shell scripts.
             if is_executable(relative_path) {
@@ -377,6 +382,7 @@ fn ensure_agents_document(repo: &Path, force: bool) -> Result<DeployAction, Stri
         });
     }
     let existing = read_text(&dest)?;
+    let content = crate::local::preserve_appended_bridge(&existing, &content)?;
     if !force && existing == content {
         return Ok(DeployAction {
             relative_path: "AGENTS.md".to_string(),
@@ -398,7 +404,9 @@ fn migrate_legacy_agents_content(repo: &Path) -> Result<Option<DeployAction>, St
         return Ok(None);
     }
     let existing = read_text(&agents_path)?;
-    let legacy_content = extract_legacy_agents_content(&existing)?;
+    let legacy_source =
+        crate::local::strip_appended_bridge(&existing).unwrap_or_else(|| existing.clone());
+    let legacy_content = extract_legacy_agents_content(&legacy_source)?;
     if legacy_content.is_empty() {
         return Ok(None);
     }
@@ -737,14 +745,34 @@ fn verify_agents_document(repo: &Path) -> Result<VerifyResult, String> {
     })
 }
 
+fn policy_receipt_body_is_intact(receipt: &crate::agents::GeneratedPolicyReceipt) -> bool {
+    if policy_sha256(&receipt.policy_body) == receipt.policy_sha256 {
+        return true;
+    }
+    crate::local::strip_appended_bridge(&receipt.policy_body)
+        .is_some_and(|body| policy_sha256(&body) == receipt.policy_sha256)
+}
+
 fn verify_policy_content(actual: &str, canonical: &str) -> (bool, PolicyProvenance) {
+    let receipt = generated_policy_receipt(actual);
+    if !crate::local::bridge_block_is_valid(actual) {
+        return match receipt {
+            Some(receipt) => (
+                false,
+                PolicyProvenance::ModifiedAfterGeneration {
+                    generator_version: receipt.generator_version,
+                },
+            ),
+            None => (false, PolicyProvenance::Unmanaged),
+        };
+    }
     if policy_matches_canonical(actual, canonical) {
         return (true, PolicyProvenance::Current);
     }
     let canonical_receipt = generated_policy_receipt(canonical)
         .expect("rendered canonical policy always carries provenance");
-    if let Some(receipt) = generated_policy_receipt(actual) {
-        if policy_sha256(&receipt.policy_body) != receipt.policy_sha256 {
+    if let Some(receipt) = receipt {
+        if !policy_receipt_body_is_intact(&receipt) {
             return (
                 false,
                 PolicyProvenance::ModifiedAfterGeneration {
@@ -1103,6 +1131,54 @@ mod tests {
                 generator_version: "0.3.0".into()
             }
         );
+    }
+
+    #[test]
+    fn inert_local_bridge_verifies_and_survives_generated_redeploy() {
+        let repo = fixture_repo("local-bridge");
+        deploy(&repo, true).unwrap();
+        crate::local::install_bridge(&repo).unwrap();
+
+        let mut results = verify(&repo).unwrap();
+        for relative in ["AGENTS.md", "CLAUDE.md"] {
+            let result = results
+                .iter()
+                .find(|result| result.relative_path == relative)
+                .unwrap();
+            assert!(
+                result.matches_canonical,
+                "{relative} should verify after installing the bridge: {:?}",
+                result.policy_provenance
+            );
+            assert!(std::fs::read_to_string(repo.join(relative))
+                .unwrap()
+                .contains(crate::local::BRIDGE_BLOCK));
+        }
+
+        deploy(&repo, false).unwrap();
+        results = verify(&repo).unwrap();
+        for relative in ["AGENTS.md", "CLAUDE.md"] {
+            let result = results
+                .iter()
+                .find(|result| result.relative_path == relative)
+                .unwrap();
+            assert!(result.matches_canonical, "{relative} should remain valid");
+            assert!(
+                std::fs::read_to_string(repo.join(relative))
+                    .unwrap()
+                    .contains(crate::local::BRIDGE_BLOCK),
+                "redeployment must preserve the local bridge in {relative}"
+            );
+        }
+
+        let agents_path = repo.join("AGENTS.md");
+        let agents = std::fs::read_to_string(&agents_path)
+            .unwrap()
+            .replace("do not run Aethyme", "probe for Aethyme");
+        std::fs::write(&agents_path, agents).unwrap();
+        let error = deploy(&repo, false).unwrap_err();
+        assert!(error.contains("customized generated policy AGENTS.md"));
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 
     #[test]
