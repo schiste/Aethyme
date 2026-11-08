@@ -875,7 +875,29 @@ fn release_signing_uses_retry_safe_legacy_cosign_and_preserves_standard_bundle()
             .unwrap();
     assert!(installer.contains("sha256sum --check --status"));
     assert!(installer.contains("sha256sum --check"));
-    assert!(installer.contains("timeout-minutes: 3"));
+    assert!(
+        !installer.contains("timeout-minutes:"),
+        "composite action steps do not support timeouts"
+    );
+    for block in [legacy_install, modern_install, homebrew_install] {
+        assert!(block.contains("timeout-minutes: 4"));
+        assert!(block.contains("continue-on-error: true"));
+    }
+    assert!(
+        workflow_step_block(&release, "Retry install retry-safe legacy cosign signer")
+            .contains("steps.legacy_cosign.outcome == 'failure'")
+    );
+    assert!(
+        workflow_step_block(
+            &release,
+            "Retry install standard-bundle converter and verifier"
+        )
+        .contains("steps.modern_cosign.outcome == 'failure'")
+    );
+    assert!(
+        workflow_step_block(&homebrew, "Retry Cosign installation")
+            .contains("steps.cosign_install.outcome == 'failure'")
+    );
     assert!(installer.contains("steps.upstream_install.outcome == 'failure'"));
     let homebrew_verify =
         workflow_step_block(&homebrew, "Verify signed manifest and regenerate formula");

@@ -312,6 +312,16 @@ jobs:
           sha256sum --check SHA256SUMS
 
       - name: Install retry-safe legacy Cosign signer
+        id: legacy_cosign
+        continue-on-error: true
+        timeout-minutes: 4
+        uses: ./.github/actions/install-cosign
+        with:
+          version: v2.6.5
+
+      - name: Retry install retry-safe legacy cosign signer
+        if: steps.legacy_cosign.outcome == 'failure'
+        timeout-minutes: 4
         uses: ./.github/actions/install-cosign
         with:
           version: v2.6.5
@@ -333,6 +343,16 @@ jobs:
             "$zip"
 
       - name: Install standard-bundle converter and verifier
+        id: modern_cosign
+        continue-on-error: true
+        timeout-minutes: 4
+        uses: ./.github/actions/install-cosign
+        with:
+          version: v3.1.3
+
+      - name: Retry install standard-bundle converter and verifier
+        if: steps.modern_cosign.outcome == 'failure'
+        timeout-minutes: 4
         uses: ./.github/actions/install-cosign
         with:
           version: v3.1.3
