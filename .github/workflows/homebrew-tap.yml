@@ -116,7 +116,17 @@ jobs:
           toolchain: stable
 
       - name: Install Cosign
+        id: cosign_install
         if: steps.release.outputs.mode != 'skip'
+        continue-on-error: true
+        timeout-minutes: 4
+        uses: ./.aethyme-workflow-source/.github/actions/install-cosign
+        with:
+          version: v3.1.3
+
+      - name: Retry Cosign installation
+        if: steps.release.outputs.mode != 'skip' && steps.cosign_install.outcome == 'failure'
+        timeout-minutes: 4
         uses: ./.aethyme-workflow-source/.github/actions/install-cosign
         with:
           version: v3.1.3
