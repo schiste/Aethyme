@@ -859,14 +859,22 @@ fn release_signing_uses_retry_safe_legacy_cosign_and_preserves_standard_bundle()
     let homebrew =
         std::fs::read_to_string(repository.join(".github/workflows/homebrew-tap.yml")).unwrap();
     let legacy_install = workflow_step_block(&release, "Install retry-safe legacy Cosign signer");
-    assert!(legacy_install.contains("cosign-release: v2.6.5"));
-    assert!(legacy_install.contains("install-dir: ${{ runner.temp }}/cosign-v2.6.5"));
+    assert!(legacy_install.contains("version: v2.6.5"));
+    assert!(legacy_install.contains("./.github/actions/install-cosign"));
     let modern_install =
         workflow_step_block(&release, "Install standard-bundle converter and verifier");
-    assert!(modern_install.contains("cosign-release: v3.1.3"));
-    assert!(modern_install.contains("install-dir: ${{ runner.temp }}/cosign-v3.1.3"));
+    assert!(modern_install.contains("version: v3.1.3"));
+    assert!(modern_install.contains("./.github/actions/install-cosign"));
     let homebrew_install = workflow_step_block(&homebrew, "Install Cosign");
-    assert!(homebrew_install.contains("cosign-release: v3.1.3"));
+    assert!(homebrew_install.contains("version: v3.1.3"));
+    assert!(homebrew_install.contains("./.github/actions/install-cosign"));
+    let installer =
+        std::fs::read_to_string(repository.join(".github/actions/install-cosign/action.yml"))
+            .unwrap();
+    assert!(installer.contains("sha256sum --check --status"));
+    assert!(installer.contains("sha256sum --check"));
+    assert!(installer.contains("timeout-minutes: 3"));
+    assert!(installer.contains("steps.upstream_install.outcome == 'failure'"));
     let homebrew_verify =
         workflow_step_block(&homebrew, "Verify signed manifest and regenerate formula");
     assert!(homebrew_verify.contains("--certificate-identity"));
@@ -1306,5 +1314,56 @@ fn windows_release_builds_and_smokes_the_native_zip() {
             smoke.contains(fragment),
             "Windows smoke is missing {fragment}"
         );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn release_gate_waits_for_success_and_rejects_failures() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = tempfile::tempdir().unwrap();
+    let gh = fixture.path().join("gh");
+    std::fs::write(&gh, r##"#!/usr/bin/env bash
+case "$CASE" in
+  pending) if test -e "$STATE"; then echo '{"workflow_runs":[{"status":"completed","conclusion":"success"}]}'; else touch "$STATE"; echo '{"workflow_runs":[{"status":"in_progress","conclusion":null}]}'; fi ;;
+  failed) echo '{"workflow_runs":[{"status":"completed","conclusion":"failure"}]}' ;;
+  missing) echo '{"workflow_runs":[]}' ;;
+  api_error) exit 1 ;;
+esac
+"##).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let script =
+        aethyme_testkit::paths::repo_root().join(".github/scripts/wait-for-release-gates.sh");
+    for (case, wait, succeeds, expected) in [
+        ("pending", "3", true, "passed on"),
+        ("failed", "3", false, "completed without success"),
+        ("missing", "0", false, "Timed out"),
+        ("api_error", "0", false, "Timed out"),
+    ] {
+        let output = Command::new("bash")
+            .arg(&script)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    fixture.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("GITHUB_REPOSITORY", "owner/repo")
+            .env("SHA", "abc123")
+            .env("AETHYME_GATE_WAIT_SECONDS", wait)
+            .env("AETHYME_GATE_POLL_SECONDS", "1")
+            .env("CASE", case)
+            .env("STATE", fixture.path().join("state"))
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.success(), succeeds, "{case}: {text}");
+        assert!(text.contains(expected), "{case}: {text}");
     }
 }

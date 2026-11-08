@@ -307,7 +307,16 @@ jobs:
           save-if: false
 
       - name: Install cargo-nextest
-        timeout-minutes: 5
+        id: nextest_install
+        continue-on-error: true
+        timeout-minutes: 3
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: cargo-nextest@0.9.146
+
+      - name: Retry cargo-nextest installation
+        if: steps.nextest_install.outcome == 'failure'
+        timeout-minutes: 3
         uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
           tool: cargo-nextest@0.9.146

@@ -509,7 +509,11 @@ fn test_shards_reuse_the_build_jobs_verified_nextest() {
         let text = workflow(file);
         let build = block(&text, build_name).join("\n");
         let shard = block(&text, shard_name).join("\n");
-        assert!(build.contains("timeout-minutes: 5"), "{file}");
+        assert!(build.contains("timeout-minutes: 3"), "{file}");
+        assert!(
+            build.contains("steps.nextest_install.outcome == 'failure'"),
+            "{file}"
+        );
         assert!(build.contains("name: rust-tests-nextest"), "{file}");
         assert!(
             build.contains("sha256sum cargo-nextest > SHA256SUMS"),
