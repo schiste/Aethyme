@@ -1366,4 +1366,13 @@ esac
         assert_eq!(output.status.success(), succeeds, "{case}: {text}");
         assert!(text.contains(expected), "{case}: {text}");
     }
+    let invalid = Command::new("bash")
+        .arg(&script)
+        .env("GITHUB_REPOSITORY", "owner/repo")
+        .env("SHA", "abc123")
+        .env("AETHYME_GATE_POLL_SECONDS", "0")
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("invalid gate polling duration"));
 }
