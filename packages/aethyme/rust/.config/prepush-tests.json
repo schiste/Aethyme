@@ -1172,5 +1172,648 @@
   "aethyme-testkit::release_contract the_graph_engine_pin_moves_with_the_release_version": 0.01,
   "aethyme-testkit::release_contract windows_release_builds_and_smokes_the_native_zip": 0.0,
   "aethyme-testkit::release_installer stable_installer_fetches_verifies_and_updates_the_binary_pair": 31.43
- }
+ },
+ "slow_seconds": 5.0,
+ "slow_tests": [
+  {
+   "binary": "aethyme-broker",
+   "test": "agent_supervisor::tests::descendant_held_pipes_finish_with_incomplete_capture",
+   "seconds": 5.1
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "agent_supervisor::tests::session_remains_live_until_the_cleanup_group_is_gone",
+   "seconds": 11.1
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "analysis_view::tests::a_crash_never_publishes_a_partial_generation",
+   "seconds": 6.1
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "analysis_view::tests::a_held_or_building_view_keeps_everything",
+   "seconds": 8.7
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "analysis_view::tests::a_pinned_generation_and_current_are_never_reclaimed",
+   "seconds": 8.7
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "analysis_view::tests::a_reader_does_not_wait_for_a_build",
+   "seconds": 5.8
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "analysis_view::tests::a_superseded_generation_waits_for_grace",
+   "seconds": 5.8
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "analysis_view::tests::a_symlinked_view_is_unknown_and_untouched",
+   "seconds": 5.1
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "analysis_view::tests::a_view_answers_only_under_its_profile",
+   "seconds": 6.1
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "analysis_view::tests::an_interrupted_view_reclamation_resumes",
+   "seconds": 5.6
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "analysis_view::tests::build_publication_waits_for_retirement_lock",
+   "seconds": 6.6
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "analysis_view::tests::concurrent_holds_preserve_each_holder_and_expiry",
+   "seconds": 5.8
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "analysis_view::tests::hold_publication_preserves_another_temporary_file",
+   "seconds": 6.5
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "analysis_view::tests::opening_a_view_pins_before_retirement_can_finish",
+   "seconds": 6.6
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "analysis_view::tests::retiring_waits_for_holds_and_readers",
+   "seconds": 6.1
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "analysis_view::tests::views_are_isolated_and_never_write_canonical_state",
+   "seconds": 6.6
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "auto_cleanup::fail_closed_removal_tests::auto_cleanup_preserves_candidate_after_git_removal_timeout",
+   "seconds": 5.6
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "auto_cleanup::tests::apply_refuses_raw_checkout_path_retargeted_to_candidate_without_db_change",
+   "seconds": 6.4
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "auto_cleanup::tests::automatic_retirement_closes_old_unbound_sessions_after_the_existing_window",
+   "seconds": 5.3
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "auto_cleanup::tests::automatic_retirement_defers_a_busy_database_writer_without_waiting",
+   "seconds": 6.4
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "auto_cleanup::tests::checked_worktree_activity_uses_the_gitdir_pointer_not_checkout_basename",
+   "seconds": 5.3
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "auto_cleanup::tests::explicit_artifact_use_apply_retains_marker_with_unavailable_start_token",
+   "seconds": 11.7
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "auto_cleanup::tests::explicit_artifact_use_apply_returns_prior_progress_when_later_marker_changes",
+   "seconds": 5.5
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "auto_cleanup::tests::marker_review_refuses_pending_churn_that_touches_the_checkout",
+   "seconds": 6.5
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "auto_cleanup::tests::marker_review_settles_a_marker_left_by_a_session_replace_stale_retired",
+   "seconds": 5.7
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "broker::cleanup::registered_removal_failure_tests::start_waits_for_a_lifecycle_claim_held_past_ten_seconds",
+   "seconds": 11.5
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "broker::gates::timeout_tests::affected_gate_selection_refuses_timed_out_git_reads",
+   "seconds": 7.2
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "broker::leases::generic_guarded_exec_tests::session_operation_guard_busy_defers_abandoned_close",
+   "seconds": 6.1
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "broker::leases::generic_guarded_exec_tests::v1_helper_refuses_v3_before_the_guarded_command_can_write",
+   "seconds": 6.0
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "broker::lifecycle::fresh_root_recovery_inventory_tests::durable_registry_row_before_binding_is_an_exact_retryable_prefix",
+   "seconds": 5.8
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "collaboration_cli::contribution::tests::an_old_omitted_fields_retry_inherits_the_current_operations_and_dependencies",
+   "seconds": 8.3
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "collaboration_cli::contribution::tests::public_handler_applies_valid_rename_and_exact_dependency_updates",
+   "seconds": 8.0
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "collaboration_cli::lifecycle::tests::retained_handoff_projection_preserves_request_without_agent_authority",
+   "seconds": 5.6
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "collaboration_cli::project::binding_tests::an_uncommitted_descriptor_pointer_does_not_authorize_binding",
+   "seconds": 6.3
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "collaboration_cli::resolution::tests::resolution_commands_attach_synthesis_under_current_authority",
+   "seconds": 11.4
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "collaboration_context::revisions::tests::exact_revision_pin_keeps_ancestor_proofs_then_gc_reclaims_unrooted_history",
+   "seconds": 8.2
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "collaboration_context::tests::a_release_purges_cached_answers_carrying_the_contribution",
+   "seconds": 6.4
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "collaboration_context::tests::an_answer_with_a_cut_dependency_set_is_partial_and_refetched",
+   "seconds": 7.8
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "collaboration_gc::tests::a_failure_mid_apply_resumes_without_losing_retained_source",
+   "seconds": 5.0
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "environments::activity_tests::probes_keep_it_awake_and_a_hung_probe_counts_as_active",
+   "seconds": 6.2
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "file_lock::tests::a_foreground_claim_outlasts_a_holder_past_the_old_ten_second_wait",
+   "seconds": 11.0
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "inline_exec_supervisor::tests::incomplete_partial_frame_hits_fixed_assembly_deadline",
+   "seconds": 5.0
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "inline_exec_supervisor::tests::ready_helper_waits_past_startup_timeout_for_admission",
+   "seconds": 5.3
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "local_compatibility::absent_or_disabled_collaboration_allocates_no_retained_state_and_keeps_legacy_verdict",
+   "seconds": 6.5
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "local_exchange::revision_tests::snapshot_page_rejects_aggregate_revision_bytes_over_the_page_cap",
+   "seconds": 35.7
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "local_handoff::tests::interrupted_dispatch_is_inspectable_and_cannot_relaunch_or_reappoint",
+   "seconds": 10.6
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "local_handoff::tests::ready_or_adopted_target_stop_drift_and_resume_aba_never_send_go",
+   "seconds": 14.1
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "local_handoff::tests::surviving_grandchild_keeps_old_descriptor_and_watcher_after_new_adoption_and_parent_exit",
+   "seconds": 5.9
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "native_gates::tests::settled_synthesized_attempt_attaches_and_prepares_a_fresh_exact_gate",
+   "seconds": 5.2
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "representation::tests::search_can_exceed_one_git_batch_while_respecting_total_budget",
+   "seconds": 5.5
+  },
+  {
+   "binary": "aethyme-broker",
+   "test": "store::fresh_database::unix::tests::a_sidecar_removed_by_the_last_connection_is_not_refused",
+   "seconds": 5.4
+  },
+  {
+   "binary": "aethyme-broker::broker",
+   "test": "cleanup_plan_and_apply_reclaim_only_safe_closed_broker_worktrees",
+   "seconds": 6.2
+  },
+  {
+   "binary": "aethyme-broker::gate_database_isolation",
+   "test": "a_dirty_tree_migration_in_a_gate_lands_only_in_its_disposable_database",
+   "seconds": 6.1
+  },
+  {
+   "binary": "aethyme-broker::gates_e2e",
+   "test": "session_and_full_tree_gates_record_committed_graph_authority_as_advice",
+   "seconds": 12.8
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "adopt_cli::unavailable_remote_default_ref_is_not_treated_as_local_only",
+   "seconds": 5.0
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "auto_cleanup::apply_preserves_selected_checkout_after_cleanup_policy_changes",
+   "seconds": 8.6
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "cleanup_resolve_cli::recovery_batch_retires_closed_targets_without_removing_a_live_target",
+   "seconds": 5.5
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "collaboration_submit_cli::a_failed_advisory_capture_never_changes_the_legacy_verdict",
+   "seconds": 9.8
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "collaboration_submit_cli::a_retried_submit_gets_the_same_receipt",
+   "seconds": 5.3
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "collaboration_submit_cli::off_is_the_legacy_submit",
+   "seconds": 19.9
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "collaboration_submit_cli::the_capture_base_is_the_base_the_submit_verified_against",
+   "seconds": 9.1
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "composer_fixtures::held_out_cases_are_reported",
+   "seconds": 6.5
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "composer_fixtures::the_provisional_cases_against_the_oracle",
+   "seconds": 10.7
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "finish_cli::finish_cli_reports_partial_cleanup_and_resumes_idempotently",
+   "seconds": 5.1
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "finish_cli::finish_timeout_does_not_kill_worktree_removal_after_the_session_closes",
+   "seconds": 5.4
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "gate_cache_inventory::a_finished_checkout_a_live_session_adopted_is_never_swept",
+   "seconds": 5.8
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "gate_cache_inventory::an_entry_whose_lease_a_live_gate_holds_is_never_proposed_nor_charged_to_the_budget",
+   "seconds": 5.3
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "gate_cache_inventory::the_active_cache_is_proposed_only_with_the_explicit_opt_in",
+   "seconds": 5.1
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "gate_trust_cli::a_new_clone_refuses_gates_and_submit_until_trusted",
+   "seconds": 5.6
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "gates_cli::exit_codes_name_the_outcome_an_agent_acts_on",
+   "seconds": 5.1
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "gates_cli::gate_cli_reports_tree_provenance_for_executed_and_cached_results",
+   "seconds": 11.4
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "gates_cli::independent_repositories_share_gate_host_resources_and_release_them",
+   "seconds": 8.1
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "gates_cli::submit_cli_bypasses_and_then_refreshes_the_merged_tree_cache",
+   "seconds": 7.5
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "gates_cli::submit_distinguishes_missing_unmatched_and_passing_gate_evidence",
+   "seconds": 13.0
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "gc_sweep_cli::a_reclaim_confirmation_is_refused_for_a_different_scope",
+   "seconds": 5.0
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "gc_sweep_cli::broker_opens_preserve_the_completed_or_partial_sweep_state",
+   "seconds": 9.9
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "gh_ref_delete_guard_cli::downloads_with_a_destination_are_refused_and_plain_ones_run",
+   "seconds": 6.0
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "gh_ref_delete_guard_cli::every_spelling_outside_the_exact_forms_is_refused_unless_acknowledged",
+   "seconds": 8.6
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "gh_ref_delete_guard_cli::the_default_and_integration_branches_are_never_rewritten",
+   "seconds": 5.0
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "gh_refusal_cli::a_timed_out_pr_topology_write_invalidates_cached_open_pr_membership",
+   "seconds": 6.2
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "inspection_budget_cli::interactive_reads_stay_under_ten_seconds_with_sixty_five_sessions",
+   "seconds": 6.1
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "merge_e2e::a_first_broker_timeout_defers_the_submission_and_a_repeat_rejects_it",
+   "seconds": 5.4
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "merge_e2e::base_gate_policy_judges_a_submission_that_weakens_or_deletes_its_gates",
+   "seconds": 5.8
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "merge_e2e::normalized_replay_handles_rebased_rename_binary_empty_and_stable_order",
+   "seconds": 5.1
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "merge_e2e::promotion_does_not_resurrect_conflicts_from_cleaned_sessions",
+   "seconds": 5.2
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "merge_e2e::reconcile_recognizes_squash_preserves_followups_and_replays_pending_work",
+   "seconds": 6.7
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "merge_e2e::reconcile_uses_upstream_boundary_and_recovers_repromoted_empty_entries",
+   "seconds": 5.8
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "queued_operations_cli::an_identical_pending_command_from_one_session_is_refused",
+   "seconds": 7.3
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "queued_operations_cli::an_operation_waiting_for_the_lock_is_visible_as_prepared",
+   "seconds": 7.3
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "queued_operations_cli::no_wait_refuses_immediately_instead_of_queueing",
+   "seconds": 7.2
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "reclaim_ordering::a_budget_reclamation_cannot_meet_reads_differently_from_a_backlog",
+   "seconds": 6.5
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "reclaim_ordering::an_unset_budget_is_off_rather_than_permanently_exceeded",
+   "seconds": 6.7
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "reclaim_ordering::build_caches_follow_the_same_rule_the_worktrees_do",
+   "seconds": 6.8
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "reclaim_ordering::over_budget_the_largest_candidate_is_planned_first",
+   "seconds": 6.2
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "reclaim_ordering::status_carries_the_same_budget_verdict_the_plan_does",
+   "seconds": 6.6
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "reclaim_ordering::the_deficit_is_reported_as_bytes_to_shed_rather_than_a_flag",
+   "seconds": 6.1
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "reclaim_ordering::the_same_backlog_is_ordered_differently_by_the_budget_alone",
+   "seconds": 6.3
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "reclaim_ordering::within_budget_the_longest_retained_candidate_is_planned_first",
+   "seconds": 6.5
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "recovery_archive_gc_cli::retirement_archive_floor_survives_landing_and_a_shorter_current_policy",
+   "seconds": 9.7
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "resolution_fixtures::held_out_cases_are_reported",
+   "seconds": 5.3
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "resolution_fixtures::verification_raises_requests_where_a_candidate_fails_its_checks",
+   "seconds": 12.9
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "resolution_fixtures::writes_outside_the_scope_are_refused",
+   "seconds": 6.5
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "review_cli::review_gated_ship_requires_every_entry_and_revalidates_live_evidence",
+   "seconds": 6.9
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "review_cli::trusted_check_run_can_satisfy_review_without_an_approval_webhook",
+   "seconds": 5.3
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "session_push_cli::malformed_pr_policy_refuses_before_pushing_the_session_branch",
+   "seconds": 5.5
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "ship_e2e::selected_prefix_publication_resolves_only_contained_promoted_entries",
+   "seconds": 5.1
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "ship_e2e::ship_execute_only_publishes_selected_entry_and_reconciles_pending_work",
+   "seconds": 7.6
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "ship_e2e::ship_plan_only_excludes_entries_already_on_the_remote",
+   "seconds": 6.3
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "ship_e2e::ship_plan_only_refuses_to_publish_when_selected_gates_fail",
+   "seconds": 5.3
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "v0_scenario::v0_three_agents_end_to_end",
+   "seconds": 6.4
+  },
+  {
+   "binary": "aethyme-broker::it",
+   "test": "worktree_root_cli::unowned_or_invalid_roots_refuse_before_permissions_checkout_or_agent_changes",
+   "seconds": 8.5
+  },
+  {
+   "binary": "aethyme-broker::operations_e2e",
+   "test": "bounded_remote_write_timeout_is_journaled_unknown_and_blocks_retry",
+   "seconds": 5.7
+  },
+  {
+   "binary": "aethyme-broker::pr_overlap_cli",
+   "test": "recorded_status_warning_is_invalidated_when_push_inputs_move",
+   "seconds": 12.4
+  },
+  {
+   "binary": "aethyme-broker::pr_overlap_cli",
+   "test": "start_path_discloses_stale_or_wrong_base_listing_and_unknown_pr_paths",
+   "seconds": 10.6
+  },
+  {
+   "binary": "aethyme-broker::pr_overlap_cli",
+   "test": "start_path_reports_cached_pr_path_overlap_without_network_or_graph",
+   "seconds": 8.3
+  },
+  {
+   "binary": "aethyme-cli::it",
+   "test": "collab_project_association::independently_enrolled_playground_clones_confirm_persist_and_revoke_one_local_association",
+   "seconds": 7.3
+  },
+  {
+   "binary": "aethyme-cli::it",
+   "test": "json_shape_snapshots::other_broker_json_shapes_match_snapshots",
+   "seconds": 7.0
+  },
+  {
+   "binary": "aethyme-cli::it",
+   "test": "repository_enrollment_cli::confirmed_execute_preserves_publishes_verifies_syncs_and_resumes",
+   "seconds": 5.1
+  },
+  {
+   "binary": "aethyme-cli::it",
+   "test": "repository_enrollment_cli::execute_publishes_but_does_not_sync_a_dirty_primary_checkout",
+   "seconds": 6.7
+  },
+  {
+   "binary": "aethyme-cli::it",
+   "test": "repository_enrollment_cli::persisted_phase_boundary_after_outputs_applied_resumes_without_duplicate_publication",
+   "seconds": 6.9
+  },
+  {
+   "binary": "aethyme-cli::it",
+   "test": "repository_enrollment_cli::persisted_phase_boundary_after_preserved_resumes_without_duplicate_publication",
+   "seconds": 5.2
+  },
+  {
+   "binary": "aethyme-cli::it",
+   "test": "repository_enrollment_cli::persisted_phase_boundary_after_promoted_resumes_without_duplicate_publication",
+   "seconds": 5.3
+  },
+  {
+   "binary": "aethyme-cli::it",
+   "test": "repository_enrollment_cli::persisted_phase_boundary_after_published_resumes_without_duplicate_publication",
+   "seconds": 5.6
+  },
+  {
+   "binary": "aethyme-cli::it",
+   "test": "repository_enrollment_cli::stale_main_enrolls_from_upstream_and_preexisting_sibling_detects_activation",
+   "seconds": 6.6
+  },
+  {
+   "binary": "aethyme-cli::it",
+   "test": "repository_upgrade_cli::apply_revalidates_head_dirty_state_and_live_sessions_before_journaling",
+   "seconds": 5.5
+  },
+  {
+   "binary": "aethyme-cli::it",
+   "test": "repository_upgrade_cli::interrupted_upgrades_recover_every_transaction_boundary",
+   "seconds": 8.7
+  },
+  {
+   "binary": "aethyme-testkit::it",
+   "test": "build_source_identity::shared_cache_tracks_stable_revision_without_unrelated_git_metadata_rebuilds",
+   "seconds": 16.3
+  },
+  {
+   "binary": "aethyme-testkit::release_installer",
+   "test": "stable_installer_fetches_verifies_and_updates_the_binary_pair",
+   "seconds": 31.4
+  }
+ ]
 }

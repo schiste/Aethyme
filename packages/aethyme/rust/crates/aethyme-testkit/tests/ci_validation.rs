@@ -1180,7 +1180,8 @@ fn prepush_selection_adds_touched_modules_cheapest_first_within_the_budget() {
   "budget_seconds": 10,
   "always_binaries": ["k::lint"],
   "always_modules": [{"binary": "c", "module": "hot", "failing_runs": 9}],
-  "modules": {"k::lint a": 1, "c hot": 1, "c small": 2, "c big": 20, "c::it suite": 3, "c::own x": 1}
+  "modules": {"k::lint a": 1, "c hot": 1, "c small": 2, "c big": 20, "c::it suite": 3, "c::own x": 1},
+  "slow_tests": [{"binary": "k::lint", "test": "slow::one", "seconds": 9}]
 }"#,
     )
     .unwrap();
@@ -1204,11 +1205,13 @@ fn prepush_selection_adds_touched_modules_cheapest_first_within_the_budget() {
         )
     };
     let always = "binary_id(k::lint) | (binary_id(c) & test(/^hot(::|$)/))";
+    // Tests slower than the data's threshold in CI run at push, never here.
+    let slow = " & !((binary_id(k::lint) & test(=slow::one)))";
 
     // No change: the always-run suites alone.
     let (status, stdout, _) = select("base");
     assert_eq!(status, Some(0));
-    assert_eq!(stdout, format!("{always}\n"));
+    assert_eq!(stdout, format!("({always}){slow}\n"));
 
     for path in [
         "src/small.rs",
@@ -1231,7 +1234,7 @@ fn prepush_selection_adds_touched_modules_cheapest_first_within_the_budget() {
     assert_eq!(
         stdout,
         format!(
-            "{always} | (binary_id(c) & test(/^newmod(::|$)/)) | binary_id(c::own) | (binary_id(c) & test(/^small(::|$)/)) | (binary_id(c::it) & test(/^suite(::|$)/))\n"
+            "({always} | (binary_id(c) & test(/^newmod(::|$)/)) | binary_id(c::own) | (binary_id(c) & test(/^small(::|$)/)) | (binary_id(c::it) & test(/^suite(::|$)/))){slow}\n"
         )
     );
     assert!(
@@ -1246,7 +1249,7 @@ fn prepush_selection_adds_touched_modules_cheapest_first_within_the_budget() {
     // Without a merge base the always-run suites still run.
     let (status, stdout, stderr) = select("no-such-ref");
     assert_eq!(status, Some(0));
-    assert_eq!(stdout, format!("{always}\n"));
+    assert_eq!(stdout, format!("({always}){slow}\n"));
     assert!(stderr.contains("no merge base"), "{stderr}");
 }
 

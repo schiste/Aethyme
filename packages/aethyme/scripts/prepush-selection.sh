@@ -16,6 +16,9 @@
 #   2. the test modules the change touches, cheapest first, until the summed
 #      test time reaches `budget_seconds` (15% of the suite). A module with no
 #      recorded time is new, so it costs nothing here and always runs.
+#   3. minus `slow_tests`, each over `slow_seconds` (5 s) in CI: 128 tests
+#      holding 23% of suite time, which run at push instead. Two of them took
+#      over a minute each under local load and set this tier's wall time.
 #
 # Measured on 187 test-failing pull-request runs from 2026-10-20 to 2026-11-08
 # (the always-run modules were chosen from earlier runs only): this selection
@@ -115,7 +118,9 @@ out="$(jq -r --arg touched "$touched" '
         if .used + $c.c <= $d.budget_seconds then .used += $c.c | .take += [$c] else .skip += [$c] end)
     | (.skip[] | "skip\t\(.b) \(.m) (\(.c * 100 | round / 100) s)"),
       "used\t\(.used | round) s of a \($d.budget_seconds) s budget, \(.take | length) changed module(s)",
-      "sel\t" + ([($always + .take)[] | term(.b; .m)] | join(" | "))
+      "sel\t" + "(" + ([($always + .take)[] | term(.b; .m)] | join(" | ")) + ")"
+        + (if ($d.slow_tests // []) == [] then ""
+           else " & !(" + ([$d.slow_tests[] | "(binary_id(\(.binary)) & test(=\(.test)))"] | join(" | ")) + ")" end)
 ' "$data")"
 while IFS=$'\t' read -r kind text; do
     case "$kind" in
