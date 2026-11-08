@@ -741,6 +741,13 @@ pub(crate) struct ClosedArtifactCheckoutCohort {
     /// before the owner's checkout was created. Marker review only; reclaim
     /// leaves this empty.
     retired_predecessors: Vec<ClosedArtifactSessionSnapshot>,
+    /// Cleaned sessions that `--replace-stale` retired while their successor
+    /// kept working in this same checkout, each with a replacement chain that
+    /// ends at a cohort member. They never owned a separate checkout, so
+    /// their aliases do not block the cohort and their markers name this
+    /// live checkout. They grant no cleanup authority of their own.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    handed_over_predecessors: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -821,6 +828,13 @@ impl ClosedArtifactCheckoutCohort {
 
     pub(crate) fn session_ids(&self) -> Vec<i64> {
         self.sessions.iter().map(|session| session.id).collect()
+    }
+
+    /// Whether `session_id` worked in this live checkout: a cohort member, or
+    /// a predecessor `--replace-stale` handed it over from.
+    pub(crate) fn worked_in_live_checkout(&self, session_id: i64) -> bool {
+        self.sessions.iter().any(|session| session.id == session_id)
+            || self.handed_over_predecessors.contains(&session_id)
     }
 
     /// The saved spawn witness of a cleaned predecessor proven removed before
@@ -2046,6 +2060,7 @@ impl Broker {
                 .and_then(|snapshot| snapshot.spawned_instance_witness.clone()),
         };
         let mut retired_predecessors = Vec::new();
+        let mut handed_over_predecessors = Vec::new();
         for row in alias_rows {
             if deadline_expired(deadline) {
                 return Ok(unavailable(Reason::DeadlineExceeded));
@@ -2063,6 +2078,19 @@ impl Broker {
                 LiveOverlapEvidence::Disjoint => {}
                 LiveOverlapEvidence::Overlap
                     if row.cleanup_state == "closed" && group_ids.contains(&row.session_id) => {}
+                LiveOverlapEvidence::Overlap
+                    if row.cleanup_state == "cleaned"
+                        && row.canonical_path == canonical_path
+                        && self.replacement_chain_reaches_cohort(
+                            row.session_id,
+                            &canonical_path,
+                            &group_ids,
+                        )? =>
+                {
+                    if !handed_over_predecessors.contains(&row.session_id) {
+                        handed_over_predecessors.push(row.session_id);
+                    }
+                }
                 LiveOverlapEvidence::Overlap => {
                     if let Some(current_witness) = current_witness.as_ref() {
                         let owner = sessions
@@ -2128,7 +2156,49 @@ impl Broker {
             owner_session_id,
             alias_refresh_generation: index_state.alias_refresh_generation,
             retired_predecessors,
+            handed_over_predecessors,
         }))
+    }
+
+    /// Whether `alias_id` was retired by `--replace-stale` into this checkout:
+    /// following replacement links from it reaches a member of `group_ids`,
+    /// and every session on the way is cleaned and recorded at this exact
+    /// canonical path. A replaced session never had a checkout of its own, so
+    /// such an alias is the cohort's own history, not an outside occupant.
+    fn replacement_chain_reaches_cohort(
+        &self,
+        alias_id: i64,
+        canonical_path: &str,
+        group_ids: &std::collections::BTreeSet<i64>,
+    ) -> Result<bool, BrokerOpError> {
+        const MAX_REPLACEMENT_LINKS: usize = 64;
+        let same_checkout = |session: &Session| {
+            ResolvedWorktreePath::resolve(Path::new(&session.worktree_path))
+                .canonical_or_raw
+                .to_str()
+                == Some(canonical_path)
+        };
+        let mut current = alias_id;
+        for _ in 0..MAX_REPLACEMENT_LINKS {
+            let session = self.store_ref().session(current)?;
+            if session.status != crate::types::SessionStatus::Cleaned
+                || session.cleanup_state != SessionCleanupState::Cleaned
+                || !same_checkout(&session)
+            {
+                return Ok(false);
+            }
+            let Some(successor) = self.store_ref().session_replacement_successor(current)? else {
+                return Ok(false);
+            };
+            if successor <= current {
+                return Ok(false);
+            }
+            if group_ids.contains(&successor) {
+                return Ok(same_checkout(&self.store_ref().session(successor)?));
+            }
+            current = successor;
+        }
+        Ok(false)
     }
 
     /// Exclude a removed spawn's historical alias only after proving that its
@@ -4471,6 +4541,167 @@ mod tests {
         assert!(report.stopped.is_none());
         assert!(!leftover.exists());
         assert!(!successor_path.exists());
+    }
+
+    /// How the replacement link is evidenced in a handover fixture.
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[derive(Clone, Copy, Debug)]
+    enum HandoverEvidence {
+        /// The `session.replaced` event this binary writes.
+        Recorded,
+        /// No event, as an earlier binary left it: only the shared timestamp.
+        LegacyTimestamp,
+        /// No event and no shared timestamp: nothing links the two.
+        None,
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    impl ArtifactUseReconcileFixture {
+        /// The spawned owner closes; an adopted session then works in the
+        /// same checkout, leaves a killed producer's marker, and is replaced
+        /// by `start --adopt --replace-stale`. Returns the replaced session's
+        /// id and its marker; `self.session` becomes the open successor.
+        fn hand_over_by_replace_stale(&mut self, evidence: HandoverEvidence) -> (i64, PathBuf) {
+            let owner_id = self.session.id;
+            self.broker
+                .close_abandoning_unpushed(owner_id, "spawned owner closed before adoption")
+                .unwrap();
+            let checkout = self.checkout_root.clone();
+            let stale = self
+                .broker
+                .adopt(&checkout, Some("stale adopted work"))
+                .unwrap();
+            self.session = stale.clone();
+            let invocation_id = "handover-killed-producer";
+            let mut child = self.start_running_marker(invocation_id);
+            child.wait().unwrap();
+            let marker = self.marker_path(invocation_id);
+
+            let replaced = self
+                .broker
+                .adopt_with(
+                    &checkout,
+                    Some("successor"),
+                    crate::AdoptMode::ReplaceStale,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(replaced.outcome, crate::AdoptOutcome::Replaced);
+            self.session = replaced.session;
+            let db = rusqlite::Connection::open(self.broker.store().db_path()).unwrap();
+            match evidence {
+                HandoverEvidence::Recorded => {}
+                HandoverEvidence::LegacyTimestamp | HandoverEvidence::None => {
+                    db.execute(
+                        "DELETE FROM events WHERE kind = ?1",
+                        [crate::events::SESSION_REPLACED],
+                    )
+                    .unwrap();
+                }
+            }
+            if matches!(evidence, HandoverEvidence::None) {
+                db.execute(
+                    "UPDATE sessions SET created_at = created_at + 1 WHERE id = ?1",
+                    [self.session.id],
+                )
+                .unwrap();
+            }
+            (stale.id, marker)
+        }
+
+        /// Close the current session, let the index catch up, and review.
+        fn close_and_review(&mut self) -> super::ClosedArtifactCheckoutCohortResolution {
+            self.broker
+                .close_abandoning_unpushed(self.session.id, "handover fixture")
+                .unwrap();
+            let namespace = crate::store::cleanup_cohort::CLEANUP_COHORT_NAMESPACE;
+            let deadline = Instant::now() + Duration::from_secs(15);
+            for _ in 0..32 {
+                let state = self
+                    .broker
+                    .store()
+                    .cleanup_cohort_scan_state(namespace)
+                    .unwrap();
+                if state.as_ref().is_some_and(|state| {
+                    state.complete && state.unresolved_rows == 0 && state.pending_dirty_rows == 0
+                }) {
+                    break;
+                }
+                self.broker
+                    .advance_cleanup_cohort_scan(Some(deadline))
+                    .unwrap();
+            }
+            self.review_cohort()
+        }
+    }
+
+    /// A session `--replace-stale` retired never owned a checkout of its
+    /// own: its successor kept working in it. Its alias must not block the
+    /// cohort, and its killed producer's marker must be reconcilable, whether
+    /// the link was recorded or only left by an earlier binary's transaction.
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn marker_review_settles_a_marker_left_by_a_session_replace_stale_retired() {
+        for evidence in [
+            HandoverEvidence::Recorded,
+            HandoverEvidence::LegacyTimestamp,
+        ] {
+            let mut fixture = ArtifactUseReconcileFixture::new();
+            let owner_id = fixture.session.id;
+            let (replaced_id, marker) = fixture.hand_over_by_replace_stale(evidence);
+            assert_eq!(
+                fixture
+                    .broker
+                    .store()
+                    .session_replacement_successor(replaced_id)
+                    .unwrap(),
+                Some(fixture.session.id),
+                "{evidence:?}"
+            );
+
+            let (cohort, registry) = fixture.close_and_bind();
+            let mut members = cohort.session_ids();
+            members.sort_unstable();
+            assert_eq!(members, vec![owner_id, fixture.session.id], "{evidence:?}");
+            assert!(cohort.worked_in_live_checkout(replaced_id), "{evidence:?}");
+            let plan = fixture.plan(&cohort, &registry);
+            assert_eq!(plan.markers.len(), 1, "{evidence:?}");
+            assert!(
+                matches!(
+                    &plan.markers[0].disposition,
+                    crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::RemoveIfConfirmed
+                ),
+                "{evidence:?}: {:?}",
+                plan.markers[0].disposition
+            );
+            let report = fixture.apply(&cohort, &registry, &plan.digest).unwrap();
+            assert!(report.stopped.is_none(), "{evidence:?}");
+            assert!(!marker.exists(), "{evidence:?}");
+        }
+    }
+
+    /// Without replacement evidence, a cleaned session recorded at the same
+    /// path is an outside occupant the cohort cannot account for.
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn marker_review_still_refuses_a_same_path_cleaned_alias_without_a_handover() {
+        let mut fixture = ArtifactUseReconcileFixture::new();
+        let (replaced_id, marker) = fixture.hand_over_by_replace_stale(HandoverEvidence::None);
+        assert_eq!(
+            fixture
+                .broker
+                .store()
+                .session_replacement_successor(replaced_id)
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            fixture.close_and_review(),
+            super::ClosedArtifactCheckoutCohortResolution::Unavailable(
+                super::ClosedArtifactCheckoutCohortUnavailableReason::AliasOverlapOutsideCohort
+            )
+        ));
+        assert!(marker.exists());
     }
 
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
