@@ -4,6 +4,17 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.65] - 2026-11-08
+
+### Fixed
+
+- Retry transient SQLite sidecar open races without accepting unsafe files (#1540).
+- Recognize supported review configuration and direct generated-policy repair to the readiness planner (#1539).
+
+### Changed
+
+- Document how to diagnose generated-policy drift when no schema migration is pending (#1538).
+
 ## [0.8.64] - 2026-11-08
 
 **Breaking:** `env logs` now includes available hook-phase logs by default, and supervisor output is timestamped. See [upgrade and rollback guidance](UPGRADING.md#v0864).
