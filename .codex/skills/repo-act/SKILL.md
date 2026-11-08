@@ -273,6 +273,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   an explicit `preserve` or `merge` resolution when available; otherwise restore
   the intended content and inspect the resulting diff. Verify the deployed text
   and mirrored-skill parity; never commit a template overwrite blindly.
+- If generated policy verification fails but an upgrade plan reports no schema
+  migration, review `aethyme broker status readiness plan --diff` with explicit
+  resolutions instead. Check the complete proposed diff and active-session and
+  lease blockers before applying its exact digest; do not force past them.
 - Keep matching `.claude/skills` and `.codex/skills` files byte-identical when
   editing a mirrored skill; run `cargo test -p aethyme-testkit --test it
   skill_surface_parity::claude_and_codex_skill_trees_stay_byte_identical -- --exact`.
