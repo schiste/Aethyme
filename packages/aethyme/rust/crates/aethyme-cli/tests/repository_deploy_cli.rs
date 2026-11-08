@@ -420,6 +420,34 @@ fn generated_only_deployment_preserves_the_discoverability_only_workflow() {
         String::from_utf8_lossy(&verified.stdout),
         String::from_utf8_lossy(&verified.stderr)
     );
+    let bridge = command(&repo)
+        .args(["deploy", "bridge", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        bridge.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bridge.stderr)
+    );
+    let verified_bridge = command(&repo)
+        .args(["deploy", "verify", "--generated-only", "--repo"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        verified_bridge.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&verified_bridge.stdout),
+        String::from_utf8_lossy(&verified_bridge.stderr)
+    );
+    assert!(!repo.join(".aethyme/local/enabled").exists());
+    assert!(fs::read_to_string(repo.join("AGENTS.md"))
+        .unwrap()
+        .contains(".aethyme/local/enabled"));
+    assert!(fs::read_to_string(repo.join("CLAUDE.md"))
+        .unwrap()
+        .contains(".aethyme/local/enabled"));
     assert!(
         repo.join(".aethyme/generated/experience-status.md")
             .is_file(),

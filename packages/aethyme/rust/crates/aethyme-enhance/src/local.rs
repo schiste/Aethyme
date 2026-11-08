@@ -122,6 +122,42 @@ pub fn bridge_installed(repo: &Path) -> bool {
     })
 }
 
+/// Remove the exact inert bridge when it is the only appended extension to a
+/// generated policy. The returned policy is normalized to one trailing
+/// newline, matching generated-policy receipt hashing.
+pub(crate) fn strip_appended_bridge(content: &str) -> Option<String> {
+    if content.matches(BRIDGE_BEGIN).count() != 1 || content.matches(BRIDGE_END).count() != 1 {
+        return None;
+    }
+    let start = content.find(BRIDGE_BEGIN)?;
+    let end_start = content.find(BRIDGE_END)?;
+    if end_start < start {
+        return None;
+    }
+    let end = end_start + BRIDGE_END.len();
+    if &content[start..end] != BRIDGE_BLOCK || !content[end..].trim().is_empty() {
+        return None;
+    }
+    let prefix = content[..start].strip_suffix("\n\n")?;
+    Some(normalize_trailing_newline(prefix.trim_end().to_string()))
+}
+
+pub(crate) fn bridge_block_is_valid(content: &str) -> bool {
+    let has_begin = content.contains(BRIDGE_BEGIN);
+    let has_end = content.contains(BRIDGE_END);
+    if !has_begin && !has_end {
+        return true;
+    }
+    strip_appended_bridge(content).is_some()
+}
+
+pub(crate) fn preserve_appended_bridge(existing: &str, generated: &str) -> Result<String, String> {
+    if strip_appended_bridge(existing).is_none() || generated.contains(BRIDGE_BLOCK) {
+        return Ok(generated.to_string());
+    }
+    upsert_block(generated, BRIDGE_BEGIN, BRIDGE_END, BRIDGE_BLOCK)
+}
+
 pub fn prepare(repo: &Path) -> Result<(), String> {
     if !bridge_installed(repo) {
         return Err(
@@ -451,6 +487,24 @@ mod tests {
                 "local-only deployment writes {path} but nothing excludes it: {entries:?}"
             );
         }
+    }
+
+    #[test]
+    fn bridge_stripping_requires_the_exact_terminal_block() {
+        let generated = "Generated policy.\n";
+        let with_bridge = upsert_block(generated, BRIDGE_BEGIN, BRIDGE_END, BRIDGE_BLOCK).unwrap();
+        assert_eq!(
+            strip_appended_bridge(&with_bridge).as_deref(),
+            Some(generated)
+        );
+
+        let altered = with_bridge.replace("do not run Aethyme", "probe for Aethyme");
+        assert!(!bridge_block_is_valid(&altered));
+        assert!(strip_appended_bridge(&altered).is_none());
+
+        let trailing_edit = format!("{with_bridge}extra text\n");
+        assert!(!bridge_block_is_valid(&trailing_edit));
+        assert!(strip_appended_bridge(&trailing_edit).is_none());
     }
 
     #[test]
