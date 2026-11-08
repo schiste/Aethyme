@@ -20,6 +20,9 @@ pub const OPERATION_FETCH_RECONCILED: &str = "operation.fetch_reconciled";
 pub const OPERATION_INSPECTED: &str = "operation.inspected";
 pub const SESSION_REGISTERED: &str = "session.registered";
 pub const SESSION_REUSED: &str = "session.reused";
+/// A session retired by `start --adopt --replace-stale` while its successor
+/// kept the same checkout; payload `{"successor_session_id": N}`.
+pub const SESSION_REPLACED: &str = "session.replaced";
 pub const SESSION_CONTEXT_UPDATED: &str = "session.context_updated";
 pub const SESSION_FINISHED: &str = "session.finished";
 pub const SESSION_HOLDER_BOUND: &str = "session.holder_bound";
