@@ -6865,6 +6865,24 @@ impl GitRepo {
         parse_commit_count(&count)
     }
 
+    /// Commits unique to each side of a pair of revisions, respectively.
+    pub(crate) fn symmetric_commit_counts(
+        &self,
+        left: &str,
+        right: &str,
+    ) -> Result<(u64, u64), GitError> {
+        let counts = run_git(
+            &self.root,
+            &[
+                "rev-list",
+                "--left-right",
+                "--count",
+                &format!("{left}...{right}"),
+            ],
+        )?;
+        parse_symmetric_commit_counts(&counts)
+    }
+
     /// Non-merge commits on `head` since it forked from `target` whose patch
     /// `target` does not already carry. Zero means every change was applied
     /// to `target` under another SHA -- a rebase or cherry-pick delivery that
@@ -8281,9 +8299,17 @@ fn parse_commit_count<T: std::str::FromStr>(text: &str) -> Result<T, GitError> {
     text.parse().map_err(|_| invalid())
 }
 
+fn parse_symmetric_commit_counts(text: &str) -> Result<(u64, u64), GitError> {
+    let invalid = || GitError::UntrustedOutput {
+        detail: "git rev-list returned invalid symmetric commit counts".to_string(),
+    };
+    let (left, right) = text.trim().split_once('\t').ok_or_else(invalid)?;
+    Ok((parse_commit_count(left)?, parse_commit_count(right)?))
+}
+
 #[cfg(test)]
 mod commit_count_tests {
-    use super::{GitError, GitRepo, parse_commit_count, run_git};
+    use super::{GitError, GitRepo, parse_commit_count, parse_symmetric_commit_counts, run_git};
 
     #[test]
     fn unknown_count_output_never_becomes_zero() {
@@ -8312,6 +8338,25 @@ mod commit_count_tests {
             u64::MAX
         );
         assert!(parse_commit_count::<u8>("256").is_err());
+    }
+
+    #[test]
+    fn symmetric_counts_reject_invalid_output() {
+        assert_eq!(parse_symmetric_commit_counts("2\t3\n").unwrap(), (2, 3));
+        for invalid in [
+            "",
+            "1",
+            "1 2",
+            "1\t2\t3",
+            "-1\t2",
+            "1\t2\nextra",
+            "18446744073709551616\t1",
+        ] {
+            assert!(
+                parse_symmetric_commit_counts(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
     }
 
     #[test]
@@ -8358,7 +8403,29 @@ mod commit_count_tests {
         assert_eq!(repo.commits_not_on_any_remote().unwrap(), 1);
         assert_eq!(repo.unmerged_commit_count(&base).unwrap(), 1);
         assert_eq!(repo.commit_count_between(&base, "HEAD").unwrap(), 1);
+        assert_eq!(repo.symmetric_commit_counts(&base, "HEAD").unwrap(), (0, 1));
+        assert_eq!(repo.symmetric_commit_counts("HEAD", &base).unwrap(), (1, 0));
+        assert_eq!(repo.symmetric_commit_counts(&base, &base).unwrap(), (0, 0));
         assert_eq!(repo.patch_unique_commit_count(&base, "HEAD").unwrap(), 1);
+        run_git(root, &["switch", "-q", "--detach", &base]).unwrap();
+        run_git(
+            root,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "other",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            repo.symmetric_commit_counts("HEAD", "main").unwrap(),
+            (1, 1)
+        );
     }
 }
 

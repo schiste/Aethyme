@@ -218,8 +218,7 @@ pub(crate) fn measure(
     head: &str,
     catch_up: CatchUp,
 ) -> Result<DefaultBranchDrift, GitError> {
-    let behind = repo.commit_count_between(head, commit)?;
-    let ahead = repo.commit_count_between(commit, head)?;
+    let (ahead, behind) = repo.symmetric_commit_counts(head, commit)?;
     // Nothing merged since the branch left the default branch: it cannot
     // conflict with it, so skip the simulation.
     let conflicts = if behind == 0 {
