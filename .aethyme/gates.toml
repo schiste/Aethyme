@@ -85,8 +85,8 @@ triggers = ["packages/aethyme-eval/**"]
 # suite finishes in under 5 s). Each suite is deterministic: it reads tracked
 # files or drives the built binary in a throwaway repository.
 #
-# COUPLING: the triggers are exactly `cargo-test`'s, so every entry that
-# runs the full suite runs these guards first. When a trigger is added to
+# COUPLING: the triggers include every `cargo-test` trigger, so each entry that
+# runs the full local suite runs these guards first. When a trigger is added to
 # `cargo-test`, add it here; `gate_policy.rs`
 # (`fast_guards_precede_cargo_test_on_every_path_it_covers`) fails
 # otherwise, and names the suites this command must keep. Every suite here
@@ -102,6 +102,7 @@ cost = 2
 timeout_seconds = 2400
 resource_wait_seconds = 900
 triggers = [
+    ".aethyme/gates.toml",
     "**/*.rs",
     "**/Cargo.toml",
     "packages/aethyme/skills/**",
@@ -123,7 +124,8 @@ name = "cargo-test"
 # minutes on one saturated runner, so the workflow runs the same suites as jobs:
 # one compile, then partitions on separate runners, as pull requests do
 # (`the_cargo_test_jobs_run_the_pull_request_suite` in ci_validation.rs). This
-# command stays the definition for local `broker submit`.
+# command remains available for gate-policy changes and explicit local runs.
+# Routine submissions use fast guards; main CI retains the full sharded suite.
 # 2026-09-29: --no-fail-fast. Without it the run stops at the first failing
 # test binary, so a change breaking several suites surfaced one per submit:
 # session 716 took 10 submits and 5 h 45 m, each revealing a new binary (#411).
@@ -172,8 +174,8 @@ name = "cargo-test"
 #   dependencies, plus the suites that read changed repository files. A
 #   repository-wide input, no merge base or no change runs the whole workspace.
 #   Doctests and examples always run the whole workspace. This gate is a local
-#   pre-check: every pull request's CI job and Aethyme Gates on main run the
-#   full suite, so a narrowing here delays a failure, it does not ship one.
+#   pre-check when explicitly selected: Aethyme Gates on main runs the full
+#   suite, so a narrowing here can delay detection until after merge.
 #   The verdict is cached by tree like every gate. The tree judged is the merge
 #   candidate, which changes whenever its base does, so a cached verdict is
 #   reused only for the same merged content.
@@ -185,36 +187,9 @@ cost = 3
 # stop a hung gate, not to time a healthy one under load.
 timeout_seconds = 2400
 resource_wait_seconds = 900
-triggers = [
-    "**/*.rs",
-    "**/Cargo.toml",
-    # 2026-08-06 (python-retirement Phase 7): the workspace suites now
-    # include the implementation-blind tests ported from pytest, and
-    # several of them assert over NON-Rust files. Without these triggers a
-    # markdown-only entry would skip the gate that guards it — the same
-    # silent-narrowing failure the retired `pytest-local` gate documented
-    # when its `src/**` trigger outlived `src/`. Each entry names the
-    # suite that reads it.
-    #
-    # COUPLING: `fast-guards` mirrors this list so it runs first on every
-    # path this gate covers; `gate_policy.rs` fails when they diverge.
-    #
-    # skill_templates.rs, playground_hygiene.rs (deployed templates,
-    # references, the SessionStart hook). skill_surface_parity.rs also reads
-    # the Claude and Codex trees, so keep their source paths in this list:
-    "packages/aethyme/skills/**",
-    ".claude/skills/**",
-    ".codex/skills/**",
-    # playground_hygiene.rs greps these two scripts, and their patterns
-    # must move in lockstep with the templates (Class-3 protocol):
-    "packages/aethyme/scripts/eval/*.sh",
-    # docs_hygiene.rs (links, required docs, last-updated, JSON fences):
-    "packages/aethyme/docs/**",
-    # pr_template.rs (the four contract labels, the cardinal-rule check):
-    ".github/pull_request_template.md",
-    # grammar_provenance.rs (manifest shape, licenses, wasm checksums):
-    "packages/aethyme/rust/grammars/**",
-]
+# Changes to gate policy still exercise the full local gate. Other changes
+# run the contract and fast guards locally; main CI runs the complete suite.
+triggers = [".aethyme/gates.toml"]
 
 [gate.managed_cache]
 key = "rust-workspace-v3"

@@ -257,6 +257,155 @@ fn landing_fixture() -> (tempfile::TempDir, impl Fn(&[&str]) -> String) {
 }
 
 #[test]
+fn finish_reuses_only_current_recorded_representation_without_a_history_walk() {
+    let (repo, git) = landing_fixture();
+    git(&["remote", "add", "origin", "."]);
+    git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(&[
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    ]);
+    let storage = crate::test_storage::TestStorage::new();
+    let mut broker = storage.open(repo.path()).unwrap();
+    let session = broker.start_worktree("recorded-squash", None).unwrap();
+    let worktree = Path::new(&session.worktree_path);
+    let work_git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(worktree)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    std::fs::write(worktree.join("feature.txt"), "work\n").unwrap();
+    work_git(&["add", "feature.txt"]);
+    work_git(&["commit", "-qm", "feature"]);
+    std::fs::write(repo.path().join("feature.txt"), "work\n").unwrap();
+    git(&["add", "feature.txt"]);
+    git(&["commit", "-qm", "squash"]);
+    let squash = git(&["rev-parse", "HEAD"]);
+    git(&["update-ref", "refs/remotes/origin/main", &squash]);
+    let scan = broker.scan_session_representation(session.id).unwrap();
+    assert_eq!(scan.search.landing().unwrap().commit, squash);
+    broker
+        .record_session_representation(session.id, &scan.digest)
+        .unwrap();
+
+    let checkout = crate::GitRepo::discover(worktree).unwrap();
+    let head = checkout.head_commit().unwrap();
+    let before = crate::representation::test_landing_search_calls();
+    // A deep search is forbidden once the recorded proof has been verified.
+    broker.landing_deadline.set(Some(std::time::Instant::now()));
+    let delivery = broker
+        .head_delivery(&session, &checkout, &head, &[])
+        .unwrap();
+    assert!(delivery.head_is_delivered);
+    assert!(delivery.representation.is_some());
+    assert_eq!(crate::representation::test_landing_search_calls(), before);
+
+    // A later local commit must not inherit the old proof.
+    std::fs::write(worktree.join("later.txt"), "unpublished\n").unwrap();
+    work_git(&["add", "later.txt"]);
+    work_git(&["commit", "-qm", "unpublished"]);
+    let moved = checkout.head_commit().unwrap();
+    assert!(
+        broker
+            .head_delivery(&session, &checkout, &moved, &[])
+            .is_err()
+    );
+}
+
+#[test]
+fn no_net_session_requires_a_current_remote_before_skipping_the_history_walk() {
+    let (repo, git) = landing_fixture();
+    let remote = tempfile::tempdir().unwrap();
+    let remote_path = remote.path().to_str().unwrap();
+    git(&["init", "-q", "--bare", "-b", "main", remote_path]);
+    git(&["remote", "add", "origin", remote_path]);
+    git(&["push", "-q", "origin", "main"]);
+    git(&[
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    ]);
+    let storage = crate::test_storage::TestStorage::new();
+    let mut broker = storage.open(repo.path()).unwrap();
+    let session = broker.start_worktree("no-net-durable", None).unwrap();
+    std::fs::write(repo.path().join("target.txt"), "other work\n").unwrap();
+    git(&["add", "target.txt"]);
+    git(&["commit", "-qm", "advance target"]);
+    git(&["push", "-q", "origin", "main"]);
+    let worktree = Path::new(&session.worktree_path);
+    let work_git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(worktree)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    work_git(&["commit", "--allow-empty", "-qm", "trigger"]);
+    let checkout = crate::GitRepo::discover(worktree).unwrap();
+    let head = checkout.head_commit().unwrap();
+    broker.landing_deadline.set(Some(std::time::Instant::now()));
+    assert!(broker.remote_durability_evidence(&head).is_none());
+    let unpublished = broker.head_delivery(&session, &checkout, &head, &[]);
+    if let Ok(result) = unpublished {
+        assert!(!result.head_is_delivered);
+        assert!(result.unsubmitted_commits > 0);
+    }
+    work_git(&["push", "-q", "origin", "HEAD:refs/heads/durable"]);
+    let delivery = broker
+        .head_delivery(&session, &checkout, &head, &[])
+        .unwrap();
+    assert_eq!(delivery.unsubmitted_commits, 0);
+    let targets = broker.cleanup_delivery_targets().unwrap();
+    let (_, reason) = broker
+        .cleanup_provenance(&session, &head, &targets)
+        .unwrap();
+    assert!(
+        reason.contains("verified current against the remote"),
+        "{reason}"
+    );
+    assert!(
+        !delivery.head_is_delivered,
+        "remote durability must not claim the work landed"
+    );
+    git(&["push", "-q", "origin", ":refs/heads/durable"]);
+    assert!(broker.remote_durability_evidence(&head).is_none());
+    if let Ok(result) = broker.head_delivery(&session, &checkout, &head, &[]) {
+        assert!(!result.head_is_delivered);
+        assert!(result.unsubmitted_commits > 0);
+    }
+    std::fs::write(worktree.join("new.txt"), "unlanded work\n").unwrap();
+    work_git(&["add", "new.txt"]);
+    work_git(&["commit", "-qm", "unlanded work"]);
+    work_git(&["push", "-q", "origin", "HEAD:refs/heads/durable"]);
+    let changed = checkout.head_commit().unwrap();
+    if let Ok(result) = broker.head_delivery(&session, &checkout, &changed, &[]) {
+        assert!(!result.head_is_delivered);
+        assert!(result.unsubmitted_commits > 0);
+    }
+}
+
+#[test]
 fn a_merged_head_is_proved_by_ancestry_before_any_candidate_walk() {
     let (repo, git) = landing_fixture();
     let base = git(&["rev-parse", "HEAD"]);

@@ -2112,6 +2112,22 @@ impl Broker {
         let Some(evidence) =
             self.recorded_representation_evidence(session, session_head, delivery_targets)?
         else {
+            // A live remote ref is independent durability evidence: the
+            // commits exist on a remote, so this directory is not where the
+            // work lives.
+            if let Some((remote_ref, tracked)) = self.remote_durability_evidence(session_head) {
+                provenance.representation = CleanupRepresentation::Represented;
+                provenance.pending_commit_count = 0;
+                provenance.represented_on = Some(tracked.clone());
+                return Ok((
+                    provenance,
+                    format!(
+                        "session head {} is reachable from {}, verified current against the remote",
+                        short_commit(session_head),
+                        remote_ref
+                    ),
+                ));
+            }
             // The predicate the representation scan and the cleanup audit use
             // (#408). Without it the audit called rebased-then-merged work
             // `in_target` while this plan held the same worktree as unproven.
@@ -2139,22 +2155,6 @@ impl Broker {
                         short_commit(session_head),
                         short_commit(&target),
                         evidence.as_str()
-                    ),
-                ));
-            }
-            // Last resort, and the one that survives any merge strategy: the
-            // commits exist on a remote, so this directory is not where the
-            // work lives.
-            if let Some((remote_ref, tracked)) = self.remote_durability_evidence(session_head) {
-                provenance.representation = CleanupRepresentation::Represented;
-                provenance.pending_commit_count = 0;
-                provenance.represented_on = Some(tracked.clone());
-                return Ok((
-                    provenance,
-                    format!(
-                        "session head {} is reachable from {}, verified current against the remote",
-                        short_commit(session_head),
-                        remote_ref
                     ),
                 ));
             }
