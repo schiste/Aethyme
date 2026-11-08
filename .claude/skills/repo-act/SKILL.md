@@ -732,6 +732,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   in `Cargo.toml`, and bind the exact lib/bin/test binary identity. A missing
   target is a setup failure; stop before Cargo instead of treating it as a
   product failure or zero-test result.
+- For GitHub composite-action changes, run the action itself on a hosted runner
+  before merging. Workflow-only `actionlint` can pass while the runner rejects
+  the action manifest; composite steps cannot declare `timeout-minutes`, so put
+  deadlines and retries on the calling workflow steps.
 - Treat release-signing failures as workflow failures, not automatically as
   transient. Inspect the exact failed step and the tag/release asset state
   before retrying. For a Rekor conflict, confirm the pinned signer's released
