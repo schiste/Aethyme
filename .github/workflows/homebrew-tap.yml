@@ -99,6 +99,16 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The renderer may be an older tag that predates the shared action.
+      # Resolve the installer from the revision running this workflow instead.
+      - name: Check out workflow tools
+        if: steps.release.outputs.mode != 'skip'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: .aethyme-workflow-source
+          persist-credentials: false
+
       - name: Set up Rust
         if: steps.release.outputs.mode != 'skip'
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -107,7 +117,7 @@ jobs:
 
       - name: Install Cosign
         if: steps.release.outputs.mode != 'skip'
-        uses: ./.github/actions/install-cosign
+        uses: ./.aethyme-workflow-source/.github/actions/install-cosign
         with:
           version: v3.1.3
 

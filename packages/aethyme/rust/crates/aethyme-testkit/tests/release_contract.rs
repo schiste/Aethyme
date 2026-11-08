@@ -867,7 +867,9 @@ fn release_signing_uses_retry_safe_legacy_cosign_and_preserves_standard_bundle()
     assert!(modern_install.contains("./.github/actions/install-cosign"));
     let homebrew_install = workflow_step_block(&homebrew, "Install Cosign");
     assert!(homebrew_install.contains("version: v3.1.3"));
-    assert!(homebrew_install.contains("./.github/actions/install-cosign"));
+    assert!(homebrew_install.contains("./.aethyme-workflow-source/.github/actions/install-cosign"));
+    let tools_checkout = workflow_step_block(&homebrew, "Check out workflow tools");
+    assert!(tools_checkout.contains("ref: ${{ github.sha }}"));
     let installer =
         std::fs::read_to_string(repository.join(".github/actions/install-cosign/action.yml"))
             .unwrap();
