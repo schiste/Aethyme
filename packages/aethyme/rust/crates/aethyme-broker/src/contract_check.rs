@@ -615,10 +615,15 @@ fn inline_code_tokens(text: &str) -> Vec<String> {
     out
 }
 
-/// Symbols too generic to track usefully: bare ALLCAPS like `TODO`, and
-/// bare numbers.
+/// Symbols too generic to track usefully: bare ALLCAPS like `TODO`, bare
+/// numbers, and bare JSON/Rust literals. The doc writes values such as
+/// `true` or `null` when describing a field, but as tracked symbols they match
+/// every removed boolean in the repository.
 fn is_excluded(token: &str) -> bool {
     if token.chars().all(|c| c.is_ascii_uppercase()) {
+        return true;
+    }
+    if matches!(token, "true" | "false" | "null" | "none" | "None" | "Some") {
         return true;
     }
     token.chars().all(|c| c.is_ascii_digit())
@@ -1322,6 +1327,21 @@ mod tests {
         assert!(!tracked.contains("foo"));
         assert!(!tracked.contains("2024"));
         assert!(!tracked.contains("TODO"));
+    }
+
+    /// Regression, 2026-11-07: the consumers doc backticks `true` when it
+    /// describes a field value, so replacing a bool argument at 19 call sites
+    /// failed the gate on main for a change that touched no contract.
+    #[test]
+    fn extract_tracked_symbols_drops_bare_literals_but_keeps_field_values() {
+        let sample = "`safe_to_use_as_answer` is `true`, `false` or `null`; \
+             `status: degraded` keeps its shape.\n";
+        let tracked = extract_tracked_symbols(sample);
+        assert!(tracked.contains("safe_to_use_as_answer"));
+        assert!(tracked.contains("status: degraded"));
+        for literal in ["true", "false", "null"] {
+            assert!(!tracked.contains(literal), "{literal}");
+        }
     }
 
     #[test]
