@@ -603,7 +603,30 @@ const CONFIG_KNOWN_KEYS: &[(&str, &[&str])] = &[
         &["ignore", "routing", "overlap_diffs", "overlap_impact"],
     ),
     ("graph", &["authority", "repository"]),
-    ("review", &["trigger", "routing", "reporting", "projection"]),
+    (
+        "review",
+        &[
+            "schema_version",
+            "enabled",
+            "provider",
+            "evidence_adapter",
+            "required_approvals",
+            "evidence_check_name",
+            "evidence_app_slug",
+            "unlock_adapter",
+            "unlock_label",
+            "workflow",
+            "run_on_push",
+            "run_on_push_budget_secs",
+            "trigger",
+            "routing",
+            "reporting",
+            "projection",
+            "classification",
+            "comments",
+            "pr_size",
+        ],
+    ),
     ("collaboration", crate::collaboration_submit::KNOWN_SETTINGS),
     (
         "worktrees",
@@ -2003,6 +2026,24 @@ mod config_key_tests {
             ["broker.open_as"]
         );
         assert_eq!(unknown("broker = false\n"), ["broker"]);
+    }
+
+    #[test]
+    fn supported_review_settings_are_known_but_typos_still_warn() {
+        let config = r#"
+[review]
+run_on_push = true
+run_on_push_budget_secs = 60
+pr_size = { max_files = 14, max_changed_lines = 999 }
+[review.classification]
+[review.comments.example]
+body = "example"
+"#;
+        assert!(unknown(config).is_empty());
+        assert_eq!(
+            unknown("[review]\nrun_on_pussh = true\n"),
+            ["review.run_on_pussh"]
+        );
     }
 
     #[test]
