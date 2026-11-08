@@ -1048,8 +1048,6 @@ impl Broker {
             } else {
                 self.cleanup_delivery_targets()?
             };
-        let landing = self.landing_on_delivery_targets(head, &delivery_targets)?;
-
         // Unlike a historical queue status, a representation record only
         // counts when its carrying commit is still reachable from a current
         // delivery target.
@@ -1059,6 +1057,29 @@ impl Broker {
             self.store.session_representation(session_id, head)?
         } else {
             None
+        };
+        // A record is bound to this exact head and remains valid only while
+        // its carrying commit is reachable from a current delivery target.
+        // Once checked above it is sufficient for finish; avoid a potentially
+        // expensive historical search for the same evidence.
+        // A session that only republishes its starting tree has no net work
+        // to land. Require both a true ancestor baseline and a live remote
+        // containing this exact head; this is durability, not delivery.
+        let remotely_durable_no_net = if representation.is_none() {
+            if let Some(base) = session.diff_base.as_deref() {
+                self.repo.is_ancestor_checked(base, head)?
+                    && self.repo.commit_tree_id(base)? == self.repo.commit_tree_id(head)?
+                    && self.remote_durability_evidence(head).is_some()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let landing = if representation.is_some() || remotely_durable_no_net {
+            None
+        } else {
+            self.landing_on_delivery_targets(head, &delivery_targets)?
         };
 
         // A promoted queue row is a trusted acceptance only while both its
@@ -1101,17 +1122,16 @@ impl Broker {
 
         let remote_default_tip = self.remote_tracking_default_tip();
         let on_remote_default = if let Some(tip) = remote_default_tip.as_ref() {
-            // An ancestry proof is self-verifying. A squash/rebase match on
-            // this branch still needs the explicit representation record
-            // checked above before finish can close the session.
-            self.landing_on_delivery_targets(head, std::slice::from_ref(tip))?
-                .is_some_and(|(_, evidence, _)| evidence == crate::LandingEvidence::Ancestry)
+            // This flag accepts ancestry only. A full landing search cannot
+            // make a squash or rebase satisfy it, and can repeat the expensive
+            // search already performed for the same target above.
+            self.repo.is_ancestor_checked(head, tip)?
         } else {
             false
         };
         let head_is_delivered =
             submitted_head_is_delivered || representation.is_some() || on_remote_default;
-        let unsubmitted_commits = if head_is_delivered {
+        let unsubmitted_commits = if head_is_delivered || remotely_durable_no_net {
             0
         } else {
             let integration_head = self.integration_tip();

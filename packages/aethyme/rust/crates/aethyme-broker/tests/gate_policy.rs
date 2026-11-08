@@ -155,6 +155,25 @@ fn cross_process_contract_uses_load_admission_despite_its_low_cost() {
     );
 }
 
+/// Routine Rust submissions keep cheap guards while main CI owns the full suite.
+#[test]
+fn routine_rust_changes_select_fast_guards_and_main_runs_workspace_tests() {
+    let root = repo_root();
+    let gates = load_gates(&root).unwrap();
+    let selected = select_gates(
+        &gates,
+        &["packages/aethyme/rust/crates/aethyme-broker/src/git.rs".to_string()],
+    );
+    assert!(selected.iter().any(|s| s.gate.name == "fast-guards"));
+    assert!(!selected.iter().any(|s| s.gate.name == "cargo-test"));
+    let policy = select_gates(&gates, &[".aethyme/gates.toml".to_string()]);
+    assert!(policy.iter().any(|s| s.gate.name == "cargo-test"));
+    let workflow = fs::read_to_string(root.join(".github/workflows/aethyme-gates.yml")).unwrap();
+    assert!(workflow.contains("branches: [\"main\", \"master\"]"));
+    assert!(workflow.contains("cargo-test-shard:"));
+    assert!(workflow.contains("cargo-test-examples-doctests:"));
+}
+
 /// The guard suites `fast-guards` runs. Each one also runs under
 /// `cargo-test`; the gate exists so their failure arrives in seconds rather
 /// than after the whole workspace suite.
