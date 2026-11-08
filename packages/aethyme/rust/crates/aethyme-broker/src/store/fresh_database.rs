@@ -296,6 +296,15 @@ mod unix {
 
     impl SqliteProbeFile {
         fn open(path: &Path, kind: u32, label: &str) -> Result<(Self, ProbeMetadata), BrokerError> {
+            Self::open_recording_code(path, kind, label, &mut None)
+        }
+
+        fn open_recording_code(
+            path: &Path,
+            kind: u32,
+            label: &str,
+            failure_code: &mut Option<i32>,
+        ) -> Result<(Self, ProbeMetadata), BrokerError> {
             let path_c = CString::new(path.as_os_str().as_bytes()).map_err(|source| {
                 io_error(
                     path,
@@ -308,6 +317,7 @@ mod unix {
             let code =
                 unsafe { sqlite3_aethyme_probe_acquire_v1(path_c.as_ptr(), kind, &mut result) };
             if code != rusqlite::ffi::SQLITE_OK {
+                *failure_code = Some(code);
                 return Err(sqlite_probe_error(path, label, code));
             }
             let Some(handle) = NonZeroU64::new(result.handle) else {
@@ -1052,19 +1062,28 @@ mod unix {
             return moved(SidecarCheckStage::Lstat, violation);
         }
         let expected = file_identity(&before);
-        let (_file, opened) =
-            match SqliteProbeFile::open(sidecar, SQLITE_PROBE_SIDECAR, "SQLite sidecar") {
-                Ok(opened) => opened,
-                Err(error) => {
-                    let still_there = lstat_optional(sidecar)?
-                        .is_some_and(|current| file_identity(&current) == expected);
-                    return if still_there {
-                        Err(error)
-                    } else {
-                        Ok(Some(error))
-                    };
-                }
-            };
+        let mut failure_code = None;
+        let (_file, opened) = match SqliteProbeFile::open_recording_code(
+            sidecar,
+            SQLITE_PROBE_SIDECAR,
+            "SQLite sidecar",
+            &mut failure_code,
+        ) {
+            Ok(opened) => opened,
+            Err(error) => {
+                let still_there = lstat_optional(sidecar)?
+                    .is_some_and(|current| file_identity(&current) == expected);
+                // The unlink and recreation can reuse the same inode between
+                // snapshots. A transient CANTOPEN is therefore inconclusive
+                // even if the name has the same identity afterward. Retry the
+                // entire guard; persistent errors still fail at the deadline.
+                return if !still_there || failure_code == Some(rusqlite::ffi::SQLITE_CANTOPEN) {
+                    Ok(Some(error))
+                } else {
+                    Err(error)
+                };
+            }
+        };
         if let Some(violation) = sidecar_snapshot_violation(&opened, expected) {
             return moved(SidecarCheckStage::Opened, violation);
         }
