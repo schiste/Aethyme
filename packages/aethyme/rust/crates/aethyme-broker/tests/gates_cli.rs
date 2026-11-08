@@ -2048,10 +2048,11 @@ fn exit_codes_name_the_outcome_an_agent_acts_on() {
 }
 
 // v0.8.1: a gate that could not run on the host (here a missing tool, exit
-// 127, classed `environment`; low disk is classed `resource_contention`) did
-// not judge the code. It exits 6, not 4, and status must not say "commit a
-// fix". A repeated `git` after `--` is refused plainly instead of steering the
-// caller toward a stronger --effect.
+// 127, classed `environment`; low disk is classed `resource_contention`)
+// exits 6, not 4. The inferred classification must direct the agent to inspect
+// the log rather than assert whether the code was judged. A repeated `git`
+// after `--` is refused plainly instead of steering the caller toward a
+// stronger --effect.
 #[test]
 fn host_failures_exit_environment_and_a_repeated_git_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2111,8 +2112,9 @@ fn host_failures_exit_environment_and_a_repeated_git_is_refused() {
         &root,
         &["status", "--json"],
     ));
-    assert!(status.contains("the code was not judged"), "{status}");
-    assert!(!status.contains("commit a fix"), "{status}");
+    assert!(status.contains("inspect the gate log"), "{status}");
+    assert!(!status.contains("the code was not judged"), "{status}");
+    assert!(!status.contains("resubmit without changing code"), "{status}");
 
     let repeated = run_with_managed_worktree_root(
         &worktree,

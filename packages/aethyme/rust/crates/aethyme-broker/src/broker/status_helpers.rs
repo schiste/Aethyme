@@ -164,9 +164,9 @@ pub(super) fn rejected_submit_advice(agent: &AgentView, entry: &MergeQueueEntry)
     );
     let summary = if environmental {
         format!(
-            "session {} latest submit qid {} was not verified: {} could not run on this host \
-             (low disk, locks or environment), so the code was not judged; free the resource, \
-             then resubmit without changing code",
+            "session {} latest submit qid {} was rejected: {} reported an environment or resource \
+             error; inspect the gate log to distinguish host problems from test output before \
+             deciding whether to fix code or retry",
             agent.session.id,
             entry.id,
             gate_names.join(", ")
