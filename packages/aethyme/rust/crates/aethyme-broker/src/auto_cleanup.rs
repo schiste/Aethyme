@@ -737,6 +737,10 @@ pub(crate) struct ClosedArtifactCheckoutCohort {
     sessions: Vec<ClosedArtifactSessionSnapshot>,
     owner_session_id: i64,
     alias_refresh_generation: i64,
+    /// Cleaned spawns that earlier occupied this path, each proven removed
+    /// before the owner's checkout was created. Marker review only; reclaim
+    /// leaves this empty.
+    retired_predecessors: Vec<ClosedArtifactSessionSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -817,6 +821,18 @@ impl ClosedArtifactCheckoutCohort {
 
     pub(crate) fn session_ids(&self) -> Vec<i64> {
         self.sessions.iter().map(|session| session.id).collect()
+    }
+
+    /// The saved spawn witness of a cleaned predecessor proven removed before
+    /// this checkout instance. Its markers named that old checkout object.
+    pub(crate) fn retired_predecessor_witness(
+        &self,
+        session_id: i64,
+    ) -> Option<&crate::events::SpawnedWorktreeInstanceWitness> {
+        self.retired_predecessors
+            .iter()
+            .find(|session| session.id == session_id)
+            .and_then(|session| session.spawned_instance_witness.as_ref())
     }
 
     pub(crate) fn owner_witness(&self) -> Option<&crate::events::SpawnedWorktreeInstanceWitness> {
@@ -2018,6 +2034,18 @@ impl Broker {
         let Some(owner_session_id) = owner_session_id else {
             return Ok(unavailable(Reason::SpawnedOwnerMissing));
         };
+        // Marker review may also prove a removed alias against the owner's
+        // saved witness: it was verified against the live checkout above, and
+        // unlike a fresh observation it shares the predecessor's mount epoch,
+        // so a later remount's renumbering does not break the comparison.
+        let saved_owner_witness = match purpose {
+            ClosedCohortPurpose::Reclaim => None,
+            ClosedCohortPurpose::MarkerReview => snapshots
+                .iter()
+                .find(|snapshot| snapshot.id == owner_session_id)
+                .and_then(|snapshot| snapshot.spawned_instance_witness.clone()),
+        };
+        let mut retired_predecessors = Vec::new();
         for row in alias_rows {
             if deadline_expired(deadline) {
                 return Ok(unavailable(Reason::DeadlineExceeded));
@@ -2041,11 +2069,23 @@ impl Broker {
                             .iter()
                             .find(|session| session.id == owner_session_id)
                             .expect("validated cohort owner");
-                        if self.removed_historical_checkout_alias(
+                        let proof_witnesses = std::iter::once(current_witness)
+                            .chain(saved_owner_witness.as_ref())
+                            .collect::<Vec<_>>();
+                        if let Some(predecessor) = self.removed_historical_checkout_alias(
                             row.session_id,
                             owner,
-                            current_witness,
+                            &proof_witnesses,
                         )? {
+                            if purpose == ClosedCohortPurpose::MarkerReview
+                                && !retired_predecessors.iter().any(
+                                    |known: &ClosedArtifactSessionSnapshot| {
+                                        known.id == predecessor.id
+                                    },
+                                )
+                            {
+                                retired_predecessors.push(predecessor);
+                            }
                             continue;
                         }
                     }
@@ -2087,42 +2127,47 @@ impl Broker {
             sessions: snapshots,
             owner_session_id,
             alias_refresh_generation: index_state.alias_refresh_generation,
+            retired_predecessors,
         }))
     }
 
     /// Exclude a removed spawn's historical alias only after proving that its
-    /// cleanup preceded the current, freshly witnessed checkout instance.
+    /// cleanup preceded the current checkout instance, described by any one of
+    /// `current_witnesses`. Returns the proven predecessor's snapshot.
     fn removed_historical_checkout_alias(
         &self,
         alias_id: i64,
         owner: &Session,
-        current_witness: &crate::events::SpawnedWorktreeInstanceWitness,
-    ) -> Result<bool, BrokerOpError> {
+        current_witnesses: &[&crate::events::SpawnedWorktreeInstanceWitness],
+    ) -> Result<Option<ClosedArtifactSessionSnapshot>, BrokerOpError> {
         let alias = self.store_ref().session(alias_id)?;
         if alias.origin != SessionOrigin::Spawned
             || alias.status != crate::types::SessionStatus::Cleaned
             || alias.cleanup_state != SessionCleanupState::Cleaned
         {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(old_witness) = self
             .store_ref()
             .spawned_worktree_instance_witness(alias_id)?
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let handoff = match self.latest_handoff_for_session(alias_id) {
             Ok(handoff) => handoff,
-            Err(BrokerOpError::HandoffNotFoundForSession { .. }) => return Ok(false),
+            Err(BrokerOpError::HandoffNotFoundForSession { .. }) => return Ok(None),
             Err(error) => return Err(error),
         };
-        Ok(proves_removed_historical_instance(
-            &alias,
-            owner,
-            &old_witness,
-            current_witness,
-            &handoff,
-        ))
+        let proven = current_witnesses.iter().any(|current| {
+            proves_removed_historical_instance(&alias, owner, &old_witness, current, &handoff)
+        });
+        Ok(proven.then(|| ClosedArtifactSessionSnapshot {
+            id: alias.id,
+            worktree_path: alias.worktree_path.clone(),
+            branch: alias.branch.clone(),
+            origin: alias.origin,
+            spawned_instance_witness: Some(old_witness),
+        }))
     }
 
     /// Snapshot one retained checkout's full canonical cohort and its
@@ -4287,6 +4332,178 @@ mod tests {
             );
             assert_eq!(fixture.index_snapshot(), before, "{label}");
         }
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    impl ArtifactUseReconcileFixture {
+        /// Leave a quiescent marker from the current session, clean that
+        /// session up, and start a fresh spawn at the same path, the way a
+        /// reused task name does. Returns the predecessor's marker path.
+        fn retire_into_successor_at_same_path(&mut self, invocation_id: &str) -> PathBuf {
+            let mut child = self.start_running_marker(invocation_id);
+            child.wait().unwrap();
+            let marker_path = self.marker_path(invocation_id);
+            // Cleanup refuses an unsettled marker; set it aside so the
+            // predecessor is cleaned, then restore it as the stale leftover.
+            let leftover = std::fs::read(&marker_path).unwrap();
+            std::fs::remove_file(&marker_path).unwrap();
+            let report = self.broker.finish(self.session.id).unwrap();
+            assert!(report.cleanup.completed && report.cleanup.worktree_removed);
+            let handoff = self
+                .broker
+                .latest_handoff_for_session(self.session.id)
+                .unwrap();
+
+            let successor = self
+                .broker
+                .start_worktree("retirement fixture", None)
+                .unwrap();
+            assert_eq!(successor.worktree_path, self.session.worktree_path);
+            let created_at = successor.created_at.max(handoff.recorded_at + 1);
+            rusqlite::Connection::open(self.broker.store().db_path())
+                .unwrap()
+                .execute(
+                    "UPDATE sessions SET created_at = ?1 WHERE id = ?2",
+                    rusqlite::params![created_at, successor.id],
+                )
+                .unwrap();
+            self.session = self.broker.store().session(successor.id).unwrap();
+            std::fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+            std::fs::write(&marker_path, leftover).unwrap();
+            marker_path
+        }
+
+        /// Age one session's saved witness to a pre-remount epoch (schema 2,
+        /// every device renumbered) and give its worktree a declared inode,
+        /// so the proof does not depend on the inode allocator.
+        fn age_saved_witness(&mut self, session_id: i64, worktree_inode: Option<u64>) {
+            let mut saved = self
+                .broker
+                .store()
+                .spawned_worktree_instance_witness(session_id)
+                .unwrap()
+                .expect("spawn records a witness");
+            saved.schema_version = 2;
+            saved.volume_uuids = None;
+            saved.git_admin_device += 1;
+            saved.git_common_device += 1;
+            saved.worktree_device += 1;
+            saved.git_pointer_device += 1;
+            if let Some(inode) = worktree_inode {
+                saved.worktree_inode = inode;
+            }
+            rusqlite::Connection::open(self.broker.store().db_path())
+                .unwrap()
+                .execute(
+                    "UPDATE spawned_worktree_instances SET witness_json = ?2 WHERE session_id = ?1",
+                    rusqlite::params![session_id, serde_json::to_string(&saved).unwrap()],
+                )
+                .unwrap();
+        }
+
+        /// Rewrite a marker as legacy schema 1 naming the given checkout
+        /// object and the aged `.git` device number.
+        fn age_marker_naming(&mut self, marker_path: &Path, session_id: i64, inode: Option<u64>) {
+            let witness = self
+                .broker
+                .store()
+                .spawned_worktree_instance_witness(session_id)
+                .unwrap()
+                .unwrap();
+            let mut marker: crate::file_lock::artifact_use::ArtifactUseMarker =
+                serde_json::from_slice(&std::fs::read(marker_path).unwrap()).unwrap();
+            marker.schema_version = 1;
+            marker.primary_volume_uuid = None;
+            marker.checkout_volume_uuid = None;
+            marker.primary_device = witness.git_common_device;
+            marker.checkout_device = witness.worktree_device;
+            if let Some(inode) = inode {
+                marker.checkout_inode = inode;
+            }
+            std::fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        }
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn marker_review_retires_a_removed_predecessors_markers_after_a_renumbered_mount() {
+        let mut fixture = ArtifactUseReconcileFixture::new();
+        let predecessor_id = fixture.session.id;
+        let leftover = fixture.retire_into_successor_at_same_path("reconcile-predecessor");
+        let successor_marker = "reconcile-successor";
+        let mut child = fixture.start_running_marker(successor_marker);
+        child.wait().unwrap();
+        let successor_path = fixture.marker_path(successor_marker);
+
+        // Both spawns were witnessed before a remount renumbered every device.
+        // The predecessor's checkout object had its own inode; its leftover
+        // marker names exactly that object.
+        let live_inode = fixture
+            .broker
+            .store()
+            .spawned_worktree_instance_witness(fixture.session.id)
+            .unwrap()
+            .unwrap()
+            .worktree_inode;
+        let retired_inode = live_inode ^ (1 << 40);
+        fixture.age_saved_witness(predecessor_id, Some(retired_inode));
+        fixture.age_saved_witness(fixture.session.id, None);
+        fixture.age_marker_naming(&leftover, predecessor_id, Some(retired_inode));
+        fixture.age_marker_naming(&successor_path, fixture.session.id, None);
+
+        let (cohort, registry) = fixture.close_and_bind();
+        assert_eq!(cohort.session_ids(), vec![fixture.session.id]);
+        assert!(cohort.retired_predecessor_witness(predecessor_id).is_some());
+        let plan = fixture.plan(&cohort, &registry);
+        assert_eq!(plan.markers.len(), 2);
+        for marker in &plan.markers {
+            assert!(
+                matches!(
+                    &marker.disposition,
+                    crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::RemoveIfConfirmed
+                ),
+                "session {}: {:?}",
+                marker.session_id,
+                marker.disposition
+            );
+        }
+        let report = fixture.apply(&cohort, &registry, &plan.digest).unwrap();
+        assert!(report.stopped.is_none());
+        assert!(!leftover.exists());
+        assert!(!successor_path.exists());
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn marker_review_retains_a_predecessor_marker_naming_another_checkout_object() {
+        let mut fixture = ArtifactUseReconcileFixture::new();
+        let predecessor_id = fixture.session.id;
+        let leftover = fixture.retire_into_successor_at_same_path("reconcile-predecessor-mismatch");
+        let live_inode = fixture
+            .broker
+            .store()
+            .spawned_worktree_instance_witness(fixture.session.id)
+            .unwrap()
+            .unwrap()
+            .worktree_inode;
+        let retired_inode = live_inode ^ (1 << 40);
+        fixture.age_saved_witness(predecessor_id, Some(retired_inode));
+        fixture.age_saved_witness(fixture.session.id, None);
+        // The marker names an object the predecessor's witness never saw.
+        fixture.age_marker_naming(&leftover, predecessor_id, Some(retired_inode ^ 1));
+
+        let (cohort, registry) = fixture.close_and_bind();
+        assert!(cohort.retired_predecessor_witness(predecessor_id).is_some());
+        let plan = fixture.plan(&cohort, &registry);
+        assert_eq!(plan.markers.len(), 1);
+        assert!(matches!(
+            &plan.markers[0].disposition,
+            crate::file_lock::artifact_use::ArtifactUseReconcileDisposition::Retain { reason }
+                if reason.contains("checkout root inode")
+        ));
+        let report = fixture.apply(&cohort, &registry, &plan.digest).unwrap();
+        assert!(report.stopped.is_none());
+        assert!(leftover.exists());
     }
 
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
