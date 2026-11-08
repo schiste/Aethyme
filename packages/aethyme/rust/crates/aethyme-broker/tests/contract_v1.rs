@@ -67,6 +67,7 @@ const V1_KINDS: &[&str] = &[
     "session.holder_gone",
     "session.idle",
     "session.registered",
+    "session.replaced",
     "session.reused",
     "session.stale",
 ];
@@ -126,6 +127,7 @@ fn v1_kind_catalog_is_frozen() {
     let mut actual: Vec<String> = vec![
         events::SESSION_REGISTERED.into(),
         events::SESSION_REUSED.into(),
+        events::SESSION_REPLACED.into(),
         events::SESSION_CONTEXT_UPDATED.into(),
         events::SESSION_FINISHED.into(),
         events::SESSION_FINISH_CLEANUP_STARTED.into(),

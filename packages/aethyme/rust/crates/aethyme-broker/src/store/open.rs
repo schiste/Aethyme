@@ -721,6 +721,56 @@ impl BrokerStore {
         self.session(id)
     }
 
+    /// The session that took over `session_id`'s checkout when `start --adopt
+    /// --replace-stale` replaced it, or `None` when it was not replaced.
+    ///
+    /// Replacements record [`crate::events::SESSION_REPLACED`]. Earlier binaries wrote
+    /// no such event, so a replaced record is also recognised by what its one
+    /// transaction left behind: the predecessor was cleaned at the very
+    /// millisecond its successor was created, at the identical recorded path.
+    /// Physical cleanup removes the checkout first and cannot share that
+    /// timestamp with a new session at the same path; an ambiguous match is
+    /// `None`.
+    pub(crate) fn session_replacement_successor(
+        &self,
+        session_id: i64,
+    ) -> Result<Option<i64>, BrokerError> {
+        let recorded: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT payload_json FROM events
+                 WHERE session_id = ?1 AND kind = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![session_id, crate::events::SESSION_REPLACED],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(payload) = recorded {
+            return Ok(serde_json::from_str::<serde_json::Value>(&payload)
+                .ok()
+                .and_then(|value| value.get("successor_session_id")?.as_i64()));
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT successor.id FROM sessions AS replaced
+             JOIN sessions AS successor
+               ON successor.worktree_path = replaced.worktree_path
+              AND successor.created_at = replaced.cleanup_completed_at
+              AND successor.id > replaced.id
+             WHERE replaced.id = ?1
+               AND replaced.status = 'cleaned'
+               AND replaced.cleanup_state = 'cleaned'
+             LIMIT 2",
+        )?;
+        let successors = stmt
+            .query_map([session_id], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(match successors.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        })
+    }
+
     /// Atomically close one stale session, register its replacement, and
     /// claim the reviewed path plan. The replaced session's leases are
     /// excluded from conflict checks because they are deleted in this same
@@ -797,6 +847,16 @@ impl BrokerStore {
         )?;
         insert_event(&tx, now, "session.cleaned", Some(replaced_id), None)?;
         let id = insert_session(&tx, new, context, now)?;
+        // "Cleaned" here retires the record, not the checkout: the successor
+        // keeps working in it. Record the handover so cleanup can tell this
+        // alias from a cleaned session whose own checkout may still exist.
+        insert_event(
+            &tx,
+            now,
+            crate::events::SESSION_REPLACED,
+            Some(replaced_id),
+            Some(&serde_json::json!({ "successor_session_id": id }).to_string()),
+        )?;
         if let Some(base_observation) = base_observation {
             write_session_base_observation(&tx, id, base_observation)?;
         }
