@@ -497,6 +497,35 @@ fn every_cargo_test_keeps_fixtures_out_of_the_hosts_worktree_root() {
 }
 
 #[test]
+fn test_shards_reuse_the_build_jobs_verified_nextest() {
+    for (file, build_name, shard_name) in [
+        ("oss-ci.yml", "  rust-tests-build:", "  rust-tests-shard:"),
+        (
+            "aethyme-gates.yml",
+            "  cargo-test-build:",
+            "  cargo-test-shard:",
+        ),
+    ] {
+        let text = workflow(file);
+        let build = block(&text, build_name).join("\n");
+        let shard = block(&text, shard_name).join("\n");
+        assert!(build.contains("timeout-minutes: 3"), "{file}");
+        assert!(
+            build.contains("steps.nextest_install.outcome == 'failure'"),
+            "{file}"
+        );
+        assert!(build.contains("name: rust-tests-nextest"), "{file}");
+        assert!(
+            build.contains("sha256sum cargo-nextest > SHA256SUMS"),
+            "{file}"
+        );
+        assert!(shard.contains("name: rust-tests-nextest"), "{file}");
+        assert!(shard.contains("sha256sum --check SHA256SUMS"), "{file}");
+        assert!(!shard.contains("taiki-e/install-action@"), "{file}");
+    }
+}
+
+#[test]
 fn the_cargo_test_jobs_run_the_pull_request_suite() {
     let run_lines = |text: &str, job: &str| -> Vec<String> {
         block(text, job)
