@@ -803,8 +803,8 @@ impl Broker {
                     );
                     report.warnings.push(if environmental {
                         format!(
-                            "latest submit qid {} could not run its gates on this host (low disk, \
-                             locks or environment); free the resource and resubmit before finish",
+                            "latest submit qid {} reported an environment or resource error; inspect \
+                             the gate log before deciding whether to fix code or retry",
                             entry.id
                         )
                     } else {
