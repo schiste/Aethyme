@@ -270,7 +270,7 @@ fn deploy_inner(
                     || !crate::local::bridge_block_is_valid(&existing)
             }) {
                 return Err(format!(
-                    "customized generated policy {relative} requires reviewed resolution; run `aethyme upgrade plan --repo . --diff`, choose preserve, merge, or replace, then apply the confirmed plan"
+                    "customized generated policy {relative} requires reviewed resolution; run `aethyme broker status readiness plan --repo . --diff`, choose preserve, merge, or replace, then apply the confirmed readiness plan"
                 ));
             }
         }
@@ -1192,7 +1192,7 @@ mod tests {
 
         let error = deploy(&repo, true).unwrap_err();
         assert!(error.contains("customized generated policy AGENTS.md"));
-        assert!(error.contains("upgrade plan --repo . --diff"));
+        assert!(error.contains("broker status readiness plan --repo . --diff"));
         assert_eq!(
             std::fs::read(repo.join(".codex/skills/aethyme/SKILL.md")).unwrap(),
             before_skill
