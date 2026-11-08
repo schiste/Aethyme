@@ -428,10 +428,29 @@ enum LegacyDevicePolicy {
     Review { checkout_device_witnessed: bool },
 }
 
+/// Which checkout root object a marker must name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckoutObject {
+    /// The checkout object live at this path now.
+    Live,
+    /// A cleaned predecessor's checkout object, proven removed before the
+    /// live one was created; its saved spawn witness recorded these numbers.
+    Retired { device: u64, inode: u64 },
+}
+
 fn marker_identity_mismatch(
     locations: &ArtifactUseLocations,
     marker: &ArtifactUseMarker,
     legacy_devices: LegacyDevicePolicy,
+) -> Option<&'static str> {
+    marker_identity_mismatch_for(locations, marker, legacy_devices, CheckoutObject::Live)
+}
+
+fn marker_identity_mismatch_for(
+    locations: &ArtifactUseLocations,
+    marker: &ArtifactUseMarker,
+    legacy_devices: LegacyDevicePolicy,
+    checkout_object: CheckoutObject,
 ) -> Option<&'static str> {
     let schema_mismatch = match marker.schema_version {
         LEGACY_MARKER_SCHEMA_VERSION
@@ -474,8 +493,17 @@ fn marker_identity_mismatch(
     if marker.checkout_root != checkout_root {
         return Some("artifact-use marker checkout root path does not match");
     }
-    if marker.checkout_inode != locations.checkout_identity.inode {
+    let (expected_checkout_inode, retired_checkout_device) = match checkout_object {
+        CheckoutObject::Live => (locations.checkout_identity.inode, None),
+        CheckoutObject::Retired { device, inode } => (inode, Some(device)),
+    };
+    if marker.checkout_inode != expected_checkout_inode {
         return Some("artifact-use marker checkout root inode does not match");
+    }
+    // The witness and the marker both saved the retired object's device
+    // number while it existed, so they must agree exactly.
+    if retired_checkout_device.is_some_and(|device| marker.checkout_device != device) {
+        return Some("artifact-use marker checkout root device does not match its retired witness");
     }
     if marker.checkout_key != locations.checkout_key {
         return Some("artifact-use marker checkout key does not match");
@@ -492,7 +520,10 @@ fn marker_identity_mismatch(
             if check_primary && marker.primary_device != locations.primary_identity.device {
                 return Some("artifact-use marker primary root device does not match");
             }
-            if check_checkout && marker.checkout_device != locations.checkout_identity.device {
+            if check_checkout
+                && retired_checkout_device.is_none()
+                && marker.checkout_device != locations.checkout_identity.device
+            {
                 return Some("artifact-use marker checkout root device does not match");
             }
         }
@@ -1617,26 +1648,41 @@ fn reconciliation_disposition(
     let unknown = |reason: &str| ArtifactUseReconcileDisposition::Unknown {
         reason: reason.to_owned(),
     };
+    let session_ids = cohort.session_ids();
+    // A cleaned predecessor's marker named the checkout object that was
+    // removed before this one existed, so it is matched against that
+    // object's saved witness instead of the live checkout.
+    let retired_witness = (!session_ids.contains(&marker.session_id))
+        .then(|| cohort.retired_predecessor_witness(marker.session_id))
+        .flatten()
+        .filter(|witness| Path::new(&witness.worktree_path) == locations.checkout_root);
+    let checkout_object =
+        retired_witness.map_or(CheckoutObject::Live, |witness| CheckoutObject::Retired {
+            device: witness.worktree_device,
+            inode: witness.worktree_inode,
+        });
     let checkout_device_witnessed = marker.schema_version == LEGACY_MARKER_SCHEMA_VERSION
         && cohort.witnesses_checkout_root_device(
             &locations.checkout_root,
             marker.checkout_device,
             marker.checkout_inode,
         );
-    if let Some(reason) = marker_identity_mismatch(
+    if let Some(reason) = marker_identity_mismatch_for(
         locations,
         marker,
         LegacyDevicePolicy::Review {
             checkout_device_witnessed,
         },
+        checkout_object,
     ) {
         return retain(reason);
     }
     if record.filename != format!("{}.json", marker.nonce) {
         return retain("marker nonce does not match its filename");
     }
-    let session_ids = cohort.session_ids();
-    if !session_ids.contains(&marker.session_id) || !session_ids.contains(&selected_session_id) {
+    if !session_ids.contains(&selected_session_id)
+        || (!session_ids.contains(&marker.session_id) && retired_witness.is_none())
+    {
         return retain("marker session is not in the exact closed checkout cohort");
     }
     // Schema 1 keeps the existing registry translation for its saved
