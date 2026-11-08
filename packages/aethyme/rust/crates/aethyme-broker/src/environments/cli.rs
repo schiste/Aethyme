@@ -71,8 +71,12 @@ Usage:
       Environments of this repository (--all: every repository on this host).
   aethyme env history <id> [--limit N] [--json]
       The environment's recorded phase transitions, oldest first.
-  aethyme env logs <id> [<component>] [--tail N] [--json]
-      The last N (default 50) lines of each component log, or of one.
+  aethyme env logs <id> [<component>] [--phase run|build|provision|template|stop|destroy] [--run last] [--tail N] [--json]
+      The last N (default 50) lines of each component log, or of one. The
+      runtime output (run) and each hook phase have their own log; without
+      --phase every log that exists is shown. --run last starts at the last
+      run's timestamped start marker. Retention: [logs] max_bytes and keep in
+      the host environments.toml.
   aethyme env infer [--range <rev-range>] [--json]
       The minimum profile this worktree's changes need: [[rules]] globs over
       the diff against its base (committed, uncommitted and untracked, both
@@ -246,6 +250,10 @@ pub(super) struct Options {
     pub(super) all: bool,
     pub(super) ensure: bool,
     pub(super) tail: usize,
+    /// `env logs --phase <phase>` (#1522).
+    pub(super) phase: Option<String>,
+    /// `env logs --run last` (#1522).
+    pub(super) last_run: bool,
     pub(super) limit: usize,
     pub(super) wait_seconds: u64,
     pub(super) reconfigure: bool,
@@ -354,6 +362,8 @@ pub(super) fn parse_options(command: &str, rest: &[String]) -> Result<Options, F
         all: false,
         ensure: false,
         tail: 50,
+        phase: None,
+        last_run: false,
         limit: 200,
         wait_seconds: 300,
         reconfigure: false,
@@ -452,6 +462,29 @@ pub(super) fn parse_options(command: &str, rest: &[String]) -> Result<Options, F
             "--all" if command == "list" => options.all = true,
             "--ensure" if command == "supervise" => options.ensure = true,
             "--tail" if command == "logs" => options.tail = number(args.next(), "--tail")?,
+            "--phase" if command == "logs" => {
+                let phase = args
+                    .next()
+                    .ok_or_else(|| usage("--phase needs a phase".into()))?;
+                if phase.as_str() != super::logs::RUN_PHASE
+                    && !super::logs::HOOK_PHASES.contains(&phase.as_str())
+                {
+                    return Err(usage(format!(
+                        "--phase {phase:?}: pass run or one of {}",
+                        super::logs::HOOK_PHASES.join(", ")
+                    )));
+                }
+                options.phase = Some(phase.clone());
+            }
+            "--run" if command == "logs" => match args.next().map(String::as_str) {
+                Some("last") => options.last_run = true,
+                other => {
+                    return Err(usage(format!(
+                        "--run {}: only `last` is supported",
+                        other.unwrap_or("<missing>")
+                    )));
+                }
+            },
             "--limit" if command == "history" => options.limit = number(args.next(), "--limit")?,
             positional
                 if !positional.starts_with('-')

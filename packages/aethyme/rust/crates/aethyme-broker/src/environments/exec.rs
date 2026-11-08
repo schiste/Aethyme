@@ -23,7 +23,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::compile::{CompiledComponent, CompiledEnvironment};
-use super::logs::{LOG_CAP_BYTES, open_for_append, tail};
+use super::logs::{LogRun, open_for_append, stamp_markers, tail};
 use super::validate::env_suffix;
 
 pub const RECEIPT_PREFIX: &str = "AETHYME_RECEIPT ";
@@ -49,9 +49,17 @@ pub enum DriverError {
         label: String,
         exit: String,
         tail: String,
+        /// Where this run's output starts in its log (#1522).
+        log: Option<LogRun>,
     },
-    #[error("{label} did not finish within {seconds}s")]
-    Timeout { label: String, seconds: u64 },
+    #[error(
+        "{label} did not finish within {seconds}s; raise the component's hook_timeout_seconds if it needs longer"
+    )]
+    Timeout {
+        label: String,
+        seconds: u64,
+        log: Option<LogRun>,
+    },
     /// Stopped on purpose before it finished (#1366): a preemptible
     /// prebuild that yielded to foreground work.
     #[error("{label} was stopped: {reason}")]
@@ -90,6 +98,14 @@ impl DriverError {
             Self::Unproven { .. } => "identity_unproven",
             Self::Engine(_) => "engine_error",
             Self::Unsupported(_) => "unsupported",
+        }
+    }
+
+    /// The log run holding this failure's output, when it came from a hook.
+    pub fn log_run(&self) -> Option<&LogRun> {
+        match self {
+            Self::HookFailed { log, .. } | Self::Timeout { log, .. } => log.as_ref(),
+            _ => None,
         }
     }
 }
@@ -304,6 +320,7 @@ pub(crate) fn run_hook_in_directory_fd(
             return Err(DriverError::Timeout {
                 label: label.into(),
                 seconds: timeout.as_secs(),
+                log: None,
             });
         }
         crate::bounded_output::LimitedOutput::OutputLimit => {
@@ -317,6 +334,7 @@ pub(crate) fn run_hook_in_directory_fd(
                 label: label.into(),
                 exit: "output limit".into(),
                 tail: String::new(),
+                log: None,
             });
         }
     };
@@ -332,6 +350,7 @@ pub(crate) fn run_hook_in_directory_fd(
             label: label.into(),
             exit: output.status.to_string(),
             tail: log.tail(20).unwrap_or_default().join("\n"),
+            log: None,
         });
     }
     let receipt = parse_receipt(&stdout).map_err(|reason| DriverError::InvalidReceipt {
@@ -384,6 +403,10 @@ pub fn run_hook_until(
     stop: &mut dyn FnMut() -> Option<String>,
 ) -> Result<HookOutcome, DriverError> {
     let mut command = command(text, cwd, pass_env, vars);
+    // The start marker opens the run: `env logs --run last` selects from it,
+    // and a failure points at its offset (#1522).
+    let run = LogRun::next(log);
+    append_log(log, &format!("[aethyme] {label}: started\n"));
     let mut reason = None;
     let mut partial = crate::bounded_output::PartialOutput::default();
     let outcome = crate::bounded_output::output_limited_in_owned_group_until(
@@ -430,6 +453,7 @@ pub fn run_hook_until(
             return Err(DriverError::Timeout {
                 label: label.into(),
                 seconds: timeout.as_secs(),
+                log: Some(run),
             });
         }
         crate::bounded_output::LimitedOutput::OutputLimit => {
@@ -441,6 +465,7 @@ pub fn run_hook_until(
                 label: label.into(),
                 exit: "output limit".into(),
                 tail: String::new(),
+                log: Some(run),
             });
         }
     };
@@ -455,6 +480,7 @@ pub fn run_hook_until(
             label: label.into(),
             exit: output.status.to_string(),
             tail: log_tail(log),
+            log: Some(run),
         });
     }
     let receipt = parse_receipt(&stdout).map_err(|reason| DriverError::InvalidReceipt {
@@ -497,9 +523,10 @@ fn append_partial_output(log: &Path, label: &str, partial: &crate::bounded_outpu
     );
 }
 
+/// Append to a log, timestamping Aethyme's own `[aethyme]` lines (#1522).
 pub(crate) fn append_log(log: &Path, text: &str) {
-    let result =
-        open_for_append(log, LOG_CAP_BYTES).and_then(|mut file| file.write_all(text.as_bytes()));
+    let text = stamp_markers(text, super::activity::now_ms());
+    let result = open_for_append(log).and_then(|mut file| file.write_all(text.as_bytes()));
     crate::warn_unrecorded("append environment log", result);
 }
 

@@ -127,7 +127,7 @@ fn identical_trees_build_once_and_only_inputs_invalidate() {
         host.path()
             .join("environments")
             .join(&second)
-            .join("site.log"),
+            .join("site.build.log"),
     )
     .unwrap();
     assert!(log.contains("build cache hit"), "{log}");

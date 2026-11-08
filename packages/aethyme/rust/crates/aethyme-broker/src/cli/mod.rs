@@ -17,7 +17,7 @@ mod flags;
 mod gates;
 mod gc_storage;
 mod git_gh;
-mod insights;
+pub(crate) mod insights;
 mod leases;
 mod merge_chain;
 mod render;

@@ -536,6 +536,41 @@ pub struct HostEnvironmentsFile {
     /// Unknown marker/process state remains busy. Unset: for the command's life.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_exec_busy_seconds: Option<u64>,
+    /// Retention of component and supervisor logs (#1522).
+    #[serde(default, skip_serializing_if = "HostLogsSpec::is_default")]
+    pub logs: HostLogsSpec,
+}
+
+/// `[logs]` in the host `environments.toml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostLogsSpec {
+    /// Size at which one log is rotated (default 8 MiB, at least 64 KiB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    /// Rotated files kept per log (default 1; 0 discards a full log).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<u32>,
+}
+
+impl HostLogsSpec {
+    /// The smallest accepted `max_bytes`: below it a single build's output
+    /// would rotate away before it could be read.
+    pub const MIN_BYTES: u64 = 64 * 1024;
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn retention(&self) -> super::logs::LogRetention {
+        let default = super::logs::LogRetention::default();
+        super::logs::LogRetention {
+            max_bytes: self
+                .max_bytes
+                .map_or(default.max_bytes, |bytes| bytes.max(Self::MIN_BYTES)),
+            keep: self.keep.unwrap_or(default.keep).min(100),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

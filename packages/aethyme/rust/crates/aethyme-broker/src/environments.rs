@@ -43,6 +43,7 @@ pub mod shared;
 pub mod spec;
 pub mod store;
 pub mod supervisor;
+pub mod supervisor_log;
 pub mod validate;
 
 #[cfg(test)]

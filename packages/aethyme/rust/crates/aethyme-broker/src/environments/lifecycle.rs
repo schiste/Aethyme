@@ -45,6 +45,13 @@ pub const RESERVATION_GRANT: &str = "reservation.grant.json";
 pub const CAPACITY_GRANT: &str = "capacity.grant.json";
 /// Destroy retries the supervisor makes before waiting for an operator.
 pub const MAX_DESTROY_RETRIES: usize = 5;
+
+/// How long the sweep waits before retrying a destroy that has failed
+/// `failures` times: 30 s, doubling, at most 30 minutes (#1521).
+pub(crate) fn destroy_retry_backoff_ms(failures: usize) -> i64 {
+    let exponent = failures.saturating_sub(1).min(6) as u32;
+    (30_000_i64 << exponent).min(30 * 60 * 1000)
+}
 /// Longest an [`Lifecycle::exclusive`] key is held before it lapses.
 pub const EXCLUSIVE_KEY_TTL_SECONDS: u64 = 1800;
 
@@ -93,6 +100,14 @@ impl LifecycleError {
             Self::RecreateRequired { .. } => "recreate_required",
             Self::NotActive { .. } => "not_active",
             Self::Io(_) => "io_error",
+        }
+    }
+
+    /// The hook log run holding this failure's output, if any (#1522).
+    pub fn log_run(&self) -> Option<&super::logs::LogRun> {
+        match self {
+            Self::Driver(error) => error.log_run(),
+            _ => None,
         }
     }
 }
@@ -634,11 +649,14 @@ impl Lifecycle {
                 .and_then(|v| serde_json::from_value(v).ok());
             let ctx = self.context(&old, component, &bindings, 1);
             if let Err(error) = driver_for(component.runtime).destroy(&ctx, identity.as_ref()) {
-                let detail = json!({
-                    "code": error.code(),
-                    "component": component.name,
-                    "message": error.to_string(),
-                });
+                let detail = super::logs::with_log(
+                    json!({
+                        "code": error.code(),
+                        "component": component.name,
+                        "message": error.to_string(),
+                    }),
+                    error.log_run(),
+                );
                 self.store.set_error(&env_id, Some(&detail))?;
                 return Err(error.into());
             }
@@ -655,11 +673,14 @@ impl Lifecycle {
             &mut provisioned,
             &mut receipts,
         )? {
-            let detail = json!({
-                "code": error.code(),
-                "message": error.to_string(),
-                "provisioned": provisioned,
-            });
+            let detail = super::logs::with_log(
+                json!({
+                    "code": error.code(),
+                    "message": error.to_string(),
+                    "provisioned": provisioned,
+                }),
+                error.log_run(),
+            );
             self.store.set_error(&env_id, Some(&detail))?;
             return Err(error.into());
         }
@@ -1053,11 +1074,14 @@ impl Lifecycle {
         if rollback_errors.is_empty() {
             self.release_capacity(env_id)?;
         }
-        let detail = json!({
-            "code": error.code(),
-            "message": error.to_string(),
-            "rollback_errors": rollback_errors,
-        });
+        let detail = super::logs::with_log(
+            json!({
+                "code": error.code(),
+                "message": error.to_string(),
+                "rollback_errors": rollback_errors,
+            }),
+            error.log_run(),
+        );
         self.store.set_error(env_id, Some(&detail))?;
         let record = self
             .store
@@ -1132,12 +1156,15 @@ impl Lifecycle {
         if rollback_errors.is_empty() {
             self.release_capacity(&record.env_id)?;
         }
-        let detail = json!({
-            "code": error.code(),
-            "component": failed,
-            "message": error.to_string(),
-            "rollback_errors": rollback_errors,
-        });
+        let detail = super::logs::with_log(
+            json!({
+                "code": error.code(),
+                "component": failed,
+                "message": error.to_string(),
+                "rollback_errors": rollback_errors,
+            }),
+            error.log_run(),
+        );
         self.store.set_error(&record.env_id, Some(&detail))?;
         let current = self
             .store
@@ -1278,11 +1305,14 @@ impl Lifecycle {
                 .and_then(|v| serde_json::from_value(v).ok());
             let ctx = self.context(&snapshot, component, &bindings, 1);
             if let Err(error) = driver_for(component.runtime).destroy(&ctx, identity.as_ref()) {
-                let detail = json!({
-                    "code": error.code(),
-                    "component": component.name,
-                    "message": error.to_string(),
-                });
+                let detail = super::logs::with_log(
+                    json!({
+                        "code": error.code(),
+                        "component": component.name,
+                        "message": error.to_string(),
+                    }),
+                    error.log_run(),
+                );
                 self.store.set_error(&env_id, Some(&detail))?;
                 let current = self
                     .store
@@ -1392,29 +1422,54 @@ impl Lifecycle {
     pub fn sweep_orphans(&mut self) -> Result<Vec<String>, LifecycleError> {
         let mut acted = Vec::new();
         for record in self.store.list(None)? {
+            if record.phase == EnvironmentPhase::Destroying {
+                continue;
+            }
             let orphaned = record.phase.retains_worktree()
                 && record
                     .worktree_root
                     .as_deref()
                     .is_some_and(|root| !Path::new(root).exists());
-            let retry = record.phase == EnvironmentPhase::DestroyFailed
-                && self
+            // A failed destroy is retried with backoff, at most
+            // MAX_DESTROY_RETRIES times, orphaned or not (#1521): a cause that
+            // persists (no container engine) must not repeat every tick.
+            let mut failures = 0;
+            if record.phase == EnvironmentPhase::DestroyFailed {
+                let failed: Vec<i64> = self
                     .store
                     .transitions(&record.env_id, 200)?
                     .iter()
                     .filter(|t| t.to == EnvironmentPhase::DestroyFailed)
-                    .count()
-                    < MAX_DESTROY_RETRIES;
-            if !(orphaned || retry) || record.phase == EnvironmentPhase::Destroying {
+                    .map(|t| t.at)
+                    .collect();
+                failures = failed.len();
+                let due = failed
+                    .last()
+                    .is_none_or(|last| now_ms() - last >= destroy_retry_backoff_ms(failures));
+                if failures >= MAX_DESTROY_RETRIES || !due {
+                    continue;
+                }
+            } else if !orphaned {
                 continue;
             }
             acted.push(record.env_id.clone());
             // The outcome is recorded on the environment (destroyed or
             // destroy_failed with its error); keep sweeping the rest.
-            crate::warn_unrecorded(
-                &format!("destroy orphaned environment {}", record.env_id),
-                self.down(&record.env_id, None),
-            );
+            if let Err(error) = self.down(&record.env_id, None) {
+                let attempt = failures + 1;
+                if attempt >= MAX_DESTROY_RETRIES {
+                    eprintln!(
+                        "warning: aethyme gave up destroying environment {} after {attempt} attempts: {error}; fix the cause, then run `aethyme env down {}`",
+                        record.env_id, record.env_id
+                    );
+                } else {
+                    eprintln!(
+                        "warning: aethyme could not destroy orphaned environment {} (attempt {attempt} of {MAX_DESTROY_RETRIES}, next in {}s): {error}",
+                        record.env_id,
+                        destroy_retry_backoff_ms(attempt) / 1000
+                    );
+                }
+            }
         }
         Ok(acted)
     }
