@@ -132,11 +132,14 @@ impl Lifecycle {
             {
                 // Not proven stopped: never release capacity for something
                 // that may still be running.
-                let detail = json!({
-                    "code": error.code(),
-                    "component": component.name,
-                    "message": error.to_string(),
-                });
+                let detail = super::logs::with_log(
+                    json!({
+                        "code": error.code(),
+                        "component": component.name,
+                        "message": error.to_string(),
+                    }),
+                    error.log_run(),
+                );
                 self.store.set_error(&env_id, Some(&detail))?;
                 let current = self.current(&env_id)?;
                 self.advance(
@@ -214,11 +217,14 @@ impl Lifecycle {
             {
                 // Not proven stopped: as for park, never start a second
                 // instance beside one that may still run.
-                let detail = json!({
-                    "code": error.code(),
-                    "component": component.name,
-                    "message": error.to_string(),
-                });
+                let detail = super::logs::with_log(
+                    json!({
+                        "code": error.code(),
+                        "component": component.name,
+                        "message": error.to_string(),
+                    }),
+                    error.log_run(),
+                );
                 self.store.set_error(&env_id, Some(&detail))?;
                 let current = self.current(&env_id)?;
                 self.advance(
@@ -251,11 +257,14 @@ impl Lifecycle {
                 Err(error) => Err(error),
             };
             if let Err(error) = outcome {
-                let detail = json!({
-                    "code": error.code(),
-                    "component": component.name,
-                    "message": error.to_string(),
-                });
+                let detail = super::logs::with_log(
+                    json!({
+                        "code": error.code(),
+                        "component": component.name,
+                        "message": error.to_string(),
+                    }),
+                    error.log_run(),
+                );
                 self.store.set_error(&env_id, Some(&detail))?;
                 self.store
                     .note(&env_id, "restart failed", &self.actor, Some(&detail))?;
@@ -465,12 +474,15 @@ impl Lifecycle {
         if !rollback_failed {
             self.release_capacity(&env_id)?;
         }
-        let detail = json!({
-            "code": error.code(),
-            "component": failed,
-            "message": error.to_string(),
-            "rollback_errors": rollback_errors,
-        });
+        let detail = super::logs::with_log(
+            json!({
+                "code": error.code(),
+                "component": failed,
+                "message": error.to_string(),
+                "rollback_errors": rollback_errors,
+            }),
+            error.log_run(),
+        );
         self.store.set_error(&env_id, Some(&detail))?;
         let current = self.current(&env_id)?;
         let (phase, reason) = if !rollback_failed {

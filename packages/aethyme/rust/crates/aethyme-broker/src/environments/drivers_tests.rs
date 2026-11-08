@@ -149,7 +149,11 @@ fn process_conformance_start_health_stop_start_destroy_leaves_nothing() {
     driver.destroy(&ctx, Some(&second)).unwrap();
     assert_eq!(driver.observe(&ctx, &second), Observation::Gone);
     let log = std::fs::read_to_string(ctx.log()).unwrap();
-    assert!(log.contains("[aethyme] srv: start"), "{log}");
+    assert!(
+        log.lines()
+            .any(|line| line.starts_with("[aethyme 20") && line.ends_with("] srv: start")),
+        "the start marker is timestamped (#1522): {log}"
+    );
 }
 
 #[test]
@@ -353,7 +357,7 @@ hook_timeout_seconds = 1
         other => panic!("{other:?}"),
     }
     assert!(started.elapsed() < Duration::from_secs(10));
-    let log = std::fs::read_to_string(stuck.log()).unwrap();
+    let log = std::fs::read_to_string(stuck.phase_log("provision")).unwrap();
     assert!(log.contains("migrating step 1"), "{log}");
     assert!(log.contains("stderr line"), "{log}");
     assert!(log.contains("timed out after 1s"), "{log}");

@@ -52,6 +52,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::compile::{CompileContext, CompiledEnvironment, EnvironmentOwner, compile};
+use super::exec::DriverError;
 use super::lifecycle::{Lifecycle, LifecycleError, UpOptions, export_commit, now_ms};
 use super::spec::{EnvironmentsFile, HostEnvironmentsFile, RedeployOn, SharedSpec};
 use super::store::{EnvironmentPhase, EnvironmentRecord, StoreError};
@@ -657,7 +658,9 @@ impl Lifecycle {
     ) -> Result<EnvironmentRecord, LifecycleError> {
         let key = shared_operation_key(repository, name);
         self.exclusive(repository, &key, Duration::from_secs(5), |this| {
-            this.shared_up_locked(main_root, repository, name, host, wait)
+            let result = this.shared_up_locked(main_root, repository, name, host, wait);
+            this.sweep_exports(repository, name);
+            result
         })
         .unwrap_or_else(|| Err(io(format!("shared environment {name:?} is busy; retry"))))
     }
@@ -725,7 +728,13 @@ impl Lifecycle {
     ) -> Result<Redeploy, LifecycleError> {
         let key = shared_operation_key(repository, name);
         match self.exclusive(repository, &key, Duration::from_secs(5), |this| {
-            this.shared_redeploy_locked(main_root, repository, name, host, wait, force)
+            let result =
+                this.shared_redeploy_locked(main_root, repository, name, host, wait, force);
+            // Whatever the outcome, only the exports a live slot runs from
+            // stay on disk (#1524): failed revisions, superseded ones and any
+            // an earlier removal could not finish.
+            this.sweep_exports(repository, name);
+            result
         }) {
             Some(result) => result,
             None => Ok(Redeploy::InProgress),
@@ -854,9 +863,27 @@ impl Lifecycle {
                 .collect()
         };
         // Build the new revision in its own export while the old one serves.
-        if let Err(error) = self.build_export(&current, &snapshot, &export) {
+        // A failure to run or clean up the build (not the build failing) is
+        // retried once (#1524): a process group that outlived its reaping or
+        // a transient I/O error says nothing about the revision.
+        let built = match self.build_export(&current, &snapshot, &export) {
+            Err(error) if is_transient(&error) => {
+                self.store.note(
+                    env_id,
+                    "redeploy build retried",
+                    &self.actor,
+                    Some(&json!({ "commit": sha, "message": error.to_string() })),
+                )?;
+                self.build_export(&current, &snapshot, &export)
+            }
+            other => other,
+        };
+        if let Err(error) = built {
             let message = error.to_string();
-            let detail = json!({ "code": "redeploy_failed", "failed_commit": sha, "serving": from, "message": message });
+            let detail = super::logs::with_log(
+                json!({ "code": "redeploy_failed", "failed_commit": sha, "serving": from, "message": message }),
+                error.log_run(),
+            );
             self.store.set_error(env_id, Some(&detail))?;
             self.store
                 .note(env_id, "redeploy build failed", &self.actor, Some(&detail))?;
@@ -866,6 +893,12 @@ impl Lifecycle {
                 error: message,
             });
         }
+        // The build can take minutes, and a wake-on-request may have changed
+        // the phase meanwhile: decide from the record as it is now (#1524).
+        let current = self
+            .store
+            .get(env_id)?
+            .ok_or_else(|| StoreError::NotFound(env_id.to_string()))?;
         // Blue/green when the environment serves: nothing is held. Never for
         // a stateful service: the new slot would start without its data.
         if current.phase == EnvironmentPhase::Active
@@ -890,35 +923,27 @@ impl Lifecycle {
                     recreate: Vec::new(),
                 },
             )?;
-            self.store.note(
+            self.note_redeployed(
                 env_id,
-                "redeployed",
-                &self.actor,
-                Some(&json!({ "from": from, "to": sha, "recreated": "component set changed" })),
+                &current,
+                json!({ "from": from, "to": sha, "recreated": "component set changed" }),
             )?;
-            remove_previous_export(previous_export, &export);
             return Ok(Redeploy::Redeployed {
                 from,
                 to: sha.to_string(),
             });
         }
-        let was_active = current.phase == EnvironmentPhase::Active;
         let _swap = SwapGuard::begin(&self.root, env_id)?;
-        if was_active {
-            self.park(env_id, "redeploy")?;
-        }
-        // Hold: from here until the wake succeeds, the proxy holds requests to
-        // this environment's routes instead of failing them.
-        self.store.replace_snapshot(env_id, &snapshot, &export)?;
+        // The marker stops new wakes; one already under way finishes first,
+        // so the swap waits for it instead of losing the race (#1524).
+        let was_active = self.swap_in(env_id, &snapshot, &export)?;
         if !was_active {
             // Parked: swap only; the new revision starts on its next wake.
-            self.store.note(
+            self.note_redeployed(
                 env_id,
-                "redeployed",
-                &self.actor,
-                Some(&json!({ "from": from, "to": sha, "while": "parked" })),
+                &current,
+                json!({ "from": from, "to": sha, "while": "parked" }),
             )?;
-            remove_previous_export(previous_export, &export);
             return Ok(Redeploy::Redeployed {
                 from,
                 to: sha.to_string(),
@@ -926,13 +951,7 @@ impl Lifecycle {
         }
         match self.wake(env_id, wait) {
             Ok(_) => {
-                self.store.note(
-                    env_id,
-                    "redeployed",
-                    &self.actor,
-                    Some(&json!({ "from": from, "to": sha })),
-                )?;
-                remove_previous_export(previous_export, &export);
+                self.note_redeployed(env_id, &current, json!({ "from": from, "to": sha }))?;
                 Ok(Redeploy::Redeployed {
                     from,
                     to: sha.to_string(),
@@ -958,16 +977,15 @@ impl Lifecycle {
                         }
                     }
                 }
-                let detail = json!({ "code": "redeploy_failed", "failed_commit": sha, "serving": serving, "message": message });
+                let detail = super::logs::with_log(
+                    json!({ "code": "redeploy_failed", "failed_commit": sha, "serving": serving, "message": message }),
+                    error.log_run(),
+                );
                 self.store.set_error(env_id, Some(&detail))?;
                 self.store
                     .note(env_id, "redeploy rolled back", &self.actor, Some(&detail))?;
-                if serving.is_some() {
-                    crate::warn_unrecorded(
-                        "remove the failed shared export",
-                        std::fs::remove_dir_all(&export),
-                    );
-                }
+                // The failed export is removed by the sweep that follows every
+                // redeploy, unless the record still runs from it.
                 Ok(Redeploy::RolledBack {
                     failed: sha.to_string(),
                     serving,
@@ -1037,7 +1055,10 @@ impl Lifecycle {
             Err(error) => {
                 self.retire_slot(&snapshot.env_id);
                 let message = error.to_string();
-                let detail = json!({ "code": "redeploy_failed", "failed_commit": sha, "serving": from, "message": message, "strategy": "blue_green" });
+                let detail = super::logs::with_log(
+                    json!({ "code": "redeploy_failed", "failed_commit": sha, "serving": from, "message": message, "strategy": "blue_green" }),
+                    error.log_run(),
+                );
                 self.store.set_error(&current.env_id, Some(&detail))?;
                 self.store.note(
                     &current.env_id,
@@ -1062,22 +1083,23 @@ impl Lifecycle {
             "destroy the previous shared slot",
             self.down(&current.env_id, None),
         );
-        self.store.note(
+        self.note_redeployed(
             &next.env_id,
-            "redeployed",
-            &self.actor,
-            Some(&json!({ "from": from, "to": sha, "strategy": "blue_green", "previous": current.env_id })),
+            current,
+            json!({ "from": from, "to": sha, "strategy": "blue_green", "previous": current.env_id }),
         )?;
-        remove_previous_export(current.worktree_root.clone().map(PathBuf::from), &export);
         Ok(Some(Redeploy::Redeployed {
             from,
             to: sha.to_string(),
         }))
     }
 
-    /// Run every component's `build` hook in the new export.
+    /// Run every component's `build` in the new export, through the build
+    /// cache exactly as `env up` does (#1219): a component that declares
+    /// `cache_inputs` and an output restores an unchanged build instead of
+    /// rebuilding it in every export (#1524).
     fn build_export(
-        &self,
+        &mut self,
         current: &EnvironmentRecord,
         snapshot: &CompiledEnvironment,
         export: &Path,
@@ -1085,12 +1107,159 @@ impl Lifecycle {
         let mut bindings = self.bindings_for(current)?;
         bindings.worktree = export.to_path_buf();
         for component in &snapshot.components {
-            if let Some(build) = &component.commands.build {
+            if component.commands.build.is_some() {
                 let ctx = self.context(snapshot, component, &bindings, 1);
-                ctx.hook("build", build)?;
+                self.cached_build(&ctx)?;
             }
         }
         Ok(())
+    }
+
+    /// Record a successful redeploy and clear the error it supersedes
+    /// (#1523). The cleared error stays in the history, on this note.
+    fn note_redeployed(
+        &mut self,
+        env_id: &str,
+        previous: &EnvironmentRecord,
+        mut detail: serde_json::Value,
+    ) -> Result<(), LifecycleError> {
+        let superseded = self
+            .store
+            .get(env_id)?
+            .and_then(|record| record.last_error)
+            .or_else(|| previous.last_error.clone());
+        if let (Some(error), Some(object)) = (superseded, detail.as_object_mut()) {
+            object.insert("resolved_error".into(), error);
+        }
+        self.store.set_error(env_id, None)?;
+        self.store
+            .note(env_id, "redeployed", &self.actor, Some(&detail))?;
+        Ok(())
+    }
+
+    /// Swap `snapshot` into a stopped environment, parking it first if it
+    /// serves. Returns whether it was serving (and must be woken). A phase in
+    /// flux (a wake or park already under way) is waited out rather than
+    /// failing the redeploy, and a swap that still loses a race is retried
+    /// once from the phase it lost to (#1524).
+    fn swap_in(
+        &mut self,
+        env_id: &str,
+        snapshot: &CompiledEnvironment,
+        export: &Path,
+    ) -> Result<bool, LifecycleError> {
+        let mut was_active = false;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let phase = self.settled_phase(env_id, PHASE_SETTLE_WAIT)?;
+            if phase == EnvironmentPhase::Active {
+                self.park(env_id, "redeploy")?;
+                was_active = true;
+            }
+            // Hold: from here until the wake succeeds, the proxy holds
+            // requests to this environment's routes instead of failing them.
+            match self.store.replace_snapshot(env_id, snapshot, export) {
+                Ok(_) => return Ok(was_active),
+                Err(StoreError::IllegalTransition { .. }) if attempt < 2 => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    /// The environment's phase once no transition is under way, waiting up to
+    /// `wait` for one to finish.
+    fn settled_phase(
+        &self,
+        env_id: &str,
+        wait: Duration,
+    ) -> Result<EnvironmentPhase, LifecycleError> {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            let phase = self
+                .store
+                .get(env_id)?
+                .ok_or_else(|| StoreError::NotFound(env_id.to_string()))?
+                .phase;
+            let in_flux = matches!(
+                phase,
+                EnvironmentPhase::Starting
+                    | EnvironmentPhase::Stopping
+                    | EnvironmentPhase::Waking
+                    | EnvironmentPhase::Provisioning
+            );
+            if !in_flux || std::time::Instant::now() >= deadline {
+                return Ok(phase);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// Remove every export of shared environment `name` that no live slot
+    /// runs from (#1524). Called under the shared operation key after every
+    /// up, redeploy and destroy, so it also reclaims exports an earlier
+    /// removal could not finish. Only directories named like an export (or
+    /// its staging directory) are touched, and nothing at all when the store
+    /// cannot say which exports are in use.
+    pub(super) fn sweep_exports(&self, repository: &str, name: &str) -> Vec<PathBuf> {
+        let directory = home(&self.root, repository, name);
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            return Vec::new();
+        };
+        let records = match self.store.list(Some(repository)) {
+            Ok(records) => records,
+            Err(error) => {
+                crate::warn_unrecorded(
+                    "list shared environments to sweep exports",
+                    Err::<(), _>(error),
+                );
+                return Vec::new();
+            }
+        };
+        let in_use: Vec<PathBuf> = records
+            .into_iter()
+            .filter(|record| record.phase.retains_worktree())
+            .filter(|record| {
+                matches!(&record.owner, EnvironmentOwner::Ref { name: owner }
+                    if owner.split('@').next() == Some(name))
+            })
+            .filter_map(|record| record.worktree_root.map(PathBuf::from))
+            .flat_map(|path| {
+                let canonical = path.canonicalize().ok();
+                std::iter::once(path).chain(canonical)
+            })
+            .collect();
+        let mut removed = Vec::new();
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            let stem = file_name.strip_suffix(".staging").unwrap_or(&file_name);
+            if !is_export_name(stem) {
+                continue;
+            }
+            let path = entry.path();
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if in_use
+                .iter()
+                .any(|used| *used == path || *used == canonical)
+            {
+                continue;
+            }
+            match remove_tree(&path) {
+                Ok(()) => removed.push(path),
+                Err(error) => crate::warn_unrecorded(
+                    &format!(
+                        "remove the unused shared export {} (retried on the next redeploy)",
+                        path.display()
+                    ),
+                    Err::<(), _>(error),
+                ),
+            }
+        }
+        removed
     }
 
     /// Supervisor work for one repository: redeploy live shared environments
@@ -1240,7 +1409,9 @@ impl Lifecycle {
     ) -> Result<EnvironmentRecord, LifecycleError> {
         let key = shared_operation_key(repository, name);
         self.exclusive(repository, &key, Duration::from_secs(5), |this| {
-            this.shared_destroy_locked(main_root, repository, name)
+            let result = this.shared_destroy_locked(main_root, repository, name);
+            this.sweep_exports(repository, name);
+            result
         })
         .unwrap_or_else(|| Err(io(format!("shared environment {name:?} is busy; retry"))))
     }
@@ -1272,15 +1443,34 @@ impl Lifecycle {
     }
 }
 
-fn remove_previous_export(previous: Option<PathBuf>, current: &Path) {
-    if let Some(old) = previous
-        && old != current
-    {
-        crate::warn_unrecorded(
-            "remove the previous shared export",
-            std::fs::remove_dir_all(&old),
-        );
+/// How long a redeploy waits for a wake or park already under way before it
+/// swaps.
+const PHASE_SETTLE_WAIT: Duration = Duration::from_secs(60);
+
+/// Whether a failed build says nothing about the revision: the hook could
+/// not be run or cleaned up, as opposed to exiting non-zero or timing out.
+fn is_transient(error: &LifecycleError) -> bool {
+    matches!(error, LifecycleError::Driver(DriverError::Io { .. }))
+}
+
+/// An export directory is named by the first 12 hex digits of its commit.
+fn is_export_name(name: &str) -> bool {
+    name.len() == 12 && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `remove_dir_all`, retried: a process still exiting or Finder writing
+/// `.DS_Store` can make one pass fail with "Directory not empty".
+fn remove_tree(path: &Path) -> io::Result<()> {
+    let mut last = None;
+    for delay in [0, 100, 500, 2000] {
+        std::thread::sleep(Duration::from_millis(delay));
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => last = Some(error),
+        }
     }
+    Err(last.unwrap_or_else(|| io::Error::other("not removed")))
 }
 
 /// `AETHYME_SHARED_<NAME>_URL` / `_DIRECT_URL` / `_PORT_<COMPONENT>` for a

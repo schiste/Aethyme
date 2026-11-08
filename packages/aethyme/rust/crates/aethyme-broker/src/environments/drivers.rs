@@ -28,7 +28,7 @@ use super::compile::{CompiledComponent, CompiledEnvironment};
 use super::engine::{ComposeCli, EngineCli, resolve};
 use super::exec::{self, Bindings, DriverError, append_log, io, log_tail, run_hook};
 use super::identity::{Observation, ProcessIdentity};
-use super::logs::{LOG_CAP_BYTES, open_for_append};
+use super::logs::open_for_append;
 use super::spec::{Engine, HealthSpec, Runtime};
 use crate::managed_services::FullContainerId;
 
@@ -67,8 +67,22 @@ pub struct DriverContext<'a> {
 }
 
 impl DriverContext<'_> {
+    /// The runtime log: what the started process prints.
     pub fn log(&self) -> PathBuf {
-        self.directory.join(format!("{}.log", self.component.name))
+        self.phase_log(super::logs::RUN_PHASE)
+    }
+
+    /// The log of one hook phase (`build`, `provision`, ...), beside the
+    /// runtime log so a long build never buries the server's output (#1522).
+    /// An unknown phase shares the runtime log.
+    pub fn phase_log(&self, phase: &str) -> PathBuf {
+        let phase = if super::logs::HOOK_PHASES.contains(&phase) {
+            phase
+        } else {
+            super::logs::RUN_PHASE
+        };
+        self.directory
+            .join(super::logs::phase_file_name(&self.component.name, phase))
     }
 
     pub fn vars(&self) -> BTreeMap<String, String> {
@@ -91,7 +105,7 @@ impl DriverContext<'_> {
             self.cwd(),
             &self.component.pass_env,
             &self.vars(),
-            &self.log(),
+            &self.phase_log(label),
             self.component.hook_timeout(self.hook_timeout),
         )
         .map(|outcome| outcome.receipt)
@@ -281,7 +295,7 @@ impl Driver for ProcessDriver {
         let text = ctx.component.commands.start.as_deref().ok_or_else(|| {
             DriverError::Unsupported(format!("{} has no start command", ctx.component.name))
         })?;
-        let log = open_for_append(&ctx.log(), LOG_CAP_BYTES).map_err(io("open component log"))?;
+        let log = open_for_append(&ctx.log()).map_err(io("open component log"))?;
         let mut command = exec::command(text, ctx.cwd(), &ctx.component.pass_env, &ctx.vars());
         command
             .stdin(Stdio::null())

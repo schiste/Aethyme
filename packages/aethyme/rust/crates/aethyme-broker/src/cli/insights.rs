@@ -517,6 +517,17 @@ fn timestamp(ms: i64) -> String {
     )
 }
 
+/// Unix milliseconds as an RFC 3339 UTC instant with milliseconds, for log
+/// lines that must line up with millisecond history timestamps (#1521).
+pub(crate) fn timestamp_millis(ms: i64) -> String {
+    let base = timestamp(ms);
+    format!(
+        "{}.{:03}Z",
+        base.trim_end_matches('Z'),
+        ms.rem_euclid(1_000)
+    )
+}
+
 /// Days since 1970-01-01 to a proleptic Gregorian date.
 ///
 /// Howard Hinnant's `civil_from_days`: the era is a 400-year cycle, the year

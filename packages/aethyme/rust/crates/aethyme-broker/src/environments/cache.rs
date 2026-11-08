@@ -545,7 +545,7 @@ impl Lifecycle {
             .join(&component.name)
             .join(short(&digest));
         let key = format!("aethyme-env-build:{repository}:{}:{digest}", component.name);
-        let log = ctx.log();
+        let log = ctx.phase_log("build");
         let target = worktree.join(output);
         let timeout = component.hook_timeout(ctx.hook_timeout);
         self.coalesce(&repository, &key, timeout, |this| {
@@ -609,7 +609,7 @@ impl Lifecycle {
                 component,
                 worktree: &worktree,
                 vars: ctx.vars(),
-                log: ctx.log(),
+                log: ctx.phase_log("template"),
                 timeout: component.hook_timeout(ctx.hook_timeout),
                 env_id: Some(&ctx.environment.env_id),
                 keep: component.template_keep,
