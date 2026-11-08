@@ -49,6 +49,12 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- For `release_contract` after building the release router and engine, run
+  from the Rust workspace with `AETHYME_RELEASE_BINARY_DIR="$PWD/target/debug"`
+  so the version check reuses those binaries instead of rebuilding them.
+  Verify both binaries match the candidate version and, when release commit
+  metadata is required, the exact source commit; do not reuse stale artifacts.
+
 - For short CLI benchmarks, wait on OS process-exit notifications rather than
   adding a polling sleep to the measured wall time. Retain raw command receipts
   and normalize platform-specific CPU/RSS accounting. On Linux, a Python-launched
