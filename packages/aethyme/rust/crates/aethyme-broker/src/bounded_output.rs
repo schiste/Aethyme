@@ -1099,7 +1099,7 @@ impl OwnedProbeChild {
                         }
                     };
                     let final_group_absence =
-                        Ok(crate::gates::gate_process_group_absent(self.process_group));
+                        Ok(group_absent_within(self.process_group, OWNED_GROUP_SETTLE));
                     validate_owned_probe_cleanup(
                         self.reaped,
                         final_group_absence,
@@ -1123,6 +1123,29 @@ impl OwnedProbeChild {
                 }
             }
         }
+    }
+}
+
+/// How long SIGKILLed members of an owned group get to finish exiting after
+/// the leader is reaped. A member in uninterruptible I/O (a build writing a
+/// virtualenv to a slow disk) dies only when that I/O returns; 200 ms was not
+/// enough and failed shared-environment redeploys with "process group
+/// remained after reaping" (#1524). No signal is sent again: the group ID is
+/// still reserved by its members, and every member already received SIGKILL.
+#[cfg(unix)]
+const OWNED_GROUP_SETTLE: Duration = Duration::from_secs(3);
+
+#[cfg(unix)]
+fn group_absent_within(process_group: i32, settle: Duration) -> bool {
+    let deadline = Instant::now() + settle;
+    loop {
+        if crate::gates::gate_process_group_absent(process_group) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -2005,5 +2028,30 @@ mod tests {
         .unwrap()
         .expect("finished within the budget");
         assert_eq!(output.stdout.len(), 1_000_000);
+    }
+
+    /// #1524: a group whose members take longer than the probe's own 200 ms
+    /// to finish exiting is still proven absent once they do.
+    #[cfg(unix)]
+    #[test]
+    fn owned_group_absence_waits_for_members_still_exiting() {
+        use std::os::unix::process::CommandExt as _;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = child.id() as i32;
+        assert!(!crate::gates::gate_process_group_absent(group));
+        let killer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            child.kill().unwrap();
+            child.wait().unwrap();
+        });
+        assert!(
+            group_absent_within(group, OWNED_GROUP_SETTLE),
+            "absence is proven once the member has exited"
+        );
+        killer.join().unwrap();
     }
 }

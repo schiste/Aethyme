@@ -718,6 +718,49 @@ destroy = "exit 1"
     assert_eq!(detail["possibly_leaked"][0]["receipt"]["database"], "x");
 }
 
+/// #1521: an orphan whose destroy keeps failing is retried with backoff,
+/// not on every supervisor tick.
+#[test]
+fn a_failing_orphan_destroy_backs_off() {
+    let host = Host::new();
+    let text = r#"
+schema = 1
+[[profiles]]
+name = "p"
+[[profiles.components]]
+name = "db"
+runtime = "hooks"
+provision = "true"
+destroy = "exit 1"
+"#;
+    let worktree = tempfile::tempdir().unwrap();
+    let snapshot = snapshot(text, "p", worktree.path(), None);
+    let mut lifecycle = host.lifecycle();
+    let record = lifecycle
+        .up(&snapshot, worktree.path(), None, None, &options())
+        .unwrap();
+    drop(worktree);
+
+    assert_eq!(
+        lifecycle.sweep_orphans().unwrap(),
+        vec![record.env_id.clone()]
+    );
+    assert_eq!(
+        lifecycle.store.get(&record.env_id).unwrap().unwrap().phase,
+        EnvironmentPhase::DestroyFailed
+    );
+    assert!(
+        lifecycle.sweep_orphans().unwrap().is_empty(),
+        "the next tick waits out the backoff"
+    );
+    assert_eq!(super::lifecycle::destroy_retry_backoff_ms(1), 30_000);
+    assert_eq!(super::lifecycle::destroy_retry_backoff_ms(4), 240_000);
+    assert_eq!(
+        super::lifecycle::destroy_retry_backoff_ms(40),
+        30 * 60 * 1000
+    );
+}
+
 /// #1211 acceptance: the owner dies and the worktree is deleted by hand;
 /// the sweep still runs every destroy, from an export of the recorded
 /// commit, and releases the leases.

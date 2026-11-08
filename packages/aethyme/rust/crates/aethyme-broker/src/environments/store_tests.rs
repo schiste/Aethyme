@@ -6,7 +6,9 @@ use rusqlite::{Connection, params};
 
 use super::compile::{CompileContext, CompiledEnvironment, EnvironmentOwner, compile};
 use super::identity::{Observation, ProcessIdentity};
-use super::logs::{log_path, open_for_append, remove_environment_directory, tail};
+use super::logs::{
+    LogRetention, log_path, open_for_append_with, remove_environment_directory, tail,
+};
 use super::spec::{EnvironmentsFile, HostEnvironmentsFile};
 use super::store::{
     EnvironmentPhase, EnvironmentStore, STORE_SCHEMA_VERSION, StoreError, valid_env_id,
@@ -375,14 +377,28 @@ fn logs_rotate_at_the_cap_and_tail_spans_the_rotation() {
     let path = log_path(directory.path(), "env-0123456789ab", "api").unwrap();
     {
         use std::io::Write;
-        let mut log = open_for_append(&path, 64).unwrap();
+        let mut log = open_for_append_with(
+            &path,
+            LogRetention {
+                max_bytes: 64,
+                keep: 1,
+            },
+        )
+        .unwrap();
         for n in 0..20 {
             writeln!(log, "old {n}").unwrap();
         }
     }
     {
         use std::io::Write;
-        let mut log = open_for_append(&path, 64).unwrap();
+        let mut log = open_for_append_with(
+            &path,
+            LogRetention {
+                max_bytes: 64,
+                keep: 1,
+            },
+        )
+        .unwrap();
         writeln!(log, "new 0").unwrap();
     }
     let mut rotated = path.as_os_str().to_owned();
@@ -425,6 +441,114 @@ fn the_supervisor_lingers_out_and_withdraws_its_record() {
     let reason = supervisor::run(&config, &mut Script(vec![true, true, true]), &|| false).unwrap();
     assert_eq!(reason, ExitReason::Linger);
     assert_eq!(supervisor::status(directory.path()).state, "absent");
+}
+
+/// #1521: an idle exit is recorded with its reason and time, so `env status`
+/// reads "absent (last exit at …: idle linger elapsed)", not a bare "absent".
+#[test]
+fn an_idle_exit_is_recorded_with_its_reason() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = quick(directory.path().to_path_buf(), 50);
+    supervisor::run(&config, &mut Script(Vec::new()), &|| false).unwrap();
+    let status = supervisor::status(directory.path());
+    assert_eq!(status.state, "absent");
+    let exit = status.last_exit.clone().expect("an exit record");
+    assert_eq!(exit.pid, std::process::id() as i32);
+    assert!(exit.exited_at_ms.is_some());
+    assert!(exit.reason.starts_with("idle linger elapsed"), "{exit:?}");
+    let line = status.describe();
+    assert!(line.contains("last exit at 20"), "{line}");
+    assert!(line.contains("idle linger elapsed"), "{line}");
+}
+
+/// #1521: a panic in the work is recorded as the exit reason before it
+/// propagates.
+#[test]
+fn a_panicking_supervisor_records_the_panic() {
+    struct Boom;
+    impl SupervisorWork for Boom {
+        fn tick(&mut self) -> TickOutcome {
+            panic!("boom in a tick");
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let config = quick(directory.path().to_path_buf(), 50);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        supervisor::run(&config, &mut Boom, &|| false)
+    }));
+    assert!(outcome.is_err(), "the panic still propagates");
+    let status = supervisor::status(directory.path());
+    assert_eq!(status.state, "absent", "the record is withdrawn");
+    assert_eq!(status.last_exit.unwrap().reason, "panic: boom in a tick");
+}
+
+/// #1521: a record whose process is gone, with no exit record of its own,
+/// reads as an unrecorded exit (a kill or crash), not as a live supervisor
+/// and not as an idle exit.
+#[cfg(unix)]
+#[test]
+fn a_supervisor_that_vanished_reads_as_an_unrecorded_exit() {
+    let directory = tempfile::tempdir().unwrap();
+    // Its own group: a gone leader whose group lives on is unproven, not gone.
+    let mut child = {
+        use std::os::unix::process::CommandExt as _;
+        std::process::Command::new("true")
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    };
+    let identity = super::identity::ProcessIdentity::capture(child.id() as i32);
+    child.wait().unwrap();
+    let Some(identity) = identity else {
+        eprintln!("SKIP vanished supervisor: the child exited before capture");
+        return;
+    };
+    let record = supervisor::SupervisorRecord {
+        identity,
+        started_at_ms: 1_000,
+        version: "0.8.57".into(),
+    };
+    std::fs::write(
+        directory.path().join(supervisor::SUPERVISOR_STATE),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let status = supervisor::status(directory.path());
+    assert_eq!(status.state, "absent");
+    let exit = status.last_exit.unwrap();
+    assert_eq!(exit.reason, supervisor::UNRECORDED_EXIT);
+    assert_eq!(exit.version, "0.8.57");
+    assert_eq!(exit.exited_at_ms, None);
+}
+
+/// #1521: a running supervisor older than this binary is reported.
+#[test]
+fn a_supervisor_running_another_version_is_reported() {
+    let directory = tempfile::tempdir().unwrap();
+    let identity = super::identity::ProcessIdentity::capture(std::process::id() as i32).unwrap();
+    let record = supervisor::SupervisorRecord {
+        identity,
+        started_at_ms: 1_000,
+        version: "0.0.1".into(),
+    };
+    std::fs::write(
+        directory.path().join(supervisor::SUPERVISOR_STATE),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    let status = supervisor::status(directory.path());
+    assert_eq!(status.state, "running");
+    assert_eq!(
+        status.installed_version.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    assert!(
+        status
+            .describe()
+            .contains("warning: the supervisor runs v0.0.1"),
+        "{}",
+        status.describe()
+    );
 }
 
 #[test]

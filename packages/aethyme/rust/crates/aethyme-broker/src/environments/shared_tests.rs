@@ -48,6 +48,25 @@ impl Host {
     }
 }
 
+/// Destroy whatever a test left running, even when it panicked: a leaked
+/// `python3 -m http.server` keeps its port, and once a test's fixed range is
+/// full every later run on the host fails with "no broker-free and
+/// OS-bindable port remains".
+impl Drop for Host {
+    fn drop(&mut self) {
+        let records = match EnvironmentStore::open(&self.store()).and_then(|s| s.list(None)) {
+            Ok(records) => records,
+            Err(_) => return,
+        };
+        let mut lifecycle = self.lifecycle();
+        for record in records {
+            if record.phase.retains_worktree() {
+                let _ = lifecycle.down(&record.env_id, None);
+            }
+        }
+    }
+}
+
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)
@@ -1606,6 +1625,275 @@ fn a_shared_environment_on_inputs_ignores_unrelated_commits() {
             break;
         }
     }
+}
+
+fn stateful(port_start: u16) -> String {
+    environments(port_start, SERVE).replacen(
+        "min_redeploy_interval_seconds = 3600\n",
+        "min_redeploy_interval_seconds = 3600\nstateful = true\n",
+        1,
+    )
+}
+
+fn with_build(text: &str, build: &str) -> String {
+    text.replace(
+        "route = true\n",
+        &format!("route = true\nbuild = '{build}'\n"),
+    )
+}
+
+/// The export directories of the `baseline` shared environment.
+fn exports(host: &Host) -> Vec<String> {
+    let home = host.root().join("shared").join(REPOSITORY).join("baseline");
+    let mut names: Vec<String> = std::fs::read_dir(home)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+fn short(sha: &str) -> String {
+    sha[..12].to_string()
+}
+
+/// #1523 and #1524: a failed build leaves no export behind, and the next
+/// successful redeploy clears the error it supersedes (keeping it in the
+/// history) instead of reporting a fixed failure forever.
+#[test]
+fn a_successful_redeploy_clears_the_error_and_failed_exports() {
+    if !python_available() {
+        eprintln!("SKIP error clearing: python3 not available");
+        return;
+    }
+    let host = Host::new();
+    let repo = repository(44200);
+    let first = commit(
+        repo.path(),
+        ".aethyme/environments.toml",
+        &stateful(44200),
+        "stateful",
+    );
+    let none = HostEnvironmentsFile::default();
+    let mut lifecycle = host.lifecycle();
+    let before = up_baseline(&mut lifecycle, repo.path());
+    // Parked, as in the report: a swap while parked wakes nothing, so no
+    // wake clears the error on the way.
+    lifecycle.park(&before.env_id, "test").unwrap();
+    let redeploy = |lifecycle: &mut Lifecycle| {
+        lifecycle
+            .shared_redeploy(
+                repo.path(),
+                REPOSITORY,
+                "baseline",
+                &none,
+                Duration::from_secs(20),
+                true,
+            )
+            .unwrap()
+    };
+
+    let broken = commit(
+        repo.path(),
+        ".aethyme/environments.toml",
+        &with_build(&stateful(44200), "echo cannot build >&2; exit 4"),
+        "broken build",
+    );
+    let outcome = redeploy(&mut lifecycle);
+    assert!(
+        matches!(&outcome, Redeploy::RolledBack { failed, .. } if *failed == broken),
+        "{outcome:?}"
+    );
+    let failed = lifecycle.store.get(&before.env_id).unwrap().unwrap();
+    let error = failed.last_error.clone().unwrap();
+    assert_eq!(error["failed_commit"], broken.as_str());
+    // #1522: the failure names the build log run that holds its output.
+    let log = PathBuf::from(error["log"]["path"].as_str().unwrap());
+    assert!(log.ends_with("api.build.log"), "{error}");
+    let offset = error["log"]["offset"].as_u64().unwrap() as usize;
+    let text = std::fs::read_to_string(&log).unwrap();
+    let run = &text[offset..];
+    assert!(
+        run.starts_with("[aethyme 20")
+            && run.lines().next().unwrap().ends_with("api: build: started"),
+        "the run starts at its timestamped marker: {run}"
+    );
+    assert!(run.contains("cannot build"), "{run}");
+    let runtime = std::fs::read_to_string(log.with_file_name("api.log")).unwrap_or_default();
+    assert!(
+        !runtime.contains("cannot build"),
+        "build output stays out of the runtime log: {runtime}"
+    );
+    assert_eq!(
+        exports(&host),
+        vec![short(&first)],
+        "the failed revision's export is removed"
+    );
+
+    let fixed = commit(
+        repo.path(),
+        ".aethyme/environments.toml",
+        &stateful(44200),
+        "fixed",
+    );
+    let outcome = redeploy(&mut lifecycle);
+    assert!(
+        matches!(&outcome, Redeploy::Redeployed { to, .. } if *to == fixed),
+        "{outcome:?}"
+    );
+    let after = lifecycle.store.get(&before.env_id).unwrap().unwrap();
+    assert_eq!(
+        after.phase,
+        EnvironmentPhase::Parked,
+        "swapped while parked"
+    );
+    assert_eq!(
+        after.snapshot.source.commit.as_deref(),
+        Some(fixed.as_str())
+    );
+    assert_eq!(after.last_error, None, "the superseded error is cleared");
+    let history = lifecycle.store.transitions(&before.env_id, 50).unwrap();
+    let redeployed = history
+        .iter()
+        .rev()
+        .find(|t| t.reason == "redeployed")
+        .expect("a redeployed note");
+    assert_eq!(
+        redeployed.detail.as_ref().unwrap()["resolved_error"]["failed_commit"],
+        broken.as_str(),
+        "the cleared error stays in the history: {redeployed:?}"
+    );
+    assert_eq!(exports(&host), vec![short(&fixed)]);
+    lifecycle
+        .shared_destroy(repo.path(), REPOSITORY, "baseline")
+        .unwrap();
+    assert!(exports(&host).is_empty(), "destroy leaves no export");
+}
+
+/// #1524: exports an earlier removal could not finish (and interrupted
+/// staging directories) are swept by the next redeploy, even one that
+/// changes nothing; the serving export and unrelated entries stay.
+#[test]
+fn a_redeploy_sweeps_exports_no_slot_runs_from() {
+    if !python_available() {
+        eprintln!("SKIP export sweep: python3 not available");
+        return;
+    }
+    let host = Host::new();
+    let repo = repository(44250);
+    let mut lifecycle = host.lifecycle();
+    let record = up_baseline(&mut lifecycle, repo.path());
+    let serving = short(record.snapshot.source.commit.as_deref().unwrap());
+    let home = host.root().join("shared").join(REPOSITORY).join("baseline");
+    for stale in ["0b9f56ec37ca", "5761376cc747.staging"] {
+        std::fs::create_dir_all(home.join(stale).join("venv/lib")).unwrap();
+        std::fs::write(home.join(stale).join("venv/lib/x.py"), "x").unwrap();
+    }
+    std::fs::create_dir_all(home.join("not-an-export")).unwrap();
+
+    let outcome = lifecycle
+        .shared_redeploy(
+            repo.path(),
+            REPOSITORY,
+            "baseline",
+            &HostEnvironmentsFile::default(),
+            Duration::from_secs(10),
+            true,
+        )
+        .unwrap();
+    assert!(matches!(outcome, Redeploy::Unchanged { .. }), "{outcome:?}");
+    assert_eq!(
+        exports(&host),
+        vec![serving, "not-an-export".to_string()],
+        "only the serving export and non-export entries remain"
+    );
+    lifecycle
+        .shared_destroy(repo.path(), REPOSITORY, "baseline")
+        .unwrap();
+}
+
+/// #1524: a parked shared environment woken (by a request) while its next
+/// revision builds is swapped from the phase it is in by then, instead of
+/// failing with "cannot go from active to snapshot swap".
+#[test]
+fn a_wake_during_the_build_does_not_fail_the_swap() {
+    if !python_available() {
+        eprintln!("SKIP wake during build: python3 not available");
+        return;
+    }
+    let host = Host::new();
+    let repo = repository(44300);
+    commit(
+        repo.path(),
+        ".aethyme/environments.toml",
+        &stateful(44300),
+        "stateful",
+    );
+    let mut lifecycle = host.lifecycle();
+    let record = up_baseline(&mut lifecycle, repo.path());
+    lifecycle.park(&record.env_id, "test").unwrap();
+
+    let signals = tempfile::tempdir().unwrap();
+    let started = signals.path().join("build-started");
+    let release = signals.path().join("release-build");
+    let build = format!(
+        "touch {}; while [ ! -e {} ]; do sleep 0.1; done",
+        started.display(),
+        release.display()
+    );
+    let v2 = commit(
+        repo.path(),
+        ".aethyme/environments.toml",
+        &with_build(&stateful(44300), &build),
+        "v2 with a build",
+    );
+    let waker = {
+        let mut other = host.lifecycle();
+        let env_id = record.env_id.clone();
+        let (started, release) = (started.clone(), release.clone());
+        std::thread::spawn(move || {
+            while !started.exists() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let woken = other.wake(&env_id, Duration::from_secs(10));
+            std::fs::write(&release, b"").unwrap();
+            woken.map(|r| r.phase)
+        })
+    };
+    let outcome = lifecycle
+        .shared_redeploy(
+            repo.path(),
+            REPOSITORY,
+            "baseline",
+            &HostEnvironmentsFile::default(),
+            Duration::from_secs(20),
+            true,
+        )
+        .unwrap();
+    assert_eq!(
+        waker.join().unwrap().unwrap(),
+        EnvironmentPhase::Active,
+        "the wake ran during the build"
+    );
+    assert!(
+        matches!(&outcome, Redeploy::Redeployed { to, .. } if *to == v2),
+        "{outcome:?}"
+    );
+    let after = lifecycle.store.get(&record.env_id).unwrap().unwrap();
+    assert_eq!(
+        after.phase,
+        EnvironmentPhase::Active,
+        "woken at the new revision"
+    );
+    assert_eq!(after.snapshot.source.commit.as_deref(), Some(v2.as_str()));
+    lifecycle
+        .shared_destroy(repo.path(), REPOSITORY, "baseline")
+        .unwrap();
 }
 
 /// Tests in these files bind real loopback ports from fixed ranges, and each

@@ -9,7 +9,7 @@ use super::cli::{
     Failure, HISTORY_SCHEMA, LIST_SCHEMA, LOGS_SCHEMA, Options, Output, STATUS_SCHEMA,
     SUPERVISE_SCHEMA, environment_failure, workspace,
 };
-use super::logs::{environments_directory, log_path, tail};
+use super::logs::{environments_directory, tail};
 use super::store::{EnvironmentRecord, EnvironmentStore, StoreError, default_store_path};
 use super::supervisor::{self, StoreWatch, SupervisorConfig, SupervisorStatus};
 use crate::exit_status;
@@ -88,13 +88,7 @@ fn summary_line(record: &EnvironmentRecord) -> String {
 }
 
 fn supervisor_line(status: &SupervisorStatus) -> String {
-    match status.pid {
-        Some(pid) => format!("supervisor: {} (pid {pid})\n", status.state),
-        None => format!(
-            "supervisor: {} (idle parking and wake on request are not running)\n",
-            status.state
-        ),
-    }
+    status.describe()
 }
 
 pub(super) fn run_status(options: &Options) -> Result<Output, Failure> {
@@ -324,21 +318,44 @@ pub(super) fn run_logs(options: &Options) -> Result<Output, Failure> {
     let mut text = String::new();
     let mut logs = Vec::new();
     for name in names {
-        let path = log_path(&root, &record.env_id, name).ok_or_else(|| {
-            environment_failure(format!("invalid log path for {}/{name}", record.env_id))
-        })?;
-        let lines = tail(&path, options.tail)
+        // One phase when asked; otherwise the runtime log (always, even when
+        // empty) and every hook phase that has written something (#1522).
+        let phases: Vec<&str> = match &options.phase {
+            Some(phase) => vec![phase.as_str()],
+            None => std::iter::once(super::logs::RUN_PHASE)
+                .chain(super::logs::HOOK_PHASES.iter().copied().filter(|phase| {
+                    super::logs::phase_log_path(&root, &record.env_id, name, phase)
+                        .is_some_and(|path| path.exists())
+                }))
+                .collect(),
+        };
+        for phase in phases {
+            let path = super::logs::phase_log_path(&root, &record.env_id, name, phase).ok_or_else(
+                || {
+                    environment_failure(format!(
+                        "invalid log path for {}/{name} ({phase})",
+                        record.env_id
+                    ))
+                },
+            )?;
+            let lines = if options.last_run {
+                super::logs::tail_last_run(&path, options.tail)
+            } else {
+                tail(&path, options.tail)
+            }
             .map_err(|error| environment_failure(format!("{}: {error}", path.display())))?;
-        text.push_str(&format!("== {name} ({})\n", path.display()));
-        for line in &lines {
-            text.push_str(line);
-            text.push('\n');
+            text.push_str(&format!("== {name} {phase} ({})\n", path.display()));
+            for line in &lines {
+                text.push_str(line);
+                text.push('\n');
+            }
+            logs.push(json!({
+                "component": name,
+                "phase": phase,
+                "path": path,
+                "lines": lines,
+            }));
         }
-        logs.push(json!({
-            "component": name,
-            "path": path,
-            "lines": lines,
-        }));
     }
     let value = json!({
         "schema": LOGS_SCHEMA,
@@ -360,6 +377,16 @@ pub(super) fn run_supervise(options: &Options) -> Result<Output, Failure> {
         return Ok((value, text, exit_status::SUCCESS));
     }
     let store_path = default_store_path().map_err(store_failure)?;
+    // Detached (started by `ensure`, stdout on the log): timestamp and
+    // throttle everything this process prints (#1521). In a terminal the
+    // output stays where the operator is looking.
+    #[cfg(unix)]
+    let _stamped = (!std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .then(|| super::supervisor_log::stamp_output(&root.join(supervisor::SUPERVISOR_LOG)))
+        .transpose()
+        .map_err(|error| environment_failure(format!("supervisor log: {error}")))?;
+    supervisor::install_signal_handlers()
+        .map_err(|error| environment_failure(format!("supervisor signals: {error}")))?;
     let config = SupervisorConfig::new(root);
     let mut work = super::operate::LifecycleWork {
         watch: StoreWatch { store_path },
