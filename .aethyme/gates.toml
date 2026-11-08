@@ -85,8 +85,8 @@ triggers = ["packages/aethyme-eval/**"]
 # suite finishes in under 5 s). Each suite is deterministic: it reads tracked
 # files or drives the built binary in a throwaway repository.
 #
-# COUPLING: the triggers are exactly `cargo-test`'s, so every entry that
-# runs the full suite runs these guards first. When a trigger is added to
+# COUPLING: the triggers include every `cargo-test` trigger, so each entry that
+# runs the full local suite runs these guards first. When a trigger is added to
 # `cargo-test`, add it here; `gate_policy.rs`
 # (`fast_guards_precede_cargo_test_on_every_path_it_covers`) fails
 # otherwise, and names the suites this command must keep. Every suite here
