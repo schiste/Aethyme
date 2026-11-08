@@ -917,6 +917,89 @@ fn workflow_only_changes_run_this_contract() {
     assert!(gate.contains("triggers = [\".github/workflows/**\"]"));
 }
 
+/// `--print-selection` reports what `--changed` would test, which is what the
+/// broker's local cargo-test gate runs. Drive the real script against a
+/// throwaway repository so the selection is checked, not its spelling.
+#[test]
+#[cfg(unix)]
+fn print_selection_reports_the_changed_selection_workspace_or_none() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(5)
+        .unwrap();
+    let script = root.join("packages/aethyme/scripts/test-like-ci.sh");
+    let fixture = tempfile::tempdir().unwrap();
+    let repo = fixture.path();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    };
+    let writes = std::cell::Cell::new(0);
+    let write = |path: &str| {
+        writes.set(writes.get() + 1);
+        let path = repo.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("revision {}\n", writes.get())).unwrap();
+    };
+    git(&["init", "-q", "-b", "main"]);
+    write("packages/aethyme/rust/crates/aethyme-graph-schema/src/lib.rs");
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+    git(&["branch", "base"]);
+    let select = |base: &str| {
+        let output = std::process::Command::new("bash")
+            .arg(&script)
+            .args(["--base", base, "--print-selection"])
+            .current_dir(repo)
+            .env_remove("CI")
+            .output()
+            .unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )
+    };
+    let repository_files = "package(aethyme-testkit) | package(aethyme-cli) | binary_id(aethyme-broker::gate_policy) | (binary_id(aethyme-broker::it) & test(/^(certify_scaffold|config_formats|plugin_floor|review_routing)::/))";
+
+    assert_eq!(select("base"), (Some(0), "none\n".to_string()));
+
+    write("packages/aethyme/rust/crates/aethyme-graph-schema/src/lib.rs");
+    git(&["commit", "-qam", "crate"]);
+    assert_eq!(
+        select("base"),
+        (Some(0), "rdeps(aethyme-graph-schema)\n".to_string())
+    );
+
+    // Uncommitted and untracked repository files count too, once each, in
+    // sorted path order.
+    write("packages/aethyme/docs/guide.md");
+    write("packages/aethyme/skills/aethyme/SKILL.md");
+    assert_eq!(
+        select("base"),
+        (
+            Some(0),
+            format!("{repository_files} | rdeps(aethyme-graph-schema)\n")
+        )
+    );
+
+    write("packages/aethyme/rust/Cargo.lock");
+    assert_eq!(select("base"), (Some(0), "workspace\n".to_string()));
+
+    let (status, stdout) = select("no-such-ref");
+    assert_eq!(status, Some(2));
+    assert_eq!(stdout, "");
+}
+
 /// CI and local commands share coverage selection while using profiles
 /// that fit their jobs. Workflows still require the explicit full CI profile;
 /// local defaults stay bounded even when changed paths require workspace

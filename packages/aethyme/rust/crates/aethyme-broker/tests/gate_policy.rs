@@ -359,9 +359,11 @@ fn only_the_gate_settings_raise_the_rust_gate_workers() {
             .current_dir(root)
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .env("AETHYME_GATE_CACHE_DIR", root.join("cache"))
-            // The main-branch gate job sets these for its own run.
+            // The main-branch gate job sets these for its own run, and the
+            // broker sets the idle count for every gate, including this one.
             .env_remove("AETHYME_GATE_BUILD_JOBS")
             .env_remove("AETHYME_GATE_TEST_THREADS")
+            .env_remove("AETHYME_GATE_IDLE_CPUS")
             .env("CARGO_BUILD_JOBS", "99")
             .env("RUST_TEST_THREADS", "99")
             .env("NEXTEST_TEST_THREADS", "99")
@@ -405,6 +407,141 @@ fn only_the_gate_settings_raise_the_rust_gate_workers() {
         assert!(
             bounded.lines().all(|line| line.starts_with("1\t2\t2\t")),
             "{name} inherited unbounded workers: {bounded}"
+        );
+        // The broker's idle count sizes every Rust gate within the
+        // repository's bounds: 2-8 test workers, half as many build jobs
+        // within 1-4. A value that is not a count is treated as no capacity.
+        for (idle, expected) in [
+            ("10", "4\t8\t8\t"),
+            ("6", "3\t6\t6\t"),
+            ("3", "1\t3\t3\t"),
+            ("1", "1\t2\t2\t"),
+            ("0", "1\t2\t2\t"),
+            ("64", "4\t8\t8\t"),
+            ("123456", "4\t8\t8\t"),
+            ("", "1\t2\t2\t"),
+            ("-4", "1\t2\t2\t"),
+            ("8; echo pwned", "1\t2\t2\t"),
+        ] {
+            let sized = run(name, &[("AETHYME_GATE_IDLE_CPUS", idle)]);
+            assert!(
+                sized.lines().all(|line| line.starts_with(expected)),
+                "{name} with {idle:?} idle CPUs: {sized}"
+            );
+        }
+        // A host dedicated to the gates still sets the bounds outright.
+        let both = [
+            ("AETHYME_GATE_BUILD_JOBS", "4"),
+            ("AETHYME_GATE_TEST_THREADS", "4"),
+            ("AETHYME_GATE_IDLE_CPUS", "10"),
+        ];
+        let dedicated = run(name, &both);
+        assert!(
+            dedicated.lines().all(|line| line.starts_with("4\t4\t4\t")),
+            "{name} let the idle count override the gate settings: {dedicated}"
+        );
+    }
+}
+
+/// The local cargo-test gate runs nextest on the selection the shared
+/// `test-like-ci.sh --print-selection` reports, and on the whole workspace
+/// whenever that selection is not a filter: the whole workspace was
+/// requested, nothing changed, or the selector failed. Doctests and examples
+/// always cover the workspace.
+#[test]
+#[cfg(unix)]
+fn cargo_test_runs_the_changed_selection_and_otherwise_the_workspace() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    fs::write(
+        &cargo,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MOCK_EVENTS\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o700)).unwrap();
+    let scripts = root.join("packages/aethyme/scripts");
+    fs::create_dir_all(&scripts).unwrap();
+    let selector = scripts.join("test-like-ci.sh");
+    fs::write(
+        &selector,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$MOCK_SELECTOR_ARGS\"\nprintf '%s\\n' \"$MOCK_SELECTION\"\nexit \"$MOCK_SELECTOR_STATUS\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&selector, fs::Permissions::from_mode(0o700)).unwrap();
+    let events = root.join("events");
+    let selector_args = root.join("selector-args");
+    let gates = load_gates(&repo_root()).unwrap();
+    let gate = gates.iter().find(|gate| gate.name == "cargo-test").unwrap();
+    let run = |selection: &str, status: &str| {
+        fs::write(&events, "").unwrap();
+        let output = Command::new("/bin/sh")
+            .args(["-c", &gate.command])
+            .current_dir(root)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("AETHYME_GATE_CACHE_DIR", root.join("cache"))
+            .env_remove("AETHYME_GATE_BUILD_JOBS")
+            .env_remove("AETHYME_GATE_TEST_THREADS")
+            .env_remove("AETHYME_GATE_IDLE_CPUS")
+            .env("MOCK_EVENTS", &events)
+            .env("MOCK_SELECTOR_ARGS", &selector_args)
+            .env("MOCK_SELECTION", selection)
+            .env("MOCK_SELECTOR_STATUS", status)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{selection:?}/{status}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = fs::read_to_string(&events).unwrap();
+        let nextest: Vec<&str> = log
+            .lines()
+            .filter(|line| line.starts_with("nextest run"))
+            .collect();
+        assert_eq!(nextest.len(), 1, "{log}");
+        assert!(
+            log.lines().any(|line| line.contains("--workspace --doc")),
+            "{log}"
+        );
+        assert!(
+            log.lines()
+                .any(|line| line.contains("--workspace --examples")),
+            "{log}"
+        );
+        nextest[0].to_string()
+    };
+
+    let filter = "rdeps(aethyme-graph-schema) | package(aethyme-cli)";
+    let selected = run(filter, "0");
+    assert!(
+        selected.ends_with(&format!("-E {filter}")),
+        "the changed selection must reach nextest: {selected}"
+    );
+    assert!(
+        selected.contains("--workspace --profile local"),
+        "{selected}"
+    );
+    // A filter that matches no test is not a failure of the change.
+    assert!(selected.contains("--no-tests warn"), "{selected}");
+    assert_eq!(
+        fs::read_to_string(&selector_args).unwrap(),
+        "--base aethyme/integration --print-selection\n"
+    );
+
+    for (selection, status) in [
+        ("workspace", "0"),
+        ("none", "0"),
+        ("", "0"),
+        ("rdeps(x)", "2"),
+    ] {
+        let whole = run(selection, status);
+        assert!(
+            !whole.contains(" -E ") && !whole.contains("--no-tests"),
+            "{selection:?}/{status} must run the whole workspace: {whole}"
         );
     }
 }
@@ -469,9 +606,11 @@ esac
                     .current_dir(root)
                     .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
                     .env("AETHYME_GATE_CACHE_DIR", root.join("cache"))
-                    // The main-branch gate job sets these for its own run.
+                    // The main-branch gate job sets these for its own run, and
+                    // the broker sets the idle count for every gate.
                     .env_remove("AETHYME_GATE_BUILD_JOBS")
                     .env_remove("AETHYME_GATE_TEST_THREADS")
+                    .env_remove("AETHYME_GATE_IDLE_CPUS")
                     .env("CARGO_BUILD_JOBS", "99")
                     .env("RUST_TEST_THREADS", "99")
                     .env("NEXTEST_TEST_THREADS", "99")
