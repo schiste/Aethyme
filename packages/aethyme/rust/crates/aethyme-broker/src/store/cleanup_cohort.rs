@@ -32,6 +32,26 @@ pub(crate) struct CleanupCohortScanState {
     pub(crate) pending_dirty_rows: i64,
 }
 
+/// Pending session changes since the last complete discovery lap, read
+/// without advancing the index. A caller that can prove none of them touches
+/// its checkout may rely on the indexed rows for that checkout alone.
+#[derive(Debug)]
+pub(crate) struct CleanupCohortPendingDelta {
+    /// The stored lap finished and its cursor reached its high-water mark.
+    pub(crate) lap_complete: bool,
+    pub(crate) unresolved_rows: i64,
+    /// `None` when more rows are pending than the caller's cap.
+    pub(crate) rows: Option<Vec<CleanupCohortPendingRow>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CleanupCohortPendingRow {
+    /// The session's current checkout path; `None` when the row was deleted.
+    pub(crate) current_raw_path: Option<String>,
+    /// What the index still says about this session, if it has a row.
+    pub(crate) indexed: Option<(String, String, Option<String>)>,
+}
+
 #[derive(Debug)]
 pub(crate) struct CleanupCohortScanPage {
     pub(crate) state: CleanupCohortScanState,
@@ -1301,6 +1321,72 @@ impl BrokerStore {
             progress_at_ms,
             unresolved_rows,
             pending_dirty_rows,
+        }))
+    }
+
+    /// Read the pending delta in one snapshot. It never writes: explicit
+    /// marker review must not advance or reset the discovery index.
+    pub(crate) fn cleanup_cohort_pending_delta(
+        &self,
+        namespace: &str,
+        cap: usize,
+    ) -> Result<Option<CleanupCohortPendingDelta>, BrokerError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let Some((high_water, after, stored_complete)) = tx
+            .query_row(
+                "SELECT high_water_session_id, after_session_id, complete
+                 FROM cleanup_cohort_scans WHERE namespace = ?1",
+                [namespace],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let unresolved_rows = tx.query_row(
+            "SELECT COUNT(*) FROM cleanup_cohort_scan_rows
+             WHERE namespace = ?1 AND resolution_error IS NOT NULL",
+            [namespace],
+            |row| row.get(0),
+        )?;
+        let mut stmt = tx.prepare(
+            "SELECT d.session_id, s.worktree_path, r.raw_path, r.canonical_path, r.git_dir
+             FROM cleanup_cohort_dirty_sessions d
+             LEFT JOIN sessions s ON s.id = d.session_id
+             LEFT JOIN cleanup_cohort_scan_rows r
+               ON r.namespace = ?1 AND r.session_id = d.session_id
+             ORDER BY d.session_id LIMIT ?2",
+        )?;
+        let limit = i64::try_from(cap.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut rows = Vec::new();
+        for row in stmt.query_map(params![namespace, limit], |row| {
+            let raw: Option<String> = row.get(2)?;
+            let canonical: Option<String> = row.get(3)?;
+            Ok(CleanupCohortPendingRow {
+                current_raw_path: row.get(1)?,
+                indexed: raw.zip(canonical).map(|(raw, canonical)| {
+                    (
+                        raw,
+                        canonical,
+                        row.get::<_, Option<String>>(4).ok().flatten(),
+                    )
+                }),
+            })
+        })? {
+            rows.push(row?);
+        }
+        drop(stmt);
+        tx.finish()?;
+        Ok(Some(CleanupCohortPendingDelta {
+            lap_complete: stored_complete && after >= high_water,
+            unresolved_rows,
+            rows: (rows.len() <= cap).then_some(rows),
         }))
     }
 
