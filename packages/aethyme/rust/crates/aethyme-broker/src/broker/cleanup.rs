@@ -4748,7 +4748,7 @@ impl Broker {
                     #[cfg(not(unix))]
                     {
                         if archive_guard.is_some_and(|guard| guard.expected_cohort().is_some()) {
-                            return Err(BrokerOpError::DirtyWorktree {
+                            return Err(BrokerOpError::CleanupArtifactUseRetained {
                                 id: session_id,
                                 reason:
                                     "artifact-use protection is unavailable; preserved the worktree"
@@ -4762,7 +4762,7 @@ impl Broker {
                     }
                     #[cfg(unix)]
                     {
-                        return Err(BrokerOpError::DirtyWorktree {
+                        return Err(BrokerOpError::CleanupArtifactUseRetained {
                             id: session_id,
                             reason:
                                 "artifact-use protection is unavailable; preserved the worktree"
@@ -4773,22 +4773,25 @@ impl Broker {
                 Ok(crate::file_lock::artifact_use::ArtifactUseReclaimTry::Blocked(block)) => {
                     let reason = match block {
                         crate::file_lock::artifact_use::ArtifactUseReclaimBlock::Contended => {
-                            "an artifact producer is active; preserved the worktree"
+                            "an artifact producer is active; preserved the worktree".to_owned()
                         }
                         crate::file_lock::artifact_use::ArtifactUseReclaimBlock::UnknownProducer {
                             ..
-                        } => "artifact-use markers are unresolved; preserved the worktree",
+                        } => format!(
+                            "artifact-use markers are unresolved; preserved the worktree; \
+                             review them with `aethyme broker gc artifact-use reconcile plan {session_id}`"
+                        ),
                         crate::file_lock::artifact_use::ArtifactUseReclaimBlock::ProtocolUnavailable => {
                             unreachable!("unavailable protocol is handled above")
                         }
                     };
-                    return Err(BrokerOpError::DirtyWorktree {
+                    return Err(BrokerOpError::CleanupArtifactUseRetained {
                         id: session_id,
-                        reason: reason.into(),
+                        reason,
                     });
                 }
                 Err(source) => {
-                    return Err(BrokerOpError::DirtyWorktree {
+                    return Err(BrokerOpError::CleanupArtifactUseRetained {
                         id: session_id,
                         reason: format!(
                             "artifact-use state could not be verified; preserved the worktree: {source}"
@@ -6090,6 +6093,52 @@ mod registered_removal_failure_tests {
         );
         assert_eq!(std::fs::read(first).unwrap(), b"keep one\n");
         assert_eq!(std::fs::read(second).unwrap(), b"keep two\n");
+    }
+
+    /// A producer that died mid-run leaves its marker. Forced cleanup must
+    /// keep the checkout (descendants may still write into it) and must not
+    /// advertise `--force` as the way out: it names marker reconciliation.
+    #[cfg(unix)]
+    #[test]
+    fn forced_cleanup_of_unresolved_artifact_markers_names_reconciliation_not_force() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = repository_with_ignored_cleanup_fixture(tmp.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&root).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "stale artifact marker cleanup");
+        broker.close(session.id).unwrap();
+        drop(
+            crate::file_lock::artifact_use::begin_artifact_use(
+                broker.main_root(),
+                &worktree,
+                session.id,
+                "test:killed-gate",
+            )
+            .unwrap(),
+        );
+
+        for force in [false, true] {
+            let error = broker.cleanup(session.id, force).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    crate::BrokerOpError::CleanupArtifactUseRetained { id, .. } if id == session.id
+                ),
+                "force={force}: {error:?}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("--force does not override this")
+                    && !message.contains("use --force")
+                    && message.contains(&format!(
+                        "aethyme broker gc artifact-use reconcile plan {}",
+                        session.id
+                    )),
+                "force={force}: {message}"
+            );
+            assert!(worktree.is_dir(), "force={force} removed the checkout");
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

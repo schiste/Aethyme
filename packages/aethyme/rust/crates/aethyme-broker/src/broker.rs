@@ -260,6 +260,11 @@ pub enum BrokerOpError {
     },
     #[error("refusing to clean session {id}: {reason} (use --force to discard)")]
     DirtyWorktree { id: i64, reason: String },
+    /// The checkout's artifact-use protocol retained it. Its markers stand for
+    /// producers whose descendants may still be writing, so a discard request
+    /// cannot settle them; the reason names what can.
+    #[error("refusing to clean session {id}: {reason} (--force does not override this)")]
+    CleanupArtifactUseRetained { id: i64, reason: String },
     #[error(
         "refusing to clean session {id}: physical cleanup requires a closed, not-yet-cleaned session; current state is {state} (--force does not override this)"
     )]
