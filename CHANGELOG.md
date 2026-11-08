@@ -4,6 +4,28 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.64] - 2026-11-08
+
+**Breaking:** `env logs` now includes available hook-phase logs by default, and supervisor output is timestamped. See [upgrade and rollback guidance](UPGRADING.md#v0864).
+
+### Added
+
+- Filter environment logs by phase and the latest run, inspect supervisor exits, and configure log retention (#1530, #1531).
+- Record session replacement so cleanup can recognize a reused checkout's predecessor (#1533).
+
+### Fixed
+
+- Reclaim obsolete shared-environment exports and clear resolved redeploy errors (#1530).
+- Verify generated deployments when the inert local bridge is present (#1520).
+- Explain inferred gate failures without presenting an unconfirmed host cause as fact (#1529).
+- Restore release signing and make release gate verification resilient (#1525, #1526).
+- Correct cleanup refusal advice for artifact-use markers (#1528).
+
+### Changed
+
+- Avoid a redundant Git history walk when measuring branch drift and redundant searches during broker finish (#1532, #1534).
+- Run focused broker submission checks for ordinary Rust changes while retaining the full workspace suite on main (#1535).
+
 ## [0.8.63] - 2026-11-08
 
 **Breaking:** Broker database schema advances to 62, and `broker sync` and `broker submit` no longer clean a diverged integration branch merely because its work has landed. See [upgrade and rollback guidance](UPGRADING.md#v0863).
