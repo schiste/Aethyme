@@ -1680,8 +1680,10 @@ fn reconciliation_disposition(
     if record.filename != format!("{}.json", marker.nonce) {
         return retain("marker nonce does not match its filename");
     }
+    // A predecessor that `--replace-stale` handed this checkout over from
+    // worked in this same live object, so its marker is checked as live.
     if !session_ids.contains(&selected_session_id)
-        || (!session_ids.contains(&marker.session_id) && retired_witness.is_none())
+        || (!cohort.worked_in_live_checkout(marker.session_id) && retired_witness.is_none())
     {
         return retain("marker session is not in the exact closed checkout cohort");
     }
