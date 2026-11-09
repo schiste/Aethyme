@@ -6600,9 +6600,10 @@ mod registered_removal_failure_tests {
         let (session, worktree) =
             start_represented_cleanup_session(&mut broker, "orphan recovery strict flip");
 
-        let residue = worktree.join("local-dataset/saved-session.json");
+        let residue = worktree.join("target/saved-session.json");
         std::fs::create_dir_all(residue.parent().unwrap()).unwrap();
         std::fs::write(&residue, b"saved session data").unwrap();
+        std::fs::write(worktree.join("target/CACHEDIR.TAG"), b"cache").unwrap();
         let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
         std::fs::remove_file(worktree.join("README.md")).unwrap();
         remove_worktree_admin_directory(&worktree);
@@ -7066,7 +7067,10 @@ mod registered_removal_failure_tests {
         std::fs::write(nested.join("one"), b"1").unwrap();
         std::fs::write(nested.join("two"), b"2").unwrap();
         std::fs::write(nested.join("three"), b"3").unwrap();
-        let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        let mut proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        proof
+            .disposable_ignored_root_prefixes
+            .push("local-dataset/".into());
         let root = PinnedOrphanRoot::open(&worktree, &proof).unwrap().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         let mut budget = OrphanResidueBudget::with_limits(deadline, 2, 1024, 1024);

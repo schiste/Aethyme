@@ -8237,7 +8237,7 @@ mod tests {
         git(&repository, &["init", "-q", "-b", "main"]);
         std::fs::write(
             repository.join(".gitignore"),
-            "/.aethyme/\n/test-results/\n",
+            "/.aethyme/\n/node_modules/\n",
         )
         .unwrap();
         std::fs::write(repository.join("README.md"), "fixture\n").unwrap();
@@ -8258,9 +8258,9 @@ mod tests {
         let late_worktree = worktree.clone();
         let outcome = broker
             .cleanup_resolve_apply_with_post_archive_hook(session.id, &digest, move || {
-                std::fs::create_dir(late_worktree.join("test-results")).unwrap();
+                std::fs::create_dir(late_worktree.join("node_modules")).unwrap();
                 std::fs::write(
-                    late_worktree.join("test-results/generated.txt"),
+                    late_worktree.join("node_modules/generated.txt"),
                     "generated",
                 )
                 .unwrap();
@@ -8982,8 +8982,13 @@ mod tests {
 
         let checkout = GitRepo::discover(repository).unwrap();
         let default_policy = crate::AutoCleanupPolicy::default();
+        assert!(ignored_inventory(&checkout, repository, &default_policy, 1, None).is_err());
+        let configured_policy = crate::AutoCleanupPolicy {
+            regenerable: vec!["opaque-cache".into()],
+            ..Default::default()
+        };
         let (roots, files) =
-            ignored_inventory(&checkout, repository, &default_policy, 1, None).unwrap();
+            ignored_inventory(&checkout, repository, &configured_policy, 1, None).unwrap();
         assert!(roots.iter().any(|root| {
             root.path == "opaque-cache/"
                 && root.classification == IgnoredPathClassification::DisposableDirectory
