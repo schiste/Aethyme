@@ -823,9 +823,10 @@ impl Broker {
                 // it: "wait for it" would leave the agent waiting forever.
                 MergeStatus::Submitted if submission_was_deferred(entry) => {
                     report.warnings.push(format!(
-                        "latest submit qid {} was deferred: a gate could not run on this host, \
-                         so the change was not judged; free the resource and resubmit before \
-                         finish",
+                        "latest submit qid {} was deferred: a gate did not complete on this host, \
+                         so the change was not judged; inspect gate evidence and use only \
+                         authorized validation before retrying. Remote checks do not complete \
+                         the broker submission",
                         entry.id
                     ));
                     report

@@ -122,9 +122,10 @@ pub(super) fn deferred_submit_advice(agent: &AgentView, entry: &MergeQueueEntry)
         .map(|failure| failure.name.clone())
         .collect();
     let summary = format!(
-        "session {} latest submit qid {} was deferred: {} could not run on this host \
-         (resources, disk, or its first timeout), so the change was not judged; free the \
-         resource, then resubmit without changing code",
+        "session {} latest submit qid {} was deferred: {} did not complete on this host \
+         (resource, disk, or first timeout); the change was not judged. Inspect the gate \
+         evidence before retrying. Use only authorized validation; remote checks on the exact \
+         revision may help if repository policy permits, but do not complete this submission",
         agent.session.id,
         entry.id,
         if gate_names.is_empty() {
