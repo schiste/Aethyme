@@ -670,6 +670,13 @@ impl Broker {
     }
 
     fn landed_session_is_safe_to_retire(&self, session: &crate::Session) -> bool {
+        if !matches!(
+            self.store_ref()
+                .session_has_unmerged_pull_request_link(session.id),
+            Ok(false)
+        ) {
+            return false;
+        }
         let worktree = std::path::Path::new(&session.worktree_path);
         let Ok(policy) = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root()) else {
             return false;
@@ -4194,6 +4201,16 @@ mod generic_guarded_exec_tests {
                 evidence: "fixture landed".into(),
             })
             .unwrap();
+        assert!(broker.landed_session_is_safe_to_retire(&session));
+        broker.store().connection().execute(
+            "INSERT INTO pull_request_session_links (repository, pr_number, session_id, linked_at, link_source) VALUES ('fixture', 1, ?1, 1, 'watch')",
+            [session.id],
+        ).unwrap();
+        assert!(!broker.landed_session_is_safe_to_retire(&session));
+        broker.store().connection().execute(
+            "INSERT INTO pull_request_milestones (repository, pr_number, merged_at, first_seen_at, updated_at) VALUES ('fixture', 1, 1, 1, 1)",
+            [],
+        ).unwrap();
         assert!(broker.landed_session_is_safe_to_retire(&session));
         std::fs::write(checkout.join("untracked-user-work"), "keep").unwrap();
         assert!(!broker.landed_session_is_safe_to_retire(&session));
