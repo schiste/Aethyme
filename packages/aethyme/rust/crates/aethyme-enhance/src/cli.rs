@@ -100,6 +100,37 @@ fn run_deploy(rest: &[String]) -> u8 {
     0
 }
 
+/// Describe the checkout actually inspected. The upstream comparison uses only
+/// existing local refs; failure to resolve either side is reported as unknown.
+fn checkout_context(repo: &std::path::Path) -> String {
+    let git = |args: &[&str]| -> Option<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8(output.stdout).ok()?.trim().to_owned())
+    };
+    let head = git(&["rev-parse", "--verify", "HEAD"])
+        .filter(|value| value.len() >= 40 && value.chars().all(|c| c.is_ascii_hexdigit()));
+    let behind = git(&["rev-list", "--count", "HEAD..@{upstream}"])
+        .and_then(|value| value.parse::<u64>().ok());
+    let head = head.as_deref().unwrap_or("unknown");
+    let upstream = match behind {
+        Some(count) => format!("{count} commits behind locally recorded upstream (no fetch)"),
+        None => "upstream divergence unknown (no fetch)".to_string(),
+    };
+    format!(
+        "Checkout inspected: {} (HEAD {head}; {upstream}).",
+        repo.display()
+    )
+}
+
 fn run_verify(rest: &[String]) -> u8 {
     let (repo, _force) = match parse_repo_arg("verify", rest) {
         Ok(parsed) => parsed,
@@ -182,6 +213,8 @@ fn run_verify(rest: &[String]) -> u8 {
     }
     let references_ok = !unresolved.iter().any(|reference| reference.kind.fails());
     if !is_ok(&results) || !references_ok {
+        eprintln!("{}", checkout_context(&repo.given));
+        eprintln!("If this checkout is stale, inspect a fresh broker session before repairing guidance; preserve uncommitted work.");
         eprintln!("Verification failed.");
         return 1;
     }
