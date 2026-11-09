@@ -1123,7 +1123,7 @@ fn ignore(fx: &Fixture, pattern: &str) {
 
 #[cfg(unix)]
 #[test]
-fn ignored_directories_are_disposable_without_names_or_witnesses() {
+fn ignored_directories_without_output_evidence_are_preserved() {
     let fx = fixture();
     let mut broker = common::open_fixture_broker(&fx.repo, fx._tmp.path()).unwrap();
     let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
@@ -1145,8 +1145,9 @@ fn ignored_directories_are_disposable_without_names_or_witnesses() {
     .unwrap();
 
     let report = run(&mut broker);
-    assert_eq!(report.removed.len(), 1, "{report:#?}");
-    assert!(!worktree.exists());
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(worktree.join("saved-sessions/session.db").is_file());
+    assert!(worktree.join("target-notes/plan.md").is_file());
 }
 
 #[cfg(unix)]

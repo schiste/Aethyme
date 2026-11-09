@@ -1729,7 +1729,9 @@ reports its checkout state (`present`, `missing_directory`,
 tracked and untracked changes separately, bytes, one disposition (`in_target`,
 `integration_only`, `remote_branch_only`, `worktree_only`, `dirty`, `live`,
 `missing_checkout_metadata`, `unknown_provenance`), evidence, blocker, and next
-action. The audit removes nothing. When anything is removable it prints the
+action. The separate `work_state` and `by_work_state` counts distinguish delivered,
+uncommitted, local-only, remote-branch-only, integration-only and unknown work
+even for an open session; they do not claim whether a PR exists. The audit removes nothing. When anything is removable it prints the
 `--all-cleaned --apply` command with the current plan digest, and it withholds
 that command if the plan would remove an item the audit retains. `--repo
 <path>` audits the repository at `<path>` instead of the current directory.

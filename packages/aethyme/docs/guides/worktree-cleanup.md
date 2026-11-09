@@ -120,8 +120,8 @@ the directory goes:
    lease that still holds covers it, and no gate is running.
 3. **Clean** -- no tracked, staged or untracked change, no stash made on its
    branch, no rebase, merge, cherry-pick, revert or bisect in progress, and no
-   protected standalone ignored file. By default every Git-ignored directory
-   is disposable, regardless of name or contents; `.DS_Store` and recognized
+   protected ignored content. Only recognized or configured output directories
+   are disposable; `.DS_Store` and recognized
    artifact files or links and catalogued broker runtime output are disposable
    too. With `strict = true`, every
    ignored leftover keeps the checkout.
@@ -138,9 +138,9 @@ Anything the sweep cannot decide keeps the checkout, with the reason in
 ```toml
 [cleanup]
 auto_remove = true             # the default; false turns checkout removal off
-strict = false                 # the default; all Git-ignored directories disposable
+strict = false                 # the default; recognized output directories disposable
 ignored_directory_sweep = false # opt in to reclaim ignored folders in retained checkouts
-regenerable = [".gradle/**"]    # extra artifact-file/link classification
+regenerable = [".gradle/**"]    # extra explicitly disposable output directories
 keep = ["*-investigation"]     # worktrees never removed automatically
 ```
 
@@ -152,11 +152,9 @@ Automatic apply reloads retention before removal, so a newly raised grace
 period or unreadable policy retains the checkout. Explicit `finish cleanup`
 remains available without waiting for the window.
 
-Ignored directories are treated as opaque: cleanup does not recursively inspect
-package fixtures, keys, databases, dangling links, or saved session records inside
-them. Ignoring a directory therefore opts its contents into disposal. Move
-irreplaceable records outside disposable checkouts, or enable `strict = true`.
-Standalone ignored files such as a root `.env` remain protected. Removal unlinks
+Recognized or explicitly configured output directories are treated as opaque:
+cleanup does not inspect their nested contents. Unknown ignored directories and
+standalone ignored files such as a root `.env` are retained. Removal unlinks
 symlinks without deleting their external targets.
 
 `ignored_directory_sweep` controls a separate in-place lane for reclaiming

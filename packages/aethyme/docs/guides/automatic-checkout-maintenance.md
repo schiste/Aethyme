@@ -116,10 +116,9 @@ remaining time; an incomplete archive is never permission to remove a checkout.
 
 ## Ignored folders
 
-Normal whole-checkout cleanup treats Git-ignored directories as disposable by
-default. That includes local datasets and saved records. Preserve anything
-irreplaceable outside the checkout before closing it. Standalone ignored files
-remain protected by the cleanup policy.
+Normal whole-checkout cleanup retains unknown Git-ignored directories, including
+local datasets and saved records. Recognized or explicitly configured build-output
+directories remain disposable; standalone ignored files remain protected.
 
 The background artifact sweep historically recognizes a catalog of generated
 folders. Broader in-place reclamation is separately opt-in in the primary

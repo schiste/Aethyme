@@ -220,6 +220,8 @@ pub struct AuditItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
     pub disposition: AuditDisposition,
+    /// Independent work classification, even when the session is still open.
+    pub work_state: &'static str,
     /// Whether the reviewed cleanup apply would remove this item.
     pub removable: bool,
     pub evidence: Vec<String>,
@@ -235,6 +237,8 @@ pub struct AuditSummary {
     /// Count per disposition, keyed by its snake_case name. Every disposition
     /// is present, so an absent zero is never mistaken for an unchecked one.
     pub by_disposition: BTreeMap<String, usize>,
+    /// Counts of work states, independent of session lifecycle.
+    pub by_work_state: BTreeMap<String, usize>,
     pub removable_count: usize,
     pub measured_bytes: u64,
     pub removable_bytes: u64,
@@ -606,6 +610,7 @@ impl Broker {
                 committed: None,
                 bytes: directory.estimated_bytes,
                 disposition: AuditDisposition::UnknownProvenance,
+                work_state: "unknown",
                 removable: false,
                 evidence: vec![format!(
                     "{} under a broker worktree root; no session row and no Git registration names it",
@@ -620,6 +625,10 @@ impl Broker {
                     directory.path
                 ),
             });
+        }
+
+        for item in &mut items {
+            item.work_state = classify_work_state(item);
         }
 
         items.sort_by(|a, b| {
@@ -809,6 +818,7 @@ impl Broker {
             committed,
             bytes: plan_item.and_then(|item| item.estimated_bytes),
             disposition,
+            work_state: "unknown",
             removable,
             evidence,
             blocker,
@@ -842,6 +852,7 @@ impl Broker {
                 committed: None,
                 bytes: Some(0),
                 disposition: AuditDisposition::MissingCheckoutMetadata,
+                work_state: "unknown",
                 removable: false,
                 evidence: vec![format!(
                     "Git registers this worktree but its directory is gone{}",
@@ -902,6 +913,7 @@ impl Broker {
             committed,
             bytes: crate::broker::directory_size_without_following_links(&entry.path).ok(),
             disposition,
+            work_state: "unknown",
             removable: false,
             evidence,
             blocker: Some(
@@ -1042,6 +1054,24 @@ fn apply_command(plan: &CleanupPlan) -> String {
     )
 }
 
+// A lifecycle label is not evidence that work is clean or delivered. An
+// uninspected checkout is unknown, never an implicit clean checkout.
+fn classify_work_state(item: &AuditItem) -> &'static str {
+    if item.checkout != CheckoutState::Present || item.head.is_none() {
+        return "unknown";
+    }
+    if item.tracked_changes > 0 || item.untracked_files > 0 {
+        return "uncommitted";
+    }
+    match &item.committed {
+        Some(CommittedWork::InTarget { .. }) => "delivered",
+        Some(CommittedWork::IntegrationOnly { .. }) => "integration_only",
+        Some(CommittedWork::RemoteBranchOnly { .. }) => "remote_branch_only",
+        Some(CommittedWork::WorktreeOnly { .. }) => "local_only",
+        Some(CommittedWork::Unknown { .. }) | None => "unknown",
+    }
+}
+
 fn summarise(items: &[AuditItem]) -> AuditSummary {
     let mut summary = AuditSummary {
         item_count: items.len(),
@@ -1061,7 +1091,21 @@ fn summarise(items: &[AuditItem]) -> AuditSummary {
             .by_disposition
             .insert(disposition.as_str().to_string(), 0);
     }
+    for state in [
+        "delivered",
+        "integration_only",
+        "remote_branch_only",
+        "local_only",
+        "uncommitted",
+        "unknown",
+    ] {
+        summary.by_work_state.insert(state.to_string(), 0);
+    }
     for item in items {
+        *summary
+            .by_work_state
+            .entry(item.work_state.to_string())
+            .or_default() += 1;
         *summary
             .by_disposition
             .entry(item.disposition.as_str().to_string())

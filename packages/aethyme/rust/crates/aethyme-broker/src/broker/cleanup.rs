@@ -7138,7 +7138,7 @@ mod registered_removal_failure_tests {
     }
 
     #[test]
-    fn registered_finish_recovery_discards_opaque_unknown_ignored_directory_by_default() {
+    fn registered_finish_recovery_preserves_unknown_ignored_directory() {
         let owner = tempfile::tempdir().unwrap();
         let repository = repository_with_ignored_cleanup_fixture(owner.path());
         let storage = crate::test_storage::TestStorage::new();
@@ -7154,14 +7154,13 @@ mod registered_removal_failure_tests {
         let closed = broker.store().session(session.id).unwrap();
         assert_eq!(
             broker.interrupted_finish_cleanup_proof(&closed),
-            Some(proof.clone()),
-            "unknown ignored directory contents are opaque in disposable mode"
+            None,
+            "unknown ignored directories cannot authorize recovery removal"
         );
 
-        broker.cleanup(session.id, false).unwrap();
-
-        assert!(!worktree.exists());
-        assert!(broker.repo.resolve_ref(&proof.branch_ref).is_none());
+        assert!(broker.cleanup(session.id, false).is_err());
+        assert!(residue.is_file());
+        assert!(broker.repo.resolve_ref(&proof.branch_ref).is_some());
     }
 
     #[cfg(not(unix))]

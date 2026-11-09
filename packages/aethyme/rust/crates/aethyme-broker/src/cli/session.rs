@@ -2208,6 +2208,17 @@ pub(super) fn render_cleanup_audit(audit: &crate::CleanupAudit, detail: bool) {
             .join(", ")
     );
     out!(
+        "  work: {}",
+        audit
+            .summary
+            .by_work_state
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|(name, count)| format!("{name} {count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    out!(
         "  measured: {}; removable now: {} in {} item(s); unmeasured: {}",
         human_bytes(audit.summary.measured_bytes),
         human_bytes(audit.summary.removable_bytes),
@@ -2222,10 +2233,11 @@ pub(super) fn render_cleanup_audit(audit: &crate::CleanupAudit, detail: bool) {
             crate::AuditOwner::None => "no session".into(),
         };
         out!(
-            "  {}: {} [{}] {}{}",
+            "  {}: {} [{}; work: {}] {}{}",
             owner,
             item.disposition.as_str(),
             item.checkout.as_str(),
+            item.work_state,
             item.bytes
                 .map(human_bytes)
                 .unwrap_or_else(|| "size unavailable".into()),
