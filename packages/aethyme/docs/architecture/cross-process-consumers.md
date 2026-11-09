@@ -1196,6 +1196,7 @@ Routine `broker status` renders compact text by default; `broker status
 keeps each warning category visible, and marks omitted details and unknown or
 deferred checks instead of presenting them as absent. Use `broker status
 --compact --json` for the versioned `aethyme.broker-status-compact/v1` shape.
+`broker status --compact --session <id> --json` adds a `focus` object with the session ID and count of unrelated session notices and informational observations omitted. Repository-wide counts, warnings, blockers, waiters and coordination records remain global; the full status remains available for omitted details. Unknown session IDs are rejected.
 `broker status --json` keeps the existing full JSON shape, and
 `broker status --summary --json` keeps the existing summary JSON shape.
 Routine `--summary` reports recorded observations instead. Consumers of the
