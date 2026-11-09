@@ -563,8 +563,7 @@ fn the_cargo_test_jobs_run_the_pull_request_suite() {
     assert!(shard.contains(&"    needs: [tested-tree, cargo-test-build]"));
     assert!(shard.contains(&"      fail-fast: false"));
     assert!(shard.contains(&"        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]"));
-    // The pull-request command, and the same limited to the push scope's
-    // selection (`main_tests_the_changed_scope_and_records_only_full_suites`).
+    // Check that the main shard uses the same full-suite command as the PR shard.
     let oss_shard: Vec<String> = run_lines(&oss, "  rust-tests-shard:")
         .into_iter()
         .filter(|line| line.contains("--from-archive"))
@@ -1253,53 +1252,15 @@ fn prepush_selection_adds_touched_modules_cheapest_first_within_the_budget() {
     assert!(stderr.contains("no merge base"), "{stderr}");
 }
 
-/// A push to main tests the changed crates, their reverse dependencies and the
-/// guard suites; a version change, a repository-wide input or a dispatch runs
-/// the whole workspace, and only such a run records the `full-suite` artifact
-/// a release tag requires.
+/// Main and release verification must always run the whole workspace.
 #[test]
-fn main_tests_the_changed_scope_and_records_only_full_suites() {
+fn main_always_tests_the_full_workspace() {
     let gates = workflow("aethyme-gates.yml");
     let tree = block(&gates, "  tested-tree:");
-    assert!(tree.contains(&"      scope: ${{ steps.scope.outputs.scope }}"));
-    assert!(tree.contains(&"      selection: ${{ steps.scope.outputs.selection }}"));
-    assert!(tree.contains(&"          fetch-depth: 2"));
-    assert!(tree.iter().any(|line| line.contains(
-        "changed=\"$(packages/aethyme/scripts/test-like-ci.sh --base HEAD^1 --print-selection)\""
-    )));
-    assert!(tree.iter().any(|line| line.contains(
-        "selection=\"($changed) | package(aethyme-testkit) | package(aethyme-cli) | binary_id(aethyme-broker::gate_policy)\""
-    )));
-    assert!(tree.contains(&"          scope=full"));
-    assert!(tree.contains(&"          if [ \"$EVENT_NAME\" = push ] && git rev-parse --verify --quiet HEAD^1 >/dev/null; then"));
-    assert!(
-        tree.contains(&"            if [ \"$(version HEAD)\" != \"$(version HEAD^1)\" ]; then")
-    );
-
-    let shard = block(&gates, "  cargo-test-shard:");
-    assert!(shard.contains(&"    needs: [tested-tree, cargo-test-build]"));
-    assert!(
-        shard
-            .iter()
-            .any(|line| line.contains("--selection \"$SELECTION\""))
-    );
-    for job in ["  cargo-test-build:", "  cargo-test-examples-doctests:"] {
-        assert!(
-            block(&gates, job)
-                .contains(&"    if: ${{ needs.tested-tree.outputs.run == '' && needs.tested-tree.outputs.scope != 'none' }}"),
-            "{job}"
-        );
-    }
+    assert!(tree.contains(&r#"          echo "scope=full" >> "$GITHUB_OUTPUT""#));
+    assert!(tree.contains(&r#"          echo "selection=" >> "$GITHUB_OUTPUT""#));
+    assert!(!tree.iter().any(|line| line.contains("scope=changed") || line.contains("scope=none")));
     let verdict = block(&gates, "  cargo-test:");
-    assert!(verdict.contains(&"            full|changed) [[ \"$BUILD\" == success && \"$SHARDS\" == success && \"$EXAMPLES\" == success ]] ;;"));
-    assert_eq!(
-        verdict
-            .iter()
-            .filter(|line| line.trim() == "if: ${{ needs.tested-tree.outputs.scope == 'full' }}")
-            .count(),
-        2,
-        "only a full scope records the full-suite artifact"
-    );
     assert!(verdict.contains(&"          name: full-suite"));
 }
 
