@@ -16,11 +16,44 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::clock::epoch_ms;
+
+thread_local! {
+    static COMPLETED_PHASE_TIMINGS: std::cell::RefCell<Option<std::collections::BTreeMap<String, u64>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn take_phase_timings() -> Option<std::collections::BTreeMap<String, u64>> {
+    COMPLETED_PHASE_TIMINGS.with(|timings| timings.borrow_mut().take())
+}
+
+fn phase_key(phase: &str) -> &'static str {
+    match phase {
+        "starting" => "starting",
+        "auditing lease ownership" => "ownership",
+        "planning the submission" => "planning",
+        "simulating the merge" => "merge_simulation",
+        PHASE_WAITING_FOR_SLOT => "verification_slot_wait",
+        PHASE_VERIFYING => "verification_setup",
+        "checking graph and selecting gates" => "graph_and_gate_selection",
+        "executing gates" => "gate_execution",
+        "recording the verdict" => "verdict",
+        _ => "other",
+    }
+}
+
+fn add_phase_duration(
+    timings: &mut std::collections::BTreeMap<String, u64>,
+    phase: &str,
+    elapsed: Duration,
+) {
+    let duration = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+    let total = timings.entry(phase_key(phase).to_string()).or_default();
+    *total = total.saturating_add(duration);
+}
 
 /// No progress for this long marks a running submit as possibly stalled.
 ///
@@ -286,6 +319,9 @@ struct Shared {
     record: SubmitProgressRecord,
     /// Last time anything was printed for this submit, heartbeat included.
     last_printed_ms: i64,
+    phase_started: Instant,
+    timing_phase: String,
+    phase_timings_ms: std::collections::BTreeMap<String, u64>,
 }
 
 /// The record of the submit running in this process. Dropping it removes the
@@ -300,6 +336,7 @@ impl SubmitProgress {
     /// Start recording, with a stderr heartbeat every `interval` of silence.
     pub(crate) fn start(main_root: &Path, session_id: i64, interval: Duration) -> Self {
         let now = epoch_ms();
+        COMPLETED_PHASE_TIMINGS.with(|timings| *timings.borrow_mut() = None);
         let shared = Arc::new(Mutex::new(Shared {
             path: submits_dir(main_root).join(format!("session-{session_id}.json")),
             record: SubmitProgressRecord {
@@ -312,6 +349,9 @@ impl SubmitProgress {
                 last_progress: String::new(),
             },
             last_printed_ms: now,
+            phase_started: Instant::now(),
+            timing_phase: "starting".into(),
+            phase_timings_ms: std::collections::BTreeMap::new(),
         }));
         persist(&shared);
         let (stop, stopped) = mpsc::channel::<()>();
@@ -333,11 +373,27 @@ impl SubmitProgress {
             return;
         };
         let now = epoch_ms();
+        Self::advance_timing(&mut shared, phase);
         shared.record.phase = phase.to_string();
         shared.record.phase_started_at_ms = now;
         shared.record.last_progress_at_ms = now;
         drop(shared);
         persist(&self.shared);
+    }
+
+    fn advance_timing(shared: &mut Shared, phase: &str) {
+        let previous_phase = shared.timing_phase.clone();
+        let elapsed = shared.phase_started.elapsed();
+        add_phase_duration(&mut shared.phase_timings_ms, &previous_phase, elapsed);
+        shared.phase_started = Instant::now();
+        shared.timing_phase = phase.to_string();
+    }
+
+    /// Split a timing phase without changing the externally visible slot state.
+    pub(crate) fn subphase(&self, phase: &str) {
+        if let Ok(mut shared) = self.shared.lock() {
+            Self::advance_timing(&mut shared, phase);
+        }
     }
 
     /// Something observable happened: a gate line, a wait tick.
@@ -387,6 +443,13 @@ impl Drop for SubmitProgress {
             && thread.join().is_err()
         {
             eprintln!("Warning: submit progress heartbeat thread panicked");
+        }
+        if let Ok(mut shared) = self.shared.lock() {
+            let phase = shared.timing_phase.clone();
+            let elapsed = shared.phase_started.elapsed();
+            add_phase_duration(&mut shared.phase_timings_ms, &phase, elapsed);
+            let timings = std::mem::take(&mut shared.phase_timings_ms);
+            COMPLETED_PHASE_TIMINGS.with(|slot| *slot.borrow_mut() = Some(timings));
         }
         if let Ok(shared) = self.shared.lock()
             && let Err(error) = std::fs::remove_file(&shared.path)
@@ -460,6 +523,33 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submit_phase_timings_survive_early_drop_and_do_not_record_arbitrary_phase_text() {
+        let root = tempfile::tempdir().unwrap();
+        let progress = SubmitProgress::start(root.path(), 41, Duration::from_secs(3600));
+        progress.phase("planning the submission");
+        progress.subphase("untrusted phase text");
+        assert_eq!(
+            in_flight_submits(root.path(), epoch_ms())[0].phase,
+            "planning the submission"
+        );
+        drop(progress);
+        let timings = take_phase_timings().unwrap();
+        assert!(timings.contains_key("starting"));
+        assert!(timings.contains_key("planning"));
+        assert!(timings.contains_key("other"));
+        assert!(!timings.contains_key("untrusted phase text"));
+        assert!(take_phase_timings().is_none());
+    }
+
+    #[test]
+    fn repeated_submit_phases_are_accumulated() {
+        let mut timings = std::collections::BTreeMap::new();
+        add_phase_duration(&mut timings, "executing gates", Duration::from_millis(12));
+        add_phase_duration(&mut timings, "executing gates", Duration::from_millis(9));
+        assert_eq!(timings.get("gate_execution"), Some(&21));
+    }
 
     fn record(session_id: i64, phase: &str, phase_started_at_ms: i64) -> SubmitProgressRecord {
         SubmitProgressRecord {

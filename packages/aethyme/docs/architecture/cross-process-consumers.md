@@ -1267,6 +1267,14 @@ remain, and shows at most eight changed paths. An ownership refusal can come
 after the command has already changed files, so a consumer must inspect the
 reported paths before retrying.
 
+Submit command metrics add `phase_timings_ms` for broker opening, contract
+preflight, ownership auditing, planning, merge simulation, verification slot
+wait, verification checkout setup, graph and gate selection, gate execution,
+and verdict recording as reached. `submission_total` includes the phases inside
+submission and must not be added to them. Durations use a monotonic clock and
+repeated phases accumulate. Early failures may have only a partial breakdown;
+phase keys are allowlisted and never contain session input.
+
 Guarded-exec reports include `phase_timings_ms`: `precheck` measures session
 lookup, the initial worktree snapshot, receipt and admission;
 `command_and_supervision` measures dispatch, the child and its supervisor;
