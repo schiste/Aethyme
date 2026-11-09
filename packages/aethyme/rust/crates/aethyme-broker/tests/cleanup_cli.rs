@@ -74,6 +74,11 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
             .closed
     );
     std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
+    std::fs::write(
+        worktree.join("target/CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
     std::fs::write(worktree.join("target/debug/cache.bin"), vec![3_u8; 2048]).unwrap();
     drop(broker);
 
@@ -143,7 +148,9 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
     assert!(!unconfirmed.status.success());
     assert!(worktree.exists());
 
-    let apply = run(
+    // The retention configuration changed since the first plan. Its digest
+    // must no longer authorize cleanup, even if the checkout is still eligible.
+    let stale = run(
         tmp.path(),
         &[
             "finish",
@@ -155,9 +162,40 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
             "--json",
         ],
     );
+    assert!(!stale.status.success());
+    assert!(worktree.exists());
+    let stale: serde_json::Value = serde_json::from_slice(&stale.stdout).unwrap();
+    assert!(
+        stale["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no longer matches")
+    );
+
+    let refreshed = run(
+        tmp.path(),
+        &["finish", "cleanup", "--all-cleaned", "--json"],
+    );
+    assert!(refreshed.status.success());
+    let refreshed: serde_json::Value = serde_json::from_slice(&refreshed.stdout).unwrap();
+    let digest = refreshed["plan"]["digest"].as_str().unwrap();
+
+    let apply = run(
+        tmp.path(),
+        &[
+            "finish",
+            "cleanup",
+            "--all-cleaned",
+            "--apply",
+            "--confirm",
+            digest,
+            "--json",
+        ],
+    );
     assert!(
         apply.status.success(),
-        "{}",
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&apply.stdout),
         String::from_utf8_lossy(&apply.stderr)
     );
     let apply: serde_json::Value = serde_json::from_slice(&apply.stdout).unwrap();

@@ -862,7 +862,7 @@ fn finish_cleanup_proof_does_not_authorize_a_replacement_checkout_at_the_same_pa
 }
 
 #[test]
-fn finish_cleanup_resumes_with_managed_runtime_and_witnessed_build_artifacts() {
+fn finish_cleanup_preserves_unproven_ignored_runtime_directory() {
     let mut gitignore = aethyme_broker::broker_runtime_ignore_patterns()
         .collect::<Vec<_>>()
         .join("\n");
@@ -876,11 +876,7 @@ fn finish_cleanup_resumes_with_managed_runtime_and_witnessed_build_artifacts() {
     std::fs::write(&broker_log, "broker log\n").unwrap();
     let target = worktree.join("target");
     std::fs::create_dir_all(&target).unwrap();
-    std::fs::write(
-        target.join("CACHEDIR.TAG"),
-        "Signature: 8a477f597d28d172789f06886806bc55\n",
-    )
-    .unwrap();
+    std::fs::write(target.join("unknown-data"), "preserve me\n").unwrap();
 
     interrupt_finish_cleanup(&tmp, session_id, &worktree);
     std::fs::remove_file(worktree.join("README.md")).unwrap();
@@ -890,18 +886,21 @@ fn finish_cleanup_resumes_with_managed_runtime_and_witnessed_build_artifacts() {
         &["finish", "cleanup", &session_id.to_string(), "--json"],
     );
     assert!(
-        resumed.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&resumed.stdout),
-        String::from_utf8_lossy(&resumed.stderr)
+        !resumed.status.success(),
+        "cleanup must not discard an ignored runtime directory without proof"
     );
-    let report: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
-    assert_eq!(report["cleaned"], session_id);
-    assert!(!worktree.exists());
-    assert!(!managed_status.exists());
-    assert!(!broker_log.exists());
-    assert!(!target.exists());
-    assert!(!branch_exists(tmp.path(), &branch));
+    let error: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("uncommitted or untracked")
+    );
+    assert!(worktree.exists());
+    assert!(managed_status.exists());
+    assert!(broker_log.exists());
+    assert!(target.exists());
+    assert!(branch_exists(tmp.path(), &branch));
 }
 
 #[test]
