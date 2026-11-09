@@ -5266,7 +5266,11 @@ mod generic_guarded_exec_tests {
 
         let outside = guarded_write(&mut broker, "tracked.txt", "unclaimed change\n");
         assert_eq!(
-            outside.phase_timings_ms.keys().map(String::as_str).collect::<Vec<_>>(),
+            outside
+                .phase_timings_ms
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
             vec!["command_and_supervision", "postcheck", "precheck"]
         );
         assert!(!outside.ownership_ok);
