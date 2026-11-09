@@ -3441,6 +3441,7 @@ impl Broker {
         if command.is_empty() {
             return Err(BrokerOpError::MissingExecCommand);
         }
+        let precheck_started = std::time::Instant::now();
         let session = self.store.session(session_id)?;
         // Global implicit leases and overlap classification are diagnostic
         // snapshots maintained by explicit refresh/submit paths. Guarded
@@ -3494,6 +3495,8 @@ impl Broker {
         };
         let mut pending_not_started_dispatch = false;
         let mut terminal_dispatch_recorded = false;
+        let precheck_ms = precheck_started.elapsed().as_millis() as u64;
+        let execution_started = std::time::Instant::now();
         let run_result = {
             let mut dispatch = |event| {
                 match event {
@@ -3534,6 +3537,8 @@ impl Broker {
             };
             run(&session, observation, &mut artifact_use, &mut dispatch)
         };
+        let execution_ms = execution_started.elapsed().as_millis() as u64;
+        let audit_started = std::time::Instant::now();
         let status = match run_result {
             Ok(status) => status,
             Err(error) => {
@@ -3662,8 +3667,17 @@ impl Broker {
         let mut warned_leases = audit.warned_leases;
         self.attach_overlap_changes(session_id, &touched, &mut conflicting_leases);
         self.attach_overlap_changes(session_id, &touched, &mut warned_leases);
+        let phase_timings_ms = std::collections::BTreeMap::from([
+            ("precheck".to_string(), precheck_ms),
+            ("command_and_supervision".to_string(), execution_ms),
+            (
+                "postcheck".to_string(),
+                audit_started.elapsed().as_millis() as u64,
+            ),
+        ]);
         let report = GuardedExecReport {
             session_id,
+            phase_timings_ms,
             command: command.to_vec(),
             exit_code: status.exit_code,
             command_success,
@@ -5251,6 +5265,14 @@ mod generic_guarded_exec_tests {
         };
 
         let outside = guarded_write(&mut broker, "tracked.txt", "unclaimed change\n");
+        assert_eq!(
+            outside
+                .phase_timings_ms
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["command_and_supervision", "postcheck", "precheck"]
+        );
         assert!(!outside.ownership_ok);
         assert!(
             outside

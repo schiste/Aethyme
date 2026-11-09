@@ -483,8 +483,16 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
     let session = parsed
         .session
         .ok_or(UsageError::Message("submit requires --session <id>".into()))?;
+    let open_started = std::time::Instant::now();
     let mut broker = open_broker(parsed.read_only_snapshot)?;
-    contract_preflight(&mut broker, session)?;
+    let open_ms = open_started.elapsed().as_millis() as u64;
+    let preflight_started = std::time::Instant::now();
+    let preflight = contract_preflight(&mut broker, session);
+    let preflight_ms = preflight_started.elapsed().as_millis() as u64;
+    telemetry::set_command_metric_details(serde_json::json!({"phase_timings_ms": {
+        "broker_open": open_ms, "contract_preflight": preflight_ms,
+    }}));
+    preflight?;
     // Preflight (dogfood feedback 2026-07-14): show exactly what
     // will be submitted before anything runs — and warn about
     // uncommitted work, which never integrates.
@@ -505,6 +513,8 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
     }
     // Opt-in collaboration capture (#660). Off unless `[collaboration]`
     // asks for it, and then this is exactly the legacy submit.
+    let _ = crate::submit_progress::take_phase_timings();
+    let submit_started = std::time::Instant::now();
     let submitted = crate::collaboration_submit::submit(
         &mut broker,
         session,
@@ -518,8 +528,16 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
         } else {
             crate::PromotionIntent::Configured
         },
-    )?;
-    let (outcome, capture) = match submitted {
+    );
+    let mut phases = crate::submit_progress::take_phase_timings().unwrap_or_default();
+    phases.insert("broker_open".into(), open_ms);
+    phases.insert("contract_preflight".into(), preflight_ms);
+    phases.insert(
+        "submission_total".into(),
+        submit_started.elapsed().as_millis() as u64,
+    );
+    telemetry::set_command_metric_details(serde_json::json!({"phase_timings_ms": phases}));
+    let (outcome, capture) = match submitted? {
         crate::collaboration_submit::CaptureSubmit::Submitted { outcome, capture } => {
             (*outcome, capture)
         }

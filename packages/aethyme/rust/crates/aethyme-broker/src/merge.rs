@@ -1504,6 +1504,9 @@ impl Broker {
         // from the merged tree: otherwise a session could weaken or delete the
         // gates and graph policy that judge it. A policy change a session makes
         // applies to the submissions after it lands.
+        if let Some(progress) = progress {
+            progress.subphase("checking graph and selecting gates");
+        }
         let graph_policy =
             crate::graph_integrity::load_graph_policy_at_commit(self.repo_handle(), &base)?;
         let graph_policy_changed =
@@ -1548,6 +1551,9 @@ impl Broker {
         // A stale or unverifiable graph is recorded above and reported with
         // the submission; it never stops the gates or the promotion (#280).
         let storage = self.storage_context().gate_storage_locations();
+        if let Some(progress) = progress {
+            progress.subphase("executing gates");
+        }
         let gate_outcomes = crate::gates::run_affected_for_submit_in(
             self.store(),
             &main_root,
