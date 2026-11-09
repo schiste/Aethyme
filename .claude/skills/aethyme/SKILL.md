@@ -23,6 +23,13 @@ Important: `python -m src.cli ...` was removed — the Python CLI no longer
 exists, so that spelling fails outright. Use the `aethyme` binary for
 graph, task, facts, intents, analyze, enhance, and Explore.
 
+## Lease Overlaps
+
+Check `[promote] mode` in `.aethyme/config.toml`: `verify-only` makes overlaps
+advisory; other modes can refuse claims against active explicit leases. An
+accepted claim with warnings permits work in your own session. Inspect overlaps,
+reconcile before merging, and resolve refusals; never edit another session's tree.
+
 ## Default Contract
 
 Explore is a navigation aid, not an authority: every result is verified against
