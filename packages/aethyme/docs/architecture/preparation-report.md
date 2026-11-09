@@ -1,5 +1,7 @@
 # Preparation report
 
+Last Updated: 2026-11-09
+
 `aethyme broker submit prepare --session <id> --json` reports completed
 preparation steps in `steps`. Each step's `duration_ms` is the elapsed wall
 clock time in milliseconds for the supervised step, including its immediate
