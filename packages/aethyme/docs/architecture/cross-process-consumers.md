@@ -1267,6 +1267,15 @@ remain, and shows at most eight changed paths. An ownership refusal can come
 after the command has already changed files, so a consumer must inspect the
 reported paths before retrying.
 
+Guarded-exec reports include `phase_timings_ms`: `precheck` measures session
+lookup, the initial worktree snapshot, receipt and admission;
+`command_and_supervision` measures dispatch, the child and its supervisor;
+`postcheck` measures outcome recording and the ownership audit. The CLI
+command metrics include these timings plus `broker_open`, without child
+arguments. Timings are wall-clock milliseconds and do not sum to the full
+duration: startup, rendering and final bookkeeping are outside these phases.
+Failures before a report is returned have no phase breakdown.
+
 CLI exec also commits an opaque receipt before command dispatch and adds its id
 to the final text/JSON report. `broker advanced exec-status --session <id>`
 reads one receipt by `--receipt` or a bounded latest list (`--limit`, default
