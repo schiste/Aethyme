@@ -271,8 +271,9 @@ Usage:
       the merge that landed it; its pull request and branch map to sessions,
       finished ones included, each with liveness, branch and pull request.
       A single commit reads as the commits it brought in. Read-only.
-  aethyme broker leases [--json]
-      Refresh and list active leases plus current overlaps.
+  aethyme broker leases [--session <id>] [--json]
+      Refresh and list active leases plus current overlaps; --session scopes
+      the list and overlap pairs to that session.
   aethyme broker leases claim <path> [<path>...] --session <id> [--ttl <seconds>] [--json]
       Explicitly claim a path (end it with / for a directory claim).
   aethyme broker leases plan <paths...> [--session <id>] [--json]

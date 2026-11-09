@@ -341,22 +341,31 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
     let mut broker = open_broker(parsed.read_only_snapshot || export)?;
     match parsed.positional.first().map(String::as_str) {
         None => {
-            let overlaps = if parsed.read_only_snapshot {
+            let mut overlaps = if parsed.read_only_snapshot {
                 broker.lease_overlaps_snapshot()?
             } else {
                 broker.refresh_leases()?
             };
-            let leases = broker.store().active_leases()?;
+            let mut leases = broker.store().active_leases()?;
+            if let Some(session) = parsed.session {
+                // Keep every overlap involving this session, including its
+                // counterpart, while omitting unrelated repository-wide rows.
+                broker.store().session(session)?;
+                leases.retain(|lease| lease.session_id == session);
+                overlaps
+                    .retain(|overlap| overlap.session_a == session || overlap.session_b == session);
+            }
             let overlap_pairs = broker.overlap_pairs_snapshot(&overlaps);
             if parsed.json {
-                out!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "leases": leases,
-                        "overlaps": overlaps,
-                        "overlap_pairs": overlap_pairs,
-                    }))?
-                );
+                let mut result = serde_json::json!({
+                    "leases": leases,
+                    "overlaps": overlaps,
+                    "overlap_pairs": overlap_pairs,
+                });
+                if let Some(session) = parsed.session {
+                    result["session_filter"] = serde_json::json!(session);
+                }
+                out!("{}", serde_json::to_string_pretty(&result)?);
             } else if leases.is_empty() {
                 out!("No active leases.");
             } else {

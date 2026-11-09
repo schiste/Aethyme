@@ -372,7 +372,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("resources reconcile", &["--confirm"]),
     ("agents", &[]),
     ("owners", &["--commits", "--path"]),
-    ("leases", &[]),
+    ("leases", &["--session"]),
     ("leases claim", &["--session", "--ttl"]),
     ("leases plan", &["--session"]),
     ("leases export", &["--session", "--entry", "--limit"]),

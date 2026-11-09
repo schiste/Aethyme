@@ -209,6 +209,63 @@ fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
 }
 
 #[test]
+fn lease_list_can_scope_leases_and_overlaps_to_one_session() {
+    let tmp = fixture();
+    let first = add_worktree(tmp.path(), "filter-first");
+    let second = add_worktree(tmp.path(), "filter-second");
+    let third = add_worktree(tmp.path(), "filter-third");
+    let (first_id, second_id) = {
+        let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
+        let first = broker.adopt(&first, None).unwrap();
+        let second = broker.adopt(&second, None).unwrap();
+        let third = broker.adopt(&third, None).unwrap();
+        broker
+            .store()
+            .claim_lease(first.id, "src/shared.rs", None)
+            .unwrap();
+        broker
+            .store()
+            .claim_lease(second.id, "src/shared.rs", None)
+            .unwrap();
+        broker
+            .store()
+            .claim_lease(third.id, "README.md", None)
+            .unwrap();
+        (first.id, second.id)
+    };
+    let output = run(
+        tmp.path(),
+        &[
+            "advanced",
+            "leases",
+            "--session",
+            &first_id.to_string(),
+            "--json",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["session_filter"], first_id);
+    let leases = result["leases"].as_array().unwrap();
+    assert!(!leases.is_empty());
+    assert!(leases.iter().all(|lease| lease["session_id"] == first_id));
+    assert!(
+        result["overlaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|overlap| {
+                (overlap["session_a"] == first_id && overlap["session_b"] == second_id)
+                    || (overlap["session_a"] == second_id && overlap["session_b"] == first_id)
+            })
+    );
+}
+
+#[test]
 fn batch_claim_reports_partial_success_without_dropping_later_paths() {
     let tmp = fixture();
     let worktree = add_worktree(tmp.path(), "batch-owner");
