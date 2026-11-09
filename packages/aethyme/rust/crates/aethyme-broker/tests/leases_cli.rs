@@ -209,6 +209,99 @@ fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
 }
 
 #[test]
+fn lease_list_can_scope_leases_and_overlaps_to_one_session() {
+    let tmp = fixture();
+    let first = add_worktree(tmp.path(), "filter-first");
+    let second = add_worktree(tmp.path(), "filter-second");
+    let third = add_worktree(tmp.path(), "filter-third");
+    let (first_id, second_id) = {
+        let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
+        let first = broker.adopt(&first, None).unwrap();
+        let second = broker.adopt(&second, None).unwrap();
+        let third = broker.adopt(&third, None).unwrap();
+        broker
+            .store()
+            .claim_lease(first.id, "src/shared.rs", None)
+            .unwrap();
+        broker
+            .store()
+            .claim_lease(second.id, "src/shared.rs", None)
+            .unwrap();
+        broker
+            .store()
+            .claim_lease(third.id, "README.md", None)
+            .unwrap();
+        (first.id, second.id)
+    };
+    let output = run(
+        tmp.path(),
+        &[
+            "advanced",
+            "leases",
+            "--session",
+            &first_id.to_string(),
+            "--json",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["session_filter"], first_id);
+    let leases = result["leases"].as_array().unwrap();
+    assert!(!leases.is_empty());
+    assert!(leases.iter().all(|lease| lease["session_id"] == first_id));
+    assert!(
+        result["overlaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|overlap| {
+                (overlap["session_a"] == first_id && overlap["session_b"] == second_id)
+                    || (overlap["session_a"] == second_id && overlap["session_b"] == first_id)
+            })
+    );
+}
+
+#[test]
+fn batch_claim_reports_partial_success_without_dropping_later_paths() {
+    let tmp = fixture();
+    let worktree = add_worktree(tmp.path(), "batch-owner");
+    let session_id = {
+        let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
+        broker.adopt(&worktree, None).unwrap().id
+    };
+    let output = run(
+        tmp.path(),
+        &[
+            "advanced",
+            "leases",
+            "claim",
+            "src/one.rs",
+            "../invalid",
+            "src/two.rs",
+            "--session",
+            &session_id.to_string(),
+            "--json",
+        ],
+    );
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["atomic"], false);
+    assert_eq!(result["failures"], 1);
+    assert_eq!(result["claims"].as_array().unwrap().len(), 3);
+    assert_eq!(result["claims"][0]["report"]["accepted"], true);
+    assert!(result["claims"][1]["error"].is_string());
+    assert_eq!(result["claims"][2]["report"]["accepted"], true);
+    let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
+    let leases = broker.store().session_leases(session_id).unwrap();
+    assert!(leases.iter().any(|lease| lease.path == "src/one.rs"));
+    assert!(leases.iter().any(|lease| lease.path == "src/two.rs"));
+}
+
+#[test]
 fn closed_session_lease_claim_fails_without_persisting_a_phantom_lease() {
     let tmp = fixture();
     let worktree = add_worktree(tmp.path(), "closed-owner");
