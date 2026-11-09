@@ -1259,7 +1259,10 @@ fn main_always_tests_the_full_workspace() {
     let tree = block(&gates, "  tested-tree:");
     assert!(tree.contains(&r#"          echo "scope=full" >> "$GITHUB_OUTPUT""#));
     assert!(tree.contains(&r#"          echo "selection=" >> "$GITHUB_OUTPUT""#));
-    assert!(!tree.iter().any(|line| line.contains("scope=changed") || line.contains("scope=none")));
+    assert!(
+        !tree.iter()
+            .any(|line| line.contains("scope=changed") || line.contains("scope=none"))
+    );
     let verdict = block(&gates, "  cargo-test:");
     assert!(verdict.contains(&"          name: full-suite"));
 }
