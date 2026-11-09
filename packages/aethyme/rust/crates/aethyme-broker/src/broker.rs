@@ -2521,6 +2521,8 @@ pub struct GuardedExecReport {
     pub command: Vec<String>,
     pub exit_code: Option<i32>,
     pub command_success: bool,
+    /// Elapsed wall time in milliseconds for the guarded execution phases.
+    pub phase_timings_ms: std::collections::BTreeMap<String, u64>,
     /// Always serialized. True only when supervised execution had no completed
     /// result before its deadline and process-group cleanup was verified;
     /// normal child exits and legacy execution report false.

@@ -540,7 +540,9 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
         .session
         .ok_or(UsageError::Message("exec requires --session <id>".into()))?;
     let requested_timeout = exec_timeout_from_seconds(parsed.timeout_seconds)?;
+    let open_started = std::time::Instant::now();
     let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let open_ms = open_started.elapsed().as_millis() as u64;
     let result = broker.guarded_exec_for_cli(
         session,
         &parsed.exec_command,
@@ -550,6 +552,9 @@ pub(super) fn run_exec(parsed: Parsed) -> Result<(), UsageError> {
     )?;
     let receipt_id = result.receipt_id;
     let report = result.report;
+    let mut phases = report.phase_timings_ms.clone();
+    phases.insert("broker_open".into(), open_ms);
+    super::telemetry::set_command_metric_details(serde_json::json!({"phase_timings_ms": phases}));
     let changed_paths = changed_paths_remaining(&report);
     let next_actions = exec_ownership_next_actions(&report);
     if parsed.json {
@@ -1590,6 +1595,11 @@ mod exec_report_tests {
             command: vec!["test".into()],
             exit_code: Some(0),
             command_success: true,
+            phase_timings_ms: std::collections::BTreeMap::from([
+                ("precheck".into(), 2),
+                ("command_and_supervision".into(), 3),
+                ("postcheck".into(), 4),
+            ]),
             command_timed_out: false,
             ownership_ok: true,
             conflicting_leases: Vec::new(),
@@ -1604,6 +1614,16 @@ mod exec_report_tests {
             foreign_paths: Vec::new(),
             ok: true,
         }
+    }
+
+    #[test]
+    fn exec_report_serializes_phase_timings_without_command_details_in_them() {
+        let report = completed_report();
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["phase_timings_ms"]["precheck"], 2);
+        assert_eq!(value["phase_timings_ms"]["command_and_supervision"], 3);
+        assert_eq!(value["phase_timings_ms"]["postcheck"], 4);
+        assert_eq!(value["phase_timings_ms"].as_object().unwrap().len(), 3);
     }
 
     #[test]
