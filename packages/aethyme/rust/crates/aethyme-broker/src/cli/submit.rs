@@ -513,7 +513,8 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
     }
     // Opt-in collaboration capture (#660). Off unless `[collaboration]`
     // asks for it, and then this is exactly the legacy submit.
-    let _ = crate::submit_progress::take_phase_timings();
+    // Discard timings from any earlier submit in this process.
+    drop(crate::submit_progress::take_phase_timings());
     let submit_started = std::time::Instant::now();
     let submitted = crate::collaboration_submit::submit(
         &mut broker,
