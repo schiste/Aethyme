@@ -291,6 +291,9 @@ fn preparation_is_explicit_language_neutral_and_invalidates_on_input_change() {
     assert_eq!(prepared["state"], "current");
     assert_eq!(prepared["shared_cache_coordinated"], true);
     assert_eq!(prepared["steps"].as_array().map(Vec::len), Some(3));
+    for step in prepared["steps"].as_array().unwrap() {
+        assert!(step["duration_ms"].as_u64().is_some());
+    }
     assert!(!temp.path().join("runtime-probe-must-not-run").exists());
     for output in ["node_modules", "target", ".venv"] {
         assert!(temp.path().join(output).is_dir());
@@ -315,6 +318,7 @@ fn preparation_is_explicit_language_neutral_and_invalidates_on_input_change() {
         ],
     ));
     assert_eq!(current["state"], "current");
+    assert_eq!(prepared["digest"], current["expected_digest"]);
     std::fs::write(temp.path().join("Cargo.lock"), "changed bytes\n").unwrap();
     let stale = success_json(run(
         temp.path(),

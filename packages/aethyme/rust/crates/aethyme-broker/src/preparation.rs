@@ -381,6 +381,8 @@ pub struct PreparationStepResult {
     pub name: String,
     pub exit_code: Option<i32>,
     pub succeeded: bool,
+    /// Elapsed wall time for this step, including execution supervision.
+    pub duration_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -673,7 +675,9 @@ impl Broker {
             reason: "repository declares no preparation steps".into(),
         })?;
         let source_digest = preparation_source_digest(&root, &config, session_id)?;
-        let digest = preparation_digest(&root, &config, session_id)?;
+        // The report digest is defined as the hash of the source digest.
+        // Reuse the bytes already read rather than hashing every input twice.
+        let digest = hash_text(&source_digest);
         let status = self.preparation_status(session_id)?;
         if status.state == PreparationState::Current {
             return Ok(PreparationReport {
@@ -960,6 +964,7 @@ impl Broker {
         let main_root = self.main_root().to_path_buf();
         let mut heartbeat = PreparationHeartbeat::new(Instant::now());
         for step in &config.steps {
+            let step_started = Instant::now();
             let command = if offline {
                 step.offline_command
                     .as_ref()
@@ -1047,6 +1052,7 @@ impl Broker {
                 name: step.name.clone(),
                 exit_code: report.exit_code,
                 succeeded: report.ok,
+                duration_ms: step_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
             });
             if !report.ok {
                 let error = PreparationError::StepFailed {
@@ -1730,7 +1736,8 @@ fn validate_relative_path(path: &str) -> Result<(), PreparationError> {
     Ok(())
 }
 
-pub(crate) fn preparation_digest(
+#[cfg(test)]
+fn preparation_digest(
     root: &Path,
     config: &PreparationConfig,
     session_id: i64,
