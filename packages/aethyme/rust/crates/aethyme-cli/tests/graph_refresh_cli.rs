@@ -539,12 +539,17 @@ fn disabled_status_is_a_cheap_healthy_no_op() {
         0
     );
     assert_eq!(status["performance"]["source_indexing"]["bytes_read"], 0);
-    assert!(
-        status["next_action"]
-            .as_str()
-            .unwrap()
-            .contains("no action is required")
-    );
+    let next = status["next_action"].as_str().unwrap();
+    for detail in [
+        "no action is required",
+        "Committed graph coverage is unavailable",
+        "source search may still help",
+        "reported source HEAD",
+        "writes graph policy and an engine pin",
+        "indexes a disposable clone",
+    ] {
+        assert!(next.contains(detail), "missing {detail}: {next}");
+    }
 }
 
 #[test]

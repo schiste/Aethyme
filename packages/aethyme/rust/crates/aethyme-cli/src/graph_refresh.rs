@@ -531,7 +531,7 @@ impl GraphStatusInspector {
                 refresh_plan_required: false,
                 blockers: Vec::new(),
                 diagnosis: None,
-                next_action: "graph authority is disabled; no action is required. Enroll explicitly with `aethyme deploy --repo . --with-graph`"
+                next_action: "graph authority is disabled; no action is required. Committed graph coverage is unavailable; source search may still help. Verify the reported source HEAD is the intended checkout. Optional enrollment with `aethyme deploy --repo . --with-graph` writes graph policy and an engine pin for review and commit; subsequent refresh planning indexes a disposable clone and takes time and storage."
                     .into(),
                 work,
                 performance,
