@@ -1842,6 +1842,7 @@ retained_bytes_budget = 1073741824
 artifact_reclaim_days = 0
 orphan_worktree_roots_days = 1
 session_abandoned_after_hours = 72
+session_landed_after_hours = 24
 idle_session_artifact_hours = 24
 artifact_sweep_budget_ms = 5000
 artifact_sweep_headroom_bytes = 17179869184
@@ -3605,3 +3606,5 @@ Current behavior:
 ## Rule
 
 CLI commands should keep using the same indexing and graph contracts as the API.
+
+A clean session with an exact recorded landing on the fetched default branch and a proven-gone recorded holder can enter guarded retirement after `session_landed_after_hours` (default 24 hours). Set it to `0` to disable this earlier path. The ordinary `session_abandoned_after_hours = 0` also disables retirement. Unknown holders, changed heads, dirty or unproven work are preserved. Checkout removal still has its separate grace period and safety checks.

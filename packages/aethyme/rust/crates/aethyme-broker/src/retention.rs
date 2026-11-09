@@ -28,6 +28,7 @@ const RETENTION_POLICY_FIELDS: &[&str] = &[
     "artifact_reclaim_days",
     "orphan_worktree_roots_days",
     "session_abandoned_after_hours",
+    "session_landed_after_hours",
     "expire_abandoned_task_leases",
     "idle_session_artifact_hours",
     "artifact_sweep_budget_ms",
@@ -114,6 +115,10 @@ pub struct RetentionPolicy {
     /// raising this trades disk against how long a dead session's disk is
     /// held -- never against whether committed work survives.
     pub session_abandoned_after_hours: u32,
+    /// Hours of inactivity before a clean, recorded-as-landed session with
+    /// a proven-gone holder can enter the normal guarded retirement path.
+    /// Zero disables early landed-session retirement.
+    pub session_landed_after_hours: u32,
     /// Opt in to guarded expiry of versioned task ownership after upgrading
     /// and draining older clients. Legacy or unknown holder evidence remains
     /// protected. This changes metadata eligibility, never deletion proofs.
@@ -187,6 +192,7 @@ impl Default for RetentionPolicy {
             artifact_reclaim_days: 0,
             orphan_worktree_roots_days: 1,
             session_abandoned_after_hours: 72,
+            session_landed_after_hours: 24,
             expire_abandoned_task_leases: false,
             idle_session_artifact_hours: 24,
             artifact_sweep_budget_ms: 5_000,
@@ -293,6 +299,13 @@ impl RetentionPolicy {
             return Err(RetentionConfigError::InvalidValue {
                 field: "session_abandoned_after_hours",
                 value: self.session_abandoned_after_hours.to_string(),
+                constraint: "must be between 0 (disabled) and 8760 hours",
+            });
+        }
+        if self.session_landed_after_hours > 8_760 {
+            return Err(RetentionConfigError::InvalidValue {
+                field: "session_landed_after_hours",
+                value: self.session_landed_after_hours.to_string(),
                 constraint: "must be between 0 (disabled) and 8760 hours",
             });
         }
