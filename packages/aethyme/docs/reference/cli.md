@@ -1731,7 +1731,9 @@ tracked and untracked changes separately, bytes, one disposition (`in_target`,
 `missing_checkout_metadata`, `unknown_provenance`), evidence, blocker, and next
 action. The separate `work_state` and `by_work_state` counts distinguish delivered,
 uncommitted, local-only, remote-branch-only, integration-only and unknown work
-even for an open session; they do not claim whether a PR exists. The audit removes nothing. When anything is removable it prints the
+even for an open session. Recorded PR links include their last observation and
+merge timestamp when known; an empty list does not prove no PR exists, and
+observations can be stale. Neither the link nor its state authorizes cleanup. The audit removes nothing. When anything is removable it prints the
 `--all-cleaned --apply` command with the current plan digest, and it withholds
 that command if the plan would remove an item the audit retains. `--repo
 <path>` audits the repository at `<path>` instead of the current directory.

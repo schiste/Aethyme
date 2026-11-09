@@ -477,6 +477,31 @@ impl BrokerStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Recorded links only; an empty result does not prove no PR exists.
+    pub(crate) fn audit_pull_request_links(
+        &self,
+    ) -> Result<Vec<(i64, String, i64, Option<String>, Option<i64>, Option<i64>)>, BrokerError>
+    {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.session_id, l.repository, l.pr_number, o.state, o.observed_at, m.merged_at
+             FROM pull_request_session_links l
+             LEFT JOIN pull_request_observations o ON o.repository = l.repository AND o.pr_number = l.pr_number
+             LEFT JOIN pull_request_milestones m ON m.repository = l.repository AND m.pr_number = l.pr_number
+             ORDER BY l.session_id, l.repository, l.pr_number",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Sessions linked to one pull request.
     pub fn pull_request_sessions(
         &self,

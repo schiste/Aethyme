@@ -2253,6 +2253,20 @@ pub(super) fn render_cleanup_audit(audit: &crate::CleanupAudit, detail: bool) {
                 item.untracked_files
             );
         }
+        for pr in &item.pull_requests {
+            out!(
+                "    recorded PR: {}#{} (observed: {}; at: {}; merged at: {})",
+                pr.repository,
+                pr.number,
+                pr.observed_state.as_deref().unwrap_or("unknown"),
+                pr.observed_at
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                pr.merged_at
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            );
+        }
         for evidence in &item.evidence {
             out!("    evidence: {evidence}");
         }

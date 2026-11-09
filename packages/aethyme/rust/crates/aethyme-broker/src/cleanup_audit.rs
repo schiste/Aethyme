@@ -198,6 +198,16 @@ impl AuditDisposition {
     }
 }
 
+/// Recorded association and last observation; neither is a live GitHub query.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AuditPullRequest {
+    pub repository: String,
+    pub number: i64,
+    pub observed_state: Option<String>,
+    pub observed_at: Option<i64>,
+    pub merged_at: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AuditItem {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -222,6 +232,8 @@ pub struct AuditItem {
     pub disposition: AuditDisposition,
     /// Independent work classification, even when the session is still open.
     pub work_state: &'static str,
+    /// Recorded links only. An empty list does not establish that no PR exists.
+    pub pull_requests: Vec<AuditPullRequest>,
     /// Whether the reviewed cleanup apply would remove this item.
     pub removable: bool,
     pub evidence: Vec<String>,
@@ -551,6 +563,21 @@ impl Broker {
         let mut items = Vec::new();
 
         let store = self.store_ref();
+        let mut pr_links: BTreeMap<i64, Vec<AuditPullRequest>> = BTreeMap::new();
+        for (session_id, repository, number, observed_state, observed_at, merged_at) in
+            store.audit_pull_request_links()?
+        {
+            pr_links
+                .entry(session_id)
+                .or_default()
+                .push(AuditPullRequest {
+                    repository,
+                    number,
+                    observed_state,
+                    observed_at,
+                    merged_at,
+                });
+        }
         let sessions = store
             .live_sessions()?
             .into_iter()
@@ -565,7 +592,7 @@ impl Broker {
                 target: &target,
                 cache: &mut *landing_cache,
             };
-            if let Some(item) = self.audit_session(
+            if let Some(mut item) = self.audit_session(
                 &session,
                 &path,
                 registration(&path),
@@ -573,6 +600,7 @@ impl Broker {
                 plan_items.get(&session.id).copied(),
                 &mut landing_context,
             ) {
+                item.pull_requests = pr_links.remove(&session.id).unwrap_or_default();
                 items.push(item);
             }
         }
@@ -611,6 +639,7 @@ impl Broker {
                 bytes: directory.estimated_bytes,
                 disposition: AuditDisposition::UnknownProvenance,
                 work_state: "unknown",
+                pull_requests: Vec::new(),
                 removable: false,
                 evidence: vec![format!(
                     "{} under a broker worktree root; no session row and no Git registration names it",
@@ -819,6 +848,7 @@ impl Broker {
             bytes: plan_item.and_then(|item| item.estimated_bytes),
             disposition,
             work_state: "unknown",
+            pull_requests: Vec::new(),
             removable,
             evidence,
             blocker,
@@ -853,6 +883,7 @@ impl Broker {
                 bytes: Some(0),
                 disposition: AuditDisposition::MissingCheckoutMetadata,
                 work_state: "unknown",
+                pull_requests: Vec::new(),
                 removable: false,
                 evidence: vec![format!(
                     "Git registers this worktree but its directory is gone{}",
@@ -914,6 +945,7 @@ impl Broker {
             bytes: crate::broker::directory_size_without_following_links(&entry.path).ok(),
             disposition,
             work_state: "unknown",
+            pull_requests: Vec::new(),
             removable: false,
             evidence,
             blocker: Some(
@@ -1146,6 +1178,42 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn open_session_reports_work_state_independently_of_lifecycle() {
+        let repository = tempfile::tempdir().unwrap();
+        git(repository.path(), &["init", "-q", "-b", "main"]);
+        git(repository.path(), &["config", "user.name", "Fixture"]);
+        git(
+            repository.path(),
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        git(
+            repository.path(),
+            &["commit", "--allow-empty", "-qm", "initial"],
+        );
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(repository.path()).unwrap();
+        let session = broker.start_worktree("open work", None).unwrap();
+        let audit = broker.cleanup_audit().unwrap();
+        let item = audit.items.iter().find(|item| matches!(item.owner, AuditOwner::Session { session_id, .. } if session_id == session.id)).unwrap();
+        assert_eq!(item.disposition, AuditDisposition::Live);
+        assert_eq!(item.work_state, "delivered");
+        assert!(!item.removable);
+        assert!(item.pull_requests.is_empty());
+
+        std::fs::write(
+            Path::new(&session.worktree_path).join("unfinished.txt"),
+            "unfinished",
+        )
+        .unwrap();
+        let audit = broker.cleanup_audit().unwrap();
+        let item = audit.items.iter().find(|item| matches!(item.owner, AuditOwner::Session { session_id, .. } if session_id == session.id)).unwrap();
+        assert_eq!(item.disposition, AuditDisposition::Live);
+        assert_eq!(item.work_state, "uncommitted");
+        assert!(!item.removable);
+        assert!(audit.summary.by_work_state["uncommitted"] >= 1);
     }
 
     #[test]
