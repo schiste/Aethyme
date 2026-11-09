@@ -731,6 +731,69 @@ fn enhance_verify_fails_on_direct_agents_edit() {
 }
 
 #[test]
+fn failed_verify_names_checkout_and_locally_recorded_upstream_drift() {
+    let tmp = tmp_dir();
+    let repo = demo_repo(tmp.path());
+    deploy(&repo, false);
+    let git = |args: &[&str]| {
+        let result = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            result.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    git(&["init", "-b", "main"]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "base",
+    ]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "upstream",
+    ]);
+    git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(&[
+        "config",
+        "remote.origin.fetch",
+        "+refs/heads/*:refs/remotes/origin/*",
+    ]);
+    git(&["config", "branch.main.remote", "origin"]);
+    git(&["config", "branch.main.merge", "refs/heads/main"]);
+    git(&["reset", "--soft", "HEAD~1"]);
+    let agents = repo.join("AGENTS.md");
+    write(&agents, &(read(&agents) + "\nmanual edit\n"));
+
+    let result = invoke_aethyme([
+        "deploy",
+        "verify",
+        "--generated-only",
+        "--repo",
+        &repo.display().to_string(),
+    ]);
+    result.expect_code(1);
+    result.assert_contains("Checkout inspected:");
+    result.assert_contains("1 commits behind locally recorded upstream (no fetch)");
+    result.assert_contains("preserve uncommitted work");
+}
+
+#[test]
 fn enhance_verify_does_not_call_legacy_generated_drift_a_direct_edit() {
     let tmp = tmp_dir();
     let repo = demo_repo(tmp.path());
