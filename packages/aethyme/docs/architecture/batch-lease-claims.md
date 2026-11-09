@@ -1,5 +1,7 @@
 # Batch lease claims
 
+Last Updated: 2026-11-09
+
 `aethyme broker advanced leases claim <path> [<path>...] --session <id>
 [--ttl <seconds>] [--json]` accepts multiple paths in one invocation. Single-path
 claims retain their existing output contract.
