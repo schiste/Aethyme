@@ -127,6 +127,7 @@ struct CompactAdviceCategory {
     summary: String,
     summary_variants_omitted: bool,
     commands: Vec<String>,
+    commands_omitted_count: usize,
     details_omitted: bool,
 }
 
@@ -219,6 +220,11 @@ struct AdviceGroup {
     commands: BTreeSet<String>,
 }
 
+fn bounded_commands(commands: BTreeSet<String>) -> (Vec<String>, usize) {
+    let omitted = commands.len().saturating_sub(DETAIL_LIMIT);
+    (commands.into_iter().take(DETAIL_LIMIT).collect(), omitted)
+}
+
 impl CompactStatus {
     pub(crate) fn from_brief(
         brief: crate::StatusBrief,
@@ -305,6 +311,7 @@ impl CompactStatus {
                 } else {
                     format!("{} observations in this category", group.count)
                 };
+                let (commands, commands_omitted_count) = bounded_commands(group.commands);
                 CompactAdviceCategory {
                     id,
                     severity,
@@ -312,7 +319,8 @@ impl CompactStatus {
                     duplicate_count: group.count.saturating_sub(1),
                     summary,
                     summary_variants_omitted,
-                    commands: group.commands.into_iter().collect(),
+                    commands,
+                    commands_omitted_count,
                     details_omitted: true,
                 }
             })
@@ -498,6 +506,12 @@ impl CompactStatus {
             for command in &category.commands {
                 line!("  run: {command}");
             }
+            if category.commands_omitted_count > 0 {
+                line!(
+                    "  {} additional commands omitted; inspect full status.",
+                    category.commands_omitted_count
+                );
+            }
         }
         line!(
             "Waiters: {} ({} additional rows omitted).",
@@ -518,7 +532,22 @@ impl CompactStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::CompactOperation;
+    use super::{bounded_commands, CompactOperation, DETAIL_LIMIT};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn compact_commands_are_bounded_and_report_omissions() {
+        let commands: BTreeSet<_> = (0..DETAIL_LIMIT + 3)
+            .map(|index| format!("command-{index:02}"))
+            .collect();
+        let (shown, omitted) = bounded_commands(commands);
+        assert_eq!(shown.len(), DETAIL_LIMIT);
+        assert_eq!(omitted, 3);
+        assert_eq!(shown[0], "command-00");
+        let (shown, omitted) = bounded_commands(BTreeSet::from(["only".into()]));
+        assert_eq!(shown, vec!["only"]);
+        assert_eq!(omitted, 0);
+    }
 
     #[test]
     fn compact_operation_roles_do_not_invent_waits() {
