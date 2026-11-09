@@ -368,10 +368,11 @@ Other agents may be working in sibling worktrees.
 For routine coordination, use `aethyme broker status --compact --json`.
 It groups advice and reports deferred checks as unknown. Use full
 `aethyme broker status --json` when exact session or lease-path evidence is
-needed. Check overlapping work before duplicating it. An accepted claim with
-informational overlap warnings is not a lock: work in your own session and
-reconcile overlapping changes before merging. Actual blockers and refused
-claims still require resolution.
+needed. Check overlapping work before duplicating it. Lease behavior depends on
+`[promote] mode` in `.aethyme/config.toml`: in `verify-only`, overlaps are
+advisory; in other modes an active session's explicit lease can refuse a claim.
+An accepted claim with warnings permits work in your own session; reconcile
+overlapping changes before merging. Resolve actual blockers and refused claims.
 
 1. `aethyme broker start --task "<task>"`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
@@ -403,10 +404,11 @@ Other agents may be working in sibling worktrees.
 For routine coordination, use `aethyme broker status --compact --json`.
 It groups advice and reports deferred checks as unknown. Use full
 `aethyme broker status --json` when exact session or lease-path evidence is
-needed. Check overlapping work before duplicating it. An accepted claim with
-informational overlap warnings is not a lock: work in your own session and
-reconcile overlapping changes before merging. Actual blockers and refused
-claims still require resolution.
+needed. Check overlapping work before duplicating it. Lease behavior depends on
+`[promote] mode` in `.aethyme/config.toml`: in `verify-only`, overlaps are
+advisory; in other modes an active session's explicit lease can refuse a claim.
+An accepted claim with warnings permits work in your own session; reconcile
+overlapping changes before merging. Resolve actual blockers and refused claims.
 
 1. `aethyme broker start --task "<task>" [--short-name "<label>"]`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
@@ -1377,8 +1379,9 @@ mod tests {
             for required in [
                 "For routine coordination, use `aethyme broker status --compact --json`.",
                 "`aethyme broker status --json` when exact session or lease-path evidence is",
-                "informational overlap warnings is not a lock",
-                "claims still require resolution.",
+                "in `verify-only`, overlaps are",
+                "advisory; in other modes an active session's explicit lease can refuse a claim.",
+                "Resolve actual blockers and refused claims.",
             ] {
                 assert!(
                     doc.contains(required),
