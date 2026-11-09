@@ -1733,7 +1733,8 @@ fn cleanup_resolve_plan_and_apply_skip_sweeping_unrelated_closed_checkouts() {
     );
     assert!(
         plan_output.status.success(),
-        "cleanup plan: {}",
+        "cleanup plan stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&plan_output.stdout),
         String::from_utf8_lossy(&plan_output.stderr)
     );
     let plan: serde_json::Value = serde_json::from_slice(&plan_output.stdout).unwrap();

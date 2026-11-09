@@ -506,6 +506,11 @@ fn cleanup_plan_and_apply_reclaim_only_safe_closed_broker_worktrees() {
         .unwrap();
     assert!(finished.cleanup_safe);
     std::fs::create_dir_all(safe_path.join("target/debug")).unwrap();
+    std::fs::write(
+        safe_path.join("target/CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
     std::fs::write(safe_path.join("target/debug/cache.bin"), vec![7_u8; 4096]).unwrap();
 
     let dirty = broker.start_worktree("dirty cleanup", None).unwrap();

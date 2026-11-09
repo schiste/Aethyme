@@ -8673,7 +8673,10 @@ mod bounded_cleanup_status_tests {
         std::fs::remove_file(root.path().join("tracked.txt")).unwrap();
 
         let repo = GitRepo::discover(root.path()).unwrap();
-        let policy = crate::AutoCleanupPolicy::default();
+        let policy = crate::AutoCleanupPolicy {
+            regenerable: vec!["opaque-cache".into()],
+            ..Default::default()
+        };
         let deadline = Instant::now() + Duration::from_secs(15);
         assert!(
             repo.has_only_unstaged_tracked_deletions_until_with_limits(&policy, deadline, 4096, 8)

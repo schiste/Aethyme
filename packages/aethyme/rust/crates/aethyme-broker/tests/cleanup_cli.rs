@@ -74,6 +74,11 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
             .closed
     );
     std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
+    std::fs::write(
+        worktree.join("target/CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
     std::fs::write(worktree.join("target/debug/cache.bin"), vec![3_u8; 2048]).unwrap();
     drop(broker);
 
