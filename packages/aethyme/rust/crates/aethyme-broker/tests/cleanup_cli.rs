@@ -162,7 +162,8 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
     );
     assert!(
         apply.status.success(),
-        "{}",
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&apply.stdout),
         String::from_utf8_lossy(&apply.stderr)
     );
     let apply: serde_json::Value = serde_json::from_slice(&apply.stdout).unwrap();

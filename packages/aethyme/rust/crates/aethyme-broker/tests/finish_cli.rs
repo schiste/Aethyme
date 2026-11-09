@@ -876,11 +876,7 @@ fn finish_cleanup_preserves_unproven_ignored_runtime_directory() {
     std::fs::write(&broker_log, "broker log\n").unwrap();
     let target = worktree.join("target");
     std::fs::create_dir_all(&target).unwrap();
-    std::fs::write(
-        target.join("CACHEDIR.TAG"),
-        "Signature: 8a477f597d28d172789f06886806bc55\n",
-    )
-    .unwrap();
+    std::fs::write(target.join("unknown-data"), "preserve me\n").unwrap();
 
     interrupt_finish_cleanup(&tmp, session_id, &worktree);
     std::fs::remove_file(worktree.join("README.md")).unwrap();
