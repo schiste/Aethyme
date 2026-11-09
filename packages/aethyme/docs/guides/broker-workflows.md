@@ -1451,9 +1451,10 @@ The new session ID may differ from the old one. Always use the ID printed by
 Default text and `aethyme broker status --compact --json` use the recorded
 observation path without scanning each checkout. The compact JSON is versioned
 as `aethyme.broker-status-compact/v1`; it groups advice by id and severity,
-counts repeated observations, retains every category and its commands, and
-marks per-observation evidence and identities as omitted. `deferred_checks`
-are unknown, not clean, and `leases_refreshed: false` means the lease counts
+counts repeated observations and retains every category. Each category shows
+up to 10 distinct commands; `commands_omitted_count` is always present (zero
+when none are omitted). Use full status to inspect omitted commands and
+per-observation evidence and identities. `deferred_checks` are unknown, not clean, and `leases_refreshed: false` means the lease counts
 come from the last recorded refresh. Null summary fields are listed in
 `summary.unknown_fields`.
 
