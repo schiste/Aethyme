@@ -4,6 +4,24 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.66] - 2026-11-09
+
+### Added
+
+- Record phase timings for guarded exec and broker submissions to identify latency (#1561).
+- Retire safely delivered, inactive sessions after a configurable interval and focus compact status on a session (#1559, #1558).
+- Report checkout work states and preserve ignored data during cleanup (#1544).
+
+### Fixed
+
+- Clarify advisory leases, deferred gate recovery, graph authority, and deployment verification failures (#1550, #1553, #1555, #1556, #1557).
+- Preserve the full main-branch test suite while optimizing submission checks (#1542).
+
+### Changed
+
+- Reduce preparation hashing, bound status advice, and batch lease operations (#1546, #1547, #1554).
+- Improve cleanup guidance for PR links and persisted permissions (#1543, #1545).
+
 ## [0.8.65] - 2026-11-08
 
 ### Fixed
