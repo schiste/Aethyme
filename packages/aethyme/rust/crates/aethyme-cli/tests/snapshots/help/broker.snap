@@ -19,5 +19,5 @@ Everything else (leases, git, gh, ship, review, operations, exec, ...):
   aethyme broker advanced --help
 
 Run `aethyme broker <verb> --help` for a verb's forms and flags.
-Overlaps warn — they never block (v0 policy).
+In verify-only mode overlaps warn; other modes can refuse claims against active explicit leases.
 --- stderr

@@ -438,7 +438,7 @@ pub(super) fn public_help() -> String {
         "\nEverything else (leases, git, gh, ship, review, operations, exec, ...):\n\
          \x20 aethyme broker advanced --help\n\n\
          Run `aethyme broker <verb> --help` for a verb's forms and flags.\n\
-         Overlaps warn — they never block (v0 policy).\n",
+         In verify-only mode overlaps warn; other modes can refuse claims against active explicit leases.\n",
     );
     text
 }
