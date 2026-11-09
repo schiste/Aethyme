@@ -368,11 +368,10 @@ Other agents may be working in sibling worktrees.
 For routine coordination, use `aethyme broker status --compact --json`.
 It groups advice and reports deferred checks as unknown. Use full
 `aethyme broker status --json` when exact session or lease-path evidence is
-needed. Check overlapping work before duplicating it. Lease behavior depends on
-`[promote] mode` in `.aethyme/config.toml`: in `verify-only`, overlaps are
-advisory; in other modes an active session's explicit lease can refuse a claim.
-An accepted claim with warnings permits work in your own session; reconcile
-overlapping changes before merging. Resolve actual blockers and refused claims.
+needed. Check overlapping work before duplicating it. In `.aethyme/config.toml`,
+`[promote] mode = "verify-only"` makes overlaps advisory; other modes can refuse
+claims against an active session's explicit lease. Accepted warnings permit work
+in your session; reconcile before merging. Resolve blockers and refusals.
 
 1. `aethyme broker start --task "<task>"`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
@@ -404,11 +403,10 @@ Other agents may be working in sibling worktrees.
 For routine coordination, use `aethyme broker status --compact --json`.
 It groups advice and reports deferred checks as unknown. Use full
 `aethyme broker status --json` when exact session or lease-path evidence is
-needed. Check overlapping work before duplicating it. Lease behavior depends on
-`[promote] mode` in `.aethyme/config.toml`: in `verify-only`, overlaps are
-advisory; in other modes an active session's explicit lease can refuse a claim.
-An accepted claim with warnings permits work in your own session; reconcile
-overlapping changes before merging. Resolve actual blockers and refused claims.
+needed. Check overlapping work before duplicating it. In `.aethyme/config.toml`,
+`[promote] mode = "verify-only"` makes overlaps advisory; other modes can refuse
+claims against an active session's explicit lease. Accepted warnings permit work
+in your session; reconcile before merging. Resolve blockers and refusals.
 
 1. `aethyme broker start --task "<task>" [--short-name "<label>"]`, then work only in the worktree it
    reports and follow the working agreement it prints. Never edit another
@@ -1379,9 +1377,9 @@ mod tests {
             for required in [
                 "For routine coordination, use `aethyme broker status --compact --json`.",
                 "`aethyme broker status --json` when exact session or lease-path evidence is",
-                "in `verify-only`, overlaps are",
-                "advisory; in other modes an active session's explicit lease can refuse a claim.",
-                "Resolve actual blockers and refused claims.",
+                "`[promote] mode = \"verify-only\"` makes overlaps advisory",
+                "claims against an active session's explicit lease.",
+                "Resolve blockers and refusals.",
             ] {
                 assert!(
                     doc.contains(required),
