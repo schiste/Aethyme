@@ -1,5 +1,7 @@
 use super::*;
 
+type AuditedPullRequestLink = (i64, String, i64, Option<String>, Option<i64>, Option<i64>);
+
 impl BrokerStore {
     /// Mark conclusive failing gate results cleared without removing their
     /// historical rows. Cleared rows stop satisfying the active cache.
@@ -480,8 +482,7 @@ impl BrokerStore {
     /// Recorded links only; an empty result does not prove no PR exists.
     pub(crate) fn audit_pull_request_links(
         &self,
-    ) -> Result<Vec<(i64, String, i64, Option<String>, Option<i64>, Option<i64>)>, BrokerError>
-    {
+    ) -> Result<Vec<AuditedPullRequestLink>, BrokerError> {
         let mut stmt = self.conn.prepare(
             "SELECT l.session_id, l.repository, l.pr_number, o.state, o.observed_at, m.merged_at
              FROM pull_request_session_links l
