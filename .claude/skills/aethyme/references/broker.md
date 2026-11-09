@@ -458,6 +458,12 @@ blocked.
    session's unmerged branch.
    Without the policy, pushing stays a separately authorized action (step 9).
 
+   For session-to-PR cleanup inventories, a session branch that is not a PR
+   head does not prove the session has no PR: check broker PR links and task
+   references too. Confirm PR state and independently prove local delivery,
+   cleanliness, and current ownership before retiring a session or removing
+   its checkout.
+
    A repository cleanup report must account for the primary checkout as well
    as session worktrees. Resolve the shared Git directory and report objects,
    conflict-resolution cache, worktree administration and recovery history
