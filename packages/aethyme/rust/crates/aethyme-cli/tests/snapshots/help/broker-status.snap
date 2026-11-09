@@ -1,11 +1,13 @@
 exit: 0
 --- stdout
-  aethyme broker status [--json] [--compact] [--summary] [--refresh]
+  aethyme broker status [--json] [--compact] [--session <id>] [--summary] [--refresh]
       Default text is compact. --compact --json returns a versioned summary
       that groups advice and marks omitted details and deferred checks; those
       checks are unknown, not clean. Full --json retains per-session detail;
       session records use `agents[].id` for every --session flag. The legacy
       --summary --json shape is unchanged; --summary text remains brief.
+      --session focuses compact status on one session while preserving global
+      warnings, blockers and counts. Pair it with --compact for JSON.
       --refresh explicitly performs the expensive full lease, conflict and
       cleanup audit; use it when needed.
   aethyme broker status readiness [--require <conflict-only|agent-ready|parallel-ready>] [--json]

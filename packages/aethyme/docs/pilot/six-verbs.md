@@ -125,3 +125,5 @@ aethyme broker gc apply --confirm <sha256 printed by plan>
 
 When you are ready to share the result, push `aethyme/integration` (or merge
 it into your default branch) the way you normally would.
+
+For a session-focused compact view, run `aethyme broker status --compact --session <id> --json` (or omit `--compact --json` for text). The summary, warnings, blockers, waiters and coordinated operations remain repository-wide; unrelated session-specific notices and informational advice are omitted. The response identifies the focus and how many observations were omitted. Use full status for all details.

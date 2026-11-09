@@ -70,6 +70,13 @@ pub(super) fn run_readiness(parsed: Parsed) -> Result<(), UsageError> {
 
 /// `broker status`.
 pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
+    if parsed.session.is_some()
+        && (parsed.summary || parsed.refresh || (parsed.json && !parsed.compact))
+    {
+        return Err(UsageError::Message(
+            "--session is supported by compact status only; use --compact with --json".into(),
+        ));
+    }
     if parsed.refresh && parsed.summary {
         return Err(UsageError::Message(
             "--refresh and --summary cannot be combined".into(),
@@ -112,7 +119,26 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             broker.status_brief(now_ms())?
         };
         let context_started = std::time::Instant::now();
-        let context = broker.routine_status_context(now_ms())?;
+        let mut context = broker.routine_status_context(now_ms())?;
+        let mut omitted_unrelated_advice = 0;
+        if let Some(session_id) = parsed.session {
+            broker.store_ref().session(session_id).map_err(|error| {
+                UsageError::Message(format!(
+                    "cannot focus status on session {session_id}: {error}"
+                ))
+            })?;
+            let before = brief.advice.len();
+            brief.advice.retain(|item| {
+                item.session_id.is_none()
+                    || item.session_id == Some(session_id)
+                    || matches!(
+                        item.severity,
+                        crate::StatusAdviceSeverity::Blocked | crate::StatusAdviceSeverity::Warning
+                    )
+            });
+            omitted_unrelated_advice = before - brief.advice.len();
+            context.session_contexts.retain(|(id, _)| *id == session_id);
+        }
         brief.phase_timings_ms.insert(
             "context_records".into(),
             context_started.elapsed().as_millis() as u64,
@@ -123,8 +149,23 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             .insert("command_total".into(), opened.elapsed().as_millis() as u64);
         let compact = super::status_compact::CompactStatus::from_brief(brief, context);
         if parsed.json {
-            out!("{}", serde_json::to_string_pretty(&compact)?);
+            if let Some(session_id) = parsed.session {
+                let mut value = serde_json::to_value(&compact)?;
+                value["focus"] = serde_json::json!({
+                    "session_id": session_id,
+                    "unrelated_notice_and_info_omitted": omitted_unrelated_advice,
+                    "summary_and_blockers_are_global": true,
+                });
+                out!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                out!("{}", serde_json::to_string_pretty(&compact)?);
+            }
         } else {
+            if let Some(session_id) = parsed.session {
+                out!(
+                    "Focused on session {session_id}; summary and blockers remain global. {omitted_unrelated_advice} unrelated notices or informational observations omitted."
+                );
+            }
             out!("{}", compact.render_text().trim_end());
         }
         return Ok(());
