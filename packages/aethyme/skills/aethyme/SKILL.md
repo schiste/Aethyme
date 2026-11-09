@@ -25,10 +25,10 @@ graph, task, facts, intents, analyze, enhance, and Explore.
 
 ## Lease Overlaps
 
-Read claim results as structured evidence: an accepted claim with informational
-overlap warnings is not a lock. Inspect overlapping work, continue in your own
-session when appropriate, and reconcile overlapping changes before merging.
-Resolve actual blockers and refused claims; never edit another session's tree.
+Check `[promote] mode` in `.aethyme/config.toml`: `verify-only` makes overlaps
+advisory; other modes can refuse claims against active explicit leases. An
+accepted claim with warnings permits work in your own session. Inspect overlaps,
+reconcile before merging, and resolve refusals; never edit another session's tree.
 
 ## Default Contract
 
