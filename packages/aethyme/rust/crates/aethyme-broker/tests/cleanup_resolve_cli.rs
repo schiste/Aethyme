@@ -571,7 +571,7 @@ fn strict_cleanup_policy_refuses_ignored_directory_during_archive_resolution() {
 
 #[cfg(unix)]
 #[test]
-fn default_opaque_ignored_directory_is_removed_without_following_nested_symlinks() {
+fn unknown_ignored_directory_is_preserved_by_archive_resolution() {
     let tmp = repo();
     let (id, worktree) = dirty_closed_session(tmp.path());
     let opaque = worktree.join("opaque-cache");
@@ -582,24 +582,10 @@ fn default_opaque_ignored_directory_is_removed_without_following_nested_symlinks
     std::fs::write(&target, "untouched\n").unwrap();
     std::os::unix::fs::symlink(&target, opaque.join("external-link")).unwrap();
 
-    let reviewed = plan(tmp.path(), &id);
-    assert_eq!(reviewed["disposition"], "dirty");
-    let untracked: Vec<&str> = reviewed["untracked_files"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|file| file["path"].as_str().unwrap())
-        .collect();
-    assert_eq!(untracked, ["data.bin", "link", "notes/todo.txt"]);
+    let error = refused_plan(tmp.path(), &id);
+    assert!(error.contains("opaque-cache"), "{error}");
     assert!(opaque.join("nested.bin").is_file());
-
-    let outcome = json(&apply(
-        tmp.path(),
-        &id,
-        reviewed["digest"].as_str().unwrap(),
-    ));
-    assert_eq!(outcome["worktree_removed"], true, "{outcome}");
-    assert!(!worktree.exists());
+    assert!(worktree.exists());
     assert_eq!(std::fs::read(target).unwrap(), b"untouched\n");
 }
 

@@ -13,8 +13,8 @@
 //!    grace does not hold, one of unknown liveness does), and no gate runs.
 //! 3. **Clean.** No tracked, staged or untracked change, no stash made on the
 //!    branch, no rebase, merge, cherry-pick, revert or bisect in progress, and
-//!    no protected standalone ignored file. All Git-ignored directories are
-//!    disposable by default; strict mode instead requires no ignored residue.
+//!    no protected ignored content. Only recognized or configured build-output
+//!    directories are disposable; strict mode requires no ignored residue.
 //! 4. **Contained.** Every commit is in the *fetched remote* default branch,
 //!    by ancestry or by the verbatim content/patch proof. A commit that only
 //!    reached local integration or a local branch is not contained.
@@ -33,8 +33,7 @@ use crate::types::{Session, SessionCleanupState, SessionOrigin};
 use crate::{Broker, BrokerOpError, GitRepo};
 
 /// Fallback classification for ignored files and artifact-root symlinks.
-/// Ignored directories are disposable independently of this catalog unless
-/// strict mode is enabled. Each fallback is recognised by its exact name and the
+/// Each directory is recognised by its exact name and the
 /// evidence that proves what it is (#588). A name alone proves nothing:
 /// `build/` and `dist/` routinely hold source, assets or data that a
 /// repository happens to ignore, so they count only beside the manifest that
@@ -249,8 +248,8 @@ fn auto_cleanup_lap_range<T>(
 pub struct AutoCleanupPolicy {
     /// On by default. `false` turns automatic checkout removal off.
     pub auto_remove: bool,
-    /// Require a checkout with no ignored leftovers. Otherwise all Git-ignored
-    /// directories are disposable without inspecting their contents.
+    /// Require a checkout with no ignored leftovers. Otherwise only recognized
+    /// or configured build-output directories are disposable.
     pub strict: bool,
     /// Allow the background artifact sweep to reclaim arbitrary Git-ignored
     /// directory roots in retained closed checkouts. Defaults off so existing
@@ -475,9 +474,9 @@ pub(crate) enum RecoveryIgnoredClassification {
     StrictRefusal,
 }
 
-/// Classify an entry from Git's ignored listing. Directories are disposable
-/// opaque output by default, including local data and session records inside
-/// them. Standalone files need the existing metadata/artifact classification.
+/// Classify an entry from Git's ignored listing. Only recognized or explicitly
+/// configured output directories are disposable. Unknown directories can hold
+/// local data and must be preserved even when Git ignores them.
 /// Strict mode keeps every ignored leftover for explicit operator cleanup.
 pub(crate) fn classify_ignored_for_recovery(
     worktree: &Path,
@@ -503,11 +502,14 @@ pub(crate) fn classify_ignored_for_recovery(
     }
     let metadata = std::fs::symlink_metadata(worktree.join(trimmed))
         .map_err(|error| format!("cannot stat ignored path {relative}: {error}"))?;
-    // Git produced this ignored path. An ignored directory is disposable by
-    // default regardless of its name, size or nested contents. Do not follow
-    // symlinks to discover whether they happen to target a directory.
+    // Git ignore rules do not prove a directory is regenerable. Do not walk
+    // arbitrary ignored trees or follow symlinks: preserve unknown roots.
     if metadata.is_dir() {
-        return Ok(RecoveryIgnoredClassification::DisposableDirectory);
+        return Ok(if regenerable_dir(worktree, trimmed, policy).is_some() {
+            RecoveryIgnoredClassification::DisposableDirectory
+        } else {
+            RecoveryIgnoredClassification::Preserve("is not a recognised build-output directory")
+        });
     }
     let Some((_enclosing, cargo_target)) = enclosing_regenerable(worktree, trimmed, policy) else {
         return Ok(RecoveryIgnoredClassification::Preserve(
@@ -3810,11 +3812,12 @@ mod tests {
         touch(root, ".aethyme/run/worker.json");
 
         let policy = AutoCleanupPolicy::default();
-        assert_eq!(ignored_content_reason(root, &policy), Ok(None));
-
-        touch(root, "private.sqlite");
         let reason = ignored_content_reason(root, &policy).unwrap().unwrap();
-        assert!(reason.contains("private.sqlite"), "{reason}");
+        assert!(
+            reason.contains("opaque") || reason.contains(".aethyme"),
+            "{reason}"
+        );
+        assert!(root.join("opaque/nested/user-data.json").exists());
     }
 
     #[cfg(unix)]
@@ -6578,7 +6581,7 @@ mod tests {
     }
 
     #[test]
-    fn ignored_directories_are_opaque_disposable_output_by_default() {
+    fn ignored_directories_require_output_evidence_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let policy = AutoCleanupPolicy::default();
@@ -6594,16 +6597,17 @@ mod tests {
         ] {
             touch(root, path);
         }
+        for path in ["node_modules/", ".pnpm-store/"] {
+            assert_eq!(classify(root, path, &policy), Ok(()), "{path}");
+        }
         for path in [
-            "node_modules/",
-            ".pnpm-store/",
             "unknown-data/",
             ".chau7/",
             ".aethyme/",
             "assets/build/",
             "target-notes/",
         ] {
-            assert_eq!(classify(root, path, &policy), Ok(()), "{path}");
+            assert!(classify(root, path, &policy).is_err(), "{path}");
         }
         // No recursive scan: an unresolvable package-fixture link is ignored.
         #[cfg(unix)]

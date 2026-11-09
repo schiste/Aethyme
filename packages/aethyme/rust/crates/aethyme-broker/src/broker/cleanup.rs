@@ -4350,8 +4350,38 @@ impl Broker {
             });
         }
 
+        // Older finish intents could authorize arbitrary ignored directories.
+        // Recheck every surviving prefix against the current policy before an
+        // orphan retry; a durable old intent does not override new safeguards.
+        let mut current_proof = expected_proof.clone();
+        current_proof.disposable_ignored_root_prefixes.clear();
+        for prefix in &expected_proof.disposable_ignored_root_prefixes {
+            let path = worktree_path.join(prefix.trim_end_matches('/'));
+            match std::fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Ok(metadata) if metadata.is_dir() => {}
+                _ => {
+                    return Err(BrokerOpError::DirtyWorktree {
+                        id: session.id,
+                        reason: format!(
+                            "ignored cleanup prefix {prefix} cannot be safely verified"
+                        ),
+                    });
+                }
+            }
+            crate::auto_cleanup::classify_ignored(&worktree_path, prefix, &policy).map_err(
+                |reason| BrokerOpError::DirtyWorktree {
+                    id: session.id,
+                    reason,
+                },
+            )?;
+            current_proof
+                .disposable_ignored_root_prefixes
+                .push(prefix.clone());
+        }
+
         if let Err(reason) =
-            remove_authorized_orphan_tree(&self.repo, &worktree_path, expected_proof)
+            remove_authorized_orphan_tree(&self.repo, &worktree_path, &current_proof)
         {
             return Err(BrokerOpError::DirtyWorktree {
                 id: session.id,
@@ -6570,9 +6600,10 @@ mod registered_removal_failure_tests {
         let (session, worktree) =
             start_represented_cleanup_session(&mut broker, "orphan recovery strict flip");
 
-        let residue = worktree.join("local-dataset/saved-session.json");
+        let residue = worktree.join("target/saved-session.json");
         std::fs::create_dir_all(residue.parent().unwrap()).unwrap();
         std::fs::write(&residue, b"saved session data").unwrap();
+        std::fs::write(worktree.join("target/CACHEDIR.TAG"), b"cache").unwrap();
         let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
         std::fs::remove_file(worktree.join("README.md")).unwrap();
         remove_worktree_admin_directory(&worktree);
@@ -6780,6 +6811,40 @@ mod registered_removal_failure_tests {
         assert!(broker.repo.resolve_ref(&proof.branch_ref).is_some());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn old_orphan_intent_cannot_discard_an_unknown_ignored_directory() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "old ignored prefix");
+        let residue = worktree.join("local-dataset/saved-session.json");
+        std::fs::create_dir_all(residue.parent().unwrap()).unwrap();
+        std::fs::write(&residue, b"saved session data").unwrap();
+        let mut proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        // Model a schema-3 intent captured by the old permissive classifier.
+        proof
+            .disposable_ignored_root_prefixes
+            .push("local-dataset/".into());
+        let payload = crate::events::session_finish_cleanup_started_payload_with_proof(
+            true,
+            true,
+            Some(&proof),
+        );
+        broker
+            .store()
+            .begin_finish_cleanup(session.id, &payload)
+            .unwrap();
+        std::fs::remove_file(worktree.join("README.md")).unwrap();
+        remove_worktree_admin_directory(&worktree);
+        let error = broker.cleanup(session.id, false).unwrap_err();
+        assert!(error.to_string().contains("local-dataset"), "{error}");
+        assert_eq!(std::fs::read(&residue).unwrap(), b"saved session data");
+        assert!(broker.repo.resolve_ref(&proof.branch_ref).is_some());
+    }
+
     #[test]
     fn legacy_v2_orphan_proof_without_root_generation_cannot_authorize_residue() {
         let owner = tempfile::tempdir().unwrap();
@@ -6792,7 +6857,7 @@ mod registered_removal_failure_tests {
         std::fs::create_dir_all(residue.parent().unwrap()).unwrap();
         std::fs::write(&residue, b"saved session data").unwrap();
         let proof = persist_finish_cleanup_intent_with_schema(&mut broker, &session, &worktree, 2);
-        assert!(!proof.disposable_ignored_root_prefixes.is_empty());
+        assert!(proof.disposable_ignored_root_prefixes.is_empty());
         assert!(proof.root_generation_sha256.is_none());
         std::fs::remove_file(worktree.join("README.md")).unwrap();
         remove_worktree_admin_directory(&worktree);
@@ -7002,7 +7067,10 @@ mod registered_removal_failure_tests {
         std::fs::write(nested.join("one"), b"1").unwrap();
         std::fs::write(nested.join("two"), b"2").unwrap();
         std::fs::write(nested.join("three"), b"3").unwrap();
-        let proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        let mut proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        proof
+            .disposable_ignored_root_prefixes
+            .push("local-dataset/".into());
         let root = PinnedOrphanRoot::open(&worktree, &proof).unwrap().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         let mut budget = OrphanResidueBudget::with_limits(deadline, 2, 1024, 1024);
@@ -7138,7 +7206,7 @@ mod registered_removal_failure_tests {
     }
 
     #[test]
-    fn registered_finish_recovery_discards_opaque_unknown_ignored_directory_by_default() {
+    fn registered_finish_recovery_preserves_unknown_ignored_directory() {
         let owner = tempfile::tempdir().unwrap();
         let repository = repository_with_ignored_cleanup_fixture(owner.path());
         let storage = crate::test_storage::TestStorage::new();
@@ -7154,14 +7222,13 @@ mod registered_removal_failure_tests {
         let closed = broker.store().session(session.id).unwrap();
         assert_eq!(
             broker.interrupted_finish_cleanup_proof(&closed),
-            Some(proof.clone()),
-            "unknown ignored directory contents are opaque in disposable mode"
+            None,
+            "unknown ignored directories cannot authorize recovery removal"
         );
 
-        broker.cleanup(session.id, false).unwrap();
-
-        assert!(!worktree.exists());
-        assert!(broker.repo.resolve_ref(&proof.branch_ref).is_none());
+        assert!(broker.cleanup(session.id, false).is_err());
+        assert!(residue.is_file());
+        assert!(broker.repo.resolve_ref(&proof.branch_ref).is_some());
     }
 
     #[cfg(not(unix))]

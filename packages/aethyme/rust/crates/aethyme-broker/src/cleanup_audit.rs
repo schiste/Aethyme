@@ -198,6 +198,16 @@ impl AuditDisposition {
     }
 }
 
+/// Recorded association and last observation; neither is a live GitHub query.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AuditPullRequest {
+    pub repository: String,
+    pub number: i64,
+    pub observed_state: Option<String>,
+    pub observed_at: Option<i64>,
+    pub merged_at: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AuditItem {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -220,6 +230,10 @@ pub struct AuditItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
     pub disposition: AuditDisposition,
+    /// Independent work classification, even when the session is still open.
+    pub work_state: &'static str,
+    /// Recorded links only. An empty list does not establish that no PR exists.
+    pub pull_requests: Vec<AuditPullRequest>,
     /// Whether the reviewed cleanup apply would remove this item.
     pub removable: bool,
     pub evidence: Vec<String>,
@@ -235,6 +249,8 @@ pub struct AuditSummary {
     /// Count per disposition, keyed by its snake_case name. Every disposition
     /// is present, so an absent zero is never mistaken for an unchecked one.
     pub by_disposition: BTreeMap<String, usize>,
+    /// Counts of work states, independent of session lifecycle.
+    pub by_work_state: BTreeMap<String, usize>,
     pub removable_count: usize,
     pub measured_bytes: u64,
     pub removable_bytes: u64,
@@ -547,6 +563,21 @@ impl Broker {
         let mut items = Vec::new();
 
         let store = self.store_ref();
+        let mut pr_links: BTreeMap<i64, Vec<AuditPullRequest>> = BTreeMap::new();
+        for (session_id, repository, number, observed_state, observed_at, merged_at) in
+            store.audit_pull_request_links()?
+        {
+            pr_links
+                .entry(session_id)
+                .or_default()
+                .push(AuditPullRequest {
+                    repository,
+                    number,
+                    observed_state,
+                    observed_at,
+                    merged_at,
+                });
+        }
         let sessions = store
             .live_sessions()?
             .into_iter()
@@ -561,7 +592,7 @@ impl Broker {
                 target: &target,
                 cache: &mut *landing_cache,
             };
-            if let Some(item) = self.audit_session(
+            if let Some(mut item) = self.audit_session(
                 &session,
                 &path,
                 registration(&path),
@@ -569,6 +600,7 @@ impl Broker {
                 plan_items.get(&session.id).copied(),
                 &mut landing_context,
             ) {
+                item.pull_requests = pr_links.remove(&session.id).unwrap_or_default();
                 items.push(item);
             }
         }
@@ -606,6 +638,8 @@ impl Broker {
                 committed: None,
                 bytes: directory.estimated_bytes,
                 disposition: AuditDisposition::UnknownProvenance,
+                work_state: "unknown",
+                pull_requests: Vec::new(),
                 removable: false,
                 evidence: vec![format!(
                     "{} under a broker worktree root; no session row and no Git registration names it",
@@ -620,6 +654,10 @@ impl Broker {
                     directory.path
                 ),
             });
+        }
+
+        for item in &mut items {
+            item.work_state = classify_work_state(item);
         }
 
         items.sort_by(|a, b| {
@@ -809,6 +847,8 @@ impl Broker {
             committed,
             bytes: plan_item.and_then(|item| item.estimated_bytes),
             disposition,
+            work_state: "unknown",
+            pull_requests: Vec::new(),
             removable,
             evidence,
             blocker,
@@ -842,6 +882,8 @@ impl Broker {
                 committed: None,
                 bytes: Some(0),
                 disposition: AuditDisposition::MissingCheckoutMetadata,
+                work_state: "unknown",
+                pull_requests: Vec::new(),
                 removable: false,
                 evidence: vec![format!(
                     "Git registers this worktree but its directory is gone{}",
@@ -902,6 +944,8 @@ impl Broker {
             committed,
             bytes: crate::broker::directory_size_without_following_links(&entry.path).ok(),
             disposition,
+            work_state: "unknown",
+            pull_requests: Vec::new(),
             removable: false,
             evidence,
             blocker: Some(
@@ -1042,6 +1086,24 @@ fn apply_command(plan: &CleanupPlan) -> String {
     )
 }
 
+// A lifecycle label is not evidence that work is clean or delivered. An
+// uninspected checkout is unknown, never an implicit clean checkout.
+fn classify_work_state(item: &AuditItem) -> &'static str {
+    if item.checkout != CheckoutState::Present || item.head.is_none() {
+        return "unknown";
+    }
+    if item.tracked_changes > 0 || item.untracked_files > 0 {
+        return "uncommitted";
+    }
+    match &item.committed {
+        Some(CommittedWork::InTarget { .. }) => "delivered",
+        Some(CommittedWork::IntegrationOnly { .. }) => "integration_only",
+        Some(CommittedWork::RemoteBranchOnly { .. }) => "remote_branch_only",
+        Some(CommittedWork::WorktreeOnly { .. }) => "local_only",
+        Some(CommittedWork::Unknown { .. }) | None => "unknown",
+    }
+}
+
 fn summarise(items: &[AuditItem]) -> AuditSummary {
     let mut summary = AuditSummary {
         item_count: items.len(),
@@ -1061,7 +1123,21 @@ fn summarise(items: &[AuditItem]) -> AuditSummary {
             .by_disposition
             .insert(disposition.as_str().to_string(), 0);
     }
+    for state in [
+        "delivered",
+        "integration_only",
+        "remote_branch_only",
+        "local_only",
+        "uncommitted",
+        "unknown",
+    ] {
+        summary.by_work_state.insert(state.to_string(), 0);
+    }
     for item in items {
+        *summary
+            .by_work_state
+            .entry(item.work_state.to_string())
+            .or_default() += 1;
         *summary
             .by_disposition
             .entry(item.disposition.as_str().to_string())
@@ -1102,6 +1178,42 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn open_session_reports_work_state_independently_of_lifecycle() {
+        let repository = tempfile::tempdir().unwrap();
+        git(repository.path(), &["init", "-q", "-b", "main"]);
+        git(repository.path(), &["config", "user.name", "Fixture"]);
+        git(
+            repository.path(),
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        git(
+            repository.path(),
+            &["commit", "--allow-empty", "-qm", "initial"],
+        );
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(repository.path()).unwrap();
+        let session = broker.start_worktree("open work", None).unwrap();
+        let audit = broker.cleanup_audit().unwrap();
+        let item = audit.items.iter().find(|item| matches!(item.owner, AuditOwner::Session { session_id, .. } if session_id == session.id)).unwrap();
+        assert_eq!(item.disposition, AuditDisposition::Live);
+        assert_eq!(item.work_state, "delivered");
+        assert!(!item.removable);
+        assert!(item.pull_requests.is_empty());
+
+        std::fs::write(
+            Path::new(&session.worktree_path).join("unfinished.txt"),
+            "unfinished",
+        )
+        .unwrap();
+        let audit = broker.cleanup_audit().unwrap();
+        let item = audit.items.iter().find(|item| matches!(item.owner, AuditOwner::Session { session_id, .. } if session_id == session.id)).unwrap();
+        assert_eq!(item.disposition, AuditDisposition::Live);
+        assert_eq!(item.work_state, "uncommitted");
+        assert!(!item.removable);
+        assert!(audit.summary.by_work_state["uncommitted"] >= 1);
     }
 
     #[test]
