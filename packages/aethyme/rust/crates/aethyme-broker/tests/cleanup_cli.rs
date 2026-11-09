@@ -148,7 +148,9 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
     assert!(!unconfirmed.status.success());
     assert!(worktree.exists());
 
-    let apply = run(
+    // The retention configuration changed since the first plan. Its digest
+    // must no longer authorize cleanup, even if the checkout is still eligible.
+    let stale = run(
         tmp.path(),
         &[
             "finish",
@@ -157,6 +159,36 @@ fn bulk_cleanup_is_dry_run_by_default_and_apply_revalidates() {
             "--apply",
             "--confirm",
             &digest,
+            "--json",
+        ],
+    );
+    assert!(!stale.status.success());
+    assert!(worktree.exists());
+    let stale: serde_json::Value = serde_json::from_slice(&stale.stdout).unwrap();
+    assert!(
+        stale["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no longer matches")
+    );
+
+    let refreshed = run(
+        tmp.path(),
+        &["finish", "cleanup", "--all-cleaned", "--json"],
+    );
+    assert!(refreshed.status.success());
+    let refreshed: serde_json::Value = serde_json::from_slice(&refreshed.stdout).unwrap();
+    let digest = refreshed["plan"]["digest"].as_str().unwrap();
+
+    let apply = run(
+        tmp.path(),
+        &[
+            "finish",
+            "cleanup",
+            "--all-cleaned",
+            "--apply",
+            "--confirm",
+            digest,
             "--json",
         ],
     );
