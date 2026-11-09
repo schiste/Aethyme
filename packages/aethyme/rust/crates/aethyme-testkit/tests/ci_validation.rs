@@ -1260,7 +1260,8 @@ fn main_always_tests_the_full_workspace() {
     assert!(tree.contains(&r#"          echo "scope=full" >> "$GITHUB_OUTPUT""#));
     assert!(tree.contains(&r#"          echo "selection=" >> "$GITHUB_OUTPUT""#));
     assert!(
-        !tree.iter()
+        !tree
+            .iter()
             .any(|line| line.contains("scope=changed") || line.contains("scope=none"))
     );
     let verdict = block(&gates, "  cargo-test:");
