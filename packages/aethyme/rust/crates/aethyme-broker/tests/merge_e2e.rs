@@ -5025,6 +5025,9 @@ fn a_first_broker_timeout_defers_the_submission_and_a_repeat_rejects_it() {
     assert_eq!(advice.severity, StatusAdviceSeverity::Blocked);
     assert_eq!(advice.queue_entry_id, Some(first.entry.id));
     assert!(advice.summary.contains("slow"), "{}", advice.summary);
+    assert!(advice.summary.contains("did not complete"));
+    assert!(advice.summary.contains("only authorized validation"));
+    assert!(advice.summary.contains("do not complete this submission"));
     assert!(
         status
             .advice
@@ -5037,6 +5040,19 @@ fn a_first_broker_timeout_defers_the_submission_and_a_repeat_rejects_it() {
         finish.warnings.iter().any(|w| w.contains("was deferred")),
         "finish must not tell the agent to wait for an entry nothing runs: {:?}",
         finish.warnings
+    );
+
+    assert!(
+        finish
+            .warnings
+            .iter()
+            .any(|w| w.contains("authorized validation"))
+    );
+    assert!(
+        finish
+            .warnings
+            .iter()
+            .any(|w| w.contains("do not complete"))
     );
 
     let second = broker.submit(session.id).unwrap();
