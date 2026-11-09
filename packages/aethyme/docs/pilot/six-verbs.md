@@ -39,8 +39,9 @@ aethyme broker status
 aethyme broker status --summary
 ```
 
-Overlaps warn; they never block. Read the `advice` lines: each names the
-session it concerns and the command to run next. `--summary` skips the
+In verify-only mode overlaps warn; other modes can refuse a claim against an
+active session's explicit lease. Read the `advice` lines for the session and
+next command. `--summary` skips the
 per-session detail and is faster on busy repositories.
 
 ## submit
