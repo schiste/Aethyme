@@ -807,12 +807,14 @@ Usage:
       queue attestations and per-SHA unrecorded-commit dispositions. The
       template option atomically writes a no-clobber schema-v2 document with
       exact identifiers and deliberately invalid null operator judgments.
-  aethyme broker status [--json] [--compact] [--summary] [--refresh]
+  aethyme broker status [--json] [--compact] [--session <id>] [--summary] [--refresh]
       Default text is compact. --compact --json returns a versioned summary
       that groups advice and marks omitted details and deferred checks; those
       checks are unknown, not clean. Full --json retains per-session detail;
       session records use `agents[].id` for every --session flag. The legacy
       --summary --json shape is unchanged; --summary text remains brief.
+      --session focuses compact status on one session while preserving global
+      warnings, blockers and counts. Pair it with --compact for JSON.
       --refresh explicitly performs the expensive full lease, conflict and
       cleanup audit; use it when needed.
   aethyme broker events [--since <id>] [--kind <prefix>] [--follow] [--json]
@@ -1135,12 +1137,23 @@ pub fn with_status_read_context<T>(args: &[String], operation: impl FnOnce() -> 
 
 fn routine_status(args: &[String]) -> bool {
     args.first().map(String::as_str) == Some("status")
-        && args[1..].iter().all(|arg| {
-            matches!(
-                arg.as_str(),
-                "--json" | "--json-output" | "--summary" | "--compact"
-            )
-        })
+        && {
+            let mut index = 1;
+            let mut valid = true;
+            while index < args.len() {
+                if args[index] == "--session" {
+                    index += 1;
+                    valid &= args.get(index).is_some_and(|id| id.parse::<i64>().is_ok());
+                } else {
+                    valid &= matches!(
+                        args[index].as_str(),
+                        "--json" | "--json-output" | "--summary" | "--compact"
+                    );
+                }
+                index += 1;
+            }
+            valid
+        }
         && (!args
             .iter()
             .any(|arg| matches!(arg.as_str(), "--json" | "--json-output"))

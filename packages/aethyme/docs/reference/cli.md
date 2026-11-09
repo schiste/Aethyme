@@ -586,7 +586,7 @@ stashing multi-worktree changes.
 - `aethyme broker status readiness plan [--repo <path>] [--local-only] [--resolution-file <path>] [--diff|--json]`
 - `aethyme broker status readiness apply [--repo <path>] [--local-only] [--resolution-file <path>] --confirm <plan-sha256> [--json]`
 - `aethyme broker status readiness recover [--repo <path>] --plan <plan-sha256> [--json]`
-- `aethyme broker status [--json] [--compact] [--summary] [--refresh]`
+- `aethyme broker status [--json] [--compact] [--session <id>] [--summary] [--refresh]`
 - `aethyme broker advanced worktree-root [--json]`
 - `aethyme broker advanced worktree-root binding plan <exact-root> <keyed_container|direct_root> [--json]`
 - `aethyme broker advanced worktree-root binding apply <exact-root> <keyed_container|direct_root> --confirm <sha256> [--json]`

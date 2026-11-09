@@ -337,3 +337,56 @@ fn summary_defers_gate_history_queries_to_full_inspection() {
         "routine status must not query deferred gate history: {summary}"
     );
 }
+
+#[test]
+fn session_focused_status_keeps_global_safety_information_and_checks_identity() {
+    let fixture = common::FixtureRepository::new();
+    init_repo(fixture.path());
+    let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
+    let root = fixture.worktree_root();
+    let first = add_worktree(fixture.path(), &root, "focused-first");
+    let second = add_worktree(fixture.path(), &root, "focused-second");
+    let session = broker.adopt(&first, Some("focused-first")).unwrap();
+    broker.adopt(&second, Some("focused-second")).unwrap();
+    std::fs::write(first.join("src/shared.txt"), "first\n").unwrap();
+    std::fs::write(second.join("src/shared.txt"), "second\n").unwrap();
+    broker.refresh_leases().unwrap();
+    drop(broker);
+
+    let session_id = session.id.to_string();
+    let global = json_status(fixture.path(), &["status", "--compact", "--json"]);
+    let focused = json_status(
+        fixture.path(),
+        &["status", "--compact", "--session", &session_id, "--json"],
+    );
+    assert_eq!(focused["focus"]["session_id"], session.id);
+    assert_eq!(focused["focus"]["summary_and_blockers_are_global"], true);
+    assert_eq!(
+        focused["summary"]["live_sessions"],
+        global["summary"]["live_sessions"]
+    );
+    let warnings = |value: &serde_json::Value| {
+        value["advice"]["categories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["severity"] == "warning" || item["severity"] == "blocked")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert!(!warnings(&global).is_empty());
+    assert_eq!(warnings(&focused), warnings(&global));
+    let text = run_status(fixture.path(), &["status", "--session", &session_id]);
+    assert!(text.status.success());
+    assert!(String::from_utf8_lossy(&text.stdout).contains("summary and blockers remain global"));
+    let unknown = run_status(
+        fixture.path(),
+        &["status", "--compact", "--json", "--session", "999999999"],
+    );
+    assert!(!unknown.status.success());
+    let invalid = run_status(
+        fixture.path(),
+        &["status", "--json", "--session", &session_id],
+    );
+    assert!(!invalid.status.success());
+}
