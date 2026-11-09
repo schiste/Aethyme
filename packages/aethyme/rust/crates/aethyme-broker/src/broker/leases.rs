@@ -638,6 +638,90 @@ impl Broker {
         allow_process_snapshot: bool,
         deadline: Option<std::time::Instant>,
     ) -> Result<AbandonedSessionCloseOutcome, BrokerOpError> {
+        self.try_close_session_inner(
+            session_id,
+            decision_now_ms,
+            abandon_after_ms,
+            process_table,
+            allow_process_snapshot,
+            deadline,
+            false,
+        )
+    }
+
+    pub(crate) fn try_close_landed_session(
+        &mut self,
+        session_id: i64,
+        decision_now_ms: i64,
+        landed_after_ms: i64,
+        process_table: &mut crate::session_holder::RecordedHolderProcessTable,
+        allow_process_snapshot: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<AbandonedSessionCloseOutcome, BrokerOpError> {
+        self.try_close_session_inner(
+            session_id,
+            decision_now_ms,
+            landed_after_ms,
+            process_table,
+            allow_process_snapshot,
+            deadline,
+            true,
+        )
+    }
+
+    fn landed_session_is_safe_to_retire(&self, session: &crate::Session) -> bool {
+        let worktree = std::path::Path::new(&session.worktree_path);
+        let Ok(policy) = crate::auto_cleanup::AutoCleanupPolicy::load(self.main_root()) else {
+            return false;
+        };
+        if !policy.auto_remove || policy.is_pinned(worktree) {
+            return false;
+        }
+        let Ok(checkout) = crate::git::GitRepo::discover(worktree) else {
+            return false;
+        };
+        let Ok(head) = checkout.head_commit() else {
+            return false;
+        };
+        let Ok(Some(record)) = self.store_ref().session_representation(session.id, &head) else {
+            return false;
+        };
+        let Some(commit) = record.representing_commit else {
+            return false;
+        };
+        let Some((upstream_ref, upstream)) = self.repo_handle().upstream_default() else {
+            return false;
+        };
+        if record.representing_ref != upstream_ref
+            && record.representing_ref != format!("refs/remotes/{upstream_ref}")
+        {
+            return false;
+        }
+        if !self.repo_handle().is_ancestor(&commit, &upstream) {
+            return false;
+        }
+        matches!(
+            crate::auto_cleanup::unclean_reason(
+                worktree,
+                Some(session.branch.as_str()),
+                self.main_root(),
+                &policy
+            ),
+            Ok(None)
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_close_session_inner(
+        &mut self,
+        session_id: i64,
+        decision_now_ms: i64,
+        abandon_after_ms: i64,
+        process_table: &mut crate::session_holder::RecordedHolderProcessTable,
+        allow_process_snapshot: bool,
+        deadline: Option<std::time::Instant>,
+        require_landed: bool,
+    ) -> Result<AbandonedSessionCloseOutcome, BrokerOpError> {
         if abandon_after_ms <= 0 {
             return Ok(AbandonedSessionCloseOutcome::NotDue);
         }
@@ -684,6 +768,10 @@ impl Broker {
             process_table,
             allow_process_snapshot,
         );
+        if require_landed && holder.liveness != crate::session_holder::RecordedHolderLiveness::Gone
+        {
+            return Ok(AbandonedSessionCloseOutcome::ActiveProcess);
+        }
         let holder_event = self.store_ref().latest_session_holder_event(session_id)?;
         if holder_event.as_ref().map(|event| event.id) != holder.binding_event_id {
             return Ok(AbandonedSessionCloseOutcome::Changed);
@@ -1019,11 +1107,37 @@ impl Broker {
             }
         }
 
-        let abandoned_payload = crate::events::session_abandoned_payload(
-            idle_ms,
-            abandon_after_ms,
-            current.pid.map(crate::broker::session_pid_alive),
-        );
+        // Recheck delivery and local changes while lifecycle and operation
+        // guards are held. Unknown evidence preserves the session.
+        if require_landed {
+            let Ok(policy) = crate::load_retention_policy(self.main_root()) else {
+                return Ok(AbandonedSessionCloseOutcome::OperationEvidenceUnavailable);
+            };
+            let configured_ms =
+                i64::from(policy.session_landed_after_hours).saturating_mul(3_600_000);
+            if policy.session_abandoned_after_hours == 0
+                || configured_ms <= 0
+                || idle_ms < configured_ms
+                || !self.landed_session_is_safe_to_retire(&current)
+            {
+                return Ok(AbandonedSessionCloseOutcome::Changed);
+            }
+        }
+        let abandoned_payload = if require_landed {
+            serde_json::json!({
+                "idle_ms": idle_ms,
+                "abandon_after_ms": abandon_after_ms,
+                "pid_alive": current.pid.map(crate::broker::session_pid_alive),
+                "retirement_basis": "clean_recorded_landing_and_gone_holder",
+            })
+            .to_string()
+        } else {
+            crate::events::session_abandoned_payload(
+                idle_ms,
+                abandon_after_ms,
+                current.pid.map(crate::broker::session_pid_alive),
+            )
+        };
         let cleanup_request = self.checkout_cleanup_request_policy(&current);
         match self
             .store()
@@ -4043,6 +4157,92 @@ mod generic_guarded_exec_tests {
             )
             .unwrap();
         old_ms
+    }
+
+    #[test]
+    fn landed_retirement_requires_exact_delivery_cleanliness_and_a_gone_holder() {
+        let (repository, _storage, mut broker) = fixture();
+        let session = broker.start_worktree("landed retirement", None).unwrap();
+        let checkout = Path::new(&session.worktree_path);
+        let head = crate::git::GitRepo::discover(checkout)
+            .unwrap()
+            .head_commit()
+            .unwrap();
+        git(
+            repository.path(),
+            &["update-ref", "refs/remotes/origin/main", &head],
+        );
+        git(
+            repository.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        assert!(!broker.landed_session_is_safe_to_retire(&session));
+        broker
+            .store()
+            .record_session_representation(&crate::types::NewSessionRepresentation {
+                session_id: session.id,
+                session_head: head.clone(),
+                representing_commit: Some(head.clone()),
+                representing_ref: "refs/remotes/origin/main".into(),
+                discovery: crate::types::RepresentationDiscovery::MergeTime,
+                pr_number: None,
+                paths_json: "[]".into(),
+                evidence: "fixture landed".into(),
+            })
+            .unwrap();
+        assert!(broker.landed_session_is_safe_to_retire(&session));
+        std::fs::write(checkout.join("untracked-user-work"), "keep").unwrap();
+        assert!(!broker.landed_session_is_safe_to_retire(&session));
+        std::fs::remove_file(checkout.join("untracked-user-work")).unwrap();
+        let old = age_worktree_for_task_retirement(&mut broker, &session);
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        let decision = old + 25 * 60 * 60 * 1_000;
+        assert!(matches!(
+            broker
+                .try_close_landed_session(
+                    session.id,
+                    decision,
+                    24 * 60 * 60 * 1_000,
+                    &mut table,
+                    true,
+                    None
+                )
+                .unwrap(),
+            AbandonedSessionCloseOutcome::ActiveProcess
+        ));
+        let holder = task_lease_holder(i64::MAX);
+        broker
+            .store()
+            .append_event(
+                crate::events::SESSION_HOLDER_BOUND,
+                Some(session.id),
+                Some(&crate::events::session_holder_bound_payload(
+                    &holder, "fixture", None,
+                )),
+            )
+            .unwrap();
+        let mut table = crate::session_holder::RecordedHolderProcessTable::default();
+        assert!(matches!(
+            broker
+                .try_close_landed_session(
+                    session.id,
+                    decision,
+                    24 * 60 * 60 * 1_000,
+                    &mut table,
+                    true,
+                    None
+                )
+                .unwrap(),
+            AbandonedSessionCloseOutcome::Closed
+        ));
+        std::fs::write(checkout.join("later-work"), "later").unwrap();
+        git(checkout, &["add", "later-work"]);
+        git(checkout, &["commit", "-qm", "new session work"]);
+        assert!(!broker.landed_session_is_safe_to_retire(&session));
     }
 
     fn task_lease_holder(pid: i64) -> crate::session_holder::AgentProcess {
