@@ -4353,6 +4353,8 @@ impl Broker {
         // Older finish intents could authorize arbitrary ignored directories.
         // Recheck every surviving prefix against the current policy before an
         // orphan retry; a durable old intent does not override new safeguards.
+        let mut current_proof = expected_proof.clone();
+        current_proof.disposable_ignored_root_prefixes.clear();
         for prefix in &expected_proof.disposable_ignored_root_prefixes {
             let path = worktree_path.join(prefix.trim_end_matches('/'));
             match std::fs::symlink_metadata(&path) {
@@ -4373,10 +4375,13 @@ impl Broker {
                     reason,
                 },
             )?;
+            current_proof
+                .disposable_ignored_root_prefixes
+                .push(prefix.clone());
         }
 
         if let Err(reason) =
-            remove_authorized_orphan_tree(&self.repo, &worktree_path, expected_proof)
+            remove_authorized_orphan_tree(&self.repo, &worktree_path, &current_proof)
         {
             return Err(BrokerOpError::DirtyWorktree {
                 id: session.id,
@@ -6805,6 +6810,40 @@ mod registered_removal_failure_tests {
         assert!(broker.repo.resolve_ref(&proof.branch_ref).is_some());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn old_orphan_intent_cannot_discard_an_unknown_ignored_directory() {
+        let owner = tempfile::tempdir().unwrap();
+        let repository = repository_with_ignored_cleanup_fixture(owner.path());
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(&repository).unwrap();
+        let (session, worktree) =
+            start_represented_cleanup_session(&mut broker, "old ignored prefix");
+        let residue = worktree.join("local-dataset/saved-session.json");
+        std::fs::create_dir_all(residue.parent().unwrap()).unwrap();
+        std::fs::write(&residue, b"saved session data").unwrap();
+        let mut proof = persist_finish_cleanup_intent(&mut broker, &session, &worktree);
+        // Model a schema-3 intent captured by the old permissive classifier.
+        proof
+            .disposable_ignored_root_prefixes
+            .push("local-dataset/".into());
+        let payload = crate::events::session_finish_cleanup_started_payload_with_proof(
+            true,
+            true,
+            Some(&proof),
+        );
+        broker
+            .store()
+            .begin_finish_cleanup(session.id, &payload)
+            .unwrap();
+        std::fs::remove_file(worktree.join("README.md")).unwrap();
+        remove_worktree_admin_directory(&worktree);
+        let error = broker.cleanup(session.id, false).unwrap_err();
+        assert!(error.to_string().contains("local-dataset"), "{error}");
+        assert_eq!(std::fs::read(&residue).unwrap(), b"saved session data");
+        assert!(broker.repo.resolve_ref(&proof.branch_ref).is_some());
+    }
+
     #[test]
     fn legacy_v2_orphan_proof_without_root_generation_cannot_authorize_residue() {
         let owner = tempfile::tempdir().unwrap();
@@ -6817,7 +6856,7 @@ mod registered_removal_failure_tests {
         std::fs::create_dir_all(residue.parent().unwrap()).unwrap();
         std::fs::write(&residue, b"saved session data").unwrap();
         let proof = persist_finish_cleanup_intent_with_schema(&mut broker, &session, &worktree, 2);
-        assert!(!proof.disposable_ignored_root_prefixes.is_empty());
+        assert!(proof.disposable_ignored_root_prefixes.is_empty());
         assert!(proof.root_generation_sha256.is_none());
         std::fs::remove_file(worktree.join("README.md")).unwrap();
         remove_worktree_admin_directory(&worktree);
