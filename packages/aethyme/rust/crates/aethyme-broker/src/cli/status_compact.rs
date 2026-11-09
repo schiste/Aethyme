@@ -532,7 +532,7 @@ impl CompactStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_commands, CompactOperation, DETAIL_LIMIT};
+    use super::{CompactOperation, DETAIL_LIMIT, bounded_commands};
     use std::collections::BTreeSet;
 
     #[test]
