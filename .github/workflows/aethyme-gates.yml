@@ -1,13 +1,7 @@
 name: Aethyme Gates
 
-# The push tier of three (see the `fast-guards` gate in .aethyme/gates.toml):
-# pre-push runs a selected tenth of the suite locally; a push to main runs, in
-# the cargo-test-* jobs, the crates the commit changed and their reverse
-# dependencies plus the repository guard suites; a release runs everything.
-# The whole workspace runs when the commit changes the workspace version (a
-# release is prepared), when a repository-wide input changes, and on a manual
-# dispatch. Only such a run records `full-suite`, which a release tag requires
-# (.github/scripts/wait-for-release-gates.sh).
+# Submission gates select focused tests; main and release run the full workspace.
+# A passing full suite is recorded for release verification.
 #
 # Convergence lane: gates.toml is the single definition of "verified" —
 # this workflow runs the gates, via the runner, that the broker runs before
@@ -95,37 +89,12 @@ jobs:
           fi
           echo "run=$run" >> "$GITHUB_OUTPUT"
 
-      # full: the whole workspace. changed: the crates this commit changed,
-      # their reverse dependencies and the guard suites. A dispatch, a
-      # workspace version change or a commit with no parent runs everything,
-      # as does any repository-wide input (`--print-selection` says workspace).
+      # Every main push and dispatch tests the whole workspace.
       - name: Choose the test scope
         id: scope
-        env:
-          EVENT_NAME: ${{ github.event_name }}
         run: |
-          set -euo pipefail
-          version() { git show "$1:packages/aethyme/rust/Cargo.toml" | sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *//p'; }
-          scope=full
-          selection=""
-          if [ "$EVENT_NAME" = push ] && git rev-parse --verify --quiet HEAD^1 >/dev/null; then
-            if [ "$(version HEAD)" != "$(version HEAD^1)" ]; then
-              echo "The workspace version changed: a release is prepared."
-            else
-              changed="$(packages/aethyme/scripts/test-like-ci.sh --base HEAD^1 --print-selection)"
-              case "$changed" in
-                workspace) echo "A repository-wide input changed." ;;
-                none) scope=none ;;
-                *)
-                  scope=changed
-                  selection="($changed) | package(aethyme-testkit) | package(aethyme-cli) | binary_id(aethyme-broker::gate_policy)"
-                  ;;
-              esac
-            fi
-          fi
-          echo "Test scope: $scope${selection:+: $selection}"
-          echo "scope=$scope" >> "$GITHUB_OUTPUT"
-          echo "selection=$selection" >> "$GITHUB_OUTPUT"
+          echo "scope=full" >> "$GITHUB_OUTPUT"
+          echo "selection=" >> "$GITHUB_OUTPUT"
 
   gates:
     name: Run all gates
