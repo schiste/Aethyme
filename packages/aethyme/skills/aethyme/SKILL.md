@@ -23,6 +23,13 @@ Important: `python -m src.cli ...` was removed — the Python CLI no longer
 exists, so that spelling fails outright. Use the `aethyme` binary for
 graph, task, facts, intents, analyze, enhance, and Explore.
 
+## Lease Overlaps
+
+Read claim results as structured evidence: an accepted claim with informational
+overlap warnings is not a lock. Inspect overlapping work, continue in your own
+session when appropriate, and reconcile overlapping changes before merging.
+Resolve actual blockers and refused claims; never edit another session's tree.
+
 ## Default Contract
 
 Explore is a navigation aid, not an authority: every result is verified against
