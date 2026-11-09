@@ -318,6 +318,7 @@ fn preparation_is_explicit_language_neutral_and_invalidates_on_input_change() {
         ],
     ));
     assert_eq!(current["state"], "current");
+    assert_eq!(prepared["digest"], current["expected_digest"]);
     std::fs::write(temp.path().join("Cargo.lock"), "changed bytes\n").unwrap();
     let stale = success_json(run(
         temp.path(),

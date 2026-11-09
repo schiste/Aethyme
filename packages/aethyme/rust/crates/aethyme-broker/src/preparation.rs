@@ -675,7 +675,9 @@ impl Broker {
             reason: "repository declares no preparation steps".into(),
         })?;
         let source_digest = preparation_source_digest(&root, &config, session_id)?;
-        let digest = preparation_digest(&root, &config, session_id)?;
+        // The report digest is defined as the hash of the source digest.
+        // Reuse the bytes already read rather than hashing every input twice.
+        let digest = hash_text(&source_digest);
         let status = self.preparation_status(session_id)?;
         if status.state == PreparationState::Current {
             return Ok(PreparationReport {
@@ -1734,7 +1736,8 @@ fn validate_relative_path(path: &str) -> Result<(), PreparationError> {
     Ok(())
 }
 
-pub(crate) fn preparation_digest(
+#[cfg(test)]
+fn preparation_digest(
     root: &Path,
     config: &PreparationConfig,
     session_id: i64,
