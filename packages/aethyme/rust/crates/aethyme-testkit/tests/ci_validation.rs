@@ -560,28 +560,35 @@ fn the_cargo_test_jobs_run_the_pull_request_suite() {
 
     // The matrix must name every partition its command divides the suite into.
     let shard = block(&gates, "  cargo-test-shard:");
-    assert!(shard.contains(&"    needs: cargo-test-build"));
+    assert!(shard.contains(&"    needs: [tested-tree, cargo-test-build]"));
     assert!(shard.contains(&"      fail-fast: false"));
     assert!(shard.contains(&"        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]"));
-    assert_eq!(
-        run_lines(&gates, "  cargo-test-shard:"),
-        run_lines(&oss, "  rust-tests-shard:")
-            .iter()
-            .map(|line| line.replace("/10\"", "/12\""))
-            .collect::<Vec<_>>(),
-    );
+    // Check that the main shard uses the same full-suite command as the PR shard.
+    let oss_shard: Vec<String> = run_lines(&oss, "  rust-tests-shard:")
+        .into_iter()
+        .filter(|line| line.contains("--from-archive"))
+        .collect();
+    assert_eq!(oss_shard.len(), 1);
+    let command = oss_shard[0]
+        .strip_prefix("run: ")
+        .unwrap()
+        .replace("/10\"", "/12\"");
+    let shard_lines: Vec<&str> = shard.iter().map(|line| line.trim()).collect();
+    assert!(shard_lines.contains(&command.as_str()), "{command}");
+    let selected = format!("{command} --selection \"$SELECTION\"");
+    assert!(shard_lines.contains(&selected.as_str()), "{selected}");
 
-    // Skipped only when a pull-request run tested the tree.
+    // Skipped when a pull-request run tested the tree or nothing changed.
     for job in ["  cargo-test-build:", "  cargo-test-examples-doctests:"] {
         assert!(
-            block(&gates, job).contains(&"    if: ${{ needs.tested-tree.outputs.run == '' }}"),
+            block(&gates, job).contains(&"    if: ${{ needs.tested-tree.outputs.run == '' && needs.tested-tree.outputs.scope != 'none' }}"),
             "{job}"
         );
     }
     let verdict = block(&gates, "  cargo-test:");
     assert!(verdict.contains(&"    needs: [tested-tree, cargo-test-build, cargo-test-shard, cargo-test-examples-doctests]"));
     assert!(verdict.contains(&"    if: ${{ !cancelled() && needs.tested-tree.result == 'success' && needs.tested-tree.outputs.run == '' }}"));
-    assert!(verdict.contains(&"          [[ \"$BUILD\" == success && \"$SHARDS\" == success && \"$EXAMPLES\" == success ]]"));
+    assert!(verdict.contains(&"            full|changed) [[ \"$BUILD\" == success && \"$SHARDS\" == success && \"$EXAMPLES\" == success ]] ;;"));
 
     // The gates job leaves out only the gates this suite runs in full, and
     // each one's test targets must be in that suite: none selects a package or
@@ -609,6 +616,9 @@ fn the_cargo_test_jobs_run_the_pull_request_suite() {
             .and_then(|gate| gate["command"].as_str())
             .unwrap();
         assert!(command.contains("cargo test --locked"), "{name}: {command}");
+        // `--profile local` names fast-guards' nextest profile (retries and
+        // workers), not a Cargo build profile.
+        let command = command.replace("--profile local", "");
         for excluded in [
             "--exclude",
             "--features",
@@ -1128,4 +1138,193 @@ fn local_nextest_profile_kills_hung_tests_after_a_finite_deadline() {
     assert_eq!(ci["retries"].as_integer(), Some(1));
     assert_eq!(ci["slow-timeout"]["period"].as_str(), Some("60s"));
     assert_eq!(ci["slow-timeout"]["terminate-after"].as_integer(), Some(5));
+}
+
+/// The pre-push tier runs the always-run suites, then the test modules the
+/// change touches, cheapest first, within the budget; what the budget leaves
+/// out is named for the push tier. A module with no recorded time is new and
+/// always runs.
+#[test]
+fn prepush_selection_adds_touched_modules_cheapest_first_within_the_budget() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(5)
+        .unwrap();
+    let script = root.join("packages/aethyme/scripts/prepush-selection.sh");
+    let fixture = tempfile::tempdir().unwrap();
+    let repo = fixture.path();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    };
+    let write = |path: &str| {
+        let path = repo.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("{}\n", path.display())).unwrap();
+    };
+    let data = repo.join("data.json");
+    std::fs::write(
+        &data,
+        r#"{
+  "budget_seconds": 10,
+  "always_binaries": ["k::lint"],
+  "always_modules": [{"binary": "c", "module": "hot", "failing_runs": 9}],
+  "modules": {"k::lint a": 1, "c hot": 1, "c small": 2, "c big": 20, "c::it suite": 3, "c::own x": 1},
+  "slow_tests": [{"binary": "k::lint", "test": "slow::one", "seconds": 9}]
+}"#,
+    )
+    .unwrap();
+    git(&["init", "-q", "-b", "main"]);
+    write("README.md");
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+    git(&["branch", "base"]);
+    let select = |base: &str| {
+        let output = std::process::Command::new("bash")
+            .arg(&script)
+            .args(["--base", base, "--data"])
+            .arg(&data)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let always = "binary_id(k::lint) | (binary_id(c) & test(/^hot(::|$)/))";
+    // Tests slower than the data's threshold in CI run at push, never here.
+    let slow = " & !((binary_id(k::lint) & test(=slow::one)))";
+
+    // No change: the always-run suites alone.
+    let (status, stdout, _) = select("base");
+    assert_eq!(status, Some(0));
+    assert_eq!(stdout, format!("({always}){slow}\n"));
+
+    for path in [
+        "src/small.rs",
+        "src/big/mod.rs",
+        "src/hot.rs",
+        "src/lib.rs",
+        "src/newmod.rs",
+        "tests/suite.rs",
+        "tests/own.rs",
+        "tests/common/mod.rs",
+    ] {
+        write(&format!("packages/aethyme/rust/crates/c/{path}"));
+    }
+    write("docs/guide.md");
+    let (status, stdout, stderr) = select("base");
+    assert_eq!(status, Some(0), "{stderr}");
+    // 2 s always-run + 0 (new) + 1 (own binary) + 2 (small) + 3 (suite) = 8 of
+    // 10; big (20 s) does not fit. The crate root, shared test support and the
+    // doc select nothing of their own, and hot already runs.
+    assert_eq!(
+        stdout,
+        format!(
+            "({always} | (binary_id(c) & test(/^newmod(::|$)/)) | binary_id(c::own) | (binary_id(c) & test(/^small(::|$)/)) | (binary_id(c::it) & test(/^suite(::|$)/))){slow}\n"
+        )
+    );
+    assert!(
+        stderr.contains("left to the push tier: c big (20 s)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("selected 8 s of a 10 s budget, 4 changed module(s)"),
+        "{stderr}"
+    );
+
+    // Without a merge base the always-run suites still run.
+    let (status, stdout, stderr) = select("no-such-ref");
+    assert_eq!(status, Some(0));
+    assert_eq!(stdout, format!("({always}){slow}\n"));
+    assert!(stderr.contains("no merge base"), "{stderr}");
+}
+
+/// Main and release verification must always run the whole workspace.
+#[test]
+fn main_always_tests_the_full_workspace() {
+    let gates = workflow("aethyme-gates.yml");
+    let tree = block(&gates, "  tested-tree:");
+    assert!(tree.contains(&r#"          echo "scope=full" >> "$GITHUB_OUTPUT""#));
+    assert!(tree.contains(&r#"          echo "selection=" >> "$GITHUB_OUTPUT""#));
+    assert!(
+        !tree.iter()
+            .any(|line| line.contains("scope=changed") || line.contains("scope=none"))
+    );
+    let verdict = block(&gates, "  cargo-test:");
+    assert!(verdict.contains(&"          name: full-suite"));
+}
+
+/// Every always-run entry names timed tests, so a renamed suite cannot drop
+/// out of the pre-push tier unnoticed, and the guard suites the `fast-guards`
+/// fallback runs stay in it.
+#[test]
+fn prepush_always_run_entries_name_timed_tests() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(5)
+        .unwrap();
+    let data: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("packages/aethyme/rust/.config/prepush-tests.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    let modules = data["modules"].as_object().unwrap();
+    let suite: f64 = modules.values().map(|v| v.as_f64().unwrap()).sum();
+    let budget = data["budget_seconds"].as_f64().unwrap();
+    assert!(
+        budget > 0.0 && budget <= 0.2 * suite,
+        "budget {budget} s of {suite} s"
+    );
+    let binaries: Vec<&str> = data["always_binaries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b.as_str().unwrap())
+        .collect();
+    for binary in &binaries {
+        assert!(
+            modules
+                .keys()
+                .any(|key| key.starts_with(&format!("{binary} "))),
+            "always-run binary {binary} has no timed tests"
+        );
+    }
+    for entry in data["always_modules"].as_array().unwrap() {
+        let key = format!(
+            "{} {}",
+            entry["binary"].as_str().unwrap(),
+            entry["module"].as_str().unwrap()
+        );
+        assert!(
+            modules.contains_key(&key),
+            "always-run module {key} has no timed tests"
+        );
+    }
+    for guard in [
+        "aethyme-cli::help_snapshots",
+        "aethyme-cli::help_surface",
+        "aethyme-cli::help_everywhere",
+        "aethyme-testkit::broker_discarded_results",
+        "aethyme-testkit::deprecated_spelling_callers",
+        "aethyme-testkit::docs_hygiene",
+        "aethyme-testkit::no_eval_tuning",
+        "aethyme-testkit::pr_template",
+        "aethyme-testkit::grammar_provenance",
+        "aethyme-broker::gate_policy",
+    ] {
+        assert!(binaries.contains(&guard), "{guard} is not always run");
+    }
 }

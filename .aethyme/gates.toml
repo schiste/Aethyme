@@ -96,8 +96,23 @@ triggers = ["packages/aethyme-eval/**"]
 # Every Rust gate opens with the same sizing step (see `cargo-test`, 2026-11-07):
 # the broker's AETHYME_GATE_IDLE_CPUS becomes 2-8 test workers and 1-4 build
 # jobs, and its absence keeps one job and two workers.
+# 2026-11-08: the pre-push tier. Testing is split in three:
+#   pre-push (this gate, before a submission is promoted): format check, a
+#     compile of every test target, and the tests
+#     `packages/aethyme/scripts/prepush-selection.sh` picks: the repository
+#     lint suites, the modules with the most failing CI runs per second, and
+#     the modules the change touches, within 15% of suite time;
+#   push to main (Aethyme Gates): the changed crates and their reverse
+#     dependencies, sharded, plus lint, examples and doctests;
+#   release (a version bump, or a dispatch): the whole workspace.
+# Measured on 845 failing pull-request runs (2026-09-10 to 2026-11-08): 45%
+# failed before any test ran (293 compile, 44 fmt, 42 clippy), which the
+# compile and format steps here catch, and the test selection caught 89% of
+# the test-failing runs after 2026-10-20 at a mean of 10% of suite time. The
+# ten guard suites below are in its always-run set; without nextest the gate
+# falls back to running just them.
 name = "fast-guards"
-command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;; ?????*) gi=16 ;; esac; gt=$gi; [ "$gt" -ge 2 ] || gt=2; [ "$gt" -le 8 ] || gt=8; gj=$((gi / 2)); [ "$gj" -ge 1 ] || gj=1; [ "$gj" -le 4 ] || gj=4; export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-$gj}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" CARGO_PROFILE_DEV_DEBUG=1 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && cargo test --locked --workspace --examples --quiet --manifest-path packages/aethyme/rust/Cargo.toml --test help_snapshots --test help_surface --test help_everywhere --test broker_discarded_results --test deprecated_spelling_callers --test docs_hygiene --test no_eval_tuning --test pr_template --test grammar_provenance --test gate_policy'
+command = 'gi="${AETHYME_GATE_IDLE_CPUS:-0}"; case "$gi" in *[!0-9]*|"") gi=0 ;; ?????*) gi=16 ;; esac; gt=$gi; [ "$gt" -ge 2 ] || gt=2; [ "$gt" -le 8 ] || gt=8; gj=$((gi / 2)); [ "$gj" -ge 1 ] || gj=1; [ "$gj" -le 4 ] || gj=4; export CHAU7_CTO_OPTIM_ACTIVE=1 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS="${AETHYME_GATE_BUILD_JOBS:-$gj}" RUST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" NEXTEST_TEST_THREADS="${AETHYME_GATE_TEST_THREADS:-$gt}" CARGO_PROFILE_DEV_DEBUG=1 CARGO_PROFILE_TEST_DEBUG=1 CARGO_TARGET_DIR="$AETHYME_GATE_CACHE_DIR" && m=packages/aethyme/rust/Cargo.toml && cargo fmt --all --check --manifest-path "$m" && if cargo nextest --version >/dev/null 2>&1; then sel="$(packages/aethyme/scripts/prepush-selection.sh --base aethyme/integration)" && cargo build --locked --workspace --bins --quiet --manifest-path "$m" && AETHYME_TESTKIT_PREBUILT_BINS=1 cargo nextest run --locked --workspace --profile local --build-jobs "$CARGO_BUILD_JOBS" --no-fail-fast --no-tests warn --cargo-quiet --manifest-path "$m" -E "$sel"; else cargo test --locked --workspace --examples --quiet --manifest-path packages/aethyme/rust/Cargo.toml --test help_snapshots --test help_surface --test help_everywhere --test broker_discarded_results --test deprecated_spelling_callers --test docs_hygiene --test no_eval_tuning --test pr_template --test grammar_provenance --test gate_policy; fi'
 cost = 2
 timeout_seconds = 2400
 resource_wait_seconds = 900
