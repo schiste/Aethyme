@@ -273,7 +273,7 @@ Usage:
       A single commit reads as the commits it brought in. Read-only.
   aethyme broker leases [--json]
       Refresh and list active leases plus current overlaps.
-  aethyme broker leases claim <path> --session <id> [--ttl <seconds>] [--json]
+  aethyme broker leases claim <path> [<path>...] --session <id> [--ttl <seconds>] [--json]
       Explicitly claim a path (end it with / for a directory claim).
   aethyme broker leases plan <paths...> [--session <id>] [--json]
       Read-only preflight for proposed claims. Reports exact and directory

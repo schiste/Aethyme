@@ -385,6 +385,47 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                 .session
                 .ok_or(UsageError::Message("claim requires --session <id>".into()))?;
             let session_info = broker.store().session(session)?;
+            let paths = &parsed.positional[1..];
+            if paths.len() > 1 {
+                // Claims are independent: report every result and return a failure
+                // if any path could not be claimed. Never imply atomicity.
+                let mut results = Vec::with_capacity(paths.len());
+                let mut failures = 0usize;
+                for path in paths {
+                    let is_directory = std::path::Path::new(&session_info.worktree_path)
+                        .join(path)
+                        .is_dir();
+                    let scope_warning =
+                        crate::leases::exact_directory_claim_warning(path, is_directory);
+                    match broker.claim_lease(session, path, parsed.ttl_seconds.map(|s| s * 1000)) {
+                        Ok(report) => results.push(serde_json::json!({
+                            "requested_path": path,
+                            "report": report,
+                            "scope_warning": scope_warning,
+                        })),
+                        Err(error) => {
+                            failures += 1;
+                            results.push(serde_json::json!({
+                                "requested_path": path,
+                                "error": error.to_string(),
+                            }));
+                        }
+                    }
+                }
+                let result = serde_json::json!({
+                    "session_id": session,
+                    "atomic": false,
+                    "failures": failures,
+                    "claims": results,
+                });
+                out!("{}", serde_json::to_string_pretty(&result)?);
+                if failures > 0 {
+                    return Err(UsageError::Message(format!(
+                        "{failures} lease claim(s) failed; inspect individual results above"
+                    )));
+                }
+                return Ok(());
+            }
             let is_directory = std::path::Path::new(&session_info.worktree_path)
                 .join(path)
                 .is_dir();

@@ -209,6 +209,42 @@ fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
 }
 
 #[test]
+fn batch_claim_reports_partial_success_without_dropping_later_paths() {
+    let tmp = fixture();
+    let worktree = add_worktree(tmp.path(), "batch-owner");
+    let session_id = {
+        let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
+        broker.adopt(&worktree, None).unwrap().id
+    };
+    let output = run(
+        tmp.path(),
+        &[
+            "advanced",
+            "leases",
+            "claim",
+            "src/one.rs",
+            "../invalid",
+            "src/two.rs",
+            "--session",
+            &session_id.to_string(),
+            "--json",
+        ],
+    );
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["atomic"], false);
+    assert_eq!(result["failures"], 1);
+    assert_eq!(result["claims"].as_array().unwrap().len(), 3);
+    assert_eq!(result["claims"][0]["report"]["accepted"], true);
+    assert!(result["claims"][1]["error"].is_string());
+    assert_eq!(result["claims"][2]["report"]["accepted"], true);
+    let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
+    let leases = broker.store().session_leases(session_id).unwrap();
+    assert!(leases.iter().any(|lease| lease.path == "src/one.rs"));
+    assert!(leases.iter().any(|lease| lease.path == "src/two.rs"));
+}
+
+#[test]
 fn closed_session_lease_claim_fails_without_persisting_a_phantom_lease() {
     let tmp = fixture();
     let worktree = add_worktree(tmp.path(), "closed-owner");
