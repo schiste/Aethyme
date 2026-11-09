@@ -242,6 +242,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   remaining budget even when the loop checked immediately beforehand; test this
   with an injected callback that runs past the deadline.
 
+- When tightening cleanup policy, inspect durable recovery intents and retry
+  paths created under older policies. Revalidate their saved deletion permissions
+  under the current policy, fail closed on missing evidence, and exercise an old
+  intent through the real recovery entrypoint with user data that must survive.
+
 - For whole-checkout cleanup, finish canonical grouping of every retained row
   and build complete live-path evidence before scheduling. Rotate a durable
   cursor across complete cohorts before per-cohort Git, witness and ownership
