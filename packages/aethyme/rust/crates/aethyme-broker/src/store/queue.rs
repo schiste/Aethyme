@@ -503,6 +503,20 @@ impl BrokerStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// A recorded unresolved PR link must prevent early session retirement.
+    /// Missing observations are not evidence of a merged pull request.
+    pub(crate) fn session_has_unmerged_pull_request_link(
+        &self,
+        session_id: i64,
+    ) -> Result<bool, BrokerError> {
+        self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pull_request_session_links l
+             LEFT JOIN pull_request_milestones m ON m.repository = l.repository AND m.pr_number = l.pr_number
+             WHERE l.session_id = ?1 AND m.merged_at IS NULL)",
+            [session_id], |row| row.get(0),
+        ).map_err(Into::into)
+    }
+
     /// Sessions linked to one pull request.
     pub fn pull_request_sessions(
         &self,

@@ -2887,6 +2887,13 @@ impl Broker {
         }
 
         let retirement_now = now_ms();
+        let landed_window_ms =
+            i64::from(policy.session_landed_after_hours).saturating_mul(3_600_000);
+        let candidate_window_ms = if landed_window_ms > 0 {
+            window_ms.min(landed_window_ms)
+        } else {
+            window_ms
+        };
         let retirement_candidates = sessions
             .iter()
             .filter(|session| {
@@ -2899,7 +2906,7 @@ impl Broker {
                         closed: false,
                     },
                     retirement_now,
-                    window_ms,
+                    candidate_window_ms,
                 )
                 .is_abandoned()
             })
@@ -2925,14 +2932,41 @@ impl Broker {
                 }
                 None => true,
             };
-            match self.try_close_abandoned_session(
-                session.id,
-                now_ms(),
+            let now = now_ms();
+            let old_enough_for_abandonment = crate::decide_abandonment(
+                &crate::SessionActivity {
+                    session_id: session.id,
+                    last_activity_at: session.last_activity_at,
+                    created_at: session.created_at,
+                    agent_alive: None,
+                    closed: false,
+                },
+                now,
                 window_ms,
-                &mut holder_process_table,
-                allow_snapshot,
-                deadline,
-            )? {
+            )
+            .is_abandoned();
+            let outcome = if old_enough_for_abandonment {
+                self.try_close_abandoned_session(
+                    session.id,
+                    now,
+                    window_ms,
+                    &mut holder_process_table,
+                    allow_snapshot,
+                    deadline,
+                )?
+            } else if landed_window_ms > 0 && landed_window_ms < window_ms {
+                self.try_close_landed_session(
+                    session.id,
+                    now,
+                    landed_window_ms,
+                    &mut holder_process_table,
+                    allow_snapshot,
+                    deadline,
+                )?
+            } else {
+                crate::broker::AbandonedSessionCloseOutcome::NotDue
+            };
+            match outcome {
                 crate::broker::AbandonedSessionCloseOutcome::Closed => summary.retired += 1,
                 crate::broker::AbandonedSessionCloseOutcome::HolderUnavailable => {
                     summary.deferred += 1;
@@ -6149,6 +6183,87 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn landed_retirement_sweep_keeps_dirty_work_and_honors_opt_out() {
+        for (dirty, disabled) in [(false, false), (true, false), (false, true)] {
+            let (_owner, _storage, mut broker, session) = retirement_fixture();
+            let root = broker.main_root().to_path_buf();
+            let checkout = PathBuf::from(&session.worktree_path);
+            let head = GitRepo::discover(&checkout).unwrap().head_commit().unwrap();
+            git(&root, &["update-ref", "refs/remotes/origin/main", &head]);
+            git(
+                &root,
+                &[
+                    "symbolic-ref",
+                    "refs/remotes/origin/HEAD",
+                    "refs/remotes/origin/main",
+                ],
+            );
+            broker
+                .store()
+                .record_session_representation(&crate::types::NewSessionRepresentation {
+                    session_id: session.id,
+                    session_head: head.clone(),
+                    representing_commit: Some(head),
+                    representing_ref: "refs/remotes/origin/main".into(),
+                    discovery: crate::types::RepresentationDiscovery::MergeTime,
+                    pr_number: None,
+                    paths_json: "[]".into(),
+                    evidence: "fixture".into(),
+                })
+                .unwrap();
+            let holder = crate::session_holder::AgentProcess {
+                pid: i64::MAX,
+                started: "Mon Jan 1 00:00:00 2024".into(),
+                command: "fixture-agent".into(),
+            };
+            broker
+                .store()
+                .append_event(
+                    crate::events::SESSION_HOLDER_BOUND,
+                    Some(session.id),
+                    Some(&crate::events::session_holder_bound_payload(
+                        &holder, "fixture", None,
+                    )),
+                )
+                .unwrap();
+            if disabled {
+                std::fs::write(root.join(".aethyme/broker.toml"), "[retention]\nsession_abandoned_after_hours = 72\nsession_landed_after_hours = 0\n").unwrap();
+            }
+            if dirty {
+                std::fs::write(checkout.join("untracked-work"), "preserve").unwrap();
+            }
+            let old_time = std::time::SystemTime::now() - Duration::from_secs(30 * 60 * 60);
+            let old_ms = old_time
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            let git_dir = crate::git::checked_worktree_git_dir(&checkout)
+                .unwrap()
+                .unwrap();
+            for name in ["index", "HEAD"] {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(git_dir.join(name))
+                    .unwrap()
+                    .set_modified(old_time)
+                    .unwrap();
+            }
+            broker.store().connection().execute("UPDATE sessions SET created_at = ?1, updated_at = ?1, last_activity_at = ?1 WHERE id = ?2", rusqlite::params![old_ms, session.id]).unwrap();
+            let summary = broker.retire_abandoned_sessions(None).unwrap();
+            assert_eq!(summary.retired, usize::from(!dirty && !disabled));
+            assert_eq!(
+                broker.store().session(session.id).unwrap().cleanup_state
+                    == SessionCleanupState::Closed,
+                !dirty && !disabled
+            );
+            if dirty {
+                assert!(checkout.join("untracked-work").exists());
+            }
+        }
     }
 
     #[cfg(unix)]
