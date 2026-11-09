@@ -1675,7 +1675,9 @@ fn blocked_session_with_build_cache(repo: &Path, container: &Path) -> (String, P
 
     // An unaccepted commit is what makes cleanup refuse this worktree.
     std::fs::write(worktree.join("work.txt"), "work\n").unwrap();
-    git(&worktree, &["add", "work.txt"]);
+    std::fs::create_dir_all(worktree.join("rust")).unwrap();
+    std::fs::write(worktree.join("rust/Cargo.toml"), "# fixture\n").unwrap();
+    git(&worktree, &["add", "work.txt", "rust/Cargo.toml"]);
     git(&worktree, &["commit", "-qm", "work"]);
 
     let target = worktree.join("rust/target");
@@ -1733,7 +1735,8 @@ fn cleanup_resolve_plan_and_apply_skip_sweeping_unrelated_closed_checkouts() {
     );
     assert!(
         plan_output.status.success(),
-        "cleanup plan: {}",
+        "cleanup plan stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&plan_output.stdout),
         String::from_utf8_lossy(&plan_output.stderr)
     );
     let plan: serde_json::Value = serde_json::from_slice(&plan_output.stdout).unwrap();

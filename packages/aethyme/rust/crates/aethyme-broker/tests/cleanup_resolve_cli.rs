@@ -81,6 +81,11 @@ fn dirty_closed_session(repo: &Path) -> (String, PathBuf) {
     std::fs::write(worktree.join("data.bin"), [0_u8, 255, 1, 7]).unwrap();
     std::os::unix::fs::symlink("notes/todo.txt", worktree.join("link")).unwrap();
     std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
+    std::fs::write(
+        worktree.join("target/CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
     std::fs::write(worktree.join("target/debug/cache.bin"), vec![9_u8; 4096]).unwrap();
     broker.close(session.id).unwrap();
     (session.id.to_string(), worktree)
@@ -153,6 +158,11 @@ fn a_dirty_worktree_is_archived_restored_and_then_removed() {
     // The ignored build output must not reach the archive, whatever the
     // close-time sweep did with it.
     std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
+    std::fs::write(
+        worktree.join("target/CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
     std::fs::write(worktree.join("target/debug/cache.bin"), vec![9_u8; 4096]).unwrap();
 
     let human = run(
