@@ -4350,6 +4350,31 @@ impl Broker {
             });
         }
 
+        // Older finish intents could authorize arbitrary ignored directories.
+        // Recheck every surviving prefix against the current policy before an
+        // orphan retry; a durable old intent does not override new safeguards.
+        for prefix in &expected_proof.disposable_ignored_root_prefixes {
+            let path = worktree_path.join(prefix.trim_end_matches('/'));
+            match std::fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Ok(metadata) if metadata.is_dir() => {}
+                _ => {
+                    return Err(BrokerOpError::DirtyWorktree {
+                        id: session.id,
+                        reason: format!(
+                            "ignored cleanup prefix {prefix} cannot be safely verified"
+                        ),
+                    });
+                }
+            }
+            crate::auto_cleanup::classify_ignored(&worktree_path, prefix, &policy).map_err(
+                |reason| BrokerOpError::DirtyWorktree {
+                    id: session.id,
+                    reason,
+                },
+            )?;
+        }
+
         if let Err(reason) =
             remove_authorized_orphan_tree(&self.repo, &worktree_path, expected_proof)
         {
