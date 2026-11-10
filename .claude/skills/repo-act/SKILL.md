@@ -117,6 +117,10 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   before adding regressions. Integration tests cannot call crate-private APIs.
   Preserve optional-value types in assertions; a compile failure supplies no
   runtime test evidence and needlessly repeats the remote validation cycle.
+- Before moving broker Git reads to worker threads, trace thread-local Git
+  deadlines, environment isolation and timeout reporting. Preserve these
+  safeguards and their caller-visible effects across threads; otherwise retain
+  sequential execution and optimize another part of the path.
 - For Rust compile review, trace the actual `mod` declarations, including
   `#[path]`, and item visibility from each use site; filenames alone do not
   establish module namespaces or sibling access.
