@@ -290,6 +290,19 @@ fn preparation_is_explicit_language_neutral_and_invalidates_on_input_change() {
     ));
     assert_eq!(prepared["state"], "current");
     assert_eq!(prepared["shared_cache_coordinated"], true);
+    assert!(prepared["shared_cache_wait_ms"].as_u64().is_some());
+    let metrics =
+        std::fs::read_to_string(temp.path().join(".aethyme/logs/command-metrics.jsonl")).unwrap();
+    let metric = metrics
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|value| value["command"] == "prepare")
+        .unwrap();
+    assert_eq!(metric["preparation"]["steps"], prepared["steps"]);
+    assert_eq!(
+        metric["preparation"]["shared_cache_wait_ms"],
+        prepared["shared_cache_wait_ms"]
+    );
     assert_eq!(prepared["steps"].as_array().map(Vec::len), Some(3));
     for step in prepared["steps"].as_array().unwrap() {
         assert!(step["duration_ms"].as_u64().is_some());

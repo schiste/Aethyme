@@ -583,7 +583,10 @@ impl Broker {
                 known.unwrap_or_default()
             )));
         };
-        phase_timings_ms.insert("push_preflight".into(), phase_started.elapsed().as_millis() as u64);
+        phase_timings_ms.insert(
+            "push_preflight".into(),
+            phase_started.elapsed().as_millis() as u64,
+        );
         let phase_started = std::time::Instant::now();
         let push = self.run_coordinated_operation_at_with_wait(
             CoordinatedCommand {
@@ -608,7 +611,10 @@ impl Broker {
             return Err(operation_failure("push", &push));
         }
         self.store().meta_set(&pushed_oid_key(session_id), &head)?;
-        phase_timings_ms.insert("push_git".into(), phase_started.elapsed().as_millis() as u64);
+        phase_timings_ms.insert(
+            "push_git".into(),
+            phase_started.elapsed().as_millis() as u64,
+        );
         let phase_started = std::time::Instant::now();
 
         let pr = if let Some(policy) = pr_open_as {
@@ -660,7 +666,10 @@ impl Broker {
             _ => (None, None),
         };
 
-        phase_timings_ms.insert("push_pr_and_watch".into(), phase_started.elapsed().as_millis() as u64);
+        phase_timings_ms.insert(
+            "push_pr_and_watch".into(),
+            phase_started.elapsed().as_millis() as u64,
+        );
         let phase_started = std::time::Instant::now();
 
         // Advisory and best-effort, like the overlap check below: the default
@@ -675,7 +684,10 @@ impl Broker {
             &main_root,
         );
 
-        phase_timings_ms.insert("push_default_branch".into(), phase_started.elapsed().as_millis() as u64);
+        phase_timings_ms.insert(
+            "push_default_branch".into(),
+            phase_started.elapsed().as_millis() as u64,
+        );
         let phase_started = std::time::Instant::now();
 
         // Advisory and best-effort: a listing or diff that cannot be read
@@ -689,7 +701,10 @@ impl Broker {
             crate::clock::epoch_ms(),
         );
 
-        phase_timings_ms.insert("push_overlap".into(), phase_started.elapsed().as_millis() as u64);
+        phase_timings_ms.insert(
+            "push_overlap".into(),
+            phase_started.elapsed().as_millis() as u64,
+        );
         let phase_started = std::time::Instant::now();
         let payload = serde_json::json!({
             "session_id": session_id,
@@ -710,7 +725,10 @@ impl Broker {
             None
         };
         let duplicate_work = self.duplicate_work_for(&session);
-        phase_timings_ms.insert("push_finalization".into(), phase_started.elapsed().as_millis() as u64);
+        phase_timings_ms.insert(
+            "push_finalization".into(),
+            phase_started.elapsed().as_millis() as u64,
+        );
         Ok(SessionPushReport {
             session_id,
             branch: session.branch,

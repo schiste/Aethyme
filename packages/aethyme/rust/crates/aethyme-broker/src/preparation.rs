@@ -393,6 +393,8 @@ pub struct PreparationReport {
     pub state: PreparationState,
     pub offline: bool,
     pub shared_cache_coordinated: bool,
+    /// Wall time spent acquiring the shared cache grant.
+    pub shared_cache_wait_ms: u64,
     /// Set when a complete over-budget measurement or a bounded inventory
     /// limit triggers a completed shared-store rotation.
     /// Additive and `None` in the overwhelmingly common case.
@@ -687,6 +689,7 @@ impl Broker {
                 state: PreparationState::Current,
                 offline,
                 shared_cache_coordinated: false,
+                shared_cache_wait_ms: 0,
                 shared_cache_rotation: None,
                 steps: Vec::new(),
                 next_action: "dependencies are already current".into(),
@@ -834,6 +837,7 @@ impl Broker {
             .map(HostResourceCoordinator::open)
             .transpose()
             .map_err(PreparationError::from)?;
+        let cache_wait_started = std::time::Instant::now();
         let mut grant = if let Some(coordinator) = coordinator.as_mut() {
             let request = preparation_resource_request(self, session_id, &root, &digest)?;
             Some(
@@ -843,6 +847,11 @@ impl Broker {
             )
         } else {
             None
+        };
+        let shared_cache_wait_ms = if shared {
+            cache_wait_started.elapsed().as_millis() as u64
+        } else {
+            0
         };
         // A shared-cache lease may have waited while another process filled
         // either volume. Recheck before rotation, state writes or commands.
@@ -1164,6 +1173,7 @@ impl Broker {
             state: PreparationState::Current,
             offline,
             shared_cache_coordinated: shared,
+            shared_cache_wait_ms,
             shared_cache_rotation: rotation,
             steps: results,
             next_action: "continue work in the prepared session".into(),
