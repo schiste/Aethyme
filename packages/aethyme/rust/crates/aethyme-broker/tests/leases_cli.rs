@@ -62,6 +62,59 @@ fn add_worktree(root: &Path, name: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn refresh_updates_multiple_sessions_without_releasing_explicit_leases() {
+    let tmp = fixture();
+    let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
+    let first_tree = add_worktree(tmp.path(), "refresh-first");
+    let second_tree = add_worktree(tmp.path(), "refresh-second");
+    let first = broker.adopt(&first_tree, None).unwrap();
+    let second = broker.adopt(&second_tree, None).unwrap();
+    broker
+        .store()
+        .claim_lease(second.id, "manual.txt", None)
+        .unwrap();
+    std::fs::write(first_tree.join("README.md"), "changed\n").unwrap();
+    std::fs::write(second_tree.join("src/owned.rs"), "changed\n").unwrap();
+
+    broker.refresh_leases().unwrap();
+    let leases = broker.store().active_leases().unwrap();
+    assert!(
+        leases
+            .iter()
+            .any(|lease| lease.session_id == first.id && lease.path == "README.md")
+    );
+    assert!(
+        leases
+            .iter()
+            .any(|lease| lease.session_id == second.id && lease.path == "src/owned.rs")
+    );
+    assert!(
+        leases
+            .iter()
+            .any(|lease| lease.session_id == second.id && lease.path == "manual.txt")
+    );
+
+    std::fs::write(first_tree.join("README.md"), "fixture\n").unwrap();
+    broker.refresh_leases().unwrap();
+    let leases = broker.store().active_leases().unwrap();
+    assert!(
+        !leases
+            .iter()
+            .any(|lease| lease.session_id == first.id && lease.path == "README.md")
+    );
+    assert!(
+        leases
+            .iter()
+            .any(|lease| lease.session_id == second.id && lease.path == "src/owned.rs")
+    );
+    assert!(
+        leases
+            .iter()
+            .any(|lease| lease.session_id == second.id && lease.path == "manual.txt")
+    );
+}
+
+#[test]
 fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
     let tmp = fixture();
     let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
