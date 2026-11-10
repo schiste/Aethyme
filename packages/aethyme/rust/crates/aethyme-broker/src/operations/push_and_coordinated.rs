@@ -2216,6 +2216,7 @@ impl Broker {
         // Starts before any preparation, so what preparation spends is taken
         // out of what the lock may wait (#219).
         let admission = AdmissionDeadline::start(queue_wait);
+        normalize_repeated_program_name(request.provider, &mut request.args);
         if request.args.is_empty() {
             return Err(BrokerOpError::InvalidCoordinatedOperation {
                 reason: format!(
@@ -2224,7 +2225,6 @@ impl Broker {
                 ),
             });
         }
-        refuse_repeated_program_name(request.provider, &request.args)?;
         if request.provider == OperationProvider::Git {
             refuse_code_executing_git_options(&request.args)?;
         }

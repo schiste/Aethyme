@@ -1417,29 +1417,34 @@ fn humanize_ms_reads_at_every_scale() {
 }
 
 #[test]
-fn a_repeated_program_name_is_refused_before_classification() {
-    assert!(
-        refuse_repeated_program_name(OperationProvider::Git, &args(&["git", "add", "x"])).is_err()
+fn repeated_program_names_are_normalized_before_classification() {
+    let mut git = args(&["git", "push", "origin", "main"]);
+    normalize_repeated_program_name(OperationProvider::Git, &mut git);
+    assert_eq!(git, args(&["push", "origin", "main"]));
+    assert_eq!(
+        classify_git(&git),
+        classify_git(&args(&["push", "origin", "main"]))
     );
-    assert!(
-        refuse_repeated_program_name(
-            OperationProvider::Git,
-            &args(&["-C", "/tmp/r", "git", "status"])
-        )
-        .is_err()
-    );
-    assert!(
-        refuse_repeated_program_name(OperationProvider::Github, &args(&["gh", "pr", "merge"]))
-            .is_err()
-    );
-    assert!(
-        refuse_repeated_program_name(OperationProvider::Git, &args(&["push", "origin", "main"]))
-            .is_ok()
-    );
-    assert!(
-        refuse_repeated_program_name(OperationProvider::Github, &args(&["pr", "view", "1"]))
-            .is_ok()
-    );
+
+    let mut with_directory = args(&["-C", "/tmp/r", "git", "status"]);
+    normalize_repeated_program_name(OperationProvider::Git, &mut with_directory);
+    assert_eq!(with_directory, args(&["-C", "/tmp/r", "status"]));
+
+    let mut gh = args(&["gh", "pr", "merge", "1"]);
+    normalize_repeated_program_name(OperationProvider::Github, &mut gh);
+    assert_eq!(gh, args(&["pr", "merge", "1"]));
+    assert_eq!(classify_gh(&gh), classify_gh(&args(&["pr", "merge", "1"])));
+
+    let mut normal = args(&["status"]);
+    normalize_repeated_program_name(OperationProvider::Git, &mut normal);
+    assert_eq!(normal, args(&["status"]));
+    let mut dangerous = args(&["git", "-c", "alias.p=!echo unsafe", "p"]);
+    normalize_repeated_program_name(OperationProvider::Git, &mut dangerous);
+    assert!(refuse_code_executing_git_options_with_env(&dangerous, |_| false).is_err());
+
+    let mut empty = args(&["git"]);
+    normalize_repeated_program_name(OperationProvider::Git, &mut empty);
+    assert!(empty.is_empty());
 }
 
 #[test]
