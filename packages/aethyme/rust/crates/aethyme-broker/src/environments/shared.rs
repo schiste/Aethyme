@@ -58,26 +58,37 @@ use super::spec::{EnvironmentsFile, HostEnvironmentsFile, RedeployOn, SharedSpec
 use super::store::{EnvironmentPhase, EnvironmentRecord, StoreError, Transition};
 use super::{ENVIRONMENTS_FILE, parse_loaded};
 
-/// Back off repeated automatic failures for the same revision, without
-/// delaying a new revision or an explicit operator redeploy. History is
-/// persisted, so restarting the supervisor does not reset the delay.
+/// Back off repeated automatic failures of the current revision. Identical
+/// errors on earlier revisions count too, but each new revision gets one
+/// attempt. Persisted history keeps the delay across supervisor restarts.
 fn automatic_retry_after(history: &[Transition], commit: &str) -> Option<i64> {
     let mut failures = 0u32;
     let mut last = None;
+    let mut error_message: Option<&str> = None;
     for transition in history.iter().rev() {
         match transition.reason.as_str() {
             "redeployed" => break,
             "redeploy build failed" | "redeploy rolled back" => {
-                if transition
-                    .detail
-                    .as_ref()
+                let detail = transition.detail.as_ref();
+                let failed_commit = detail
                     .and_then(|d| d.get("failed_commit"))
-                    .and_then(|v| v.as_str())
-                    != Some(commit)
+                    .and_then(|v| v.as_str());
+                let message = detail
+                    .and_then(|d| d.get("message"))
+                    .and_then(|v| v.as_str());
+                if failures == 0 {
+                    if failed_commit != Some(commit) {
+                        break;
+                    }
+                    last = Some(transition.at);
+                    error_message = message;
+                } else if failed_commit != Some(commit)
+                    && (error_message.is_none() || message != error_message)
                 {
                     break;
+                } else if error_message.is_some() && message != error_message {
+                    break;
                 }
-                last.get_or_insert(transition.at);
                 failures += 1;
             }
             _ => {}
@@ -1406,8 +1417,8 @@ impl Lifecycle {
                 }
             }
             // Only the supervisor applies failure backoff. Explicit redeploys
-            // retain their existing debounce/--force behaviour, and a new
-            // commit is never held back by failures of the previous one.
+            // retain their existing debounce/--force behaviour. A new commit
+            // gets an attempt before previous identical failures count.
             if let Ok(sha) = resolve_ref(main_root, &spec.reference) {
                 let history = match self.store.transitions(&record.env_id, 200) {
                     Ok(history) => history,
@@ -1636,6 +1647,21 @@ mod operation_key_tests {
         );
         history.push(transition("redeployed", "", 5_000));
         assert_eq!(automatic_retry_after(&history, "a"), None);
+    }
+
+    #[test]
+    fn identical_errors_across_revisions_back_off_after_the_new_revision_fails() {
+        let mut first = transition("redeploy build failed", "a", 1_000);
+        first.detail = Some(serde_json::json!({"failed_commit": "a", "message": "TLS failure"}));
+        let mut second = transition("redeploy build failed", "b", 2_000);
+        second.detail = Some(serde_json::json!({"failed_commit": "b", "message": "TLS failure"}));
+        assert_eq!(automatic_retry_after(&[first.clone()], "b"), None);
+        assert_eq!(
+            automatic_retry_after(&[first.clone(), second.clone()], "b"),
+            Some(2_000 + 30 * 60_000)
+        );
+        second.detail = Some(serde_json::json!({"failed_commit": "b", "message": "different"}));
+        assert_eq!(automatic_retry_after(&[first, second], "b"), None);
     }
 
     #[test]
