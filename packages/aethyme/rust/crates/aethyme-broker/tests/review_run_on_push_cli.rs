@@ -317,7 +317,17 @@ fn nothing_runs_when_run_on_push_is_off() {
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .find(|metric| metric["command"] == "push")
         .expect("push metric exists");
-    for phase in ["broker_open", "push_session", "review_on_push"] {
+    for phase in [
+        "broker_open",
+        "push_session",
+        "review_on_push",
+        "push_preflight",
+        "push_git",
+        "push_pr_and_watch",
+        "push_default_branch",
+        "push_overlap",
+        "push_finalization",
+    ] {
         assert!(
             metric["phase_timings_ms"][phase].as_u64().is_some(),
             "missing {phase}: {metric}"
