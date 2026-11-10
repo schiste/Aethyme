@@ -150,6 +150,18 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             });
             omitted_unrelated_advice = before - brief.advice.len();
             context.session_contexts.retain(|(id, _)| *id == session_id);
+            // Keep global counts and safety warnings, but reserve the bounded
+            // detail slots for the caller's own coordination first.
+            brief
+                .waiters
+                .sort_by_key(|waiter| waiter.session_id != Some(session_id));
+            context.lease_release_requests.sort_by_key(|request| {
+                request.requester_session_id != session_id
+                    && request.holder_session_id != session_id
+            });
+            context
+                .coordinated_operations
+                .sort_by_key(|operation| operation.session_id != session_id);
         }
         brief.phase_timings_ms.insert(
             "context_records".into(),
