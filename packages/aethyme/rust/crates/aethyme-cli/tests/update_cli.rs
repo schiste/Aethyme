@@ -176,7 +176,10 @@ fn write_executable_pair_manifest(root: &Path, version: &str, engine_version: &s
 }
 
 fn install_managed_current(root: &Path) -> std::path::PathBuf {
-    let install_dir = root.join("install/bin");
+    // macOS TMPDIR normally begins with /var, a symlink to /private/var.
+    // The runtime lock deliberately requires a canonical managed root, just
+    // as the installer provides in production.
+    let install_dir = fs::canonicalize(root).unwrap().join("install/bin");
     let managed = install_dir.join(".aethyme-managed");
     let bundle = managed.join("versions/v0.2.0-current");
     fs::create_dir_all(&bundle).unwrap();
