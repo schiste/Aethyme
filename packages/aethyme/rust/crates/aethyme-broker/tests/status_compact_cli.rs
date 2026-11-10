@@ -392,3 +392,23 @@ fn session_focused_status_keeps_global_safety_information_and_checks_identity() 
     assert_eq!(implicit["schema"], focused["schema"]);
     assert_eq!(warnings(&implicit), warnings(&focused));
 }
+
+#[test]
+fn compact_revision_returns_safe_deltas_and_resets_on_scope_change() {
+    let fixture = common::FixtureRepository::new();
+    init_repo(fixture.path());
+    let initial = json_status(fixture.path(), &["status", "--compact", "--json"]);
+    let revision = initial["revision"].as_str().unwrap();
+    let next = json_status(
+        fixture.path(),
+        &["status", "--since-revision", revision, "--json"],
+    );
+    assert_eq!(next["schema"], "aethyme.broker-status-delta/v1");
+    assert_eq!(next["data_freshness"]["deferred_checks_are_unknown"], true);
+    let reset = json_status(
+        fixture.path(),
+        &["status", "--since-revision", "invalid", "--json"],
+    );
+    assert_eq!(reset["revision_reset"], true);
+    assert_eq!(reset["schema"], "aethyme.broker-status-compact/v1");
+}
