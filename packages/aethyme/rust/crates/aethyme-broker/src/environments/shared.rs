@@ -55,8 +55,42 @@ use super::compile::{CompileContext, CompiledEnvironment, EnvironmentOwner, comp
 use super::exec::DriverError;
 use super::lifecycle::{Lifecycle, LifecycleError, UpOptions, export_commit, now_ms};
 use super::spec::{EnvironmentsFile, HostEnvironmentsFile, RedeployOn, SharedSpec};
-use super::store::{EnvironmentPhase, EnvironmentRecord, StoreError};
+use super::store::{EnvironmentPhase, EnvironmentRecord, StoreError, Transition};
 use super::{ENVIRONMENTS_FILE, parse_loaded};
+
+/// Back off repeated automatic failures for the same revision, without
+/// delaying a new revision or an explicit operator redeploy. History is
+/// persisted, so restarting the supervisor does not reset the delay.
+fn automatic_retry_after(history: &[Transition], commit: &str) -> Option<i64> {
+    let mut failures = 0u32;
+    let mut last = None;
+    for transition in history.iter().rev() {
+        match transition.reason.as_str() {
+            "redeployed" => break,
+            "redeploy build failed" | "redeploy rolled back" => {
+                if transition
+                    .detail
+                    .as_ref()
+                    .and_then(|d| d.get("failed_commit"))
+                    .and_then(|v| v.as_str())
+                    != Some(commit)
+                {
+                    break;
+                }
+                last.get_or_insert(transition.at);
+                failures += 1;
+            }
+            _ => {}
+        }
+    }
+    // The normal minimum interval already covers the first failure. Grow
+    // from 30 minutes to a maximum of six hours on subsequent failures.
+    if failures < 2 {
+        return None;
+    }
+    let minutes = 30_i64 * (1_i64 << (failures - 2).min(4));
+    last.map(|at| at.saturating_add(minutes.min(360) * 60_000))
+}
 
 pub const SHARED_DIRECTORY: &str = "shared";
 /// Written into every shared export: the commit it was exported from. An
@@ -1371,6 +1405,23 @@ impl Lifecycle {
                     }
                 }
             }
+            // Only the supervisor applies failure backoff. Explicit redeploys
+            // retain their existing debounce/--force behaviour, and a new
+            // commit is never held back by failures of the previous one.
+            if let Ok(sha) = resolve_ref(main_root, &spec.reference) {
+                let history = match self.store.transitions(&record.env_id, 200) {
+                    Ok(history) => history,
+                    Err(error) => {
+                        actions.push(format!(
+                            "skipped redeploy of {shared}: cannot read retry history: {error}"
+                        ));
+                        continue;
+                    }
+                };
+                if automatic_retry_after(&history, &sha).is_some_and(|until| now_ms() < until) {
+                    continue;
+                }
+            }
             // One environment's failure never stops the others.
             match self.shared_redeploy(
                 main_root,
@@ -1550,8 +1601,42 @@ fn proxied_url(root: &Path, record: &EnvironmentRecord, proxy_port: u16) -> Opti
 
 #[cfg(test)]
 mod operation_key_tests {
-    use super::{SharedSpec, declared_spec_for_owner, shared_operation_key};
+    use super::{SharedSpec, automatic_retry_after, declared_spec_for_owner, shared_operation_key};
     use crate::environments::spec::RedeployOn;
+    use crate::environments::store::{EnvironmentPhase, Transition};
+
+    fn transition(reason: &str, commit: &str, at: i64) -> Transition {
+        Transition {
+            seq: at,
+            env_id: "baseline".into(),
+            from: None,
+            to: EnvironmentPhase::Active,
+            reason: reason.into(),
+            actor: "test".into(),
+            at,
+            detail: Some(serde_json::json!({"failed_commit": commit})),
+        }
+    }
+
+    #[test]
+    fn automatic_failure_backoff_tracks_revision_and_survives_unrelated_events() {
+        let mut history = vec![transition("redeploy build failed", "a", 1_000)];
+        assert_eq!(automatic_retry_after(&history, "a"), None);
+        history.push(transition("other event", "", 2_000));
+        history.push(transition("redeploy rolled back", "a", 3_000));
+        assert_eq!(
+            automatic_retry_after(&history, "a"),
+            Some(3_000 + 30 * 60_000)
+        );
+        assert_eq!(automatic_retry_after(&history, "b"), None);
+        history.push(transition("redeploy build failed", "a", 4_000));
+        assert_eq!(
+            automatic_retry_after(&history, "a"),
+            Some(4_000 + 60 * 60_000)
+        );
+        history.push(transition("redeployed", "", 5_000));
+        assert_eq!(automatic_retry_after(&history, "a"), None);
+    }
 
     #[test]
     fn shared_operation_key_is_stable_and_scoped_by_repository_and_name() {
