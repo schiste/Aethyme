@@ -384,9 +384,11 @@ fn session_focused_status_keeps_global_safety_information_and_checks_identity() 
         &["status", "--compact", "--json", "--session", "999999999"],
     );
     assert!(!unknown.status.success());
-    let invalid = run_status(
+    let implicit = json_status(
         fixture.path(),
         &["status", "--json", "--session", &session_id],
     );
-    assert!(!invalid.status.success());
+    assert_eq!(implicit["focus"]["session_id"], session.id);
+    assert_eq!(implicit["schema"], focused["schema"]);
+    assert_eq!(warnings(&implicit), warnings(&focused));
 }

@@ -70,11 +70,9 @@ pub(super) fn run_readiness(parsed: Parsed) -> Result<(), UsageError> {
 
 /// `broker status`.
 pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
-    if parsed.session.is_some()
-        && (parsed.summary || parsed.refresh || (parsed.json && !parsed.compact))
-    {
+    if parsed.session.is_some() && (parsed.summary || parsed.refresh) {
         return Err(UsageError::Message(
-            "--session is supported by compact status only; use --compact with --json".into(),
+            "--session cannot be combined with --summary or --refresh".into(),
         ));
     }
     if parsed.refresh && parsed.summary {
@@ -100,7 +98,8 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         ));
     }
     let opened = std::time::Instant::now();
-    let routine = !parsed.refresh && (parsed.compact || parsed.summary || !parsed.json);
+    let routine = !parsed.refresh
+        && (parsed.compact || parsed.summary || parsed.session.is_some() || !parsed.json);
     let mut broker = if routine {
         let cwd = std::env::current_dir()
             .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;
@@ -112,7 +111,10 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
     // Routine text is the compact, recorded-observation path. Full JSON stays
     // on the established StatusView contract; --compact opts JSON callers into
     // the separate versioned envelope below.
-    if parsed.compact || (!parsed.json && !parsed.summary && !parsed.refresh) {
+    if parsed.compact
+        || parsed.session.is_some()
+        || (!parsed.json && !parsed.summary && !parsed.refresh)
+    {
         let mut brief = if parsed.read_only_snapshot {
             broker.status_brief_snapshot(now_ms())?
         } else {

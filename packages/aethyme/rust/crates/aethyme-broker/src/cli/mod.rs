@@ -814,7 +814,7 @@ Usage:
       session records use `agents[].id` for every --session flag. The legacy
       --summary --json shape is unchanged; --summary text remains brief.
       --session focuses compact status on one session while preserving global
-      warnings, blockers and counts. Pair it with --compact for JSON.
+      warnings, blockers and counts, including with --json.
       --refresh explicitly performs the expensive full lease, conflict and
       cleanup audit; use it when needed.
   aethyme broker events [--since <id>] [--kind <prefix>] [--follow] [--json]
@@ -1159,7 +1159,7 @@ fn routine_status(args: &[String]) -> bool {
             .any(|arg| matches!(arg.as_str(), "--json" | "--json-output"))
             || args
                 .iter()
-                .any(|arg| matches!(arg.as_str(), "--summary" | "--compact")))
+                .any(|arg| matches!(arg.as_str(), "--summary" | "--compact" | "--session")))
 }
 
 /// Dispatch an internal command with the router-selected compatibility mode.
