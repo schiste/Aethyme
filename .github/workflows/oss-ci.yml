@@ -761,10 +761,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
       - name: Generate versioned release guidance
         run: |
           cargo build --locked --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-cli -p aethyme-engine
+          git show c774893e3b23c80b359926e84cdf4b12e3f41fa5:.github/workflows/oss-ci.yml > .github/workflows/oss-ci.yml
+          git add .github/workflows/oss-ci.yml
           packages/aethyme/rust/target/debug/aethyme deploy --generated-only --repo "$PWD"
           git diff --binary > /tmp/aethyme-release-guidance.patch
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
