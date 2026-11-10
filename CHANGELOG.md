@@ -4,6 +4,19 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.67] - 2026-11-10
+
+**Breaking:** Previously refused repeated `git` and `gh` command names are now accepted, and focused status exposes new revision options and output. See [upgrade and rollback guidance](UPGRADING.md#v0867).
+
+### Added
+
+- Add session-focused compact status and scoped revision deltas (#1565).
+
+### Fixed
+
+- Back off repeated automatic shared-environment deployment failures (#1567).
+- Accept redundant Git and GitHub program names in coordinated commands while preserving safety checks (#1568).
+
 ## [0.8.66] - 2026-11-09
 
 ### Added
