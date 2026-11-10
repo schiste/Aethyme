@@ -1715,6 +1715,13 @@ pub(super) fn run_prepare(parsed: Parsed) -> Result<(), UsageError> {
                 .unwrap_or_default();
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             let report = broker.prepare_session(session_id, parsed.offline, wait)?;
+            telemetry::set_command_metric_details(serde_json::json!({
+                "preparation": {
+                    "shared_cache_coordinated": report.shared_cache_coordinated,
+                    "shared_cache_wait_ms": report.shared_cache_wait_ms,
+                    "steps": report.steps,
+                }
+            }));
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&report)?);
             } else {

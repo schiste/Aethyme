@@ -988,13 +988,11 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
     let review_started = std::time::Instant::now();
     report.review_run = review_on_push(broker.main_root(), &report);
     let review_ms = review_started.elapsed().as_millis() as u64;
-    telemetry::set_command_metric_details(serde_json::json!({
-        "phase_timings_ms": {
-            "broker_open": open_ms,
-            "push_session": push_ms,
-            "review_on_push": review_ms,
-        }
-    }));
+    let mut phases = report.phase_timings_ms.clone();
+    phases.insert("broker_open".into(), open_ms);
+    phases.insert("push_session".into(), push_ms);
+    phases.insert("review_on_push".into(), review_ms);
+    telemetry::set_command_metric_details(serde_json::json!({"phase_timings_ms": phases}));
     if parsed.json {
         out!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -1327,6 +1325,8 @@ fn review_run_args(report: &crate::SessionPushReport, pull_request: i64) -> Vec<
         "--pr".into(),
         pull_request.to_string(),
         "--from-provider".into(),
+        "--head".into(),
+        report.pushed_oid.clone(),
         "--json".into(),
     ]
 }
@@ -1703,6 +1703,7 @@ mod review_on_push_tests {
             pr_watch_note: None,
             pr_size: None,
             review_run: None,
+            phase_timings_ms: Default::default(),
             repository: "acme/product".into(),
         }
     }
@@ -1789,7 +1790,10 @@ mod review_on_push_tests {
         );
         assert_eq!(
             run["rerun"],
-            "aethyme broker advanced review run --session 12 --repo acme/product --pr 7 --from-provider"
+            format!(
+                "aethyme broker advanced review run --session 12 --repo acme/product --pr 7 --from-provider --head {}",
+                "a".repeat(40)
+            )
         );
     }
 
