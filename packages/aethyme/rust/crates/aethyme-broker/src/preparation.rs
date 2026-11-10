@@ -594,12 +594,21 @@ impl Broker {
                 return Ok(invalid_status(session_id, error.to_string()));
             }
         };
+        self.preparation_status_for_config(session_id, root, &config)
+    }
+
+    fn preparation_status_for_config(
+        &self,
+        session_id: i64,
+        root: &Path,
+        config: &PreparationConfig,
+    ) -> Result<PreparationStatus, BrokerOpError> {
         let hook_required = config.steps.iter().any(|step| step.required_for_hooks);
-        let source_digest = match preparation_source_digest(root, &config, session_id) {
+        let source_digest = match preparation_source_digest(root, config, session_id) {
             Ok(digest) => digest,
             Err(error) => return Ok(invalid_status(session_id, error.to_string())),
         };
-        let missing_outputs = missing_outputs(root, &config)?;
+        let missing_outputs = missing_outputs(root, config)?;
         let record = read_record(&record_path(self.main_root(), session_id))?;
         let (state, reason, recorded_digest, recorded_source_digest) = match record {
             None => (
@@ -676,11 +685,16 @@ impl Broker {
             path: PREPARATION_CONFIG_RELPATH.into(),
             reason: "repository declares no preparation steps".into(),
         })?;
-        let source_digest = preparation_source_digest(&root, &config, session_id)?;
-        // The report digest is defined as the hash of the source digest.
-        // Reuse the bytes already read rather than hashing every input twice.
+        // Status and execution must use the same parsed configuration and
+        // fingerprint. Hashing it once avoids re-reading every input on each
+        // preparation, including when the checkout is already current.
+        let status = self.preparation_status_for_config(session_id, &root, &config)?;
+        let source_digest = match status.source_digest.as_ref() {
+            Some(digest) => digest.clone(),
+            // Preserve the original detailed error for invalid inputs.
+            None => preparation_source_digest(&root, &config, session_id)?,
+        };
         let digest = hash_text(&source_digest);
-        let status = self.preparation_status(session_id)?;
         if status.state == PreparationState::Current {
             return Ok(PreparationReport {
                 schema_version: PREPARATION_REPORT_SCHEMA_VERSION,
