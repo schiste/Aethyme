@@ -2054,7 +2054,7 @@ fn exit_codes_name_the_outcome_an_agent_acts_on() {
 // after `--` is refused plainly instead of steering the caller toward a
 // stronger --effect.
 #[test]
-fn host_failures_exit_environment_and_a_repeated_git_is_refused() {
+fn host_failures_exit_environment_and_a_repeated_git_is_accepted() {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
@@ -2133,12 +2133,8 @@ fn host_failures_exit_environment_and_a_repeated_git_is_refused() {
             "status",
         ],
     );
-    assert_eq!(
-        repeated.status.code(),
-        Some(i32::from(aethyme_broker::exit_status::REFUSED))
-    );
     assert!(
-        String::from_utf8_lossy(&repeated.stderr).contains("drop the leading `git`"),
+        repeated.status.success(),
         "{}",
         String::from_utf8_lossy(&repeated.stderr)
     );

@@ -2635,30 +2635,19 @@ fn config_key_executes_code(key: &str) -> bool {
         || CODE_EXECUTING_CONFIG_KEYS.contains(&key.as_str())
 }
 
-/// `broker git -- git push` runs `git git push`. Refuse it plainly: otherwise
-/// the command reads as an unrecognized subcommand, the caller raises its
-/// declared effect to get past that, and the failed write then blocks the
-/// repository as an unknown outcome (seen twice on 2026-09-23).
-pub(crate) fn refuse_repeated_program_name(
-    provider: OperationProvider,
-    args: &[String],
-) -> Result<(), BrokerOpError> {
-    let (program, first) = match provider {
-        OperationProvider::Git => (
-            "git",
-            git_subcommand_index(args).and_then(|index| args.get(index)),
-        ),
-        OperationProvider::Github => ("gh", args.first()),
+/// Accept the common `broker advanced git -- git push` spelling. Strip
+/// only the provider's own program token, before any routing, safety checks,
+/// classification, journaling or execution use the arguments.
+pub(crate) fn normalize_repeated_program_name(provider: OperationProvider, args: &mut Vec<String>) {
+    let (program, index) = match provider {
+        OperationProvider::Git => ("git", git_subcommand_index(args)),
+        OperationProvider::Github => ("gh", (!args.is_empty()).then_some(0)),
     };
-    if first.is_some_and(|arg| arg == program) {
-        return Err(BrokerOpError::InvalidCoordinatedOperation {
-            reason: format!(
-                "the broker already runs `{program}`; drop the leading `{program}` after `--` \
-                 (write `broker {program} ... -- <args>`, not `-- {program} <args>`)"
-            ),
-        });
+    if let Some(index) = index
+        && args.get(index).is_some_and(|arg| arg == program)
+    {
+        args.remove(index);
     }
-    Ok(())
 }
 
 /// Refuse global options that change what a coordinated Git command executes.
