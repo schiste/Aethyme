@@ -1602,34 +1602,60 @@ impl Broker {
         }
         coordinating.extend(acting);
         let mut pending_implicit_leases = Vec::new();
-        for session in self.store.live_sessions()? {
-            if let Some(preparation) = preparation {
-                preparation.check()?;
+        let sessions = self.store.live_sessions()?;
+        if preparation.is_none() {
+            // Git reads for distinct checkouts are independent. Keep a small
+            // bound on concurrent scans and persist results in session order;
+            // the deadline-sensitive claim path below remains sequential.
+            let coordinating_sessions: Vec<_> = sessions
+                .iter()
+                .filter(|session| coordinating.contains(&session.id))
+                .collect();
+            for pair in coordinating_sessions.chunks(2) {
+                let results = scan_pair(pair, |session| {
+                    implicit_lease_paths(
+                        session,
+                        &rules,
+                        integration.as_deref(),
+                        upstream.as_deref(),
+                    )
+                });
+                for (session, paths) in pair.iter().zip(results) {
+                    if let Some(paths) = paths {
+                        self.store.set_implicit_leases(session.id, &paths)?;
+                    }
+                }
             }
-            if !coordinating.contains(&session.id) {
-                continue;
-            }
-            let Some(paths) = implicit_lease_paths(
-                &session,
-                &rules,
-                integration.as_deref(),
-                upstream.as_deref(),
-            ) else {
+        } else {
+            for session in sessions {
                 if let Some(preparation) = preparation {
-                    // `integration_tip`, `upstream_default`, baseline and
-                    // changed-file helpers deliberately hide ordinary Git
-                    // failures behind `Option`. A timeout is different: a
-                    // lease claim must stop rather than treating that
-                    // incomplete scan as an empty or absent worktree.
                     preparation.check()?;
                 }
-                continue;
-            };
-            if let Some(preparation) = preparation {
-                preparation.check()?;
-                pending_implicit_leases.push((session.id, paths));
-            } else {
-                self.store.set_implicit_leases(session.id, &paths)?;
+                if !coordinating.contains(&session.id) {
+                    continue;
+                }
+                let Some(paths) = implicit_lease_paths(
+                    &session,
+                    &rules,
+                    integration.as_deref(),
+                    upstream.as_deref(),
+                ) else {
+                    if let Some(preparation) = preparation {
+                        // `integration_tip`, `upstream_default`, baseline and
+                        // changed-file helpers deliberately hide ordinary Git
+                        // failures behind `Option`. A timeout is different: a
+                        // lease claim must stop rather than treating that
+                        // incomplete scan as an empty or absent worktree.
+                        preparation.check()?;
+                    }
+                    continue;
+                };
+                if let Some(preparation) = preparation {
+                    preparation.check()?;
+                    pending_implicit_leases.push((session.id, paths));
+                } else {
+                    self.store.set_implicit_leases(session.id, &paths)?;
+                }
             }
         }
         if let Some(preparation) = preparation {
@@ -3987,6 +4013,39 @@ struct GuardedCommandResult {
     timed_out: bool,
     command_started: bool,
     process_group_cleanup: &'static str,
+}
+
+// Run at most two independent checkout scans at a time and preserve input
+// ordering. A missing scan stays missing rather than becoming an empty lease.
+fn scan_pair<T: Sync, R: Send>(items: &[T], scan: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    std::thread::scope(|scope| {
+        let scan = &scan;
+        let handles: Vec<_> = items
+            .iter()
+            .map(|item| scope.spawn(move || scan(item)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("checkout scan panicked"))
+            .collect()
+    })
+}
+
+#[cfg(test)]
+mod parallel_lease_scan_tests {
+    use super::scan_pair;
+    use std::sync::Barrier;
+
+    #[test]
+    fn paired_scans_run_concurrently_and_keep_order_and_missing_results() {
+        let barrier = Barrier::new(2);
+        let values = [1, 2];
+        let results = scan_pair(&values, |value| {
+            barrier.wait();
+            if *value == 1 { Some(vec!["a"]) } else { None }
+        });
+        assert_eq!(results, vec![Some(vec!["a"]), None]);
+    }
 }
 
 /// The paths a lease refresh records as `session`'s implicit leases, or
