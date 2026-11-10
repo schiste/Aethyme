@@ -384,9 +384,57 @@ fn session_focused_status_keeps_global_safety_information_and_checks_identity() 
         &["status", "--compact", "--json", "--session", "999999999"],
     );
     assert!(!unknown.status.success());
-    let invalid = run_status(
+    let implicit = json_status(
         fixture.path(),
         &["status", "--json", "--session", &session_id],
     );
-    assert!(!invalid.status.success());
+    assert_eq!(implicit["focus"]["session_id"], session.id);
+    assert_eq!(implicit["schema"], focused["schema"]);
+    assert_eq!(warnings(&implicit), warnings(&focused));
+}
+
+#[test]
+fn compact_revision_returns_safe_deltas_and_resets_on_scope_change() {
+    let fixture = common::FixtureRepository::new();
+    init_repo(fixture.path());
+    let initial = json_status(fixture.path(), &["status", "--compact", "--json"]);
+    let revision = initial["revision"].as_str().unwrap();
+    let next = json_status(
+        fixture.path(),
+        &["status", "--since-revision", revision, "--json"],
+    );
+    assert_eq!(next["schema"], "aethyme.broker-status-delta/v1");
+    assert_eq!(next["data_freshness"]["deferred_checks_are_unknown"], true);
+    let reset = json_status(
+        fixture.path(),
+        &["status", "--since-revision", "invalid", "--json"],
+    );
+    assert_eq!(reset["revision_reset"], true);
+    assert_eq!(reset["schema"], "aethyme.broker-status-compact/v1");
+}
+
+#[test]
+fn focused_status_prioritizes_the_callers_waiters_without_hiding_global_counts() {
+    let fixture = common::FixtureRepository::new();
+    init_repo(fixture.path());
+    let mut broker = common::open_fixture_repository_broker(&fixture).unwrap();
+    let worktree = add_worktree(fixture.path(), &fixture.worktree_root(), "focused-waiter");
+    let session = broker.adopt(&worktree, Some("focused-waiter")).unwrap();
+    drop(broker);
+    let waits = fixture.path().join(".aethyme/run/waits");
+    std::fs::create_dir_all(&waits).unwrap();
+    for index in 0..12 {
+        let waiter = serde_json::json!({
+            "pid": std::process::id(),
+            "session_id": if index == 11 { session.id } else { 987654 },
+            "kind": "lease", "resource": format!("path-{index}"),
+            "holder": "fixture", "started_at_ms": if index == 11 { 2 } else { 1 }
+        });
+        std::fs::write(waits.join(format!("{index}.json")), waiter.to_string()).unwrap();
+    }
+    let id = session.id.to_string();
+    let status = json_status(fixture.path(), &["status", "--session", &id, "--json"]);
+    assert_eq!(status["waiters"]["count"], 12);
+    assert_eq!(status["waiters"]["omitted_count"], 2);
+    assert_eq!(status["waiters"]["records"][0]["session_id"], session.id);
 }

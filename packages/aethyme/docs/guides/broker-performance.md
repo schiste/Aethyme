@@ -238,3 +238,15 @@ compilation cost for much larger archives; enabling it is not established as an
 improvement by a dependency-cache hit. A future lightweight checker should share
 the existing policy implementation and qualify both verdict parity and complete
 job timing before replacing the current path.
+
+### Incremental compact status
+
+Compact JSON includes a `revision` bound to its repository and optional session.
+Pass it with `status --since-revision <revision> --json` (and the same `--session`
+when focused) to receive replacement values only for changed compact sections.
+A `null` replacement removes an optional section. The response always includes
+current deferred-check information; an unchanged section is not proof that
+external state was freshly inspected. A malformed or mismatched token returns a
+full compact snapshot with `revision_reset: true`. Timings are excluded from
+revision comparisons. This protocol reduces repeated output; it still computes
+the compact snapshot on each call and does not promise a compute speedup.

@@ -85,6 +85,7 @@ pub(super) const VALUE_FLAGS: &[&str] = &[
     "--service-directory",
     "--short-name",
     "--since",
+    "--since-revision",
     "--source",
     "--state",
     "--status",
@@ -607,7 +608,13 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ),
     (
         "status",
-        &["--summary", "--refresh", "--compact", "--session"],
+        &[
+            "--summary",
+            "--refresh",
+            "--compact",
+            "--session",
+            "--since-revision",
+        ],
     ),
     ("events", &["--since", "--kind", "--follow"]),
     ("events prune", &["--keep-days"]),

@@ -29,6 +29,7 @@ mod session;
 mod ship;
 mod status;
 mod status_compact;
+mod status_revision;
 mod submit;
 mod surface;
 mod telemetry;
@@ -807,14 +808,17 @@ Usage:
       queue attestations and per-SHA unrecorded-commit dispositions. The
       template option atomically writes a no-clobber schema-v2 document with
       exact identifiers and deliberately invalid null operator judgments.
-  aethyme broker status [--json] [--compact] [--session <id>] [--summary] [--refresh]
+  aethyme broker status [--json] [--compact] [--session <id>] [--since-revision <token>] [--summary] [--refresh]
       Default text is compact. --compact --json returns a versioned summary
       that groups advice and marks omitted details and deferred checks; those
       checks are unknown, not clean. Full --json retains per-session detail;
       session records use `agents[].id` for every --session flag. The legacy
       --summary --json shape is unchanged; --summary text remains brief.
       --session focuses compact status on one session while preserving global
-      warnings, blockers and counts. Pair it with --compact for JSON.
+      warnings, blockers and counts, including with --json.
+      --since-revision returns changed sections of compact JSON; invalid or
+      differently scoped revisions return a fresh snapshot. Deferred checks
+      remain unknown even when no sections changed.
       --refresh explicitly performs the expensive full lease, conflict and
       cleanup audit; use it when needed.
   aethyme broker events [--since <id>] [--kind <prefix>] [--follow] [--json]
@@ -1144,6 +1148,9 @@ fn routine_status(args: &[String]) -> bool {
                 if args[index] == "--session" {
                     index += 1;
                     valid &= args.get(index).is_some_and(|id| id.parse::<i64>().is_ok());
+                } else if args[index] == "--since-revision" {
+                    index += 1;
+                    valid &= args.get(index).is_some();
                 } else {
                     valid &= matches!(
                         args[index].as_str(),
@@ -1157,9 +1164,12 @@ fn routine_status(args: &[String]) -> bool {
         && (!args
             .iter()
             .any(|arg| matches!(arg.as_str(), "--json" | "--json-output"))
-            || args
-                .iter()
-                .any(|arg| matches!(arg.as_str(), "--summary" | "--compact")))
+            || args.iter().any(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "--summary" | "--compact" | "--session" | "--since-revision"
+                )
+            }))
 }
 
 /// Dispatch an internal command with the router-selected compatibility mode.
@@ -1617,6 +1627,7 @@ struct Parsed {
     summary: bool,
     /// `status --compact`: emit a compact routine response.
     compact: bool,
+    status_revision: Option<String>,
     refresh: bool,
     positional: Vec<String>,
     task: Option<String>,
@@ -1810,6 +1821,7 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         verify_only: false,
         summary: false,
         compact: false,
+        status_revision: None,
         refresh: false,
         positional: Vec::new(),
         task: None,
@@ -1971,6 +1983,15 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
             "--non-interactive" => parsed.non_interactive = true,
             "--summary" => parsed.summary = true,
             "--compact" => parsed.compact = true,
+            "--since-revision" => {
+                parsed.status_revision = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message(
+                            "--since-revision requires a value".into(),
+                        ))?
+                        .clone(),
+                );
+            }
             "--refresh" => parsed.refresh = true,
             "--follow" => parsed.follow = true,
             "--since" => {

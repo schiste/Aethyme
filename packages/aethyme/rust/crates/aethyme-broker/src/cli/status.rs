@@ -70,11 +70,14 @@ pub(super) fn run_readiness(parsed: Parsed) -> Result<(), UsageError> {
 
 /// `broker status`.
 pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
-    if parsed.session.is_some()
-        && (parsed.summary || parsed.refresh || (parsed.json && !parsed.compact))
-    {
+    if parsed.status_revision.is_some() && (!parsed.json || parsed.summary || parsed.refresh) {
         return Err(UsageError::Message(
-            "--session is supported by compact status only; use --compact with --json".into(),
+            "--since-revision requires JSON compact status and cannot be combined with --summary or --refresh".into(),
+        ));
+    }
+    if parsed.session.is_some() && (parsed.summary || parsed.refresh) {
+        return Err(UsageError::Message(
+            "--session cannot be combined with --summary or --refresh".into(),
         ));
     }
     if parsed.refresh && parsed.summary {
@@ -100,7 +103,12 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         ));
     }
     let opened = std::time::Instant::now();
-    let routine = !parsed.refresh && (parsed.compact || parsed.summary || !parsed.json);
+    let routine = !parsed.refresh
+        && (parsed.compact
+            || parsed.summary
+            || parsed.session.is_some()
+            || parsed.status_revision.is_some()
+            || !parsed.json);
     let mut broker = if routine {
         let cwd = std::env::current_dir()
             .map_err(|error| UsageError::Message(format!("cannot resolve cwd: {error}")))?;
@@ -112,7 +120,11 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
     // Routine text is the compact, recorded-observation path. Full JSON stays
     // on the established StatusView contract; --compact opts JSON callers into
     // the separate versioned envelope below.
-    if parsed.compact || (!parsed.json && !parsed.summary && !parsed.refresh) {
+    if parsed.compact
+        || parsed.status_revision.is_some()
+        || parsed.session.is_some()
+        || (!parsed.json && !parsed.summary && !parsed.refresh)
+    {
         let mut brief = if parsed.read_only_snapshot {
             broker.status_brief_snapshot(now_ms())?
         } else {
@@ -138,6 +150,18 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             });
             omitted_unrelated_advice = before - brief.advice.len();
             context.session_contexts.retain(|(id, _)| *id == session_id);
+            // Keep global counts and safety warnings, but reserve the bounded
+            // detail slots for the caller's own coordination first.
+            brief
+                .waiters
+                .sort_by_key(|waiter| waiter.session_id != Some(session_id));
+            context.lease_release_requests.sort_by_key(|request| {
+                request.requester_session_id != session_id
+                    && request.holder_session_id != session_id
+            });
+            context
+                .coordinated_operations
+                .sort_by_key(|operation| operation.session_id != session_id);
         }
         brief.phase_timings_ms.insert(
             "context_records".into(),
@@ -149,17 +173,21 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             .insert("command_total".into(), opened.elapsed().as_millis() as u64);
         let compact = super::status_compact::CompactStatus::from_brief(brief, context);
         if parsed.json {
+            let mut value = serde_json::to_value(&compact)?;
             if let Some(session_id) = parsed.session {
-                let mut value = serde_json::to_value(&compact)?;
                 value["focus"] = serde_json::json!({
                     "session_id": session_id,
                     "unrelated_notice_and_info_omitted": omitted_unrelated_advice,
                     "summary_and_blockers_are_global": true,
                 });
-                out!("{}", serde_json::to_string_pretty(&value)?);
-            } else {
-                out!("{}", serde_json::to_string_pretty(&compact)?);
             }
+            let value = super::status_revision::render(
+                value,
+                broker.main_root(),
+                parsed.session,
+                parsed.status_revision.as_deref(),
+            )?;
+            out!("{}", serde_json::to_string_pretty(&value)?);
         } else {
             if let Some(session_id) = parsed.session {
                 out!(
