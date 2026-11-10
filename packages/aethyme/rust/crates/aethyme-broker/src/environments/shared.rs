@@ -86,8 +86,6 @@ fn automatic_retry_after(history: &[Transition], commit: &str) -> Option<i64> {
                     && (error_message.is_none() || message != error_message)
                 {
                     break;
-                } else if error_message.is_some() && message != error_message {
-                    break;
                 }
                 failures += 1;
             }
@@ -1661,7 +1659,12 @@ mod operation_key_tests {
             Some(2_000 + 30 * 60_000)
         );
         second.detail = Some(serde_json::json!({"failed_commit": "b", "message": "different"}));
-        assert_eq!(automatic_retry_after(&[first, second], "b"), None);
+        assert_eq!(automatic_retry_after(&[first, second.clone()], "b"), None);
+        let older_same_commit = transition("redeploy build failed", "b", 500);
+        assert_eq!(
+            automatic_retry_after(&[older_same_commit, second], "b"),
+            Some(2_000 + 30 * 60_000)
+        );
     }
 
     #[test]
