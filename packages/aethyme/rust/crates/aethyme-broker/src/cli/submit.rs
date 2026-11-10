@@ -1325,6 +1325,8 @@ fn review_run_args(report: &crate::SessionPushReport, pull_request: i64) -> Vec<
         "--pr".into(),
         pull_request.to_string(),
         "--from-provider".into(),
+        "--head".into(),
+        report.pushed_oid.clone(),
         "--json".into(),
     ]
 }
@@ -1788,7 +1790,10 @@ mod review_on_push_tests {
         );
         assert_eq!(
             run["rerun"],
-            "aethyme broker advanced review run --session 12 --repo acme/product --pr 7 --from-provider"
+            format!(
+                "aethyme broker advanced review run --session 12 --repo acme/product --pr 7 --from-provider --head {}",
+                "a".repeat(40)
+            )
         );
     }
 

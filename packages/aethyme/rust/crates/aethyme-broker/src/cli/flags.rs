@@ -275,6 +275,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
             "--base",
             "--tabs-file",
             "--from-provider",
+            "--head",
             "--dry-run",
         ],
     ),

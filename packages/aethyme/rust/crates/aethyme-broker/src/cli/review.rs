@@ -951,6 +951,16 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
         (paths, classification, head, None)
     };
 
+    // Push-triggered runs must never classify a later head as the pushed one.
+    // This check also happens before expiring or creating any ledger rows.
+    if let Some(expected) = parsed.head.as_deref()
+        && expected != head
+    {
+        return Err(UsageError::Message(format!(
+            "pull request {pull_request} is at {head}, not the expected head {expected}; review was not run"
+        )));
+    }
+
     // Before reading anything, stop waiting on reviews nobody is coming back
     // for. This has to happen first: an expired row becomes `abandoned`, which
     // is neither spend nor in flight, so a tick that read either before

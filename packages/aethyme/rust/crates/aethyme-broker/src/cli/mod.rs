@@ -649,7 +649,7 @@ Usage:
       Reads git and .aethyme/config.toml, needs no session, and performs
       nothing. Every review table is off by default, so an unconfigured
       repository plans nothing.
-  aethyme broker review run --session <id> --repo <owner/name> --pr <number> [--base <ref>] [--tabs-file <path>] [--from-provider] [--dry-run]
+  aethyme broker review run --session <id> --repo <owner/name> --pr <number> [--base <ref>] [--tabs-file <path>] [--from-provider] [--head <commit>] [--dry-run]
       Perform one tick of the review router for one pull request: decide as
       `review plan` does but with the spent reviews read from the ledger, the
       in-flight reviews read from a Chau7 tab snapshot, and the pull request

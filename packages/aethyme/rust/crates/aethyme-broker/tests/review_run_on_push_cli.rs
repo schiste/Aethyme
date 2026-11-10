@@ -378,3 +378,27 @@ fn a_failed_review_run_still_lets_the_push_succeed_with_a_warning() {
     );
     assert!(fixture.writes().is_empty());
 }
+
+#[test]
+fn a_push_does_not_review_a_different_provider_head() {
+    let fixture = Fixture::new(true);
+    let (session, branch, head) = fixture.session();
+    let later_head = "b".repeat(40);
+
+    let output = fixture.push(
+        session,
+        &branch,
+        &head,
+        &[("AETHYME_FAKE_PR_HEAD", &later_head)],
+    );
+    let pushed = report(&output);
+    assert_eq!(pushed["pushed_oid"], head);
+    assert_eq!(pushed["review_run"]["performed"], false, "{pushed:#}");
+    assert!(
+        pushed["review_run"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not the expected head")
+    );
+    assert!(fixture.writes().is_empty());
+}
