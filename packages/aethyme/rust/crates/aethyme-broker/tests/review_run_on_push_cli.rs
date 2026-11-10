@@ -317,7 +317,17 @@ fn nothing_runs_when_run_on_push_is_off() {
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .find(|metric| metric["command"] == "push")
         .expect("push metric exists");
-    for phase in ["broker_open", "push_session", "review_on_push"] {
+    for phase in [
+        "broker_open",
+        "push_session",
+        "review_on_push",
+        "push_preflight",
+        "push_git",
+        "push_pr_and_watch",
+        "push_default_branch",
+        "push_overlap",
+        "push_finalization",
+    ] {
         assert!(
             metric["phase_timings_ms"][phase].as_u64().is_some(),
             "missing {phase}: {metric}"
@@ -365,6 +375,30 @@ fn a_failed_review_run_still_lets_the_push_succeed_with_a_warning() {
     assert!(
         stderr.contains("Rerun: aethyme broker advanced review run"),
         "{stderr}"
+    );
+    assert!(fixture.writes().is_empty());
+}
+
+#[test]
+fn a_push_does_not_review_a_different_provider_head() {
+    let fixture = Fixture::new(true);
+    let (session, branch, head) = fixture.session();
+    let later_head = "b".repeat(40);
+
+    let output = fixture.push(
+        session,
+        &branch,
+        &head,
+        &[("AETHYME_FAKE_PR_HEAD", &later_head)],
+    );
+    let pushed = report(&output);
+    assert_eq!(pushed["pushed_oid"], head);
+    assert_eq!(pushed["review_run"]["performed"], false, "{pushed:#}");
+    assert!(
+        pushed["review_run"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("not the expected head")
     );
     assert!(fixture.writes().is_empty());
 }

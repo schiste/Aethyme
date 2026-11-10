@@ -1627,12 +1627,13 @@ impl Broker {
             };
             if let Some(preparation) = preparation {
                 preparation.check()?;
-                pending_implicit_leases.push((session.id, paths));
-            } else {
-                self.store.set_implicit_leases(session.id, &paths)?;
             }
+            pending_implicit_leases.push((session.id, paths));
         }
-        if let Some(preparation) = preparation {
+        if preparation.is_none() {
+            self.store
+                .set_implicit_leases_batch(&pending_implicit_leases)?;
+        } else if let Some(preparation) = preparation {
             preparation.check()?;
             for (session_id, paths) in pending_implicit_leases {
                 preparation.check()?;

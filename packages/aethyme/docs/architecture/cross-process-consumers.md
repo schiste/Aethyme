@@ -1267,6 +1267,20 @@ remain, and shows at most eight changed paths. An ownership refusal can come
 after the command has already changed files, so a consumer must inspect the
 reported paths before retrying.
 
+Successful `broker submit prepare --json` reports `shared_cache_wait_ms`, the
+monotonic time spent acquiring the shared cache grant (zero when no shared
+cache is used). Its command metric adds a `preparation` object with that wait,
+`shared_cache_coordinated`, and the already-reported step results. A current
+preparation has no executed steps and a zero wait. Step names are
+repository-declared; commands and arguments are not logged in this object.
+Failed preparation may have no metric breakdown.
+
+Successful `broker push` command metrics add `push_preflight`, `push_git`,
+`push_pr_and_watch`, `push_default_branch`, `push_overlap`, and
+`push_finalization` to `phase_timings_ms`. These are wall-clock milliseconds
+inside the existing `push_session` phase and must not be added to that total.
+The JSON push report itself is unchanged.
+
 Submit command metrics add `phase_timings_ms` for broker opening, contract
 preflight, ownership auditing, planning, merge simulation, verification slot
 wait, verification checkout setup, graph and gate selection, gate execution,
