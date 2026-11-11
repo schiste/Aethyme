@@ -2302,12 +2302,25 @@ fn build_caches_are_reclaimable_even_when_the_worktree_itself_is_blocked() {
             .all(|worktree| worktree["session_id"].as_i64().unwrap().to_string() != id),
         "a session with unaccepted commits must not be scheduled for removal"
     );
+    // This failed every night and once in a sharded main run (43008303335)
+    // with no trace of what the plan decided instead. Name it, so the next
+    // failure says which blocker or deferral replaced the age blocker.
     let retained_summary = plan["blocker_summary"]
         .as_array()
         .unwrap()
         .iter()
         .find(|summary| summary["kind"] == "retention_age")
-        .expect("a recently closed unproven worktree should be age-blocked");
+        .unwrap_or_else(|| {
+            panic!(
+                "a recently closed unproven worktree should be age-blocked; \
+                 evaluated_at={} blockers={} blocker_summary={} deferred_checks={} worktrees={}",
+                plan["evaluated_at"],
+                plan["blockers"],
+                plan["blocker_summary"],
+                plan["deferred_checks"],
+                plan["worktrees"]
+            )
+        });
     assert_eq!(retained_summary["count"], 1);
     assert!(
         retained_summary["retained_bytes"].as_u64().unwrap() > 0,
