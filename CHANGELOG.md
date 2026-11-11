@@ -4,6 +4,19 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.69] - 2026-11-11
+
+### Added
+
+- Let several sessions prepare against a repository's shared cache at once with `[shared_cache] max_concurrent` (1 to 6, default 1); rotation, sweeps and recovery still hold the cache alone. Set it only when every broker on the host is 0.8.69 or later (#1586).
+- Report an object store with about 25,000 or more loose objects in status advice, and start one background `git gc --no-prune` a day after `broker finish`; `AETHYME_OBJECT_STORE_MAINTENANCE=0` turns it off (#1583).
+- Record how long each phase of every broker command takes, and how often it ran, in command metrics (#1579).
+
+### Fixed
+
+- Give `broker finish` 60 seconds for its Git checks by default instead of 10, which one finish in seven exceeded (#1581).
+- Scan session leases and overlap states in parallel, which roughly halves `broker advanced agents` in a repository with a hundred sessions (#1580, #1582).
+
 ## [0.8.68] - 2026-11-11
 
 ### Added
