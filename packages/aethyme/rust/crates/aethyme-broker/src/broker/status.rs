@@ -1864,12 +1864,17 @@ impl Broker {
         session_head: &str,
     ) -> Option<(String, String)> {
         const FRESHNESS_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-        // A branch the remote lists at this very commit needs no search of
-        // the remote-tracking refs for one that contains it.
-        if let Some(evidence) = self.remote_branch_at_in_pass(session_head) {
-            return Some(evidence);
-        }
         let repo = self.repo_handle();
+        // A branch the remote lists at this very commit, whose tracking ref
+        // agrees, needs no search of every tracking ref for one containing
+        // it. The tracking ref is still required: it is what a push or fetch
+        // left behind, and a remote that is this repository itself lists
+        // local branches that were never pushed anywhere.
+        for remote_ref in self.remote_refs_listed_at_in_pass(session_head) {
+            if repo.resolve_ref(&remote_ref).as_deref() == Some(session_head) {
+                return Some((remote_ref, session_head.to_string()));
+            }
+        }
         for remote_ref in repo.remote_refs_containing(session_head) {
             let Some(rest) = remote_ref.strip_prefix("refs/remotes/") else {
                 continue;
