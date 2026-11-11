@@ -1591,7 +1591,7 @@ mod tests {
         }
         assert!(
             cache.patch_ids.hit_count() > 0,
-            "the second head must reuse target patches"
+            "the second head must reuse what the first learned about the target"
         );
     }
 
@@ -2265,7 +2265,10 @@ mod tests {
                 patch_ids += 1;
             }
         }
-        assert_eq!(logs, 1, "patch_landing lists both sides in one git log");
+        assert_eq!(
+            logs, 2,
+            "patch_landing lists changed paths once, then streams the comparable patches once"
+        );
         assert_eq!(
             patch_ids, 1,
             "work_landed's real patch_landing call shares one patch-id stream"

@@ -216,6 +216,8 @@ pub enum CherrySide {
 #[derive(Debug, Default)]
 pub(crate) struct PatchIdCache {
     entries: std::collections::BTreeMap<(PathBuf, String), Option<String>>,
+    /// Changed-path signatures, see [`GitRepo::commits_sharing_changed_paths`].
+    changed_paths: std::collections::BTreeMap<(PathBuf, String), ChangedPathSignature>,
     #[cfg(test)]
     hits: usize,
 }
@@ -229,6 +231,26 @@ impl PatchIdCache {
 
 /// Cap retained entries; exceeding it only causes a subsequent re-computation.
 const MAX_PATCH_ID_CACHE_ENTRIES: usize = 65_536;
+
+/// Digest of the paths one commit changes against its first parent.
+type ChangedPathSignature = [u8; 32];
+
+fn changed_path_log_args() -> Vec<&'static str> {
+    vec![
+        "log",
+        "--no-walk=unsorted",
+        "--stdin",
+        "--name-only",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ignore-submodules=none",
+        "--no-renames",
+        "--diff-merges=first-parent",
+        // NUL cannot occur in a path line, so it delimits commits exactly.
+        "--format=%x00%H",
+    ]
+}
 
 /// Both side-specific patch-equivalence results for one symmetric range.
 #[derive(Debug, PartialEq, Eq)]
@@ -4968,13 +4990,9 @@ impl GitRepo {
                 .map(|(commit, _)| (commit, false))
                 .collect());
         }
-        let with_parent = listed
-            .iter()
-            .chain(other.iter())
-            .filter(|(_, has_parent)| *has_parent)
-            .map(|(commit, _)| commit.clone())
-            .collect::<Vec<_>>();
-        let patch_ids = self.first_parent_patch_ids(&with_parent)?;
+        let comparable =
+            self.commits_sharing_changed_paths(&listed, &other, &mut PatchIdCache::default())?;
+        let patch_ids = self.first_parent_patch_ids(&comparable)?;
         let other_ids = other
             .iter()
             .filter_map(|(commit, _)| patch_ids.get(commit))
@@ -5030,13 +5048,8 @@ impl GitRepo {
             });
         }
 
-        let with_parent = left
-            .iter()
-            .chain(right.iter())
-            .filter(|(_, has_parent)| *has_parent)
-            .map(|(commit, _)| commit.clone())
-            .collect::<Vec<_>>();
-        let patch_ids = self.cached_first_parent_patch_ids(&with_parent, cache)?;
+        let comparable = self.commits_sharing_changed_paths(&left, &right, cache)?;
+        let patch_ids = self.cached_first_parent_patch_ids(&comparable, cache)?;
         let left_patch_ids = left
             .iter()
             .filter_map(|(commit, _)| patch_ids.get(commit).map(String::as_str))
@@ -5067,6 +5080,131 @@ impl GitRepo {
             left_only: left,
             right_only: right,
         })
+    }
+
+    /// The commits of two sides whose patch ids can decide patch equivalence
+    /// between them: those with a parent whose changed-path set also occurs
+    /// on the opposite side.
+    ///
+    /// A verbatim patch id covers each file header, so two commits with the
+    /// same id change the same paths. A commit whose path set occurs on one
+    /// side only therefore has no equivalent, and rendering its patch proves
+    /// nothing. The default branch usually gained hundreds of commits since a
+    /// session forked and almost none share a path set with the session's
+    /// few, so this replaces a patch stream over all of that history with one
+    /// path listing. Measured on 2026-11-11 over 2,426 default-branch
+    /// commits: 13.8 s to hash every patch, 1.0 s to list the paths.
+    ///
+    /// Narrowing can only withhold an equivalence, never invent one, and a
+    /// listing that is unavailable falls back to every commit.
+    fn commits_sharing_changed_paths(
+        &self,
+        left: &[(String, bool)],
+        right: &[(String, bool)],
+        cache: &mut PatchIdCache,
+    ) -> Result<Vec<String>, GitError> {
+        let with_parent = |side: &[(String, bool)]| {
+            side.iter()
+                .filter(|(_, has_parent)| *has_parent)
+                .map(|(commit, _)| commit.clone())
+                .collect::<Vec<_>>()
+        };
+        let (left, right) = (with_parent(left), with_parent(right));
+        let every_commit = || left.iter().chain(&right).cloned().collect::<Vec<_>>();
+        if left.is_empty() || right.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(signatures) = self.cached_changed_path_signatures(&every_commit(), cache)? else {
+            return Ok(every_commit());
+        };
+        let on_side = |side: &[String]| {
+            side.iter()
+                .filter_map(|commit| signatures.get(commit))
+                .collect::<std::collections::HashSet<_>>()
+        };
+        let (left_signatures, right_signatures) = (on_side(&left), on_side(&right));
+        Ok(left
+            .iter()
+            .chain(&right)
+            .filter(|commit| {
+                signatures.get(*commit).is_some_and(|signature| {
+                    left_signatures.contains(signature) && right_signatures.contains(signature)
+                })
+            })
+            .cloned()
+            .collect())
+    }
+
+    /// Changed-path signatures for `commits`, or `None` when the listing is
+    /// too large to hold or does not answer for every commit.
+    fn cached_changed_path_signatures(
+        &self,
+        commits: &[String],
+        cache: &mut PatchIdCache,
+    ) -> Result<Option<BTreeMap<String, ChangedPathSignature>>, GitError> {
+        let key = |commit: &String| (self.root.clone(), commit.clone());
+        let missing = commits
+            .iter()
+            .filter(|commit| !cache.changed_paths.contains_key(&key(commit)))
+            .cloned()
+            .collect::<Vec<_>>();
+        let Some(fresh) = self.changed_path_signatures(&missing)? else {
+            return Ok(None);
+        };
+        let mut result = BTreeMap::new();
+        for commit in commits {
+            let signature = match cache.changed_paths.get(&key(commit)) {
+                Some(signature) => {
+                    #[cfg(test)]
+                    {
+                        cache.hits += 1;
+                    }
+                    *signature
+                }
+                None => {
+                    let Some(signature) = fresh.get(commit) else {
+                        return Ok(None);
+                    };
+                    if cache.changed_paths.len() < MAX_PATCH_ID_CACHE_ENTRIES {
+                        cache.changed_paths.insert(key(commit), *signature);
+                    }
+                    *signature
+                }
+            };
+            result.insert(commit.clone(), signature);
+        }
+        Ok(Some(result))
+    }
+
+    /// One `git log --name-only` over `commits`, digested per commit. `None`
+    /// when the listing exceeds the batch output limit.
+    fn changed_path_signatures(
+        &self,
+        commits: &[String],
+    ) -> Result<Option<BTreeMap<String, ChangedPathSignature>>, GitError> {
+        use sha2::Digest as _;
+        let mut signatures = BTreeMap::new();
+        if commits.is_empty() {
+            return Ok(Some(signatures));
+        }
+        let Some(stdout) =
+            self.run_git_with_stdin_within_output_limit(&changed_path_log_args(), commits)?
+        else {
+            return Ok(None);
+        };
+        for record in stdout.split(|byte| *byte == 0).skip(1) {
+            let (commit, paths) = match record.iter().position(|byte| *byte == b'\n') {
+                Some(end) => (&record[..end], &record[end..]),
+                None => (record, &[][..]),
+            };
+            // Surrounding blank lines vary with a commit's position in the
+            // listing; the path lines between them do not.
+            signatures.insert(
+                String::from_utf8_lossy(commit).into_owned(),
+                sha2::Sha256::digest(paths.trim_ascii()).into(),
+            );
+        }
+        Ok(Some(signatures))
     }
 
     /// Reuse only successful, complete batches; missing IDs represent empty
@@ -5270,6 +5408,22 @@ impl GitRepo {
     /// staged into an anonymous file so the child runner has no writer thread
     /// that could outlive the command deadline.
     fn run_git_with_stdin(&self, args: &[&str], commits: &[String]) -> Result<Vec<u8>, GitError> {
+        self.run_git_with_stdin_within_output_limit(args, commits)?
+            .ok_or_else(|| GitError::Git {
+                args: args.join(" "),
+                stderr: format!(
+                    "Git batch output exceeded {MAX_GIT_BATCH_OUTPUT_BYTES} bytes per stream"
+                ),
+            })
+    }
+
+    /// [`Self::run_git_with_stdin`], with `None` for output past the batch
+    /// limit so a caller holding a fallback can take it.
+    fn run_git_with_stdin_within_output_limit(
+        &self,
+        args: &[&str],
+        commits: &[String],
+    ) -> Result<Option<Vec<u8>>, GitError> {
         let args_display = args.join(" ");
         let started = Instant::now();
         let deadline = effective_git_deadline(&args_display, git_timeout(), started)?;
@@ -5300,14 +5454,7 @@ impl GitRepo {
                     seconds: budget.as_secs().max(1),
                 });
             }
-            crate::bounded_output::LimitedOutput::OutputLimit => {
-                return Err(GitError::Git {
-                    args: args_display,
-                    stderr: format!(
-                        "Git batch output exceeded {MAX_GIT_BATCH_OUTPUT_BYTES} bytes per stream"
-                    ),
-                });
-            }
+            crate::bounded_output::LimitedOutput::OutputLimit => return Ok(None),
         };
         if !output.status.success() {
             return Err(GitError::Git {
@@ -5315,7 +5462,7 @@ impl GitRepo {
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             });
         }
-        Ok(output.stdout)
+        Ok(Some(output.stdout))
     }
 
     /// Verbatim patch id (`git patch-id --verbatim`) for the cumulative diff
@@ -10234,6 +10381,85 @@ mod batched_commit_tests {
     }
 
     #[test]
+    fn only_commits_sharing_a_changed_path_set_have_their_patches_compared() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let commit = |path: &str, body: &str| {
+            std::fs::write(root.join(path), body).unwrap();
+            run(root, &["add", "--", path]);
+            run(root, &["commit", "-qm", path]);
+            run(root, &["rev-parse", "HEAD"])
+        };
+        run(root, &["init", "-q", "-b", "main"]);
+        commit("base", "base\n");
+        run(root, &["branch", "session"]);
+        // A name Git quotes in a listing, so quoting is exercised on both sides.
+        let shared = "caf\u{e9} notes.txt";
+        let unrelated = [commit("a", "a\n"), commit("b", "b\n")];
+        run(root, &["checkout", "-q", "session"]);
+        let session = commit(shared, "session\n");
+        run(root, &["checkout", "-q", "main"]);
+        run(root, &["cherry-pick", "session"]);
+        let carrier = run(root, &["rev-parse", "HEAD"]);
+        let same_path_other_patch = commit(shared, "session\nand more\n");
+
+        let repo = GitRepo::discover(root).unwrap();
+        let left = repo
+            .cherry_side_commits("main...session", "--left-only")
+            .unwrap();
+        let right = repo
+            .cherry_side_commits("main...session", "--right-only")
+            .unwrap();
+        let mut cache = PatchIdCache::default();
+        let comparable = repo
+            .commits_sharing_changed_paths(&left, &right, &mut cache)
+            .unwrap();
+        assert_eq!(
+            comparable.iter().collect::<std::collections::BTreeSet<_>>(),
+            [&carrier, &same_path_other_patch, &session]
+                .into_iter()
+                .collect(),
+            "commits changing other paths cannot be patch-equivalent"
+        );
+        assert!(unrelated.iter().all(|commit| !comparable.contains(commit)));
+
+        // Narrowing changes which patches are rendered, never the marks.
+        let all = left
+            .iter()
+            .chain(&right)
+            .map(|(commit, _)| commit.clone())
+            .collect::<Vec<_>>();
+        let patch_ids = repo.first_parent_patch_ids(&all).unwrap();
+        let marks = |listed: &[(String, bool)], other: &[(String, bool)]| {
+            listed
+                .iter()
+                .map(|(commit, _)| {
+                    let equivalent = other
+                        .iter()
+                        .any(|(candidate, _)| patch_ids[candidate] == patch_ids[commit]);
+                    (commit.clone(), equivalent)
+                })
+                .collect::<Vec<_>>()
+        };
+        let paired = repo
+            .cherry_marked_both_cached("main", "session", &mut cache)
+            .unwrap();
+        assert_eq!(paired.left_only, marks(&left, &right));
+        assert_eq!(paired.right_only, marks(&right, &left));
+        assert_eq!(paired.right_only, vec![(session, true)]);
+        assert_eq!(
+            repo.cherry_marked("main", "session", CherrySide::Left)
+                .unwrap(),
+            paired.left_only
+        );
+        assert_eq!(
+            cache.entries.len(),
+            3,
+            "only the comparable commits were hashed"
+        );
+    }
+
+    #[test]
     fn patch_id_cache_reuses_complete_batches_without_changing_cherry_marks() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
@@ -10253,6 +10479,9 @@ mod batched_commit_tests {
             std::fs::write(root.join(branch), format!("{branch}\n")).unwrap();
             run(root, &["add", branch]);
             run(root, &["commit", "-qm", branch]);
+            // An empty commit on each side shares the target's empty path
+            // set, so the target's empty commit is hashed and cached.
+            run(root, &["commit", "--allow-empty", "-qm", "empty"]);
         }
         let repo = GitRepo::discover(root).unwrap();
         let mut cache = PatchIdCache::default();
@@ -10477,7 +10706,10 @@ mod batched_commit_tests {
             }
         }
         assert_eq!(rev_lists, 2, "one commit listing for each side");
-        assert_eq!(logs, 1, "all candidate patches share one git log stream");
+        assert_eq!(
+            logs, 2,
+            "one path listing, then one git log stream for the comparable patches"
+        );
         assert_eq!(
             patch_ids, 1,
             "all candidate patches share one patch-id stream"
