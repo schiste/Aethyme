@@ -30,9 +30,14 @@ pub(crate) fn take_phase_timings() -> Option<std::collections::BTreeMap<String, 
     COMPLETED_PHASE_TIMINGS.with(|timings| timings.borrow_mut().take())
 }
 
+/// Learning whether a submission has anything left to verify, before the
+/// lease audit.
+pub(crate) const PHASE_CONTENT_CHECK: &str = "checking for content to verify";
+
 fn phase_key(phase: &str) -> &'static str {
     match phase {
         "starting" => "starting",
+        PHASE_CONTENT_CHECK => "content_check",
         "auditing lease ownership" => "ownership",
         "planning the submission" => "planning",
         "simulating the merge" => "merge_simulation",
