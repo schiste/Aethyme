@@ -466,11 +466,13 @@ where
         .min(items.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
     let deadline = crate::git::active_git_deadline();
+    let isolation = crate::git::current_git_isolation();
     let phases = crate::phase_telemetry::active();
     let mut results: Vec<(usize, R)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
+                    crate::git::adopt_git_isolation_on_this_thread(isolation);
                     let _phases = phases.clone().map(crate::phase_telemetry::install);
                     let _git_deadline = deadline.map(crate::git::limit_git_until);
                     let mut done = Vec::new();
@@ -513,11 +515,13 @@ where
         .clamp(1, INSPECTION_WORKERS)
         .min(items.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
+    let isolation = crate::git::current_git_isolation();
     let phases = crate::phase_telemetry::active();
     let completed: Vec<(usize, R)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
+                    crate::git::adopt_git_isolation_on_this_thread(isolation);
                     let _phases = phases.clone().map(crate::phase_telemetry::install);
                     let _git_deadline = crate::git::limit_git_until(deadline);
                     let mut done = Vec::new();
@@ -753,6 +757,33 @@ pub(crate) fn build_with_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_workers_run_git_under_the_callers_isolation() {
+        let items = [0_u8; 4];
+        let plain = crate::git::current_git_isolation();
+        assert!(
+            inspect_in_parallel(&items, |_| crate::git::current_git_isolation())
+                .iter()
+                .all(|seen| *seen == plain)
+        );
+
+        let _isolated = crate::git::graph_verification_git_guard();
+        let isolated = crate::git::current_git_isolation();
+        assert_ne!(isolated, plain);
+        assert!(
+            inspect_in_parallel(&items, |_| crate::git::current_git_isolation())
+                .iter()
+                .all(|seen| *seen == isolated),
+            "a worker without the flag reads the inherited Git environment"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert!(
+            inspect_in_parallel_until(&items, deadline, |_| crate::git::current_git_isolation())
+                .iter()
+                .all(|seen| *seen == Some(isolated))
+        );
+    }
 
     fn run_git(path: &Path, args: &[&str]) {
         let output = std::process::Command::new("git")
