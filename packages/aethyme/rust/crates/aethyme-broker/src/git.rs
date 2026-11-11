@@ -6901,6 +6901,27 @@ impl GitRepo {
         Ok(())
     }
 
+    /// The commit `remote` holds at `refs/heads/<branch>` right now, asked of
+    /// the remote within `budget`; `None` when it has no such branch. Reads
+    /// the remote only: no ref moves and no object is downloaded.
+    pub fn remote_branch_tip(
+        &self,
+        remote: &str,
+        branch: &str,
+        budget: Duration,
+    ) -> Result<Option<String>, GitError> {
+        let _span = crate::phase_telemetry::span("remote_tip_query");
+        let reference = format!("refs/heads/{branch}");
+        let args = ["ls-remote", "--refs", remote, reference.as_str()];
+        let mut command = git_command();
+        command.args(args).current_dir(&self.root);
+        let output = run_git_command(command, &args, budget)?;
+        Ok(output.lines().find_map(|line| {
+            let (commit, name) = line.split_once('\t')?;
+            (name == reference).then(|| commit.to_string())
+        }))
+    }
+
     /// Abandon a paused rebase, restoring the branch it started from.
     pub fn abort_rebase(&self) -> Result<(), GitError> {
         run_git(&self.root, &["rebase", "--abort"])?;

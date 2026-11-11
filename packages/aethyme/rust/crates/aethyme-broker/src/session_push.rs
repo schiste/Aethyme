@@ -118,6 +118,39 @@ fn push_operation_wait() -> QueueWait {
 /// Thirty seconds leaves room for ordinary contention while keeping refreshes
 /// bounded. A timeout with an unknown write outcome still blocks writes until
 /// reconciliation; this budget never makes a cached ref safe to assume.
+/// The most a default-branch refresh waits for the remote to name its tip
+/// before fetching anyway.
+const REMOTE_TIP_QUERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether the remote's default branch is exactly the commit the tracking
+/// ref already holds, asked of the remote.
+///
+/// A refresh exists to learn the remote's tip. Asking for that one ref took
+/// 1.1 s where the fetch took 4.2 s at the median in the busiest repository
+/// (2026-11-11), most of it local work repeated for a branch that had not
+/// moved since the previous command's fetch. When the answer matches, the
+/// tracking ref is as fresh as a fetch would leave it and the fetch is
+/// skipped; any other answer, a failed query included, is `false`, so the
+/// caller fetches and reports a failure in its own terms.
+pub(crate) fn remote_default_is_already_fetched(
+    repo: &GitRepo,
+    default: &TrackedDefault,
+    budget: std::time::Duration,
+) -> bool {
+    let Ok(Some(tip)) = repo.remote_branch_tip(
+        &default.remote,
+        &default.branch,
+        budget.min(REMOTE_TIP_QUERY_BUDGET),
+    ) else {
+        return false;
+    };
+    let current = repo.resolve_ref(&default.tracking_ref).as_deref() == Some(tip.as_str());
+    if current {
+        crate::phase_telemetry::add("default_branch_fetch_skipped", std::time::Duration::ZERO);
+    }
+    current
+}
+
 fn fetch_operation_wait() -> QueueWait {
     QueueWait::Seconds(30)
 }
@@ -769,6 +802,9 @@ impl Broker {
         main_root: &Path,
     ) -> Result<(), String> {
         let _span = crate::phase_telemetry::span("default_branch_fetch");
+        if remote_default_is_already_fetched(self.repo_handle(), default, REMOTE_TIP_QUERY_BUDGET) {
+            return Ok(());
+        }
         let target = match target {
             Some(target) => target.clone(),
             None => self

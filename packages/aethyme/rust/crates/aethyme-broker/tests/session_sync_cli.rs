@@ -243,6 +243,54 @@ fn start_begins_from_a_commit_pushed_after_the_last_fetch() {
     assert_eq!(head(&worktree), landed, "the worktree itself moved");
 }
 
+/// The `start` lines of the fixture's command metrics, oldest first.
+fn start_metrics(fixture: &Fixture) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(fixture.repo.join(".aethyme/logs/command-metrics.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|line| line["command"] == "start")
+        .collect()
+}
+
+#[test]
+fn start_skips_the_fetch_only_while_the_remote_tip_is_already_held() {
+    let fixture = Fixture::new();
+    let held = git_output(&fixture.repo, &["rev-parse", "origin/main"]);
+
+    // The remote still holds what the tracking ref holds: asking it is the
+    // whole refresh, and the base is as confirmed as a fetch would make it.
+    let unchanged = fixture.start("unchanged");
+    assert_eq!(unchanged["start_base"]["fetched"], true, "{unchanged}");
+    assert_eq!(unchanged["start_base"]["commit"], held, "{unchanged}");
+
+    // The remote moved: the same question now answers a different commit, so
+    // the fetch runs and the session starts from it.
+    let landed = fixture.land_on_remote_only("other.txt", "moved on\n");
+    let moved = fixture.start("moved");
+    assert_eq!(moved["start_base"]["fetched"], true, "{moved}");
+    assert_eq!(moved["start_base"]["commit"], landed, "{moved}");
+
+    let metrics = start_metrics(&fixture);
+    assert_eq!(metrics.len(), 2, "{metrics:?}");
+    let counts = |line: &serde_json::Value, name: &str| line["phase_counts"][name].as_u64();
+    assert_eq!(
+        counts(&metrics[0], "default_branch_fetch_skipped"),
+        Some(1),
+        "{}",
+        metrics[0]
+    );
+    assert_eq!(counts(&metrics[0], "git_fetch"), None, "{}", metrics[0]);
+    assert_eq!(counts(&metrics[0], "remote_tip_query"), Some(1));
+    assert_eq!(
+        counts(&metrics[1], "default_branch_fetch_skipped"),
+        None,
+        "{}",
+        metrics[1]
+    );
+    assert_eq!(counts(&metrics[1], "git_fetch"), Some(1), "{}", metrics[1]);
+}
+
 #[test]
 fn an_offline_implicit_start_refuses_before_creating_a_worktree() {
     let fixture = Fixture::new();

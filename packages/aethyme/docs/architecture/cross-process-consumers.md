@@ -1462,3 +1462,7 @@ Introduced 2026-11-05. `LeaseBlocker` (lease claim `warnings`, submit `lease_war
 ### Lease overlap impact
 
 Introduced 2026-11-05, opt-in with `[leases] overlap_impact = true`. The `PreToolUse` hook context can add an advisory note naming another live session changing a file the edited file directly calls or imports, with its graph revision, confidence and diff. No JSON surface changes.
+
+### Default-branch refresh
+
+Introduced 2026-11-11. Before `start`, `push`, `sync` and a reused or adopted `start` fetch the default branch, they ask the remote for that one branch's tip (`git ls-remote --refs <remote> refs/heads/<branch>`, at most 10 seconds). When the answer is the commit the remote-tracking ref already holds, the fetch is skipped and the refresh is reported exactly as a successful fetch (`start_base.fetched: true`, no `fetch_note`); `push` and `sync` then record no coordinated fetch operation for it. Any other answer, including a failed or timed-out query, fetches as before and reports a failure in the existing terms. Command metric lines gain the spans `remote_tip_query` and `default_branch_fetch_skipped` (a count; its time is always 0). No JSON field, exit code or stdout shape changes.

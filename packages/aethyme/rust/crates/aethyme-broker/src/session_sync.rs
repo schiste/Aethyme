@@ -166,11 +166,15 @@ impl crate::Broker {
                 cached_ref_age_seconds: None,
             };
         };
-        match repo.fetch_branch_into_tracking_ref(
-            &default.remote,
-            &default.branch,
-            start_refresh_budget(crate::git::git_timeout()),
-        ) {
+        let budget = start_refresh_budget(crate::git::git_timeout());
+        if crate::session_push::remote_default_is_already_fetched(repo, &default, budget) {
+            return StartRefresh {
+                fetched: Some(true),
+                error: None,
+                cached_ref_age_seconds: None,
+            };
+        }
+        match repo.fetch_branch_into_tracking_ref(&default.remote, &default.branch, budget) {
             Ok(()) => StartRefresh {
                 fetched: Some(true),
                 error: None,
