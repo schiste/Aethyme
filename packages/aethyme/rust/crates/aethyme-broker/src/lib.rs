@@ -164,6 +164,7 @@ mod pr_monitoring;
 mod runtime_paths;
 pub use runtime_paths::broker_runtime_ignore_patterns;
 mod scopes;
+pub mod scoreboard;
 mod submit_progress;
 pub use submit_progress::{
     InFlightSubmit, SUBMIT_STALL_AFTER, SlotHolder, SubmitProgressRecord, WaitPosition,
