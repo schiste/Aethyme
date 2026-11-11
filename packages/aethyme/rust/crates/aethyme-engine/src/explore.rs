@@ -93,7 +93,6 @@ use observability::*;
 use params::*;
 use response::*;
 use surface_coverage::*;
-pub(crate) use text_search::extract_text_search_terms;
 
 // ── public envelope ─────────────────────────────────────────────────────
 

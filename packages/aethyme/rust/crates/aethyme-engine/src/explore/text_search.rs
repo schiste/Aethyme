@@ -17,7 +17,7 @@
 use std::ffi::OsStr;
 use std::path::Path;
 
-use super::{AnswerItem, extract_symbol_queries};
+use super::AnswerItem;
 
 const RIPGREP_BIN: &str = "rg";
 const SOURCE_TEXT_FILE_SIZE_CAP_BYTES: u64 = 750_000;
@@ -35,40 +35,6 @@ struct TextLineRef {
     line: u64,
     text: String,
     matched_terms: Vec<String>,
-}
-
-/// Build the term list for source-text search. Wider than
-/// `extract_symbol_queries` — keeps behavioural words ("view", "seen")
-/// that are too noisy for symbol search but useful for line-level
-/// evidence. Mirrors `_request_text_search_terms` in cli.py.
-pub(crate) fn extract_text_search_terms(request: &str) -> Vec<String> {
-    let mut terms = extract_symbol_queries(request);
-    let lowered = request.to_ascii_lowercase();
-    let mut extras: Vec<&str> = Vec::new();
-    if lowered.contains("watchlist") || lowered.contains("watchlisted") {
-        extras.extend(["watchlist", "watchlisted", "watched", "notification"]);
-    }
-    if lowered.contains("seen") {
-        extras.extend(["seen", "notification", "timestamp"]);
-    }
-    if lowered.contains("view") {
-        extras.extend(["view", "viewed", "viewing"]);
-    }
-    if lowered.contains("diff") {
-        extras.extend(["diff", "difference", "diffonly"]);
-    }
-    if lowered.contains("revision") || lowered.contains("oldid") {
-        extras.extend(["revision", "revisions", "oldid"]);
-    }
-    let mut seen: std::collections::HashSet<String> =
-        terms.iter().map(|t| t.to_ascii_lowercase()).collect();
-    for extra in extras {
-        let lower = extra.to_ascii_lowercase();
-        if seen.insert(lower) {
-            terms.push(extra.to_string());
-        }
-    }
-    terms
 }
 
 /// Walk the repo with ripgrep across all terms in one pass, score each
