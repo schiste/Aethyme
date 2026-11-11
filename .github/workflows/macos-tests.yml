@@ -26,7 +26,7 @@ name: macOS tests
 # use what macOS ships (`shasum -a 256`, `wc -c`, bsdtar). The archive itself
 # is written and read by cargo-nextest, which needs no zstd binary.
 #
-# No untrusted event data (`github.event.*`) is interpolated into any
+# No untrusted event payload data is interpolated into any
 # `run:` block here — every step is a fixed command.
 
 on:
