@@ -288,10 +288,7 @@ pub(super) fn record_command_metric(
         })
         .map(|fields| format!(",{fields}"))
         .unwrap_or_default();
-    let line = format!(
-        "{{\"ts\":{ts},\"command\":\"{}\",\"duration_ms\":{duration_ms},\"exit\":{exit},\"output_bytes\":{output_bytes}{extra_fields}}}\n",
-        label
-    );
+    let line = metric_line(ts, &label, duration_ms, exit, output_bytes, &extra_fields);
     use std::io::Write;
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
@@ -464,12 +461,57 @@ fn command_records_outcome(args: &[String]) -> bool {
     ) && command_records_metric(args)
 }
 
+/// One `command-metrics.jsonl` row.
+///
+/// `aethyme_version` is what makes two releases comparable: impact is measured
+/// by deploying a release and reading the rows it wrote, and a row that does
+/// not say which binary produced it can only be attributed by guessing from
+/// its timestamp. `extra_fields` is either empty or begins with a comma.
+fn metric_line(
+    ts: i64,
+    label: &str,
+    duration_ms: i64,
+    exit: u8,
+    output_bytes: u64,
+    extra_fields: &str,
+) -> String {
+    format!(
+        "{{\"ts\":{ts},\"aethyme_version\":\"{}\",\"command\":\"{label}\",\"duration_ms\":{duration_ms},\"exit\":{exit},\"output_bytes\":{output_bytes}{extra_fields}}}\n",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        command_metric_enabled, command_records_metric, command_records_outcome,
+        command_metric_enabled, command_records_metric, command_records_outcome, metric_line,
         safe_command_surface,
     };
+
+    #[test]
+    fn every_metric_row_names_the_release_that_wrote_it() {
+        let line = metric_line(
+            7,
+            "submit",
+            1200,
+            3,
+            42,
+            ",\"phase_counts\":{\"broker_open\":1}",
+        );
+        assert!(line.ends_with('\n'));
+        let row: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(row["aethyme_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(row["ts"], 7);
+        assert_eq!(row["command"], "submit");
+        assert_eq!(row["duration_ms"], 1200);
+        assert_eq!(row["exit"], 3);
+        assert_eq!(row["output_bytes"], 42);
+        assert_eq!(row["phase_counts"]["broker_open"], 1);
+
+        let bare: serde_json::Value =
+            serde_json::from_str(&metric_line(7, "status", 1, 0, 0, "")).unwrap();
+        assert_eq!(bare["aethyme_version"], env!("CARGO_PKG_VERSION"));
+    }
 
     /// Labels are built from the resolved internal spelling, which is what
     /// the dispatcher records.
