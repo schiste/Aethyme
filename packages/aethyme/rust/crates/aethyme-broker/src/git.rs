@@ -154,6 +154,34 @@ fn graph_verification_git_enabled() -> bool {
     GRAPH_VERIFICATION_GIT.with(std::cell::Cell::get)
 }
 
+/// The Git isolation in force on one thread, for a worker thread to adopt.
+///
+/// Both flags are thread-local, so a worker spawned to run Git on behalf of a
+/// caller starts without them and would read the inherited `GIT_*`
+/// environment and global configuration the caller had fenced off. That is
+/// how a parallel lease scan ran an unrelated repository's hook from inside
+/// the disposable quick test (2026-11-11, #1580).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GitIsolation {
+    graph_verification: bool,
+    drop_inherited_environment: bool,
+}
+
+/// The calling thread's Git isolation.
+pub(crate) fn current_git_isolation() -> GitIsolation {
+    GitIsolation {
+        graph_verification: graph_verification_git_enabled(),
+        drop_inherited_environment: DROP_INHERITED_GIT_ENVIRONMENT.with(std::cell::Cell::get),
+    }
+}
+
+/// Run every Git command of this thread under `isolation`. Only for a thread
+/// that ends with its work, because nothing restores the previous state.
+pub(crate) fn adopt_git_isolation_on_this_thread(isolation: GitIsolation) {
+    GRAPH_VERIFICATION_GIT.with(|enabled| enabled.set(isolation.graph_verification));
+    DROP_INHERITED_GIT_ENVIRONMENT.with(|flag| flag.set(isolation.drop_inherited_environment));
+}
+
 /// Lift the deadline for a mutation that runs inside a report. The deadline
 /// exists to bound reads; killing a ref or index write midway would leave
 /// the half-applied state it was never meant to produce. Each command keeps
