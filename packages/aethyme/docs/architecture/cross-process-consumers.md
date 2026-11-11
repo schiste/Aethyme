@@ -1271,7 +1271,18 @@ Successful `broker submit prepare --json` reports `shared_cache_wait_ms`, the
 monotonic time spent acquiring the shared cache grant (zero when no shared
 cache is used). Its command metric adds a `preparation` object with that wait,
 `shared_cache_coordinated`, and the already-reported step results. A current
-preparation has no executed steps and a zero wait. Step names are
+preparation has no executed steps and a zero wait. When a step uses the
+shared cache, the report and the metric's `preparation` object also carry
+`shared_cache_mode`: `shared` when the preparation ran alongside others under
+`[shared_cache] max_concurrent`, `exclusive` when it held the cache alone; the
+field is absent otherwise. A sharing preparation holds a `capacity` allocation
+keyed `preparation_cache_users` in pool `aethyme-prepare-cache-users:<repository>`
+(60 units divided by `max_concurrent`); every holder that needs the cache alone
+holds the `preparation_cache` exclusive key and all 60 units. Command metrics
+add the spans `shared_cache_acquire` and `shared_cache_rotation_probe`, and the
+counters `shared_cache_held_shared`, `shared_cache_held_exclusive`,
+`shared_cache_exclusive_for_recovery`, `shared_cache_exclusive_for_budget_check`
+and `shared_cache_exclusive_for_overdue_budget_check`. Step names are
 repository-declared; commands and arguments are not logged in this object.
 Failed preparation may have no metric breakdown.
 

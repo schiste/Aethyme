@@ -891,12 +891,7 @@ impl BrokerStorageContext {
             run_id: request_id,
             ttl_seconds: 30,
             holder_pid: Some(std::process::id()),
-            resources: vec![crate::HostResourceRequirement {
-                key: "preparation_cache".into(),
-                resource: crate::HostResourceKind::ExclusiveKey {
-                    name: crate::preparation::preparation_cache_lease_name(&repository),
-                },
-            }],
+            resources: crate::preparation::preparation_cache_exclusive_resources(&repository),
         };
         let mut coordinator = crate::HostResourceCoordinator::open(resource_db).map_err(|error| {
             BrokerOpError::InvalidStorageContext {

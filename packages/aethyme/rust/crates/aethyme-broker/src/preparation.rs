@@ -297,6 +297,212 @@ pub struct SharedCacheBudget {
     /// placement root, unless an explicit operator root was captured.
     #[serde(default)]
     pub root: SharedCacheRoot,
+    /// How many sessions may run their preparation steps against this
+    /// repository's shared cache at once. Omission means 1: every
+    /// preparation holds the cache alone, as before 2026-11-11. A larger
+    /// value is a statement about the repository's own commands, that they
+    /// tolerate another copy of themselves writing the same cache directory
+    /// (package-manager download stores do); rotation, sweeps and recovery
+    /// still wait for every running preparation and then hold it alone.
+    #[serde(
+        default = "default_shared_cache_max_concurrent",
+        skip_serializing_if = "is_default_shared_cache_max_concurrent"
+    )]
+    pub max_concurrent: u32,
+}
+
+/// The most sessions `[shared_cache] max_concurrent` can admit at once.
+pub(crate) const SHARED_CACHE_MAX_CONCURRENT: u32 = 6;
+
+/// Units in a repository's shared-cache user pool. A preparation that shares
+/// the cache holds `SHARED_CACHE_USER_UNITS / max_concurrent` of them and
+/// anything that needs the cache alone holds all of them, so the two exclude
+/// each other without either knowing the other's configuration. 60 divides
+/// evenly by every allowed `max_concurrent`.
+const SHARED_CACHE_USER_UNITS: u32 = 60;
+
+/// How long a completed budget check stands before a sharing preparation
+/// takes the cache alone to repeat it, if the cache happens to be free.
+const SHARED_CACHE_BUDGET_CHECK_INTERVAL_MS: i64 = 60 * 60 * 1000;
+
+/// Past this age every sharing preparation waits for the cache alone, so a
+/// host that is never idle still measures its cache once a day.
+const SHARED_CACHE_BUDGET_CHECK_OVERDUE_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Bounds for the unfinished-rotation probe a sharing preparation runs once
+/// it holds its share of the cache.
+const SHARED_CACHE_ROTATION_PROBE_BUDGET: Duration = Duration::from_secs(2);
+const SHARED_CACHE_ROTATION_PROBE_MAX_ENTRIES: usize = 4096;
+
+/// When a cache root's last budget check completed, in the repository's
+/// broker metadata; the suffix is a digest of the cache root.
+const SHARED_CACHE_BUDGET_CHECKED_KEY_PREFIX: &str =
+    "preparation.shared_cache_budget_checked_at_ms.";
+
+fn default_shared_cache_max_concurrent() -> u32 {
+    1
+}
+
+fn is_default_shared_cache_max_concurrent(value: &u32) -> bool {
+    *value == default_shared_cache_max_concurrent()
+}
+
+/// How a preparation holds the repository's shared cache.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedCacheMode {
+    /// Alone: no other preparation, sweep or rotation runs meanwhile.
+    Exclusive,
+    /// Alongside other preparations, per `[shared_cache] max_concurrent`.
+    Shared,
+}
+
+impl SharedCacheMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exclusive => "exclusive",
+            Self::Shared => "shared",
+        }
+    }
+}
+
+/// Why a preparation that could share the cache holds it alone instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExclusiveNeed {
+    /// A rotation is unfinished or its state is unknown: nothing may run
+    /// against the store until it is recovered.
+    Recovery,
+    /// The budget check is due and the cache was free.
+    BudgetCheckDue,
+    /// The budget check is a day late; this preparation waited for it.
+    BudgetCheckOverdue,
+}
+
+impl ExclusiveNeed {
+    fn phase(self) -> &'static str {
+        match self {
+            Self::Recovery => "shared_cache_exclusive_for_recovery",
+            Self::BudgetCheckDue => "shared_cache_exclusive_for_budget_check",
+            Self::BudgetCheckOverdue => "shared_cache_exclusive_for_overdue_budget_check",
+        }
+    }
+}
+
+fn budget_check_need(last_checked_ms: Option<i64>, now_ms: i64) -> Option<ExclusiveNeed> {
+    let age = match last_checked_ms {
+        Some(checked) => now_ms.saturating_sub(checked),
+        // Never checked by a sharing-aware broker: measure at the first
+        // free moment rather than making this preparation wait.
+        None => SHARED_CACHE_BUDGET_CHECK_INTERVAL_MS,
+    };
+    if age >= SHARED_CACHE_BUDGET_CHECK_OVERDUE_MS {
+        Some(ExclusiveNeed::BudgetCheckOverdue)
+    } else if age >= SHARED_CACHE_BUDGET_CHECK_INTERVAL_MS {
+        Some(ExclusiveNeed::BudgetCheckDue)
+    } else {
+        None
+    }
+}
+
+fn shared_cache_budget_checked_key(cache_root: &Path) -> String {
+    let digest = hash_text(&cache_root.to_string_lossy());
+    format!("{SHARED_CACHE_BUDGET_CHECKED_KEY_PREFIX}{}", &digest[..12])
+}
+
+fn is_resource_contention(error: &crate::HostResourceError) -> bool {
+    matches!(
+        error,
+        crate::HostResourceError::Conflict { code, .. } if code == "resource_contention"
+    )
+}
+
+/// Take the repository's shared cache for one preparation.
+///
+/// `sharing` is the repository's opt-in. Without it, and whenever the cache
+/// has work that must not overlap a running step, the preparation holds the
+/// cache alone. `rotation_unsettled` runs only while a share is held: nothing
+/// can publish a rotation meanwhile, so "no debt" stays true until release.
+fn acquire_preparation_cache(
+    coordinator: &mut HostResourceCoordinator,
+    request_for: &dyn Fn(SharedCacheMode) -> Result<HostResourceRequest, PreparationError>,
+    sharing: bool,
+    budget_check: Option<ExclusiveNeed>,
+    wait: Duration,
+    rotation_unsettled: &mut dyn FnMut() -> bool,
+) -> Result<
+    (
+        crate::HostResourceGrant,
+        SharedCacheMode,
+        Option<ExclusiveNeed>,
+    ),
+    PreparationError,
+> {
+    let _span = crate::phase_telemetry::span("shared_cache_acquire");
+    let deadline = Instant::now() + wait;
+    let mut next_notice = Instant::now();
+    let mut notice = |message: &str| {
+        let now = Instant::now();
+        if now >= next_notice {
+            eprintln!(
+                "waiting up to {}s for the shared preparation cache ({message}); \
+                 `--wait 0s` fails fast instead",
+                wait.as_secs()
+            );
+            next_notice = now + SHARED_CACHE_WAIT_NOTICE_INTERVAL;
+        }
+    };
+    let alone = |coordinator: &mut HostResourceCoordinator,
+                 notice: &mut dyn FnMut(&str)|
+     -> Result<crate::HostResourceGrant, PreparationError> {
+        let request = request_for(SharedCacheMode::Exclusive)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        Ok(coordinator.acquire_with_wait(&request, remaining, notice)?)
+    };
+    if !sharing {
+        return Ok((
+            alone(coordinator, &mut notice)?,
+            SharedCacheMode::Exclusive,
+            None,
+        ));
+    }
+    match budget_check {
+        Some(need @ ExclusiveNeed::BudgetCheckOverdue) => {
+            return Ok((
+                alone(coordinator, &mut notice)?,
+                SharedCacheMode::Exclusive,
+                Some(need),
+            ));
+        }
+        Some(need) => {
+            // Only if nothing else is using the cache right now: the check
+            // can wait for a quieter moment, this preparation should not.
+            match coordinator.acquire(&request_for(SharedCacheMode::Exclusive)?) {
+                Ok(grant) => return Ok((grant, SharedCacheMode::Exclusive, Some(need))),
+                Err(error) if is_resource_contention(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        None => {}
+    }
+    let request = request_for(SharedCacheMode::Shared)?;
+    let grant = coordinator.acquire_with_wait(&request, wait, &mut notice)?;
+    let unsettled = {
+        let _span = crate::phase_telemetry::span("shared_cache_rotation_probe");
+        rotation_unsettled()
+    };
+    if !unsettled {
+        return Ok((grant, SharedCacheMode::Shared, None));
+    }
+    coordinator.release(
+        &grant.lease.lease_id,
+        grant.lease.generation,
+        &grant.ownership_token,
+    )?;
+    Ok((
+        alone(coordinator, &mut notice)?,
+        SharedCacheMode::Exclusive,
+        Some(ExclusiveNeed::Recovery),
+    ))
 }
 
 fn default_shared_cache_max_bytes() -> u64 {
@@ -308,6 +514,7 @@ impl Default for SharedCacheBudget {
         Self {
             max_bytes: default_shared_cache_max_bytes(),
             root: SharedCacheRoot::default(),
+            max_concurrent: default_shared_cache_max_concurrent(),
         }
     }
 }
@@ -397,6 +604,9 @@ pub struct PreparationReport {
     pub shared_cache_coordinated: bool,
     /// Wall time spent acquiring the shared cache grant.
     pub shared_cache_wait_ms: u64,
+    /// How the shared cache was held; absent when no step shares it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_cache_mode: Option<SharedCacheMode>,
     /// Set when a complete over-budget measurement or a bounded inventory
     /// limit triggers a completed shared-store rotation.
     /// Additive and `None` in the overwhelmingly common case.
@@ -708,6 +918,7 @@ impl Broker {
                 offline,
                 shared_cache_coordinated: false,
                 shared_cache_wait_ms: 0,
+                shared_cache_mode: None,
                 shared_cache_rotation: None,
                 steps: Vec::new(),
                 next_action: "dependencies are already current".into(),
@@ -856,26 +1067,74 @@ impl Broker {
             .transpose()
             .map_err(PreparationError::from)?;
         let cache_wait_started = std::time::Instant::now();
+        let max_concurrent = config
+            .shared_cache
+            .as_ref()
+            .map_or(1, |cache| cache.max_concurrent);
+        let budget_checked_key = cache_root_binding
+            .as_ref()
+            .map(|binding| shared_cache_budget_checked_key(&binding.path));
+        let mut cache_mode = SharedCacheMode::Exclusive;
         let mut grant = if let Some(coordinator) = coordinator.as_mut() {
-            let request = preparation_resource_request(self, session_id, &root, &digest)?;
-            // Say why the command is quiet: the caller sees nothing else
-            // until the session holding the shared cache finishes.
-            let mut next_notice = cache_wait_started;
-            Some(
-                coordinator
-                    .acquire_with_wait(&request, wait, |message| {
-                        let now = std::time::Instant::now();
-                        if now >= next_notice {
-                            eprintln!(
-                                "waiting up to {}s for the shared preparation cache ({message}); \
-                                 `--wait 0s` fails fast instead",
-                                wait.as_secs()
-                            );
-                            next_notice = now + SHARED_CACHE_WAIT_NOTICE_INTERVAL;
-                        }
-                    })
-                    .map_err(PreparationError::from)?,
-            )
+            let sharing = max_concurrent > 1;
+            let budget_check = if sharing
+                && config
+                    .shared_cache
+                    .as_ref()
+                    .is_some_and(|cache| cache.max_bytes > 0)
+                && let Some(key) = budget_checked_key.as_deref()
+            {
+                let last_checked = self
+                    .store_ref()
+                    .meta_get(key)?
+                    .and_then(|value| value.parse::<i64>().ok());
+                budget_check_need(last_checked, now_ms())
+            } else {
+                None
+            };
+            let binding = cache_root_binding
+                .as_ref()
+                .expect("shared cache has a binding");
+            let probe_db = resource_db_path
+                .as_deref()
+                .expect("shared cache has a host resource database");
+            let (acquired, mode, need) = acquire_preparation_cache(
+                coordinator,
+                &|mode| {
+                    preparation_resource_request(
+                        self,
+                        session_id,
+                        &root,
+                        &digest,
+                        mode,
+                        max_concurrent,
+                    )
+                },
+                sharing,
+                budget_check,
+                wait,
+                &mut || {
+                    probe_rotation_recovery(
+                        &binding.path,
+                        binding.identity.as_deref(),
+                        probe_db,
+                        SHARED_CACHE_ROTATION_PROBE_MAX_ENTRIES,
+                        Instant::now() + SHARED_CACHE_ROTATION_PROBE_BUDGET,
+                    ) != rotation_debt::DebtProbe::NoDebt
+                },
+            )?;
+            cache_mode = mode;
+            crate::phase_telemetry::add(
+                match mode {
+                    SharedCacheMode::Shared => "shared_cache_held_shared",
+                    SharedCacheMode::Exclusive => "shared_cache_held_exclusive",
+                },
+                Duration::ZERO,
+            );
+            if let Some(need) = need {
+                crate::phase_telemetry::add(need.phase(), Duration::ZERO);
+            }
+            Some(acquired)
         } else {
             None
         };
@@ -906,7 +1165,12 @@ impl Broker {
         // It also runs before this run's directory is created, because it
         // moves the whole repository store away, that directory included.
         let mut next_inventory_renewal = Instant::now();
-        let rotation_result = if shared {
+        // Recovery, measurement and rotation move or remove the whole store,
+        // so they run only when this preparation holds the cache alone. A
+        // sharing holder has already seen that no rotation is unfinished.
+        let rotation_result = if shared && cache_mode == SharedCacheMode::Shared {
+            ensure_preparation_cache_root_binding(cache_root_binding.as_ref()).map(|()| None)
+        } else if shared {
             let mut progress = |force: bool| -> Result<(), PreparationError> {
                 if force || Instant::now() >= next_inventory_renewal {
                     require_preparation_storage_with_cache_root(
@@ -951,6 +1215,15 @@ impl Broker {
                     cache_root_binding.as_ref(),
                 )
             })?;
+        if shared
+            && cache_mode == SharedCacheMode::Exclusive
+            && let Some(key) = budget_checked_key.as_deref()
+            && let Err(error) = self.store().meta_set(key, &now_ms().to_string())
+        {
+            // Only the next check's timing depends on this; the check that
+            // just ran is unaffected.
+            eprintln!("warning: could not record the shared-cache budget check: {error}");
+        }
         if let Some(cache_dir) = &cache_dir {
             let create_cache_dir = require_preparation_storage_with_cache_root(
                 &storage_root,
@@ -1205,6 +1478,7 @@ impl Broker {
             offline,
             shared_cache_coordinated: shared,
             shared_cache_wait_ms,
+            shared_cache_mode: shared.then_some(cache_mode),
             shared_cache_rotation: rotation,
             steps: results,
             next_action: "continue work in the prepared session".into(),
@@ -1275,6 +1549,25 @@ fn validate_config(config: &PreparationConfig) -> Result<(), PreparationError> {
     {
         return Err(invalid_config(
             "shared_cache requires at least one step with cache = \"repository_shared\"",
+        ));
+    }
+    if let Some(cache) = &config.shared_cache
+        && !(1..=SHARED_CACHE_MAX_CONCURRENT).contains(&cache.max_concurrent)
+    {
+        return Err(invalid_config(format!(
+            "shared_cache.max_concurrent must be 1..={SHARED_CACHE_MAX_CONCURRENT}"
+        )));
+    }
+    // The managed-storage owner is granted the cache key alone and accounts
+    // for growth as the only writer; it has no rule for a second writer.
+    if config.managed_storage.is_some()
+        && config
+            .shared_cache
+            .as_ref()
+            .is_some_and(|cache| cache.max_concurrent > 1)
+    {
+        return Err(invalid_config(
+            "shared_cache.max_concurrent above 1 cannot be combined with managed_storage",
         ));
     }
     let mut runtime_names = BTreeSet::new();
@@ -2307,29 +2600,64 @@ fn preparation_resource_request(
     session_id: i64,
     root: &Path,
     digest: &str,
+    mode: SharedCacheMode,
+    max_concurrent: u32,
 ) -> Result<HostResourceRequest, PreparationError> {
     let repository = repository_identity(broker);
     let worktree_fingerprint = hash_text(&root.to_string_lossy());
     let run_id = format!("prepare-s{session_id}-{}", &digest[..12]);
+    // One preparation can ask more than once (alone, then sharing); each
+    // attempt is its own request.
+    static NEXT_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let attempt = NEXT_ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(HostResourceRequest {
         schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
-        request_id: format!("{run_id}-{}-{}", std::process::id(), now_ms()),
+        request_id: format!("{run_id}-{}-{}-{attempt}", std::process::id(), now_ms()),
         repository: repository.clone(),
         worktree_fingerprint,
         run_id,
         ttl_seconds: PREPARATION_LEASE_TTL_SECONDS,
         holder_pid: Some(std::process::id()),
-        resources: vec![HostResourceRequirement {
-            key: "preparation_cache".into(),
-            resource: HostResourceKind::ExclusiveKey {
-                name: preparation_cache_lease_name(&repository),
-            },
-        }],
+        resources: match mode {
+            SharedCacheMode::Exclusive => preparation_cache_exclusive_resources(&repository),
+            SharedCacheMode::Shared => vec![preparation_cache_users(
+                &repository,
+                SHARED_CACHE_USER_UNITS / max_concurrent.clamp(1, SHARED_CACHE_MAX_CONCURRENT),
+            )],
+        },
     })
 }
 
 pub(crate) fn preparation_cache_lease_name(repository: &str) -> String {
     format!("aethyme-prepare-cache:{repository}")
+}
+
+fn preparation_cache_users(repository: &str, units: u32) -> HostResourceRequirement {
+    HostResourceRequirement {
+        key: "preparation_cache_users".into(),
+        resource: HostResourceKind::Capacity {
+            pool: format!("aethyme-prepare-cache-users:{repository}"),
+            units,
+            limit: SHARED_CACHE_USER_UNITS,
+        },
+    }
+}
+
+/// What a holder that needs a repository's shared cache alone must be
+/// granted: the cache key, which excludes every other such holder, and the
+/// whole user pool, which excludes every preparation sharing the cache.
+pub(crate) fn preparation_cache_exclusive_resources(
+    repository: &str,
+) -> Vec<HostResourceRequirement> {
+    vec![
+        HostResourceRequirement {
+            key: "preparation_cache".into(),
+            resource: HostResourceKind::ExclusiveKey {
+                name: preparation_cache_lease_name(repository),
+            },
+        },
+        preparation_cache_users(repository, SHARED_CACHE_USER_UNITS),
+    ]
 }
 
 /// The shared-cache key this checkout would ask for right now, if it declares
@@ -4547,6 +4875,205 @@ mod tests {
         }
     }
 
+    fn cache_test_request(mode: SharedCacheMode, max_concurrent: u32) -> HostResourceRequest {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        HostResourceRequest {
+            schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+            request_id: format!("cache-test-{id}"),
+            repository: "fixture-repository".into(),
+            worktree_fingerprint: "f".repeat(64),
+            run_id: format!("cache-test-{id}-run"),
+            ttl_seconds: PREPARATION_LEASE_TTL_SECONDS,
+            holder_pid: Some(std::process::id()),
+            resources: match mode {
+                SharedCacheMode::Exclusive => {
+                    preparation_cache_exclusive_resources("fixture-repository")
+                }
+                SharedCacheMode::Shared => vec![preparation_cache_users(
+                    "fixture-repository",
+                    SHARED_CACHE_USER_UNITS / max_concurrent,
+                )],
+            },
+        }
+    }
+
+    fn acquire_for_test(
+        coordinator: &mut HostResourceCoordinator,
+        max_concurrent: u32,
+        budget_check: Option<ExclusiveNeed>,
+        rotation_unsettled: bool,
+    ) -> Result<
+        (
+            crate::HostResourceGrant,
+            SharedCacheMode,
+            Option<ExclusiveNeed>,
+        ),
+        PreparationError,
+    > {
+        acquire_preparation_cache(
+            coordinator,
+            &|mode| Ok(cache_test_request(mode, max_concurrent)),
+            max_concurrent > 1,
+            budget_check,
+            Duration::ZERO,
+            &mut || rotation_unsettled,
+        )
+    }
+
+    fn is_contention(error: &PreparationError) -> bool {
+        matches!(error, PreparationError::HostResource(source) if is_resource_contention(source))
+    }
+
+    #[test]
+    fn sharing_admits_up_to_the_declared_number_of_preparations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&tmp.path().join("r.db")).unwrap();
+        let (_first, first_mode, need) =
+            acquire_for_test(&mut coordinator, 2, None, false).unwrap();
+        let (second, second_mode, _) = acquire_for_test(&mut coordinator, 2, None, false).unwrap();
+        assert_eq!(
+            (first_mode, second_mode, need),
+            (SharedCacheMode::Shared, SharedCacheMode::Shared, None)
+        );
+        let third = acquire_for_test(&mut coordinator, 2, None, false).unwrap_err();
+        assert!(is_contention(&third), "{third}");
+        coordinator
+            .release(
+                &second.lease.lease_id,
+                second.lease.generation,
+                &second.ownership_token,
+            )
+            .unwrap();
+        acquire_for_test(&mut coordinator, 2, None, false).expect("a released share is reusable");
+    }
+
+    #[test]
+    fn a_preparation_holding_the_cache_alone_and_sharers_exclude_each_other() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&tmp.path().join("r.db")).unwrap();
+        let (sharer, _, _) = acquire_for_test(&mut coordinator, 3, None, false).unwrap();
+        // The sweep, cache-root initialization and a non-sharing preparation
+        // all ask for exactly this.
+        let alone = coordinator
+            .acquire(&cache_test_request(SharedCacheMode::Exclusive, 1))
+            .unwrap_err();
+        assert!(is_resource_contention(&alone), "{alone}");
+        coordinator
+            .release(
+                &sharer.lease.lease_id,
+                sharer.lease.generation,
+                &sharer.ownership_token,
+            )
+            .unwrap();
+        let (_alone, mode, need) = acquire_for_test(&mut coordinator, 1, None, false).unwrap();
+        assert_eq!((mode, need), (SharedCacheMode::Exclusive, None));
+        let sharer = acquire_for_test(&mut coordinator, 3, None, false).unwrap_err();
+        assert!(is_contention(&sharer), "{sharer}");
+        let second_alone = acquire_for_test(&mut coordinator, 1, None, false).unwrap_err();
+        assert!(is_contention(&second_alone), "{second_alone}");
+    }
+
+    #[test]
+    fn a_due_budget_check_takes_the_cache_alone_only_when_it_is_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&tmp.path().join("r.db")).unwrap();
+        let due = Some(ExclusiveNeed::BudgetCheckDue);
+        let (free, mode, need) = acquire_for_test(&mut coordinator, 2, due, false).unwrap();
+        assert_eq!((mode, need), (SharedCacheMode::Exclusive, due));
+        coordinator
+            .release(
+                &free.lease.lease_id,
+                free.lease.generation,
+                &free.ownership_token,
+            )
+            .unwrap();
+
+        let (_sharer, _, _) = acquire_for_test(&mut coordinator, 2, None, false).unwrap();
+        let (_busy, mode, need) = acquire_for_test(&mut coordinator, 2, due, false).unwrap();
+        assert_eq!(
+            (mode, need),
+            (SharedCacheMode::Shared, None),
+            "a busy cache leaves the check for a later preparation"
+        );
+    }
+
+    #[test]
+    fn an_overdue_budget_check_waits_for_the_cache_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&tmp.path().join("r.db")).unwrap();
+        let overdue = Some(ExclusiveNeed::BudgetCheckOverdue);
+        let (sharer, _, _) = acquire_for_test(&mut coordinator, 2, None, false).unwrap();
+        let waiting = acquire_for_test(&mut coordinator, 2, overdue, false).unwrap_err();
+        assert!(is_contention(&waiting), "{waiting}");
+        coordinator
+            .release(
+                &sharer.lease.lease_id,
+                sharer.lease.generation,
+                &sharer.ownership_token,
+            )
+            .unwrap();
+        let (_alone, mode, need) = acquire_for_test(&mut coordinator, 2, overdue, false).unwrap();
+        assert_eq!((mode, need), (SharedCacheMode::Exclusive, overdue));
+    }
+
+    #[test]
+    fn an_unsettled_rotation_gives_up_the_share_and_takes_the_cache_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut coordinator = HostResourceCoordinator::open(&tmp.path().join("r.db")).unwrap();
+        let (_alone, mode, need) = acquire_for_test(&mut coordinator, 2, None, true).unwrap();
+        assert_eq!(
+            (mode, need),
+            (SharedCacheMode::Exclusive, Some(ExclusiveNeed::Recovery))
+        );
+        // Nothing is left behind from the share it gave up: the pool is
+        // wholly held by the one lease.
+        let sharer = acquire_for_test(&mut coordinator, 2, None, false).unwrap_err();
+        assert!(is_contention(&sharer), "{sharer}");
+    }
+
+    #[test]
+    fn budget_checks_become_due_after_an_hour_and_overdue_after_a_day() {
+        let now = 10 * SHARED_CACHE_BUDGET_CHECK_OVERDUE_MS;
+        assert_eq!(budget_check_need(Some(now - 1), now), None);
+        assert_eq!(
+            budget_check_need(Some(now - SHARED_CACHE_BUDGET_CHECK_INTERVAL_MS), now),
+            Some(ExclusiveNeed::BudgetCheckDue)
+        );
+        assert_eq!(
+            budget_check_need(Some(now - SHARED_CACHE_BUDGET_CHECK_OVERDUE_MS), now),
+            Some(ExclusiveNeed::BudgetCheckOverdue)
+        );
+        assert_eq!(
+            budget_check_need(None, now),
+            Some(ExclusiveNeed::BudgetCheckDue),
+            "a first run measures when free, without waiting"
+        );
+    }
+
+    #[test]
+    fn max_concurrent_is_bounded_and_defaults_to_one_without_changing_the_digest_input() {
+        let base = shared_budget_config(true, 1024);
+        let parsed = parse_config(&base).unwrap();
+        assert_eq!(parsed.shared_cache.unwrap().max_concurrent, 1);
+        assert!(
+            !serde_json::to_string(&parsed.shared_cache.unwrap())
+                .unwrap()
+                .contains("max_concurrent"),
+            "the default must serialize as before so existing digests stand"
+        );
+        let three = parse_config(&format!("{base}max_concurrent = 3\n")).unwrap();
+        assert_eq!(three.shared_cache.unwrap().max_concurrent, 3);
+        for refused in [0, SHARED_CACHE_MAX_CONCURRENT + 1] {
+            let error = parse_config(&format!("{base}max_concurrent = {refused}\n"))
+                .expect_err("out of range");
+            assert!(error.to_string().contains("max_concurrent"), "{error}");
+        }
+        for allowed in 1..=SHARED_CACHE_MAX_CONCURRENT {
+            assert_eq!(SHARED_CACHE_USER_UNITS % allowed, 0);
+        }
+    }
+
     fn in_progress_test_record(
         session_id: i64,
         grant: &crate::HostResourceGrant,
@@ -4721,8 +5248,15 @@ mod tests {
         let mut broker = Broker::open(tmp.path()).unwrap();
         let resource_db = tmp.path().join("host-state/host-resources.db");
         let mut coordinator = Some(HostResourceCoordinator::open(&resource_db).unwrap());
-        let request =
-            preparation_resource_request(&broker, 7, tmp.path(), &"a".repeat(64)).unwrap();
+        let request = preparation_resource_request(
+            &broker,
+            7,
+            tmp.path(),
+            &"a".repeat(64),
+            SharedCacheMode::Exclusive,
+            1,
+        )
+        .unwrap();
         let acquired = coordinator.as_mut().unwrap().acquire(&request).unwrap();
         let lease_id = acquired.lease.lease_id.clone();
         let mut grant = Some(acquired);

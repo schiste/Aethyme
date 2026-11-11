@@ -1729,6 +1729,7 @@ pub(super) fn run_prepare(parsed: Parsed) -> Result<(), UsageError> {
                 "preparation": {
                     "shared_cache_coordinated": report.shared_cache_coordinated,
                     "shared_cache_wait_ms": report.shared_cache_wait_ms,
+                    "shared_cache_mode": report.shared_cache_mode.map(|mode| mode.as_str()),
                     "steps": report.steps,
                 }
             }));

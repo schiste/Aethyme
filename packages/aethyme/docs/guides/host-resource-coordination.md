@@ -274,6 +274,31 @@ not a write quota. Rotation happens inside the exclusive lease, never after it,
 because it removes a store other worktrees may be reading. Declaring a budget
 without a `repository_shared` step is refused rather than ignored.
 
+By default one preparation at a time uses a repository's shared store, so a
+second session waits for the first to finish its steps. A repository whose
+shared steps tolerate another copy of themselves writing the same directory
+can let several run together:
+
+```toml
+[shared_cache]
+max_concurrent = 3
+```
+
+`max_concurrent` accepts 1 to 6 and defaults to 1. It is a statement about the
+repository's own commands, which Aethyme cannot check: package-manager download
+and content-addressable stores (pnpm, uv, pip, npm) are written for concurrent
+use, a step that builds into the shared directory in place usually is not.
+Sessions preparing the same digest share one directory, so that is the case to
+reason about. Work that moves or removes the store still runs alone: finishing
+an interrupted rotation, the budget check and rotation, the cache sweep and
+cache-root initialization each wait for every running preparation, and nothing
+starts while they hold the store. With sharing on, the budget is checked at
+most once an hour, by a preparation that finds the store free; when a check is
+a day late, preparations wait for the store alone until one has run it. Every
+broker on the host must be 0.8.69 or later before a repository sets this: an
+older broker refuses the unknown setting, and its own sweep does not wait for
+sharing preparations. It cannot be combined with `managed_storage`.
+
 An unspecified `shared_cache.root` keeps the historical Host placement for
 existing configurations. A new pnpm draft from `aethyme init` selects the
 worktree placement filesystem and passes its broker-managed store path with
