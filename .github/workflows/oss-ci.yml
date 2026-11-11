@@ -642,8 +642,8 @@ jobs:
   # ── Cache warm-up ───────────────────────────────────────────────────────
   # Compiles main's tests on each push so the contract check and a dispatched
   # run of the test jobs above restore a warm cache instead of starting cold. Builds only; main's test
-  # verdict is Aethyme Gates. macOS is tested nightly (macos-nightly.yml),
-  # which keeps its own cache.
+  # verdict is Aethyme Gates. macOS is tested on every commit on main
+  # (macos-tests.yml) and nightly (macos-nightly.yml), with their own caches.
   warm-rust-cache:
     name: Warm Rust cache (${{ matrix.os }})
     if: github.event_name == 'push'

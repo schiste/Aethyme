@@ -723,6 +723,91 @@ fn macos_nightly_runs_the_whole_workspace_suite() {
     assert!(job.contains(&"        run: cargo build --locked --workspace --bins"));
 }
 
+/// Every commit on main also runs the workspace suite on macOS, with the
+/// commands of the Linux shards. It stays off pull requests (the per-PR macOS
+/// job blocked merges for 6-10 min of runner queue) and is no required check.
+#[test]
+fn macos_tests_run_the_workspace_suite_on_main() {
+    let run_lines = |text: &str, job: &str| -> Vec<String> {
+        block(text, job)
+            .iter()
+            .filter(|line| line.trim_start().starts_with("run:"))
+            .map(|line| line.trim().to_owned())
+            .collect()
+    };
+    let macos = workflow("macos-tests.yml");
+    let oss = workflow("oss-ci.yml");
+    assert_eq!(
+        block(&macos, "on:"),
+        [
+            "  push:",
+            "    branches: [\"main\"]",
+            "  workflow_dispatch:"
+        ]
+    );
+    assert_eq!(block(&macos, "permissions:"), ["  contents: read"]);
+    assert!(macos.contains("  group: macos-tests-${{ github.sha }}\n  cancel-in-progress: false"));
+    assert!(!macos.contains("github.event."));
+
+    for job in [
+        "  macos-tests-build:",
+        "  macos-tests-shard:",
+        "  macos-tests-examples-doctests:",
+    ] {
+        assert!(
+            block(&macos, job).contains(&"    runs-on: macos-15"),
+            "{job}"
+        );
+    }
+
+    // The build: the archive command of the Linux build job, and a cache key
+    // of its own that this job saves from main.
+    let build = block(&macos, "  macos-tests-build:");
+    let oss_archive: Vec<String> = run_lines(&oss, "  rust-tests-build:")
+        .into_iter()
+        .filter(|line| line.contains("--archive"))
+        .collect();
+    assert_eq!(oss_archive.len(), 1);
+    assert!(
+        run_lines(&macos, "  macos-tests-build:").contains(&oss_archive[0]),
+        "{}",
+        oss_archive[0]
+    );
+    assert!(build.contains(&"          shared-key: rust-tests-macos"));
+    assert!(build.contains(&"          save-if: ${{ github.ref == 'refs/heads/main' }}"));
+
+    // The shards: the Linux shard command, divided into six partitions, each
+    // of which the matrix names.
+    let shard = block(&macos, "  macos-tests-shard:");
+    assert!(shard.contains(&"      fail-fast: false"));
+    assert!(shard.contains(&"        shard: [1, 2, 3, 4, 5, 6]"));
+    let oss_shard: Vec<String> = run_lines(&oss, "  rust-tests-shard:")
+        .into_iter()
+        .filter(|line| line.contains("--from-archive"))
+        .collect();
+    assert_eq!(oss_shard.len(), 1);
+    let command = oss_shard[0].replace("/10\"", "/6\"");
+    assert!(
+        run_lines(&macos, "  macos-tests-shard:").contains(&command),
+        "{command}"
+    );
+
+    let examples = run_lines(&macos, "  macos-tests-examples-doctests:");
+    assert!(examples.contains(&"run: cargo test --locked --workspace --examples".to_owned()));
+    assert!(examples.contains(&"run: cargo test --locked --workspace --doc".to_owned()));
+    let examples_job = block(&macos, "  macos-tests-examples-doctests:");
+    assert!(examples_job.contains(&"          shared-key: rust-tests-macos"));
+    assert!(examples_job.contains(&"          save-if: false"));
+
+    let verdict = block(&macos, "  macos-tests:");
+    assert!(verdict.contains(
+        &"    needs: [macos-tests-build, macos-tests-shard, macos-tests-examples-doctests]"
+    ));
+    assert!(verdict.contains(
+        &"          [[ \"$BUILD\" == success && \"$SHARDS\" == success && \"$EXAMPLES\" == success ]]"
+    ));
+}
+
 #[test]
 fn linux_nightly_publishes_workspace_coverage_without_a_threshold() {
     let nightly = workflow("macos-nightly.yml");

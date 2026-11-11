@@ -107,7 +107,7 @@ discovered rather than looked up. Realistic range: **45–70 engineer-days**
 | `src/` files with the same patterns (upper bound, covering product and test code) | 62 files, ≤581 tests |
 | Shebang fake executables written by tests (fake `git`/`gh`/`aethyme` on PATH) | 53 |
 | Tests already `#[cfg(unix)]`-gated (skipped, not failing, on Windows) | 40 |
-| Current CI OSes | `ubuntu-latest` (`oss-ci.yml`, `aethyme-gates.yml`, `cross-process-contract.yml`, `aethyme-local-tests.yml`), `macos-14` (`oss-ci.yml:210`, `macos-nightly.yml`). No Windows job |
+| Current CI OSes | `ubuntu-latest` (`oss-ci.yml`, `aethyme-gates.yml`, `cross-process-contract.yml`, `aethyme-local-tests.yml`), `macos-15` (`macos-tests.yml` on every commit on main, `macos-nightly.yml`). No Windows job |
 
 Roughly 350–900 tests assume Unix, directly or through a harness. The main
 cost is the fake-executable pattern: Windows resolves `PATHEXT` (`.exe`,
