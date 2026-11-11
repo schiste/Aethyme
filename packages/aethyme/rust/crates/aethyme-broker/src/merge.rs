@@ -528,6 +528,14 @@ pub struct VerificationBase {
     pub fallback_reason: Option<String>,
 }
 
+/// A submission whose replay onto its verification base changes nothing, and
+/// the base, plan and resulting tree that showed it.
+struct ContentEmptySubmission {
+    verification: VerificationBase,
+    plan: SubmissionPlan,
+    tree: String,
+}
+
 /// [`VerificationBase::source`] for the fetched default branch.
 pub const VERIFIED_AGAINST_UPSTREAM: &str = "upstream";
 /// [`VerificationBase::source`] for the integration branch.
@@ -1027,6 +1035,14 @@ impl Broker {
         // in verify-only mode, integration otherwise. This prevents upstream-only
         // commits from being counted as session work when integration is stale (#352).
         self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Submit);
+        // Most submissions on a repository that lands work through pull
+        // requests arrive after the work has merged, and have nothing left to
+        // verify. Learn that before the lease audit, which scans every live
+        // session and is by far the largest fixed cost of a submit.
+        progress.phase(crate::submit_progress::PHASE_CONTENT_CHECK);
+        if let Some(empty) = self.content_empty_submission(&session, &head) {
+            return self.submit_content_empty(&session, &checkout, &head, empty);
+        }
         progress.phase("auditing lease ownership");
         let mut ownership = self.audit_submit_ownership(session_id)?;
         if !ownership.ok {
@@ -1106,16 +1122,38 @@ impl Broker {
         self.prepare_worktree_root_for_submission()?;
         let entry = self.store().submit(session_id, &head, &base)?;
         drop(lifecycle_claim);
-        // A new head supersedes this session's older in-flight entries:
-        // without this, a stale conflicted entry would be re-simulated
-        // (and re-announced) on every future promotion.
+        self.supersede_older_entries(session_id, entry.id)?;
+        let mut outcome = self.simulate_and_gate_with_policy(
+            entry.id,
+            cache_policy,
+            intent,
+            Some(&progress),
+            prepared_plan,
+        )?;
+        outcome.lease_warnings = ownership.warned_leases;
+        self.attach_overlap_changes(
+            session_id,
+            &ownership.changed_paths,
+            &mut outcome.lease_warnings,
+        );
+        Ok(outcome)
+    }
+
+    /// A new head supersedes this session's older in-flight entries: without
+    /// this, a stale conflicted entry would be re-simulated (and re-announced)
+    /// on every future promotion.
+    fn supersede_older_entries(
+        &mut self,
+        session_id: i64,
+        current_entry_id: i64,
+    ) -> Result<(), BrokerOpError> {
         let stale: Vec<i64> = self
             .store()
             .merge_queue()?
             .into_iter()
             .filter(|e| {
                 e.session_id == session_id
-                    && e.id != entry.id
+                    && e.id != current_entry_id
                     && matches!(
                         e.status,
                         MergeStatus::Submitted
@@ -1131,20 +1169,168 @@ impl Broker {
             self.store()
                 .set_merge_status(stale_id, MergeStatus::Superseded, None, None)?;
         }
-        let mut outcome = self.simulate_and_gate_with_policy(
-            entry.id,
-            cache_policy,
-            intent,
-            Some(&progress),
-            prepared_plan,
-        )?;
-        outcome.lease_warnings = ownership.warned_leases;
-        self.attach_overlap_changes(
-            session_id,
-            &ownership.changed_paths,
-            &mut outcome.lease_warnings,
-        );
+        Ok(())
+    }
+
+    /// Whether replaying this submission onto its verification base leaves the
+    /// base's tree unchanged, with what was computed to learn it.
+    ///
+    /// A probe, never a verdict on anything else: every failure, conflict or
+    /// doubt answers `None` and the ordinary path decides, reporting its own
+    /// errors in its own order. Primary-checkout sessions are excluded because
+    /// their submit must still gate and record main's movement.
+    fn content_empty_submission(
+        &mut self,
+        session: &crate::types::Session,
+        head: &str,
+    ) -> Option<ContentEmptySubmission> {
+        let _span = crate::phase_telemetry::span("content_empty_probe");
+        if Path::new(&session.worktree_path) == self.main_root_path() {
+            return None;
+        }
+        let verification = self.submission_base().ok()?;
+        let base_tree = self
+            .repo_handle()
+            .commit_tree_id(&verification.commit)
+            .ok()?;
+        // One plain merge simulation screens out every submission that still
+        // carries content, so those pay nothing more here: planning reads the
+        // patch history of both sides and must run only once for them.
+        let screen = self
+            .repo_handle()
+            .merge_tree_simulate(&verification.commit, head)
+            .ok()?;
+        if !screen.conflicts.is_empty() || screen.tree != base_tree {
+            return None;
+        }
+        // The screen merges everything since the merge base; the verdict that
+        // is recorded comes from the same plan and replay submit always uses.
+        let plan = self
+            .build_submission_plan(session, head, &verification.commit)
+            .ok()?;
+        let replay = self.replay_submission_plan(&plan).ok()?;
+        if !replay.conflicts.is_empty() {
+            return None;
+        }
+        (replay.tree == base_tree).then_some(ContentEmptySubmission {
+            verification,
+            plan,
+            tree: replay.tree,
+        })
+    }
+
+    /// Record a submission the probe found content-empty, without the lease
+    /// audit or a second plan.
+    ///
+    /// The outcome is recorded against exactly the base and tree the probe
+    /// compared, so it stays true even if the base moves meanwhile. The lease
+    /// audit is skipped because it guards paths a submission would change, and
+    /// this one changes none. Trust, checkout identity, the lifecycle claim and
+    /// the queue row are kept as on the ordinary path.
+    fn submit_content_empty(
+        &mut self,
+        session: &crate::types::Session,
+        checkout: &GitRepo,
+        head: &str,
+        empty: ContentEmptySubmission,
+    ) -> Result<SubmitOutcome, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("content_empty_fast_path");
+        let ContentEmptySubmission {
+            verification,
+            plan,
+            tree,
+        } = empty;
+        let base = verification.commit.clone();
+        self.require_trusted_policy_at_commit(&base, Some(session.id))?;
+        require_session_checkout_identity(session, checkout, Some(head))?;
+        let lifecycle_claim = self.claim_worktree_lifecycle()?;
+        self.prepare_worktree_root_for_submission()?;
+        let entry = self.store().submit(session.id, head, &base)?;
+        drop(lifecycle_claim);
+        self.supersede_older_entries(session.id, entry.id)?;
+        self.store()
+            .set_merge_status(entry.id, MergeStatus::Simulating, None, None)?;
+        let mut outcome = self.record_content_empty(&entry, session, &base, &tree, plan)?;
+        outcome.verified_against = Some(verification);
         Ok(outcome)
+    }
+
+    /// Record that a clean replay left the base's tree unchanged: supersede the
+    /// entry as content-empty, or claim the promotion an earlier attempt of
+    /// this session produced and lost (issue #135).
+    fn record_content_empty(
+        &mut self,
+        entry: &MergeQueueEntry,
+        session: &crate::types::Session,
+        base: &str,
+        tree: &str,
+        submission_plan: SubmissionPlan,
+    ) -> Result<SubmitOutcome, BrokerOpError> {
+        let details = serde_json::json!({
+            "base": base,
+            "reason": "submission produces no content change",
+            "pending_session_owned_commits": submission_plan.pending_owned_commit_ids(),
+        });
+        // Ask why it is empty before recording it as nothing. If this very
+        // session already produced the integration tip and no promoted entry
+        // claims it, a previous attempt promoted and lost its response:
+        // superseding here would strand that commit as unrecorded and refuse
+        // publication (issue #135). Claim it instead, which is idempotent.
+        if self.integration_tip_is_unclaimed_promotion_for(session.id, base)? {
+            let recovered = serde_json::json!({
+                "commit": base,
+                "reason": "retry claimed an unrecorded promotion this session produced",
+            });
+            let promotion_parent = self.repo_handle().first_parent(base)?;
+            let promoted_paths = self
+                .repo_handle()
+                .changed_between(&promotion_parent, base)?;
+            let integration_ref = PromoteConfig::load(&self.main_root_path()).branch;
+            self.store().record_recovered_promotion(
+                entry.id,
+                base,
+                tree,
+                &integration_ref,
+                &promoted_paths,
+                &recovered.to_string(),
+            )?;
+            clear_action_required(Path::new(&session.worktree_path));
+            return Ok(SubmitOutcome {
+                entry: self.queue_entry(entry.id)?,
+                submission_plan,
+                conflicts: Vec::new(),
+                conflict_details: Vec::new(),
+                gate_outcomes: Vec::new(),
+                graph_integrity: None,
+                gate_verification: SubmissionGateVerification::not_run(),
+                no_changes: true,
+                lease_warnings: Vec::new(),
+                verified_against: None,
+                promoted: true,
+                promotion_suppressed: None,
+            });
+        }
+        self.store().record_content_empty_supersession(
+            entry.id,
+            base,
+            tree,
+            &details.to_string(),
+        )?;
+        clear_action_required(Path::new(&session.worktree_path));
+        Ok(SubmitOutcome {
+            entry: self.queue_entry(entry.id)?,
+            submission_plan,
+            conflicts: Vec::new(),
+            conflict_details: Vec::new(),
+            gate_outcomes: Vec::new(),
+            graph_integrity: None,
+            gate_verification: SubmissionGateVerification::not_run(),
+            no_changes: true,
+            lease_warnings: Vec::new(),
+            verified_against: None,
+            promoted: false,
+            promotion_suppressed: None,
+        })
     }
 
     /// Whether `commit` is a promotion this session produced that no promoted
@@ -1343,71 +1529,13 @@ impl Broker {
         // HEAD, and submit still needs to gate and record that externally
         // visible main movement.
         if simulation.tree == base_tree && !main_checkout_session {
-            let details = serde_json::json!({
-                "base": base,
-                "reason": "submission produces no content change",
-                "pending_session_owned_commits": submission_plan.pending_owned_commit_ids(),
-            });
-            // Ask why it is empty before recording it as nothing. If this very
-            // session already produced the integration tip and no promoted entry
-            // claims it, a previous attempt promoted and lost its response:
-            // superseding here would strand that commit as unrecorded and refuse
-            // publication (issue #135). Claim it instead, which is idempotent.
-            if self.integration_tip_is_unclaimed_promotion_for(session.id, &base)? {
-                let recovered = serde_json::json!({
-                    "commit": base,
-                    "reason": "retry claimed an unrecorded promotion this session produced",
-                });
-                let promotion_parent = self.repo_handle().first_parent(&base)?;
-                let promoted_paths = self
-                    .repo_handle()
-                    .changed_between(&promotion_parent, &base)?;
-                let integration_ref = PromoteConfig::load(&self.main_root_path()).branch;
-                self.store().record_recovered_promotion(
-                    entry.id,
-                    &base,
-                    &simulation.tree,
-                    &integration_ref,
-                    &promoted_paths,
-                    &recovered.to_string(),
-                )?;
-                clear_action_required(Path::new(&session.worktree_path));
-                return Ok(SubmitOutcome {
-                    entry: self.queue_entry(entry.id)?,
-                    submission_plan,
-                    conflicts: Vec::new(),
-                    conflict_details: Vec::new(),
-                    gate_outcomes: Vec::new(),
-                    graph_integrity: None,
-                    gate_verification: SubmissionGateVerification::not_run(),
-                    no_changes: true,
-                    lease_warnings: Vec::new(),
-                    verified_against: None,
-                    promoted: true,
-                    promotion_suppressed: None,
-                });
-            }
-            self.store().record_content_empty_supersession(
-                entry.id,
+            return self.record_content_empty(
+                &entry,
+                &session,
                 &base,
                 &simulation.tree,
-                &details.to_string(),
-            )?;
-            clear_action_required(Path::new(&session.worktree_path));
-            return Ok(SubmitOutcome {
-                entry: self.queue_entry(entry.id)?,
                 submission_plan,
-                conflicts: Vec::new(),
-                conflict_details: Vec::new(),
-                gate_outcomes: Vec::new(),
-                graph_integrity: None,
-                gate_verification: SubmissionGateVerification::not_run(),
-                no_changes: true,
-                lease_warnings: Vec::new(),
-                verified_against: None,
-                promoted: false,
-                promotion_suppressed: None,
-            });
+            );
         }
 
         // Clean merge: materialize as a commit and run affected gates in the
@@ -3257,6 +3385,75 @@ mod owned_merge_history_tests {
         std::fs::write(root.join(file), content).unwrap();
         git(root, &["add", file]);
         git(root, &["commit", "-qm", file]);
+    }
+
+    /// Submit one adopted worktree and return the outcome with how many times
+    /// each span ran.
+    fn submit_counting_spans(
+        commit_a_change: bool,
+    ) -> (SubmitOutcome, std::collections::BTreeMap<String, u64>) {
+        // The worktree sits beside the repository: a fresh broker refuses to
+        // bind a worktree root that already exists inside it.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = &tmp.path().join("repository");
+        std::fs::create_dir(root).unwrap();
+        git(root, &["init", "-q", "-b", "main"]);
+        edit(root, "base.txt", "base\n");
+        let mut broker = Broker::open(root).unwrap();
+        let worktree = tmp.path().join("landed");
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent/landed",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let session = broker.adopt(&worktree, None).unwrap();
+        if commit_a_change {
+            edit(&worktree, "work.txt", "work\n");
+        }
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let outcome = {
+            let _installed = crate::phase_telemetry::install(recorder.clone());
+            broker.submit(session.id).unwrap()
+        };
+        (outcome, recorder.totals().1)
+    }
+
+    #[test]
+    fn a_submission_with_nothing_to_verify_skips_the_lease_audit() {
+        let (outcome, spans) = submit_counting_spans(false);
+
+        assert!(outcome.no_changes);
+        assert!(!outcome.promoted);
+        assert_eq!(outcome.entry.status, MergeStatus::Superseded);
+        let details: serde_json::Value =
+            serde_json::from_str(outcome.entry.details_json.as_deref().unwrap()).unwrap();
+        assert_eq!(details["reason"], "submission produces no content change");
+        assert!(outcome.verified_against.is_some());
+        assert_eq!(spans.get("content_empty_fast_path"), Some(&1));
+        assert_eq!(
+            spans.get("lease_refresh"),
+            None,
+            "the lease audit ran for a submission that changes nothing: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn a_submission_with_content_still_gets_the_lease_audit() {
+        let (outcome, spans) = submit_counting_spans(true);
+
+        assert!(!outcome.no_changes);
+        assert_eq!(spans.get("content_empty_probe"), Some(&1));
+        assert_eq!(spans.get("content_empty_fast_path"), None);
+        assert!(
+            spans.get("lease_refresh").is_some_and(|count| *count >= 1),
+            "a submission with content skipped the lease audit: {spans:?}"
+        );
     }
 
     fn fixture() -> (tempfile::TempDir, Broker, SubmissionPlan) {
