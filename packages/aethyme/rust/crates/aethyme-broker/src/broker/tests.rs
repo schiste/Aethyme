@@ -446,10 +446,9 @@ fn a_bulk_pass_proves_remote_durability_from_one_listing_per_remote() {
         broker.remote_durability_evidence(&heads[0]),
         Some(("refs/remotes/origin/one".to_string(), heads[0].clone()))
     );
-    assert_eq!(
-        broker.remote_durability_evidence(&heads[1]),
-        Some(("refs/remotes/origin/two".to_string(), heads[1].clone())),
-        "the remote holding the commit at a branch tip is durable without a tracking ref"
+    assert!(
+        broker.remote_durability_evidence(&heads[1]).is_none(),
+        "a listed branch proves nothing without the tracking ref a push leaves"
     );
     assert_eq!(
         broker.remote_durability_evidence(&heads[2]),
@@ -464,6 +463,16 @@ fn a_bulk_pass_proves_remote_durability_from_one_listing_per_remote() {
     assert!(broker.remote_durability_evidence(&heads[0]).is_none());
     drop(pass);
     assert!(broker.remote_heads.borrow().is_none());
+
+    // A remote that is this repository lists its own local branches. None of
+    // them was pushed anywhere, so none is durable.
+    git(&["remote", "set-url", "origin", "."]);
+    git(&["switch", "-q", "-c", "local-only", "main"]);
+    git(&["commit", "--allow-empty", "-qm", "never pushed"]);
+    let local_only = git(&["rev-parse", "HEAD"]);
+    git(&["switch", "-q", "main"]);
+    let _pass = broker.remote_heads_pass();
+    assert!(broker.remote_durability_evidence(&local_only).is_none());
 }
 
 #[test]

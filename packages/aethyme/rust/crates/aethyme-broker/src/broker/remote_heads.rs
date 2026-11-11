@@ -103,11 +103,17 @@ impl Broker {
         Some(heads.and_then(|heads| heads.get(branch).cloned()))
     }
 
-    /// A branch some remote lists at exactly `commit`, from the open pass,
-    /// as `(remote-tracking ref name, commit)`. The remote holding the commit
-    /// at a branch tip is the durability being proved, whether or not this
-    /// repository has fetched that branch.
-    pub(super) fn remote_branch_at_in_pass(&self, commit: &str) -> Option<(String, String)> {
+    /// The remote-tracking ref names of every branch some remote lists at
+    /// exactly `commit`, from the open pass; empty outside one.
+    ///
+    /// These are candidates only. A listing is not proof by itself: a remote
+    /// whose URL is this repository lists its local branches, so the caller
+    /// must still find the tracking ref a push or fetch left at that commit.
+    pub(super) fn remote_refs_listed_at_in_pass(&self, commit: &str) -> Vec<String> {
+        self.remote_refs_listed_at(commit).unwrap_or_default()
+    }
+
+    fn remote_refs_listed_at(&self, commit: &str) -> Option<Vec<String>> {
         let remotes = {
             let mut slot = self.remote_heads.borrow_mut();
             let snapshot = slot.as_mut()?;
@@ -116,17 +122,18 @@ impl Broker {
             }
             snapshot.remote_names.clone()?
         };
-        remotes.iter().find_map(|remote| {
-            let heads = self.remote_heads_in_pass(remote)??;
-            heads
-                .iter()
-                .find(|(_, head)| head.as_str() == commit)
-                .map(|(branch, _)| {
-                    (
-                        format!("refs/remotes/{remote}/{branch}"),
-                        commit.to_string(),
-                    )
-                })
-        })
+        let mut refs = Vec::new();
+        for remote in &remotes {
+            let Some(Some(heads)) = self.remote_heads_in_pass(remote) else {
+                continue;
+            };
+            refs.extend(
+                heads
+                    .iter()
+                    .filter(|(_, head)| head.as_str() == commit)
+                    .map(|(branch, _)| format!("refs/remotes/{remote}/{branch}")),
+            );
+        }
+        Some(refs)
     }
 }
