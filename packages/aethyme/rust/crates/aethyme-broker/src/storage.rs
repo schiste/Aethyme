@@ -3077,12 +3077,9 @@ fn preparation_cache_lease_request(
         run_id,
         ttl_seconds: ttl_seconds.max(15),
         holder_pid: Some(std::process::id()),
-        resources: vec![crate::HostResourceRequirement {
-            key: "preparation_cache".into(),
-            resource: crate::HostResourceKind::ExclusiveKey {
-                name: crate::preparation::preparation_cache_lease_name(repository),
-            },
-        }],
+        // The sweep removes entries, so it also waits out every preparation
+        // that shares the cache.
+        resources: crate::preparation::preparation_cache_exclusive_resources(repository),
     })
 }
 

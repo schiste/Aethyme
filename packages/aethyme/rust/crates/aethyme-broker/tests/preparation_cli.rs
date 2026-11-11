@@ -799,3 +799,107 @@ cache = "repository_shared"
         "{waited}"
     );
 }
+
+/// With `max_concurrent`, a second session prepares while the first is still
+/// inside its shared step, instead of waiting for it.
+#[test]
+fn a_shared_cache_admits_concurrent_preparations_when_the_repository_opts_in() {
+    let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    git(temp.path(), &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(temp.path().join(".aethyme")).unwrap();
+    std::fs::write(
+        temp.path().join(".gitignore"),
+        "/.aethyme/broker.db*\n/.aethyme/run/\n/node_modules/\n/host-state/\n/step-started\n/hold\n",
+    )
+    .unwrap();
+    std::fs::write(temp.path().join("pnpm-lock.yaml"), "v1\n").unwrap();
+    let release = temp.path().join("host-state").join("release");
+    std::fs::write(
+        temp.path().join(".aethyme/prepare.toml"),
+        format!(
+            r#"schema_version = 1
+
+[[steps]]
+name = "deps"
+command = ["sh", "-c", "touch step-started; while [ ! -e '{}' ] && [ -e hold ]; do sleep 0.05; done; mkdir -p node_modules"]
+inputs = ["pnpm-lock.yaml"]
+outputs = ["node_modules/"]
+cache = "repository_shared"
+
+[shared_cache]
+max_concurrent = 2
+"#,
+            release.display()
+        ),
+    )
+    .unwrap();
+    git(temp.path(), &["add", "."]);
+    git(temp.path(), &["commit", "-qm", "fixture"]);
+    let state = temp.path().join("host-state");
+    let start = |task: &str| {
+        let started = success_json(run(
+            temp.path(),
+            &state,
+            &["start", "--task", task, "--short-name", task, "--json"],
+        ));
+        started["id"].as_i64().unwrap().to_string()
+    };
+    let holder = success_json(run(
+        temp.path(),
+        &state,
+        &["start", "--adopt", ".", "--task", "holder", "--json"],
+    ));
+    let holder_id = holder["id"].as_i64().unwrap().to_string();
+    let (first_id, second_id) = (start("first"), start("second"));
+
+    // The first preparation finds a free cache whose budget was never
+    // checked, so it holds the cache alone and checks it.
+    let first = success_json(run(
+        temp.path(),
+        &state,
+        &["submit", "prepare", "--session", &first_id, "--json"],
+    ));
+    assert_eq!(first["shared_cache_mode"], "exclusive", "{first}");
+
+    std::fs::write(temp.path().join("hold"), "").unwrap();
+    let holding = {
+        let (repo, state, holder_id) = (temp.path().to_path_buf(), state.clone(), holder_id);
+        std::thread::spawn(move || {
+            run(
+                &repo,
+                &state,
+                &["submit", "prepare", "--session", &holder_id, "--json"],
+            )
+        })
+    };
+    let started = std::time::Instant::now();
+    while !temp.path().join("step-started").exists() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "the holder never started its shared step"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // The holder is still in its step: `--wait 0s` proves nothing waited.
+    let alongside = success_json(run(
+        temp.path(),
+        &state,
+        &[
+            "submit",
+            "prepare",
+            "--session",
+            &second_id,
+            "--wait",
+            "0s",
+            "--json",
+        ],
+    ));
+    assert_eq!(alongside["state"], "current", "{alongside}");
+    assert_eq!(alongside["shared_cache_mode"], "shared", "{alongside}");
+    assert!(!holding.is_finished(), "the holder must still be preparing");
+
+    std::fs::write(&release, "").unwrap();
+    let held = success_json(holding.join().unwrap());
+    assert_eq!(held["shared_cache_mode"], "shared", "{held}");
+}

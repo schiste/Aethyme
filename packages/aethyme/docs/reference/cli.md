@@ -684,7 +684,9 @@ symlink at an output path is refused. Repositories should ignore local outputs
 in Git. `worktree_local` steps receive no shared cache. A
 `repository_shared` step receives `AETHYME_PREPARE_CACHE_DIR`; access is
 serialized in per-user host state by canonical remote identity, renewed while
-the command runs, and released afterward. The cache path and ownership token
+the command runs, and released afterward. `[shared_cache] max_concurrent`
+(1 to 6, default 1) lets that many sessions run their steps against the store
+at once; see the host resource coordination guide. The cache path and ownership token
 are absent from JSON and broker journals.
 
 Steps with `cache = "repository_shared"` may declare `shared_package_caches`
