@@ -685,7 +685,9 @@ pub(super) fn run_metrics(parsed: Parsed) -> Result<(), UsageError> {
     let metrics_path = broker
         .main_root()
         .join(".aethyme/logs/command-metrics.jsonl");
+    let mut by_release = serde_json::Value::Array(Vec::new());
     if let Ok(text) = std::fs::read_to_string(&metrics_path) {
+        by_release = crate::scoreboard::by_release(text.lines());
         for line in text.lines() {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 let name = v
@@ -719,6 +721,7 @@ pub(super) fn run_metrics(parsed: Parsed) -> Result<(), UsageError> {
                 "command": name, "count": count, "total_ms": ms,
                 "total_output_bytes": bytes, "output_sampled_calls": sized,
             })).collect::<Vec<_>>(),
+            "by_release": by_release,
         });
         out!("{}", serde_json::to_string_pretty(&out)?);
     } else {
