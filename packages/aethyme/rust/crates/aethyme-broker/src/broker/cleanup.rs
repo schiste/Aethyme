@@ -3188,6 +3188,7 @@ impl Broker {
         }
         self.landing_deadline.set(deadline);
         let _clear_landing_deadline = ClearOnDrop(&self.landing_deadline);
+        let _remote_heads = self.remote_heads_pass();
         let target_snapshot = self.cleanup_target_snapshot();
         let mut plan = CleanupPlan {
             target_snapshot: target_snapshot.refs.clone(),

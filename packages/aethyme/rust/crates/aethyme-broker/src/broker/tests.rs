@@ -406,6 +406,67 @@ fn no_net_session_requires_a_current_remote_before_skipping_the_history_walk() {
 }
 
 #[test]
+fn a_bulk_pass_proves_remote_durability_from_one_listing_per_remote() {
+    let (repo, git) = landing_fixture();
+    let remote = tempfile::tempdir().unwrap();
+    let remote_path = remote.path().to_str().unwrap();
+    git(&["init", "-q", "--bare", "-b", "main", remote_path]);
+    git(&["remote", "add", "origin", remote_path]);
+    git(&["push", "-q", "origin", "main"]);
+    let mut heads = Vec::new();
+    for name in ["one", "two", "three"] {
+        git(&["switch", "-q", "-c", name, "main"]);
+        std::fs::write(repo.path().join(format!("{name}.txt")), name).unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", name]);
+        git(&["push", "-q", "origin", name]);
+        heads.push(git(&["rev-parse", "HEAD"]));
+    }
+    // `three` moves on, so its first commit is held below the branch tip.
+    git(&["commit", "--allow-empty", "-qm", "later"]);
+    git(&["push", "-q", "origin", "three"]);
+    let three_tip = git(&["rev-parse", "HEAD"]);
+    git(&["switch", "-q", "main"]);
+    // `two` is on the remote, but this repository holds no tracking ref.
+    git(&["update-ref", "-d", "refs/remotes/origin/two"]);
+    let storage = crate::test_storage::TestStorage::new();
+    let broker = storage.open(repo.path()).unwrap();
+    let queries = crate::git::test_remote_queries;
+
+    // Outside a pass every check asks the remote, and only about refs this
+    // repository tracks.
+    let before = queries();
+    assert!(broker.remote_durability_evidence(&heads[0]).is_some());
+    assert!(broker.remote_durability_evidence(&heads[1]).is_none());
+    assert_eq!(queries() - before, 1);
+
+    let pass = broker.remote_heads_pass();
+    let before = queries();
+    assert_eq!(
+        broker.remote_durability_evidence(&heads[0]),
+        Some(("refs/remotes/origin/one".to_string(), heads[0].clone()))
+    );
+    assert_eq!(
+        broker.remote_durability_evidence(&heads[1]),
+        Some(("refs/remotes/origin/two".to_string(), heads[1].clone())),
+        "the remote holding the commit at a branch tip is durable without a tracking ref"
+    );
+    assert_eq!(
+        broker.remote_durability_evidence(&heads[2]),
+        Some(("refs/remotes/origin/three".to_string(), three_tip)),
+        "a commit below a current branch tip is found through the tracking ref"
+    );
+    assert_eq!(queries() - before, 1, "one listing answers every check");
+
+    // A branch deleted mid-pass stops proving anything once the listing ages.
+    git(&["push", "-q", "origin", ":refs/heads/one"]);
+    broker.remote_heads.borrow_mut().as_mut().unwrap().max_age = std::time::Duration::ZERO;
+    assert!(broker.remote_durability_evidence(&heads[0]).is_none());
+    drop(pass);
+    assert!(broker.remote_heads.borrow().is_none());
+}
+
+#[test]
 fn a_merged_head_is_proved_by_ancestry_before_any_candidate_walk() {
     let (repo, git) = landing_fixture();
     let base = git(&["rev-parse", "HEAD"]);

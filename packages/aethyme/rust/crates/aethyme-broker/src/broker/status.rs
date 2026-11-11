@@ -1856,11 +1856,19 @@ impl Broker {
     /// remote reports, and not knowing -- offline, slow, unreadable -- is
     /// unproven rather than absent. Offline, this evidence simply never fires
     /// and behaviour is exactly what it was.
+    ///
+    /// Inside a bulk cleanup pass "right now" is one listing of the remote's
+    /// branches, re-read as it ages (see `remote_heads`).
     pub(super) fn remote_durability_evidence(
         &self,
         session_head: &str,
     ) -> Option<(String, String)> {
         const FRESHNESS_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+        // A branch the remote lists at this very commit needs no search of
+        // the remote-tracking refs for one that contains it.
+        if let Some(evidence) = self.remote_branch_at_in_pass(session_head) {
+            return Some(evidence);
+        }
         let repo = self.repo_handle();
         for remote_ref in repo.remote_refs_containing(session_head) {
             let Some(rest) = remote_ref.strip_prefix("refs/remotes/") else {
@@ -1873,10 +1881,19 @@ impl Broker {
             if branch == "HEAD" {
                 continue;
             }
+            // A branch the pass's listing lacks is settled without reading
+            // its tracking ref: most containing refs are ones the remote has
+            // since deleted.
+            let listed = self.remote_branch_head_in_pass(remote, branch);
+            if listed == Some(None) {
+                continue;
+            }
             let Some(tracked) = repo.resolve_ref(&remote_ref) else {
                 continue;
             };
-            let Some(live) = repo.remote_branch_head(remote, branch, FRESHNESS_BUDGET) else {
+            let live =
+                listed.unwrap_or_else(|| repo.remote_branch_head(remote, branch, FRESHNESS_BUDGET));
+            let Some(live) = live else {
                 continue;
             };
             if live == tracked {
