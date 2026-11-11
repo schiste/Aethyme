@@ -348,6 +348,12 @@ std::thread_local! {
     static TEST_LANDING_SEARCH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Candidate/path entries the landing search actually read on this thread.
+    static TEST_LANDING_PATH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Per-thread observation of actual search entry, independent of its verdict.
 #[cfg(test)]
 pub(crate) fn test_landing_search_calls() -> usize {
@@ -538,27 +544,10 @@ fn find_landing_with_limits_cached(
                 window.len()
             )));
         }
-        let queries = batch
-            .iter()
-            .flat_map(|candidate| {
-                paths
-                    .iter()
-                    .map(move |(path, _)| (candidate.as_str(), path.as_str()))
-            })
-            .collect::<Vec<_>>();
-        let blobs = repo
-            .objects_at_many(&queries)
+        let matches = matching_path_prefixes(repo, batch, &paths)
             .map_err(|source| unavailable(format!("cannot read candidate content: {source}")))?;
-        for (offset, (candidate, found)) in batch.iter().zip(blobs.chunks(paths.len())).enumerate()
-        {
+        for (offset, (candidate, matched)) in batch.iter().zip(matches).enumerate() {
             let position = examined + offset;
-            // Paths are compared in order and the first mismatch ends the
-            // count, so "closest" means the longest matching prefix.
-            let matched = paths
-                .iter()
-                .zip(found)
-                .take_while(|((_, wanted), found)| *wanted == *found)
-                .count();
             if matched == paths.len() && tree_entries_equal(repo, content, candidate)? {
                 return Ok(LandingSearch {
                     outcome: LandingOutcome::Landed(Landing {
@@ -620,6 +609,63 @@ fn find_landing_with_limits_cached(
         examined: window.len(),
         truncated,
     })
+}
+
+/// For each candidate, how many of `paths` match in order before the first
+/// mismatch: the longest matching prefix, which is all the search compares.
+///
+/// Only the first path is read for every candidate. The remaining paths are
+/// read just for the candidates that matched it, because a mismatch on the
+/// first path already fixes the answer at zero. A session's own content on a
+/// path it changed is rare on the branch, so this turns a read of every path
+/// at every candidate into about one read per candidate. Measured on
+/// 2026-11-11, reading every path took 5 to 12 s of a `finish` in a
+/// repository with a long default-branch history.
+fn matching_path_prefixes(
+    repo: &GitRepo,
+    candidates: &[String],
+    paths: &[(&String, &Option<String>)],
+) -> Result<Vec<usize>, crate::GitError> {
+    let Some(((first_path, first_wanted), rest)) = paths.split_first() else {
+        return Ok(vec![0; candidates.len()]);
+    };
+    #[cfg(test)]
+    TEST_LANDING_PATH_READS.with(|reads| reads.set(reads.get() + candidates.len()));
+    let first = repo.objects_at_many(
+        &candidates
+            .iter()
+            .map(|candidate| (candidate.as_str(), first_path.as_str()))
+            .collect::<Vec<_>>(),
+    )?;
+    let mut matched = first
+        .iter()
+        .map(|found| usize::from(found == *first_wanted))
+        .collect::<Vec<_>>();
+    let survivors = (0..candidates.len())
+        .filter(|&index| matched[index] == 1)
+        .collect::<Vec<_>>();
+    if rest.is_empty() || survivors.is_empty() {
+        return Ok(matched);
+    }
+    #[cfg(test)]
+    TEST_LANDING_PATH_READS.with(|reads| reads.set(reads.get() + survivors.len() * rest.len()));
+    let found = repo.objects_at_many(
+        &survivors
+            .iter()
+            .flat_map(|&index| {
+                rest.iter()
+                    .map(move |(path, _)| (candidates[index].as_str(), path.as_str()))
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    for (&index, found) in survivors.iter().zip(found.chunks(rest.len())) {
+        matched[index] += rest
+            .iter()
+            .zip(found)
+            .take_while(|((_, wanted), found)| *wanted == *found)
+            .count();
+    }
+    Ok(matched)
 }
 
 /// The earliest candidate whose history holds a patch-identical copy of every
@@ -1704,6 +1750,72 @@ mod tests {
 
         let search = find_landing(&repo, &content, &landing, DEFAULT_SEARCH_CAP).unwrap();
         assert_eq!(search.landing().unwrap().commit, landing);
+    }
+
+    #[test]
+    fn later_paths_are_read_only_for_candidates_matching_the_first() {
+        let (tmp, repo, base) = seeded();
+        git(tmp.path(), &["checkout", "-q", "-b", "session"]);
+        for path in ["a.rs", "b.rs", "c.rs"] {
+            write(tmp.path(), path, "work\n");
+        }
+        let head = commit(tmp.path(), "session work");
+        let content = session_content(&repo, &base, &head).unwrap();
+
+        // Six unrelated commits, one that carries only the first path, one
+        // that adds the second, then the landing.
+        git(tmp.path(), &["checkout", "-q", "main"]);
+        let mut candidates = Vec::new();
+        for index in 0..6 {
+            write(tmp.path(), "unrelated.rs", &format!("{index}\n"));
+            candidates.push(commit(tmp.path(), "unrelated"));
+        }
+        write(tmp.path(), "a.rs", "work\n");
+        candidates.push(commit(tmp.path(), "first path only"));
+        write(tmp.path(), "b.rs", "work\n");
+        candidates.push(commit(tmp.path(), "first two paths"));
+        write(tmp.path(), "c.rs", "work\n");
+        let landing = commit(tmp.path(), "squashed (#7)");
+        candidates.push(landing.clone());
+
+        // The prefix lengths equal a comparison that reads every entry.
+        let paths = content.paths.iter().collect::<Vec<_>>();
+        let every_entry = repo
+            .objects_at_many(
+                &candidates
+                    .iter()
+                    .flat_map(|candidate| {
+                        paths
+                            .iter()
+                            .map(move |(path, _)| (candidate.as_str(), path.as_str()))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let expected = every_entry
+            .chunks(paths.len())
+            .map(|found| {
+                paths
+                    .iter()
+                    .zip(found)
+                    .take_while(|((_, wanted), found)| *wanted == *found)
+                    .count()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expected, [0, 0, 0, 0, 0, 0, 1, 2, 3]);
+        TEST_LANDING_PATH_READS.with(|reads| reads.set(0));
+        assert_eq!(
+            matching_path_prefixes(&repo, &candidates, &paths).unwrap(),
+            expected
+        );
+        // One read per candidate, plus the two later paths for the three
+        // candidates that matched the first: 15, not 9 * 3.
+        assert_eq!(TEST_LANDING_PATH_READS.with(std::cell::Cell::get), 15);
+
+        let search = find_landing(&repo, &content, &landing, DEFAULT_SEARCH_CAP).unwrap();
+        let found = search.landing().unwrap();
+        assert_eq!(found.commit, landing);
+        assert_eq!(found.position, 8);
     }
 
     #[test]
