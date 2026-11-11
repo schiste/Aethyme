@@ -11,3 +11,11 @@ inputs = ["packages/aethyme-eval/pyproject.toml"]
 outputs = ["packages/aethyme-eval/.venv/"]
 cache = "repository_shared"
 required_for_hooks = false
+
+# The only shared step installs pytest into each worktree's own venv; the
+# shared directory is pip's download cache, which pip writes safely from
+# several processes. Letting sessions prepare together removes a queue every
+# new session otherwise waits in. Requires every broker on the host to be
+# 0.8.69 or later (both installed binaries were 0.8.69 on 2026-11-11).
+[shared_cache]
+max_concurrent = 3
