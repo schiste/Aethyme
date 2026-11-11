@@ -3586,6 +3586,9 @@ pub struct Broker {
     /// stops at it instead of finishing one expensive worktree long past the
     /// pass's budget (#460).
     landing_deadline: std::cell::Cell<Option<std::time::Instant>>,
+    /// Set only while a bulk cleanup pass runs: what each remote listed, so
+    /// the pass asks a remote once rather than once per ref it checks.
+    remote_heads: std::cell::RefCell<Option<remote_heads::RemoteHeadsSnapshot>>,
     /// The main repository's Git common directory, read once: ownership
     /// checks ask for it twice per closed worktree, and each ask was a
     /// `rev-parse` subprocess (#460). Only a successful read is kept.
@@ -3607,6 +3610,7 @@ mod finish;
 mod gates;
 mod leases;
 mod owners;
+mod remote_heads;
 pub(crate) use leases::{AbandonedSessionCloseOutcome, validate_session_commit_args};
 pub use owners::{CommitOwner, MAX_OWNER_COMMITS, OwnedCommit, OwnersReport};
 pub(crate) mod lifecycle;

@@ -186,8 +186,14 @@ struct CleanupInspectionContext<'a> {
     landing_cache: &'a mut crate::representation::LandingVerdictCache,
     status_limits: CleanupStatusLimits,
     size_deadline: Option<std::time::Instant>,
+    /// Sizes a bulk pass already walked, by recorded worktree path; `None`
+    /// inside is a walk that failed.
+    measured_sizes: Option<&'a MeasuredWorktreeSizes>,
     allow_adopted_path: bool,
 }
+
+type MeasuredWorktreeSizes =
+    std::collections::BTreeMap<String, Option<crate::disk_headroom::DirectoryUsage>>;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2633,6 +2639,7 @@ impl Broker {
                 landing_cache: &mut landing_cache,
                 status_limits,
                 size_deadline: None,
+                measured_sizes: None,
                 allow_adopted_path,
             },
         )
@@ -2789,6 +2796,7 @@ impl Broker {
                 landing_cache: &mut landing_cache,
                 status_limits,
                 size_deadline: None,
+                measured_sizes: None,
                 allow_adopted_path: false,
             },
         )
@@ -2812,6 +2820,7 @@ impl Broker {
             landing_cache,
             status_limits,
             size_deadline,
+            measured_sizes,
             allow_adopted_path,
         } = inspection;
         let worktree_path = PathBuf::from(&session.worktree_path);
@@ -2868,9 +2877,17 @@ impl Broker {
             broker_owned && matches!(&live_owner, Ok(None)),
             scan,
             records,
-            |path| match size_deadline {
-                Some(deadline) => crate::disk_headroom::directory_usage_bounded(path, deadline),
-                None => crate::disk_headroom::directory_usage_without_following_links(path).ok(),
+            |path| {
+                let measured = measured_sizes.and_then(|sizes| sizes.get(&session.worktree_path));
+                match (measured, size_deadline) {
+                    (Some(usage), _) => *usage,
+                    (None, Some(deadline)) => {
+                        crate::disk_headroom::directory_usage_bounded(path, deadline)
+                    }
+                    (None, None) => {
+                        crate::disk_headroom::directory_usage_without_following_links(path).ok()
+                    }
+                }
             },
         );
         let (mut disposition, mut reason, provenance) = if let Err(reason) = &live_owner {
@@ -3188,6 +3205,7 @@ impl Broker {
         }
         self.landing_deadline.set(deadline);
         let _clear_landing_deadline = ClearOnDrop(&self.landing_deadline);
+        let _remote_heads = self.remote_heads_pass();
         let target_snapshot = self.cleanup_target_snapshot();
         let mut plan = CleanupPlan {
             target_snapshot: target_snapshot.refs.clone(),
@@ -3232,6 +3250,27 @@ impl Broker {
             sessions.truncate(limit as usize);
             plan.batch_last_session = sessions.last().map(|session| session.id);
         }
+        // Sizing walks every file of every retained worktree. One worktree
+        // after another it was most of what a measuring pass still spent
+        // (68% of a sampled audit on 2026-11-11), so an unbounded pass walks
+        // them side by side first. A bounded pass keeps sizing each worktree
+        // as it reaches it, which is how its deadline is honoured.
+        let measured_sizes: Option<MeasuredWorktreeSizes> = (scan.measures() && deadline.is_none())
+            .then(|| {
+                let paths = sessions
+                    .iter()
+                    .filter(|session| session.origin == SessionOrigin::Spawned)
+                    .map(|session| session.worktree_path.as_str())
+                    .filter(|path| Path::new(path).is_dir())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let usages = crate::worktree_report::inspect_in_parallel(&paths, |path| {
+                    crate::disk_headroom::directory_usage_without_following_links(Path::new(path))
+                        .ok()
+                });
+                paths.into_iter().map(str::to_string).zip(usages).collect()
+            });
         for (index, session) in sessions.iter().enumerate() {
             if session.origin != SessionOrigin::Spawned {
                 continue;
@@ -3286,6 +3325,7 @@ impl Broker {
                             crate::git::MAX_CLEANUP_STATUS_PATH_FIELDS,
                         ),
                         size_deadline: deadline,
+                        measured_sizes: measured_sizes.as_ref(),
                         allow_adopted_path: false,
                     },
                 )?;

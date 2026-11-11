@@ -4862,6 +4862,7 @@ impl Broker {
             agent_supervisor_executable: None,
             collaboration_state_override: None,
             landing_deadline: std::cell::Cell::new(None),
+            remote_heads: std::cell::RefCell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
             artifact_sweep_namespace: std::cell::OnceCell::new(),
             #[cfg(test)]
@@ -4928,6 +4929,7 @@ impl Broker {
             agent_supervisor_executable: None,
             collaboration_state_override: None,
             landing_deadline: std::cell::Cell::new(None),
+            remote_heads: std::cell::RefCell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
             artifact_sweep_namespace: std::cell::OnceCell::new(),
             #[cfg(test)]
@@ -4979,6 +4981,7 @@ impl Broker {
             agent_supervisor_executable: None,
             collaboration_state_override: None,
             landing_deadline: std::cell::Cell::new(None),
+            remote_heads: std::cell::RefCell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
             artifact_sweep_namespace: std::cell::OnceCell::new(),
             #[cfg(test)]
@@ -5052,6 +5055,7 @@ impl Broker {
             agent_supervisor_executable: None,
             collaboration_state_override: None,
             landing_deadline: std::cell::Cell::new(None),
+            remote_heads: std::cell::RefCell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
             artifact_sweep_namespace: std::cell::OnceCell::new(),
             #[cfg(test)]

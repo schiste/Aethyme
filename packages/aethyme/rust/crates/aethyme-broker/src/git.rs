@@ -44,6 +44,17 @@ thread_local! {
     static GIT_TIMEOUT_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Times this thread asked a remote what its branches point at.
+    static TEST_REMOTE_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_remote_queries() -> usize {
+    TEST_REMOTE_QUERIES.with(std::cell::Cell::get)
+}
+
 /// A snapshot for callers that must detect Git timeouts hidden by a
 /// best-effort `Option`-returning read helper.
 pub(crate) fn git_timeout_generation() -> u64 {
@@ -4264,6 +4275,8 @@ impl GitRepo {
         branch: &str,
         budget: std::time::Duration,
     ) -> Option<String> {
+        #[cfg(test)]
+        TEST_REMOTE_QUERIES.with(|queries| queries.set(queries.get() + 1));
         let mut command = git_command();
         command.arg("-C").arg(&self.root).args([
             "ls-remote",
@@ -4280,6 +4293,40 @@ impl GitRepo {
             .next()
             .and_then(|line| line.split_whitespace().next())
             .map(str::to_string)
+    }
+
+    /// Every branch `remote` lists right now, by branch name, within a
+    /// bounded wait. `None` means "do not know", as for
+    /// [`Self::remote_branch_head`]; a branch missing from a listing that
+    /// was read is absent on the remote.
+    pub fn remote_branch_heads(
+        &self,
+        remote: &str,
+        budget: std::time::Duration,
+    ) -> Option<BTreeMap<String, String>> {
+        #[cfg(test)]
+        TEST_REMOTE_QUERIES.with(|queries| queries.set(queries.get() + 1));
+        let mut command = git_command();
+        command
+            .arg("-C")
+            .arg(&self.root)
+            .args(["ls-remote", "--heads", remote]);
+        let output = crate::bounded_output::output_within(&mut command, budget).ok()??;
+        if !output.status.success() {
+            return None;
+        }
+        Some(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let (oid, name) = line.split_once('\t')?;
+                    Some((
+                        name.strip_prefix("refs/heads/")?.to_string(),
+                        oid.to_string(),
+                    ))
+                })
+                .collect(),
+        )
     }
 
     /// True when `ancestor` is reachable from `descendant`
