@@ -1604,10 +1604,35 @@ impl Broker {
         }
         coordinating.extend(acting);
         let mut pending_implicit_leases = Vec::new();
+        if preparation.is_none() {
+            // Each scan stats one session's whole working tree, and the
+            // sessions share nothing, so they are scanned side by side. One
+            // after another, 32 sessions took 6.9 s of every status refresh
+            // in a 300-session repository on 2026-11-11; four at a time
+            // halved it. A lease claim keeps the serial loop below because
+            // it must stop at its deadline between sessions.
+            let sessions = self
+                .store
+                .live_sessions()?
+                .into_iter()
+                .filter(|session| coordinating.contains(&session.id))
+                .collect::<Vec<_>>();
+            let _span = crate::phase_telemetry::span("implicit_lease_scan_all");
+            let scanned = crate::worktree_report::inspect_in_parallel(&sessions, |session| {
+                implicit_lease_paths(session, &rules, integration.as_deref(), upstream.as_deref())
+            });
+            pending_implicit_leases.extend(
+                sessions
+                    .iter()
+                    .zip(scanned)
+                    .filter_map(|(session, paths)| Some((session.id, paths?))),
+            );
+        }
         for session in self.store.live_sessions()? {
-            if let Some(preparation) = preparation {
-                preparation.check()?;
-            }
+            let Some(preparation) = preparation else {
+                break;
+            };
+            preparation.check()?;
             if !coordinating.contains(&session.id) {
                 continue;
             }
@@ -1617,22 +1642,19 @@ impl Broker {
                 integration.as_deref(),
                 upstream.as_deref(),
             ) else {
-                if let Some(preparation) = preparation {
-                    // `integration_tip`, `upstream_default`, baseline and
-                    // changed-file helpers deliberately hide ordinary Git
-                    // failures behind `Option`. A timeout is different: a
-                    // lease claim must stop rather than treating that
-                    // incomplete scan as an empty or absent worktree.
-                    preparation.check()?;
-                }
+                // `integration_tip`, `upstream_default`, baseline and
+                // changed-file helpers deliberately hide ordinary Git
+                // failures behind `Option`. A timeout is different: a
+                // lease claim must stop rather than treating that
+                // incomplete scan as an empty or absent worktree.
+                preparation.check()?;
                 continue;
             };
-            if let Some(preparation) = preparation {
-                preparation.check()?;
-            }
+            preparation.check()?;
             pending_implicit_leases.push((session.id, paths));
         }
         if preparation.is_none() {
+            let _span = crate::phase_telemetry::span("implicit_lease_store");
             self.store
                 .set_implicit_leases_batch(&pending_implicit_leases)?;
         } else if let Some(preparation) = preparation {
@@ -1643,7 +1665,10 @@ impl Broker {
             }
         }
 
-        let after = detect_overlaps(&self.coordinating_leases(&coordinating)?);
+        let after = {
+            let _span = crate::phase_telemetry::span("lease_overlap_detection");
+            detect_overlaps(&self.coordinating_leases(&coordinating)?)
+        };
         if let Some(preparation) = preparation {
             preparation.check()?;
         }
@@ -4001,14 +4026,21 @@ fn implicit_lease_paths(
     upstream: Option<&str>,
 ) -> Option<Vec<String>> {
     let _span = crate::phase_telemetry::span("implicit_lease_scan");
-    let checkout = GitRepo::discover(Path::new(&session.worktree_path)).ok()?;
+    let checkout = {
+        let _span = crate::phase_telemetry::span("implicit_lease_discover");
+        GitRepo::discover(Path::new(&session.worktree_path)).ok()?
+    };
     // #41: derive the baseline instead of trusting the stored
     // adoption-time diff_base — after a conflict-rebase the stored
     // value inflates the diff with everyone else's promoted work.
-    let base = integration
-        .and_then(|tip| crate::merge::session_baseline(&checkout, tip, upstream))
-        .or_else(|| session.diff_base.clone())
-        .unwrap_or_else(|| "HEAD".to_string());
+    let base = {
+        let _span = crate::phase_telemetry::span("implicit_lease_baseline");
+        integration
+            .and_then(|tip| crate::merge::session_baseline(&checkout, tip, upstream))
+            .or_else(|| session.diff_base.clone())
+            .unwrap_or_else(|| "HEAD".to_string())
+    };
+    let _span = crate::phase_telemetry::span("implicit_lease_changed_files");
     let changed = checkout.changed_files(&base).ok()?;
     Some(
         changed
