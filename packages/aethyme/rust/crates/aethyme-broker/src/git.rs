@@ -6892,6 +6892,7 @@ impl GitRepo {
         branch: &str,
         budget: Duration,
     ) -> Result<(), GitError> {
+        let _span = crate::phase_telemetry::span("git_fetch");
         let refspec = format!("refs/heads/{branch}:refs/remotes/{remote}/{branch}");
         let args = ["fetch", "--no-tags", "--quiet", remote, refspec.as_str()];
         let mut command = git_command();
@@ -7830,6 +7831,7 @@ impl GitRepo {
     }
 
     pub fn worktree_remove(&self, worktree: &Path, force: bool) -> Result<(), GitError> {
+        let _span = crate::phase_telemetry::span("worktree_remove");
         let Err(error) = self.worktree_remove_registered(worktree, force) else {
             return Ok(());
         };

@@ -179,6 +179,7 @@ fn capture_with_stdin(
     budget: Duration,
     max_stream_bytes: usize,
 ) -> io::Result<LimitedOutput> {
+    let _span = crate::phase_telemetry::subprocess_span(command);
     let deadline = checked_deadline(budget)?;
     checked_stream_limit(max_stream_bytes)?;
     if Instant::now() >= deadline {
@@ -263,6 +264,7 @@ pub(crate) fn pipeline_with_input_limited(
     budget: Duration,
     max_stream_bytes: usize,
 ) -> io::Result<LimitedPipelineOutput> {
+    let _span = crate::phase_telemetry::subprocess_span(first);
     let deadline = checked_deadline(budget)?;
     checked_stream_limit(max_stream_bytes)?;
     if Instant::now() >= deadline {
@@ -498,6 +500,7 @@ pub(crate) fn output_limited_in_owned_group_until(
     stop: &mut dyn FnMut() -> bool,
     partial: &mut PartialOutput,
 ) -> io::Result<Option<LimitedOutput>> {
+    let _span = crate::phase_telemetry::subprocess_span(command);
     let started = Instant::now();
     let deadline = started
         .checked_add(budget)
@@ -631,6 +634,7 @@ pub(crate) fn stream_stdout_to_writer_limited_in_owned_group<W: Write>(
     max_stderr_bytes: usize,
     writer: &mut W,
 ) -> io::Result<LimitedStreamOutput> {
+    let _span = crate::phase_telemetry::subprocess_span(command);
     let started = Instant::now();
     let deadline = started
         .checked_add(budget)
@@ -1222,6 +1226,7 @@ impl Drop for LimitedChild {
 /// joined: a grandchild that inherited the pipes could otherwise hold the
 /// caller past the deadline it was promised.
 pub(crate) fn output_within(command: &mut Command, budget: Duration) -> io::Result<Option<Output>> {
+    let _span = crate::phase_telemetry::subprocess_span(command);
     let deadline = Instant::now() + budget;
     let mut child = command
         .stdin(Stdio::null())

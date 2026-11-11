@@ -4824,6 +4824,7 @@ fn sync_bound_directory(path: &Path, expected: &BoundDirectoryIdentity) -> Resul
 
 impl Broker {
     pub fn open(path_inside_repo: &Path) -> Result<Self, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("broker_open");
         Self::open_with_options(path_inside_repo, BrokerOpenOptions::default())
     }
 

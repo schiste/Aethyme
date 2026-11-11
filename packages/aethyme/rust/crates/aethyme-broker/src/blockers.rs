@@ -261,6 +261,7 @@ impl Broker {
     }
 
     fn collect_blockers_with_recovery(&self, inspect_recovery: bool) -> BlockerReport {
+        let _span = crate::phase_telemetry::span("blockers");
         let mut report = BlockerReport::default();
         let mut linked_host_operations = Vec::new();
         match self.operation_blockers(&mut linked_host_operations) {

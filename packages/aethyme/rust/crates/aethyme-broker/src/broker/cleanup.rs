@@ -1952,6 +1952,7 @@ impl Broker {
     where
         F: FnOnce(&str) -> Result<CleanupProvenanceAssessment, BrokerOpError>,
     {
+        let _span = crate::phase_telemetry::span("cleanup_eligibility");
         let _inspection_deadline = crate::git::limit_git_until(status_limits.deadline);
         if worktree_path == self.main_root.as_path() {
             return Ok((
@@ -3179,6 +3180,7 @@ impl Broker {
         records_complete: bool,
         scope: Option<(i64, i64, u32)>,
     ) -> Result<CleanupPlan, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("cleanup_plan");
         // Cleared on every exit below, including an error return.
         struct ClearOnDrop<'a>(&'a std::cell::Cell<Option<std::time::Instant>>);
         impl Drop for ClearOnDrop<'_> {

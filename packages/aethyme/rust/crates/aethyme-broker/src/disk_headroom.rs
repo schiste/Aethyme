@@ -69,6 +69,7 @@ fn first_visit(
 pub(crate) fn directory_usage_without_following_links(
     path: &std::path::Path,
 ) -> std::io::Result<DirectoryUsage> {
+    let _span = crate::phase_telemetry::span("size_walk");
     fn visit(
         path: &std::path::Path,
         usage: &mut DirectoryUsage,
@@ -150,6 +151,7 @@ pub(crate) fn directory_usage_bounded(
     path: &std::path::Path,
     deadline: std::time::Instant,
 ) -> Option<DirectoryUsage> {
+    let _span = crate::phase_telemetry::span("size_walk");
     fn visit(
         path: &std::path::Path,
         usage: &mut DirectoryUsage,

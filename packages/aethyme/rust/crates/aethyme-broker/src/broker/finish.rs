@@ -450,6 +450,7 @@ impl Broker {
     /// dirty work and no committed work waiting for submit/promotion;
     /// otherwise return actionable guidance without mutating state.
     pub fn finish(&mut self, session_id: i64) -> Result<FinishReport, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("finish_session");
         self.finish_with_options(session_id, FinishOptions::default())
     }
 

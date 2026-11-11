@@ -768,6 +768,7 @@ impl Broker {
         target: Option<&crate::ResolvedRemoteTarget>,
         main_root: &Path,
     ) -> Result<(), String> {
+        let _span = crate::phase_telemetry::span("default_branch_fetch");
         let target = match target {
             Some(target) => target.clone(),
             None => self

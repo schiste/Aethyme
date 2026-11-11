@@ -515,6 +515,7 @@ impl Broker {
         budget: std::time::Duration,
         cache: &mut BTreeMap<String, CachedPair>,
     ) -> Result<Vec<PairKey>, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("overlap_classification");
         let sessions: BTreeMap<i64, String> = self
             .store_ref()
             .live_sessions()?

@@ -927,6 +927,7 @@ pub(crate) fn work_landed_with_cache(
     profile: LandingSearchProfile,
     cache: &mut LandingVerdictCache,
 ) -> Result<LandingVerdict, BrokerOpError> {
+    let _span = crate::phase_telemetry::span("landing_search");
     let (Some(head_oid), Some(target_oid)) = (full_commit_oid(head), full_commit_oid(target))
     else {
         return work_landed_with_profile(repo, head, target, profile, deadline);
