@@ -1686,6 +1686,16 @@ pub(super) fn run_start_agent(parsed: Parsed) -> Result<(), UsageError> {
 }
 
 /// `broker prepare`.
+/// How long `prepare` waits for a shared preparation cache another session
+/// holds when `--wait` is not given.
+///
+/// Shared caches are serialized host-wide, so two sessions preparing at once
+/// is ordinary contention, not an error. Refusing immediately made the caller
+/// poll by hand: measured on 2026-11-11, 29% of `prepare` runs in the busiest
+/// repository exited with "exclusive key is held" and were simply retried.
+/// `--wait 0s` keeps the fail-fast behaviour.
+const DEFAULT_PREPARE_SHARED_CACHE_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
 pub(super) fn run_prepare(parsed: Parsed) -> Result<(), UsageError> {
     let session_id = parsed
         .session
@@ -1712,7 +1722,7 @@ pub(super) fn run_prepare(parsed: Parsed) -> Result<(), UsageError> {
                 .as_deref()
                 .map(parse_resource_duration)
                 .transpose()?
-                .unwrap_or_default();
+                .unwrap_or(DEFAULT_PREPARE_SHARED_CACHE_WAIT);
             let mut broker = open_broker(parsed.read_only_snapshot)?;
             let report = broker.prepare_session(session_id, parsed.offline, wait)?;
             telemetry::set_command_metric_details(serde_json::json!({

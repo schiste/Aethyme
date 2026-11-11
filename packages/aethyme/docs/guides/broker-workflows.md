@@ -77,10 +77,14 @@ or runs a version command automatically.
 
 ```bash
 aethyme broker submit prepare status --session 111 --json
-aethyme broker submit prepare --session 111 --wait 10m
+aethyme broker submit prepare --session 111
 # only when every step declares an offline alternative:
 aethyme broker submit prepare --session 111 --offline
 ```
+
+Shared caches are serialized host-wide, so a second session preparing at the
+same time waits for the first: up to 10 minutes by default, or as long as
+`--wait <duration>` says. `--wait 0s` refuses immediately instead.
 
 The repository defines argv commands, lockfile/config inputs, local output
 paths, cache scope, and whether hooks need the result. The broker provides the

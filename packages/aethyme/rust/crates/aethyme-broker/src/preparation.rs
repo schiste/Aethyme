@@ -39,6 +39,8 @@ pub const PREPARATION_REPORT_SCHEMA_VERSION: u32 = 2;
 const PREPARATION_LEASE_TTL_SECONDS: u64 = 30;
 const PREPARATION_STORAGE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const PREPARATION_CACHE_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
+/// How often a `prepare` waiting on the shared cache repeats its notice.
+const SHARED_CACHE_WAIT_NOTICE_INTERVAL: Duration = Duration::from_secs(30);
 const PREPARATION_CACHE_HASH_BUFFER_BYTES: usize = 64 * 1024;
 // The scanner checks the deadline between filesystem operations. Individual
 // filesystem calls are not interruptible by this cooperative time limit.
@@ -854,9 +856,22 @@ impl Broker {
         let cache_wait_started = std::time::Instant::now();
         let mut grant = if let Some(coordinator) = coordinator.as_mut() {
             let request = preparation_resource_request(self, session_id, &root, &digest)?;
+            // Say why the command is quiet: the caller sees nothing else
+            // until the session holding the shared cache finishes.
+            let mut next_notice = cache_wait_started;
             Some(
                 coordinator
-                    .acquire_with_wait(&request, wait, |_| {})
+                    .acquire_with_wait(&request, wait, |message| {
+                        let now = std::time::Instant::now();
+                        if now >= next_notice {
+                            eprintln!(
+                                "waiting up to {}s for the shared preparation cache ({message}); \
+                                 `--wait 0s` fails fast instead",
+                                wait.as_secs()
+                            );
+                            next_notice = now + SHARED_CACHE_WAIT_NOTICE_INTERVAL;
+                        }
+                    })
                     .map_err(PreparationError::from)?,
             )
         } else {

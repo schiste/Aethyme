@@ -25,7 +25,8 @@ exit: 0
       Explicitly run the repository's .aethyme/prepare.toml commands in the
       session worktree. Shared caches are serialized host-wide; no command is
       ever run automatically by start or adopt. --offline refuses any step
-      without a declared offline_command.
+      without a declared offline_command. A shared cache held by another
+      session is waited for (10m by default; --wait 0s fails fast).
   aethyme broker submit promote --entry <id> [--json]
       Manual-mode only: advance the local integration branch to a verified
       entry's merge commit; other in-flight entries are re-simulated.
