@@ -252,17 +252,22 @@ impl Fixture {
     }
 }
 
-/// A stand-in agent runtime working in `dir`: `sleep` run through a symlink
-/// named `codex`, so its command line identifies it as an agent.
+/// A stand-in agent runtime working in `dir`: the shell run through a symlink
+/// named `codex`, so its command line identifies it as an agent. It blocks on
+/// a stdin pipe the returned handle keeps open.
+///
+/// The shell rather than `sleep`: a multicall coreutils `sleep` refuses to
+/// run under a name it does not know, which is what CI runners now ship.
 fn codex_in(dir: &Path, bin: &Path) -> Agent {
     let codex = bin.join("codex");
     if !codex.exists() {
         std::fs::create_dir_all(bin).unwrap();
-        std::os::unix::fs::symlink("/bin/sleep", &codex).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", &codex).unwrap();
     }
     Agent(
         Command::new(&codex)
-            .arg("600")
+            .args(["-c", "read _"])
+            .stdin(std::process::Stdio::piped())
             .current_dir(dir)
             .spawn()
             .unwrap(),

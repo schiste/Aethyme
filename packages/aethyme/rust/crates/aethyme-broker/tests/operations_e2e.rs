@@ -1224,8 +1224,11 @@ fn bounded_remote_write_timeout_is_journaled_unknown_and_blocks_retry() {
         std::fs::create_dir(&bin).unwrap();
         let arm = control.path().join("armed");
         let hit = control.path().join("provider-pid");
+        // The shell under a recognizable name, not `sleep`: a multicall
+        // coreutils `sleep` refuses to run under a name it does not know,
+        // which is what CI runners now ship.
         let sleeper = control.path().join("broker-timeout-sleeper");
-        std::os::unix::fs::symlink("/bin/sleep", &sleeper).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", &sleeper).unwrap();
 
         let real_git = real_git_executable();
         let proxy = bin.join("git");
@@ -1242,7 +1245,7 @@ if [ "${{1-}}" = "push" ] && [ -f {} ]; then
     if ! (set -C; printf '%s\n' "$$" > {}); then
         exit 125
     fi
-    exec {} 60
+    exec {} -c 'i=0; while [ "$i" -lt 60 ]; do sleep 1; i=$((i+1)); done'
 fi
 exec {} "$@"
 "#,
