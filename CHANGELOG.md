@@ -4,6 +4,18 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.70] - 2026-11-11
+
+### Added
+
+- Name the release that wrote each row of `.aethyme/logs/command-metrics.jsonl` (`aethyme_version`), and report calls, p50 and p95 time, the costliest phases and exits by class for each command of each release as `by_release` in `broker advanced metrics --json` (#1588).
+- Queue local cargo builds on this repository through a host-wide capacity pool with `packages/aethyme/scripts/with-host-capacity.sh`; `test-like-ci.sh` uses it for local runs (#1591).
+
+### Fixed
+
+- Make `broker submit` faster when the session's work has already landed and nothing is left to verify: it now checks for content before the lease audit, which was most of the time such a submit took. The recorded outcome is unchanged (#1592).
+- Stop Explore's text search from adding vocabulary taken from one particular codebase to requests that mention words such as "watchlist", "diff" or "revision" (#1589).
+
 ## [0.8.69] - 2026-11-11
 
 ### Added
