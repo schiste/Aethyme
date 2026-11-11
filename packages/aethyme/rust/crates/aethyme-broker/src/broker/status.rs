@@ -624,6 +624,7 @@ impl Broker {
         now_ms: i64,
         refresh: bool,
     ) -> Result<StatusView, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("status_build");
         let started = std::time::Instant::now();
         let mut phase_timings_ms = std::collections::BTreeMap::new();
         // In a verify-only repository nothing moves integration: submit
@@ -1863,6 +1864,7 @@ impl Broker {
         &self,
         session_head: &str,
     ) -> Option<(String, String)> {
+        let _span = crate::phase_telemetry::span("remote_durability");
         const FRESHNESS_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
         let repo = self.repo_handle();
         // A branch the remote lists at this very commit, whose tracking ref

@@ -820,6 +820,7 @@ impl Broker {
         cache_policy: crate::gates::CachePolicy,
         progress: &dyn crate::gates::GateProgressSink,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("gates_run");
         let (checkout, gates, changed) = self.gate_inputs(session_id)?;
         let storage = self.storage_context().gate_storage_locations();
         crate::gates::run_affected_with_progress_in(

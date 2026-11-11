@@ -405,6 +405,7 @@ impl Broker {
     /// and PID liveness for spawned sessions. Reconciles dead spawned
     /// processes to `exited` in the store as a side effect.
     pub fn agents(&mut self, now_ms: i64) -> Result<Vec<AgentView>, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("agents_view");
         let sessions = self.store.live_sessions()?;
         let abandon_after_ms = self.abandonment_window_ms();
         let mut views = Vec::with_capacity(sessions.len());
@@ -1583,6 +1584,7 @@ impl Broker {
         preparation: Option<&LeaseClaimPreparation>,
         classify_overlaps: bool,
     ) -> Result<Vec<crate::leases::Overlap>, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("lease_refresh");
         use crate::leases::{LeaseIgnoreRules, detect_overlaps};
 
         let rules = LeaseIgnoreRules::load(&self.main_root);
@@ -3998,6 +4000,7 @@ fn implicit_lease_paths(
     integration: Option<&str>,
     upstream: Option<&str>,
 ) -> Option<Vec<String>> {
+    let _span = crate::phase_telemetry::span("implicit_lease_scan");
     let checkout = GitRepo::discover(Path::new(&session.worktree_path)).ok()?;
     // #41: derive the baseline instead of trusting the stored
     // adoption-time diff_base — after a conflict-rebase the stored

@@ -1220,6 +1220,8 @@ fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 
         return crate::contract_check::run(&args[1..]);
     }
     let command_output = crate::cli_output::snapshot();
+    let spans = crate::phase_telemetry::Recorder::default();
+    let _recording = crate::phase_telemetry::install(spans.clone());
     let (code, record_outcome, error) = match run_inner(args, &mode) {
         Ok(()) => (0, true, None),
         Err(UsageError::Help) => {
@@ -1256,7 +1258,7 @@ fn run_resolved_with_mode_inner(args: &[String], mode: CompatibilityMode) -> u8 
         if record_outcome {
             record_command_outcome(args, code, error.as_deref());
         }
-        record_command_metric(args, code, started.elapsed().as_millis() as i64);
+        record_command_metric(args, code, started.elapsed().as_millis() as i64, &spans);
     }
     code
 }

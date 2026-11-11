@@ -3152,6 +3152,7 @@ impl Broker {
         &mut self,
         deadline: Option<Instant>,
     ) -> Result<AutoCleanupPlan, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("auto_cleanup_plan");
         self.auto_cleanup_plan_with_group_inspector(
             deadline,
             |broker, group, live, live_worktrees, deadline| {
@@ -3362,6 +3363,7 @@ impl Broker {
         &mut self,
         plan: AutoCleanupPlan,
     ) -> Result<AutoCleanupReport, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("auto_cleanup_apply");
         let AutoCleanupPlan {
             mut report,
             policy,

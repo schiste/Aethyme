@@ -226,6 +226,7 @@ impl crate::Broker {
     /// Bring a live session up to the freshly fetched default branch when it
     /// is safe; see the module documentation.
     pub fn sync_session(&mut self, session_id: i64) -> Result<SessionSyncReport, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("sync_session");
         let session = self.store().session(session_id)?;
         if session.status.is_closed() {
             return Err(BrokerOpError::ClosedSessionOperation {

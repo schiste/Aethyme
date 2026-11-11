@@ -238,7 +238,12 @@ pub(super) fn record_command_outcome(args: &[String], exit: u8, error: Option<&s
 /// Record one command's cost. `output_bytes` counts stdout emitted through
 /// `out!`; stderr is excluded because it carries diagnostics rather than the
 /// payload an agent pays to read.
-pub(super) fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
+pub(super) fn record_command_metric(
+    args: &[String],
+    exit: u8,
+    duration_ms: i64,
+    spans: &crate::phase_telemetry::Recorder,
+) {
     let output_bytes = crate::cli_output::emitted();
     let details = take_command_metric_details();
     // Inspection commands are contractually side-effect free: the CLI documents
@@ -254,6 +259,9 @@ pub(super) fn record_command_metric(args: &[String], exit: u8, duration_ms: i64)
     let Some(label) = safe_command_surface(args) else {
         return;
     };
+    // Spans never decide whether a line is written: a read-only command stays
+    // telemetry-free however much of its work was timed.
+    let details = Some(with_spans(details.unwrap_or_default(), spans));
     let Ok(cwd) = std::env::current_dir() else {
         return;
     };
@@ -292,6 +300,37 @@ pub(super) fn record_command_metric(args: &[String], exit: u8, duration_ms: i64)
     {
         let _ = file.write_all(line.as_bytes());
     }
+}
+
+/// Fold the spans recorded anywhere during the command into its metric
+/// fields. A phase the command named itself wins over a span of the same
+/// name; `phase_counts` says how many times each span ran.
+fn with_spans(
+    mut fields: serde_json::Map<String, serde_json::Value>,
+    spans: &crate::phase_telemetry::Recorder,
+) -> serde_json::Map<String, serde_json::Value> {
+    let (millis, counts) = spans.totals();
+    if millis.is_empty() {
+        return fields;
+    }
+    let phases = fields
+        .entry("phase_timings_ms")
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    if let Some(phases) = phases.as_object_mut() {
+        for (name, elapsed) in millis {
+            phases.entry(name).or_insert(elapsed.into());
+        }
+    }
+    fields.insert(
+        "phase_counts".into(),
+        serde_json::Value::Object(
+            counts
+                .into_iter()
+                .map(|(name, count)| (name, count.into()))
+                .collect(),
+        ),
+    );
+    fields
 }
 
 /// Whether this invocation should contribute command-latency telemetry.

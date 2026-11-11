@@ -435,3 +435,38 @@ fn a_session_started_from_upstream_leases_only_its_own_changes() {
         .collect();
     assert_eq!(paths, vec!["mine.txt"], "{status:#}");
 }
+
+#[test]
+fn a_command_metric_line_carries_spans_recorded_where_the_work_happens() {
+    let tmp = fixture();
+    let output = run(tmp.path(), &["start", "--task", "span telemetry", "--json"]);
+    let session = json(&output);
+    let id = session["id"].as_i64().unwrap().to_string();
+    // `finish close` names no phases itself: everything on its line is a span.
+    let output = run(tmp.path(), &["finish", "close", "--session", &id]);
+    assert!(output.status.success());
+
+    let metrics =
+        std::fs::read_to_string(tmp.path().join(".aethyme/logs/command-metrics.jsonl")).unwrap();
+    let lines: Vec<serde_json::Value> = metrics
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let start = lines
+        .iter()
+        .find(|line| line["command"] == "start")
+        .unwrap();
+    assert!(
+        start["phase_timings_ms"]["git_worktree_add"].is_u64(),
+        "a phase the command names itself is kept: {start}"
+    );
+    for line in &lines {
+        assert!(
+            line["phase_counts"]["subprocess_git"].as_u64().unwrap() >= 1,
+            "every command here runs Git: {line}"
+        );
+        assert!(line["phase_timings_ms"]["subprocess_git"].is_u64());
+        assert!(line["phase_counts"]["broker_open"].as_u64().unwrap() >= 1);
+    }
+    assert!(lines.iter().any(|line| line["command"] != "start"));
+}

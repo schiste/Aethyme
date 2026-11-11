@@ -539,6 +539,7 @@ impl Broker {
     }
 
     pub fn preparation_status(&self, session_id: i64) -> Result<PreparationStatus, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("preparation_status");
         let session = self.store_ref().session(session_id)?;
         let root = Path::new(&session.worktree_path);
         let config = match load_config(root) {
@@ -681,6 +682,7 @@ impl Broker {
         offline: bool,
         wait: Duration,
     ) -> Result<PreparationReport, BrokerOpError> {
+        let _span = crate::phase_telemetry::span("prepare_session");
         let session = self.store_ref().session(session_id)?;
         let root = PathBuf::from(&session.worktree_path);
         let config = load_config(&root)?.ok_or_else(|| PreparationError::InvalidConfig {

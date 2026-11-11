@@ -466,10 +466,12 @@ where
         .min(items.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
     let deadline = crate::git::active_git_deadline();
+    let phases = crate::phase_telemetry::active();
     let mut results: Vec<(usize, R)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
+                    let _phases = phases.clone().map(crate::phase_telemetry::install);
                     let _git_deadline = deadline.map(crate::git::limit_git_until);
                     let mut done = Vec::new();
                     loop {
@@ -511,10 +513,12 @@ where
         .clamp(1, INSPECTION_WORKERS)
         .min(items.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
+    let phases = crate::phase_telemetry::active();
     let completed: Vec<(usize, R)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
+                    let _phases = phases.clone().map(crate::phase_telemetry::install);
                     let _git_deadline = crate::git::limit_git_until(deadline);
                     let mut done = Vec::new();
                     loop {

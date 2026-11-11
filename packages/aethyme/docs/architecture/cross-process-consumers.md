@@ -1281,6 +1281,21 @@ Successful `broker push` command metrics add `push_preflight`, `push_git`,
 inside the existing `push_session` phase and must not be added to that total.
 The JSON push report itself is unchanged.
 
+Every command metric line may add span totals to `phase_timings_ms`, and a
+`phase_counts` object with how many times each span ran. Spans are recorded
+where the work happens rather than by each command: `subprocess_git` and
+`subprocess_other` (child processes), `broker_open`, `lease_refresh`,
+`implicit_lease_scan`, `overlap_classification`, `landing_search`,
+`remote_durability`, `size_walk`, `status_build`, `blockers`, `agents_view`,
+`cleanup_plan`, `cleanup_eligibility`, `auto_cleanup_plan`,
+`auto_cleanup_apply`, `finish_session`, `sync_session`, `prepare_session`,
+`preparation_status`, `gates_run`, `git_fetch`, `default_branch_fetch` and
+`worktree_remove`. A phase a command names itself takes precedence over a
+span of the same name. Spans nest and are summed across worker threads, so
+one can exceed `duration_ms` and they must not be added together. The set
+grows; consumers must ignore names they do not know. Spans never cause a
+read-only command to write a metric line.
+
 Submit command metrics add `phase_timings_ms` for broker opening, contract
 preflight, ownership auditing, planning, merge simulation, verification slot
 wait, verification checkout setup, graph and gate selection, gate execution,
