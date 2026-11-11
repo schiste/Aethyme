@@ -21,6 +21,9 @@
 #         # print what --changed would test and exit: a nextest filterset,
 #         # `workspace`, or `none`; the broker's cargo-test gate runs on it
 #
+# Every run except --print-selection holds host build capacity through
+# with-host-capacity.sh (3 units, 2 for --package/--lib), waiting up to 30m.
+#
 # --changed (the default) selects affected crates and their reverse
 # dependencies. Repository-wide inputs that affect every suite fall back to
 # full workspace coverage while keeping the bounded local profile.
@@ -41,6 +44,7 @@
 # target/debug paths `env!("CARGO_BIN_EXE_*")` and aethyme-testkit expect.
 set -euo pipefail
 
+original_args=("$@")
 coverage=changed
 coverage_explicit=0
 base=origin/main
@@ -161,6 +165,15 @@ for arg in "${extra[@]+"${extra[@]}"}"; do
     esac
 done
 
+# Hold host build capacity for the whole run, so concurrent agents queue
+# instead of stacking builds. The wrapper runs the command directly in CI, in
+# a broker gate, or inside an existing grant.
+if [ "$print_selection" -eq 0 ] && [ -z "${AETHYME_TEST_LIKE_CI_CAPACITY:-}" ]; then
+    units=3
+    [ "$coverage" != focused ] || units=2
+    AETHYME_TEST_LIKE_CI_CAPACITY=1 exec "$(dirname -- "$0")/with-host-capacity.sh" --units "$units" -- \
+        bash "$0" "${original_args[@]+"${original_args[@]}"}"
+fi
 
 # Rust and tempfile helpers compare paths literally. Normalize the effective
 # inherited temp root so symlinked aliases (for example /var vs /private/var)
