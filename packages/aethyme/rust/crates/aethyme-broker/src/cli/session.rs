@@ -1918,13 +1918,23 @@ pub(super) fn run_handoff(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+/// What `broker finish` gives its closing Git checks when `--timeout` is
+/// absent. The checks are read-only until the close, so the limit only bounds
+/// a hung Git; it was 10 s until 2026-11-11, when 640 of 4,490 recorded
+/// finishes (14%) had expired at it and been retried by hand with the doubled
+/// value the refusal prints. Successful finishes ran 12 s at the median and
+/// 44 s at the 90th percentile end to end.
+const FINISH_GIT_DEADLINE_SECONDS: u64 = 60;
+
 /// `broker finish`.
 pub(super) fn run_finish(parsed: Parsed) -> Result<(), UsageError> {
     let session = parsed
         .session
         .ok_or(UsageError::Message("finish requires --session <id>".into()))?;
     let abandon_reason = abandon_reason(&parsed)?;
-    let timeout_seconds = parsed.timeout_seconds.unwrap_or(10);
+    let timeout_seconds = parsed
+        .timeout_seconds
+        .unwrap_or(FINISH_GIT_DEADLINE_SECONDS);
     if !(1..=86_400).contains(&timeout_seconds) {
         return Err(UsageError::Message(
             "finish --timeout must be between 1 and 86400 seconds".into(),
