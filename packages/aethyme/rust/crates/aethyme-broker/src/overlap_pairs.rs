@@ -106,6 +106,9 @@ type PairKey = (i64, i64);
 /// test prove a pass reads each session once, however many pairs it is in.
 static STATE_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Session states read side by side before the budget is checked again.
+const STATE_READ_BATCH: usize = 8;
+
 /// How many session states classification has read in this process.
 #[doc(hidden)]
 pub fn overlap_state_reads() -> usize {
@@ -536,6 +539,7 @@ impl Broker {
             }
         }
         let read_state = |session: i64| -> Result<SessionState, StateError> {
+            let _span = crate::phase_telemetry::span("overlap_state_read");
             let worktree = sessions
                 .get(&session)
                 .ok_or_else(|| StateError::Other(format!("session {session} is not live")))?;
@@ -567,6 +571,29 @@ impl Broker {
         });
 
         let started = std::time::Instant::now();
+        // Reading a session's state runs several Git commands in its
+        // worktree and the sessions share nothing, so the states the pairs
+        // below will ask for are read side by side, a batch at a time so the
+        // budget is still checked between batches. One after another they
+        // were most of a 10 s classification over 102 sessions (2026-11-11).
+        let mut wanted: Vec<i64> = Vec::new();
+        for (key, _) in &order {
+            for session in [key.0, key.1] {
+                if !wanted.contains(&session) {
+                    wanted.push(session);
+                }
+            }
+        }
+        for batch in wanted.chunks(STATE_READ_BATCH) {
+            if started.elapsed() >= budget {
+                break;
+            }
+            let read = crate::worktree_report::inspect_in_parallel(batch, |session| {
+                STATE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                read_state(*session)
+            });
+            states.extend(batch.iter().copied().zip(read));
+        }
         let mut judged = Vec::new();
         for (key, paths) in order {
             let entry = cache.entry(pair_key_string(*key)).or_default();
@@ -592,6 +619,7 @@ impl Broker {
                     (Ok(left), Ok(right)) => {
                         let current = input_key(left, right, paths);
                         if !entry.classified || entry.input_key != current {
+                            let _span = crate::phase_telemetry::span("overlap_pair_merge");
                             match classify(self.repo_handle(), left, right, paths) {
                                 Ok(conflicting) => {
                                     entry.severity = Some(if conflicting.is_empty() {
