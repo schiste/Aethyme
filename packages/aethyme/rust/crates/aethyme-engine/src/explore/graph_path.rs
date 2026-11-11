@@ -46,12 +46,11 @@ pub fn explore_with_intent(
     // 2. Symbol-search evidence. If a local store read fails after the
     //    task view has succeeded, keep going with anchors/text evidence
     //    rather than block the whole request.
-    let symbol_queries = extract_symbol_queries(request);
-    let symbol_queries = if symbol_queries.len() > params.max_symbol_queries {
-        symbol_queries[..params.max_symbol_queries].to_vec()
-    } else {
-        symbol_queries
-    };
+    //    Symbol search takes the first `max_symbol_queries` request
+    //    terms; source-text search (step 3) uses the full list.
+    let request_terms = extract_symbol_queries(request);
+    let symbol_queries =
+        request_terms[..request_terms.len().min(params.max_symbol_queries)].to_vec();
     let symbol_matches = if symbol_queries.is_empty() {
         SymbolBatchResults::default()
     } else {
@@ -61,7 +60,7 @@ pub fn explore_with_intent(
     // 3. Source-text evidence. Runs ripgrep client-side against the repo
     //    filesystem; doesn't need redb. Tolerates ripgrep absence:
     //    we degrade to symbol-only without failing the request.
-    let text_terms = extract_text_search_terms(request);
+    let text_terms = request_terms;
     let text_items = text_search::source_text_files(
         &canonical_repo,
         &text_terms,

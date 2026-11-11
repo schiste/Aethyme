@@ -507,27 +507,25 @@ fn extract_symbol_queries_adds_underscore_collapsed_variant() {
 }
 
 #[test]
-fn extract_text_search_terms_extends_for_behavioural_words() {
-    // For text search we keep behavioural keywords like "viewed" and
-    // "seen" that the symbol-query helper drops. The trigger is
-    // matching them in the request itself; if the request mentions
-    // "watchlist" we add domain synonyms ("watched", "notification").
-    let terms = extract_text_search_terms("Bug: viewing a diff revision marks watchlist as seen");
+fn extract_symbol_queries_keeps_request_words_without_expansion() {
+    // Request terms come only from the request text: behavioural words
+    // (inflected verbs such as "viewed", "seen", "marks") are kept like
+    // any other content word, English function words are dropped, and
+    // nothing is added that the request did not say.
+    let terms = extract_symbol_queries("Bug: archiving an invoice marks it as viewed and seen");
     let lower: Vec<String> = terms.iter().map(|t| t.to_ascii_lowercase()).collect();
-    // The request word "viewing" survives (symbol-search would drop it
-    // as too noisy, text-search keeps it).
-    assert!(lower.contains(&"viewing".to_string()));
-    // Domain expansions added by the watchlist trigger:
-    assert!(lower.contains(&"watched".to_string()));
-    assert!(lower.contains(&"notification".to_string()));
-    // Domain expansions added by the diff/revision trigger:
-    assert!(lower.contains(&"diff".to_string()));
-    assert!(lower.contains(&"revisions".to_string()));
-    // No duplicates (case-insensitive):
-    let mut sorted = lower.clone();
-    sorted.sort();
-    sorted.dedup();
-    assert_eq!(sorted.len(), lower.len(), "duplicate term in {lower:?}");
+    assert_eq!(
+        lower,
+        ["archiving", "invoice", "marks", "viewed", "seen"],
+        "unexpected request terms {lower:?}"
+    );
+}
+
+#[test]
+fn extract_symbol_queries_deduplicates_case_insensitively() {
+    let terms = extract_symbol_queries("Invoice totals: invoice TOTALS drift");
+    let lower: Vec<String> = terms.iter().map(|t| t.to_ascii_lowercase()).collect();
+    assert_eq!(lower, ["invoice", "totals", "drift"]);
 }
 
 // ── Intent::auto_select heuristic ──────────────────────────────────
