@@ -145,6 +145,7 @@ pub mod managed_services;
 mod measurement;
 mod merge;
 mod merge_chain;
+mod object_store;
 mod operation_stats;
 mod operations;
 pub mod overlap_diff;

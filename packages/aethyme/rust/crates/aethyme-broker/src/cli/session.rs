@@ -1997,6 +1997,13 @@ pub(super) fn run_finish(parsed: Parsed) -> Result<(), UsageError> {
     } else {
         render_finish_report(&report);
     }
+    // After the report: the session is closed either way, and a repack that
+    // cannot be started must not turn a finished session into a failure.
+    if let Ok(Some(estimate)) = broker.maybe_start_object_store_maintenance() {
+        eprintln!(
+            "note: started a background `git gc --no-prune` for about {estimate} loose Git objects"
+        );
+    }
     Ok(())
 }
 

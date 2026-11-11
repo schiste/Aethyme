@@ -2325,6 +2325,12 @@ fn worker_path_error(path: &Path, message: &str) -> BrokerOpError {
     .into()
 }
 
+/// Whether this process must not start detached background work: a test
+/// binary, a private worker, or a command pinned to a test database.
+pub(crate) fn background_process_is_suppressed() -> bool {
+    artifact_worker_process_is_suppressed()
+}
+
 fn artifact_worker_process_is_suppressed() -> bool {
     cfg!(test)
         || std::env::var_os(ARTIFACT_SWEEP_WORKER_ENV).is_some()

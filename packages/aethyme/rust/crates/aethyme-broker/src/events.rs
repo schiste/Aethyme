@@ -40,6 +40,9 @@ pub const BROKER_COMMAND_FAILED: &str = "broker.command.failed";
 pub const BROKER_GC_APPLIED: &str = "broker.gc.applied";
 pub const BROKER_PROMOTION_RECORD_RESTORED: &str = "broker.promotion-record.restored";
 pub const BROKER_GC_ARTIFACTS_SWEPT: &str = "broker.gc.artifacts-swept";
+/// A detached non-pruning repack was started because the repository's loose
+/// objects passed the threshold; the payload carries the estimate.
+pub const BROKER_OBJECT_STORE_MAINTENANCE_STARTED: &str = "broker.object_store.maintenance_started";
 
 /// Dead shared preparation-cache entries reclaimed without an operator.
 pub const BROKER_GC_PREPARATION_SWEPT: &str = "broker.gc.preparation-swept";
