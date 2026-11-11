@@ -4,6 +4,19 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.68] - 2026-11-11
+
+### Added
+
+- Report time spent in each push phase, each preparation step and the shared-cache wait in command metrics, and let a review run name the head it expects (#1570).
+
+### Fixed
+
+- Make `broker finish` faster in repositories with long histories: the landing search reads fewer paths per candidate and compares patches only for commits that changed the same files (#1573, #1575).
+- Make bulk cleanup plans and audits ask each remote for its branches once per pass instead of once per remote-tracking ref of every retained worktree (#1576, #1577).
+- Find unresolved coordinated operations without scanning the whole operation history, which every push and submit paid for (#1572).
+- Wait for a busy shared preparation cache instead of failing the preparation (#1572).
+
 ## [0.8.67] - 2026-11-10
 
 **Breaking:** Previously refused repeated `git` and `gh` command names are now accepted, and focused status exposes new revision options and output. See [upgrade and rollback guidance](UPGRADING.md#v0867).
