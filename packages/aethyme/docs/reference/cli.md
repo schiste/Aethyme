@@ -609,7 +609,7 @@ the limit; `--reuse` without it keeps the session's existing name. When Chau7 is
 with a pending rename, while ambiguous or mismatched identity is refused with
 a reason.
 - `aethyme broker submit prepare status --session <id> [--json]`
-- `aethyme broker submit prepare --session <id> [--offline] [--wait <duration>] [--json]`
+- `aethyme broker submit prepare --session <id> [--offline] [--wait <duration>] [--json]` — a shared cache held by another session is waited for, 10 minutes by default; `--wait 0s` fails fast instead.
 - `aethyme broker advanced heartbeat --session <id> [--json]` — renew the exact current holder's task lease during quiet work; guarded commands renew automatically.
 - `aethyme broker advanced exec --session <id> [--non-interactive] [--json] -- <command>`
 - `aethyme broker advanced exec-status --session <id> [--receipt <32-hex-id> | --limit <1..100>] [--json]`

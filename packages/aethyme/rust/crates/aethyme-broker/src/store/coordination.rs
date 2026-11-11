@@ -1,5 +1,28 @@
 use super::*;
 
+/// Every coordinated `git`/`gh` operation runs this to learn what holds its
+/// repository's lock, so it must stay proportional to the unresolved rows,
+/// not to the repository's history.
+///
+/// `ORDER BY +id` is deliberate. With a plain `ORDER BY id` SQLite satisfies
+/// the ordering from `coordinated_operations_history_by_repository
+/// (repository, id DESC)`, then visits every row the repository ever recorded
+/// to test `status` and `effect`: 3.7 s over 113k rows, measured on
+/// 2026-11-11. The unary plus makes the ordering unusable as an index hint, so
+/// the planner seeks `coordinated_operations_by_repository
+/// (repository, status, id)` and sorts the handful of unresolved rows.
+const UNRESOLVED_COORDINATED_OPERATIONS_SQL: &str =
+    "SELECT id, session_id, provider, repository, scope, effect,
+            status, authorization_reason, command_json, pid,
+            exit_code, details_json,
+            created_at, updated_at, finished_at,
+            host_operation_id, identity_provenance, agent_provenance_json
+     FROM coordinated_operations
+     WHERE repository = ?1
+       AND effect <> 'read'
+       AND status IN ('prepared', 'running', 'outcome_unknown')
+     ORDER BY +id";
+
 impl BrokerStore {
     /// Touch activity and renew or upgrade the task lease only for the exact
     /// current holder. The caller must already hold the session's shared
@@ -257,18 +280,7 @@ impl BrokerStore {
         &self,
         repository: &str,
     ) -> Result<Vec<CoordinatedOperation>, BrokerError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, provider, repository, scope, effect,
-                    status, authorization_reason, command_json, pid,
-                    exit_code, details_json,
-                    created_at, updated_at, finished_at,
-                    host_operation_id, identity_provenance, agent_provenance_json
-             FROM coordinated_operations
-             WHERE repository = ?1
-               AND effect <> 'read'
-               AND status IN ('prepared', 'running', 'outcome_unknown')
-             ORDER BY id",
-        )?;
+        let mut stmt = self.conn.prepare(UNRESOLVED_COORDINATED_OPERATIONS_SQL)?;
         let rows = stmt.query_map([repository], coordinated_operation_from_row)?;
         let mut operations = Vec::new();
         for row in rows {
@@ -2069,6 +2081,28 @@ mod finish_lease_query_tests {
         assert_eq!(
             crate::session_holder::task_lease(&reupgraded),
             Some(crate::session_holder::TaskLease::current())
+        );
+    }
+
+    #[test]
+    fn unresolved_operations_lookup_seeks_by_status_instead_of_walking_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BrokerStore::open(&temp.path().join("broker.db")).unwrap();
+        let plan: Vec<String> = store
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {UNRESOLVED_COORDINATED_OPERATIONS_SQL}"
+            ))
+            .unwrap()
+            .query_map(["repository"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            plan.iter().any(|step| step.contains(
+                "USING INDEX coordinated_operations_by_repository (repository=? AND status=?)"
+            )),
+            "the lookup must seek the unresolved statuses, not scan the repository's history: {plan:?}"
         );
     }
 

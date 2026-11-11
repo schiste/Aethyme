@@ -240,7 +240,8 @@ Usage:
       Explicitly run the repository's .aethyme/prepare.toml commands in the
       session worktree. Shared caches are serialized host-wide; no command is
       ever run automatically by start or adopt. --offline refuses any step
-      without a declared offline_command.
+      without a declared offline_command. A shared cache held by another
+      session is waited for (10m by default; --wait 0s fails fast).
   aethyme broker advanced worktree-root [--json]
       Resolve the scanner-safe external root used by future broker starts.
       Read-only: reports the preferred location, repository key and

@@ -667,3 +667,135 @@ cache = "repository_shared"
 
 #[path = "common/json_error.rs"]
 mod json_error;
+
+/// Two sessions preparing at once is ordinary contention on the host-wide
+/// shared cache. The second one waits by default; `--wait 0s` still refuses.
+#[test]
+fn a_contended_shared_cache_is_waited_for_by_default() {
+    let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    git(temp.path(), &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(temp.path().join(".aethyme")).unwrap();
+    std::fs::write(
+        temp.path().join(".gitignore"),
+        "/.aethyme/broker.db*\n/.aethyme/run/\n/node_modules/\n/host-state/\n/step-started\n",
+    )
+    .unwrap();
+    std::fs::write(temp.path().join("pnpm-lock.yaml"), "v1\n").unwrap();
+    // The first session holds the shared cache for as long as `release`
+    // is absent, so the test controls the contention window exactly.
+    let release = temp.path().join("host-state").join("release");
+    std::fs::write(
+        temp.path().join(".aethyme/prepare.toml"),
+        format!(
+            r#"schema_version = 1
+
+[[steps]]
+name = "deps"
+command = ["sh", "-c", "touch step-started; while [ ! -e '{}' ] && [ -e hold ]; do sleep 0.05; done; mkdir -p node_modules"]
+inputs = ["pnpm-lock.yaml"]
+outputs = ["node_modules/"]
+cache = "repository_shared"
+"#,
+            release.display()
+        ),
+    )
+    .unwrap();
+    git(temp.path(), &["add", "."]);
+    git(temp.path(), &["commit", "-qm", "fixture"]);
+    let state = temp.path().join("host-state");
+    let holder = success_json(run(
+        temp.path(),
+        &state,
+        &["start", "--adopt", ".", "--task", "holder", "--json"],
+    ));
+    let holder_id = holder["id"].as_i64().unwrap().to_string();
+    let waiter = success_json(run(
+        temp.path(),
+        &state,
+        &[
+            "start",
+            "--task",
+            "waiter",
+            "--short-name",
+            "waiter",
+            "--json",
+        ],
+    ));
+    let waiter_id = waiter["id"].as_i64().unwrap().to_string();
+    // Only the holder's checkout blocks in its step.
+    std::fs::write(temp.path().join("hold"), "").unwrap();
+
+    let holding = {
+        let (repo, state, holder_id) = (temp.path().to_path_buf(), state.clone(), holder_id);
+        std::thread::spawn(move || {
+            run(
+                &repo,
+                &state,
+                &["submit", "prepare", "--session", &holder_id, "--json"],
+            )
+        })
+    };
+    let started = std::time::Instant::now();
+    while !temp.path().join("step-started").exists() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "the holder never started its shared step"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let refused = run(
+        temp.path(),
+        &state,
+        &[
+            "submit",
+            "prepare",
+            "--session",
+            &waiter_id,
+            "--wait",
+            "0s",
+            "--json",
+        ],
+    );
+    assert!(!refused.status.success(), "--wait 0s must still fail fast");
+    // `--json` reports the refusal on stdout; the human form uses stderr.
+    let refusal = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(refusal.contains("preparation_cache"), "{refusal}");
+
+    let waiting = {
+        let (repo, state, waiter_id) = (temp.path().to_path_buf(), state.clone(), waiter_id);
+        std::thread::spawn(move || {
+            run(
+                &repo,
+                &state,
+                &["submit", "prepare", "--session", &waiter_id, "--json"],
+            )
+        })
+    };
+    // Long enough for the waiter to reach the held cache, and for an
+    // immediate refusal to have returned.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(
+        !waiting.is_finished(),
+        "prepare without --wait must wait for the shared cache, not refuse"
+    );
+    std::fs::write(&release, "").unwrap();
+
+    success_json(holding.join().unwrap());
+    let waited = waiting.join().unwrap();
+    assert!(
+        String::from_utf8_lossy(&waited.stderr).contains("waiting up to 600s"),
+        "stderr={}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    let waited = success_json(waited);
+    assert_eq!(waited["state"], "current", "{waited}");
+    assert!(
+        waited["shared_cache_wait_ms"].as_u64().unwrap() >= 500,
+        "{waited}"
+    );
+}
