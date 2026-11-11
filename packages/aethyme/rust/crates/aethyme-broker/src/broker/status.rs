@@ -2143,6 +2143,7 @@ impl Broker {
         let (integration_branch, integration_head) = integration;
 
         let mut advice = self.base_failure_incident_status_advice(Some(agents));
+        advice.extend(self.object_store_advice());
         if let Some(warning) = promote_config_warning {
             advice.push(StatusAdvice {
                 id: "promote.mode-invalid",

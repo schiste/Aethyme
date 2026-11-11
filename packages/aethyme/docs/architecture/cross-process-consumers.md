@@ -1462,3 +1462,7 @@ Introduced 2026-11-05. `LeaseBlocker` (lease claim `warnings`, submit `lease_war
 ### Lease overlap impact
 
 Introduced 2026-11-05, opt-in with `[leases] overlap_impact = true`. The `PreToolUse` hook context can add an advisory note naming another live session changing a file the edited file directly calls or imports, with its graph revision, confidence and diff. No JSON surface changes.
+
+### Object-store maintenance
+
+Introduced 2026-11-11. `broker status --json` can carry an `advice[]` row with id `repository.loose-objects` (severity `notice`) when the repository holds about 25,000 or more loose Git objects, estimated from `objects/17` as `git gc --auto` does; its `commands` hold the manual `git -C <root> gc --no-prune`. A successful `broker finish` in such a repository starts one detached `git gc --no-prune --quiet` at most once every 24 hours, prints a `note:` line on stderr, and records a `broker.object_store.maintenance_started` event whose payload has `estimated_loose_objects`, `threshold` and `started`. `AETHYME_OBJECT_STORE_MAINTENANCE=0` turns the automatic repack off and keeps the advice. Command metric lines gain an `object_store_probe` span. No existing field, exit code or stdout shape changes.

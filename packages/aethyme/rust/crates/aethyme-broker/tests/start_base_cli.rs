@@ -470,3 +470,46 @@ fn a_command_metric_line_carries_spans_recorded_where_the_work_happens() {
     }
     assert!(lines.iter().any(|line| line["command"] != "start"));
 }
+
+#[test]
+fn status_names_an_object_store_with_many_loose_objects() {
+    let tmp = fixture();
+    let advice_ids = |tmp: &Path| -> Vec<String> {
+        let output = run(tmp, &["status", "--refresh", "--json"]);
+        assert!(output.status.success(), "{output:?}");
+        json(&output)["advice"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert!(
+        !advice_ids(tmp.path()).contains(&"repository.loose-objects".to_string()),
+        "a fresh repository is under the threshold"
+    );
+
+    // Git estimates loose objects from this one fan-out directory, and so does
+    // the broker: 98 entries stand for 98 * 256 = 25,088 objects.
+    let sampled = tmp.path().join(".git/objects/17");
+    std::fs::create_dir_all(&sampled).unwrap();
+    for index in 0..98 {
+        std::fs::write(sampled.join(format!("{index:038x}")), b"").unwrap();
+    }
+    let output = run(tmp.path(), &["status", "--refresh", "--json"]);
+    let status = json(&output);
+    let row = status["advice"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "repository.loose-objects")
+        .unwrap_or_else(|| panic!("the loose-object advice is missing: {status}"));
+    assert_eq!(row["severity"], "notice");
+    assert!(row["summary"].as_str().unwrap().contains("25088"));
+    assert!(
+        row["commands"][0]
+            .as_str()
+            .unwrap()
+            .ends_with("gc --no-prune")
+    );
+}
