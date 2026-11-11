@@ -7,7 +7,7 @@ exit: 0
       while HEAD has commits no remote holds; --abandon --reason closes
       anyway and records a broker.session.abandoned_unpushed event. If it
       is not safe, prints the next command; suggests cleanup only when
-      cleanup would pass without --force. Git checks share a 10-second
+      cleanup would pass without --force. Git checks share a 60-second
       deadline by default; --timeout changes it, and an expiry names the
       timed-out check with safe status/handoff guidance. Successful closure atomically
       persists a redacted session.finished handoff with delivery, pending
