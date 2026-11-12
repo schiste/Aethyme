@@ -335,8 +335,96 @@ pub(super) fn parse_advisory_id(value: Option<&String>, usage: &str) -> Result<i
     Ok(id)
 }
 
+/// The refusals of `broker leases` that read only the parsed arguments, with
+/// the messages each action gives. They run before the broker opens: a
+/// writable open runs startup maintenance, which a refused command must not
+/// trigger.
+fn validate_leases_arguments(parsed: &Parsed) -> Result<(), UsageError> {
+    let action = parsed.positional.first().map(String::as_str);
+    let path = |message: &str| {
+        parsed
+            .positional
+            .get(1)
+            .map(|_| ())
+            .ok_or_else(|| UsageError::Message(message.into()))
+    };
+    let session = |message: &str| {
+        parsed
+            .session
+            .map(|_| ())
+            .ok_or_else(|| UsageError::Message(message.into()))
+    };
+    match action {
+        None | Some("export") => {}
+        Some("claim") => {
+            path("claim requires a path")?;
+            session("claim requires --session <id>")?;
+        }
+        Some("plan") => {
+            if parsed.positional.len() < 2 {
+                return Err(UsageError::Message(
+                    "plan requires at least one path".into(),
+                ));
+            }
+        }
+        Some("release") => {
+            path("release requires a path")?;
+            session("release requires --session <id>")?;
+        }
+        Some("request-release") => {
+            path("request-release requires a path")?;
+            session("request-release requires --session <id>")?;
+            if parsed.reason.is_none() {
+                return Err(UsageError::Message(
+                    "request-release requires --reason <why>".into(),
+                ));
+            }
+        }
+        Some(action @ ("ack" | "decline")) => {
+            if !parsed
+                .positional
+                .get(1)
+                .and_then(|id| id.parse::<i64>().ok())
+                .is_some_and(|id| id > 0)
+            {
+                return Err(UsageError::Message(format!(
+                    "{action} requires a positive request id"
+                )));
+            }
+            session(&format!("{action} requires --session <holder>"))?;
+            if action == "decline" && parsed.reason.is_none() {
+                return Err(UsageError::Message(
+                    "decline requires --reason <why>".into(),
+                ));
+            }
+        }
+        Some("wait") => {
+            let path = parsed
+                .positional
+                .get(1)
+                .ok_or(UsageError::Message("wait requires a path".into()))?;
+            session("wait requires --session <id>")?;
+            crate::broker::normalize_lease_path(path)
+                .map_err(|error| UsageError::Message(error.to_string()))?;
+        }
+        Some("explain") => {
+            for path in parsed.positional.get(1..).unwrap_or_default() {
+                crate::broker::normalize_lease_path(path)
+                    .map_err(|error| UsageError::Message(error.to_string()))?;
+            }
+        }
+        Some(other) => {
+            return Err(UsageError::Message(format!(
+                "unknown leases action {other:?} — expected claim, plan, explain, request-release, ack, decline, wait, export, or release"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `broker leases`.
 pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
+    validate_leases_arguments(&parsed)?;
     let export = parsed.positional.first().map(String::as_str) == Some("export");
     let mut broker = open_broker(parsed.read_only_snapshot || export)?;
     match parsed.positional.first().map(String::as_str) {
