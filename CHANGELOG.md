@@ -4,6 +4,20 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.76] - 2026-11-12
+
+### Removed
+
+- `aethyme broker advanced integration status`, `aethyme broker advanced integration wait-stable`, `aethyme broker advanced main reconcile plan|apply` and `aethyme broker submit promotion-record plan|apply`. They only served the local landing path. Hints that named them now point at `aethyme broker status` or `aethyme broker advanced agents`. `integration reconcile` remains until the promoting modes are removed (#1617).
+
+### Changed
+
+- `aethyme deploy`'s first enrollment publishes its gate-verified commit directly, without a promotion and without the integration branch. It refuses before any remote operation unless the commit's only parent is the reviewed remote base, and still refuses a `review_gated` publication policy. The enrollment journal gains a `verified` phase; journals an older version left at `base_prepared` or `promoted` still resume (#1618).
+
+### Fixed
+
+- A supervisor replaced by an update releases its services before starting its successor, so the worktree watcher is available from the successor's first tick, and the proxy is tried again while its port is still busy instead of being given up on the first attempt (#1619).
+
 ## [0.8.75] - 2026-11-12
 
 ### Added
