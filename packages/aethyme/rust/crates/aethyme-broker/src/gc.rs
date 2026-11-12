@@ -7683,7 +7683,7 @@ impl Broker {
     fn run_artifact_sweep_recovery_worker_loop(
         &mut self,
         policy: &RetentionPolicy,
-        request_generation: i64,
+        mut request_generation: i64,
         max_passes: Option<usize>,
         max_duration: Option<Duration>,
         mut sweep_pass: impl FnMut(
@@ -7720,6 +7720,22 @@ impl Broker {
                 return Ok(());
             }
             if outcome.complete {
+                // A request that arrived during this lap, such as build output
+                // a finish could not reclaim while this worker held the GC
+                // lock, may name a session this lap's pages never reached:
+                // they stop at the newest session seen when the lap began.
+                // Lap again for it now instead of leaving it to a later open.
+                let latest_generation = self
+                    .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)?
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or(0);
+                if latest_generation > request_generation
+                    && max_passes.is_none_or(|limit| passes < limit)
+                {
+                    request_generation = latest_generation;
+                    no_progress_passes = 0;
+                    continue;
+                }
                 // Preserve request history and advance only the generation
                 // this pass actually covered. A pressure refusal arriving
                 // between this write and the next open remains pending.
@@ -8533,6 +8549,23 @@ impl Broker {
         }
         // A concurrent GC owns the artifact namespace; skip rather than race.
         let Ok(_lock) = GcLock::acquire(&main_root) else {
+            if closed_session_id.is_some() {
+                // A just-closed session's build output is due now, under
+                // `artifact_reclaim_days`, not when the closed-worktree grace
+                // lets its checkout go. The pages below are the same for every
+                // scope, so a durable request for another lap covers it: the
+                // lock holder (normally the detached worker) re-reads the
+                // request after its current lap, and any later broker open
+                // admits a worker for it.
+                crate::phase_telemetry::add(
+                    "closed_session_artifact_reclaim_deferred_gc_locked",
+                    Duration::ZERO,
+                );
+                crate::warn_unrecorded(
+                    "request a sweep lap for build output deferred by a held GC lock",
+                    self.persist_artifact_sweep_recovery_request(),
+                );
+            }
             return Ok((
                 ArtifactSweepOutcome::no_work(
                     // An explicit sweep did not inspect the namespace and
@@ -13869,6 +13902,154 @@ mod tests {
         assert!(complete_after_settlement);
         assert_eq!(removed_after_settlement, 1);
         assert!(!cache.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn build_output_deferred_by_a_held_gc_lock_is_reclaimed_by_the_next_lap() {
+        let (_temporary, _storage, mut broker, root) = closed_artifact_sweep_fixture();
+        let (session_id, worktree, cache) = closed_artifact_cache(&mut broker, "deferred by lock");
+        // A day of closed-worktree grace, the default; build output has none
+        // (`artifact_reclaim_days = 0`), so it must not wait for the grace.
+        set_closed_worktree_grace(&root, 24);
+        assert!(!broker.artifact_sweep_recovery_requested().unwrap());
+
+        // The detached worker holds the GC lock while finish closes a session.
+        let held = GcLock::acquire(&root).unwrap();
+        let deferred = broker.reclaim_closed_session_artifacts(session_id).unwrap();
+        assert!(!deferred.complete, "a skipped reclaim is not complete");
+        assert_eq!(deferred.directories_reclaimed, 0);
+        assert!(cache.is_dir());
+        assert!(
+            broker.artifact_sweep_recovery_requested().unwrap(),
+            "the deferred reclaim leaves a durable request for another lap"
+        );
+        assert!(
+            !test_worker_retry_pending(&mut broker, now_ms()).unwrap(),
+            "the next open may admit a worker for it at once"
+        );
+        drop(held);
+
+        let generation = broker
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .unwrap()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap();
+        let policy = load_retention_policy(&root).unwrap();
+        broker
+            .run_artifact_sweep_recovery_worker_loop(
+                &policy,
+                generation,
+                Some(1),
+                None,
+                |broker, policy, _remaining| {
+                    broker.sweep_artifacts_autonomously_with_test_deadlines(
+                        policy,
+                        ArtifactSweepScope::AutomaticContinuation,
+                        Instant::now() + Duration::from_secs(30),
+                        Instant::now() + Duration::from_secs(30),
+                    )
+                },
+            )
+            .unwrap();
+        assert!(
+            !cache.exists(),
+            "the next lap reclaims the closed session's build output"
+        );
+        assert!(
+            worktree.join("README.md").is_file(),
+            "the checkout itself still waits for its closed-worktree grace"
+        );
+        assert!(GitRepo::discover(&worktree).is_ok());
+    }
+
+    #[test]
+    fn worker_laps_again_for_a_request_that_arrived_during_its_lap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        let storage = crate::test_storage::TestStorage::new();
+        let mut broker = storage.open(root).unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
+            .unwrap();
+        broker
+            .artifact_sweep_meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
+            .unwrap();
+        let policy = load_retention_policy(root).unwrap();
+        let complete = || {
+            Ok((
+                ArtifactSweepOutcome {
+                    directories_reclaimed: 1,
+                    entries_reclaimed: 1,
+                    complete: true,
+                    auto_cleanup: None,
+                    ..ArtifactSweepOutcome::no_work(true, None)
+                },
+                1,
+            ))
+        };
+
+        let mut passes = 0;
+        broker
+            .run_artifact_sweep_recovery_worker_loop(
+                &policy,
+                7,
+                None,
+                None,
+                |broker, _policy, _remaining| {
+                    passes += 1;
+                    if passes == 1 {
+                        // A finish that found the lock held, mid-lap.
+                        broker.persist_artifact_sweep_recovery_request()?;
+                    }
+                    complete()
+                },
+            )
+            .unwrap();
+        assert_eq!(passes, 2, "the new request buys one more lap");
+        let requested = broker
+            .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .unwrap()
+            .unwrap();
+        assert!(requested.parse::<i64>().unwrap() > 7);
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap(),
+            Some(requested.clone()),
+            "the second lap completes the newer request"
+        );
+
+        // A pass limit still bounds the worker: the newer request stays
+        // pending for the next open rather than being acknowledged.
+        let mut passes = 0;
+        broker
+            .run_artifact_sweep_recovery_worker_loop(
+                &policy,
+                requested.parse().unwrap(),
+                Some(1),
+                None,
+                |broker, _policy, _remaining| {
+                    passes += 1;
+                    broker.persist_artifact_sweep_recovery_request()?;
+                    complete()
+                },
+            )
+            .unwrap();
+        assert_eq!(passes, 1);
+        assert_eq!(
+            broker
+                .artifact_sweep_meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap(),
+            Some(requested),
+            "only the generation the lap covered is acknowledged"
+        );
+        assert!(broker.artifact_sweep_recovery_requested().unwrap());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

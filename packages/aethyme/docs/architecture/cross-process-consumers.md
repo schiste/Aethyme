@@ -153,10 +153,20 @@ lock (`.aethyme/gc.lock`), normally the background reclaim worker; the pid is
 that lock's owner when the lock file names one. `reclaim_deferred: true` means
 reclaim was handed off, not skipped: the session's durable cleanup request is
 kept, the running worker re-reads that request after its cache lane, and any
-later broker open re-queues it. Nothing is removed before the request's
-closed-worktree grace period ends either way. `cleanup.attempted` and
-`cleanup.artifact_bytes_reclaimed` keep their meaning. Readers of saved reports
-must treat a missing field as `false` / absent.
+later broker open re-queues it. The checkout itself is not removed before the
+request's closed-worktree grace period ends either way. The kept checkout's
+build output is a separate rule (changed 2026-11-12): it is due under
+`retention.artifact_reclaim_days` (default `0`, at once) whether or not finish
+got the lock. When the lock is held, the closed-session reclaim records a new
+artifact-sweep recovery generation instead of nothing; the holding worker laps
+again for a generation that arrived during its lap (its pages stop at the
+newest session seen when the lap began), and any later broker open admits a
+worker for it. Command metrics count each such hand-off as
+`closed_session_artifact_reclaim_deferred_gc_locked` in `phase_counts`.
+Before this change the build output waited for the next periodic lap
+(`artifact_sweep_interval_hours`, 24 h by default) or for checkout removal.
+`cleanup.attempted` and `cleanup.artifact_bytes_reclaimed` keep their meaning.
+Readers of saved reports must treat a missing field as `false` / absent.
 
 ## Coordinated fetches never write-block (2026-11-12)
 
