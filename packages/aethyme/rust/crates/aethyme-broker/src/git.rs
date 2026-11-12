@@ -3215,11 +3215,11 @@ impl GitRepo {
     ///
     /// A status of 373 sessions asked this 850 times on 2026-11-12, one Git
     /// process each, which was most of its time. Two answers need no Git: one
-    /// Git already gave in this process for a checkout whose `.git` entry is
-    /// unchanged, and a linked worktree's own registration, which names the
-    /// common directory in files. Anything else, and any registration that is
-    /// not consistent in both directions, is still put to Git. An expired
-    /// deadline reaches Git and fails there.
+    /// already given in this process (by Git or by a registration) for a
+    /// checkout whose `.git` entry is unchanged, and a linked worktree's own
+    /// registration, which names the common directory in files. Anything else,
+    /// and any registration that is not consistent in both directions, is
+    /// still put to Git. An expired deadline reaches Git and fails there.
     pub(crate) fn worktree_common_dir(path: &Path) -> Result<PathBuf, GitError> {
         let deadline_open = active_git_deadline().is_none_or(|deadline| deadline > Instant::now());
         if deadline_open && let Some(common) = repository_identity_cache::common_dir_for(path) {
@@ -3228,6 +3228,9 @@ impl GitRepo {
         }
         if deadline_open && let Some(common) = Self::registered_worktree_common_dir(path) {
             crate::phase_telemetry::add("worktree_common_dir_registered", Duration::ZERO);
+            // One status read the same registration about 1,600 times; the
+            // memory re-checks only the `.git` file and the common directory.
+            repository_identity_cache::remember_common_dir(path, &common);
             return Ok(common);
         }
         let _span = crate::phase_telemetry::span("worktree_common_dir_probe");
@@ -10097,6 +10100,78 @@ mod worktree_common_dir_tests {
         std::fs::remove_dir_all(&admin).unwrap();
         assert!(GitRepo::worktree_common_dir(&linked).is_err());
         assert_eq!(count("worktree_common_dir_registered"), registered);
+    }
+
+    #[test]
+    fn a_remembered_registration_is_not_reread_until_its_git_file_changes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let main = fixture.path().join("main");
+        let linked = fixture.path().join("linked");
+        let moved = fixture.path().join("moved");
+        std::fs::create_dir(&main).unwrap();
+        run_git(&main, &["init", "-q", "-b", "main"]).unwrap();
+        run_git(
+            &main,
+            &[
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+        )
+        .unwrap();
+        run_git(
+            &main,
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent/linked",
+                linked.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let expected = GitRepo::discover(&main).unwrap().git_common_dir().unwrap();
+        let recorder = crate::phase_telemetry::Recorder::default();
+        let _installed = crate::phase_telemetry::install(recorder.clone());
+        let count = |name: &str| recorder.totals().1.get(name).copied().unwrap_or(0);
+        repository_identity_cache::ENABLED_ON_THIS_THREAD.with(|enabled| enabled.set(true));
+
+        assert_eq!(GitRepo::worktree_common_dir(&linked).unwrap(), expected);
+        assert_eq!(GitRepo::worktree_common_dir(&linked).unwrap(), expected);
+        assert_eq!(count("worktree_common_dir_registered"), 1);
+        assert_eq!(
+            count("worktree_common_dir_remembered"),
+            1,
+            "the second lookup reuses the registration's answer"
+        );
+        assert_eq!(count("worktree_common_dir_probe"), 0, "no Git was needed");
+
+        // A checkout moved away has no `.git` entry at the remembered path.
+        std::fs::rename(&linked, &moved).unwrap();
+        assert!(GitRepo::worktree_common_dir(&linked).is_err());
+        assert_eq!(count("worktree_common_dir_remembered"), 1);
+        assert_eq!(count("worktree_common_dir_registered"), 1);
+        std::fs::rename(&moved, &linked).unwrap();
+
+        // A re-pointed `.git` file (longer, so a different entry) is not
+        // answered from memory, and its broken registration goes to Git.
+        let pointer = std::fs::read_to_string(linked.join(".git")).unwrap();
+        let re_pointed = format!("{}-re-pointed\n", pointer.trim_end());
+        std::fs::write(linked.join(".git"), re_pointed).unwrap();
+        assert!(GitRepo::worktree_common_dir(&linked).is_err());
+        assert_eq!(count("worktree_common_dir_remembered"), 1);
+        assert_eq!(count("worktree_common_dir_registered"), 1);
+        repository_identity_cache::ENABLED_ON_THIS_THREAD.with(|enabled| enabled.set(false));
     }
 
     #[test]
