@@ -4,6 +4,21 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.73] - 2026-11-12
+
+### Added
+
+- One shared file watcher, hosted by the host supervisor (`aethyme env supervise`), lets `broker status` and `broker agents` reuse a session worktree's changed-path answer while nothing in that worktree changed, instead of running `git diff` and `git ls-files` in it again. Git still produces every answer; any doubt (no watcher, a dropped file event, a changed index or baseline) asks Git as before. Commands that decide whether work may land never reuse. Set `AETHYME_WORKTREE_WATCH=off` to always ask Git (#1602).
+- The host supervisor hosts several services in one process, so new background work does not need a process of its own (#1602).
+
+### Changed
+
+- This repository's Rust gates draw their cost from the `aethyme-host-build` capacity pool, the same pool local cargo runs reserve, so gates and local builds queue instead of compiling at once (#1601).
+
+### Fixed
+
+- `broker submit prepare` reclaims the shared preparation cache by itself when the lease holding it belongs to a preparation whose process is gone, instead of refusing until someone runs `resources reconcile`. It does so only for a lease that holds nothing but the preparation cache; any other dead holder still needs the reviewed command (#1603).
+
 ## [0.8.72] - 2026-11-12
 
 ### Added
